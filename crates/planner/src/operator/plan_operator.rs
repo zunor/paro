@@ -101,6 +101,21 @@ impl LogicalOutputLayout {
         }
         Self::new(types, bindings)
     }
+
+    fn project_for(self, projection: &ProjectionMap, mode: OutputLayoutMode) -> Self {
+        match mode {
+            OutputLayoutMode::Output => self.project(projection),
+            OutputLayoutMode::Carriers => self,
+        }
+    }
+}
+
+/// Output maps restrict returned columns, not the columns a local predicate
+/// may still consume. Both views share the same operator/layout derivation.
+#[derive(Clone, Copy)]
+enum OutputLayoutMode {
+    Output,
+    Carriers,
 }
 
 /// The LogicalOperator represents a node in the logical query plan.
@@ -826,6 +841,24 @@ impl<Child> LogicalOperator<Child> {
         &self,
         child_layouts: &[&LogicalOutputLayout],
     ) -> LogicalOutputLayout {
+        self.local_layout_from_child_refs(child_layouts, OutputLayoutMode::Output)
+    }
+
+    /// Derive available predicate carriers without rewriting/cloning the
+    /// operator to clear its Filter/Order/TopN/join output projection maps.
+    /// Row-producing semantics (including SEMI and MARK) remain unchanged.
+    pub fn carrier_layout_from_child_refs(
+        &self,
+        child_layouts: &[&LogicalOutputLayout],
+    ) -> LogicalOutputLayout {
+        self.local_layout_from_child_refs(child_layouts, OutputLayoutMode::Carriers)
+    }
+
+    fn local_layout_from_child_refs(
+        &self,
+        child_layouts: &[&LogicalOutputLayout],
+        mode: OutputLayoutMode,
+    ) -> LogicalOutputLayout {
         let mut arity = 0;
         self.visit_child_links(&mut |_| arity += 1);
         debug_assert_eq!(child_layouts.len(), arity);
@@ -838,7 +871,7 @@ impl<Child> LogicalOperator<Child> {
                 child_layouts.get(1).copied(),
             ),
         };
-        derive_local_output_layout(self, first, second)
+        derive_local_output_layout(self, first, second, mode)
     }
 
     /// Return the child whose layout is exactly the node output, when that
@@ -893,6 +926,7 @@ fn derive_output_layout(root: &LogicalOperator) -> LogicalOutputLayout {
                         operator,
                         Option::None,
                         Option::None,
+                        OutputLayoutMode::Output,
                     ));
                     continue;
                 }
@@ -928,6 +962,7 @@ fn derive_output_layout(root: &LogicalOperator) -> LogicalOutputLayout {
                     operator,
                     first.as_ref(),
                     second.as_ref(),
+                    OutputLayoutMode::Output,
                 ));
             }
         }
@@ -1009,6 +1044,7 @@ fn derive_local_output_layout<Child>(
     operator: &LogicalOperator<Child>,
     first: Option<&LogicalOutputLayout>,
     second: Option<&LogicalOutputLayout>,
+    mode: OutputLayoutMode,
 ) -> LogicalOutputLayout {
     match operator {
         LogicalOperator::Get(get) => {
@@ -1018,7 +1054,7 @@ fn derive_local_output_layout<Child>(
             LogicalOutputLayout::new(reference.types.clone(), reference.bindings.clone())
         }
         LogicalOperator::Filter(filter) => {
-            required_output_layout(first, "filter child").project(&filter.projection_map)
+            required_output_layout(first, "filter child").project_for(&filter.projection_map, mode)
         }
         LogicalOperator::Projection(projection) => LogicalOutputLayout::new(
             projection.returned_types.clone(),
@@ -1060,10 +1096,10 @@ fn derive_local_output_layout<Child>(
             required_output_layout(first, "pass-through child")
         }
         LogicalOperator::TopN(topn) => {
-            required_output_layout(first, "topn child").project(&topn.projection_map)
+            required_output_layout(first, "topn child").project_for(&topn.projection_map, mode)
         }
         LogicalOperator::Order(order) => {
-            required_output_layout(first, "order child").project(&order.projection_map)
+            required_output_layout(first, "order child").project_for(&order.projection_map, mode)
         }
         LogicalOperator::CreateTable(_)
         | LogicalOperator::CreateRoutine(_)
@@ -1087,7 +1123,7 @@ fn derive_local_output_layout<Child>(
         LogicalOperator::ExpressionGet(values) => {
             LogicalOutputLayout::for_table(values.table_index, values.types.clone())
         }
-        LogicalOperator::Join(join) => finish_join_layout(join, first, second),
+        LogicalOperator::Join(join) => finish_join_layout(join, first, second, mode),
         LogicalOperator::DelimGet(delim) => {
             LogicalOutputLayout::for_table(delim.table_index, delim.chunk_types.clone())
         }
@@ -1188,6 +1224,7 @@ fn finish_join_layout<Child>(
     join: &Join<Child>,
     left: Option<&LogicalOutputLayout>,
     right: Option<&LogicalOutputLayout>,
+    mode: OutputLayoutMode,
 ) -> LogicalOutputLayout {
     let (left_projection, right_projection, mark_index) = match join {
         Join::Comparison(join) => (
@@ -1205,10 +1242,10 @@ fn finish_join_layout<Child>(
 
     match join.join_type() {
         JoinType::Semi | JoinType::Anti => required_output_layout(left, "join left child")
-            .project(left_projection.expect("projected join")),
+            .project_for(left_projection.expect("projected join"), mode),
         JoinType::Mark => {
             let mut left = required_output_layout(left, "mark join left child")
-                .project(left_projection.expect("projected join"));
+                .project_for(left_projection.expect("projected join"), mode);
             left.push(
                 LogicalType::Boolean,
                 ColumnBinding::new(mark_index.unwrap_or(0), 0),
@@ -1217,7 +1254,7 @@ fn finish_join_layout<Child>(
         }
         JoinType::RightSemi | JoinType::RightAnti => {
             required_output_layout(right, "join right child")
-                .project(right_projection.expect("projected join"))
+                .project_for(right_projection.expect("projected join"), mode)
         }
         JoinType::Invalid
         | JoinType::Left
@@ -1227,13 +1264,13 @@ fn finish_join_layout<Child>(
         | JoinType::Single => {
             let right = match right_projection {
                 Some(projection) => {
-                    required_output_layout(right, "join right child").project(projection)
+                    required_output_layout(right, "join right child").project_for(projection, mode)
                 }
                 None => required_output_layout(right, "cross join right child"),
             };
             let mut left = match left_projection {
                 Some(projection) => {
-                    required_output_layout(left, "join left child").project(projection)
+                    required_output_layout(left, "join left child").project_for(projection, mode)
                 }
                 None => required_output_layout(left, "cross join left child"),
             };
@@ -2017,6 +2054,41 @@ mod tests {
                     "{name} pass-through layout diverges from its child contract"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn carrier_layout_matches_cleared_output_maps_for_every_operator_sample() {
+        for (name, mut operator) in sample_non_leaf_operators() {
+            let clear_maps =
+                |operator: &mut LogicalOperator, projection: ProjectionMap| match operator {
+                    LogicalOperator::Filter(filter) => filter.projection_map = projection,
+                    LogicalOperator::Order(order) => order.projection_map = projection,
+                    LogicalOperator::TopN(topn) => topn.projection_map = projection,
+                    LogicalOperator::Join(Join::Comparison(join)) => {
+                        join.left_projection_map = projection.clone();
+                        join.right_projection_map = projection;
+                    }
+                    LogicalOperator::Join(Join::Any(join)) => {
+                        join.left_projection_map = projection.clone();
+                        join.right_projection_map = projection;
+                    }
+                    _ => {}
+                };
+            clear_maps(&mut operator, ProjectionMap::none());
+            let layouts = operator
+                .children()
+                .iter()
+                .map(|child| child.output_layout())
+                .collect::<Vec<_>>();
+            let refs = layouts.iter().collect::<Vec<_>>();
+            let carrier = operator.carrier_layout_from_child_refs(&refs);
+            clear_maps(&mut operator, ProjectionMap::all());
+            assert_eq!(
+                carrier,
+                operator.output_layout_from_child_refs(&refs),
+                "{name}"
+            );
         }
     }
 }

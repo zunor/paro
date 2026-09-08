@@ -44,30 +44,16 @@ pub(super) fn derive(
         let node = arena.get(index)?;
         let mut children = Vec::new();
         node.operator
-            .visit_child_links(&mut |child| children.push(layouts[child].clone()));
-        layouts.insert(index, node.operator.output_layout_from_children(&children));
+            .visit_child_links(&mut |child| children.push(&layouts[child]));
+        let output = node.operator.output_layout_from_child_refs(&children);
+        layouts.insert(index, output);
         let mut carrier_children = Vec::new();
         node.operator
-            .visit_child_links(&mut |child| carrier_children.push(carriers[child].clone()));
-        let mut operator = node.operator.clone();
-        match &mut operator {
-            LogicalOperator::Filter(filter) => filter.projection_map = ProjectionMap::all(),
-            LogicalOperator::Order(order) => order.projection_map = ProjectionMap::all(),
-            LogicalOperator::TopN(topn) => topn.projection_map = ProjectionMap::all(),
-            LogicalOperator::Join(Join::Comparison(join)) => {
-                join.left_projection_map = ProjectionMap::all();
-                join.right_projection_map = ProjectionMap::all();
-            }
-            LogicalOperator::Join(Join::Any(join)) => {
-                join.left_projection_map = ProjectionMap::all();
-                join.right_projection_map = ProjectionMap::all();
-            }
-            _ => {}
-        }
-        carriers.insert(
-            index,
-            operator.output_layout_from_children(&carrier_children),
-        );
+            .visit_child_links(&mut |child| carrier_children.push(&carriers[child]));
+        let carrier = node
+            .operator
+            .carrier_layout_from_child_refs(&carrier_children);
+        carriers.insert(index, carrier);
     }
     let mut outputs = BTreeMap::from([(
         root,
@@ -87,8 +73,7 @@ pub(super) fn derive(
         let wanted = outputs[&index].clone();
         let mut execution = wanted.clone();
         let mut positional = false;
-        let mut operator = node.operator.clone();
-        paro_planner::visitor::enumerate_expressions(&mut operator, |expression| {
+        paro_planner::visitor::enumerate_expression_refs(&node.operator, |expression| {
             crate::expression::traversal::visit_expression(expression, &mut |expression| {
                 if let Expression::ColumnRef(column) = expression {
                     if column.depth == 0 {
@@ -150,15 +135,15 @@ pub(super) fn derive(
 }
 
 fn remap_expression(expression: &mut Expression, bindings: &BindingMap) {
-    if let Expression::ColumnRef(column) = expression {
-        if column.depth == 0 {
-            if let Some(binding) = bindings.get(&column.binding) {
-                column.binding = *binding;
+    ExpressionIterator::visit_mut(expression, &mut |expression| {
+        if let Expression::ColumnRef(column) = expression {
+            if column.depth == 0 {
+                if let Some(binding) = bindings.get(&column.binding) {
+                    column.binding = *binding;
+                }
             }
         }
-    }
-    ExpressionIterator::enumerate_children_mut(expression, |child| {
-        remap_expression(child, bindings)
+        paro_planner::expression::ExpressionVisitDecision::Descend
     });
 }
 
