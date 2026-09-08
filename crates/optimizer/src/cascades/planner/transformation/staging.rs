@@ -181,7 +181,10 @@ pub(super) fn stage_transformed_expression(
         }
         let (skeleton, children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
         let semantic_template = semantic_plan::canonical_template(skeleton.clone());
-        let semantic_plan = semantic_template.clone().assemble(children)?;
+        // The canonical extraction template deliberately has no output demand
+        // or occurrence statistics. Derive the published schema/facts from the
+        // settled occurrence, before erasing those annotations for storage.
+        let semantic_plan = skeleton.clone().assemble(children)?;
         let memo = &mut *session.memo;
         let state = &mut *session.state;
         let options = &session.options;
@@ -1071,6 +1074,65 @@ mod tests {
             input.memo.group(children[0]).unwrap().schema,
             input.memo.group(children[1]).unwrap().schema
         );
+    }
+
+    #[test]
+    fn staging_preserves_the_settled_root_projection_before_canonicalization() {
+        use paro_planner::operator::{Filter, ProjectionMap};
+        let make_plan = || {
+            let source = equality_join(
+                test_base_get(0, 70_001, "left_source", 10),
+                test_base_get(1, 70_002, "right_source", 10),
+                10,
+            );
+            let mut filter = Filter::new(source, vec![]);
+            filter.projection_map = ProjectionMap::new(vec![1]);
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(filter))
+        };
+        let mut input =
+            MemoBuilder::build(make_plan(), BindContext::new(), SearchBudget::default()).unwrap();
+        let mut state = input.planner_state.write().unwrap();
+        state.session = Some(TestStatementContextBuilder::minimal().build());
+        let plan = state.staging_arena.import(make_plan()).unwrap();
+        let staged = stage_transformed_expression(
+            StagingRequest {
+                plan,
+                input_facts: boundary::BoundarySnapshot::default(),
+                column_stats: Arc::new(HashMap::new()),
+                column_stat_scopes: HashMap::new(),
+                target: StagingTarget {
+                    group: input.root,
+                    rule: RuleId(999),
+                    budget_class: TransformationBudgetClass::Local,
+                    input_context: OptimizationContextId(0),
+                    child_context: OptimizationContextId(0),
+                    refined_cardinality_kind: None,
+                },
+                regions: StagingRegionRequirements {
+                    preserved_facet: None,
+                    extended_required_facets: Box::new([]),
+                    inherited_runtime_filter_facet: None,
+                },
+                nested_group_holes: BTreeMap::new(),
+            },
+            &mut input.memo,
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        let metadata = &state.metadata[&staged.payload];
+        assert_eq!(metadata.output_columns.len(), 1);
+        assert_eq!(
+            input.memo.group(input.root).unwrap().schema.columns().len(),
+            1
+        );
+        let LogicalOperator::Filter(template) = &state.payloads.logical[staged.payload.index()]
+            .semantic_template
+            .operator
+        else {
+            panic!("expected canonical filter template")
+        };
+        assert!(template.projection_map.is_all());
     }
 
     #[test]
