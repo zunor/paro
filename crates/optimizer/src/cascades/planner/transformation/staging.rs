@@ -263,7 +263,7 @@ pub(super) fn stage_transformed_expression(
             &output_bindings,
             &output_columns,
             column_stats.as_ref(),
-            semantic_plan.stats.estimated_cardinality,
+            &schema,
         )?;
         if let LogicalOperator::CTERef(reference) = &semantic_plan.operator {
             logical_properties

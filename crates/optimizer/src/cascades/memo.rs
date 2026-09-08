@@ -36,6 +36,10 @@ pub struct LogicalProperties {
     pub column_domains: BTreeMap<super::ids::ColumnId, GroupColumnDomain>,
     pub column_values:
         BTreeMap<super::ids::ColumnId, paro_planner::operator::bound_reference::BoundColumnValues>,
+    /// Conflicting advisory types are absorbing unknown evidence. Remembering
+    /// this state makes equivalent-fact merge commutative and prevents a later
+    /// alternative from reviving a value domain rejected earlier.
+    pub conflicting_column_values: BTreeSet<super::ids::ColumnId>,
     /// Definition-column bridges from scan-local columns to producer groups.
     /// Equivalent references may originate from different CTE identities, so
     /// this is a canonical set rather than an insertion-order-sensitive slot.
@@ -218,7 +222,18 @@ impl LogicalProperties {
         }
         self.cte_references
             .extend(other.cte_references.iter().cloned());
+        self.conflicting_column_values
+            .extend(other.conflicting_column_values.iter().copied());
         for (column, value) in &other.column_values {
+            if self.conflicting_column_values.contains(column) {
+                continue;
+            }
+            if self.column_values.get(column).is_some_and(|previous| {
+                previous.statistics().get_type() != value.statistics().get_type()
+            }) {
+                self.conflicting_column_values.insert(*column);
+                continue;
+            }
             let value = self
                 .column_values
                 .get(column)
@@ -227,12 +242,19 @@ impl LogicalProperties {
                 .unwrap_or_else(|| value.clone());
             self.column_values.insert(*column, value);
         }
+        for column in &self.conflicting_column_values {
+            self.column_values.remove(column);
+        }
         Ok(())
     }
 
     fn stable_fact_fingerprint(&self) -> Fingerprint {
         let mut fingerprint = StableFingerprintBuilder::default();
         fingerprint.write_bytes(b"paro.memo.logical-facts.v1");
+        fingerprint.write_u64(self.conflicting_column_values.len() as u64);
+        for column in &self.conflicting_column_values {
+            fingerprint.write_u64(column.0 as u64);
+        }
         fingerprint.write_u64(self.unique_keys.len() as u64);
         for key in &self.unique_keys {
             fingerprint.write_u64(key.len() as u64);
@@ -1110,6 +1132,13 @@ impl Memo {
         let Some(group) = self.group(self.canonical_group(id)) else {
             return Ok(None);
         };
+        if group
+            .logical_properties
+            .conflicting_column_values
+            .contains(&column)
+        {
+            return Ok(None);
+        }
         let Some(declared) = group
             .schema
             .columns()

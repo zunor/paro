@@ -468,10 +468,23 @@ fn attach_group_column_domains(
     output_bindings: &[ColumnBinding],
     output_columns: &[ColumnId],
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-    _estimated_cardinality: Option<CardinalityEstimate>,
+    schema: &GroupSchema,
 ) -> Result<()> {
     for (&binding, &column) in output_bindings.iter().zip(output_columns) {
-        let statistics = column_stats.get(&binding);
+        let declared = schema
+            .columns()
+            .iter()
+            .find(|entry| entry.id == column)
+            .ok_or_else(|| paro_error::internal("column fact has no declared schema"))?;
+        let statistics = column_stats.get(&binding).filter(|statistics| {
+            let matches = statistics.get_type() == &declared.logical_type;
+            if !matches {
+                tracing::debug!(target: "paro::optimizer", ?binding, ?column,
+                    expected = ?declared.logical_type, actual = ?statistics.get_type(),
+                    "discarded ill-typed scalar statistics at Memo publication");
+            }
+            matches
+        });
         if let Some(statistics) = statistics {
             properties.column_values.insert(
                 column,
@@ -737,7 +750,7 @@ impl MemoBuilder {
                         &output_bindings,
                         &output_columns,
                         candidate_stats.as_ref(),
-                        plan.stats.estimated_cardinality,
+                        &schema,
                     )?;
                     if let LogicalOperator::CTERef(reference) = &plan.operator {
                         logical_properties.cte_references.insert(cte_reference_domain(reference, &output_columns)?);

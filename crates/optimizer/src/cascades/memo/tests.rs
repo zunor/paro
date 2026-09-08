@@ -1033,6 +1033,48 @@ fn stale_cte_value_statistics_are_not_a_compilation_error_or_a_proof() {
 }
 
 #[test]
+fn conflicting_advisory_values_merge_to_absorbing_unknown_in_every_order() {
+    use paro_common::runtime_value::Value;
+    use paro_planner::operator::bound_reference::BoundColumnValues;
+    use paro_storage::statistics::BaseStatistics;
+
+    let inputs = [
+        Value::Integer(5),
+        Value::Varchar("stale".to_string()),
+        Value::Integer(8),
+    ]
+    .map(|value| {
+        let mut facts = LogicalProperties::default();
+        facts.column_values.insert(
+            ColumnId(1),
+            BoundColumnValues::new(BaseStatistics::from_constant(&value)).unwrap(),
+        );
+        facts
+    });
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut merged = LogicalProperties::default();
+        for index in order {
+            merged.merge_equivalent_facts(&inputs[index]).unwrap();
+        }
+        assert!(merged.column_values.is_empty());
+        assert_eq!(
+            merged.conflicting_column_values,
+            BTreeSet::from([ColumnId(1)])
+        );
+        let again = merged.clone();
+        merged.merge_equivalent_facts(&again).unwrap();
+        assert_eq!(merged, again);
+    }
+}
+
+#[test]
 fn peer_row_preserving_recipes_track_every_equivalent_input() {
     let mut memo = Memo::new(SearchBudget::default());
     let first = memo.create_group(
