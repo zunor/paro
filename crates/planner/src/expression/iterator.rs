@@ -21,51 +21,41 @@ impl ExpressionIterator {
         expr: &Expression,
         mut fold: impl FnMut(&Expression, &[State]) -> Result<State>,
     ) -> Result<State> {
-        struct Frame<'a, State> {
-            expr: &'a Expression,
-            children: Vec<&'a Expression>,
-            next_child: usize,
-            completed: Vec<State>,
+        enum Task<'a> {
+            Enter(&'a Expression),
+            Finish(&'a Expression, usize),
         }
-
-        fn frame<'a, State>(expr: &'a Expression) -> Frame<'a, State> {
-            let mut children = Vec::new();
-            ExpressionIterator::enumerate_children(expr, |child| children.push(child));
-            Frame {
-                expr,
-                next_child: 0,
-                completed: Vec::with_capacity(children.len()),
-                children,
-            }
-        }
-
-        let mut stack = vec![frame(expr)];
-        loop {
-            let descend = {
-                let current = stack
-                    .last_mut()
-                    .expect("expression post-order traversal retains its root frame");
-                if let Some(child) = current.children.get(current.next_child).copied() {
-                    current.next_child += 1;
-                    Some(child)
-                } else {
-                    None
+        // Two reusable buffers for the whole traversal. Per-node child and
+        // completed-state vectors turn a stack-safety primitive into O(n)
+        // allocator calls even when the fold itself allocates nothing.
+        let mut pending = vec![Task::Enter(expr)];
+        let mut completed = Vec::new();
+        while let Some(task) = pending.pop() {
+            match task {
+                Task::Enter(expression) => {
+                    let start = pending.len();
+                    Self::enumerate_children(expression, |child| pending.push(Task::Enter(child)));
+                    let count = pending.len() - start;
+                    if count == 0 {
+                        completed.push(fold(expression, &[])?);
+                    } else {
+                        pending.push(Task::Finish(expression, count));
+                        pending[start..].reverse();
+                    }
                 }
-            };
-            if let Some(child) = descend {
-                stack.push(frame(child));
-                continue;
+                Task::Finish(expression, count) => {
+                    let start = completed
+                        .len()
+                        .checked_sub(count)
+                        .expect("expression fold retained every child state");
+                    let state = fold(expression, &completed[start..])?;
+                    completed.truncate(start);
+                    completed.push(state);
+                }
             }
-
-            let completed = stack
-                .pop()
-                .expect("expression post-order traversal retains its completed frame");
-            let state = fold(completed.expr, &completed.completed)?;
-            let Some(parent) = stack.last_mut() else {
-                return Ok(state);
-            };
-            parent.completed.push(state);
         }
+        debug_assert_eq!(completed.len(), 1);
+        Ok(completed.pop().expect("expression fold retained its root"))
     }
 
     /// Visit an expression tree in pre-order with explicit subtree pruning.
@@ -84,9 +74,9 @@ impl ExpressionIterator {
             if visitor(current) == ExpressionVisitDecision::SkipChildren {
                 continue;
             }
-            let mut children = Vec::new();
-            Self::enumerate_children(current, |child| children.push(child));
-            pending.extend(children.into_iter().rev());
+            let start = pending.len();
+            Self::enumerate_children(current, |child| pending.push(child));
+            pending[start..].reverse();
         }
     }
 
@@ -115,11 +105,11 @@ impl ExpressionIterator {
             if visitor(current) == ExpressionVisitDecision::SkipChildren {
                 continue;
             }
-            let mut children = Vec::new();
+            let start = pending.len();
             Self::enumerate_children_mut(current, |child| {
-                children.push(child as *mut Expression);
+                pending.push(child as *mut Expression);
             });
-            pending.extend(children.into_iter().rev());
+            pending[start..].reverse();
         }
     }
 
@@ -324,6 +314,53 @@ mod tests {
         Expression::ColumnRef(
             ColumnRefExpression::new(ColumnBinding::new(10, idx), LogicalType::Integer).into(),
         )
+    }
+
+    #[test]
+    fn flat_post_order_preserves_sibling_states_and_stops_at_first_error() {
+        use crate::expression::{ConjunctionExpression, ConjunctionType};
+        let expression = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![
+                    Expression::Conjunction(
+                        ConjunctionExpression::new(
+                            ConjunctionType::And,
+                            vec![int_column(0), int_column(1)],
+                        )
+                        .into(),
+                    ),
+                    int_column(2),
+                ],
+            )
+            .into(),
+        );
+        let mut groups = Vec::new();
+        let value = ExpressionIterator::try_fold_post_order(&expression, |expression, children| {
+            if let Expression::ColumnRef(column) = expression {
+                return Ok(column.binding.column_index);
+            }
+            groups.push(children.to_vec());
+            Ok(children.iter().fold(9, |prefix, child| prefix * 10 + child))
+        })
+        .unwrap();
+        assert_eq!(groups, vec![vec![0, 1], vec![901, 2]]);
+        assert_eq!(value, 9912);
+
+        let mut visited = Vec::new();
+        let result =
+            ExpressionIterator::try_fold_post_order(&expression, |expression, _: &[()]| {
+                let Expression::ColumnRef(column) = expression else {
+                    panic!("parent ran after a failed child")
+                };
+                visited.push(column.binding.column_index);
+                if column.binding.column_index == 1 {
+                    return Err(paro_common::error::internal("expected traversal stop"));
+                }
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert_eq!(visited, vec![0, 1]);
     }
 
     #[test]

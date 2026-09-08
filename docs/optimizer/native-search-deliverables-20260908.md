@@ -103,6 +103,7 @@ or debug-logging builds from latency evidence.
 | `native-q11-cold-evidence-20260908.json` | `62392da9` | 1652.7 ms | 1023 / 1817 / 2906; more frontier exhaustion and RSS |
 | `native-q11-cold-fact-cache-20260908.json` | `30240f8d` | 1490.4 ms | Exactly the preceding row's counts, hit/miss and exhaustion counters |
 | `native-q11-cold-shared-scalars-20260909.json` | `8321589e` | 1411.7 ms | Exactly the preceding row's counters; median peak RSS 580,042,752 bytes |
+| `native-q11-cold-persistent-scalars-20260909.json` | `4e217881` | 1556.5 ms | Exactly the preceding row's counters; a measured intermediate latency regression |
 
 The fact-cache comparison isolates about 9.8% less cold latency without reducing
 search. All v2 reports above have zero deadline expiry and zero rule failures,
@@ -111,7 +112,13 @@ exploration. The evidence-algebra change increased frontier pressure; the
 newer reports must **not** be blessed as a no-regression replacement for the
 journal report. The shared-scalar migration reduces median cold latency a
 further 5.3% without changing those counters; its cold gate passes against
-`30240f8d`. No latency measurement above represents revisions after `8321589e`.
+`30240f8d`. The first persistent-normalizer implementation then regresses by
+10.3%: its explicit stack still creates a temporary child vector per node.
+The follow-up removes those vectors from normalization and the shared traversal
+primitives, using one work stack and one completed-state buffer per fold instead.
+That work needs a new cold measurement; the ownership contract alone is not
+evidence of a performance improvement. No latency measurement above represents
+revisions after `4e217881`.
 
 The separately instrumented `native-q11-allocation-shared-scalars-20260909.json`
 at `8321589e` records 3,641,969,536 bytes in Memo exploration. Its main rule

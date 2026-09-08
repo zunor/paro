@@ -99,20 +99,18 @@ impl ExpressionRewriter {
                         *changes_made = true;
                         expression = rewritten;
                     }
-                    let mut children = Vec::new();
+                    let start = pending.len();
                     ExpressionIterator::enumerate_children(&expression, |child| {
-                        children.push(child.clone())
+                        pending.push(Task::Enter(child.clone(), false));
                     });
-                    if children.is_empty() {
+                    let count = pending.len() - start;
+                    if count == 0 {
                         completed.push(expression);
                     } else {
-                        pending.push(Task::Finish(expression, children.len()));
-                        pending.extend(
-                            children
-                                .into_iter()
-                                .rev()
-                                .map(|child| Task::Enter(child, false)),
-                        );
+                        pending.push(Task::Finish(expression, count));
+                        // Finish first in the stack, then visit children in
+                        // declaration order. No per-node child buffer exists.
+                        pending[start..].reverse();
                     }
                 }
                 Task::Finish(mut expression, count) => {
