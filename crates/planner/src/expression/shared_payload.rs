@@ -5,7 +5,7 @@
 //! immutable node; mutation detaches only that node, never its descendant DAG.
 
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::*;
 
@@ -21,8 +21,14 @@ pub trait ExpressionPayload: Clone + std::fmt::Debug {
     fn into_expression_children(self, pending: &mut Vec<Expression>);
 }
 
+#[derive(Debug, Clone)]
+struct SharedExpressionNode<T: ExpressionPayload> {
+    value: T,
+    evaluation: OnceLock<EvaluationProperties>,
+}
+
 pub struct SharedExpressionPayload<T: ExpressionPayload> {
-    inner: Option<Arc<T>>,
+    inner: Option<Arc<SharedExpressionNode<T>>>,
 }
 
 impl<T: ExpressionPayload> std::fmt::Debug for SharedExpressionPayload<T> {
@@ -37,9 +43,16 @@ impl<T: ExpressionPayload> SharedExpressionPayload<T> {
         ExpressionIdentity(Arc::as_ptr(self.inner.as_ref().expect("live scalar payload")) as usize)
     }
 
+    pub(crate) fn evaluation_cache(&self) -> &OnceLock<EvaluationProperties> {
+        &self.inner.as_ref().expect("live scalar payload").evaluation
+    }
+
     pub fn new(payload: T) -> Self {
         Self {
-            inner: Some(Arc::new(payload)),
+            inner: Some(Arc::new(SharedExpressionNode {
+                value: payload,
+                evaluation: OnceLock::new(),
+            })),
         }
     }
 
@@ -47,11 +60,12 @@ impl<T: ExpressionPayload> SharedExpressionPayload<T> {
         let shared = self.inner.as_ref().expect("live scalar payload");
         if Arc::strong_count(shared) == 1 {
             return Arc::into_inner(self.inner.take().expect("live scalar payload"))
-                .expect("unique scalar payload");
+                .expect("unique scalar payload")
+                .value;
         }
         // Dropping `self` uses the same iterative release path, even if the
         // last peer disappears concurrently while this local copy is made.
-        shared.as_ref().clone()
+        shared.value.clone()
     }
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
@@ -63,7 +77,7 @@ impl<T: ExpressionPayload> SharedExpressionPayload<T> {
 
     pub(crate) fn release_into(&mut self, pending: &mut Vec<Expression>) {
         if let Some(payload) = self.inner.take().and_then(Arc::into_inner) {
-            payload.into_expression_children(pending);
+            payload.value.into_expression_children(pending);
         }
     }
 }
@@ -79,13 +93,17 @@ impl<T: ExpressionPayload> Clone for SharedExpressionPayload<T> {
 impl<T: ExpressionPayload> Deref for SharedExpressionPayload<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.inner.as_deref().expect("live scalar payload")
+        &self.inner.as_deref().expect("live scalar payload").value
     }
 }
 
 impl<T: ExpressionPayload> DerefMut for SharedExpressionPayload<T> {
     fn deref_mut(&mut self) -> &mut T {
-        Arc::make_mut(self.inner.as_mut().expect("live scalar payload"))
+        let node = Arc::make_mut(self.inner.as_mut().expect("live scalar payload"));
+        // All mutable payload access crosses this point, including in-place
+        // child replacement. Descendants retain their own immutable facts.
+        node.evaluation.take();
+        &mut node.value
     }
 }
 
@@ -269,7 +287,9 @@ mod tests {
         )
     }
 
-    fn leaf_weak(expression: &Expression) -> std::sync::Weak<ConstantExpression> {
+    fn leaf_weak(
+        expression: &Expression,
+    ) -> std::sync::Weak<SharedExpressionNode<ConstantExpression>> {
         let Expression::Constant(payload) = expression else {
             panic!("expected constant")
         };
@@ -306,7 +326,10 @@ mod tests {
                 });
                 assert_eq!(visited, 10_001);
                 assert!(!expression.equals(&edited));
-                assert_eq!(observed_leaf.upgrade().unwrap().value, Value::Boolean(true));
+                assert_eq!(
+                    observed_leaf.upgrade().unwrap().value.value,
+                    Value::Boolean(true)
+                );
                 drop(expression);
                 assert!(observed_leaf.upgrade().is_none());
                 drop(edited);

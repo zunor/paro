@@ -144,12 +144,23 @@ impl Expression {
 
     /// Compute the evaluation contract for this expression tree.
     pub fn evaluation_properties(&self) -> EvaluationProperties {
-        let mut properties = EvaluationProperties::default();
-        ExpressionIterator::visit(self, &mut |node| {
-            properties.merge(node.local_evaluation_properties());
-            super::ExpressionVisitDecision::Descend
-        });
-        properties
+        if let Some(properties) = self.evaluation_cache().get() {
+            return *properties;
+        }
+        ExpressionIterator::try_fold_post_order_cached(
+            self,
+            |node| node.evaluation_cache().get().copied(),
+            |node, children| {
+                let mut properties = node.local_evaluation_properties();
+                for child in children {
+                    properties.merge(*child);
+                }
+                let published = *node.evaluation_cache().get_or_init(|| properties);
+                debug_assert_eq!(published, properties);
+                Ok(published)
+            },
+        )
+        .expect("intrinsic scalar property derivation is infallible")
     }
 
     /// Intrinsic operator contract, excluding children. Native scalar DAGs
@@ -263,6 +274,72 @@ mod tests {
         };
         function.function.error_mode = FunctionErrorMode::Infallible;
         expression
+    }
+
+    fn uncached_properties(expression: &Expression) -> EvaluationProperties {
+        let mut expected = EvaluationProperties::default();
+        ExpressionIterator::visit(expression, &mut |node| {
+            expected.merge(node.local_evaluation_properties());
+            super::super::ExpressionVisitDecision::Descend
+        });
+        expected
+    }
+
+    #[test]
+    fn cached_properties_survive_no_op_sharing_and_invalidate_the_changed_path() {
+        let original = infallible_call(vec![infallible_call(vec![]), infallible_call(vec![])]);
+        assert_eq!(
+            original.evaluation_properties(),
+            uncached_properties(&original)
+        );
+        let mut edited = original.clone();
+        let Expression::Function(parent) = &mut edited else {
+            unreachable!()
+        };
+        let Expression::Function(child) = &mut parent.children[0] else {
+            unreachable!()
+        };
+        child.function.error_mode = FunctionErrorMode::CanError;
+        assert!(edited.evaluation_cache().get().is_none());
+        let Expression::Function(parent) = &edited else {
+            unreachable!()
+        };
+        assert!(parent.children[0].evaluation_cache().get().is_none());
+        assert!(parent.children[1].evaluation_cache().get().is_some());
+        assert!(original.evaluation_properties().is_infallible());
+        assert!(!edited.evaluation_properties().is_infallible());
+        assert_eq!(edited.evaluation_properties(), uncached_properties(&edited));
+    }
+
+    #[test]
+    fn unique_node_mutation_invalidates_cached_intrinsic_metadata() {
+        let mut expression = infallible_call(vec![]);
+        assert!(expression.evaluation_properties().can_share_evaluation());
+        let Expression::Function(function) = &mut expression else {
+            unreachable!()
+        };
+        function.function.stability = FunctionStability::Volatile;
+        assert!(expression.evaluation_cache().get().is_none());
+        assert!(!expression.evaluation_properties().can_share_evaluation());
+        assert_eq!(
+            expression.evaluation_properties(),
+            uncached_properties(&expression)
+        );
+    }
+
+    #[test]
+    fn shared_dag_publishes_context_free_facts_for_every_owned_node() {
+        let mut expression = infallible_call(vec![]);
+        let mut nodes = vec![expression.clone()];
+        // Bounded even if a future change accidentally disables the cache.
+        for _ in 0..18 {
+            expression = infallible_call(vec![expression.clone(), expression]);
+            nodes.push(expression.clone());
+        }
+        assert!(expression.evaluation_properties().is_infallible());
+        assert!(nodes
+            .iter()
+            .all(|node| node.evaluation_cache().get().is_some()));
     }
 
     #[test]

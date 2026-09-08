@@ -19,6 +19,19 @@ impl ExpressionIterator {
     /// reimplementing recursive walkers for each new expression variant.
     pub fn try_fold_post_order<State>(
         expr: &Expression,
+        fold: impl FnMut(&Expression, &[State]) -> Result<State>,
+    ) -> Result<State> {
+        Self::try_fold_post_order_cached(expr, |_| None, fold)
+    }
+
+    /// A fact fold over immutable nodes. Lookup may prune an already-derived
+    /// subtree; publishing the result in `fold` lets later DAG edges consume
+    /// it without expanding the same node again. This is not an occurrence
+    /// visitor: evaluation counts and effectful rewrites must use their own
+    /// explicit occurrence contract instead.
+    pub fn try_fold_post_order_cached<State>(
+        expr: &Expression,
+        mut lookup: impl FnMut(&Expression) -> Option<State>,
         mut fold: impl FnMut(&Expression, &[State]) -> Result<State>,
     ) -> Result<State> {
         enum Task<'a> {
@@ -33,6 +46,10 @@ impl ExpressionIterator {
         while let Some(task) = pending.pop() {
             match task {
                 Task::Enter(expression) => {
+                    if let Some(state) = lookup(expression) {
+                        completed.push(state);
+                        continue;
+                    }
                     let start = pending.len();
                     Self::enumerate_children(expression, |child| pending.push(Task::Enter(child)));
                     let count = pending.len() - start;
@@ -361,6 +378,45 @@ mod tests {
             });
         assert!(result.is_err());
         assert_eq!(visited, vec![0, 1]);
+    }
+
+    #[test]
+    fn cached_fold_visits_shared_nodes_once_without_losing_edge_multiplicity() {
+        use crate::expression::{ConjunctionExpression, ConjunctionType};
+        let mut expression = int_column(0);
+        for _ in 0..50 {
+            expression = Expression::Conjunction(
+                ConjunctionExpression::new(
+                    ConjunctionType::And,
+                    vec![expression.clone(), expression],
+                )
+                .into(),
+            );
+        }
+        let facts = std::cell::RefCell::new(std::collections::HashMap::new());
+        let mut derived = 0;
+        let leaves = ExpressionIterator::try_fold_post_order_cached(
+            &expression,
+            |node| facts.borrow().get(&node.allocation_identity()).copied(),
+            |node, children: &[u64]| {
+                derived += 1;
+                // Fail quickly if pruning regresses instead of expanding
+                // 2^50 paths and hanging the test process.
+                if derived > 51 {
+                    return Err(paro_common::error::internal("shared fact expanded again"));
+                }
+                let value = if children.is_empty() {
+                    1
+                } else {
+                    children.iter().sum()
+                };
+                facts.borrow_mut().insert(node.allocation_identity(), value);
+                Ok(value)
+            },
+        )
+        .unwrap();
+        assert_eq!(derived, 51);
+        assert_eq!(leaves, 1u64 << 50);
     }
 
     #[test]

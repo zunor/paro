@@ -39,6 +39,24 @@ pub enum Expression {
 const _: () = assert!(std::mem::size_of::<Expression>() <= 16);
 
 impl Expression {
+    pub(crate) fn evaluation_cache(&self) -> &std::sync::OnceLock<super::EvaluationProperties> {
+        match self {
+            Self::Constant(value) => value.evaluation_cache(),
+            Self::ColumnRef(value) => value.evaluation_cache(),
+            Self::Function(value) => value.evaluation_cache(),
+            Self::Cast(value) => value.evaluation_cache(),
+            Self::Conjunction(value) => value.evaluation_cache(),
+            Self::Case(value) => value.evaluation_cache(),
+            Self::Comparison(value) => value.evaluation_cache(),
+            Self::Operator(value) => value.evaluation_cache(),
+            Self::Parameter(value) => value.evaluation_cache(),
+            Self::Reference(value) => value.evaluation_cache(),
+            Self::Aggregate(value) => value.evaluation_cache(),
+            Self::Subquery(value) => value.evaluation_cache(),
+            Self::Window(value) => value.evaluation_cache(),
+        }
+    }
+
     /// Query-local allocation identity. This is never a semantic fingerprint
     /// and cannot be persisted or used without the allocation's lifetime.
     pub fn allocation_identity(&self) -> super::ExpressionIdentity {
