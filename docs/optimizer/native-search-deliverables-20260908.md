@@ -285,3 +285,56 @@ changed facts.
 - At `18c1c301`: optimizer 993 passed; workspace/all-target Clippy passed.
   New post-change cold/execution measurements and a final full suite are still
   required. Do not reuse the historical performance reports as its evidence.
+
+## Executable scalar operands and refreshed evidence
+
+`6bb666a5` shares immutable, aligned child layouts and reads only the key facet
+when deriving uniqueness. It removes full boundary-statistic transport from that
+path; NULL equality and column permutation/pruning are independently tested.
+This structural improvement did **not** demonstrate a cold-latency speedup.
+
+`19324b64` supplies exact, iterative identity for bound CAST kernels, including
+context dependence, metadata roles and nested shared casts. `0ba087b4` replaces
+digest-only scalar call operands with immutable executable descriptors. Native
+construction/substitution retains bind data, aggregate modifiers, window frame
+roles and intrinsic effect/error contracts; it needs no original extraction
+expression. Typed substitution retains unchanged IDs, leaves correlated scopes
+alone and rolls back its append delta on error. Export/substitution use cursors
+rather than enqueueing a wide node's unadmitted siblings. Deep/shared-DAG tests
+and deliberately colliding bind-data digests cover these contracts.
+
+This closes a scalar prerequisite, **not** the relational-rule migration:
+production transformations and physical extraction still use the operator
+template adapter. Bound routine descriptors are currently copied when lowering
+an owned call, so their construction is not a free operation. Search-time native
+rule outputs, query-owned memory admission and the performance targets remain
+unfinished.
+
+| Report | Revision | Observation |
+| --- | --- | --- |
+| `native-plan-quality-scalar-operands-20260909.json` | `682613ea` | 10/10 boundaries pass; q-errors unchanged, max 2, mean 1.30833 |
+| `native-q11-cold-scalar-operands-20260909.json` | `682613ea` | Five fresh processes, median 1344.03 ms; every search/settlement counter identical to `14ec9409` |
+| `native-q11-execution-scalar-operands-20260909.json` | `682613ea` | 70 verified measurements per engine; Paro 100.064 ms / DuckDB 105.318 ms; paired ratio 0.971371, hierarchical 95% CI [0.943, 1.008] |
+| `native-q11-cold-shared-layout-20260909.json` | `6bb666a5` | Median 1378.97 ms; all counters identical to the preceding cold report |
+| `native-q11-cold-call-descriptors-20260909.json` | `0ba087b4` | Median 1475.47 ms; 1021 groups / 1833 logical / 2919 physical; 8094 settlement hits / 2880 misses; median peak RSS 564,510,720 bytes |
+
+The execution interval still crosses one; it is not a stable DuckDB win. A
+separate instrumented execution diagnostic confirms four actual workers, but its
+140.36 ms duration is not a comparator sample. The new scalar identities change
+bounded-search scheduling and evidence discrimination: the call-descriptor
+report has 18,028 bindings and more child-frontier/composition exhaustion than
+the shared-layout report. Its latency increase cannot be attributed solely to
+descriptor allocation. All cold samples have zero deadline expiry and zero rule
+failures, but retain `search_complete=0`; no budget constants were reduced.
+
+`native-q11-allocation-call-descriptors-20260909.json` is a separate instrumented
+build at `0ba087b4`. Memo exploration records 2,867,054,086 bytes of allocation
+traffic, not peak live memory. Inclusive rule times: predicate transfer 224.85
+ms / 1263 attempts, join enumeration 128.39 ms / 758, dimension sharing 89.45 ms /
+67, and aggregate join subsumption 71.60 ms / 2015. These are not an isolated
+before/after comparison against older profiles with different search counts.
+
+Validation at committed `0ba087b4`: full workspace **6472 passed, 85 ignored**;
+strict workspace/all-target Clippy passes. The new SQL/plan-quality/Q11 execution
+checks after this commit are still pending; the earlier 184/184 SQL run and
+execution comparison must not be presented as verification of the new binary.
