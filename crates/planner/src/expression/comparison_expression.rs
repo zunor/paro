@@ -31,6 +31,18 @@ pub enum ComparisonType {
 }
 
 impl ComparisonType {
+    /// Exchange operands while preserving the comparison's truth value,
+    /// including UNKNOWN and both NULL-safe comparison operators.
+    pub const fn flipped(self) -> Self {
+        match self {
+            Self::LessThan => Self::GreaterThan,
+            Self::LessThanOrEqual => Self::GreaterThanOrEqual,
+            Self::GreaterThan => Self::LessThan,
+            Self::GreaterThanOrEqual => Self::LessThanOrEqual,
+            other => other,
+        }
+    }
+
     /// Convert to display string for debugging/error messages.
     pub fn as_str(&self) -> &'static str {
         match self {

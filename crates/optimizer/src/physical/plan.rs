@@ -1707,6 +1707,50 @@ struct ExplainExpressionFormatter<'a> {
     columns: &'a [String],
 }
 
+#[cfg(test)]
+mod expression_format_tests {
+    use super::*;
+    use paro_common::{runtime_value::Value, types::LogicalType};
+    use paro_planner::expression::{
+        ComparisonExpression, ComparisonType, ConstantExpression, ReferenceExpression,
+    };
+
+    #[test]
+    fn comparison_presentation_does_not_depend_on_native_hash_orientation() {
+        let names = ["sum(amount)".to_string()];
+        let formatter = ExplainExpressionFormatter::new(&names);
+        let column =
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into());
+        for literal in [Value::Integer(100), Value::Null(LogicalType::Integer)] {
+            let constant =
+                Expression::Constant(ConstantExpression::new(literal, LogicalType::Integer).into());
+            for op in [
+                ComparisonType::Equal,
+                ComparisonType::NotEqual,
+                ComparisonType::LessThan,
+                ComparisonType::LessThanOrEqual,
+                ComparisonType::GreaterThan,
+                ComparisonType::GreaterThanOrEqual,
+                ComparisonType::DistinctFrom,
+                ComparisonType::NotDistinctFrom,
+            ] {
+                assert_eq!(op.flipped().flipped(), op);
+                let normal = Expression::Comparison(
+                    ComparisonExpression::new(op, column.clone(), constant.clone()).into(),
+                );
+                let reversed = Expression::Comparison(
+                    ComparisonExpression::new(op.flipped(), constant.clone(), column.clone())
+                        .into(),
+                );
+                let before = reversed.allocation_identity();
+                assert_eq!(formatter.format(&normal), formatter.format(&reversed));
+                assert_eq!(reversed.allocation_identity(), before);
+                assert!(formatter.format(&normal).starts_with("sum(amount) "));
+            }
+        }
+    }
+}
+
 const EXPLAIN_EXPRESSION_MAX_NODES: usize = 1_024;
 const EXPLAIN_EXPRESSION_MAX_DEPTH: usize = 64;
 const EXPLAIN_EXPRESSION_MAX_BYTES: usize = 16 * 1_024;
@@ -1807,25 +1851,48 @@ impl<'a> ExplainExpressionFormatter<'a> {
                 format!("${}", parameter.slot.index.index() + 1),
                 ExplainPrecedence::Primary,
             ),
-            Expression::Comparison(comparison) => (
-                format!(
-                    "{} {} {}",
-                    self.format_expression(
-                        &comparison.left,
-                        ExplainPrecedence::Comparison,
-                        next_depth,
-                        budget,
+            Expression::Comparison(comparison) => {
+                // Native scalar identity may choose either orientation by
+                // fingerprint. Presentation has its own stable convention:
+                // keep a lone literal on the right. This changes no IR or
+                // evaluation order and prevents hash order from changing a
+                // named predicate boundary in EXPLAIN consumers.
+                let (left, op, right) =
+                    if matches!(comparison.left.as_ref(), Expression::Constant(_))
+                        && !matches!(comparison.right.as_ref(), Expression::Constant(_))
+                    {
+                        (
+                            &comparison.right,
+                            comparison.comparison_type.flipped(),
+                            &comparison.left,
+                        )
+                    } else {
+                        (
+                            &comparison.left,
+                            comparison.comparison_type,
+                            &comparison.right,
+                        )
+                    };
+                (
+                    format!(
+                        "{} {} {}",
+                        self.format_expression(
+                            left,
+                            ExplainPrecedence::Comparison,
+                            next_depth,
+                            budget,
+                        ),
+                        op,
+                        self.format_expression(
+                            right,
+                            ExplainPrecedence::Comparison,
+                            next_depth,
+                            budget,
+                        )
                     ),
-                    comparison.comparison_type,
-                    self.format_expression(
-                        &comparison.right,
-                        ExplainPrecedence::Comparison,
-                        next_depth,
-                        budget,
-                    )
-                ),
-                ExplainPrecedence::Comparison,
-            ),
+                    ExplainPrecedence::Comparison,
+                )
+            }
             Expression::Conjunction(conjunction) => {
                 let (separator, precedence) = match conjunction.conjunction_type {
                     paro_planner::expression::ConjunctionType::And => {
