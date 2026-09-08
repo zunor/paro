@@ -229,6 +229,13 @@ pub(super) fn apply(
         .iter()
         .flat_map(|map| map.iter().map(|(a, b)| (*a, *b)))
         .collect::<BindingMap>();
+    if let LogicalOperator::MaterializedCTE(cte) = &mut shell.operator {
+        for column in &mut cte.output_columns {
+            if let Some(binding) = bindings.get(&column.binding) {
+                column.binding = *binding;
+            }
+        }
+    }
     let get_output = matches!(shell.operator, LogicalOperator::Get(_));
     // Get's output identities are positional today. Compact its aligned
     // arrays atomically, then explicitly rebind every parent-local use.

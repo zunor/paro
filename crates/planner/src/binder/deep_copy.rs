@@ -639,12 +639,17 @@ impl LogicalPlanDeepCopy {
                 let child = self.copy_plan(cte.child.as_ref(), bind_shared);
                 let mut cte_index = cte.cte_index;
                 self.remap_cte_index(bind_shared, &mut cte_index);
+                let mut output_columns = cte.output_columns.clone();
+                for column in &mut output_columns {
+                    self.remap_table_index(bind_shared, &mut column.binding.table_index);
+                }
                 LogicalOperator::MaterializedCTE(MatCteNode {
                     cte_index,
                     cte_name: cte.cte_name.clone(),
                     column_names: cte.column_names.clone(),
                     column_types: cte.column_types.clone(),
                     materialized: cte.materialized,
+                    output_columns,
                     ref_count: cte.ref_count,
                     cte_query: Box::new(cte_query),
                     child: Box::new(child),
@@ -674,6 +679,7 @@ impl LogicalPlanDeepCopy {
                     relation_alias: c.relation_alias.clone(),
                     column_names: c.column_names.clone(),
                     column_types: c.column_types.clone(),
+                    definition_columns: c.definition_columns.clone(),
                 })
             }
             LogicalOperator::TableFunctionGet(t) => {

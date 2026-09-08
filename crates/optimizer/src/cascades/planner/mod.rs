@@ -518,6 +518,60 @@ struct PendingPlannerRegionFacets {
 
 pub struct MemoBuilder;
 
+fn cte_reference_domain(
+    reference: &paro_planner::operator::CTERef,
+    columns: &[ColumnId],
+) -> Result<CteReferenceDomain> {
+    if reference.definition_columns.len() != columns.len() {
+        return Err(paro_error::internal(
+            "CTE reference column correspondence has inconsistent arity",
+        ));
+    }
+    let mut mapping = BTreeMap::new();
+    for (definition, column) in reference.definition_columns.iter().zip(columns) {
+        if mapping.insert(*definition, *column).is_some() {
+            return Err(paro_error::internal(
+                "CTE reference repeats a definition column",
+            ));
+        }
+    }
+    Ok(CteReferenceDomain {
+        cte_index: reference.cte_index,
+        columns: mapping,
+    })
+}
+
+fn cte_producer_columns<Child>(
+    cte: &paro_planner::operator::MaterializedCTE<Child>,
+    producer: GroupId,
+    memo: &Memo,
+    bindings: &BindingCatalog,
+) -> Result<BTreeMap<paro_planner::operator::cte::CteColumnId, ColumnId>> {
+    let schema = &memo
+        .group(producer)
+        .ok_or_else(|| paro_error::internal("CTE producer group is missing"))?
+        .schema;
+    let mut mapping = BTreeMap::new();
+    for column in &cte.output_columns {
+        let ty = cte
+            .column_types
+            .get(column.definition.0)
+            .ok_or_else(|| paro_error::internal("CTE definition column has no declared type"))?;
+        let Some(id) = bindings.get(column.binding.table_index, column.binding.column_index, ty)
+        else {
+            continue;
+        };
+        // A pruned producer may no longer expose this definition column. Its
+        // absence contributes no evidence, never the next positional column.
+        if schema.contains(*id) && mapping.insert(column.definition, *id).is_some() {
+            return Err(paro_error::internal(
+                "CTE producer repeats a definition column",
+            ));
+        }
+    }
+    Ok(mapping)
+}
+
 impl MemoBuilder {
     pub fn build(
         plan: OwnedLogicalPlan,
@@ -686,18 +740,15 @@ impl MemoBuilder {
                         plan.stats.estimated_cardinality,
                     )?;
                     if let LogicalOperator::CTERef(reference) = &plan.operator {
-                        logical_properties.cte_references.insert(CteReferenceDomain {
-                            cte_index: reference.cte_index,
-                            columns: output_columns.clone().into_boxed_slice(),
-                        });
+                        logical_properties.cte_references.insert(cte_reference_domain(reference, &output_columns)?);
                     }
                     if let LogicalOperator::MaterializedCTE(cte) = &plan.operator {
                         if let Some(producer) = child_states.first() {
                             memo.register_cte_producer(
                                 cte.cte_index,
                                 producer.group,
-                                producer.columns.clone(),
-                            );
+                                cte_producer_columns(cte, producer.group, &memo, &binding_ids)?,
+                            )?;
                         }
                     }
                     let output_rows_hard_upper = logical_properties.maximum_cardinality;

@@ -821,7 +821,7 @@ fn cte_reference_domain_reads_the_current_producer_group_fact() {
         GroupColumnDomain::new(Some(10), Some(20)).unwrap(),
     );
     let producer = memo.create_group(
-        schema(1),
+        schema(0),
         producer_properties,
         GroupCardinality::new(Fingerprint(1), CardinalityRecipeKind::Statistics, 5, 10, 20),
     );
@@ -835,10 +835,15 @@ fn cte_reference_domain_reads_the_current_producer_group_fact() {
         .cte_references
         .insert(CteReferenceDomain {
             cte_index: 7,
-            columns: vec![ColumnId::new(1)].into_boxed_slice(),
+            columns: BTreeMap::from([(CteColumnId(0), ColumnId::new(1))]),
         });
     let reference = memo.create_group(schema(2), reference_properties, GroupCardinality::default());
-    memo.register_cte_producer(7, producer, vec![ColumnId::new(0)].into_boxed_slice());
+    memo.register_cte_producer(
+        7,
+        producer,
+        BTreeMap::from([(CteColumnId(0), ColumnId::new(0))]),
+    )
+    .unwrap();
 
     assert_eq!(
         memo.column_domain(reference, ColumnId::new(1))
@@ -870,6 +875,76 @@ fn cte_reference_domain_reads_the_current_producer_group_fact() {
 }
 
 #[test]
+fn cte_definition_columns_survive_pruned_and_reordered_producers() {
+    use paro_common::runtime_value::Value;
+    use paro_planner::operator::bound_reference::BoundColumnValues;
+    use paro_storage::statistics::BaseStatistics;
+
+    for other_value in [Value::Integer(999), Value::Varchar("unrelated".to_string())] {
+        let mut memo = Memo::new(SearchBudget::default());
+        let mut make_producer = |entries: &[(usize, u32, Value, u64)]| {
+            let mut properties = LogicalProperties::default();
+            let mut mapping = BTreeMap::new();
+            let mut columns = Vec::new();
+            for (definition, id, value, ndv) in entries {
+                let id = ColumnId(*id);
+                let statistics = BaseStatistics::from_constant(value);
+                columns.push(ColumnDesc {
+                    id,
+                    logical_type: statistics.get_type().clone(),
+                    nullable: false,
+                    origin: ColumnOrigin::Derived {
+                        key: Fingerprint(id.0 as u128),
+                    },
+                    visibility: ColumnVisibility::Visible,
+                    name_hint: None,
+                });
+                properties
+                    .column_domains
+                    .insert(id, GroupColumnDomain::new(Some(*ndv), None).unwrap());
+                properties
+                    .column_values
+                    .insert(id, BoundColumnValues::new(statistics).unwrap());
+                mapping.insert(CteColumnId(*definition), id);
+            }
+            let group = memo.create_group(
+                GroupSchema::new(columns).unwrap(),
+                properties,
+                GroupCardinality::default(),
+            );
+            memo.register_cte_producer(7, group, mapping).unwrap();
+        };
+        make_producer(&[
+            (0, 10, Value::Integer(5), 2),
+            (1, 11, other_value.clone(), 90),
+        ]);
+        make_producer(&[(0, 20, Value::Integer(5), 2)]);
+        make_producer(&[
+            (1, 30, other_value.clone(), 90),
+            (0, 31, Value::Integer(5), 2),
+        ]);
+        let mut properties = LogicalProperties::default();
+        properties.cte_references.insert(CteReferenceDomain {
+            cte_index: 7,
+            columns: BTreeMap::from([(CteColumnId(0), ColumnId(40))]),
+        });
+        let reference = memo.create_group(schema(40), properties, GroupCardinality::default());
+        assert_eq!(
+            memo.column_domain(reference, ColumnId(40))
+                .unwrap()
+                .expected(),
+            Some(2)
+        );
+        let value = memo
+            .column_value_domain(reference, ColumnId(40))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.statistics().min_value(), Some(Value::Integer(5)));
+        assert_eq!(value.statistics().max_value(), Some(Value::Integer(5)));
+    }
+}
+
+#[test]
 fn column_domain_expected_is_a_ranking_point_inside_the_proof_hull() {
     let domain = GroupColumnDomain::new(Some(2), None)
         .unwrap()
@@ -881,6 +956,80 @@ fn column_domain_expected_is_a_ranking_point_inside_the_proof_hull() {
     // estimate and must not be fabricated from the hull midpoint.
     let bounded = GroupColumnDomain::new(Some(2), Some(8)).unwrap();
     assert_eq!(bounded.guaranteed_upper, Some(8));
+}
+
+#[test]
+fn cte_column_registry_rolls_back_types_and_rejects_invalid_mapping_atomically() {
+    use paro_common::types::LogicalType;
+
+    let mut memo = Memo::new(SearchBudget::default());
+    let first = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.register_cte_producer(7, first, BTreeMap::from([(CteColumnId(0), ColumnId(1))]))
+        .unwrap();
+    let checkpoint = memo.transformation_savepoint();
+    let text_column = ColumnDesc {
+        id: ColumnId(2),
+        logical_type: LogicalType::Varchar,
+        nullable: false,
+        origin: ColumnOrigin::Derived {
+            key: Fingerprint(2),
+        },
+        visibility: ColumnVisibility::Visible,
+        name_hint: None,
+    };
+    let second = memo.create_group(
+        GroupSchema::new(vec![text_column]).unwrap(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    assert!(memo
+        .register_cte_producer(7, second, BTreeMap::from([(CteColumnId(0), ColumnId(2))]))
+        .is_err());
+    assert_eq!(memo.cte_producers[&7].len(), 1);
+    memo.register_cte_producer(7, second, BTreeMap::from([(CteColumnId(1), ColumnId(2))]))
+        .unwrap();
+    assert!(memo.cte_column_types.contains_key(&(7, CteColumnId(1))));
+    memo.rollback_transformation(checkpoint).unwrap();
+    assert_eq!(memo.cte_producers[&7].len(), 1);
+    assert!(!memo.cte_column_types.contains_key(&(7, CteColumnId(1))));
+    memo.register_cte_producer(7, first, BTreeMap::from([(CteColumnId(1), ColumnId(1))]))
+        .unwrap();
+}
+
+#[test]
+fn stale_cte_value_statistics_are_not_a_compilation_error_or_a_proof() {
+    use paro_common::runtime_value::Value;
+    use paro_planner::operator::bound_reference::BoundColumnValues;
+    use paro_storage::statistics::BaseStatistics;
+
+    let mut memo = Memo::new(SearchBudget::default());
+    let mut producer_properties = LogicalProperties::default();
+    producer_properties.column_values.insert(
+        ColumnId(1),
+        BoundColumnValues::new(BaseStatistics::from_constant(&Value::Varchar(
+            "stale".to_string(),
+        )))
+        .unwrap(),
+    );
+    let producer = memo.create_group(schema(1), producer_properties, GroupCardinality::default());
+    memo.register_cte_producer(7, producer, BTreeMap::from([(CteColumnId(0), ColumnId(1))]))
+        .unwrap();
+    let mut reference_properties = LogicalProperties::default();
+    reference_properties
+        .cte_references
+        .insert(CteReferenceDomain {
+            cte_index: 7,
+            columns: BTreeMap::from([(CteColumnId(0), ColumnId(2))]),
+        });
+    let reference = memo.create_group(schema(2), reference_properties, GroupCardinality::default());
+    assert!(memo
+        .column_value_domain(reference, ColumnId(2))
+        .unwrap()
+        .is_none());
 }
 
 #[test]

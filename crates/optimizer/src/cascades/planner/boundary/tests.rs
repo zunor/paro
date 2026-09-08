@@ -436,13 +436,18 @@ fn cte_registry_is_observed_even_before_a_producer_exists_and_rolls_back() {
         .cte_references
         .insert(CteReferenceDomain {
             cte_index: 7,
-            columns: Box::new([column]),
+            columns: BTreeMap::from([(paro_planner::operator::cte::CteColumnId(0), column)]),
         });
     let read = PatternRead::facts_from_group(&input.memo, input.root).unwrap();
     let savepoint = input.memo.transformation_savepoint();
     input
         .memo
-        .register_cte_producer(7, input.root, Box::new([column]));
+        .register_cte_producer(
+            7,
+            input.root,
+            BTreeMap::from([(paro_planner::operator::cte::CteColumnId(0), column)]),
+        )
+        .unwrap();
     assert!(!read.is_current(&input.memo).unwrap());
     assert_eq!(input.memo.take_changed_cte_readers(), vec![input.root]);
     input.memo.rollback_transformation(savepoint).unwrap();

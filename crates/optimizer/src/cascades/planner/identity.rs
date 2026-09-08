@@ -209,6 +209,10 @@ fn query_operator_identity_inner<Child>(
         }
         LogicalOperator::MaterializedCTE(cte) => {
             fingerprint.write_u64(cte.cte_index as u64);
+            fingerprint.write_u64(cte.output_columns.len() as u64);
+            for column in &cte.output_columns {
+                fingerprint.write_u64(column.definition.0 as u64);
+            }
             fingerprint.write_u64(match cte.materialized {
                 paro_planner::binder::ir::CTEMaterialize::Default => 0,
                 paro_planner::binder::ir::CTEMaterialize::Materialized => 1,
@@ -222,6 +226,10 @@ fn query_operator_identity_inner<Child>(
         }
         LogicalOperator::CTERef(cte) => {
             fingerprint.write_u64(cte.cte_index as u64);
+            fingerprint.write_u64(cte.definition_columns.len() as u64);
+            for column in &cte.definition_columns {
+                fingerprint.write_u64(column.0 as u64);
+            }
         }
         LogicalOperator::TableFunctionGet(function) => {
             encode_table_function(&mut fingerprint, function);

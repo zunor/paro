@@ -53,7 +53,7 @@ child_links!(CopyTo {
 child_links!(MaterializedCTE {
     required [cte_query, child]
     optional []
-    payload [cte_index, cte_name, column_names, column_types, materialized, ref_count]
+    payload [cte_index, cte_name, column_names, column_types, output_columns, materialized, ref_count]
 });
 
 child_links!(RecursiveCTE {

@@ -7,7 +7,7 @@ optimization in this delivery.
 ## Deliverables
 
 - [ ] Reproducers and fresh-process cold planning evidence collector/gate.
-- [ ] Explicit CTE definition-column correspondence for all domain facts.
+- [x] Explicit CTE definition-column correspondence for all domain facts.
 - [x] Single-writer session storage; alternatives hold references, not COW arenas.
 - [ ] Verified incumbent before optional search; time, work, memory, cancellation
       have explicit completion/exit contracts.
@@ -40,3 +40,11 @@ exchange `PlanIndex` values. `absorb`/`adopt_or_absorb` have been removed. Seven
 arena tests and 37 transformation tests pass; the shared-prefix test retains
 4,096 alternative roots and verifies exactly one appended slot per alternative.
 This is an ownership/work-complexity result, not a post-change Q11 timing claim.
+
+CTE domains use `CteColumnId` and an explicit definition-to-output map on both
+producers and references. Pruning/remapping preserves that map. Publication
+checks schema types; mismatched advisory value statistics return no evidence.
+Type lookup is indexed, and registry rollback uses insertion cursors rather
+than copying all producers on each rule attempt. Seventeen CTE unit tests pass.
+The new SQL regression retains `SUM(a-b)` with asymmetric NULL inputs and four
+references to a UNION producer; its complete result agrees with DuckDB.

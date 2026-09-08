@@ -885,6 +885,13 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 let mut cte_query_optimizer =
                     RemoveUnusedColumns::new(self.binder, self.session, true);
                 cte_query_optimizer.visit_logical_plan(&mut cte.cte_query);
+                for replacement in &cte_query_optimizer.replacements {
+                    for column in &mut cte.output_columns {
+                        if column.binding == replacement.old_binding {
+                            column.binding = replacement.new_binding;
+                        }
+                    }
+                }
 
                 // Consumer-side pruning still follows the parent demand.
                 let mut child_optimizer =

@@ -268,14 +268,15 @@ pub(super) fn stage_transformed_expression(
         if let LogicalOperator::CTERef(reference) = &semantic_plan.operator {
             logical_properties
                 .cte_references
-                .insert(CteReferenceDomain {
-                    cte_index: reference.cte_index,
-                    columns: output_columns.clone().into_boxed_slice(),
-                });
+                .insert(cte_reference_domain(reference, &output_columns)?);
         }
         if let LogicalOperator::MaterializedCTE(cte) = &semantic_plan.operator {
             if let Some(producer) = child_states.first() {
-                memo.register_cte_producer(cte.cte_index, producer.group, producer.columns.clone());
+                memo.register_cte_producer(
+                    cte.cte_index,
+                    producer.group,
+                    cte_producer_columns(cte, producer.group, memo, &state.binding_ids)?,
+                )?;
             }
         }
         let output_rows_hard_upper = logical_properties.maximum_cardinality;

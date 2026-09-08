@@ -5,8 +5,20 @@
 
 use paro_common::types::LogicalType;
 
+use super::ColumnBinding;
 use crate::binder::ir::CTEMaterialize;
 use crate::plan::OwnedLogicalPlan;
+
+/// Column identity inside a lexical CTE definition/domain. Unlike an output
+/// slot this identity survives pruning and reordering of a producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CteColumnId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CteOutputColumn {
+    pub definition: CteColumnId,
+    pub binding: ColumnBinding,
+}
 
 /// Non-recursive materialized CTE wrapper.
 #[derive(Debug, Clone)]
@@ -15,6 +27,9 @@ pub struct MaterializedCTE<Child = Box<OwnedLogicalPlan>> {
     pub cte_name: String,
     pub column_names: Vec<String>,
     pub column_types: Vec<LogicalType>,
+    /// Explicit definition-to-producer correspondence; never reconstruct it
+    /// from the compacted producer's output ordinal.
+    pub output_columns: Vec<CteOutputColumn>,
     pub materialized: CTEMaterialize,
     pub ref_count: usize,
     pub cte_query: Child,
@@ -35,11 +50,21 @@ impl MaterializedCTE {
             values.names.clone_from(&column_names);
             values.relation_alias = Some(cte_name.clone());
         }
+        let output_columns = cte_query
+            .get_column_bindings()
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, binding)| CteOutputColumn {
+                definition: CteColumnId(ordinal),
+                binding,
+            })
+            .collect();
         Self {
             cte_index,
             cte_name,
             column_names,
             column_types,
+            output_columns,
             materialized,
             ref_count: 0,
             cte_query: Box::new(cte_query),
@@ -86,6 +111,7 @@ pub struct CTERef {
     pub relation_alias: String,
     pub column_names: Vec<String>,
     pub column_types: Vec<LogicalType>,
+    pub definition_columns: Vec<CteColumnId>,
 }
 
 impl CTERef {
@@ -96,12 +122,14 @@ impl CTERef {
         column_names: Vec<String>,
         column_types: Vec<LogicalType>,
     ) -> Self {
+        let definition_columns = (0..column_types.len()).map(CteColumnId).collect();
         Self {
             cte_index,
             table_index,
             relation_alias,
             column_names,
             column_types,
+            definition_columns,
         }
     }
 

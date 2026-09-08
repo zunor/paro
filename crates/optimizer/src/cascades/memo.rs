@@ -21,6 +21,7 @@ use super::properties::{PropertyInterner, ProvidedProperties, RequiredProperties
 use super::region::{JointCostProof, RegionFacet, RegionForest};
 use super::rules::CostComposition;
 use crate::physical::ObjectiveProfile;
+use paro_planner::operator::cte::CteColumnId;
 use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
 use std::sync::{Arc, OnceLock};
 
@@ -35,7 +36,7 @@ pub struct LogicalProperties {
     pub column_domains: BTreeMap<super::ids::ColumnId, GroupColumnDomain>,
     pub column_values:
         BTreeMap<super::ids::ColumnId, paro_planner::operator::bound_reference::BoundColumnValues>,
-    /// Positional bridges from CTE scan-local ColumnIds to producer groups.
+    /// Definition-column bridges from scan-local columns to producer groups.
     /// Equivalent references may originate from different CTE identities, so
     /// this is a canonical set rather than an insertion-order-sensitive slot.
     /// No physical winner or materialized payload is captured here.
@@ -45,13 +46,13 @@ pub struct LogicalProperties {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CteReferenceDomain {
     pub cte_index: usize,
-    pub columns: Box<[super::ids::ColumnId]>,
+    pub columns: BTreeMap<CteColumnId, super::ids::ColumnId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CteProducerDomain {
     group: GroupId,
-    columns: Box<[super::ids::ColumnId]>,
+    columns: BTreeMap<CteColumnId, super::ids::ColumnId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,7 +269,8 @@ impl LogicalProperties {
         for reference in &self.cte_references {
             fingerprint.write_u64(reference.cte_index as u64);
             fingerprint.write_u64(reference.columns.len() as u64);
-            for column in &reference.columns {
+            for (definition, column) in &reference.columns {
+                fingerprint.write_u64(definition.0 as u64);
                 fingerprint.write_u64(column.0 as u64);
             }
         }
@@ -889,6 +891,9 @@ pub struct Memo {
     global_ledger: SearchLedger,
     optional_group_budget_sealed: bool,
     cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
+    cte_producer_insertions: Vec<(usize, CteProducerDomain)>,
+    cte_column_types: BTreeMap<(usize, CteColumnId), paro_common::types::LogicalType>,
+    cte_type_insertions: Vec<(usize, CteColumnId)>,
     changed_cte_domains: BTreeSet<usize>,
     failed_search_obligations: BTreeSet<super::budget::SearchObligation>,
 }
@@ -906,7 +911,8 @@ pub(crate) struct TransformationSavepoint {
     logical_expression_count: usize,
     regions: RegionForest,
     global_ledger: SearchLedger,
-    cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
+    cte_producer_insertions: usize,
+    cte_type_insertions: usize,
     changed_cte_domains: BTreeSet<usize>,
 }
 
@@ -937,6 +943,9 @@ impl Memo {
             global_ledger,
             optional_group_budget_sealed: false,
             cte_producers: BTreeMap::new(),
+            cte_producer_insertions: Vec::new(),
+            cte_column_types: BTreeMap::new(),
+            cte_type_insertions: Vec::new(),
             changed_cte_domains: BTreeSet::new(),
             failed_search_obligations: BTreeSet::new(),
         }
@@ -954,17 +963,50 @@ impl Memo {
         &mut self,
         cte_index: usize,
         group: GroupId,
-        columns: Box<[super::ids::ColumnId]>,
-    ) {
+        columns: BTreeMap<CteColumnId, super::ids::ColumnId>,
+    ) -> Result<()> {
         let group = self.canonical_group(group);
+        let schema = &self
+            .group(group)
+            .ok_or_else(|| paro_error::internal("CTE producer group is missing"))?
+            .schema;
+        let mut new_types = Vec::new();
+        for (definition, column) in &columns {
+            let declared = schema
+                .columns()
+                .iter()
+                .find(|entry| entry.id == *column)
+                .ok_or_else(|| {
+                    paro_error::internal("CTE mapping names a column absent from its producer")
+                })?;
+            let key = (cte_index, *definition);
+            if let Some(previous) = self.cte_column_types.get(&key) {
+                if previous != &declared.logical_type {
+                    return Err(paro_error::internal(
+                        "CTE definition column changes type across producers",
+                    ));
+                }
+            } else {
+                new_types.push((key, declared.logical_type.clone()));
+            }
+        }
+        // Publication is atomic: validate every correspondence before changing
+        // the registry. Savepoints retain journal cursors, never registry copies.
+        for (key, logical_type) in new_types {
+            self.cte_column_types.insert(key, logical_type);
+            self.cte_type_insertions.push(key);
+        }
+        let producer = CteProducerDomain { group, columns };
         if self
             .cte_producers
             .entry(cte_index)
             .or_default()
-            .insert(CteProducerDomain { group, columns })
+            .insert(producer.clone())
         {
+            self.cte_producer_insertions.push((cte_index, producer));
             self.changed_cte_domains.insert(cte_index);
         }
+        Ok(())
     }
 
     /// Registry changes are facts too: a previously unresolved CTE reader
@@ -1007,7 +1049,8 @@ impl Memo {
             {
                 fingerprint.write_u64(self.canonical_group(producer.group).0 as u64);
                 fingerprint.write_u64(producer.columns.len() as u64);
-                for column in &producer.columns {
+                for (definition, column) in &producer.columns {
+                    fingerprint.write_u64(definition.0 as u64);
                     fingerprint.write_u64(column.0 as u64);
                 }
             }
@@ -1016,7 +1059,7 @@ impl Memo {
     }
 
     /// Resolve a column domain through the relational group, including a CTE
-    /// scan's positional dependency on every equivalent producer expression.
+    /// scan's definition-column dependency on every equivalent producer.
     /// Multiple producer witnesses form an uncertainty hull; none is selected
     /// by a physical winner, so cost search cannot freeze stale payload stats.
     pub(crate) fn column_domain(
@@ -1035,16 +1078,18 @@ impl Memo {
             .cte_references
             .iter()
             .filter_map(|reference| {
-                let ordinal = reference
+                let definition = reference
                     .columns
                     .iter()
-                    .position(|candidate| *candidate == column)?;
+                    .find_map(|(definition, candidate)| {
+                        (*candidate == column).then_some(definition)
+                    })?;
                 self.cte_producers
                     .get(&reference.cte_index)?
                     .iter()
                     .filter_map(|producer| {
                         let producer_group = self.group(self.canonical_group(producer.group))?;
-                        let producer_column = *producer.columns.get(ordinal)?;
+                        let producer_column = *producer.columns.get(definition)?;
                         producer_group
                             .logical_properties
                             .column_domains
@@ -1065,12 +1110,20 @@ impl Memo {
         let Some(group) = self.group(self.canonical_group(id)) else {
             return Ok(None);
         };
+        let Some(declared) = group
+            .schema
+            .columns()
+            .iter()
+            .find(|entry| entry.id == column)
+        else {
+            return Ok(None);
+        };
         let mut values = None;
         for reference in &group.logical_properties.cte_references {
-            let Some(ordinal) = reference
+            let Some(definition) = reference
                 .columns
                 .iter()
-                .position(|candidate| *candidate == column)
+                .find_map(|(definition, candidate)| (*candidate == column).then_some(definition))
             else {
                 continue;
             };
@@ -1080,7 +1133,7 @@ impl Memo {
                 .into_iter()
                 .flatten()
             {
-                let Some(value) = producer.columns.get(ordinal).and_then(|column| {
+                let Some(value) = producer.columns.get(definition).and_then(|column| {
                     self.group(producer.group)?
                         .logical_properties
                         .column_values
@@ -1088,13 +1141,26 @@ impl Memo {
                 }) else {
                     continue;
                 };
+                // Statistics are advisory. Invalid/stale evidence cannot
+                // fail compilation or authorize a value-domain rewrite. The
+                // explicit column mapping itself is checked at publication.
+                if value.statistics().get_type() != &declared.logical_type {
+                    return Ok(None);
+                }
                 values = Some(match values {
                     None => value.clone(),
                     Some(previous) => value.hull(&previous)?,
                 });
             }
         }
-        Ok(values.or_else(|| group.logical_properties.column_values.get(&column).cloned()))
+        Ok(values.or_else(|| {
+            group
+                .logical_properties
+                .column_values
+                .get(&column)
+                .filter(|value| value.statistics().get_type() == &declared.logical_type)
+                .cloned()
+        }))
     }
 
     pub fn set_regions(&mut self, regions: RegionForest) {
@@ -1110,7 +1176,8 @@ impl Memo {
             logical_expression_count: self.logical_exprs.len(),
             regions: self.regions.clone(),
             global_ledger: self.global_ledger.clone(),
-            cte_producers: self.cte_producers.clone(),
+            cte_producer_insertions: self.cte_producer_insertions.len(),
+            cte_type_insertions: self.cte_type_insertions.len(),
             changed_cte_domains: self.changed_cte_domains.clone(),
         }
     }
@@ -1122,6 +1189,8 @@ impl Memo {
         if savepoint.group_count > self.groups.len()
             || savepoint.logical_expression_count > self.logical_exprs.len()
             || savepoint.logical_expression_count > self.logical_owners.len()
+            || savepoint.cte_producer_insertions > self.cte_producer_insertions.len()
+            || savepoint.cte_type_insertions > self.cte_type_insertions.len()
         {
             return Err(paro_error::internal(
                 "transformation rollback exceeds the current Memo generation",
@@ -1187,7 +1256,23 @@ impl Memo {
         self.regions = savepoint.regions;
         self.global_ledger
             .rollback_to_preserving_exhaustion(savepoint.global_ledger);
-        self.cte_producers = savepoint.cte_producers;
+        for (domain, producer) in self
+            .cte_producer_insertions
+            .drain(savepoint.cte_producer_insertions..)
+        {
+            if let Some(producers) = self.cte_producers.get_mut(&domain) {
+                producers.remove(&producer);
+                if producers.is_empty() {
+                    self.cte_producers.remove(&domain);
+                }
+            }
+        }
+        for key in self
+            .cte_type_insertions
+            .drain(savepoint.cte_type_insertions..)
+        {
+            self.cte_column_types.remove(&key);
+        }
         self.changed_cte_domains = savepoint.changed_cte_domains;
         Ok(())
     }
