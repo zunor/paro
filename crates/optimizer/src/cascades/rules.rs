@@ -352,15 +352,15 @@ impl<'a> TransformContext<'a> {
                 "facts must be read before transformation publication",
             ));
         }
-        let group = self
+        let ledger = self
             .memo
-            .group_mut(self.group)
+            .group_ledger_mut(self.group)
             .ok_or_else(|| paro_error::internal("fact reader lost its owner"))?;
         let mut event = StableFingerprintBuilder::default();
         event.write_bytes(b"paro.memo.fact-read-work.v1");
         event.write_u64(self.group.0 as u64);
-        event.write_u64(group.ledger.consumed(dimension) as u64);
-        Ok(group.ledger.admit_optional_units(
+        event.write_u64(ledger.consumed(dimension) as u64);
+        Ok(ledger.admit_optional_units(
             dimension,
             event.finish(),
             u32::try_from(units).unwrap_or(u32::MAX),

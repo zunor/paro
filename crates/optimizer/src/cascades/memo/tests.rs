@@ -60,6 +60,33 @@ fn required() -> RequiredProperties {
 }
 
 #[test]
+fn search_accounting_retains_fact_snapshots_and_savepoints_share_regions() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let logical = memo.group(group).unwrap().logical_fact_fingerprint();
+    let statistics = memo.group(group).unwrap().statistics_snapshot_fingerprint();
+    memo.group_ledger_mut(group)
+        .unwrap()
+        .admit_optional(BudgetDimension::RuleWorkPerGroup, Fingerprint(1));
+    let facts = memo.group(group).unwrap();
+    assert_eq!(facts.logical_fact_fingerprint.get(), Some(&logical));
+    assert_eq!(
+        facts.statistics_snapshot_fingerprint.get(),
+        Some(&statistics)
+    );
+    let checkpoint = memo.transformation_savepoint();
+    assert!(Arc::ptr_eq(&checkpoint.regions, &memo.regions));
+    memo.rollback_transformation(checkpoint).unwrap();
+    let facts = memo.group_mut(group).unwrap();
+    assert!(facts.logical_fact_fingerprint.get().is_none());
+    assert!(facts.statistics_snapshot_fingerprint.get().is_none());
+}
+
+#[test]
 fn rule_history_is_expression_local_and_duplicate_expr_is_deduped() {
     let mut memo = Memo::new(SearchBudget::default());
     let group = memo.create_group(

@@ -910,7 +910,7 @@ pub struct Memo {
     logical_frontier_revision: u64,
     budget: Arc<SearchBudget>,
     calibration: Arc<MachineCalibrationBundle>,
-    regions: RegionForest,
+    regions: Arc<RegionForest>,
     global_ledger: SearchLedger,
     optional_group_budget_sealed: bool,
     cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
@@ -932,8 +932,8 @@ struct WinnerCandidate {
 pub(crate) struct TransformationSavepoint {
     group_count: usize,
     logical_expression_count: usize,
-    regions: RegionForest,
-    global_ledger: SearchLedger,
+    regions: Arc<RegionForest>,
+    global_ledger: super::budget::LedgerCheckpoint,
     cte_producer_insertions: usize,
     cte_type_insertions: usize,
     changed_cte_domains: BTreeSet<usize>,
@@ -965,7 +965,7 @@ impl Memo {
             logical_frontier_revision: 0,
             budget,
             calibration: Arc::new(MachineCalibrationBundle::default()),
-            regions: RegionForest::default(),
+            regions: Arc::default(),
             global_ledger,
             optional_group_budget_sealed: false,
             cte_producers: BTreeMap::new(),
@@ -1222,18 +1222,18 @@ impl Memo {
     }
 
     pub fn set_regions(&mut self, regions: RegionForest) {
-        self.regions = regions;
+        self.regions = Arc::new(regions);
     }
 
     /// Capture the append-only relational state available to a transformation.
     /// Physical expressions, winners, and property sets are not writable in
     /// this search phase and therefore are intentionally absent.
-    pub(crate) fn transformation_savepoint(&self) -> TransformationSavepoint {
+    pub(crate) fn transformation_savepoint(&mut self) -> TransformationSavepoint {
         TransformationSavepoint {
             group_count: self.groups.len(),
             logical_expression_count: self.logical_exprs.len(),
             regions: self.regions.clone(),
-            global_ledger: self.global_ledger.clone(),
+            global_ledger: self.global_ledger.checkpoint(),
             cte_producer_insertions: self.cte_producer_insertions.len(),
             cte_type_insertions: self.cte_type_insertions.len(),
             changed_cte_domains: self.changed_cte_domains.clone(),
@@ -1313,7 +1313,7 @@ impl Memo {
         self.parents.truncate(savepoint.group_count);
         self.regions = savepoint.regions;
         self.global_ledger
-            .rollback_to_preserving_exhaustion(savepoint.global_ledger);
+            .rollback_to_preserving_exhaustion(savepoint.global_ledger)?;
         for (domain, producer) in self
             .cte_producer_insertions
             .drain(savepoint.cte_producer_insertions..)
@@ -1437,7 +1437,7 @@ impl Memo {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         regions.dropped_optional_facets = dropped.clone();
-        self.regions = regions;
+        self.regions = Arc::new(regions);
         Ok(dropped)
     }
 
@@ -1544,6 +1544,15 @@ impl Memo {
         let group = self.groups.get_mut(id.index())?;
         group.invalidate_fact_fingerprints();
         Some(group)
+    }
+
+    /// Search accounting is not logical evidence. Mutating a ledger must not
+    /// invalidate facts or make subscribed transformations re-read them.
+    pub(crate) fn group_ledger_mut(&mut self, id: GroupId) -> Option<&mut SearchLedger> {
+        let id = self.canonical_group(id);
+        self.groups
+            .get_mut(id.index())
+            .map(|group| &mut group.ledger)
     }
 
     /// Resolve a group's canonical cardinality recipe and clamp it by every

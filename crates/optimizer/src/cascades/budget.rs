@@ -283,12 +283,65 @@ pub enum BudgetDecision {
 
 /// Optional budget consumption is keyed by stable semantic events. Replaying a
 /// task or merging groups cannot manufacture fresh credit.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SearchLedger {
     budget: Arc<SearchBudget>,
     limit_overrides: BTreeMap<BudgetDimension, u32>,
     consumed: BTreeMap<BudgetDimension, BudgetUsage>,
     exhaustion_events: BTreeSet<(BudgetDimension, Fingerprint)>,
+    /// Journaling starts only when a transactional owner takes a checkpoint.
+    /// Per-group work ledgers are not rolled back and allocate no journal.
+    journal: Option<LedgerJournal>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LedgerCheckpoint {
+    owner: u64,
+    length: usize,
+    last_revision: u64,
+}
+
+#[derive(Debug)]
+enum LedgerChange {
+    Reservation {
+        dimension: BudgetDimension,
+        event: Fingerprint,
+        previous: Option<u32>,
+        units: u32,
+    },
+    Limit {
+        dimension: BudgetDimension,
+        previous: Option<u32>,
+    },
+}
+
+#[derive(Debug)]
+struct LedgerJournal {
+    owner: u64,
+    revision: u64,
+    changes: Vec<(u64, LedgerChange)>,
+}
+
+impl LedgerJournal {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+        Self {
+            owner: NEXT_OWNER
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("search ledger identity space exhausted"),
+            revision: 0,
+            changes: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, change: LedgerChange) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("search ledger revision space exhausted");
+        self.changes.push((self.revision, change));
+    }
 }
 
 /// Per-dimension reservations with semantic idempotence and O(1) admission.
@@ -309,6 +362,7 @@ impl SearchLedger {
             limit_overrides: BTreeMap::new(),
             consumed: BTreeMap::new(),
             exhaustion_events: BTreeSet::new(),
+            journal: None,
         }
     }
 
@@ -350,6 +404,14 @@ impl SearchLedger {
             self.exhaustion_events.insert((dimension, event));
             return BudgetDecision::Exhausted;
         }
+        if let Some(journal) = &mut self.journal {
+            journal.record(LedgerChange::Reservation {
+                dimension,
+                event,
+                previous: usage.events.get(&event).copied(),
+                units: usage.units,
+            });
+        }
         usage.events.insert(event, units);
         usage.units = usage.units.saturating_add(additional);
         BudgetDecision::Allowed
@@ -362,6 +424,16 @@ impl SearchLedger {
     }
 
     pub fn set_limit(&mut self, dimension: BudgetDimension, limit: u32) {
+        let previous = self.limit_overrides.get(&dimension).copied();
+        if previous == Some(limit) {
+            return;
+        }
+        if let Some(journal) = &mut self.journal {
+            journal.record(LedgerChange::Limit {
+                dimension,
+                previous,
+            });
+        }
         self.limit_overrides.insert(dimension, limit);
     }
 
@@ -392,6 +464,14 @@ impl SearchLedger {
             let Some(units) = usage.events.remove(&event) else {
                 return false;
             };
+            if let Some(journal) = &mut self.journal {
+                journal.record(LedgerChange::Reservation {
+                    dimension,
+                    event,
+                    previous: Some(units),
+                    units: usage.units,
+                });
+            }
             usage.units = usage.units.saturating_sub(units);
             true
         })
@@ -403,16 +483,26 @@ impl SearchLedger {
             for (&event, &units) in &usage.events {
                 let existing = target.events.entry(event).or_default();
                 if units > *existing {
+                    if let Some(journal) = &mut self.journal {
+                        journal.record(LedgerChange::Reservation {
+                            dimension,
+                            event,
+                            previous: (*existing > 0).then_some(*existing),
+                            units: target.units,
+                        });
+                    }
                     target.units = target.units.saturating_add(units - *existing);
                     *existing = units;
                 }
             }
         }
         for (&dimension, &limit) in &other.limit_overrides {
-            self.limit_overrides
-                .entry(dimension)
-                .and_modify(|existing| *existing = (*existing).min(limit))
-                .or_insert(limit);
+            self.set_limit(
+                dimension,
+                self.limit_overrides
+                    .get(&dimension)
+                    .map_or(limit, |existing| (*existing).min(limit)),
+            );
         }
         self.exhaustion_events
             .extend(other.exhaustion_events.iter().copied());
@@ -420,11 +510,65 @@ impl SearchLedger {
 
     /// Restore reservations to a transactional savepoint while retaining
     /// evidence that the abandoned attempt reached a search boundary.
-    pub fn rollback_to_preserving_exhaustion(&mut self, mut savepoint: Self) {
-        savepoint
-            .exhaustion_events
-            .extend(self.exhaustion_events.iter().copied());
-        *self = savepoint;
+    pub(crate) fn checkpoint(&mut self) -> LedgerCheckpoint {
+        let journal = self.journal.get_or_insert_with(LedgerJournal::new);
+        LedgerCheckpoint {
+            owner: journal.owner,
+            length: journal.changes.len(),
+            last_revision: journal.changes.last().map_or(0, |(revision, _)| *revision),
+        }
+    }
+
+    pub(crate) fn rollback_to_preserving_exhaustion(
+        &mut self,
+        savepoint: LedgerCheckpoint,
+    ) -> paro_common::error::Result<()> {
+        let valid = self.journal.as_ref().is_some_and(|journal| {
+            journal.owner == savepoint.owner
+                && journal.changes.len() >= savepoint.length
+                && (savepoint.length == 0
+                    || journal.changes[savepoint.length - 1].0 == savepoint.last_revision)
+        });
+        if !valid {
+            return Err(paro_common::error::internal(
+                "stale or foreign search ledger checkpoint",
+            ));
+        }
+        let journal = self.journal.as_mut().expect("validated ledger journal");
+        while journal.changes.len() > savepoint.length {
+            let (_, change) = journal.changes.pop().expect("journal length checked");
+            match change {
+                LedgerChange::Reservation {
+                    dimension,
+                    event,
+                    previous,
+                    units,
+                } => {
+                    let usage = self.consumed.entry(dimension).or_default();
+                    usage.units = units;
+                    match previous {
+                        Some(value) => {
+                            usage.events.insert(event, value);
+                        }
+                        None => {
+                            usage.events.remove(&event);
+                        }
+                    }
+                }
+                LedgerChange::Limit {
+                    dimension,
+                    previous,
+                } => match previous {
+                    Some(limit) => {
+                        self.limit_overrides.insert(dimension, limit);
+                    }
+                    None => {
+                        self.limit_overrides.remove(&dimension);
+                    }
+                },
+            }
+        }
+        Ok(())
     }
 
     pub fn exhaustion_events(&self) -> impl Iterator<Item = &(BudgetDimension, Fingerprint)> {
@@ -552,5 +696,89 @@ mod tests {
         assert!(!budget.transformation_enabled(super::super::rules::LATE_PAYLOAD_FETCH_RULE));
         assert!(budget.disable_transformations_by_name("10011").is_err());
         assert!(budget.disable_transformations_by_name("missing").is_err());
+    }
+
+    #[test]
+    fn nested_ledger_checkpoints_restore_changes_not_exhaustion() {
+        let dimension = BudgetDimension::RuleWorkPerGroup;
+        let mut ledger = SearchLedger::new(SearchBudget::default());
+        ledger.set_limit(dimension, 8);
+        ledger.admit_optional_units(dimension, Fingerprint(1), 2);
+        assert!(ledger.journal.is_none());
+        let outer = ledger.checkpoint();
+        ledger.admit_optional_units(dimension, Fingerprint(1), 4);
+        let inner = ledger.checkpoint();
+        ledger.release_optional_reservation(dimension, Fingerprint(1));
+        ledger.admit_optional_units(dimension, Fingerprint(2), 8);
+        assert_eq!(
+            ledger.admit_optional(dimension, Fingerprint(3)),
+            BudgetDecision::Exhausted
+        );
+        ledger.set_limit(dimension, 20);
+        ledger.rollback_to_preserving_exhaustion(inner).unwrap();
+        assert_eq!(ledger.consumed(dimension), 4);
+        assert_eq!(ledger.limit(dimension), Some(8));
+        assert_eq!(ledger.consumed[&dimension].events.len(), 1);
+        assert_eq!(ledger.consumed[&dimension].events[&Fingerprint(1)], 4);
+        ledger.rollback_to_preserving_exhaustion(outer).unwrap();
+        assert_eq!(ledger.consumed(dimension), 2);
+        assert_eq!(ledger.consumed[&dimension].events[&Fingerprint(1)], 2);
+        assert_eq!(ledger.exhaustion_events().count(), 1);
+    }
+
+    #[test]
+    fn ledger_checkpoint_cannot_alias_a_rolled_back_branch_or_another_ledger() {
+        let dimension = BudgetDimension::RuleWorkPerGroup;
+        let mut ledger = SearchLedger::new(SearchBudget::default());
+        let root = ledger.checkpoint();
+        ledger.admit_optional(dimension, Fingerprint(1));
+        let abandoned = ledger.checkpoint();
+        ledger.rollback_to_preserving_exhaustion(root).unwrap();
+        ledger.admit_optional(dimension, Fingerprint(2));
+        assert!(ledger.rollback_to_preserving_exhaustion(abandoned).is_err());
+        assert_eq!(ledger.consumed(dimension), 1);
+        assert!(ledger.consumed[&dimension]
+            .events
+            .contains_key(&Fingerprint(2)));
+
+        let mut other = SearchLedger::new(SearchBudget::default());
+        let foreign = other.checkpoint();
+        assert!(ledger.rollback_to_preserving_exhaustion(foreign).is_err());
+        ledger.rollback_to_preserving_exhaustion(root).unwrap();
+    }
+
+    #[test]
+    fn ledger_merge_is_transactional_and_checkpoints_do_not_copy_the_prefix() {
+        let dimension = BudgetDimension::RuleWorkPerGroup;
+        let mut ledger = SearchLedger::new(SearchBudget::default());
+        ledger.set_limit(dimension, 10_000);
+        let origin = ledger.checkpoint();
+        for event in 0..1_000 {
+            ledger.admit_optional(dimension, Fingerprint(event));
+        }
+        for _ in 0..1_000 {
+            assert_eq!(ledger.checkpoint().length, 1_000);
+        }
+        let checkpoint = ledger.checkpoint();
+        let mut other = SearchLedger::new(SearchBudget::default());
+        other.set_limit(dimension, 2_000);
+        other.admit_optional_units(dimension, Fingerprint(0), 3);
+        other.admit_optional_units(dimension, Fingerprint(1_001), 5);
+        other.record_budget_limited(dimension, Fingerprint(2_000));
+        ledger.merge_from(&other);
+        assert_eq!(ledger.consumed(dimension), 1_007);
+        assert_eq!(ledger.limit(dimension), Some(2_000));
+        ledger
+            .rollback_to_preserving_exhaustion(checkpoint)
+            .unwrap();
+        assert_eq!(ledger.consumed(dimension), 1_000);
+        assert_eq!(ledger.limit(dimension), Some(10_000));
+        assert_eq!(ledger.consumed[&dimension].events[&Fingerprint(0)], 1);
+        assert!(!ledger.consumed[&dimension]
+            .events
+            .contains_key(&Fingerprint(1_001)));
+        assert_eq!(ledger.exhaustion_events().count(), 1);
+        ledger.rollback_to_preserving_exhaustion(origin).unwrap();
+        assert_eq!(ledger.consumed(dimension), 0);
     }
 }

@@ -517,9 +517,8 @@ impl CascadesEngine {
                 witness.write_u64(expression.index() as u64);
                 witness.write_u64(rule.0 as u64);
                 self.memo
-                    .group_mut(group)
+                    .group_ledger_mut(group)
                     .ok_or_else(|| paro_error::internal("pattern owner disappeared"))?
-                    .ledger
                     .record_budget_limited(dimension, witness.finish());
                 continue;
             }
@@ -589,9 +588,8 @@ impl CascadesEngine {
                 witness.write_u64(enumerated_bindings as u64);
                 witness.write_u64(omitted_at_least as u64);
                 self.memo
-                    .group_mut(group)
+                    .group_ledger_mut(group)
                     .ok_or_else(|| paro_error::internal("pattern owner group disappeared"))?
-                    .ledger
                     .record_budget_limited(binding_set.work_dimension, witness.finish());
             }
             // Enumeration work belongs to the observed pattern frontier, not
@@ -732,9 +730,8 @@ impl CascadesEngine {
                 let event = transformation_event(group, expression, rule, dependency_version);
                 let admitted = self
                     .memo
-                    .group_mut(group)
+                    .group_ledger_mut(group)
                     .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                    .ledger
                     .admit_optional(fire_dimension, event);
                 if admitted == BudgetDecision::Exhausted {
                     *self.rule_budget_exhaustions.entry(rule).or_default() += 1;
@@ -769,9 +766,8 @@ impl CascadesEngine {
                     );
                     let admitted = self
                         .memo
-                        .group_mut(group)
+                        .group_ledger_mut(group)
                         .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                        .ledger
                         .admit_optional(output_dimension, event);
                     if admitted == BudgetDecision::Exhausted {
                         output_budget_limited = true;
@@ -1489,11 +1485,10 @@ impl CascadesEngine {
                         "optional physical candidate rejected by its region budget"
                     );
                     self.memo
-                        .group_mut(group)
+                        .group_ledger_mut(group)
                         .ok_or_else(|| {
                             paro_error::internal("unknown group during region admission")
                         })?
-                        .ledger
                         .record_budget_limited(
                             BudgetDimension::CompositeRegionCandidate,
                             candidate.stable_event(goal),
@@ -1504,9 +1499,8 @@ impl CascadesEngine {
             }
             let decision = self
                 .memo
-                .group_mut(group)
+                .group_ledger_mut(group)
                 .ok_or_else(|| paro_error::internal("unknown group during physical admission"))?
-                .ledger
                 .admit_optional(
                     BudgetDimension::PhysicalExprPerGroup,
                     candidate.stable_event(goal),
@@ -1675,9 +1669,8 @@ impl CascadesEngine {
                 witness.write_u64(first_omitted as u64);
                 witness.write_u64(omitted_at_least as u64);
                 self.memo
-                    .group_mut(group)
+                    .group_ledger_mut(group)
                     .ok_or_else(|| paro_error::internal("child-product owner disappeared"))?
-                    .ledger
                     .record_budget_limited(
                         BudgetDimension::ChildFrontierCombination,
                         witness.finish(),
@@ -1706,9 +1699,8 @@ impl CascadesEngine {
                     );
                     if self
                         .memo
-                        .group_mut(group)
+                        .group_ledger_mut(group)
                         .ok_or_else(|| paro_error::internal("child-combination owner disappeared"))?
-                        .ledger
                         .admit_optional(BudgetDimension::ChildFrontierCombination, event)
                         == BudgetDecision::Exhausted
                     {
@@ -1962,10 +1954,9 @@ fn release_transformation_output_reservations(
     events: &[Fingerprint],
     dimension: BudgetDimension,
 ) -> Result<()> {
-    let ledger = &mut memo
-        .group_mut(group)
-        .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-        .ledger;
+    let ledger = memo
+        .group_ledger_mut(group)
+        .ok_or_else(|| paro_error::internal("rule task references unknown group"))?;
     for event in events {
         ledger.release_optional_reservation(dimension, *event);
     }
@@ -2793,9 +2784,8 @@ fn admit_transformation_work(
     event.write_u64(rule.0 as u64);
     event.write_fingerprint(dependency_version);
     Ok(memo
-        .group_mut(target)
+        .group_ledger_mut(target)
         .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
-        .ledger
         .admit_optional_units(work_dimension, event.finish(), units)
         != BudgetDecision::Exhausted)
 }
