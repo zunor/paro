@@ -1250,9 +1250,7 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
             result_guarantee: crate::physical::requirements::ResultGuarantee::Exact,
         },
         cost: crate::physical::SearchCost::ZERO,
-        grant: crate::physical::PhysicalGrantContract::Invariant(
-            crate::physical::identity::AdmissibleGrantSetId(0),
-        ),
+        grant: crate::physical::PhysicalGrantContract::Invariant,
         origin: crate::physical::PlanOrigin::SpecializedRegion(
             crate::physical::identity::Fingerprint(88),
         ),
@@ -1345,9 +1343,7 @@ fn build_left_runtime_filter_keeps_artifact_ownership_on_the_hash_join() {
             result_guarantee: crate::physical::requirements::ResultGuarantee::Exact,
         },
         cost: crate::physical::SearchCost::ZERO,
-        grant: crate::physical::PhysicalGrantContract::Invariant(
-            crate::physical::identity::AdmissibleGrantSetId(0),
-        ),
+        grant: crate::physical::PhysicalGrantContract::Invariant,
         origin: crate::physical::PlanOrigin::SpecializedRegion(owner),
         goal_fingerprint: artifact,
         physical_fingerprint: artifact,

@@ -4,6 +4,7 @@
 //! Arena-backed immutable physical plan.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use super::children::{PlanChildren, PlanChildrenArena};
@@ -12,10 +13,11 @@ use super::edges::PhysicalEdgeArena;
 use super::explain::types::{
     ExplainDoc, ExplainNode, ExplainProperty, ExplainValue, EXPLAIN_FORMAT_VERSION,
 };
+use super::identity::{Fingerprint, StableFingerprintBuilder};
 use super::ids::PhysicalPlanNodeId;
 use super::node::PhysicalPlanNode;
 use super::portfolio::ExecutionResourceContract;
-use super::properties::PlanPropertyMap;
+use super::properties::{PhysicalGrantContract, PlanPropertyMap};
 use super::specs::{AggregateSpec, NestedLoopJoinSpec, PhysicalNodeKind, SearchSourceSpec};
 use paro_catalog::entry::{StandardEntry, TableCatalogEntry};
 use paro_planner::expression::{
@@ -103,6 +105,51 @@ impl PhysicalPlan {
 
     pub fn child_ids<'a>(&'a self, children: &'a PlanChildren) -> &'a [PhysicalPlanNodeId] {
         children.as_slice(&self.children)
+    }
+
+    /// Portfolio identity includes the selected implementation's operating
+    /// points, not merely its Memo expression and enforcer shape. Two equal-cost
+    /// sorts can have the same structural fingerprint while being proved for
+    /// different memory classes. Merging those plans would keep only one of
+    /// the proofs and advertise it for both classes.
+    ///
+    /// Admission is the intersection of every node's contract. Canonicalize
+    /// that conjunction independently of arena ids, node order and duplicate
+    /// constraints. Auxiliary producers are included: extraction has already
+    /// compacted the complete executable arena before this method is called.
+    pub(crate) fn portfolio_fingerprint(
+        &self,
+        structural: Fingerprint,
+    ) -> paro_common::error::Result<Fingerprint> {
+        let mut contracts = BTreeSet::new();
+        for node in self.nodes.iter() {
+            let properties = self.properties.get(node.id).ok_or_else(|| {
+                paro_common::error::internal(
+                    "portfolio identity requires every node grant contract",
+                )
+            })?;
+            if properties.grant_contract != PhysicalGrantContract::Invariant {
+                contracts.insert(properties.grant_contract);
+            }
+        }
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_bytes(b"paro.physical.portfolio-admission.v1");
+        fingerprint.write_fingerprint(structural);
+        fingerprint.write_u64(contracts.len() as u64);
+        for contract in contracts {
+            match contract {
+                PhysicalGrantContract::Invariant => {}
+                PhysicalGrantContract::Parallelism { tasks } => {
+                    fingerprint.write_u64(1);
+                    fingerprint.write_u64(u64::from(tasks));
+                }
+                PhysicalGrantContract::Class(class) => {
+                    fingerprint.write_u64(2);
+                    fingerprint.write_u64(u64::from(class.0));
+                }
+            }
+        }
+        Ok(fingerprint.finish())
     }
 
     /// Remove nodes made unreachable by physical rewrites and reassign dense

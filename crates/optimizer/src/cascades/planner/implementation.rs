@@ -88,7 +88,10 @@ pub(super) fn register_implementations(
             force_spill,
         })?;
     }
-    registry.register_implementation(PlannerSearchImplementation { planner_state })?;
+    registry.register_implementation(PlannerSearchImplementation {
+        planner_state,
+        grant_classes,
+    })?;
     Ok(())
 }
 
@@ -123,7 +126,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 }) {
                     GrantDependencyDescriptor::Sensitive
                 } else {
-                    metadata.grant_dependency
+                    implementation_grant_dependency(metadata, metadata.implementations.baseline)
                 }
             })
             .unwrap_or(GrantDependencyDescriptor::Sensitive)
@@ -471,6 +474,7 @@ impl PhysicalImplementation for AlternativeImplementation {
 #[derive(Debug)]
 struct PlannerSearchImplementation {
     planner_state: Arc<RwLock<PlannerTransformState>>,
+    grant_classes: Arc<BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>>,
 }
 
 impl PhysicalImplementation for PlannerSearchImplementation {
@@ -507,7 +511,7 @@ impl PhysicalImplementation for PlannerSearchImplementation {
     fn candidates(
         &self,
         expr: crate::cascades::ids::LogicalExprId,
-        _goal: OptimizationGoal,
+        goal: OptimizationGoal,
         ctx: &ImplementationContext<'_>,
     ) -> Result<Box<[PhysicalCandidate]>> {
         let logical = ctx
@@ -544,10 +548,11 @@ impl PhysicalImplementation for PlannerSearchImplementation {
             task_supply: TaskSupplyContract::Serial,
             cost_composition: CostComposition::Sequential,
             spillable: false,
-            enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(
-                cost_facts.output_rows,
-                cost_facts.output_row_width,
-            ),
+            enforcer_cost_input: planner_enforcer_cost_input(
+                &cost_facts,
+                goal.grant,
+                &self.grant_classes,
+            )?,
             physical_fingerprint: fingerprint.finish(),
             region: planner_region_contract(ctx.memo, None)?,
             mandatory: false,

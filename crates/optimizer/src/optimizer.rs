@@ -572,7 +572,8 @@ impl Optimizer {
                 paro_common::error::internal("utility physical plan has no root contract")
             })?;
             let cost = root.cumulative_cost;
-            let fingerprint = utility_plan_fingerprint(&plan.node(plan.root).kind)?;
+            let fingerprint =
+                plan.portfolio_fingerprint(utility_plan_fingerprint(&plan.node(plan.root).kind)?)?;
             class_plans.push((grant.id, plan, fingerprint, cost));
         }
         let portfolio = PhysicalPlanPortfolio::build(
@@ -642,12 +643,8 @@ impl Optimizer {
             .with_statement_write_contracts(variant.write_contracts)
             .requiring_winner_contracts()
             .extract(&variant.plan)?;
-            class_plans.push((
-                variant.class,
-                plan,
-                variant.physical_fingerprint,
-                variant.cost,
-            ));
+            let fingerprint = plan.portfolio_fingerprint(variant.physical_fingerprint)?;
+            class_plans.push((variant.class, plan, fingerprint, variant.cost));
         }
         let portfolio = PhysicalPlanPortfolio::build(
             crate::physical::ObjectiveProfile::Latency,

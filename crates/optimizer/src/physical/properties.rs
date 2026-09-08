@@ -9,18 +9,19 @@ use paro_common::vector::VECTOR_SIZE;
 use paro_planner::plan::CardinalityEstimate;
 
 use crate::physical::cost::SearchCost;
-use crate::physical::identity::{AdmissibleGrantSetId, Fingerprint, ResourceGrantClassId};
+use crate::physical::identity::{Fingerprint, ResourceGrantClassId};
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::requirements::{ProvidedProperties, RequiredProperties};
 
 pub type ExecutionColumnId = usize;
 pub type MemoryBytes = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PhysicalGrantContract {
-    Invariant(AdmissibleGrantSetId),
+    /// The selected node's algorithm and price are grant-independent. An
+    /// admissible-set id belongs to Memo search, not to this executable proof.
+    Invariant,
     Parallelism {
-        admissible: AdmissibleGrantSetId,
         tasks: u16,
     },
     Class(ResourceGrantClassId),
@@ -33,7 +34,7 @@ impl PhysicalGrantContract {
     pub(crate) fn accepts(self, class: ResourceGrantClassId, tasks: u16) -> bool {
         tasks != 0
             && match self {
-                Self::Invariant(_) => true,
+                Self::Invariant => true,
                 Self::Parallelism { tasks: priced, .. } => priced == tasks,
                 Self::Class(priced) => priced == class,
             }

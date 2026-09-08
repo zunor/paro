@@ -539,7 +539,34 @@ fn build_probe_byte_work_ppm(facts: &ResolvedPlannerCostFacts) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{retained_ratio_ppm, retained_upper_ratio_ppm};
+    use super::{retained_ratio_ppm, retained_upper_ratio_ppm, selected_node_grant_contract};
+    use crate::cascades::ids::{AdmissibleGrantSetId, ResourceGrantClassId};
+    use crate::cascades::memo::GrantGoalKey;
+    use crate::cascades::rules::GrantDependencyDescriptor;
+    use crate::physical::PhysicalGrantContract;
+
+    #[test]
+    fn selected_implementation_contract_is_independent_of_sibling_search_requirements() {
+        let goal = GrantGoalKey::Class(ResourceGrantClassId(7));
+        assert_eq!(
+            selected_node_grant_contract(GrantDependencyDescriptor::Invariant, goal, 4).unwrap(),
+            PhysicalGrantContract::Invariant,
+        );
+        assert_eq!(
+            selected_node_grant_contract(GrantDependencyDescriptor::Parallelism, goal, 4).unwrap(),
+            PhysicalGrantContract::Parallelism { tasks: 4 },
+        );
+        assert_eq!(
+            selected_node_grant_contract(GrantDependencyDescriptor::Sensitive, goal, 4).unwrap(),
+            PhysicalGrantContract::Class(ResourceGrantClassId(7)),
+        );
+        assert!(selected_node_grant_contract(
+            GrantDependencyDescriptor::Sensitive,
+            GrantGoalKey::Invariant(AdmissibleGrantSetId(1)),
+            4,
+        )
+        .is_err());
+    }
 
     #[test]
     fn retained_upper_ratio_never_rounds_below_the_proof() {
@@ -560,6 +587,45 @@ pub(super) fn append_grant_fingerprint(
 ) {
     if dependency != GrantDependencyDescriptor::Invariant {
         fingerprint.write_u64(grant.stable_tag());
+    }
+}
+
+/// Dependency of this selected implementation, not the union of alternatives
+/// searched in its Memo group. A grant-independent provider can legitimately
+/// win a class-specific goal created by a memory-sensitive sibling algorithm.
+pub(super) fn implementation_grant_dependency(
+    metadata: &PlannerOperatorMetadata,
+    flavor: PhysicalImplementationFlavor,
+) -> GrantDependencyDescriptor {
+    if flavor == PhysicalImplementationFlavor::SearchProvider {
+        GrantDependencyDescriptor::Invariant
+    } else if flavor == metadata.implementations.baseline {
+        metadata.grant_dependency
+    } else {
+        GrantDependencyDescriptor::Sensitive
+    }
+}
+
+pub(super) fn selected_node_grant_contract(
+    dependency: GrantDependencyDescriptor,
+    goal: GrantGoalKey,
+    max_tasks: u16,
+) -> Result<crate::physical::PhysicalGrantContract> {
+    use crate::physical::PhysicalGrantContract;
+    match dependency {
+        GrantDependencyDescriptor::Invariant => Ok(PhysicalGrantContract::Invariant),
+        GrantDependencyDescriptor::Parallelism if max_tasks > 0 => {
+            Ok(PhysicalGrantContract::Parallelism { tasks: max_tasks })
+        }
+        GrantDependencyDescriptor::Sensitive => match goal {
+            GrantGoalKey::Class(class) => Ok(PhysicalGrantContract::Class(class)),
+            _ => Err(paro_error::internal(
+                "class-sensitive node was selected under a shared goal",
+            )),
+        },
+        GrantDependencyDescriptor::Parallelism => {
+            Err(paro_error::internal("selected node has zero task capacity"))
+        }
     }
 }
 

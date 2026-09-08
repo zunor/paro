@@ -313,14 +313,17 @@ impl PhysicalPlanPortfolio<PhysicalPlan> {
                         "physical portfolio variant references an undeclared grant class",
                     )
                 })?;
-                if variant.plan.properties.iter().any(|(_, properties)| {
-                    !properties
-                        .grant_contract
-                        .accepts(grant.id, grant.max_parallel_tasks)
-                }) {
-                    return Err(paro_error::internal(
-                        "physical portfolio advertises an incompatible node grant contract",
-                    ));
+                if let Some((node, properties)) =
+                    variant.plan.properties.iter().find(|(_, properties)| {
+                        !properties
+                            .grant_contract
+                            .accepts(grant.id, grant.max_parallel_tasks)
+                    })
+                {
+                    return Err(paro_error::internal(format!(
+                        "physical portfolio advertises an incompatible node grant contract: node={node:?}, contract={:?}, class={:?}, tasks={}",
+                        properties.grant_contract, grant.id, grant.max_parallel_tasks,
+                    )));
                 }
                 if variant.cost.peak_memory_upper > grant.hard_memory_bytes {
                     return Err(paro_error::internal(

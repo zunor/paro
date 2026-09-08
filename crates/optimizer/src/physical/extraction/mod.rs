@@ -554,7 +554,7 @@ impl PhysicalPlanExtractor {
         cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> PhysicalPlanNodeId {
         use crate::physical::cost::{CompactRange, ScoreSummary, SearchCost};
-        use crate::physical::identity::{AdmissibleGrantSetId, Fingerprint};
+        use crate::physical::identity::Fingerprint;
         use crate::physical::properties::{
             PhysicalCharacteristics, PhysicalGrantContract, PhysicalNodeProperties, PlanOrigin,
         };
@@ -650,7 +650,7 @@ impl PhysicalPlanExtractor {
                 characteristics,
                 output_estimate: cardinality,
                 cumulative_cost,
-                grant_contract: PhysicalGrantContract::Invariant(AdmissibleGrantSetId(0)),
+                grant_contract: PhysicalGrantContract::Invariant,
                 auxiliary_dependencies: Box::new([]),
                 region_owner: None,
                 owned_artifacts: Box::new([]),

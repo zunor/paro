@@ -148,20 +148,22 @@ pub(super) fn extract_planner_tree(
                 let required = memo.required(goal.required).cloned().ok_or_else(|| {
                     paro_error::internal("winner extraction lost required properties")
                 })?;
-                let grant = match goal.grant {
-                    GrantGoalKey::Invariant(set) => {
-                        crate::physical::properties::PhysicalGrantContract::Invariant(set)
+                let enforced_grant = match goal.grant {
+                    GrantGoalKey::Invariant(_) => {
+                        crate::physical::properties::PhysicalGrantContract::Invariant
                     }
-                    GrantGoalKey::Parallelism { admissible, tasks } => {
-                        crate::physical::properties::PhysicalGrantContract::Parallelism {
-                            admissible,
-                            tasks,
-                        }
+                    GrantGoalKey::Parallelism { tasks, .. } => {
+                        crate::physical::properties::PhysicalGrantContract::Parallelism { tasks }
                     }
                     GrantGoalKey::Class(class) => {
                         crate::physical::properties::PhysicalGrantContract::Class(class)
                     }
                 };
+                let grant = selected_node_grant_contract(
+                    implementation_grant_dependency(operator_metadata, implementation),
+                    goal.grant,
+                    winner.enforcer_cost_input.max_parallel_tasks,
+                )?;
                 let origin = if let Some(proof) = &winner.joint_cost_proof {
                     let region = memo.regions().node(proof.region).ok_or_else(|| {
                         paro_error::internal("winner extraction lost its planning region")
@@ -225,7 +227,11 @@ pub(super) fn extract_planner_tree(
                     required,
                     provided: winner.provided.clone(),
                     cost: winner.cost,
-                    grant,
+                    grant: if winner.enforcers.is_empty() {
+                        grant
+                    } else {
+                        enforced_grant
+                    },
                     origin,
                     goal_fingerprint: optimization_goal_fingerprint(goal),
                     physical_fingerprint: winner.physical_fingerprint,
