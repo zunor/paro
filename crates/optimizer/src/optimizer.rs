@@ -756,7 +756,7 @@ impl Optimizer {
                     &scan.schema_name,
                     &scan.graph_name,
                 );
-                if let Some(snapshot) = optimizer.ctx.session.services.graph_index.snapshot(&id) {
+                if let Some(snapshot) = optimizer.ctx.session.graph_snapshot(&id) {
                     dependencies
                         .graph_generations
                         .insert(graph_key(&id), snapshot.generation_id());

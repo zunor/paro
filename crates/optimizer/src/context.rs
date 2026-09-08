@@ -41,11 +41,13 @@ impl GraphStatsLoader for EmptyGraphStatsLoader {
 
 impl GraphStatsLoader for ContextGraphStatsLoader {
     fn load(&self, graph_name: &str) -> Option<Arc<GraphStatistics>> {
-        self.context.services.graph_index.statistics(&GraphId::new(
-            self.context.current_database(),
-            self.context.current_schema(),
-            graph_name,
-        ))
+        self.context
+            .graph_snapshot(&GraphId::new(
+                self.context.current_database(),
+                self.context.current_schema(),
+                graph_name,
+            ))
+            .map(|snapshot| snapshot.statistics().clone())
     }
 }
 

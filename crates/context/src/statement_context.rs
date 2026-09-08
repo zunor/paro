@@ -72,6 +72,8 @@ pub struct StatementContext {
     pub limits: RuntimeLimits,
     pub cancellation: StatementCancellation,
     pub services: Arc<QueryResources>,
+    /// Pins acquired by this statement, including its compilation phase.
+    pub graph_snapshots: crate::StatementGraphSnapshots,
     pub graph_registry: Arc<dyn crate::GraphRegistry>,
     pub session_metadata: Arc<dyn SessionMetadataProvider>,
     /// Mutable diagnostics owned by this client session, never by the process.
@@ -90,6 +92,14 @@ impl std::fmt::Debug for StatementContext {
 }
 
 impl StatementContext {
+    pub fn graph_snapshot(
+        &self,
+        id: &GraphId,
+    ) -> Option<paro_storage::index::graph::GraphReadSnapshot> {
+        self.graph_snapshots
+            .read(self.services.graph_index.as_ref(), id)
+    }
+
     pub fn current_database(&self) -> &str {
         &self.env.current_database
     }

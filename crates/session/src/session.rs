@@ -526,6 +526,7 @@ impl Session {
                 governance: paro_context::QueryResourceGovernance::default(),
                 connection_info: None,
             }),
+            graph_snapshots: Default::default(),
             graph_registry: self.instance.graph_manager().clone(),
             session_metadata: self.session_metadata.clone(),
             diagnostics: self.diagnostics.clone(),

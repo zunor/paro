@@ -246,6 +246,7 @@ impl TestStatementContextBuilder {
                 governance: crate::QueryResourceGovernance::default(),
                 connection_info: None,
             }),
+            graph_snapshots: Default::default(),
             graph_registry: graph_manager,
             session_metadata: Arc::new(StaticSessionMetadata::default()),
             diagnostics: Arc::new(crate::SessionDiagnostics::default()),

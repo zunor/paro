@@ -42,9 +42,7 @@ impl GraphExpandTransformExec {
         let snapshot = ctx
             .query
             .session
-            .services
-            .graph_index
-            .snapshot(&GraphId::new(
+            .graph_snapshot(&GraphId::new(
                 ctx.query.session.current_database(),
                 &self.spec.schema_name,
                 &self.spec.graph_name,

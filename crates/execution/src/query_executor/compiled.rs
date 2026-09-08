@@ -200,9 +200,7 @@ pub(crate) fn physical_plan_dependencies_available(
         let Some(expected) = plan.dependencies.graph_generations.get(&graph_key(&id)) else {
             return false;
         };
-        ctx.services
-            .graph_index
-            .snapshot(&id)
+        ctx.graph_snapshot(&id)
             .is_some_and(|snapshot| snapshot.generation_id() == *expected)
     }
 
@@ -400,5 +398,87 @@ mod tests {
 
         assert!(replaced_statement.shares_image_with(&replacement));
         assert!(Arc::ptr_eq(&original_bindings, &replaced_bindings));
+    }
+
+    #[test]
+    fn graph_dependency_admission_uses_the_statement_pin_not_the_live_publication() {
+        use paro_common::identity::GraphId;
+        use paro_optimizer::physical::{
+            GraphScanSpec, OperatorLabel, PhysicalPlan, PhysicalPlanNode, PhysicalPlanNodeArena,
+            PhysicalPlanNodeId, PlanChildren, RowType,
+        };
+        use paro_storage::index::graph::{
+            GraphBuildInput, GraphManifest, GraphProjectionIndex, GraphRuntimeHandle, GraphState,
+            GraphStorageGeneration,
+        };
+
+        struct Provider(GraphRuntimeHandle);
+        impl paro_context::GraphIndexProvider for Provider {
+            fn snapshot(
+                &self,
+                _: &GraphId,
+            ) -> Option<paro_storage::index::graph::GraphReadSnapshot> {
+                Some(self.0.snapshot())
+            }
+        }
+        let generation = |id| {
+            GraphStorageGeneration::from_index(
+                GraphProjectionIndex::build(&GraphBuildInput {
+                    graph_name: "g".into(),
+                    vertex_tables: vec![],
+                    edge_tables: vec![],
+                    build_backward_adjacency: true,
+                })
+                .unwrap(),
+                GraphManifest::new("g".into(), GraphState::Ready, "schema".into()),
+                id,
+            )
+        };
+        let provider = Arc::new(Provider(GraphRuntimeHandle::new(generation(1))));
+        let mut context = TestStatementContextBuilder::minimal()
+            .build()
+            .as_ref()
+            .clone();
+        Arc::make_mut(&mut context.services).graph_index = provider.clone();
+        let id = GraphId::new(context.current_database(), "public", "g");
+        let compiled_generation = context.graph_snapshot(&id).unwrap().generation_id();
+        let mut key = StableFingerprintBuilder::default();
+        key.write_bytes(b"paro.graph-generation.v1");
+        key.write_bytes(id.runtime_key().as_bytes());
+        let mut nodes = PhysicalPlanNodeArena::default();
+        let root = nodes.push(PhysicalPlanNode {
+            id: PhysicalPlanNodeId::INVALID,
+            output: RowType::new(vec![], vec![]),
+            cardinality: None,
+            kind: PhysicalNodeKind::GraphScan(Box::new(GraphScanSpec {
+                vertex_info: paro_catalog::entry::VertexTableInfo {
+                    table_name: "vertices".into(),
+                    table_oid: 1,
+                    key_column_ids: vec![0],
+                    label: "Node".into(),
+                    property_column_ids: vec![],
+                },
+                filter: None,
+                table_index: 1,
+                label: "Node".into(),
+                graph_name: "g".into(),
+                schema_name: "public".into(),
+                output_types: Box::new([]),
+            })),
+            children: PlanChildren::Empty,
+            label: OperatorLabel::new(paro_planner::plan::PlanNodeId::SYNTHETIC, "graph"),
+        });
+        let mut plan = PhysicalPlan::new(root, nodes, Default::default(), Default::default());
+        plan.dependencies
+            .graph_generations
+            .insert(key.finish(), compiled_generation);
+        provider.0.publish(generation(2));
+        assert!(physical_plan_dependencies_available(&plan, &context));
+        let mut next_statement = context.clone();
+        next_statement.graph_snapshots = Default::default();
+        assert!(
+            !physical_plan_dependencies_available(&plan, &next_statement),
+            "a new statement must recompile a generation-dependent cached plan"
+        );
     }
 }
