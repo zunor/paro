@@ -34,8 +34,17 @@ pub(super) fn extract_planner_tree(
     bind_context: &BindContext,
     root: GroupId,
     goal: OptimizationGoal,
+    candidate: super::super::ids::CandidateId,
     mode: SearchMode,
 ) -> Result<ExtractedWinnerTree> {
+    super::super::verifier::WinnerVerifier::verify_candidate_tree(
+        memo,
+        ChildWinnerRef {
+            group: root,
+            goal,
+            candidate,
+        },
+    )?;
     #[derive(Debug)]
     struct BuildTask {
         payload: PhysicalPayloadId,
@@ -62,7 +71,11 @@ pub(super) fn extract_planner_tree(
     let mut tasks = vec![Task::Visit {
         group: root,
         goal,
-        candidate: None,
+        candidate: Some(ChildWinnerRef {
+            group: root,
+            goal,
+            candidate,
+        }),
         occurrence: Fingerprint(0),
     }];
     let mut plans = Vec::new();

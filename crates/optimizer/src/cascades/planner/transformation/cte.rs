@@ -634,6 +634,7 @@ mod tests {
             &binding.root,
             Some(&facts),
         )
+        .unwrap()
         .unwrap();
         drop(state);
         (input, requirement, plan, facts)
@@ -1044,6 +1045,7 @@ mod tests {
             &binding.root,
             Some(&facts),
         )
+        .unwrap()
         .unwrap();
         let original_layout = instantiated.plan.output_layout();
         let mut holes = instantiated.group_holes;

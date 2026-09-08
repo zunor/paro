@@ -612,7 +612,7 @@ impl SettlementCache {
         let mut arena = std::mem::take(&mut self.test_arena);
         let result = self.settle_arena_in(plan, environment, &mut arena);
         self.test_arena = arena;
-        result
+        result?.ok_or_else(|| paro_error::internal("test settlement was interrupted"))
     }
 
     /// Settle into the session's sole storage owner. The result is an index,
@@ -622,11 +622,12 @@ impl SettlementCache {
         plan: OwnedLogicalPlan,
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
-    ) -> Result<SettledExpression> {
+    ) -> Result<Option<SettledExpression>> {
         let checkpoint = arena.checkpoint();
         let result = self.settle_arena_impl(plan, environment, arena);
-        if result.is_err() {
+        if !matches!(result, Ok(Some(_))) {
             arena.rollback_to(checkpoint)?;
+            self.discard_stale_recipes(arena);
         }
         result
     }
@@ -636,14 +637,25 @@ impl SettlementCache {
         plan: OwnedLogicalPlan,
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
-    ) -> Result<SettledExpression> {
+    ) -> Result<Option<SettledExpression>> {
         enum Task {
             Enter(PlanIndex, CteEnvironment),
             Consumer(PlanIndex, usize, CteEnvironment),
             Finish(PlanIndex, CteEnvironment, usize),
         }
-        let root = arena.import_checked(plan, || environment.session.cancellation.check())?;
-        let demands = demand::derive(arena, root, environment)?;
+        if !environment.control.checkpoint()? {
+            return Ok(None);
+        }
+        let Some(root) = arena.import_controlled(plan, || {
+            environment.session.cancellation.check()?;
+            environment.control.checkpoint()
+        })?
+        else {
+            return Ok(None);
+        };
+        let Some(demands) = demand::derive(arena, root, environment)? else {
+            return Ok(None);
+        };
         // Keep the imported source DAG and settled output in one arena.  The
         // source edges are immutable and remain valid while settled nodes are
         // appended, so settlement no longer allocates a second arena or
@@ -658,6 +670,9 @@ impl SettlementCache {
         let mut scopes = HashMap::new();
         while let Some(task) = pending.pop() {
             environment.session.cancellation.check()?;
+            if !environment.control.checkpoint()? {
+                return Ok(None);
+            }
             match task {
                 Task::Enter(index, ctes) => {
                     let node = arena.get(index)?;
@@ -804,11 +819,11 @@ impl SettlementCache {
             return Err(paro_error::internal("settlement has no unique result"));
         }
         let (root, _, statistics, _) = completed.pop().unwrap();
-        Ok(SettledExpression {
+        Ok(Some(SettledExpression {
             plan: root,
             statistics,
             scopes,
-        })
+        }))
     }
 }
 
@@ -827,6 +842,7 @@ mod tests {
             bind_context.generate_table_index();
         }
         PlannerRuleEnvironment {
+            control: Arc::new(crate::cascades::control::SearchControl::new(None)),
             bind_context,
             session: TestStatementContextBuilder::minimal().build(),
             cost_model: Default::default(),
@@ -988,6 +1004,7 @@ mod tests {
                 &environment,
                 &mut arena,
             )
+            .unwrap()
             .unwrap();
         let retained = arena.checkpoint();
         assert!(!cache.locals.is_empty());
@@ -1017,6 +1034,7 @@ mod tests {
                 &environment,
                 &mut arena,
             )
+            .unwrap()
             .unwrap();
         assert!(!arena.owns(first.plan));
         assert!(arena.owns(next.plan));

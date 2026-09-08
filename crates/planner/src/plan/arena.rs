@@ -297,6 +297,20 @@ impl LogicalPlanArena {
         plan: OwnedLogicalPlan,
         mut admit: impl FnMut() -> Result<()>,
     ) -> Result<PlanIndex> {
+        self.import_controlled(plan, || {
+            admit()?;
+            Ok(true)
+        })?
+        .ok_or_else(|| paro_error::internal("unconditional arena import stopped"))
+    }
+
+    /// A cooperative stop is distinct from an invalid plan. Both unwind the
+    /// complete append suffix, without publishing a partially imported root.
+    pub fn import_controlled(
+        &mut self,
+        plan: OwnedLogicalPlan,
+        mut admit: impl FnMut() -> Result<bool>,
+    ) -> Result<Option<PlanIndex>> {
         enum Frame {
             Enter(OwnedLogicalPlan),
             Exit(PlanNodeId, NodeStats, LogicalOperator<()>, usize),
@@ -306,9 +320,11 @@ impl LogicalPlanArena {
             let mut pending = vec![Frame::Enter(plan)];
             let mut completed = Vec::new();
             while let Some(frame) = pending.pop() {
+                if !admit()? {
+                    return Ok(None);
+                }
                 match frame {
                     Frame::Enter(plan) => {
-                        admit()?;
                         let (id, stats, operator) = plan.into_parts();
                         let mut children = Vec::new();
                         let shell = operator.try_map_child_links(&mut |child| {
@@ -342,9 +358,9 @@ impl LogicalPlanArena {
                     "logical arena import has no unique root",
                 ));
             }
-            Ok(completed[0])
+            Ok(Some(completed[0]))
         })();
-        if result.is_err() {
+        if !matches!(result, Ok(Some(_))) {
             self.rollback_to(checkpoint)?;
         }
         result
@@ -363,17 +379,31 @@ impl LogicalPlanArena {
         root: PlanIndex,
         mut admit: impl FnMut() -> Result<()>,
     ) -> Result<Vec<PlanIndex>> {
+        self.post_order_controlled(root, || {
+            admit()?;
+            Ok(true)
+        })?
+        .ok_or_else(|| paro_error::internal("unconditional arena traversal stopped"))
+    }
+
+    pub fn post_order_controlled(
+        &self,
+        root: PlanIndex,
+        mut admit: impl FnMut() -> Result<bool>,
+    ) -> Result<Option<Vec<PlanIndex>>> {
         let mut visited = std::collections::BTreeSet::new();
         let mut pending = vec![root];
         while let Some(index) = pending.pop() {
-            admit()?;
+            if !admit()? {
+                return Ok(None);
+            }
             let node = self.get(index)?;
             if visited.insert(index) {
                 node.operator
                     .visit_child_links(&mut |child| pending.push(*child));
             }
         }
-        Ok(visited.into_iter().collect())
+        Ok(Some(visited.into_iter().collect()))
     }
 
     /// Materialize evaluation occurrences at an ownership boundary. Traversal

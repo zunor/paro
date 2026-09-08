@@ -100,114 +100,134 @@ impl WinnerVerifier {
     pub fn verify(memo: &Memo) -> Result<()> {
         for group in memo.groups() {
             for (goal, frontier) in group.winner_frontiers() {
-                verify_optimization_context(memo, group.id, goal.context)?;
                 if frontier.candidates().is_empty() {
                     return Err(paro_error::internal("winner frontier is empty"));
                 }
                 for winner in frontier.candidates() {
-                    winner.local_cost.validate()?;
-                    winner.cost.validate()?;
-                    let physical = memo.physical_expr(winner.expression).ok_or_else(|| {
-                        paro_error::internal("winner references unknown physical expression")
-                    })?;
-                    if memo.physical_owner(winner.expression) != Some(group.id) {
-                        return Err(paro_error::internal(
-                            "winner references a physical expression from another group",
-                        ));
-                    }
-                    let required = memo.required(goal.required).ok_or_else(|| {
-                        paro_error::internal("winner references unknown required properties")
-                    })?;
-                    let provided = replay_enforcer_chain(
-                        physical.provided.clone(),
-                        required,
-                        &winner.enforcers,
-                    )?;
-                    if provided != winner.provided || !provided.satisfies(required) {
-                        return Err(paro_error::internal(
-                            "winner enforcer replay does not satisfy its goal",
-                        ));
-                    }
-                    let mut child_costs = Vec::with_capacity(winner.children.len());
-                    let mut child_source_work = Vec::with_capacity(winner.children.len());
-                    for (ordinal, child) in winner.children.iter().enumerate() {
-                        verify_optimization_context(memo, child.group, child.goal.context)?;
-                        let mut expected_sources = memo
-                            .optimization_context(goal.context)
-                            .ok_or_else(|| {
-                                paro_error::internal("winner source context disappeared")
-                            })?
-                            .filterable_sources()
-                            .clone();
-                        if let Some((filtered_child, sources)) =
-                            winner.cost_composition.sideways_filter()
-                        {
-                            if ordinal == filtered_child {
-                                expected_sources.extend(sources.iter().map(|source| source.source));
-                            }
-                        }
-                        if memo
-                            .optimization_context(child.goal.context)
-                            .unwrap()
-                            .filterable_sources()
-                            != &expected_sources
-                        {
-                            return Err(paro_error::internal(
-                                "winner child frontier has a different source-demand contract",
-                            ));
-                        }
-                        let Some(child_winner) = memo.resolve_child_winner(*child) else {
-                            return Err(paro_error::internal(
-                                "winner has no verified exact child candidate",
-                            ));
-                        };
-                        child_costs.push(child_winner.cost);
-                        child_source_work.push(child_winner.source_work.as_ref());
-                    }
-                    let recomposed = super::engine::compose_candidate_cost_with_sources_at(
-                        winner.local_cost,
-                        winner.source_filter_apply_cost,
-                        &child_costs,
-                        &child_source_work,
-                        winner.cost_composition.clone(),
-                        memo.calibration(),
-                    )?;
-                    if recomposed.source_work != winner.source_work {
-                        return Err(paro_error::internal(
-                            "winner source-work evidence failed independent composition replay",
-                        ));
-                    }
-                    let mut recomputed_cost = super::engine::constrain_composed_cost_to_grant(
-                        recomposed.cost,
-                        winner.enforcer_cost_input,
-                    )?
-                    .ok_or_else(|| {
-                        paro_error::internal("winner composition exceeds its resource grant")
-                    })?;
-                    let enforcer_phase = super::engine::enforcer_cost(
-                        &winner.enforcers,
-                        winner.enforcer_cost_input,
-                        memo.calibration(),
-                    )?
-                    .ok_or_else(|| {
-                        paro_error::internal("winner enforcer exceeds its resource grant")
-                    })?;
-                    recomputed_cost = super::engine::constrain_composed_cost_to_grant(
-                        enforcer_phase.compose_after(recomputed_cost)?,
-                        winner.enforcer_cost_input,
-                    )?
-                    .ok_or_else(|| {
-                        paro_error::internal("winner enforcers exceed its resource grant")
-                    })?;
-                    if recomputed_cost != winner.cost {
-                        return Err(paro_error::internal(
-                            "winner cumulative cost failed independent composition replay",
-                        ));
-                    }
-                    verify_joint_cost_proof(memo, group.id, *goal, winner, physical)?;
+                    Self::verify_one(memo, group.id, *goal, winner)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Replay the precise immutable DAG selected for extraction, including
+    /// archived incumbent children no longer retained by a cost frontier.
+    pub fn verify_candidate_tree(memo: &Memo, root: super::memo::ChildWinnerRef) -> Result<()> {
+        let mut pending = vec![root];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(reference) = pending.pop() {
+            if !seen.insert(reference.candidate) {
+                continue;
+            }
+            let winner = memo
+                .resolve_child_winner(reference)
+                .ok_or_else(|| paro_error::internal("incumbent references an unknown candidate"))?;
+            Self::verify_one(
+                memo,
+                memo.canonical_group(reference.group),
+                reference.goal,
+                winner,
+            )?;
+            pending.extend(winner.children.iter().copied());
+        }
+        Ok(())
+    }
+
+    fn verify_one(
+        memo: &Memo,
+        group: super::ids::GroupId,
+        goal: super::memo::OptimizationGoal,
+        winner: &super::memo::Winner,
+    ) -> Result<()> {
+        verify_optimization_context(memo, group, goal.context)?;
+        winner.local_cost.validate()?;
+        winner.cost.validate()?;
+        let physical = memo
+            .physical_expr(winner.expression)
+            .ok_or_else(|| paro_error::internal("winner references unknown physical expression"))?;
+        if memo.physical_owner(winner.expression) != Some(group) {
+            return Err(paro_error::internal(
+                "winner references a physical expression from another group",
+            ));
+        }
+        let required = memo
+            .required(goal.required)
+            .ok_or_else(|| paro_error::internal("winner references unknown required properties"))?;
+        let provided =
+            replay_enforcer_chain(physical.provided.clone(), required, &winner.enforcers)?;
+        if provided != winner.provided || !provided.satisfies(required) {
+            return Err(paro_error::internal(
+                "winner enforcer replay does not satisfy its goal",
+            ));
+        }
+        let mut child_costs = Vec::with_capacity(winner.children.len());
+        let mut child_source_work = Vec::with_capacity(winner.children.len());
+        for (ordinal, child) in winner.children.iter().enumerate() {
+            verify_optimization_context(memo, child.group, child.goal.context)?;
+            let mut expected_sources = memo
+                .optimization_context(goal.context)
+                .ok_or_else(|| paro_error::internal("winner source context disappeared"))?
+                .filterable_sources()
+                .clone();
+            if let Some((filtered_child, sources)) = winner.cost_composition.sideways_filter() {
+                if ordinal == filtered_child {
+                    expected_sources.extend(sources.iter().map(|source| source.source));
+                }
+            }
+            if memo
+                .optimization_context(child.goal.context)
+                .unwrap()
+                .filterable_sources()
+                != &expected_sources
+            {
+                return Err(paro_error::internal(
+                    "winner child frontier has a different source-demand contract",
+                ));
+            }
+            let Some(child_winner) = memo.resolve_child_winner(*child) else {
+                return Err(paro_error::internal(
+                    "winner has no verified exact child candidate",
+                ));
+            };
+            child_costs.push(child_winner.cost);
+            child_source_work.push(child_winner.source_work.as_ref());
+        }
+        let recomposed = super::engine::compose_candidate_cost_with_sources_at(
+            winner.local_cost,
+            winner.source_filter_apply_cost,
+            &child_costs,
+            &child_source_work,
+            winner.cost_composition.clone(),
+            memo.calibration(),
+        )?;
+        if recomposed.source_work != winner.source_work {
+            return Err(paro_error::internal(
+                "winner source-work evidence failed independent composition replay",
+            ));
+        }
+        let mut recomputed_cost = super::engine::constrain_composed_cost_to_grant(
+            recomposed.cost,
+            winner.enforcer_cost_input,
+        )?
+        .ok_or_else(|| paro_error::internal("winner composition exceeds its resource grant"))?;
+        let enforcer_phase = super::engine::enforcer_cost(
+            &winner.enforcers,
+            winner.enforcer_cost_input,
+            memo.calibration(),
+        )?
+        .ok_or_else(|| paro_error::internal("winner enforcer exceeds its resource grant"))?;
+        recomputed_cost = super::engine::constrain_composed_cost_to_grant(
+            enforcer_phase.compose_after(recomputed_cost)?,
+            winner.enforcer_cost_input,
+        )?
+        .ok_or_else(|| paro_error::internal("winner enforcers exceed its resource grant"))?;
+        if recomputed_cost != winner.cost {
+            return Err(paro_error::internal(
+                "winner cumulative cost failed independent composition replay",
+            ));
+        }
+        verify_joint_cost_proof(memo, group, goal, winner, physical)?;
         Ok(())
     }
 }

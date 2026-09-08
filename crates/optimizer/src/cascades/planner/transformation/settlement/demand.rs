@@ -28,11 +28,19 @@ pub(super) fn derive(
     arena: &LogicalPlanArena,
     root: PlanIndex,
     environment: &PlannerRuleEnvironment,
-) -> Result<Demands> {
+) -> Result<Option<Demands>> {
     let mut layouts = BTreeMap::<PlanIndex, LogicalOutputLayout>::new();
     let mut carriers = BTreeMap::<PlanIndex, LogicalOutputLayout>::new();
-    for index in arena.post_order(root)? {
+    let Some(post_order) =
+        arena.post_order_controlled(root, || environment.control.checkpoint())?
+    else {
+        return Ok(None);
+    };
+    for index in post_order {
         environment.session.cancellation.check()?;
+        if !environment.control.checkpoint()? {
+            return Ok(None);
+        }
         let node = arena.get(index)?;
         let mut children = Vec::new();
         node.operator
@@ -72,6 +80,9 @@ pub(super) fn derive(
     let mut pending = vec![root];
     while let Some(index) = pending.pop() {
         environment.session.cancellation.check()?;
+        if !environment.control.checkpoint()? {
+            return Ok(None);
+        }
         let node = arena.get(index)?;
         let wanted = outputs[&index].clone();
         let mut execution = wanted.clone();
@@ -131,11 +142,11 @@ pub(super) fn derive(
             }
         }
     }
-    Ok(Demands {
+    Ok(Some(Demands {
         layouts,
         carriers,
         outputs,
-    })
+    }))
 }
 
 fn remap_expression(expression: &mut Expression, bindings: &BindingMap) {

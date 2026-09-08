@@ -292,11 +292,11 @@ pub(super) fn stage_transformed_expression(
                 "attached search provider to transformed logical expression"
             );
         }
-        let mut plan = skeleton;
+        let plan = skeleton;
         // Preserve binding semantics before Query IR interning replaces
         // operator expressions with scalar-arena references.
         let scalar_roots = intern_operator_scalars(
-            &mut plan.operator,
+            &plan.operator,
             &output_columns,
             &child_states
                 .iter()
@@ -756,6 +756,9 @@ pub(super) fn stage_transformed_expression(
     let mut search_candidates = HashMap::new();
     if let Some(context) = &search_context {
         for index in provider_roots {
+            if !memo.control().checkpoint()? {
+                return Ok(None);
+            }
             let node = state
                 .staging_arena
                 .export_checked(index, || context.session.cancellation.check())?;
@@ -795,8 +798,17 @@ pub(super) fn stage_transformed_expression(
         session.state.staging_arena.get(root_index)?;
         let mut completed = BTreeMap::<PlanIndex, (LogicalPlanNode<()>, NodeState)>::new();
         let mut root_result = None;
-        let post_order = session.state.staging_arena.post_order(root_index)?;
+        let Some(post_order) = session
+            .state
+            .staging_arena
+            .post_order_controlled(root_index, || session.memo.control().checkpoint())?
+        else {
+            return Ok(None);
+        };
         for index in post_order {
+            if !session.memo.control().checkpoint()? {
+                return Ok(None);
+            }
             if let Some(statement) = &session.state.session {
                 statement.cancellation.check()?;
             }

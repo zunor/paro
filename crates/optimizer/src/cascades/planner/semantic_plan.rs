@@ -38,7 +38,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
     state: &PlannerTransformState,
     binding: &PatternOperand,
     facts: Option<&boundary::BoundarySnapshot>,
-) -> Result<InstantiatedPlanWithGroupHoles> {
+) -> Result<Option<InstantiatedPlanWithGroupHoles>> {
     fn group_hole_transport(
         state: &PlannerTransformState,
         layout: &PlannerBindingLayout,
@@ -85,6 +85,9 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
     let mut pending = vec![(binding, None, false)];
     let mut completed = Vec::new();
     while let Some((binding, expected_layout, finish)) = pending.pop() {
+        if !memo.control().checkpoint()? {
+            return Ok(None);
+        }
         match binding {
             PatternOperand::Group(group) => {
                 let group = memo.canonical_group(*group);
@@ -177,7 +180,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
         ));
     }
     let plan = completed.pop().unwrap();
-    Ok(InstantiatedPlanWithGroupHoles { plan, group_holes })
+    Ok(Some(InstantiatedPlanWithGroupHoles { plan, group_holes }))
 }
 
 /// Restore the occurrence's output column set after materializing a canonical

@@ -567,12 +567,12 @@ fn graph_filter_is_part_of_the_query_ir_fingerprint() {
             "public".to_string(),
         ))))
     };
-    let fingerprint = |mut plan: OwnedLogicalPlan| {
+    let fingerprint = |plan: OwnedLogicalPlan| {
         let mut binding_ids = BindingCatalog::default();
         let mut columns = ColumnCatalog::default();
         let mut scalars = ScalarArena::default();
         let roots = intern_operator_scalars(
-            &mut plan.operator,
+            &plan.operator,
             &[],
             &[],
             &mut binding_ids,

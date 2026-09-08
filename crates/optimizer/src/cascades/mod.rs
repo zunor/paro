@@ -11,6 +11,7 @@
 pub mod budget;
 pub mod calibration;
 pub mod column;
+pub mod control;
 pub mod cost {
     pub use crate::physical::cost::*;
 }

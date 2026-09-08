@@ -71,6 +71,10 @@ pub(super) fn dimension_sharing_pattern_bindings(
 
     impl LocalMatcher<'_> {
         fn admit_work(&mut self, units: usize) -> Result<bool> {
+            if !self.memo.control().checkpoint()? {
+                self.limited = true;
+                return Ok(false);
+            }
             if let Some(cancellation) = self.cancellation {
                 cancellation.check()?;
             }
@@ -631,9 +635,14 @@ pub(super) fn dimension_sharing_pattern_bindings(
             if !matcher.admit_work(LocalMatcher::operand_nodes(&root))? {
                 break 'frontiers;
             }
-            let candidate = super::super::semantic_plan::instantiate_bound_plan_with_group_holes(
-                memo, state, &root, None,
-            )?;
+            let Some(candidate) =
+                super::super::semantic_plan::instantiate_bound_plan_with_group_holes(
+                    memo, state, &root, None,
+                )?
+            else {
+                matcher.limited = true;
+                break 'frontiers;
+            };
             if !crate::aggregate::dimension_sharing::recognizes_plan(&candidate.plan) {
                 continue;
             }
@@ -1051,6 +1060,10 @@ fn enumerate_pattern_bindings(
         }
 
         fn admit_work(&mut self, units: usize) -> Result<bool> {
+            if !self.memo.control().checkpoint()? {
+                self.limited = true;
+                return Ok(false);
+            }
             if let Some(cancellation) = self.cancellation {
                 cancellation.check()?;
             }

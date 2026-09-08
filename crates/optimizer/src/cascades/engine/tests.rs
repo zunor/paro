@@ -966,6 +966,121 @@ fn optional_transformation_can_improve_mandatory_baseline() {
 }
 
 #[test]
+fn zero_wall_budget_returns_a_verified_incumbent_without_charging_work() {
+    let budget = super::super::budget::SearchBudget {
+        optional_time_limit: Some(Duration::ZERO),
+        ..Default::default()
+    };
+    let (mut engine, group, goal) = engine_with_budget(budget);
+    let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+    assert_eq!(winner.physical_fingerprint, Fingerprint(10));
+    assert!(engine.rule_attempts().is_empty());
+    assert_eq!(engine.memo.search_obligations().len(), 1);
+    assert_eq!(
+        engine.memo.search_obligations()[0].reason,
+        crate::cascades::budget::SearchIncompleteReason::Deadline
+    );
+    assert_eq!(
+        engine
+            .memo
+            .group(group)
+            .unwrap()
+            .ledger
+            .consumed(BudgetDimension::RuleWorkPerGroup),
+        0
+    );
+    crate::cascades::verifier::WinnerVerifier::verify(&engine.memo).unwrap();
+}
+
+struct StopAfterMemoWrite {
+    cancel: bool,
+}
+
+impl TransformationRule for StopAfterMemoWrite {
+    fn id(&self) -> RuleId {
+        RuleId(906)
+    }
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
+        expr.key.operator == Fingerprint(10)
+    }
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
+    }
+    fn apply(
+        &self,
+        expr: LogicalExprId,
+        ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        ctx.memo_mut().create_group(
+            schema(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        if self.cancel {
+            return Err(paro_error::query_canceled());
+        }
+        ctx.memo().control().expire();
+        AddEquivalent.apply(expr, ctx)
+    }
+}
+
+#[test]
+fn deadline_mid_attempt_rolls_back_and_extracts_the_archived_incumbent() {
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.disable_transformation(RuleId(5));
+    let (mut engine, group, goal) = engine_with_budget(budget);
+    engine
+        .registry
+        .register_transformation(StopAfterMemoWrite { cancel: false })
+        .unwrap();
+    let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+    assert_eq!(engine.memo.group_count(), 1);
+    assert_eq!(winner.physical_fingerprint, Fingerprint(10));
+    assert!(
+        engine.memo.group(group).unwrap().winner(goal).is_none(),
+        "new cost epoch has no complete root"
+    );
+    let archived = engine
+        .memo
+        .resolve_child_winner(ChildWinnerRef {
+            group,
+            goal,
+            candidate: winner.candidate,
+        })
+        .unwrap();
+    assert_eq!(archived.physical_fingerprint, winner.physical_fingerprint);
+    crate::cascades::verifier::WinnerVerifier::verify_candidate_tree(
+        &engine.memo,
+        ChildWinnerRef {
+            group,
+            goal,
+            candidate: winner.candidate,
+        },
+    )
+    .unwrap();
+    assert_eq!(engine.memo.search_obligations().len(), 1);
+    assert_eq!(
+        engine.memo.search_obligations()[0].reason,
+        crate::cascades::budget::SearchIncompleteReason::Deadline
+    );
+}
+
+#[test]
+fn statement_cancellation_is_not_an_advisory_rule_failure() {
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.disable_transformation(RuleId(5));
+    let (mut engine, group, goal) = engine_with_budget(budget);
+    engine
+        .registry
+        .register_transformation(StopAfterMemoWrite { cancel: true })
+        .unwrap();
+    let error = engine.optimize(group, goal, SearchMode::Memo).unwrap_err();
+    assert!(error.is_query_canceled());
+    assert_eq!(engine.memo.group_count(), 1);
+    assert!(engine.memo.search_obligations().is_empty());
+}
+
+#[test]
 fn engine_seals_context_catalog_before_optional_search() {
     let mut budget = super::super::budget::SearchBudget::default();
     budget.disable_transformation(RuleId(5));

@@ -22,6 +22,9 @@ pub struct SearchObligation {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SearchIncompleteReason {
     Budget(BudgetDimension),
+    /// Cooperative wall deadline. Work ledgers remain unchanged: this is not
+    /// evidence that the configured logical/physical closure was exhausted.
+    Deadline,
     /// The baseline survives an advisory rule failure, but an unexamined
     /// equivalence class must not be advertised as a completed search.
     RuleFailure {
@@ -87,6 +90,10 @@ impl BudgetDimension {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchBudget {
+    /// Isolation ceiling, not a latency tuning knob. It includes incumbent
+    /// construction; only optional work stops at this deadline. `None` is
+    /// useful for exhaustive oracles and controlled profiling.
+    pub optional_time_limit: Option<std::time::Duration>,
     /// Emergency isolation surface for a faulty optional equivalence rule.
     /// Mandatory normalization and baseline implementations are not rules and
     /// cannot be disabled through this set.
@@ -148,6 +155,7 @@ pub struct SearchBudget {
 impl Default for SearchBudget {
     fn default() -> Self {
         Self {
+            optional_time_limit: Some(std::time::Duration::from_secs(30)),
             disabled_transformation_rules: BTreeSet::new(),
             // Local and composition shells are separate pools, but both must
             // leave enough headroom for two independent child rewrites to be

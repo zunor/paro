@@ -169,6 +169,7 @@ type BindingApplications = BTreeMap<(TransformationTaskId, Fingerprint), Vec<Bin
 /// recursive goal optimization, and winner verification.
 #[derive(Debug)]
 pub struct CascadesEngine {
+    mandatory_only: bool,
     memo: Memo,
     registry: ImplementationRegistry,
     enforcement: EnforcementPlanner,
@@ -204,6 +205,7 @@ impl CascadesEngine {
     pub fn new(memo: Memo, registry: ImplementationRegistry) -> Self {
         let budget = memo.budget().clone();
         Self {
+            mandatory_only: false,
             memo,
             registry,
             enforcement: EnforcementPlanner::new(
@@ -252,7 +254,22 @@ impl CascadesEngine {
         // contexts admitted with the initial logical forest.
         self.memo.freeze_optimization_contexts()?;
         let root = self.memo.canonical_group(root);
+        let mut incumbent = None;
         if mode == SearchMode::Memo {
+            self.mandatory_only = true;
+            self.optimize_group(root, goal)?;
+            super::verifier::MemoVerifier::verify(&self.memo, None)?;
+            incumbent = self
+                .memo
+                .group(root)
+                .and_then(|group| group.winner(goal))
+                .cloned();
+            self.mandatory_only = false;
+            self.memo.control().begin_optional();
+            if !self.memo.control().checkpoint()? {
+                return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
+            }
+            self.reset_cost_epoch();
             self.explore_transformations()?;
         }
         self.optimize_group(root, goal)?;
@@ -261,7 +278,17 @@ impl CascadesEngine {
             .group(root)
             .and_then(|group| group.winner(goal))
             .cloned()
+            .or(incumbent)
             .ok_or_else(|| self.infeasible_goal_error(root, goal))
+    }
+
+    fn reset_cost_epoch(&mut self) {
+        self.memo.clear_cost_frontiers();
+        self.recipes.clear();
+        self.implemented_goals.clear();
+        self.infeasible_goals.clear();
+        self.grant_sensitivity.clear();
+        self.region_candidates.clear();
     }
 
     /// Optimize a bounded set of grant classes while sharing the complete
@@ -288,9 +315,42 @@ impl CascadesEngine {
             ));
         }
         self.memo.freeze_optimization_contexts()?;
+        let root = self.memo.canonical_group(root);
         if mode == SearchMode::Memo {
+            self.mandatory_only = true;
+            let incumbent = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
+            self.mandatory_only = false;
+            // An infeasible initial implementation may become feasible under
+            // an optional rewrite. Do not report a fabricated incumbent in
+            // that case, but still permit the requested bounded search.
+            if incumbent.is_ok() {
+                super::verifier::MemoVerifier::verify(&self.memo, None)?;
+            }
+            self.memo.control().begin_optional();
+            if !self.memo.control().checkpoint()? {
+                return incumbent;
+            }
+            self.reset_cost_epoch();
             self.explore_transformations()?;
+            if !self.memo.control().checkpoint()? {
+                return incumbent;
+            }
+            let result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
+            if self.memo.control().deadline_reached() && result.is_err() {
+                return incumbent;
+            }
+            return result;
         }
+        self.optimize_grant_classes(root, base_goal, admissible_set, &classes)
+    }
+
+    fn optimize_grant_classes(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: &BTreeSet<ResourceGrantClassId>,
+    ) -> Result<GrantOptimization> {
         self.grant_class_sets.clear();
         self.grant_class_sets
             .extend(classes.iter().copied().map(|class| (class, admissible_set)));
@@ -321,7 +381,7 @@ impl CascadesEngine {
                 };
                 let winner = self.optimize(root, goal, SearchMode::Direct)?;
                 verify_grant_invariance(&self.memo, &self.registry, proof)?;
-                winners.extend(classes.into_iter().map(|class| GrantWinner {
+                winners.extend(classes.iter().copied().map(|class| GrantWinner {
                     class,
                     goal,
                     winner: winner.clone(),
@@ -329,7 +389,7 @@ impl CascadesEngine {
             }
             GrantSensitivitySummary::Sensitive { .. } => {
                 let mut last_infeasible = None;
-                for class in classes {
+                for class in classes.iter().copied() {
                     let goal = OptimizationGoal {
                         grant: GrantGoalKey::Class(class),
                         ..base_goal
@@ -396,6 +456,7 @@ impl CascadesEngine {
     }
 
     fn explore_transformations(&mut self) -> Result<()> {
+        self.memo.control().begin_optional();
         self.memo.seal_optional_group_budget();
         let mut agenda = StableAgenda::default();
         for group_index in 0..self.memo.group_count() {
@@ -404,7 +465,10 @@ impl CascadesEngine {
                 self.schedule_transformations(group, &mut agenda)?;
             }
         }
-        while let Some(task) = agenda.pop() {
+        'tasks: while let Some(task) = agenda.pop() {
+            if !self.memo.control().checkpoint()? {
+                break;
+            }
             let SearchTask::Transform {
                 group,
                 expression,
@@ -485,6 +549,9 @@ impl CascadesEngine {
             let allocated = paro_common::allocator::allocated_bytes_since(binding_allocated);
             let accumulated = self.rule_allocated_bytes.entry(rule).or_default();
             *accumulated = accumulated.saturating_add(allocated);
+            if !self.memo.control().checkpoint()? {
+                break;
+            }
             if let Some(previous) = self.transformation_fact_observations.get(&task_id) {
                 let mut reads = binding_set.reads.into_vec();
                 for read in previous {
@@ -551,6 +618,9 @@ impl CascadesEngine {
                 .transformation_bindings
                 .saturating_add(binding_set.bindings.len() as u64);
             for binding in binding_set.bindings.iter() {
+                if !self.memo.control().checkpoint()? {
+                    break 'tasks;
+                }
                 let application_key = (task_id, binding.fingerprint);
                 let previous_application = self
                     .transformation_applications
@@ -733,6 +803,20 @@ impl CascadesEngine {
                 let allocated = paro_common::allocator::allocated_bytes_since(apply_allocated);
                 let accumulated = self.rule_allocated_bytes.entry(rule).or_default();
                 *accumulated = accumulated.saturating_add(allocated);
+                match context.memo().control().checkpoint() {
+                    Ok(true) => {}
+                    stopped => {
+                        context.rollback()?;
+                        release_transformation_output_reservations(
+                            &mut self.memo,
+                            group,
+                            &output_events,
+                            output_dimension,
+                        )?;
+                        stopped?;
+                        break 'tasks;
+                    }
+                }
                 let fact_value = context.fact_value_fingerprint();
                 let fact_reads = context.take_fact_reads();
                 application_reads.extend(fact_reads.iter().copied());
@@ -747,6 +831,9 @@ impl CascadesEngine {
                     Ok(outputs) => outputs,
                     Err(error) => {
                         context.rollback()?;
+                        if error.is_query_canceled() {
+                            return Err(error);
+                        }
                         self.seed_transformation_observation(task_id, &binding_set.reads)?;
                         release_transformation_output_reservations(
                             &mut self.memo,
@@ -1283,6 +1370,9 @@ impl CascadesEngine {
         }
 
         while let Some(task) = agenda.pop() {
+            if !self.memo.control().checkpoint()? {
+                break;
+            }
             let SearchTask::Implement {
                 group,
                 expression,
@@ -1316,6 +1406,9 @@ impl CascadesEngine {
                 )
             });
             for candidate in candidates {
+                if self.mandatory_only && !candidate.mandatory {
+                    continue;
+                }
                 self.admit_candidate(group, expression, implementation, goal, candidate)?;
             }
         }
@@ -1440,6 +1533,9 @@ impl CascadesEngine {
     }
 
     fn optimize_group(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
+        if !self.memo.control().checkpoint()? {
+            return Ok(());
+        }
         let group = self.memo.canonical_group(group);
         if self
             .memo
@@ -1497,6 +1593,9 @@ impl CascadesEngine {
             );
         }
         for (physical, recipe) in recipes {
+            if !self.memo.control().checkpoint()? {
+                break;
+            }
             let mut child_frontiers = Vec::with_capacity(recipe.child_goals.len());
             let mut children_feasible = true;
             for (child, child_goal) in recipe.child_goals.iter().copied() {
@@ -1585,6 +1684,9 @@ impl CascadesEngine {
                 "enumerated bounded child frontier product"
             );
             for (ordinal, child_selections) in combinations.combinations.enumerate() {
+                if !self.memo.control().checkpoint()? {
+                    break;
+                }
                 if ordinal > 0 {
                     let event = child_frontier_combination_event(
                         physical,

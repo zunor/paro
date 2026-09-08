@@ -895,6 +895,7 @@ impl Group {
 
 #[derive(Debug)]
 pub struct Memo {
+    control: Arc<super::control::SearchControl>,
     groups: Vec<Group>,
     parents: Vec<GroupId>,
     logical_exprs: Vec<LogicalExpr>,
@@ -944,6 +945,9 @@ impl Memo {
         let budget = Arc::new(budget);
         let global_ledger = SearchLedger::new(budget.clone());
         Self {
+            control: Arc::new(super::control::SearchControl::new(
+                budget.optional_time_limit,
+            )),
             groups: Vec::new(),
             parents: Vec::new(),
             logical_exprs: Vec::new(),
@@ -975,6 +979,31 @@ impl Memo {
 
     pub fn set_calibration(&mut self, calibration: Arc<MachineCalibrationBundle>) {
         self.calibration = calibration;
+    }
+
+    pub fn control(&self) -> &Arc<super::control::SearchControl> {
+        &self.control
+    }
+
+    pub fn set_cancellation(
+        &mut self,
+        cancellation: paro_context::StatementCancellation,
+    ) -> Result<()> {
+        Arc::get_mut(&mut self.control)
+            .ok_or_else(|| {
+                paro_error::internal("search cancellation must be set before sharing control")
+            })?
+            .set_cancellation(cancellation);
+        Ok(())
+    }
+
+    /// Start a new cost epoch after logical facts change. Archived candidate
+    /// DAGs remain immutable and extractable; stale estimates do not compete
+    /// with the new epoch's frontier.
+    pub(crate) fn clear_cost_frontiers(&mut self) {
+        for group in &mut self.groups {
+            group.winner_frontiers.clear();
+        }
     }
 
     pub fn calibration(&self) -> &MachineCalibrationBundle {
@@ -1701,6 +1730,13 @@ impl Memo {
                 obligation
             })
             .collect::<BTreeSet<_>>();
+        if self.control.deadline_reached() {
+            obligations.insert(SearchObligation {
+                group: None,
+                reason: SearchIncompleteReason::Deadline,
+                witness: Fingerprint(0),
+            });
+        }
         obligations.extend(
             self.global_ledger
                 .exhaustion_events()

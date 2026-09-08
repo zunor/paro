@@ -341,6 +341,9 @@ impl<'a> TransformContext<'a> {
     /// Admit evidence work before traversal or allocation. Unlike a Memo
     /// mutation, this work survives an unsuccessful transformation attempt.
     pub fn admit_fact_work(&mut self, dimension: BudgetDimension, units: usize) -> Result<bool> {
+        if !self.memo.control().checkpoint()? {
+            return Ok(false);
+        }
         if units == 0 {
             return Ok(true);
         }

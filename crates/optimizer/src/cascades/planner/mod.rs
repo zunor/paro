@@ -308,6 +308,11 @@ impl OptimizationInput {
             self.force_spill,
         )?;
         let mut engine = CascadesEngine::new(self.memo, registry);
+        if let Some(session) = &self.planner_state.read().unwrap().session {
+            engine
+                .memo_mut()
+                .set_cancellation(session.cancellation.clone())?;
+        }
         let grant_optimization = engine.optimize_for_grants(
             self.root,
             self.root_goal,
@@ -344,6 +349,7 @@ impl OptimizationInput {
                     &self.bind_context,
                     self.root,
                     grant_winner.goal,
+                    winner.candidate,
                     mode,
                 )?
             };
@@ -778,7 +784,7 @@ impl MemoBuilder {
                     // post-order node, turning Memo construction into O(N²).
                     let (shell, detached_children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
                     let semantic_template = semantic_plan::canonical_template(shell.clone());
-                    let mut plan = shell.assemble(detached_children)?;
+                    let plan = shell.assemble(detached_children)?;
                     let search_candidate = match candidate_context.as_ref() {
                         Some(search_context)
                             if matches!(
@@ -792,7 +798,7 @@ impl MemoBuilder {
                         _ => None,
                     };
                     let scalar_roots = intern_operator_scalars(
-                        &mut plan.operator,
+                        &plan.operator,
                         &output_columns,
                         &child_states
                             .iter()

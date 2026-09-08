@@ -19,7 +19,7 @@ fn settle_with_session_arena(
     state: &mut PlannerTransformState,
     plan: OwnedLogicalPlan,
     environment: &PlannerRuleEnvironment,
-) -> Result<settlement::SettledExpression> {
+) -> Result<Option<settlement::SettledExpression>> {
     state
         .settlement_cache
         .settle_arena_in(plan, environment, &mut state.staging_arena)
@@ -410,12 +410,15 @@ impl TransformationRule for PlannerTransformationRule {
                 .planner_state
                 .read()
                 .expect("planner transform state poisoned");
-            let instantiated = semantic_plan::instantiate_bound_plan_with_group_holes(
+            let Some(instantiated) = semantic_plan::instantiate_bound_plan_with_group_holes(
                 ctx.memo(),
                 &state,
                 &binding.root,
                 Some(&facts),
-            )?;
+            )?
+            else {
+                return Ok(Box::new([]));
+            };
             let plan = instantiated.plan;
             let logical = ctx
                 .memo()
@@ -451,6 +454,7 @@ impl TransformationRule for PlannerTransformationRule {
                 metadata.output_columns.clone(),
                 instantiated.group_holes,
                 PlannerRuleEnvironment {
+                    control: ctx.memo().control().clone(),
                     bind_context: state.bind_context.clone(),
                     session: state.session.clone().ok_or_else(|| {
                         paro_error::internal("planner rule has no statement context")
@@ -555,16 +559,20 @@ impl TransformationRule for PlannerTransformationRule {
                 retained_group_holes.keys().copied(),
                 &environment.bind_context,
             )?;
-            let settlement::SettledExpression {
-                plan,
-                statistics: column_stats,
-                scopes,
-            } = {
+            let settled = {
                 let mut planner_state = self
                     .planner_state
                     .write()
                     .expect("planner transform state poisoned");
                 settle_with_session_arena(&mut planner_state, plan, &environment)?
+            };
+            let Some(settlement::SettledExpression {
+                plan,
+                statistics: column_stats,
+                scopes,
+            }) = settled
+            else {
+                return Ok(Box::new([]));
             };
             {
                 let state = self
@@ -853,6 +861,7 @@ fn transformed_layout_matches_group_contract(
 
 #[derive(Clone)]
 struct PlannerRuleEnvironment {
+    control: Arc<super::super::control::SearchControl>,
     bind_context: BindContext,
     session: Arc<paro_context::StatementContext>,
     cost_model: crate::cost_model::CostModel,

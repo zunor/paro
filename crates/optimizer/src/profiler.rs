@@ -166,6 +166,12 @@ impl OptimizerProfiler {
                 })
                 .count() as u64,
         );
+        self.counters.insert(
+            "search_deadline_reached".to_string(),
+            u64::from(summary.obligations.iter().any(|obligation| {
+                obligation.reason == crate::cascades::budget::SearchIncompleteReason::Deadline
+            })),
+        );
         self.counters
             .insert("memo_group_count".to_string(), summary.groups);
         self.counters.insert(
