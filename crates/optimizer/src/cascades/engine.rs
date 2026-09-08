@@ -803,6 +803,19 @@ impl CascadesEngine {
                 let allocated = paro_common::allocator::allocated_bytes_since(apply_allocated);
                 let accumulated = self.rule_allocated_bytes.entry(rule).or_default();
                 *accumulated = accumulated.saturating_add(allocated);
+                if let Err(error) = &outputs_result {
+                    if error.is_query_canceled() {
+                        let error = error.clone();
+                        context.rollback()?;
+                        release_transformation_output_reservations(
+                            &mut self.memo,
+                            group,
+                            &output_events,
+                            output_dimension,
+                        )?;
+                        return Err(error);
+                    }
+                }
                 match context.memo().control().checkpoint() {
                     Ok(true) => {}
                     stopped => {
@@ -831,9 +844,6 @@ impl CascadesEngine {
                     Ok(outputs) => outputs,
                     Err(error) => {
                         context.rollback()?;
-                        if error.is_query_canceled() {
-                            return Err(error);
-                        }
                         self.seed_transformation_observation(task_id, &binding_set.reads)?;
                         release_transformation_output_reservations(
                             &mut self.memo,

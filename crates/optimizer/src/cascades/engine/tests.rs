@@ -1017,6 +1017,9 @@ impl TransformationRule for StopAfterMemoWrite {
             GroupCardinality::default(),
         );
         if self.cancel {
+            // Both can become visible at the same boundary. The statement
+            // cancellation must win over the optional-search fallback.
+            ctx.memo().control().expire();
             return Err(paro_error::query_canceled());
         }
         ctx.memo().control().expire();
@@ -1077,7 +1080,14 @@ fn statement_cancellation_is_not_an_advisory_rule_failure() {
     let error = engine.optimize(group, goal, SearchMode::Memo).unwrap_err();
     assert!(error.is_query_canceled());
     assert_eq!(engine.memo.group_count(), 1);
-    assert!(engine.memo.search_obligations().is_empty());
+    assert!(!engine
+        .memo
+        .search_obligations()
+        .iter()
+        .any(|obligation| matches!(
+            obligation.reason,
+            crate::cascades::budget::SearchIncompleteReason::RuleFailure { .. }
+        )));
 }
 
 #[test]
