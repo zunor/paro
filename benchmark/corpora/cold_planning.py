@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+"""Measure the first EXPLAIN in a fresh, owned server, with an external watchdog.
+
+The SQL is never rewritten. Startup/connection/SET costs are outside the timer;
+EXPLAIN wall time includes transport, parse, bind, optimize and plan rendering.
+Optimizer component time is reported separately. Allocation metrics are a
+separate build/configuration, never compared to an uninstrumented baseline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import psycopg
+from psycopg import sql
+
+from benchmark_evidence import (ManagedParoServer, build_benchmark_server,
+                                content_digest, repository_identity, tree_digest)
+
+COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physical_search",
+              "memo_exploration", "physical_extraction", "winner_verification"}
+
+
+class ProcessWatchdog:
+    """Bound a single owned process even when cooperative query checks stall."""
+
+    def __init__(self, process: subprocess.Popen, seconds: float, rss_limit: int) -> None:
+        self.process, self.seconds, self.rss_limit = process, seconds, rss_limit
+        self.peak_rss = 0
+        self.failure: str | None = None
+        self.done = threading.Event()
+        self.worker = threading.Thread(target=self._watch, daemon=True)
+
+    def _watch(self) -> None:
+        started = time.monotonic()
+        while not self.done.is_set() and self.process.poll() is None:
+            try:
+                output = subprocess.check_output(["ps", "-o", "rss=", "-p", str(self.process.pid)],
+                                                 timeout=2, text=True)
+                self.peak_rss = max(self.peak_rss, int(output.strip()) * 1024)
+            except (ValueError, subprocess.SubprocessError):
+                self.failure = "RSS observation failed"
+            if self.peak_rss > self.rss_limit:
+                self.failure = "external RSS limit exceeded"
+            if time.monotonic() - started > self.seconds:
+                self.failure = "external wall deadline exceeded"
+            if self.failure:
+                # Popen refers only to the child created for this sample. Never
+                # search/kill by port, binary name or an unowned numeric PID.
+                self.process.kill()
+                return
+            self.done.wait(0.02)
+
+    def __enter__(self) -> "ProcessWatchdog":
+        self.worker.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.done.set()
+        self.worker.join(timeout=3)
+
+
+def write_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    temporary.replace(path)
+
+
+def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block: int,
+           data_dir: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {"block": block, "status": "error"}
+    log = args.report.with_suffix(f".{name}.{block}.parod.log")
+    with ManagedParoServer(binary, data_dir, args.listen, log,
+                           max_memory=args.memory_limit, threads=args.threads) as server:
+        result["server"] = server.identity()
+        assert server.process is not None
+        with ProcessWatchdog(server.process, args.watchdog_seconds,
+                             args.rss_limit_mb * 1024 * 1024) as watchdog:
+            try:
+                host, port = args.listen.rsplit(":", 1)
+                with psycopg.connect(host=host, port=int(port), dbname=args.database,
+                                     user=args.user, autocommit=True, connect_timeout=10) as connection:
+                    connection.execute("SET optimizer_verify=true")
+                    connection.execute(sql.SQL("SET threads={}").format(sql.Literal(args.threads)))
+                    connection.execute(sql.SQL("SET memory_limit={}").format(sql.Literal(args.memory_limit)))
+                    connection.execute(sql.SQL("SET statement_timeout={}").format(
+                        sql.Literal(f"{args.watchdog_seconds}s")))
+                    started = time.perf_counter_ns()
+                    plan = connection.execute("EXPLAIN " + query).fetchall()
+                    result["explain_wall_ms"] = (time.perf_counter_ns() - started) / 1_000_000
+                    result["plan"] = "\n".join(str(row[0]) for row in plan)
+                    result["plan_sha256"] = hashlib.sha256(result["plan"].encode()).hexdigest()
+                    cursor = connection.execute("SELECT * FROM paro_optimizers()")
+                    columns = [column.name for column in cursor.description or ()]
+                    diagnostics = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+                    result["diagnostics"] = diagnostics
+                    seen = {row["name"] for row in diagnostics if row["name"] in COMPONENTS}
+                    if seen != COMPONENTS:
+                        raise RuntimeError("missing optimizer component diagnostics")
+                    result["optimizer_ms"] = sum(row["last_elapsed_us"] for row in diagnostics
+                                                 if row["name"] in COMPONENTS) / 1000
+                    result["counters"] = {row["name"]: row["metric_value"] for row in diagnostics
+                                          if row["kind"] == "search_counter" and row["metric_unit"] == "count"}
+                    result["status"] = "ok"
+            except Exception as error:
+                result["error"] = f"{type(error).__name__}: {error}"
+        result["peak_rss_bytes"] = watchdog.peak_rss
+        if watchdog.failure:
+            result.update(status="error", error=watchdog.failure)
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--server-data-dir", type=Path, required=True)
+    parser.add_argument("--query", type=Path, action="append", required=True)
+    parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--listen", default="127.0.0.1:6432")
+    parser.add_argument("--database", default="postgres")
+    parser.add_argument("--user", default="paro")
+    parser.add_argument("--process-blocks", type=int, default=5)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--memory-limit", default="2GB")
+    parser.add_argument("--watchdog-seconds", type=int, default=30)
+    parser.add_argument("--rss-limit-mb", type=int, default=2048)
+    parser.add_argument("--alloc-metrics", action="store_true")
+    parser.add_argument("--build-jobs", type=int, default=4)
+    args = parser.parse_args()
+    if min(args.process_blocks, args.watchdog_seconds, args.rss_limit_mb, args.threads) < 1:
+        parser.error("blocks, time, RSS and threads must be positive")
+    if len({path.stem for path in args.query}) != len(args.query):
+        parser.error("query filenames must have unique stems")
+    root = Path(__file__).resolve().parents[2]
+    binary, build = build_benchmark_server(root, args.build_jobs,
+                                           features=("alloc-metrics",) if args.alloc_metrics else ())
+    harness_files = (Path(__file__).resolve(), Path(__file__).with_name("benchmark_evidence.py"),
+                     root / "benchmark/harness/cold_planning_gate.py")
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "configuration": {key: getattr(args, key) for key in ("process_blocks", "threads", "memory_limit",
+                             "watchdog_seconds", "rss_limit_mb", "alloc_metrics")},
+        "evidence": {"build": build, "dataset_sha256": tree_digest(args.server_data_dir),
+                     "dataset_path": str(args.server_data_dir.resolve()),
+                     "machine": {"system": platform.platform(), "machine": platform.machine(),
+                                 "processor": platform.processor(), "host": platform.node(),
+                                 "logical_cpus": os.cpu_count()},
+                     "harness_sha256": hashlib.sha256("".join(content_digest(p) for p in harness_files).encode()).hexdigest(),
+                     "harness": [{"path": str(p), "sha256": content_digest(p)} for p in harness_files]},
+        "queries": [{"name": path.stem, "path": str(path.resolve()), "sql_sha256": content_digest(path),
+                     "samples": []} for path in args.query],
+    }
+    for path, observation in zip(args.query, report["queries"], strict=True):
+        query = path.read_text().strip()
+        for block in range(args.process_blocks):
+            try:
+                # Startup mutates owner/checkpoint metadata even for EXPLAIN.
+                # Every sample starts from the same immutable seed, not the
+                # preceding process's database. Copying is outside the timer.
+                with tempfile.TemporaryDirectory(prefix="paro-cold-") as temporary:
+                    data_dir = Path(temporary) / "data"
+                    command = ["cp", "-cR"] if sys.platform == "darwin" else ["cp", "-R", "--reflink=auto"]
+                    subprocess.run([*command, str(args.server_data_dir.resolve()), str(data_dir)], check=True)
+                    measurement = sample(args, binary, query, path.stem, block, data_dir)
+            except Exception as error:
+                measurement = {"block": block, "status": "error", "error": f"{type(error).__name__}: {error}"}
+            observation["samples"].append(measurement)
+            print(f"{path.stem} block {block}: {measurement.get('explain_wall_ms', '?')} ms, "
+                  f"{measurement['status']}", flush=True)
+            write_report(args.report, report)
+    if (repository_identity(root) != build["source"] or content_digest(binary) != build["binary_sha256"]
+            or tree_digest(args.server_data_dir) != report["evidence"]["dataset_sha256"]
+            or any(content_digest(path) != query["sql_sha256"] for path, query in zip(args.query, report["queries"], strict=True))):
+        report["invalidated"] = "source, SQL, dataset or binary changed during measurements"
+        write_report(args.report, report)
+        return 1
+    return 0 if all(s["status"] == "ok" for q in report["queries"] for s in q["samples"]) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

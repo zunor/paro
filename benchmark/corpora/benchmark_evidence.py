@@ -173,11 +173,13 @@ def hierarchical_abba_ratio(
 
 
 def build_benchmark_server(
-    repo_root: Path, jobs: int
+    repo_root: Path, jobs: int, *, features: tuple[str, ...] = ()
 ) -> tuple[Path, dict[str, Any]]:
     """Build the exact server image used by the owned benchmark process."""
     before = repository_identity(repo_root)
     command = ["cargo", "build", "--release", "--locked", "--bin", "parod"]
+    if features:
+        command.extend(["--features", ",".join(features)])
     environment = os.environ.copy()
     environment["CARGO_BUILD_JOBS"] = str(max(1, jobs))
     started = time.perf_counter_ns()
