@@ -45,3 +45,44 @@ proposal; no new pruning, rule, budget or ordering policy is introduced.
 
 Optimizer tests: 1033 pass, two doc tests ignored; optimizer/all-target Clippy
 passes. Diagnostic timing and the explanation of frontier growth follow.
+
+One fresh normal-release diagnostic at `ea1f1bc0` took 1348.831 ms with
+452,952,064 bytes peak RSS. Search counts exactly match the starting revision;
+this single process is attribution, not a latency regression conclusion.
+There were **zero group merges**, 3,402 physical goals, and only 13 frontiers at
+the 256-candidate cap. All 13 have **no ancestor source-filter demand**. The
+problem is concentrated, not universal high-dimensional frontier saturation.
+The immutable candidate archive retains 138,897,568 bytes of source-work
+slice payloads, including nested filters and proofs. This is live payload,
+not allocation traffic. The largest proposal groups are 30 (4,168),
+1021/982/969 (4,099 each), 1009 (3,949), and 996 (3,537). The precise cost-axis
+tradeoffs keeping these frontiers alive still need attribution before changing
+their pruning contract.
+
+## Frozen physical predicate schedules
+
+Physical implementation holds a read guard on logical state. An independent
+short-held payload-store mutex publishes immutable physical payloads; native
+predicate analysis occurs outside that mutex. A completed schedule is keyed by
+the logical expression ID and physical cost epoch, not by goal or permutation
+bytes. Mandatory and post-exploration epochs cannot reuse changed statistics,
+while exact old candidates retain their original physical payloads.
+
+`Canonical` is a completed schedule, distinct from interruption. An interrupted
+analysis publishes neither a payload nor a candidate; it cannot silently race
+an ordered implementation with a cost-identical canonical fallback. The engine
+still returns its separately verified mandatory incumbent on optional expiry.
+The cache is valid for the engine's frozen-fact physical-search epochs, not for
+arbitrary mutation of Memo facts inside an epoch.
+
+Rollback unwinds only schedule insertions after its savepoint. A no-delta
+rollback is constant work. Tests cover a held logical reader during actual
+implementation, 100 repeated goals in one epoch, changed evidence in the next
+epoch, exact old-payload replay, every interrupted analysis prefix, rollback,
+and the existing exhaustive fence/permutation oracle. The three schedule
+counters distinguish builds, hits and rollback removals; they do not alter
+search admission.
+
+Validation: 1,036 optimizer and 664 execution tests pass (two optimizer doc
+tests ignored), and strict workspace/all-target Clippy passes. This revision
+has not yet been timed; the cache is not claimed to close the cold target.

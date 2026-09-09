@@ -16,6 +16,41 @@ pub(super) struct PredicateOrder {
     ordinals: Box<[usize]>,
 }
 
+/// Canonical is a completed decision, not an interruption fallback. A missing
+/// result means no candidate may be published for this attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PredicateSchedule {
+    Canonical,
+    Ordered(PredicateOrder),
+}
+
+pub(super) fn implementation_schedule(
+    logical: &crate::cascades::memo::LogicalExpr,
+    metadata: &PlannerOperatorMetadata,
+    state: &PlannerTransformState,
+    memo: &Memo,
+) -> Result<Option<CachedFilterSchedule>> {
+    let key = FilterScheduleKey {
+        epoch: memo.cost_epoch(),
+        expression: logical.id,
+    };
+    if let Some(schedule) = state.payloads.filter_schedule(key) {
+        return Ok(Some(schedule));
+    }
+    let Some(schedule) = select(logical, state, memo)? else {
+        return Ok(None);
+    };
+    Ok(Some(state.payloads.publish_filter_schedule(
+        key,
+        logical.payload,
+        CachedFilterSchedule {
+            payload: metadata.baseline_payload,
+            fingerprint: metadata.operator_fingerprint,
+        },
+        schedule,
+    )))
+}
+
 impl PredicateOrder {
     pub(super) fn verify(&self, roots: &[ScalarExprId], arena: &ScalarArena) -> Result<()> {
         if self.ordinals.len() != roots.len() {
@@ -90,9 +125,12 @@ pub(super) fn select(
     logical: &crate::cascades::memo::LogicalExpr,
     state: &PlannerTransformState,
     memo: &Memo,
-) -> Result<Option<PredicateOrder>> {
-    if logical.key.scalars.len() < 2 || !memo.control().checkpoint()? {
+) -> Result<Option<PredicateSchedule>> {
+    if !memo.control().checkpoint()? {
         return Ok(None);
+    }
+    if logical.key.scalars.len() < 2 {
+        return Ok(Some(PredicateSchedule::Canonical));
     }
     let [input] = logical.key.children.as_ref() else {
         return Err(paro_error::internal(
@@ -133,7 +171,7 @@ pub(super) fn select(
                 }
             })
         },
-        memo.control(),
+        || memo.control().checkpoint(),
     )
 }
 
@@ -141,13 +179,13 @@ pub(super) fn permutation<'a>(
     roots: &[ScalarExprId],
     state: &'a PlannerTransformState,
     statistics: impl Fn(ColumnId) -> Option<crate::cost_model::ColumnPredicateEvidence<'a>>,
-    control: &crate::cascades::control::SearchControl,
-) -> Result<Option<PredicateOrder>> {
-    if !control.checkpoint()? {
+    mut checkpoint: impl FnMut() -> Result<bool>,
+) -> Result<Option<PredicateSchedule>> {
+    if !checkpoint()? {
         return Ok(None);
     }
     if roots.len() < 2 {
-        return Ok(None);
+        return Ok(Some(PredicateSchedule::Canonical));
     }
     let mut ordering = Vec::with_capacity(roots.len());
     let mut segment = Vec::<(usize, f64)>::new();
@@ -156,7 +194,7 @@ pub(super) fn permutation<'a>(
         ordering.extend(segment.drain(..).map(|(ordinal, _)| ordinal));
     };
     for (ordinal, &root) in roots.iter().enumerate() {
-        if !control.checkpoint()? {
+        if !checkpoint()? {
             return Ok(None);
         }
         let node = state
@@ -172,7 +210,7 @@ pub(super) fn permutation<'a>(
                 &state.scalars,
                 &state.binding_ids,
                 &statistics,
-                || control.checkpoint(),
+                &mut checkpoint,
             )?
             else {
                 return Ok(None);
@@ -186,13 +224,13 @@ pub(super) fn permutation<'a>(
         .enumerate()
         .all(|(before, after)| before == *after)
     {
-        return Ok(None);
+        return Ok(Some(PredicateSchedule::Canonical));
     }
     let order = PredicateOrder {
         ordinals: ordering.into_boxed_slice(),
     };
     order.verify(roots, &state.scalars)?;
-    Ok(Some(order))
+    Ok(Some(PredicateSchedule::Ordered(order)))
 }
 
 #[cfg(test)]
@@ -496,13 +534,13 @@ mod tests {
         assert!(found);
         drop(state);
         {
-            let mut state = input.planner_state.write().unwrap();
-            let PlannerPhysicalTemplate::OrderedFilter { order, .. } =
-                &mut state.payloads.physical[payload.index()].template
-            else {
-                panic!("ordered filter")
-            };
-            order.ordinals[0] = order.ordinals[1];
+            let state = input.planner_state.read().unwrap();
+            state.payloads.tamper_physical(payload, |template| {
+                let PlannerPhysicalTemplate::OrderedFilter { order, .. } = template else {
+                    panic!("ordered filter")
+                };
+                order.ordinals[0] = order.ordinals[1];
+            });
         }
         let state = input.planner_state.read().unwrap();
         assert!(extract_planner_tree(
@@ -526,27 +564,49 @@ mod tests {
             .unwrap();
         let mut state = input.planner_state.write().unwrap();
         let checkpoint = state.savepoint();
-        let before = state.payloads.physical.len();
+        let before = state.payloads.physical_count();
         let order = PredicateOrder {
             ordinals: Box::new([1, 0]),
         };
-        let first = state
-            .payloads
-            .intern_filter_order(logical.payload, order.clone());
+        let metadata = &state.metadata[&logical.payload];
+        let key = FilterScheduleKey {
+            epoch: input.memo.cost_epoch(),
+            expression: logical.id,
+        };
+        let canonical = CachedFilterSchedule {
+            payload: metadata.baseline_payload,
+            fingerprint: metadata.operator_fingerprint,
+        };
+        let first = state.payloads.publish_filter_schedule(
+            key,
+            logical.payload,
+            canonical,
+            PredicateSchedule::Ordered(order.clone()),
+        );
         for _ in 0..100 {
-            assert_eq!(
-                state
-                    .payloads
-                    .intern_filter_order(logical.payload, order.clone()),
-                first
-            );
+            assert_eq!(state.payloads.filter_schedule(key), Some(first));
         }
-        assert_eq!(state.payloads.physical.len(), before + 1);
+        assert_eq!(state.payloads.physical_count(), before + 1);
         state.rollback_to(checkpoint).unwrap();
-        assert_eq!(state.payloads.physical.len(), before);
-        let reinserted = state.payloads.intern_filter_order(logical.payload, order);
-        assert!(state.payloads.get_physical(reinserted).is_some());
-        assert_eq!(state.payloads.physical.len(), before + 1);
+        assert_eq!(state.payloads.physical_count(), before);
+        assert!(state.payloads.filter_schedule(key).is_none());
+        let reinserted = state.payloads.publish_filter_schedule(
+            key,
+            logical.payload,
+            canonical,
+            PredicateSchedule::Ordered(order),
+        );
+        assert!(state.payloads.get_physical(reinserted.payload).is_some());
+        assert_eq!(state.payloads.physical_count(), before + 1);
+        assert_eq!(state.payloads.schedule_counters()[2].1, 1);
+        // A normal unsuccessful rule attempt has no physical delta. It must
+        // not scan, retire or reinsert the persistent schedule cache.
+        for _ in 0..100 {
+            let checkpoint = state.savepoint();
+            state.rollback_to(checkpoint).unwrap();
+        }
+        assert_eq!(state.payloads.filter_schedule(key), Some(reinserted));
+        assert_eq!(state.payloads.schedule_counters()[2].1, 1);
     }
 
     #[test]
@@ -557,15 +617,176 @@ mod tests {
             .logical_expr(input.memo.group(input.root).unwrap().logical_exprs()[0])
             .unwrap();
         let state = input.planner_state.read().unwrap();
-        let count = state.payloads.physical.len();
+        let count = state.payloads.physical_count();
         input.memo.control().begin_optional();
         input.memo.control().expire();
-        assert!(select(logical, &state, &input.memo).unwrap().is_none());
-        assert_eq!(state.payloads.physical.len(), count);
+        assert!(implementation_schedule(
+            logical,
+            &state.metadata[&logical.payload],
+            &state,
+            &input.memo
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(state.payloads.physical_count(), count);
+        assert_eq!(state.payloads.schedule_counters()[1].1, 0);
         assert!(state
             .payloads
             .get_physical(state.metadata[&logical.payload].baseline_payload)
             .is_some());
+    }
+
+    #[test]
+    fn schedule_is_built_once_per_frozen_epoch_not_once_per_goal() {
+        let mut input = two_column_filter();
+        let logical = input
+            .memo
+            .logical_expr(input.memo.group(input.root).unwrap().logical_exprs()[0])
+            .unwrap()
+            .clone();
+        let state = input.planner_state.read().unwrap();
+        let columns: Vec<_> = logical
+            .key
+            .scalars
+            .iter()
+            .map(|root| {
+                state
+                    .scalars
+                    .get(*root)
+                    .unwrap()
+                    .properties
+                    .local_columns()
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        let child = logical.key.children[0];
+        for (column, point) in columns.iter().zip([2, 100]) {
+            input
+                .memo
+                .group_mut(child)
+                .unwrap()
+                .logical_properties
+                .column_domains
+                .insert(*column, GroupColumnDomain::new(Some(point), None).unwrap());
+        }
+        let metadata = &state.metadata[&logical.payload];
+        let selected = implementation_schedule(&logical, metadata, &state, &input.memo)
+            .unwrap()
+            .unwrap();
+        assert_ne!(selected.payload, metadata.baseline_payload);
+        for _ in 0..100 {
+            assert_eq!(
+                implementation_schedule(&logical, metadata, &state, &input.memo).unwrap(),
+                Some(selected)
+            );
+        }
+        assert_eq!(state.payloads.schedule_counters()[1].1, 1);
+        assert_eq!(state.payloads.schedule_counters()[0].1, 100);
+        let previous = input.memo.cost_epoch();
+        input.memo.clear_cost_frontiers().unwrap();
+        assert_ne!(previous, input.memo.cost_epoch());
+        for (column, point) in columns.iter().zip([100, 2]) {
+            input
+                .memo
+                .group_mut(child)
+                .unwrap()
+                .logical_properties
+                .column_domains
+                .insert(*column, GroupColumnDomain::new(Some(point), None).unwrap());
+        }
+        let next = implementation_schedule(&logical, metadata, &state, &input.memo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.payload, metadata.baseline_payload);
+        assert_eq!(state.payloads.schedule_counters()[1].1, 2);
+        assert!(
+            state.payloads.get_physical(selected.payload).is_some(),
+            "old exact candidates retain their frozen payload"
+        );
+    }
+
+    #[test]
+    fn physical_implementation_can_complete_while_a_logical_reader_is_held() {
+        let input = two_column_filter();
+        let state = input.planner_state.clone();
+        let reader = state.read().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let classes = super::super::tests::test_grant_classes();
+            let mut registry = ImplementationRegistry::default();
+            implementation::register_implementations(
+                &mut registry,
+                input.planner_state.clone(),
+                Arc::new(classes.iter().map(|class| (class.id, *class)).collect()),
+                input.calibration.clone(),
+                false,
+            )
+            .unwrap();
+            let goal = OptimizationGoal {
+                grant: GrantGoalKey::Class(classes[0].id),
+                ..input.root_goal
+            };
+            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let candidates = registry
+                .implementation(PLANNER_BASELINE_IMPLEMENTATION)
+                .unwrap()
+                .candidates(
+                    expression,
+                    goal,
+                    &ImplementationContext {
+                        memo: &input.memo,
+                        group: input.root,
+                    },
+                )
+                .unwrap();
+            send.send(candidates.len()).unwrap();
+        });
+        let completed = receive.recv_timeout(std::time::Duration::from_secs(5));
+        // Release even on regression so the worker cannot strand the suite.
+        drop(reader);
+        worker.join().unwrap();
+        assert!(completed.unwrap() > 0);
+    }
+
+    #[test]
+    fn every_interrupted_scheduling_prefix_is_distinct_from_canonical_completion() {
+        let input = two_column_filter();
+        let logical = input
+            .memo
+            .logical_expr(input.memo.group(input.root).unwrap().logical_exprs()[0])
+            .unwrap();
+        let state = input.planner_state.read().unwrap();
+        let mut calls = 0;
+        let completed = permutation(
+            &logical.key.scalars,
+            &state,
+            |_| None,
+            || {
+                calls += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(completed.is_some());
+        for prefix in 0..calls {
+            let mut consumed = 0;
+            let interrupted = permutation(
+                &logical.key.scalars,
+                &state,
+                |_| None,
+                || {
+                    let admitted = consumed < prefix;
+                    consumed += 1;
+                    Ok(admitted)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                interrupted, None,
+                "interruption {prefix}/{calls} must not masquerade as canonical"
+            );
+        }
     }
 
     #[test]
@@ -646,15 +867,28 @@ mod tests {
             .find(|root| *root != equality)
             .unwrap();
         roots = vec![range, equality, roots[2], range, equality, equality];
-        let order = permutation(&roots, &state, |_| None, input.memo.control())
-            .unwrap()
-            .unwrap();
+        let order = permutation(
+            &roots,
+            &state,
+            |_| None,
+            || input.memo.control().checkpoint(),
+        )
+        .unwrap()
+        .unwrap();
+        let PredicateSchedule::Ordered(order) = order else {
+            panic!("ordered")
+        };
         assert_eq!(&*order.ordinals, &[1, 0, 2, 4, 5, 3]);
         let ordered = order.ordered_roots(&roots, &state.scalars).unwrap();
-        assert!(
-            permutation(&ordered, &state, |_| None, input.memo.control())
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            permutation(
+                &ordered,
+                &state,
+                |_| None,
+                || input.memo.control().checkpoint()
+            )
+            .unwrap(),
+            Some(PredicateSchedule::Canonical)
         );
         assert_eq!(
             before,

@@ -28,6 +28,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod profile;
 pub use profile::{PhysicalFrontierProfile, PhysicalGroupProfile, PhysicalSearchProfile};
 
+/// A physical costing/scheduling epoch observes one frozen logical fact set.
+/// Old exact candidates remain replayable, but cannot seed new fact decisions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CostEpoch(u64);
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogicalProperties {
     pub unique_keys: BTreeSet<Box<[super::ids::ColumnId]>>,
@@ -945,6 +950,7 @@ pub struct Memo {
     winner_candidates: Vec<WinnerCandidate>,
     winner_proposals: u64,
     group_merges: u64,
+    cost_epoch: CostEpoch,
     properties: PropertyInterner,
     optimization_contexts: Vec<OptimizationContext>,
     optimization_context_index: BTreeMap<OptimizationContext, OptimizationContextId>,
@@ -1002,6 +1008,7 @@ impl Memo {
             winner_candidates: Vec::new(),
             winner_proposals: 0,
             group_merges: 0,
+            cost_epoch: CostEpoch::default(),
             properties: PropertyInterner::default(),
             optimization_contexts: vec![root_context.clone()],
             optimization_context_index: BTreeMap::from([(
@@ -1048,10 +1055,21 @@ impl Memo {
     /// Start a new cost epoch after logical facts change. Archived candidate
     /// DAGs remain immutable and extractable; stale estimates do not compete
     /// with the new epoch's frontier.
-    pub(crate) fn clear_cost_frontiers(&mut self) {
+    pub(crate) fn clear_cost_frontiers(&mut self) -> Result<()> {
+        self.cost_epoch = CostEpoch(
+            self.cost_epoch
+                .0
+                .checked_add(1)
+                .ok_or_else(|| paro_error::internal("physical cost epoch exhausted"))?,
+        );
         for group in &mut self.groups {
             group.winner_frontiers.clear();
         }
+        Ok(())
+    }
+
+    pub(crate) fn cost_epoch(&self) -> CostEpoch {
+        self.cost_epoch
     }
 
     pub fn calibration(&self) -> &MachineCalibrationBundle {

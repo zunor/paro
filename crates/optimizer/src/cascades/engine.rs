@@ -274,7 +274,7 @@ impl CascadesEngine {
             if !self.memo.control().checkpoint()? {
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
             }
-            self.reset_cost_epoch();
+            self.reset_cost_epoch()?;
             self.explore_transformations()?;
         }
         self.optimize_group(root, goal)?;
@@ -287,13 +287,14 @@ impl CascadesEngine {
             .ok_or_else(|| self.infeasible_goal_error(root, goal))
     }
 
-    fn reset_cost_epoch(&mut self) {
-        self.memo.clear_cost_frontiers();
+    fn reset_cost_epoch(&mut self) -> Result<()> {
+        self.memo.clear_cost_frontiers()?;
         self.recipes.clear();
         self.implemented_goals.clear();
         self.infeasible_goals.clear();
         self.grant_sensitivity.clear();
         self.region_candidates.clear();
+        Ok(())
     }
 
     /// Optimize a bounded set of grant classes while sharing the complete
@@ -357,7 +358,7 @@ impl CascadesEngine {
             if !self.memo.control().checkpoint()? {
                 return incumbent;
             }
-            self.reset_cost_epoch();
+            self.reset_cost_epoch()?;
             self.explore_transformations()?;
             if !self.memo.control().checkpoint()? {
                 return incumbent;

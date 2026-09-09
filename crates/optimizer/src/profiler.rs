@@ -312,6 +312,9 @@ pub fn publish_optimizer_profile_snapshot(
 fn physical_search_diagnostics(
     profile: &crate::cascades::memo::PhysicalSearchProfile,
 ) -> Vec<OptimizerDiagnostic> {
+    if profile.groups.is_empty() && profile.frontiers.is_empty() && profile.group_merges == 0 {
+        return Vec::new();
+    }
     let mut entries = Vec::new();
     let mut push = |name: String, kind: &str, value: u64, unit| {
         entries.push(OptimizerDiagnostic {

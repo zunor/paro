@@ -403,6 +403,7 @@ impl OptimizationInput {
                 "settlement_invalidation_visit_count",
                 state.settlement_cache.invalidation_visits,
             );
+            work_counters.extend(state.payloads.schedule_counters());
         }
         let search_summary = SearchSummary {
             groups: u64::try_from(engine.memo().canonical_group_count()).unwrap_or(u64::MAX),

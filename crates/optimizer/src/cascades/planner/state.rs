@@ -109,11 +109,46 @@ pub(super) struct PlannerPhysicalPayload {
 #[derive(Debug, Default)]
 pub(super) struct PlannerPayloadArena {
     pub(super) logical: Vec<PlannerLogicalPayload>,
-    pub(super) physical: Vec<PlannerPhysicalPayload>,
-    filter_orders: BTreeMap<
-        LogicalPayloadId,
-        BTreeMap<super::predicate_order::PredicateOrder, PhysicalPayloadId>,
-    >,
+    // Physical publication never requires an exclusive logical-planner lock.
+    // The mutex protects only lookup/append; evidence analysis runs outside it.
+    physical: std::sync::Mutex<PhysicalPayloadStorage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct FilterScheduleKey {
+    pub(super) epoch: crate::cascades::memo::CostEpoch,
+    pub(super) expression: LogicalExprId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CachedFilterSchedule {
+    pub(super) payload: PhysicalPayloadId,
+    pub(super) fingerprint: Fingerprint,
+}
+
+#[derive(Debug, Default)]
+struct PhysicalPayloadStorage {
+    payloads: Vec<Arc<PlannerPhysicalPayload>>,
+    schedules: HashMap<FilterScheduleKey, CachedFilterSchedule>,
+    schedule_insertions: Vec<FilterScheduleKey>,
+    schedule_hits: u64,
+    schedule_builds: u64,
+    rollback_removals: u64,
+}
+
+impl PhysicalPayloadStorage {
+    fn push(&mut self, template: PlannerPhysicalTemplate) -> PhysicalPayloadId {
+        let id = PhysicalPayloadId::new(self.payloads.len());
+        self.payloads
+            .push(Arc::new(PlannerPhysicalPayload { template }));
+        id
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PhysicalPayloadCheckpoint {
+    payload_count: usize,
+    schedule_count: usize,
 }
 
 impl PlannerPayloadArena {
@@ -127,45 +162,123 @@ impl PlannerPayloadArena {
         (id, physical)
     }
 
-    pub(super) fn push_physical(&mut self, template: PlannerPhysicalTemplate) -> PhysicalPayloadId {
-        let id = PhysicalPayloadId::new(self.physical.len());
-        self.physical.push(PlannerPhysicalPayload { template });
-        id
+    pub(super) fn push_physical(&self, template: PlannerPhysicalTemplate) -> PhysicalPayloadId {
+        self.physical
+            .lock()
+            .expect("physical payload store poisoned")
+            .push(template)
     }
 
-    pub(super) fn get_physical(&self, id: PhysicalPayloadId) -> Option<&PlannerPhysicalPayload> {
-        self.physical.get(id.index())
+    pub(super) fn get_physical(
+        &self,
+        id: PhysicalPayloadId,
+    ) -> Option<Arc<PlannerPhysicalPayload>> {
+        self.physical
+            .lock()
+            .expect("physical payload store poisoned")
+            .payloads
+            .get(id.index())
+            .cloned()
     }
 
-    pub(super) fn intern_filter_order(
-        &mut self,
+    pub(super) fn filter_schedule(&self, key: FilterScheduleKey) -> Option<CachedFilterSchedule> {
+        let mut store = self
+            .physical
+            .lock()
+            .expect("physical payload store poisoned");
+        let schedule = store.schedules.get(&key).copied();
+        store.schedule_hits += u64::from(schedule.is_some());
+        schedule
+    }
+
+    pub(super) fn publish_filter_schedule(
+        &self,
+        key: FilterScheduleKey,
         logical: LogicalPayloadId,
-        order: super::predicate_order::PredicateOrder,
-    ) -> PhysicalPayloadId {
-        if let Some(id) = self
-            .filter_orders
-            .get(&logical)
-            .and_then(|orders| orders.get(&order))
-        {
-            return *id;
+        canonical: CachedFilterSchedule,
+        order: super::predicate_order::PredicateSchedule,
+    ) -> CachedFilterSchedule {
+        let mut store = self
+            .physical
+            .lock()
+            .expect("physical payload store poisoned");
+        // Two readers may compute the same immutable-epoch decision. Only
+        // one publication owns a payload; the other reuses its exact identity.
+        if let Some(schedule) = store.schedules.get(&key) {
+            return *schedule;
         }
-        let id = self.push_physical(PlannerPhysicalTemplate::OrderedFilter {
-            logical,
-            order: order.clone(),
-        });
-        self.filter_orders
-            .entry(logical)
-            .or_default()
-            .insert(order, id);
-        id
+        let schedule = match order {
+            super::predicate_order::PredicateSchedule::Canonical => canonical,
+            super::predicate_order::PredicateSchedule::Ordered(order) => {
+                let fingerprint = order.fingerprint(canonical.fingerprint);
+                CachedFilterSchedule {
+                    payload: store.push(PlannerPhysicalTemplate::OrderedFilter { logical, order }),
+                    fingerprint,
+                }
+            }
+        };
+        store.schedules.insert(key, schedule);
+        store.schedule_insertions.push(key);
+        store.schedule_builds += 1;
+        schedule
     }
 
-    fn truncate_physical(&mut self, len: usize) {
-        self.physical.truncate(len);
-        self.filter_orders.retain(|_, orders| {
-            orders.retain(|_, id| id.index() < len);
-            !orders.is_empty()
-        });
+    fn physical_checkpoint(&self) -> PhysicalPayloadCheckpoint {
+        let store = self
+            .physical
+            .lock()
+            .expect("physical payload store poisoned");
+        PhysicalPayloadCheckpoint {
+            payload_count: store.payloads.len(),
+            schedule_count: store.schedule_insertions.len(),
+        }
+    }
+
+    fn rollback_physical(&self, checkpoint: PhysicalPayloadCheckpoint) {
+        let mut store = self
+            .physical
+            .lock()
+            .expect("physical payload store poisoned");
+        while store.schedule_insertions.len() > checkpoint.schedule_count {
+            let key = store
+                .schedule_insertions
+                .pop()
+                .expect("schedule journal length checked");
+            store.schedules.remove(&key);
+            store.rollback_removals += 1;
+        }
+        store.payloads.truncate(checkpoint.payload_count);
+    }
+
+    pub(super) fn schedule_counters(&self) -> [(&'static str, u64); 3] {
+        let store = self
+            .physical
+            .lock()
+            .expect("physical payload store poisoned");
+        [
+            ("filter_schedule_cache_hits", store.schedule_hits),
+            ("filter_schedule_cache_builds", store.schedule_builds),
+            ("filter_schedule_rollback_removals", store.rollback_removals),
+        ]
+    }
+
+    #[cfg(test)]
+    pub(super) fn physical_count(&self) -> usize {
+        self.physical_checkpoint().payload_count
+    }
+
+    #[cfg(test)]
+    pub(super) fn tamper_physical(
+        &self,
+        id: PhysicalPayloadId,
+        mutate: impl FnOnce(&mut PlannerPhysicalTemplate),
+    ) {
+        let mut store = self.physical.lock().unwrap();
+        mutate(
+            &mut Arc::get_mut(&mut store.payloads[id.index()])
+                .expect("unborrowed test payload")
+                .template,
+        );
     }
 }
 
@@ -210,7 +323,7 @@ pub(super) struct PlannerTransformSavepoint {
     scalar_count: usize,
     binding_checkpoint: usize,
     logical_payload_count: usize,
-    physical_payload_count: usize,
+    physical_checkpoint: PhysicalPayloadCheckpoint,
     expression_group_insertion_count: usize,
     metadata_runtime_filter_change_count: usize,
     join_region_insertion_count: usize,
@@ -235,7 +348,7 @@ impl PlannerTransformState {
             scalar_count: self.scalars.len(),
             binding_checkpoint: self.binding_ids.checkpoint(),
             logical_payload_count: self.payloads.logical.len(),
-            physical_payload_count: self.payloads.physical.len(),
+            physical_checkpoint: self.payloads.physical_checkpoint(),
             expression_group_insertion_count: self.expression_group_insertions.len(),
             metadata_runtime_filter_change_count: self.metadata_runtime_filter_changes.len(),
             join_region_insertion_count: self.join_region_insertions.len(),
@@ -278,7 +391,7 @@ impl PlannerTransformState {
             .logical
             .truncate(savepoint.logical_payload_count);
         self.payloads
-            .truncate_physical(savepoint.physical_payload_count);
+            .rollback_physical(savepoint.physical_checkpoint);
         // Payload IDs are append-only within a transaction. Remove the delta
         // by ordered range, not a scan of all earlier immutable metadata.
         self.metadata

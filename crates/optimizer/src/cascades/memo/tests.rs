@@ -680,7 +680,7 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
     assert_eq!(profile.frontiers[0].high_water, 16);
     assert_eq!(profile.frontiers[0].candidates, 16);
     assert_eq!(profile.groups[0].archived_candidates, 16);
-    memo.clear_cost_frontiers();
+    memo.clear_cost_frontiers().unwrap();
     let cleared = memo.physical_search_profile();
     assert!(cleared.frontiers.is_empty());
     assert_eq!(

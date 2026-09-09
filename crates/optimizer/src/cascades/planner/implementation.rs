@@ -159,9 +159,9 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             .memo
             .logical_expr(expr)
             .ok_or_else(|| paro_error::internal("baseline implementation lost logical expr"))?;
-        let mut planner_state = self
+        let planner_state = self
             .planner_state
-            .write()
+            .read()
             .expect("planner transform state poisoned");
         let metadata = planner_state
             .metadata
@@ -169,24 +169,19 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             .ok_or_else(|| paro_error::internal("baseline implementation lost metadata"))?;
         let (payload, payload_fingerprint) =
             if metadata.operator_type == LogicalOperatorType::Filter {
-                if let Some(order) = predicate_order::select(logical, &planner_state, ctx.memo)? {
-                    let fingerprint = order.fingerprint(metadata.operator_fingerprint);
-                    (
-                        planner_state
-                            .payloads
-                            .intern_filter_order(logical.payload, order),
-                        fingerprint,
-                    )
-                } else {
-                    (metadata.baseline_payload, metadata.operator_fingerprint)
-                }
+                let Some(schedule) = predicate_order::implementation_schedule(
+                    logical,
+                    metadata,
+                    &planner_state,
+                    ctx.memo,
+                )?
+                else {
+                    return Ok(Box::new([]));
+                };
+                (schedule.payload, schedule.fingerprint)
             } else {
                 (metadata.baseline_payload, metadata.operator_fingerprint)
             };
-        let metadata = planner_state
-            .metadata
-            .get(&logical.payload)
-            .ok_or_else(|| paro_error::internal("baseline implementation lost metadata"))?;
         let children = logical.key.children.clone();
         let cost_facts =
             expression_cost_facts(ctx.memo, ctx.group, &children, &metadata.cost_facts)?;
