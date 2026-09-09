@@ -9,7 +9,8 @@ use paro_common::task_supply::useful_pipeline_tasks;
 mod facts;
 
 pub(super) use facts::{
-    expression_cost_facts, planner_cost_facts, planner_row_width, planner_scan_access_width,
+    expression_cost_facts, planner_cost_facts, planner_native_cost_facts, planner_row_width,
+    planner_row_width_from_layout, planner_scan_access_width,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1991,6 +1992,100 @@ pub(super) fn planner_operator_cost(
             .unwrap_or(1.0);
         cost.resources_expected[ResourceDimension::MemoryWrite as usize] =
             resident_expected_rows * row_width as f64;
+        cost.resources_risk_upper[ResourceDimension::MemoryWrite as usize] =
+            cost.peak_memory_upper as f64;
+    }
+    cost.validate()?;
+    Ok(cost)
+}
+
+/// Cost a closed native operator from the facts already reduced by staging.
+/// This is intentionally the same structural proxy as the owned planner path;
+/// only the input representation changes, so native migration cannot silently
+/// change ranking or grant behavior.
+pub(super) fn planner_native_operator_cost<Child>(
+    operator: &LogicalOperator<Child>,
+    stats: &NodeStats,
+    child_count: usize,
+    output_rows_hard_upper: Option<u64>,
+    child_rows_hard_upper: &[Option<u64>],
+    child_expected_rows: &[f64],
+    child_row_widths: &[u64],
+    output_row_width: u64,
+) -> Result<SearchCost> {
+    if child_count != child_rows_hard_upper.len()
+        || child_count != child_expected_rows.len()
+        || child_count != child_row_widths.len()
+    {
+        return Err(paro_error::internal(
+            "native operator cost child fact arity mismatch",
+        ));
+    }
+    let expected_rows = stats
+        .estimated_cardinality
+        .map(|cardinality| cardinality.expected as f64)
+        .unwrap_or(1.0)
+        .max(1.0);
+    let width_factor = (output_row_width as f64 / 32.0).max(1.0);
+    let materialization_write = match operator {
+        LogicalOperator::MaterializedCTE(_) => {
+            let producer_expected = child_expected_rows.first().copied().unwrap_or(1.0);
+            let producer_upper = child_rows_hard_upper
+                .first()
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| (producer_expected.max(1.0) as u64).saturating_mul(4));
+            let producer_width = child_row_widths.first().copied().unwrap_or(1);
+            let factor = (producer_width as f64 / 32.0).max(1.0);
+            (producer_expected * factor, producer_upper as f64 * factor)
+        }
+        _ => (0.0, 0.0),
+    };
+    let expected = expected_rows * width_factor + child_count as f64 + materialization_write.0;
+    let upper_rows = stats
+        .estimated_cardinality
+        .map(|cardinality| cardinality.max as f64)
+        .unwrap_or(expected_rows * 4.0)
+        .max(expected_rows);
+    let upper = upper_rows * width_factor + child_count as f64 + materialization_write.1;
+    let mut cost = SearchCost {
+        score: ScoreSummary {
+            range: CompactRange::new(1.0, expected, upper)?,
+            risk_adjusted: expected + (upper - expected) * 0.5,
+        },
+        work_latency: CompactRange::new(1.0, expected, upper)?,
+        critical_path: CompactRange::new(1.0, expected, upper)?,
+        ..SearchCost::ZERO
+    };
+    if planner_grant_dependency(operator) == GrantDependencyDescriptor::Sensitive {
+        let (resident_expected_rows, resident_row_width, resident_rows_upper) = match operator {
+            LogicalOperator::Join(Join::Cross(_)) => (
+                child_expected_rows.get(1).copied().unwrap_or(1.0),
+                child_row_widths.get(1).copied().unwrap_or(1),
+                child_rows_hard_upper
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(u64::MAX),
+            ),
+            LogicalOperator::MaterializedCTE(_) => (
+                child_expected_rows.first().copied().unwrap_or(1.0),
+                child_row_widths.first().copied().unwrap_or(1),
+                child_rows_hard_upper
+                    .first()
+                    .copied()
+                    .flatten()
+                    .unwrap_or(u64::MAX),
+            ),
+            _ => (
+                expected_rows,
+                output_row_width,
+                output_rows_hard_upper.unwrap_or(u64::MAX),
+            ),
+        };
+        cost.peak_memory_upper = resident_rows_upper.saturating_mul(resident_row_width);
+        cost.resources_expected[ResourceDimension::MemoryWrite as usize] =
+            resident_expected_rows * resident_row_width as f64;
         cost.resources_risk_upper[ResourceDimension::MemoryWrite as usize] =
             cost.peak_memory_upper as f64;
     }

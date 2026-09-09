@@ -210,6 +210,130 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
     })
 }
 
+/// Build cost facts directly from a closed native operator shell.  The child
+/// tree has already been reduced to immutable `NodeState` facts by staging, so
+/// recreating `BoundReference` plans here would only pay owned-IR allocation
+/// without adding evidence.  Source-lineage fields intentionally remain
+/// unknown: a native shell may use them only after a boundary adapter proves
+/// that its group facts cover the requested source lane.
+pub(in crate::cascades::planner) fn planner_native_cost_facts<Child>(
+    operator: &LogicalOperator<Child>,
+    child_materialization_risk_rows: &[u64],
+    child_row_widths: &[u64],
+    output_row_width: u64,
+    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+) -> Result<PlannerCostFacts> {
+    let mut operator_child_count = 0;
+    operator.visit_child_links(&mut |_| operator_child_count += 1);
+    if operator_child_count != child_materialization_risk_rows.len()
+        || child_materialization_risk_rows.len() != child_row_widths.len()
+    {
+        return Err(paro_error::internal(
+            "native cost facts child stats/width arity mismatch",
+        ));
+    }
+    let child_materialization_risk_rows = child_materialization_risk_rows
+        .iter()
+        .copied()
+        .collect::<Box<[_]>>();
+    let hash_key_width = match operator {
+        LogicalOperator::Aggregate(aggregate) => Some(
+            aggregate
+                .groups
+                .iter()
+                .map(|group| scan_access_cost.estimated_width(&group.return_type()) as u64)
+                .sum(),
+        ),
+        LogicalOperator::Join(Join::Comparison(join))
+            if join.conditions.iter().any(|condition| {
+                matches!(
+                    condition.comparison,
+                    JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
+                )
+            }) =>
+        {
+            Some(
+                join.conditions
+                    .iter()
+                    .filter(|condition| {
+                        matches!(
+                            condition.comparison,
+                            JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
+                        )
+                    })
+                    .map(|condition| {
+                        scan_access_cost.estimated_width(&condition.right.return_type()) as u64
+                    })
+                    .sum(),
+            )
+        }
+        _ => None,
+    };
+    let perfect_hash = match operator {
+        LogicalOperator::Aggregate(aggregate) => {
+            crate::physical::aggregate_planning::plan_perfect_hash_aggregate(
+                aggregate,
+                &aggregate.groups,
+                &aggregate.aggregates,
+            )
+            .map(|plan| plan.resource)
+        }
+        _ => None,
+    };
+    let topn_capacity = match operator {
+        LogicalOperator::TopN(topn) => Some(
+            u64::try_from(topn.limit)
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(topn.offset).unwrap_or(u64::MAX)),
+        ),
+        _ => None,
+    };
+    let runtime_filter_key_types = match operator {
+        LogicalOperator::Join(Join::Comparison(join)) => join
+            .conditions
+            .iter()
+            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+            .map(|condition| condition.right.return_type())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        _ => Box::new([]),
+    };
+    Ok(PlannerCostFacts {
+        child_row_widths: child_row_widths.iter().copied().collect(),
+        child_materialization_risk_rows,
+        output_row_width,
+        hash_key_width,
+        scan_access_width: None,
+        scan_physical_rows: None,
+        scan_work_source: None,
+        perfect_hash,
+        topn_capacity,
+        runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_probe_source_rows: None,
+        runtime_filter_build_left_probe_source_rows: None,
+        runtime_filter_probe_sources: Box::new([]),
+        runtime_filter_build_left_probe_sources: Box::new([]),
+        runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_domain_column: None,
+        runtime_filter_build_left_distinct_expected: None,
+        runtime_filter_build_left_domain_column: None,
+        runtime_filter_key_types,
+    })
+}
+
+pub(in crate::cascades::planner) fn planner_row_width_from_layout(
+    layout: &paro_planner::operator::LogicalOutputLayout,
+    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+) -> u64 {
+    layout
+        .types()
+        .iter()
+        .map(|logical_type| scan_access_cost.estimated_width(logical_type) as u64)
+        .sum::<u64>()
+        .saturating_add(std::mem::size_of::<u64>() as u64)
+}
+
 pub(in crate::cascades::planner) fn planner_row_width(
     plan: &OwnedLogicalPlan,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
