@@ -82,6 +82,7 @@ pub(super) fn stage_transformed_expression(
     struct NodeState {
         group: GroupId,
         columns: Box<[ColumnId]>,
+        layout: Arc<paro_planner::operator::LogicalOutputLayout>,
         region_scope: PlannerRegionScope,
     }
 
@@ -145,8 +146,9 @@ pub(super) fn stage_transformed_expression(
             if let Some(group) = nested_reference
                 .and_then(|reference_id| session.nested_group_holes.remove(&reference_id))
             {
-                let bindings = plan.get_column_bindings();
-                let types = plan.types();
+                let layout = plan.output_layout();
+                let bindings = layout.bindings();
+                let types = layout.types();
                 if bindings.len() != types.len() {
                     return Err(paro_error::internal(
                         "nested group hole has inconsistent binding/type arity",
@@ -155,7 +157,7 @@ pub(super) fn stage_transformed_expression(
                 let columns = bindings
                     .into_iter()
                     .zip(types)
-                    .map(|(binding, logical_type)| {
+                    .map(|(&binding, logical_type)| {
                         session
                             .state
                             .binding_ids
@@ -182,6 +184,7 @@ pub(super) fn stage_transformed_expression(
                     NodeState {
                         group,
                         columns: columns.into_boxed_slice(),
+                        layout: Arc::new(layout.clone()),
                         region_scope: PlannerRegionScope::group(group),
                     },
                     None,
@@ -208,8 +211,15 @@ pub(super) fn stage_transformed_expression(
             .unwrap_or(options.column_stats);
         let pending_runtime_filter_facets = &mut session.pending_runtime_filter_facets;
 
-        let output_bindings = semantic_plan.get_column_bindings();
-        let output_types = semantic_plan.types();
+        let child_layouts = child_states
+            .iter()
+            .map(|child| child.layout.as_ref())
+            .collect::<Vec<_>>();
+        let output_layout = semantic_plan
+            .operator
+            .output_layout_from_child_refs(&child_layouts);
+        let output_bindings = output_layout.bindings();
+        let output_types = output_layout.types();
         let output_names = semantic_plan.output_names();
         if output_bindings.len() != output_types.len() {
             return Err(paro_error::internal(
@@ -422,6 +432,7 @@ pub(super) fn stage_transformed_expression(
                     NodeState {
                         group,
                         columns: output_columns.into_boxed_slice(),
+                        layout: Arc::new(output_layout.clone()),
                         region_scope: PlannerRegionScope::new(
                             group,
                             child_states.iter().map(|child| child.region_scope.clone()),
@@ -517,6 +528,7 @@ pub(super) fn stage_transformed_expression(
                         NodeState {
                             group,
                             columns: output_columns.into_boxed_slice(),
+                            layout: Arc::new(output_layout.clone()),
                             region_scope,
                         },
                         None,
@@ -527,6 +539,7 @@ pub(super) fn stage_transformed_expression(
                     NodeState {
                         group,
                         columns: output_columns.into_boxed_slice(),
+                        layout: Arc::new(output_layout.clone()),
                         region_scope,
                     },
                     Some(StagedEquivalent {
@@ -748,6 +761,7 @@ pub(super) fn stage_transformed_expression(
             NodeState {
                 group,
                 columns: output_columns.into_boxed_slice(),
+                layout: Arc::new(output_layout),
                 region_scope,
             },
             staged,
@@ -888,7 +902,7 @@ pub(super) fn stage_transformed_expression(
                         session
                             .facts
                             .settle_group(session.memo, session.state, node.group)?;
-                        let layout = Arc::new(plan.output_layout());
+                        let layout = node.layout.clone();
                         let facts = session.facts.transport(
                             session.memo,
                             session.state,
@@ -1005,7 +1019,7 @@ pub(super) fn stage_transformed_expression(
                                     session.state,
                                     node.group,
                                 )?;
-                                let layout = Arc::new(plan.output_layout());
+                                let layout = node.layout.clone();
                                 let facts = session.facts.transport(
                                     session.memo,
                                     session.state,
