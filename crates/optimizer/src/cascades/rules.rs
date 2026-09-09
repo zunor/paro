@@ -666,7 +666,50 @@ pub struct SourceFilterWork {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SourceWork {
+pub struct SourceWork(Arc<SourceWorkData>);
+
+impl SourceWork {
+    pub(crate) fn snapshot(&self) -> &SourceWorkData {
+        &self.0
+    }
+
+    /// Diagnostic-only allocation identity, valid while the snapshot is
+    /// borrowed. This is never a semantic identity or retained cache key.
+    pub(crate) fn payload_identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    pub(crate) fn retained_payload_bytes(&self) -> usize {
+        std::mem::size_of::<SourceWorkData>()
+            + std::mem::size_of_val(self.retentions.as_ref())
+            + std::mem::size_of_val(self.filters.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_payload(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl From<SourceWorkData> for SourceWork {
+    fn from(data: SourceWorkData) -> Self {
+        Self(Arc::new(data))
+    }
+}
+
+impl std::ops::Deref for SourceWork {
+    type Target = SourceWorkData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// An immutable source response once published. Streaming/branch composition
+/// shares the complete snapshot; only a filter which changes this source
+/// constructs a new one. No mutable access to a published snapshot is exposed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceWorkData {
     pub source: WorkSourceId,
     /// Immutable number of rows in this physical source lane before runtime
     /// predicates. Predicate work is attributed by this row domain, never by

@@ -137,3 +137,30 @@ An independent oracle enumerates all phases for 12³ input/local operating-point
 triples and four overlap masks. A separate oracle checks objective pruning
 under independently priced work/span/memory continuations. 1,039 optimizer
 tests and strict workspace/all-target Clippy pass; Q11 timing is pending.
+
+Five normal processes at `5221c858`: median EXPLAIN 1185.359 ms, optimizer
+1180.565 ms, RSS 350,994,432 bytes. Groups (1,022), logical expressions (1,582),
+physical expressions (2,785), binding count (7,871), and settlement hit/miss
+counts are unchanged. Proposals fall to 26,888; frontier truncations fall to
+**zero**, and child-product obligations from 144 to 86. This attributes most
+frontier pressure to irrelevant objective axes and relative-memory accounting,
+not to an irreducible 256-way source-response partition. The median sample still
+spends 233.8 ms in predicate transfer and 134.8 ms in join-region enumeration;
+the sub-100 ms target is not closed.
+
+## Immutable source-response payloads
+
+Candidates now share immutable source-work snapshots. Ordinary parent
+composition copies handles, not four `SearchCost` values plus nested proof and
+evaluation slices for every lane. A filter forks only affected lanes; a repeated
+proof/evaluation occurrence keeps the original snapshot. There is no mutable
+access to a published snapshot. Existing source algebra/oracle tests additionally
+check parent-child sharing, unchanged sibling sharing, child isolation and
+idempotent-publication identity.
+
+Payload-byte attribution counts shared backing storage once (against the first
+archive owner to reference it), plus each candidate's handle slice. It includes
+all nested proof/evaluation payloads but excludes allocator/control-block
+overhead; it is still not an RSS or allocation-traffic metric. Search budgets,
+source response equality and costing algebra are unchanged by this storage
+refactor.

@@ -33,7 +33,7 @@ use super::rules::WorkSourceId;
 use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PatternEnumerationCompletion,
     PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof,
-    SourceWork, TaskSupplyContract, TransformContext,
+    SourceWork, SourceWorkData, TaskSupplyContract, TransformContext,
 };
 use crate::physical::{ResourceGrantClass, SpillPolicy};
 
@@ -2475,7 +2475,7 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
         let serial_cost = serial_normalized_work(local_cost);
         return Ok(ComposedCost {
             cost,
-            source_work: Box::new([SourceWork {
+            source_work: Box::new([SourceWorkData {
                 source: *source,
                 source_rows: *source_rows,
                 base_cost: serial_cost,
@@ -2485,7 +2485,8 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
                 filter_apply_cost: SearchCost::ZERO,
                 phased_cost: local_cost.work_only(),
                 phase_tasks: local_cost.output_pipeline_tasks,
-            }]),
+            }
+            .into()]),
         });
     }
     let sideways_filter = composition.sideways_filter();
@@ -2571,11 +2572,26 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
                             let share = apply_shares
                                 .next()
                                 .expect("one predicate-cost share per matching source lane");
+                            if lane
+                                .retentions
+                                .iter()
+                                .any(|proof| proof.domain == source.domain)
+                                && lane
+                                    .filters
+                                    .iter()
+                                    .any(|filter| filter.evaluation == source.evaluation)
+                            {
+                                // The parent term was already attributed above.
+                                // Re-publishing an existing proof/occurrence does
+                                // not change the immutable source response.
+                                continue;
+                            }
+                            let mut updated = lane.snapshot().clone();
                             let full_apply_cost = total_apply_cost.retain_work(share, share)?;
                             // Speculative filters retain the complete risk
                             // ceiling. Exact membership over a declared-unique
                             // probe carries a proof-backed smaller ceiling.
-                            let mut retentions = lane.retentions.to_vec();
+                            let mut retentions = std::mem::take(&mut updated.retentions).into_vec();
                             if !retentions
                                 .iter()
                                 .any(|retention| retention.domain == source.domain)
@@ -2588,9 +2604,9 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
                             }
                             retentions.sort_by_key(|retention| retention.domain);
                             let retained = retained_source_cost(lane.base_cost, &retentions)?;
-                            lane.cost = retained;
-                            lane.retentions = retentions.into_boxed_slice();
-                            let mut filters = lane.filters.to_vec();
+                            updated.cost = retained;
+                            updated.retentions = retentions.into_boxed_slice();
+                            let mut filters = std::mem::take(&mut updated.filters).into_vec();
                             if !filters
                                 .iter()
                                 .any(|filter| filter.evaluation == source.evaluation)
@@ -2606,8 +2622,8 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
                             }
                             filters.sort_by_key(|filter| filter.evaluation);
                             let new_apply_cost = ordered_source_filter_cost(&filters)?;
-                            lane.filters = filters.into_boxed_slice();
-                            lane.filter_apply_cost = new_apply_cost;
+                            updated.filters = filters.into_boxed_slice();
+                            updated.filter_apply_cost = new_apply_cost;
                             let serial_pipeline = retained.sequential(new_apply_cost)?;
                             let phased_pipeline = calibration.rephase(
                                 serial_pipeline,
@@ -2616,7 +2632,8 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
                                 lane.phase_tasks,
                             )?;
                             child = child.replace_work(lane.phased_cost, phased_pipeline)?;
-                            lane.phased_cost = phased_pipeline;
+                            updated.phased_cost = phased_pipeline;
+                            *lane = updated.into();
                         }
                     }
                 }

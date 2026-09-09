@@ -37,14 +37,16 @@ pub struct PhysicalFrontierProfile {
 impl Memo {
     pub fn physical_search_profile(&self) -> PhysicalSearchProfile {
         let mut archived = vec![(0_u64, 0_u64); self.groups.len()];
+        let mut source_payloads = std::collections::HashSet::new();
         for candidate in &self.winner_candidates {
             let entry = &mut archived[self.canonical_group(candidate.group).index()];
             entry.0 += 1;
             let lanes = candidate.winner.source_work.as_ref();
             entry.1 += std::mem::size_of_val(lanes) as u64;
             for lane in lanes {
-                entry.1 += std::mem::size_of_val(lane.filters.as_ref()) as u64;
-                entry.1 += std::mem::size_of_val(lane.retentions.as_ref()) as u64;
+                if source_payloads.insert(lane.payload_identity()) {
+                    entry.1 += lane.retained_payload_bytes() as u64;
+                }
             }
         }
         let mut groups = Vec::new();

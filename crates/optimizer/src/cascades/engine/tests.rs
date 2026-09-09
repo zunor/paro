@@ -2204,7 +2204,7 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
         peak_memory_upper: 80,
         ..cost(100.0)
     };
-    let source_work = [SourceWork {
+    let source_work = [SourceWorkData {
         source,
         source_rows: 100,
         base_cost: child.work_only(),
@@ -2214,7 +2214,8 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
         filter_apply_cost: SearchCost::ZERO,
         phased_cost: child.work_only(),
         phase_tasks: 1,
-    }];
+    }
+    .into()];
     let filtered = compose_candidate_cost_with_sources(
         SearchCost::ZERO,
         Some(SearchCost::ZERO),
@@ -2397,7 +2398,7 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
     let unique_source = WorkSourceId(80);
     let repeated_source = WorkSourceId(81);
     let lanes = [
-        SourceWork {
+        SourceWorkData {
             source: unique_source,
             source_rows: 100,
             base_cost: cost(100.0),
@@ -2407,8 +2408,9 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
             filter_apply_cost: SearchCost::ZERO,
             phased_cost: cost(100.0),
             phase_tasks: 1,
-        },
-        SourceWork {
+        }
+        .into(),
+        SourceWorkData {
             source: repeated_source,
             source_rows: 300,
             base_cost: cost(300.0),
@@ -2418,7 +2420,8 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
             filter_apply_cost: SearchCost::ZERO,
             phased_cost: cost(300.0),
             phase_tasks: 1,
-        },
+        }
+        .into(),
     ];
     let filtered = compose_candidate_cost_with_sources(
         cost(40.0),
@@ -2452,7 +2455,7 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
     let missing = WorkSourceId(19);
     let unrelated = WorkSourceId(20);
     let lanes = [
-        SourceWork {
+        SourceWorkData {
             source: matched,
             source_rows: 100,
             base_cost: cost(100.0),
@@ -2462,8 +2465,9 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
             filter_apply_cost: SearchCost::ZERO,
             phased_cost: cost(100.0),
             phase_tasks: 1,
-        },
-        SourceWork {
+        }
+        .into(),
+        SourceWorkData {
             source: unrelated,
             source_rows: 300,
             base_cost: cost(300.0),
@@ -2473,7 +2477,8 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
             filter_apply_cost: SearchCost::ZERO,
             phased_cost: cost(300.0),
             phase_tasks: 1,
-        },
+        }
+        .into(),
     ];
     let filtered = compose_candidate_cost_with_sources(
         cost(40.0),
@@ -2530,11 +2535,12 @@ fn source_filter_charges_full_evaluation_domain_after_prior_retention() {
     // A previous runtime filter has already reduced the lane's current work
     // to ten units.  The next predicate still evaluates its immutable input
     // domain and therefore costs the full operator-local term, not ten units.
-    let reduced = SourceWork {
+    let reduced = SourceWorkData {
         cost: cost(10.0),
         phased_cost: cost(10.0),
-        ..scan.source_work[0].clone()
-    };
+        ..scan.source_work[0].snapshot().clone()
+    }
+    .into();
     let filtered = compose_candidate_cost_with_sources(
         cost(100.0),
         Some(cost(100.0)),
@@ -2563,7 +2569,7 @@ fn source_filter_keeps_unmatched_apply_work_on_the_parent() {
     let matched = WorkSourceId(2_010);
     let unrelated = WorkSourceId(2_011);
     let lanes = [
-        SourceWork {
+        SourceWorkData {
             source: matched,
             source_rows: 100,
             base_cost: cost(100.0),
@@ -2573,8 +2579,9 @@ fn source_filter_keeps_unmatched_apply_work_on_the_parent() {
             filter_apply_cost: SearchCost::ZERO,
             phased_cost: cost(100.0),
             phase_tasks: 1,
-        },
-        SourceWork {
+        }
+        .into(),
+        SourceWorkData {
             source: unrelated,
             source_rows: 900,
             base_cost: cost(900.0),
@@ -2584,7 +2591,8 @@ fn source_filter_keeps_unmatched_apply_work_on_the_parent() {
             filter_apply_cost: SearchCost::ZERO,
             phased_cost: cost(900.0),
             phase_tasks: 1,
-        },
+        }
+        .into(),
     ];
     let filtered = compose_candidate_cost_with_sources(
         cost(100.0),
@@ -2600,6 +2608,13 @@ fn source_filter_keeps_unmatched_apply_work_on_the_parent() {
     .unwrap();
     assert_eq!(filtered.source_work[0].filters.len(), 1);
     assert!(filtered.source_work[1].filters.is_empty());
+    assert!(!filtered.source_work[0].shares_payload(&lanes[0]));
+    assert!(filtered.source_work[1].shares_payload(&lanes[1]));
+    assert!(
+        lanes[0].filters.is_empty(),
+        "publishing a filtered response must not change its child"
+    );
+    assert_eq!(lanes[0].cost.score.range.expected, 100.0);
     assert_eq!(
         filtered.cost.score.range.expected, 1_050.0,
         "the 90% lineage gap must remain charged at the parent"
@@ -2610,7 +2625,7 @@ fn source_filter_keeps_unmatched_apply_work_on_the_parent() {
 fn sideways_filter_accepts_multiple_lanes_for_one_source() {
     let source = WorkSourceId(21);
     let lanes = [
-        SourceWork {
+        SourceWorkData {
             source,
             source_rows: 100,
             base_cost: cost(100.0),
@@ -2620,8 +2635,9 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
             filter_apply_cost: SearchCost::ZERO,
             phased_cost: cost(100.0),
             phase_tasks: 1,
-        },
-        SourceWork {
+        }
+        .into(),
+        SourceWorkData {
             source,
             source_rows: 300,
             base_cost: cost(300.0),
@@ -2631,7 +2647,8 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
             filter_apply_cost: SearchCost::ZERO,
             phased_cost: cost(300.0),
             phase_tasks: 1,
-        },
+        }
+        .into(),
     ];
     let filtered = compose_candidate_cost_with_sources(
         cost(40.0),
@@ -2671,7 +2688,7 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
 fn sideways_filter_with_no_physical_lane_is_retained() {
     let declared = WorkSourceId(22);
     let unrelated = WorkSourceId(23);
-    let lanes = [SourceWork {
+    let lanes = [SourceWorkData {
         source: unrelated,
         source_rows: 400,
         base_cost: cost(400.0),
@@ -2681,7 +2698,8 @@ fn sideways_filter_with_no_physical_lane_is_retained() {
         filter_apply_cost: SearchCost::ZERO,
         phased_cost: cost(400.0),
         phase_tasks: 1,
-    }];
+    }
+    .into()];
     let filtered = compose_candidate_cost_with_sources(
         cost(40.0),
         None,
@@ -2749,6 +2767,9 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
     assert_eq!(second.cost.score.range.expected, 85.0);
     assert_eq!(second.source_work.len(), 1);
     assert_eq!(second.source_work[0].cost.score.range.expected, 5.0);
+    assert!(independent_parent.source_work[0].shares_payload(&scan.source_work[0]));
+    assert!(!first.source_work[0].shares_payload(&scan.source_work[0]));
+    assert_eq!(scan.source_work[0].cost.score.range.expected, 100.0);
 }
 
 #[test]
@@ -2785,6 +2806,7 @@ fn exact_survivor_bounds_are_absolute_and_proof_idempotent() {
     let duplicate = apply(&first, first_proof);
     assert_eq!(duplicate.source_work[0].cost.score.range.expected, 100.0);
     assert_eq!(duplicate.source_work[0].cost.score.range.upper, 100.0);
+    assert!(duplicate.source_work[0].shares_payload(&first.source_work[0]));
 
     let correlated = apply(
         &first,
@@ -3449,16 +3471,19 @@ fn duplicate_domain_proof_does_not_shrink_later_evaluation_domain() {
 #[test]
 fn source_predicate_attribution_is_invariant_to_lane_partitioning() {
     let source = WorkSourceId(901);
-    let lane = |rows, work| SourceWork {
-        source,
-        source_rows: rows,
-        base_cost: cost(work),
-        cost: cost(work),
-        retentions: Box::new([]),
-        filters: Box::new([]),
-        filter_apply_cost: SearchCost::ZERO,
-        phased_cost: cost(work),
-        phase_tasks: 1,
+    let lane = |rows, work| {
+        SourceWorkData {
+            source,
+            source_rows: rows,
+            base_cost: cost(work),
+            cost: cost(work),
+            retentions: Box::new([]),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(work),
+            phase_tasks: 1,
+        }
+        .into()
     };
     let composition = CostComposition::SidewaysFilter {
         overlapping_children: 0,
