@@ -25,6 +25,9 @@ use paro_planner::operator::cte::CteColumnId;
 use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod profile;
+pub use profile::{PhysicalFrontierProfile, PhysicalGroupProfile, PhysicalSearchProfile};
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogicalProperties {
     pub unique_keys: BTreeSet<Box<[super::ids::ColumnId]>>,
@@ -713,6 +716,9 @@ pub struct WinnerFrontier {
     // pruning must neither copy their proof trees nor retire parent references.
     candidates: Vec<Arc<Winner>>,
     filterable_sources: BTreeSet<super::rules::WorkSourceId>,
+    proposals: u64,
+    truncations: u64,
+    high_water: usize,
 }
 
 #[derive(Debug, Default)]
@@ -756,6 +762,7 @@ impl WinnerFrontier {
         winner: Winner,
         limit: usize,
     ) -> FrontierInsertion {
+        self.proposals = self.proposals.saturating_add(1);
         let old_selected = self.selected().map(|entry| entry.physical_fingerprint);
 
         if self.candidates.iter().any(|incumbent| {
@@ -783,6 +790,8 @@ impl WinnerFrontier {
         });
         let limit = limit.max(1);
         let truncated = self.candidates.len().saturating_add(1) > limit;
+        self.high_water = self.high_water.max(self.candidates.len().saturating_add(1));
+        self.truncations = self.truncations.saturating_add(u64::from(truncated));
         let published = (position < limit).then(|| {
             let winner = Arc::new(winner);
             self.candidates.insert(position, Arc::clone(&winner));
@@ -867,6 +876,7 @@ pub struct Group {
     logical_index: BTreeMap<LogicalExprKey, Vec<LogicalExprId>>,
     physical_index: BTreeMap<PhysicalExprKey, PhysicalExprId>,
     winner_frontiers: BTreeMap<OptimizationGoal, WinnerFrontier>,
+    winner_proposals: u64,
     pub ledger: SearchLedger,
 }
 
@@ -934,6 +944,7 @@ pub struct Memo {
     physical_owners: Vec<GroupId>,
     winner_candidates: Vec<WinnerCandidate>,
     winner_proposals: u64,
+    group_merges: u64,
     properties: PropertyInterner,
     optimization_contexts: Vec<OptimizationContext>,
     optimization_context_index: BTreeMap<OptimizationContext, OptimizationContextId>,
@@ -990,6 +1001,7 @@ impl Memo {
             physical_owners: Vec::new(),
             winner_candidates: Vec::new(),
             winner_proposals: 0,
+            group_merges: 0,
             properties: PropertyInterner::default(),
             optimization_contexts: vec![root_context.clone()],
             optimization_context_index: BTreeMap::from([(
@@ -1530,6 +1542,7 @@ impl Memo {
             logical_index: BTreeMap::new(),
             physical_index: BTreeMap::new(),
             winner_frontiers: BTreeMap::new(),
+            winner_proposals: 0,
             ledger: SearchLedger::new(self.budget.clone()),
         });
         self.parents.push(id);
@@ -2173,6 +2186,9 @@ impl Memo {
         let physical_fingerprint = winner.physical_fingerprint;
         let frontier_limit = self.budget.max_winner_frontier_candidates_per_goal.max(1) as usize;
         self.winner_proposals = self.winner_proposals.saturating_add(1);
+        self.groups[group.index()].winner_proposals = self.groups[group.index()]
+            .winner_proposals
+            .saturating_add(1);
         let slot = self.groups[group.index()].winner_frontiers.entry(goal);
         let insertion = match slot {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -2255,6 +2271,7 @@ impl Memo {
         }
         self.advance_cte_registry_revision()?;
         self.parents[secondary.index()] = canonical;
+        self.group_merges = self.group_merges.saturating_add(1);
         self.logical_frontier_revision = self
             .logical_frontier_revision
             .checked_add(1)
@@ -2264,6 +2281,10 @@ impl Memo {
             two_groups_mut(&mut self.groups, canonical.index(), secondary.index());
         canonical_group.invalidate_fact_fingerprints();
         secondary_group.invalidate_fact_fingerprints();
+        canonical_group.winner_proposals = canonical_group
+            .winner_proposals
+            .saturating_add(secondary_group.winner_proposals);
+        secondary_group.winner_proposals = 0;
         // Equivalent expressions can establish different conservative row
         // bounds (for example, a decorrelated plan can prove a tighter cap
         // than its dependent form). Both proofs describe the same relation,

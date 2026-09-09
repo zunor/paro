@@ -413,6 +413,7 @@ impl OptimizationInput {
             exhaustion_events: engine.memo().exhaustion_counts(),
             obligations: engine.memo().search_obligations(),
             work_counters,
+            physical_search: engine.memo().physical_search_profile(),
         };
         Ok(OptimizationOutput {
             variants: variants.into_boxed_slice(),
@@ -451,6 +452,7 @@ pub struct SearchSummary {
     pub exhaustion_events: BTreeMap<BudgetDimension, u64>,
     pub obligations: Box<[super::budget::SearchObligation]>,
     pub work_counters: BTreeMap<&'static str, u64>,
+    pub physical_search: super::memo::PhysicalSearchProfile,
 }
 
 impl SearchSummary {

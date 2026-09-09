@@ -426,6 +426,13 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
     }
     assert_eq!(memo.winner_proposal_count(), 2_002);
     assert_eq!(memo.published_winner_count(), 2);
+    let profile = memo.physical_search_profile();
+    assert_eq!(profile.groups[0].proposals, 2_002);
+    assert_eq!(profile.groups[0].archived_candidates, 2);
+    assert_eq!(profile.frontiers.len(), 1);
+    assert_eq!(profile.frontiers[0].proposals, 2_002);
+    assert_eq!(profile.frontiers[0].candidates, 1);
+    assert_eq!(profile.frontiers[0].truncations, 0);
     assert!(
         memo.resolve_child_winner(ChildWinnerRef {
             group,
@@ -669,6 +676,28 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
         frontier.selected().unwrap().physical_fingerprint,
         Fingerprint(1)
     );
+    let profile = memo.physical_search_profile();
+    assert_eq!(profile.frontiers[0].high_water, 16);
+    assert_eq!(profile.frontiers[0].candidates, 16);
+    assert_eq!(profile.groups[0].archived_candidates, 16);
+    memo.clear_cost_frontiers();
+    let cleared = memo.physical_search_profile();
+    assert!(cleared.frontiers.is_empty());
+    assert_eq!(
+        cleared.groups, profile.groups,
+        "epoch reset must not erase archive attribution"
+    );
+    let sibling = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.merge_groups(group, sibling).unwrap();
+    memo.merge_groups(group, sibling).unwrap();
+    let merged = memo.physical_search_profile();
+    assert_eq!(merged.group_merges, 1);
+    assert_eq!(merged.groups.len(), 1);
+    assert_eq!(merged.groups[0].archived_candidates, 16);
 }
 
 #[test]

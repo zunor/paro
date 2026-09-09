@@ -67,6 +67,7 @@ pub struct OptimizerProfiler {
     rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     component_allocated_bytes: BTreeMap<OptimizerComponent, u64>,
     counters: BTreeMap<String, u64>,
+    physical_search: crate::cascades::memo::PhysicalSearchProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,7 @@ pub struct OptimizerProfileSnapshot {
     pub rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     pub component_allocated_bytes: BTreeMap<OptimizerComponent, u64>,
     pub counters: BTreeMap<String, u64>,
+    pub physical_search: crate::cascades::memo::PhysicalSearchProfile,
 }
 
 impl OptimizerProfiler {
@@ -125,6 +127,7 @@ impl OptimizerProfiler {
             component_allocated_bytes: self.component_allocated_bytes.clone(),
             rule_attempts: self.rule_attempts.clone(),
             counters: self.counters.clone(),
+            physical_search: self.physical_search.clone(),
         }
     }
 
@@ -149,6 +152,7 @@ impl OptimizerProfiler {
     }
 
     pub fn record_search_summary(&mut self, summary: &crate::cascades::SearchSummary) {
+        self.physical_search = summary.physical_search.clone();
         self.counters.insert(
             "search_complete".to_string(),
             u64::from(summary.is_complete()),
@@ -301,12 +305,180 @@ pub fn publish_optimizer_profile_snapshot(
                 invocation_count: 0,
             }),
     );
+    entries.extend(physical_search_diagnostics(&snapshot.physical_search));
     diagnostics.publish_optimizer(entries);
+}
+
+fn physical_search_diagnostics(
+    profile: &crate::cascades::memo::PhysicalSearchProfile,
+) -> Vec<OptimizerDiagnostic> {
+    let mut entries = Vec::new();
+    let mut push = |name: String, kind: &str, value: u64, unit| {
+        entries.push(OptimizerDiagnostic {
+            name,
+            kind: kind.to_string(),
+            last_elapsed_us: 0,
+            metric_value: value.min(i64::MAX as u64) as i64,
+            metric_unit: unit,
+            invocation_count: 0,
+        })
+    };
+    push(
+        "memo_group_merge_count".into(),
+        "search_counter",
+        profile.group_merges,
+        OptimizerMetricUnit::Count,
+    );
+    push(
+        "physical_goal_count".into(),
+        "search_counter",
+        profile.frontiers.len() as u64,
+        OptimizerMetricUnit::Count,
+    );
+    let mut by_group = BTreeMap::<_, (u64, usize)>::new();
+    let mut histogram = BTreeMap::<usize, u64>::new();
+    for frontier in &profile.frontiers {
+        let group = by_group.entry(frontier.group).or_default();
+        group.0 += 1;
+        group.1 = group.1.max(frontier.candidates);
+        *histogram.entry(frontier.candidates).or_default() += 1;
+        let goal = frontier.goal;
+        let prefix = format!(
+            "group_{}_required_{}_rows_{}_objective_{}_grant_{}_context_{}_sources_{}",
+            frontier.group.0,
+            goal.required.0,
+            goal.row_goal.stable_tag(),
+            goal.objective.stable_tag(),
+            goal.grant.stable_tag(),
+            goal.context.0,
+            frontier.demanded_sources
+        );
+        for (metric, value) in [
+            ("size", frontier.candidates as u64),
+            ("high_water", frontier.high_water as u64),
+            ("proposals", frontier.proposals),
+            ("truncations", frontier.truncations),
+        ] {
+            push(
+                format!("{prefix}_{metric}"),
+                "search_frontier",
+                value,
+                OptimizerMetricUnit::Count,
+            );
+        }
+    }
+    for (size, count) in histogram {
+        push(
+            format!("physical_frontiers_size_{size}"),
+            "search_counter",
+            count,
+            OptimizerMetricUnit::Count,
+        );
+    }
+    for group in &profile.groups {
+        let (goals, maximum) = by_group.get(&group.group).copied().unwrap_or_default();
+        for (metric, value) in [
+            ("goals", goals),
+            ("max_frontier", maximum as u64),
+            ("proposals", group.proposals),
+            ("archived", group.archived_candidates),
+        ] {
+            push(
+                format!("group_{}_{}", group.group.0, metric),
+                "search_group",
+                value,
+                OptimizerMetricUnit::Count,
+            );
+        }
+        push(
+            format!("group_{}_source_payload_bytes", group.group.0),
+            "search_group",
+            group.source_payload_bytes,
+            OptimizerMetricUnit::Bytes,
+        );
+    }
+    push(
+        "winner_source_payload_bytes".into(),
+        "search_bytes",
+        profile
+            .groups
+            .iter()
+            .map(|group| group.source_payload_bytes)
+            .sum(),
+        OptimizerMetricUnit::Bytes,
+    );
+    entries
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_search_attribution_distinguishes_goals_frontiers_and_byte_payloads() {
+        use crate::cascades::memo::{
+            GrantGoalKey, OptimizationGoal, PhysicalFrontierProfile, PhysicalGroupProfile,
+            PhysicalSearchProfile, RowGoal,
+        };
+        use crate::cascades::{
+            AdmissibleGrantSetId, GroupId, OptimizationContextId, PropertySetId,
+        };
+        let group = GroupId(7);
+        let goal = OptimizationGoal {
+            required: PropertySetId(0),
+            row_goal: RowGoal::All,
+            objective: crate::physical::ObjectiveProfile::Latency,
+            grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+            context: OptimizationContextId(0),
+        };
+        let profile = PhysicalSearchProfile {
+            group_merges: 2,
+            groups: Box::new([PhysicalGroupProfile {
+                group,
+                proposals: 50,
+                archived_candidates: 13,
+                source_payload_bytes: 4096,
+            }]),
+            frontiers: Box::new([
+                PhysicalFrontierProfile {
+                    group,
+                    goal,
+                    candidates: 1,
+                    demanded_sources: 0,
+                    proposals: 20,
+                    truncations: 0,
+                    high_water: 1,
+                },
+                PhysicalFrontierProfile {
+                    group,
+                    goal: OptimizationGoal {
+                        context: OptimizationContextId(1),
+                        ..goal
+                    },
+                    candidates: 8,
+                    demanded_sources: 3,
+                    proposals: 30,
+                    truncations: 5,
+                    high_water: 9,
+                },
+            ]),
+        };
+        let entries = physical_search_diagnostics(&profile);
+        let find = |name: &str| entries.iter().find(|entry| entry.name == name).unwrap();
+        assert_eq!(find("physical_goal_count").metric_value, 2);
+        assert_eq!(find("group_7_goals").metric_value, 2);
+        assert_eq!(find("group_7_max_frontier").metric_value, 8);
+        assert_eq!(find("physical_frontiers_size_8").metric_value, 1);
+        assert_eq!(
+            find("winner_source_payload_bytes").metric_unit,
+            OptimizerMetricUnit::Bytes
+        );
+        assert_eq!(find("winner_source_payload_bytes").metric_value, 4096);
+        assert!(entries.iter().any(|entry| entry.kind == "search_frontier"
+            && entry.name.ends_with("sources_3_truncations")
+            && entry.metric_value == 5));
+        assert!(entries.iter().all(|entry| entry.invocation_count == 0));
+    }
 
     #[test]
     fn snapshot_has_stable_architectural_components_not_pass_toggles() {
@@ -338,6 +510,7 @@ mod tests {
                 .collect(),
             work_counters: [("transformation_binding_count", 7)].into_iter().collect(),
             obligations: Box::new([]),
+            physical_search: Default::default(),
         });
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.counters.get("search_complete"), Some(&0));
