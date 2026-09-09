@@ -2701,6 +2701,7 @@ mod tests {
                 rule_budget_exhaustions: Default::default(),
                 component_allocated_bytes: Default::default(),
                 counters: Default::default(),
+                physical_search: Default::default(),
             },
         );
         publish_optimizer_profile_snapshot(
@@ -2718,6 +2719,7 @@ mod tests {
                 rule_budget_exhaustions: Default::default(),
                 component_allocated_bytes: Default::default(),
                 counters: Default::default(),
+                physical_search: Default::default(),
             },
         );
 
