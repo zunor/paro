@@ -784,15 +784,51 @@ impl TaskRegistry {
     /// evaluations that read either side are invalidated before a caller can
     /// request work against the canonical group, so stale proofs cannot be
     /// silently reused after merge/reinsert.
+    pub fn validate_group_redirect(&self, from: GroupId, to: GroupId) -> Result<()> {
+        let from = self.canonical_group(from);
+        let to = self.canonical_group(to);
+        if from == to {
+            return Ok(());
+        }
+
+        // Redirects are expected to point at a canonical root.  Keep this
+        // check explicit: callers performing a Memo merge can preflight the
+        // task side before changing Memo's union-find, and a future reinsert
+        // path cannot accidentally create a redirect cycle.
+        let mut current = to;
+        let mut visited = BTreeSet::new();
+        while let Some(parent) = self.group_redirects.get(&current).copied() {
+            if !visited.insert(current) {
+                return Err(paro_error::internal(
+                    "task group redirect table already contains a cycle",
+                ));
+            }
+            if parent == from {
+                return Err(paro_error::internal(
+                    "task group redirect would create a cycle",
+                ));
+            }
+            current = parent;
+        }
+        Ok(())
+    }
+
     pub fn redirect_group(&mut self, from: GroupId, to: GroupId) -> Result<Vec<TaskWakeup>> {
         let from = self.canonical_group(from);
         let to = self.canonical_group(to);
         if from == to {
             return Ok(Vec::new());
         }
+        self.validate_group_redirect(from, to)?;
+        let next_revision = self
+            .group_revisions
+            .get(&to)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("task group revision overflow"))?;
         self.group_redirects.insert(from, to);
-        let revision = self.group_revisions.entry(to).or_default();
-        *revision = revision.saturating_add(1);
+        self.group_revisions.insert(to, next_revision);
         let affected = self
             .tasks
             .iter()

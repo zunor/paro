@@ -382,6 +382,11 @@ impl CascadesEngine {
         } else {
             (left, right)
         };
+        // Preflight the task-side redirect while Memo still has both group
+        // identities.  The actual registry mutation is deterministic after
+        // this check; if Memo rejects the contract, no task is invalidated.
+        self.task_registry
+            .validate_group_redirect(secondary, expected_canonical)?;
         let canonical = self.memo.merge_groups(left, right)?;
         debug_assert_eq!(canonical, expected_canonical);
         // Memo::merge_groups validates the output contract and completes its
