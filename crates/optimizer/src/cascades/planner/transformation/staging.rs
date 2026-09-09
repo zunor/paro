@@ -196,7 +196,10 @@ pub(super) fn stage_transformed_expression(
         id: paro_planner::plan::PlanNodeId,
         group: GroupId,
         stats: NodeStats,
-        columns: Box<[ColumnId]>,
+        /// Immutable child column identities are shared by every post-order
+        /// consumer. Native staging clones `NodeState` while walking the
+        /// flattened shell, so an `Arc` avoids copying this slice per edge.
+        columns: Arc<[ColumnId]>,
         layout: Arc<paro_planner::operator::LogicalOutputLayout>,
         names: Arc<[String]>,
         region_scope: PlannerRegionScope,
@@ -304,7 +307,7 @@ pub(super) fn stage_transformed_expression(
             id,
             group,
             stats,
-            columns: columns.into_boxed_slice(),
+            columns: columns.into(),
             layout: Arc::new(layout),
             names,
             region_scope: PlannerRegionScope::group(group),
@@ -489,6 +492,7 @@ pub(super) fn stage_transformed_expression(
             };
             output_columns.push(id);
         }
+        let output_columns: Arc<[ColumnId]> = output_columns.into();
         let unique_columns: BTreeSet<_> = output_columns.iter().copied().collect();
         let schema = GroupSchema::new(
             unique_columns
@@ -656,7 +660,7 @@ pub(super) fn stage_transformed_expression(
                         id,
                         group,
                         stats: stats.clone(),
-                        columns: output_columns.into_boxed_slice(),
+                        columns: Arc::clone(&output_columns),
                         layout: Arc::new(output_layout.clone()),
                         names: Arc::clone(&output_names),
                         region_scope: PlannerRegionScope::new(
@@ -756,7 +760,7 @@ pub(super) fn stage_transformed_expression(
                             id,
                             group,
                             stats: stats.clone(),
-                            columns: output_columns.into_boxed_slice(),
+                            columns: Arc::clone(&output_columns),
                             layout: Arc::new(output_layout.clone()),
                             names: Arc::clone(&output_names),
                             region_scope,
@@ -771,7 +775,7 @@ pub(super) fn stage_transformed_expression(
                         id,
                         group,
                         stats: stats.clone(),
-                        columns: output_columns.into_boxed_slice(),
+                        columns: Arc::clone(&output_columns),
                         layout: Arc::new(output_layout.clone()),
                         names: Arc::clone(&output_names),
                         region_scope,
@@ -880,7 +884,7 @@ pub(super) fn stage_transformed_expression(
                 &state.binding_ids,
                 state.scan_access_cost,
             )?,
-            output_columns: output_columns.clone().into_boxed_slice(),
+            output_columns: output_columns.to_vec().into_boxed_slice(),
             child_layouts: child_states
                 .iter()
                 .map(|child| Arc::clone(&child.layout))
@@ -991,7 +995,7 @@ pub(super) fn stage_transformed_expression(
                 id,
                 group,
                 stats: stats.clone(),
-                columns: output_columns.into_boxed_slice(),
+                columns: output_columns,
                 layout: Arc::new(output_layout),
                 names: output_names,
                 region_scope,
