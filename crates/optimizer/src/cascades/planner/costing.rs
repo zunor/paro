@@ -12,24 +12,99 @@ pub(super) use facts::{
     expression_cost_facts, planner_cost_facts, planner_row_width, planner_scan_access_width,
 };
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PlannerImplementationCapabilities {
+    perfect_hash_aggregate: bool,
+    singleton_aggregate_projection: bool,
+    sort_range_join: bool,
+    classic_ie_join: bool,
+    hash_join_build_left_runtime_filter: bool,
+    hash_join_runtime_filter: bool,
+    partition_aggregate_window: bool,
+}
+
 pub(super) fn planner_implementation_set(
     plan: &OwnedLogicalPlan,
     rowset_scan_pushdown: bool,
 ) -> PlannerImplementationSet {
+    let mut capabilities = PlannerImplementationCapabilities::default();
     match &plan.operator {
-        LogicalOperator::Aggregate(aggregate) => PlannerImplementationSet {
-            baseline: PhysicalImplementationFlavor::HashAggregate,
-            perfect_hash_aggregate:
+        LogicalOperator::Aggregate(aggregate) => {
+            capabilities.perfect_hash_aggregate =
                 crate::physical::extraction::helpers::can_use_perfect_hash_aggregate(
                     aggregate,
                     &aggregate.groups,
                     &aggregate.aggregates,
                 )
-                .is_some(),
-            singleton_aggregate_projection:
+                .is_some();
+            capabilities.singleton_aggregate_projection =
                 crate::physical::extraction::aggregate::supports_singleton_aggregate_projection(
                     aggregate,
-                ),
+                );
+        }
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            capabilities.hash_join_build_left_runtime_filter =
+                supports_build_left_runtime_filter_auxiliary(join, rowset_scan_pushdown);
+            capabilities.hash_join_runtime_filter =
+                supports_runtime_filter_auxiliary(join, rowset_scan_pushdown);
+            capabilities.sort_range_join =
+                crate::physical::extraction::inequality_join_gate::is_sort_range_join_candidate(
+                    join,
+                    plan.stats.estimated_cardinality,
+                );
+            capabilities.classic_ie_join =
+                crate::physical::extraction::inequality_join_gate::is_classic_ie_join_candidate(
+                    join,
+                    plan.stats.estimated_cardinality,
+                );
+        }
+        LogicalOperator::Window(window) => {
+            capabilities.partition_aggregate_window =
+                crate::physical::extraction::misc::supports_partition_aggregate_window(window);
+        }
+        _ => {}
+    }
+    planner_implementation_set_for_operator(&plan.operator, capabilities)
+}
+
+/// Native shells can retain all operator-local specialized implementations
+/// whose guards do not inspect an owned child tree. Source-lineage and
+/// inequality gates remain disabled until their boundary fact adapters are
+/// available; they are optional and never alter the structural baseline.
+pub(super) fn planner_native_implementation_set<Child>(
+    operator: &LogicalOperator<Child>,
+) -> PlannerImplementationSet {
+    let mut capabilities = PlannerImplementationCapabilities::default();
+    match operator {
+        LogicalOperator::Aggregate(aggregate) => {
+            capabilities.perfect_hash_aggregate =
+                crate::physical::extraction::helpers::can_use_perfect_hash_aggregate(
+                    aggregate,
+                    &aggregate.groups,
+                    &aggregate.aggregates,
+                )
+                .is_some();
+        }
+        _ => {}
+    };
+    planner_implementation_set_for_operator(operator, capabilities)
+}
+
+/// Derive implementation capabilities from an operator shell and immutable
+/// facts. Native transformation staging uses this entry point so it does not
+/// rebuild a shallow `OwnedLogicalPlan` merely to inspect operator-local
+/// capabilities. Runtime-filter source lineage is supplied by the owned
+/// settlement path; a closed native shell leaves those optional capabilities
+/// disabled until its boundary facts provide a native lineage contract.
+fn planner_implementation_set_for_operator<Child>(
+    operator: &LogicalOperator<Child>,
+    capabilities: PlannerImplementationCapabilities,
+) -> PlannerImplementationSet {
+    match operator {
+        LogicalOperator::Aggregate(_aggregate) => PlannerImplementationSet {
+            baseline: PhysicalImplementationFlavor::HashAggregate,
+            perfect_hash_aggregate: capabilities.perfect_hash_aggregate,
+            singleton_aggregate_projection: capabilities.singleton_aggregate_projection,
             ..PlannerImplementationSet::STRUCTURAL
         },
         LogicalOperator::Join(Join::Comparison(join)) => {
@@ -104,28 +179,19 @@ pub(super) fn planner_implementation_set(
                     && join.build_side_constraint.allows_left(),
                 hash_join_build_left_runtime_filter: supports_build_left_type
                     && join.build_side_constraint.allows_left()
-                    && supports_build_left_runtime_filter_auxiliary(join, rowset_scan_pushdown),
+                    && capabilities.hash_join_build_left_runtime_filter,
                 hash_join_runtime_filter: has_hash_key
                     && supports_hash_type
                     && join.build_side_constraint.allows_right()
-                    && supports_runtime_filter_auxiliary(join, rowset_scan_pushdown),
-                sort_range_join:
-                    crate::physical::extraction::inequality_join_gate::is_sort_range_join_candidate(
-                        join,
-                        plan.stats.estimated_cardinality,
-                    ),
-                classic_ie_join:
-                    crate::physical::extraction::inequality_join_gate::is_classic_ie_join_candidate(
-                        join,
-                        plan.stats.estimated_cardinality,
-                    ),
+                    && capabilities.hash_join_runtime_filter,
+                sort_range_join: capabilities.sort_range_join,
+                classic_ie_join: capabilities.classic_ie_join,
                 ..PlannerImplementationSet::STRUCTURAL
             }
         }
-        LogicalOperator::Window(window) => PlannerImplementationSet {
+        LogicalOperator::Window(_window) => PlannerImplementationSet {
             baseline: PhysicalImplementationFlavor::Window,
-            partition_aggregate_window:
-                crate::physical::extraction::misc::supports_partition_aggregate_window(window),
+            partition_aggregate_window: capabilities.partition_aggregate_window,
             ..PlannerImplementationSet::STRUCTURAL
         },
         LogicalOperator::Join(Join::Any(join)) => PlannerImplementationSet {

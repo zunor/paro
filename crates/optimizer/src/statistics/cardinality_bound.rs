@@ -9,8 +9,8 @@
 
 use paro_planner::operator::{Join, JoinType, LogicalOperator, SetOpType};
 
-pub(crate) fn derive_maximum_cardinality(
-    operator: &LogicalOperator,
+pub(crate) fn derive_maximum_cardinality<Child>(
+    operator: &LogicalOperator<Child>,
     child_maximum_cardinalities: &[Option<u64>],
 ) -> Option<u64> {
     let unary_bound = || child_maximum_cardinalities.first().copied().flatten();

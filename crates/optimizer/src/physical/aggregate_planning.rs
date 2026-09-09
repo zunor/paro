@@ -220,8 +220,8 @@ const PERFECT_HASH_RANGE_LIMIT: u128 = 1u128 << 32;
 /// invariants. `table_bytes_upper` deliberately over-accounts direct
 /// update scratch so the executor can validate its exact allocation against
 /// one contract without rediscovering feasibility.
-pub(crate) fn plan_perfect_hash_aggregate(
-    aggregate: &LogicalAggregate,
+pub(crate) fn plan_perfect_hash_aggregate<Child>(
+    aggregate: &LogicalAggregate<Child>,
     groups: &[Expression],
     aggregate_exprs: &[Expression],
 ) -> Option<PerfectHashAggregatePlan> {

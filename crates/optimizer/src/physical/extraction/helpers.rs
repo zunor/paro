@@ -29,8 +29,8 @@ pub(crate) fn extract_payload_expression(
     Expression::Reference(ReferenceExpression::new(reference_index, return_type).into())
 }
 
-pub(crate) fn can_use_perfect_hash_aggregate(
-    aggregate: &LogicalAggregate,
+pub(crate) fn can_use_perfect_hash_aggregate<Child>(
+    aggregate: &LogicalAggregate<Child>,
     groups: &[Expression],
     aggregate_exprs: &[Expression],
 ) -> Option<PerfectHashAggregatePlan> {

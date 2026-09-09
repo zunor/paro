@@ -18,8 +18,8 @@ pub(super) fn optimization_goal_fingerprint(goal: OptimizationGoal) -> Fingerpri
     fingerprint.finish()
 }
 
-pub(super) fn derive_provided_ordering(
-    operator: &LogicalOperator,
+pub(super) fn derive_provided_ordering<Child>(
+    operator: &LogicalOperator<Child>,
     output_columns: &[ColumnId],
     child_columns: Option<&[ColumnId]>,
     binding_ids: &BindingCatalog,
@@ -95,8 +95,8 @@ pub(super) fn derive_provided_ordering(
     }
 }
 
-pub(super) fn derive_logical_properties(
-    operator: &LogicalOperator,
+pub(super) fn derive_logical_properties<Child>(
+    operator: &LogicalOperator<Child>,
     child_maximum_cardinalities: &[Option<u64>],
 ) -> LogicalProperties {
     // Group properties describe the output relation, never a particular
@@ -112,8 +112,8 @@ pub(super) fn derive_logical_properties(
     }
 }
 
-pub(super) fn derive_group_cardinality(
-    operator: &LogicalOperator,
+pub(super) fn derive_group_cardinality<Child>(
+    operator: &LogicalOperator<Child>,
     children: &[GroupId],
     stats: &NodeStats,
     recipe: Fingerprint,
@@ -141,7 +141,9 @@ pub(super) fn derive_group_cardinality(
         })
 }
 
-pub(super) fn planner_grant_dependency(operator: &LogicalOperator) -> GrantDependencyDescriptor {
+pub(super) fn planner_grant_dependency<Child>(
+    operator: &LogicalOperator<Child>,
+) -> GrantDependencyDescriptor {
     if matches!(
         operator,
         LogicalOperator::Aggregate(_)
@@ -169,7 +171,7 @@ pub(super) fn planner_grant_dependency(operator: &LogicalOperator) -> GrantDepen
     }
 }
 
-pub(super) fn planner_operator_spillable(operator: &LogicalOperator) -> bool {
+pub(super) fn planner_operator_spillable<Child>(operator: &LogicalOperator<Child>) -> bool {
     match operator {
         LogicalOperator::Aggregate(aggregate) => {
             !aggregate.groups.is_empty()
@@ -222,7 +224,9 @@ pub(super) fn implementation_spillable(
     }
 }
 
-pub(super) fn planner_structural_retained_children(operator: &LogicalOperator) -> u64 {
+pub(super) fn planner_structural_retained_children<Child>(
+    operator: &LogicalOperator<Child>,
+) -> u64 {
     match operator {
         LogicalOperator::Order(_)
         | LogicalOperator::TopN(_)
@@ -769,7 +773,9 @@ pub(super) fn add_spill_cost(cost: &mut SearchCost, spilled: u64) -> Result<()> 
     Ok(())
 }
 
-pub(super) fn provided_result_guarantee(operator: &LogicalOperator) -> ResultGuarantee {
+pub(super) fn provided_result_guarantee<Child>(
+    operator: &LogicalOperator<Child>,
+) -> ResultGuarantee {
     match operator {
         LogicalOperator::SearchScan(scan)
             if scan.request.intents.iter().any(|intent| {

@@ -330,96 +330,101 @@ pub(super) fn stage_transformed_expression(
             target_child_context,
             refined_cardinality_kind,
         } = request;
-        let (id, stats, semantic_operator, semantic_template, cost_plan) = match input {
-            NodeStagingInput::Owned(plan) => {
-                if let LogicalOperator::BoundReference(reference) = &plan.operator {
-                    if target.is_some()
-                        || !session
-                            .nested_group_holes
-                            .contains_key(&reference.reference_id)
-                    {
+        let (id, stats, semantic_operator, semantic_template, cost_plan, native_direct) =
+            match input {
+                NodeStagingInput::Owned(plan) => {
+                    if let LogicalOperator::BoundReference(reference) = &plan.operator {
+                        if target.is_some()
+                            || !session
+                                .nested_group_holes
+                                .contains_key(&reference.reference_id)
+                        {
+                            return Err(paro_error::internal(
+                                "staging reached an unregistered or root Memo group hole",
+                            ));
+                        }
+                        let node = resolve_group_hole(session, plan)?;
+                        return Ok(Some((node, None)));
+                    }
+                    let (skeleton, children) =
+                        paro_planner::plan::arena::LogicalPlanNode::detach(plan);
+                    let semantic_template = semantic_plan::canonical_template(skeleton.clone());
+                    let semantic_operator = skeleton.operator.clone();
+                    let semantic_plan = skeleton.assemble(children)?;
+                    (
+                        semantic_plan.id,
+                        semantic_plan.stats.clone(),
+                        semantic_operator,
+                        semantic_template,
+                        semantic_plan,
+                        false,
+                    )
+                }
+                NodeStagingInput::Native {
+                    id,
+                    stats,
+                    operator,
+                } => {
+                    let semantic_operator = operator
+                        .clone()
+                        .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
+                        .expect("mapping native group references to a semantic shell cannot fail");
+                    let semantic_template = semantic_plan::canonical_template(
+                        paro_planner::plan::arena::LogicalPlanNode {
+                            id,
+                            stats: NodeStats::default(),
+                            operator: semantic_operator.clone(),
+                        },
+                    );
+                    // Keep the recursive staging representation native. The
+                    // legacy planner-only helpers below receive one shallow
+                    // compatibility view for names and local cost probes; it
+                    // contains no child subtree and is never published or fed
+                    // back into settlement.
+                    let mut child_index = 0;
+                    let cost_operator = operator.clone().try_map_child_links(&mut |group| {
+                        let child = child_states.get(child_index).ok_or_else(|| {
+                            paro_error::internal("native staging lost a costing child")
+                        })?;
+                        child_index += 1;
+                        let reference_id = child.boundary_reference_id.unwrap_or_else(|| {
+                            paro_planner::operator::BoundReferenceId::group_hole(group.0)
+                        });
+                        let mut reference = paro_planner::operator::BoundReference::new(
+                            reference_id,
+                            child.layout.bindings().to_vec(),
+                            child.layout.types().to_vec(),
+                        );
+                        if let Some(facts) = &child.boundary_facts {
+                            reference = reference.with_facts(facts.clone())?;
+                        }
+                        let unique_keys = reference.facts.unique_keys.clone();
+                        let mut child_plan =
+                            OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference));
+                        child_plan.id = child.id;
+                        child_plan.stats = child.stats.clone();
+                        child_plan.stats.unique_keys = unique_keys;
+                        Ok::<_, paro_error::ParoError>(Box::new(child_plan))
+                    })?;
+                    if child_index != child_states.len() {
                         return Err(paro_error::internal(
-                            "staging reached an unregistered or root Memo group hole",
+                            "native staging costing child arity mismatch",
                         ));
                     }
-                    let node = resolve_group_hole(session, plan)?;
-                    return Ok(Some((node, None)));
-                }
-                let (skeleton, children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
-                let semantic_template = semantic_plan::canonical_template(skeleton.clone());
-                let semantic_operator = skeleton.operator.clone();
-                let semantic_plan = skeleton.assemble(children)?;
-                (
-                    semantic_plan.id,
-                    semantic_plan.stats.clone(),
-                    semantic_operator,
-                    semantic_template,
-                    semantic_plan,
-                )
-            }
-            NodeStagingInput::Native {
-                id,
-                stats,
-                operator,
-            } => {
-                let semantic_operator = operator
-                    .clone()
-                    .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
-                    .expect("mapping native group references to a semantic shell cannot fail");
-                let semantic_template =
-                    semantic_plan::canonical_template(paro_planner::plan::arena::LogicalPlanNode {
+                    (
                         id,
-                        stats: NodeStats::default(),
-                        operator: semantic_operator.clone(),
-                    });
-                // Keep the recursive staging representation native. The
-                // legacy planner-only helpers below receive one shallow
-                // compatibility view for names and local cost probes; it
-                // contains no child subtree and is never published or fed
-                // back into settlement.
-                let mut child_index = 0;
-                let cost_operator = operator.clone().try_map_child_links(&mut |group| {
-                    let child = child_states.get(child_index).ok_or_else(|| {
-                        paro_error::internal("native staging lost a costing child")
-                    })?;
-                    child_index += 1;
-                    let reference_id = child.boundary_reference_id.unwrap_or_else(|| {
-                        paro_planner::operator::BoundReferenceId::group_hole(group.0)
-                    });
-                    let mut reference = paro_planner::operator::BoundReference::new(
-                        reference_id,
-                        child.layout.bindings().to_vec(),
-                        child.layout.types().to_vec(),
-                    );
-                    if let Some(facts) = &child.boundary_facts {
-                        reference = reference.with_facts(facts.clone())?;
-                    }
-                    let unique_keys = reference.facts.unique_keys.clone();
-                    let mut child_plan =
-                        OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference));
-                    child_plan.id = child.id;
-                    child_plan.stats = child.stats.clone();
-                    child_plan.stats.unique_keys = unique_keys;
-                    Ok::<_, paro_error::ParoError>(Box::new(child_plan))
-                })?;
-                if child_index != child_states.len() {
-                    return Err(paro_error::internal(
-                        "native staging costing child arity mismatch",
-                    ));
+                        stats.clone(),
+                        semantic_operator,
+                        semantic_template,
+                        OwnedLogicalPlan {
+                            id,
+                            stats,
+                            operator: cost_operator,
+                        },
+                        true,
+                    )
                 }
-                (
-                    id,
-                    stats.clone(),
-                    semantic_operator,
-                    semantic_template,
-                    OwnedLogicalPlan {
-                        id,
-                        stats,
-                        operator: cost_operator,
-                    },
-                )
-            }
-        };
+            };
         // The canonical extraction template deliberately has no output demand
         // or occurrence statistics. Derive the published schema/facts from the
         // settled occurrence, before erasing those annotations for storage.
@@ -448,11 +453,8 @@ pub(super) fn stage_transformed_expression(
             .iter()
             .map(|child| child.names.as_ref())
             .collect::<Vec<_>>();
-        let output_names = Arc::<[String]>::from(
-            cost_plan
-                .operator
-                .output_names_from_child_refs(&child_names),
-        );
+        let output_names =
+            Arc::<[String]>::from(semantic_operator.output_names_from_child_refs(&child_names));
         if output_bindings.len() != output_types.len() {
             return Err(paro_error::internal(
                 "transformed plan output binding/type arity mismatch",
@@ -512,7 +514,7 @@ pub(super) fn stage_transformed_expression(
             })
             .collect::<Vec<_>>();
         let mut logical_properties =
-            derive_logical_properties(&cost_plan.operator, &child_maximum_cardinalities);
+            derive_logical_properties(&semantic_operator, &child_maximum_cardinalities);
         attach_group_column_domains(
             &mut logical_properties,
             &output_bindings,
@@ -520,12 +522,12 @@ pub(super) fn stage_transformed_expression(
             column_stats.as_ref(),
             &schema,
         )?;
-        if let LogicalOperator::CTERef(reference) = &cost_plan.operator {
+        if let LogicalOperator::CTERef(reference) = &semantic_operator {
             logical_properties
                 .cte_references
                 .insert(cte_reference_domain(reference, &output_columns)?);
         }
-        if let LogicalOperator::MaterializedCTE(cte) = &cost_plan.operator {
+        if let LogicalOperator::MaterializedCTE(cte) = &semantic_operator {
             if let Some(producer) = child_states.first() {
                 memo.register_cte_producer(
                     cte.cte_index,
@@ -574,7 +576,7 @@ pub(super) fn stage_transformed_expression(
         };
         let logical_identity = key.stable_fingerprint();
         let mut cardinality =
-            derive_group_cardinality(&cost_plan.operator, &key.children, &stats, logical_identity);
+            derive_group_cardinality(&semantic_operator, &key.children, &stats, logical_identity);
         if let Some(target) = target {
             cardinality = if let Some(kind) = refined_cardinality_kind {
                 cardinality.with_kind(kind)
@@ -829,8 +831,12 @@ pub(super) fn stage_transformed_expression(
                 )
             })
             .transpose()?;
-        let implementations = planner_implementation_set(&cost_plan, state.rowset_scan_pushdown);
-        if let LogicalOperator::Join(Join::Comparison(join)) = &cost_plan.operator {
+        let implementations = if native_direct {
+            planner_native_implementation_set(&semantic_operator)
+        } else {
+            planner_implementation_set(&cost_plan, state.rowset_scan_pushdown)
+        };
+        if let LogicalOperator::Join(Join::Comparison(join)) = &semantic_operator {
             debug!(
                 target: targets::OPTIMIZER,
                 rule = options.rule.0,
@@ -838,7 +844,7 @@ pub(super) fn stage_transformed_expression(
                 join_type = ?join.join_type,
                 runtime_filter_candidate = implementations.hash_join_runtime_filter,
                 build_left_runtime_filter_candidate = implementations.hash_join_build_left_runtime_filter,
-                probe_operator = ?join.left.operator.op_type(),
+                probe_operator = ?semantic_operator.op_type(),
                 conditions = ?join.conditions,
                 "staged transformed physical join implementation set"
             );
@@ -853,7 +859,7 @@ pub(super) fn stage_transformed_expression(
             operator_fingerprint,
             provided: ProvidedProperties {
                 ordering: derive_provided_ordering(
-                    &cost_plan.operator,
+                    &semantic_operator,
                     &output_columns,
                     child_states.first().map(|child| child.columns.as_ref()),
                     &state.binding_ids,
@@ -866,7 +872,7 @@ pub(super) fn stage_transformed_expression(
                 mutation_safety: ProvidedMutationSafety::NotApplicable,
                 representation: ProvidedRepresentation::Flat,
                 replayability: ProvidedReplayability::OnePass,
-                result_guarantee: provided_result_guarantee(&cost_plan.operator),
+                result_guarantee: provided_result_guarantee(&semantic_operator),
             },
             local_cost: planner_operator_cost(
                 &cost_plan,
@@ -876,8 +882,8 @@ pub(super) fn stage_transformed_expression(
                 state.scan_access_cost,
             )?,
             implementations,
-            grant_dependency: planner_grant_dependency(&cost_plan.operator),
-            spillable: planner_operator_spillable(&cost_plan.operator),
+            grant_dependency: planner_grant_dependency(&semantic_operator),
+            spillable: planner_operator_spillable(&semantic_operator),
             cost_facts: planner_cost_facts(
                 &cost_plan,
                 column_stats.as_ref(),
@@ -894,13 +900,13 @@ pub(super) fn stage_transformed_expression(
                 memo,
                 child_states.iter().map(|child| child.columns.as_ref()),
             )?,
-            child_row_goals: child_row_goals(&cost_plan.operator, child_states.len()),
+            child_row_goals: child_row_goals(&semantic_operator, child_states.len()),
             search,
             input_context: node_context,
             child_context: target_child_context.unwrap_or(node_context),
             required_region_facet: target.and(required_region_facet),
             runtime_filter_region_facet: None,
-            structural_retained_children: planner_structural_retained_children(&cost_plan.operator),
+            structural_retained_children: planner_structural_retained_children(&semantic_operator),
             baseline_payload,
         };
         if state.metadata.insert(payload, metadata).is_some() {

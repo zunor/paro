@@ -1276,7 +1276,10 @@ fn intern_child_requirements<'a>(
         .map(Vec::into_boxed_slice)
 }
 
-fn child_row_goals(operator: &LogicalOperator, child_count: usize) -> Box<[PlannerChildRowGoal]> {
+fn child_row_goals<Child>(
+    operator: &LogicalOperator<Child>,
+    child_count: usize,
+) -> Box<[PlannerChildRowGoal]> {
     let policy = match operator {
         LogicalOperator::Projection(_)
         | LogicalOperator::RowFetch(_)
