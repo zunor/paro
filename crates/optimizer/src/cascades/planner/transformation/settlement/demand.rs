@@ -134,17 +134,24 @@ pub(super) fn derive(
     }))
 }
 
-fn remap_expression(expression: &mut Expression, bindings: &BindingMap) {
-    ExpressionIterator::visit_mut(expression, &mut |expression| {
-        if let Expression::ColumnRef(column) = expression {
-            if column.depth == 0 {
-                if let Some(binding) = bindings.get(&column.binding) {
-                    column.binding = *binding;
-                }
-            }
+fn remap_expression(expression: &Expression, bindings: &BindingMap) -> Result<Expression> {
+    ExpressionIterator::try_rewrite_dag(expression, |node| {
+        let Expression::ColumnRef(column) = node else {
+            return Ok(None);
+        };
+        if column.depth != 0 {
+            return Ok(None);
         }
-        paro_planner::expression::ExpressionVisitDecision::Descend
-    });
+        let Some(binding) = bindings.get(&column.binding) else {
+            return Ok(None);
+        };
+        if *binding == column.binding {
+            return Ok(None);
+        }
+        let mut rewritten = column.clone();
+        rewritten.binding = *binding;
+        Ok(Some(Expression::ColumnRef(rewritten)))
+    })
 }
 
 fn project(
@@ -289,9 +296,23 @@ pub(super) fn apply(
             .filter_map(|index| get.names.get(*index).cloned())
             .collect();
     }
-    paro_planner::visitor::enumerate_expressions(&mut shell.operator, |expression| {
-        remap_expression(expression, &bindings)
-    });
+    // A carrier map also proves retention, so identity entries must remain in
+    // `bindings`. They are not scalar edits. Avoid even visiting expression
+    // payloads for an identity substitution; otherwise copy only changed paths.
+    if bindings.iter().any(|(before, after)| before != after) {
+        let mut failure = None;
+        paro_planner::visitor::enumerate_expressions(&mut shell.operator, |expression| {
+            if failure.is_none() {
+                match remap_expression(expression, &bindings) {
+                    Ok(rewritten) => *expression = rewritten,
+                    Err(error) => failure = Some(error),
+                }
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+    }
     match &mut shell.operator {
         LogicalOperator::Filter(filter) => project(
             &mut filter.projection_map,
@@ -364,4 +385,63 @@ pub(super) fn apply(
         .collect();
     shell.stats.invalidate_structural_facts();
     Ok((shell, map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_planner::expression::{ColumnRefExpression, ConjunctionExpression, ConjunctionType};
+
+    #[test]
+    fn binding_substitution_preserves_unaffected_paths_and_correlated_columns() {
+        let column = |ordinal, depth| {
+            let mut column =
+                ColumnRefExpression::new(ColumnBinding::new(0, ordinal), LogicalType::Integer);
+            column.depth = depth;
+            Expression::ColumnRef(column.into())
+        };
+        let a = column(0, 0);
+        let b = column(1, 0);
+        let outer = column(0, 1);
+        let root = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::And,
+                vec![a.clone(), b.clone(), outer.clone(), a],
+            )
+            .into(),
+        );
+        let identity = BindingMap::from([(ColumnBinding::new(0, 0), ColumnBinding::new(0, 0))]);
+        assert_eq!(
+            remap_expression(&root, &identity)
+                .unwrap()
+                .allocation_identity(),
+            root.allocation_identity()
+        );
+        let replacements = BindingMap::from([(ColumnBinding::new(0, 0), ColumnBinding::new(7, 3))]);
+        let changed = remap_expression(&root, &replacements).unwrap();
+        let Expression::Conjunction(node) = changed else {
+            panic!()
+        };
+        assert_eq!(
+            node.children[0].allocation_identity(),
+            node.children[3].allocation_identity()
+        );
+        assert_eq!(
+            node.children[1].allocation_identity(),
+            b.allocation_identity()
+        );
+        assert_eq!(
+            node.children[2].allocation_identity(),
+            outer.allocation_identity()
+        );
+        assert!(
+            matches!(&node.children[0], Expression::ColumnRef(column) if column.binding == ColumnBinding::new(7, 3))
+        );
+        assert_eq!(
+            remap_expression(&Expression::Conjunction(node.clone()), &replacements)
+                .unwrap()
+                .allocation_identity(),
+            Expression::Conjunction(node).allocation_identity()
+        );
+    }
 }

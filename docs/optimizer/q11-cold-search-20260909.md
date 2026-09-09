@@ -244,6 +244,23 @@ All 1,051 optimizer and 286 planner tests pass. Four diagnostic counters expose
 hits/misses separately for settlement and planner imports; timing follows after
 the source snapshot is committed.
 
+Five normal processes at `774b087c` give median EXPLAIN **736.034 ms**.
+All pre-existing search counters and the selected plan are identical to
+`6e070f6c`; only the four new import counters differ. Planner imports have
+3,718 hits / 8,759 misses, while settlement has just 106 / 19,378. This is
+a small measured reduction, not the remaining order-of-magnitude improvement.
+Inspection explains one reason for poor reuse: demand's identity binding
+substitution entered the mutable scalar visitor and detached every node even
+when every mapping was `(column, column)`.
+
+Settlement now separates retention maps from actual scalar edits. Identity
+substitutions do not visit expression payloads. Real substitutions use a
+context-free persistent DAG rewrite: one visit per shared node, only changed
+ancestor paths copied, correlated references untouched. The common traversal
+contract covers aggregate/window modifier edges and short-circuits errors.
+Tests cover a 2^50-occurrence shared DAG, 10,000-deep scalar, repeated local
+bindings, correlated bindings, unchanged siblings and idempotent substitution.
+
 ## Immutable source-response payloads
 
 Candidates now share immutable source-work snapshots. Ordinary parent

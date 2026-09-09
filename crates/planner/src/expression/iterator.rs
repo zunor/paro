@@ -13,6 +13,55 @@ pub enum ExpressionVisitDecision {
 }
 
 impl ExpressionIterator {
+    /// Rewrite immutable scalar nodes in post-order, preserving every unchanged
+    /// allocation. The callback is a context-free local substitution, not an
+    /// evaluation/occurrence visitor: a shared input node is rewritten once and
+    /// its result is shared by all incoming edges. Runtime occurrence counts
+    /// are not changed. Returning `None` leaves the node (with rewritten
+    /// children) unchanged; a replacement is not recursively rewritten again.
+    pub fn try_rewrite_dag(
+        expr: &Expression,
+        mut rewrite: impl FnMut(&Expression) -> Result<Option<Expression>>,
+    ) -> Result<Expression> {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+
+        // All input allocations remain borrowed until the fold finishes;
+        // address identities cannot be recycled within this local memo.
+        let rewritten = RefCell::new(HashMap::new());
+        Self::try_fold_post_order_cached(
+            expr,
+            |node| rewritten.borrow().get(&node.allocation_identity()).cloned(),
+            |node, children: &[Expression]| {
+                let mut changed = false;
+                let mut ordinal = 0;
+                Self::enumerate_children(node, |child| {
+                    changed |=
+                        child.allocation_identity() != children[ordinal].allocation_identity();
+                    ordinal += 1;
+                });
+                let mut result = node.clone();
+                if changed {
+                    let mut children = children.iter();
+                    Self::enumerate_children_mut(&mut result, |child| {
+                        *child = children
+                            .next()
+                            .expect("rewrite retained every edge")
+                            .clone();
+                    });
+                    debug_assert!(children.next().is_none());
+                }
+                if let Some(replacement) = rewrite(&result)? {
+                    result = replacement;
+                }
+                rewritten
+                    .borrow_mut()
+                    .insert(node.allocation_identity(), result.clone());
+                Ok(result)
+            },
+        )
+    }
+
     /// Fold an expression in post-order without using the native call stack.
     /// Expression children include aggregate/window modifiers and frame
     /// offsets, so callers get one complete traversal contract instead of
@@ -366,6 +415,93 @@ mod tests {
         Expression::ColumnRef(
             ColumnRefExpression::new(ColumnBinding::new(10, idx), LogicalType::Integer).into(),
         )
+    }
+
+    #[test]
+    fn persistent_dag_rewrite_preserves_no_ops_and_rewrites_shared_nodes_once() {
+        use crate::expression::{ConjunctionExpression, ConjunctionType};
+        let leaf = int_column(0);
+        let untouched = int_column(1);
+        let mut root = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::And, vec![leaf, untouched.clone()]).into(),
+        );
+        for _ in 0..50 {
+            root = Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::Or, vec![root.clone(), root]).into(),
+            );
+        }
+        let mut visited = 0;
+        let noop = ExpressionIterator::try_rewrite_dag(&root, |_| {
+            visited += 1;
+            assert!(visited <= 53, "a shared scalar was expanded more than once");
+            Ok(None)
+        })
+        .unwrap();
+        assert_eq!(visited, 53);
+        assert_eq!(noop.allocation_identity(), root.allocation_identity());
+        visited = 0;
+        let changed = ExpressionIterator::try_rewrite_dag(&root, |node| {
+            visited += 1;
+            assert!(visited <= 53);
+            Ok(
+                matches!(node, Expression::ColumnRef(c) if c.binding.column_index == 0)
+                    .then(|| int_column(2)),
+            )
+        })
+        .unwrap();
+        assert_eq!(visited, 53);
+        assert_ne!(changed.allocation_identity(), root.allocation_identity());
+        let mut cursor = &changed;
+        for _ in 0..50 {
+            let Expression::Conjunction(node) = cursor else {
+                panic!()
+            };
+            assert_eq!(
+                node.children[0].allocation_identity(),
+                node.children[1].allocation_identity()
+            );
+            cursor = &node.children[0];
+        }
+        let Expression::Conjunction(node) = cursor else {
+            panic!()
+        };
+        assert!(node.children[0].equals(&int_column(2)));
+        assert_eq!(
+            node.children[1].allocation_identity(),
+            untouched.allocation_identity()
+        );
+    }
+
+    #[test]
+    fn persistent_rewrite_is_stack_safe_and_short_circuits_errors() {
+        use crate::expression::{ConjunctionExpression, ConjunctionType};
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut root = int_column(0);
+                for _ in 0..10_000 {
+                    root = Expression::Conjunction(
+                        ConjunctionExpression::new(ConjunctionType::And, vec![root]).into(),
+                    );
+                }
+                let rewritten = ExpressionIterator::try_rewrite_dag(&root, |node| {
+                    Ok(matches!(node, Expression::ColumnRef(_)).then(|| int_column(1)))
+                })
+                .unwrap();
+                assert!(!rewritten.equals(&root));
+                let mut reads = 0;
+                let failed = ExpressionIterator::try_rewrite_dag(&root, |_| {
+                    reads += 1;
+                    Err(paro_common::error::internal(
+                        "intentional local rewrite failure",
+                    ))
+                });
+                assert!(failed.is_err());
+                assert_eq!(reads, 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
