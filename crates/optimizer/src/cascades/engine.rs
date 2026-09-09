@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use paro_common::error::{self as paro_error, Result};
+use smallvec::SmallVec;
 
 use super::budget::{BudgetDecision, BudgetDimension};
 use super::calibration::{
@@ -2453,7 +2454,14 @@ impl CascadesEngine {
                 child_costs.clear();
                 child_fingerprints.clear();
                 let (local_cost, source_work, mut cost) = {
-                    let mut child_source_work_refs = Vec::with_capacity(child_frontier_count);
+                    // Q11 and the other common plans have only a handful of
+                    // child pipelines. Keep the borrowed source-lane list in
+                    // inline storage so this per-combination scratch does not
+                    // allocate; it is dropped before the next mutable Memo
+                    // operation, preserving the single-owner publication
+                    // boundary.
+                    let mut child_source_work_refs =
+                        SmallVec::<[&[SourceWork]; 8]>::with_capacity(child_frontier_count);
                     for child in &child_selections {
                         let winner = self.memo.resolve_child_winner(*child).ok_or_else(|| {
                             paro_error::internal("child product lost an immutable candidate")
@@ -3225,10 +3233,12 @@ pub(crate) fn compose_candidate_cost_with_sources_at_ref(
     }
     let sideways_filter = composition.sideways_filter();
     let mut source_work = Vec::new();
+    let source_work_capacity = child_source_work.iter().map(|lanes| lanes.len()).sum();
+    source_work.reserve(source_work_capacity);
     for (index, child) in child_costs.iter().copied().enumerate() {
         let mut child = child;
-        let mut lanes = child_source_work[index].to_vec();
         if let Some((filtered_child, sources)) = sideways_filter {
+            let mut lanes = child_source_work[index].to_vec();
             if index == filtered_child {
                 let matching_lanes = lanes
                     .iter()
@@ -3380,9 +3390,15 @@ pub(crate) fn compose_candidate_cost_with_sources_at_ref(
                     "composed source-attributed sideways filter"
                 );
             }
+            source_work.extend(lanes);
+        } else {
+            // SourceWork is an immutable Arc-backed snapshot. When no
+            // sideways predicate changes a lane, append shallow handles
+            // directly to the output buffer instead of allocating a
+            // per-child temporary Vec for every Cartesian-product candidate.
+            source_work.extend(child_source_work[index].iter().cloned());
         }
         cost = child.sequential(cost)?;
-        source_work.extend(lanes);
     }
     let overlapping_children = composition.overlapping_children();
     if overlapping_children != 0 {
