@@ -80,11 +80,15 @@ pub(super) fn stage_transformed_expression(
 
     #[derive(Clone)]
     struct NodeState {
+        id: paro_planner::plan::PlanNodeId,
         group: GroupId,
+        stats: NodeStats,
         columns: Box<[ColumnId]>,
         layout: Arc<paro_planner::operator::LogicalOutputLayout>,
         names: Arc<[String]>,
         region_scope: PlannerRegionScope,
+        boundary_reference_id: Option<paro_planner::operator::BoundReferenceId>,
+        boundary_facts: Option<Arc<paro_planner::operator::bound_reference::BoundRelationFacts>>,
     }
 
     struct StagingOptions<'a> {
@@ -104,8 +108,17 @@ pub(super) fn stage_transformed_expression(
         search_candidates: HashMap<paro_planner::plan::PlanNodeId, OwnedLogicalPlan>,
     }
 
+    enum NodeStagingInput {
+        Owned(OwnedLogicalPlan),
+        Native {
+            id: paro_planner::plan::PlanNodeId,
+            stats: NodeStats,
+            operator: LogicalOperator<GroupId>,
+        },
+    }
+
     struct NodeStagingRequest {
-        plan: OwnedLogicalPlan,
+        input: NodeStagingInput,
         target: Option<GroupId>,
         required_region_facet: Option<Fingerprint>,
         inherited_runtime_filter_facet: Option<Fingerprint>,
@@ -114,13 +127,74 @@ pub(super) fn stage_transformed_expression(
         refined_cardinality_kind: Option<CardinalityRecipeKind>,
     }
 
+    fn resolve_group_hole(
+        session: &mut StagingSession<'_>,
+        plan: OwnedLogicalPlan,
+    ) -> Result<NodeState> {
+        let layout = plan.output_layout();
+        let names = Arc::<[String]>::from(plan.output_names());
+        let LogicalOperator::BoundReference(reference) = &plan.operator else {
+            return Err(paro_error::internal(
+                "native staging expected a Memo group hole",
+            ));
+        };
+        let group = session
+            .nested_group_holes
+            .remove(&reference.reference_id)
+            .ok_or_else(|| {
+                paro_error::internal("staging reached an unregistered Memo group hole")
+            })?;
+        let bindings = layout.bindings();
+        let types = layout.types();
+        if bindings.len() != types.len() {
+            return Err(paro_error::internal(
+                "nested group hole has inconsistent binding/type arity",
+            ));
+        }
+        let columns = bindings
+            .into_iter()
+            .zip(types)
+            .map(|(&binding, logical_type)| {
+                session
+                    .state
+                    .binding_ids
+                    .get(binding.table_index, binding.column_index, &logical_type)
+                    .copied()
+                    .ok_or_else(|| {
+                        paro_error::internal("nested group hole references an unknown column")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let group = session.memo.canonical_group(group);
+        let contract = session
+            .memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("nested group hole references an unknown group"))?;
+        if columns.iter().copied().collect::<BTreeSet<_>>() != contract.schema.ids() {
+            return Err(paro_error::internal(
+                "nested group hole changes its referenced group schema",
+            ));
+        }
+        Ok(NodeState {
+            id: plan.id,
+            group,
+            stats: plan.stats.clone(),
+            columns: columns.into_boxed_slice(),
+            layout: Arc::new(layout),
+            names,
+            region_scope: PlannerRegionScope::group(group),
+            boundary_reference_id: Some(reference.reference_id),
+            boundary_facts: Some(reference.facts.clone()),
+        })
+    }
+
     fn stage_node(
         session: &mut StagingSession<'_>,
         request: NodeStagingRequest,
         child_states: Vec<NodeState>,
-    ) -> Result<Option<(OwnedLogicalPlan, NodeState, Option<StagedEquivalent>)>> {
+    ) -> Result<Option<(NodeState, Option<StagedEquivalent>)>> {
         let NodeStagingRequest {
-            plan,
+            input,
             target,
             required_region_facet,
             inherited_runtime_filter_facet,
@@ -128,89 +202,110 @@ pub(super) fn stage_transformed_expression(
             target_child_context,
             refined_cardinality_kind,
         } = request;
-        if let LogicalOperator::BoundReference(reference) = &plan.operator {
-            if target.is_some()
-                || !session
-                    .nested_group_holes
-                    .contains_key(&reference.reference_id)
-            {
-                return Err(paro_error::internal(
-                    "staging reached an unregistered or root Memo group hole",
-                ));
-            }
-        }
-        if target.is_none() {
-            let nested_reference = match &plan.operator {
-                LogicalOperator::BoundReference(reference) => Some(reference.reference_id),
-                _ => None,
-            };
-            if let Some(group) = nested_reference
-                .and_then(|reference_id| session.nested_group_holes.remove(&reference_id))
-            {
-                let layout = plan.output_layout();
-                let names = Arc::<[String]>::from(plan.output_names());
-                let bindings = layout.bindings();
-                let types = layout.types();
-                if bindings.len() != types.len() {
-                    return Err(paro_error::internal(
-                        "nested group hole has inconsistent binding/type arity",
-                    ));
+        let (id, stats, semantic_operator, semantic_template, cost_plan) = match input {
+            NodeStagingInput::Owned(plan) => {
+                if let LogicalOperator::BoundReference(reference) = &plan.operator {
+                    if target.is_some()
+                        || !session
+                            .nested_group_holes
+                            .contains_key(&reference.reference_id)
+                    {
+                        return Err(paro_error::internal(
+                            "staging reached an unregistered or root Memo group hole",
+                        ));
+                    }
+                    let node = resolve_group_hole(session, plan)?;
+                    return Ok(Some((node, None)));
                 }
-                let columns = bindings
-                    .into_iter()
-                    .zip(types)
-                    .map(|(&binding, logical_type)| {
-                        session
-                            .state
-                            .binding_ids
-                            .get(binding.table_index, binding.column_index, &logical_type)
-                            .copied()
-                            .ok_or_else(|| {
-                                paro_error::internal(
-                                    "nested group hole references an unknown column",
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let group = session.memo.canonical_group(group);
-                let contract = session.memo.group(group).ok_or_else(|| {
-                    paro_error::internal("nested group hole references an unknown group")
+                let (skeleton, children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
+                let semantic_template = semantic_plan::canonical_template(skeleton.clone());
+                let semantic_operator = skeleton.operator.clone();
+                let semantic_plan = skeleton.assemble(children)?;
+                (
+                    semantic_plan.id,
+                    semantic_plan.stats.clone(),
+                    semantic_operator,
+                    semantic_template,
+                    semantic_plan,
+                )
+            }
+            NodeStagingInput::Native {
+                id,
+                stats,
+                operator,
+            } => {
+                let semantic_operator = operator
+                    .clone()
+                    .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
+                    .expect("mapping native group references to a semantic shell cannot fail");
+                let semantic_template =
+                    semantic_plan::canonical_template(paro_planner::plan::arena::LogicalPlanNode {
+                        id,
+                        stats: NodeStats::default(),
+                        operator: semantic_operator.clone(),
+                    });
+                // Keep the recursive staging representation native. The
+                // legacy planner-only helpers below receive one shallow
+                // compatibility view for names and local cost probes; it
+                // contains no child subtree and is never published or fed
+                // back into settlement.
+                let mut child_index = 0;
+                let cost_operator = operator.clone().try_map_child_links(&mut |group| {
+                    let child = child_states.get(child_index).ok_or_else(|| {
+                        paro_error::internal("native staging lost a costing child")
+                    })?;
+                    child_index += 1;
+                    let reference_id = child.boundary_reference_id.unwrap_or_else(|| {
+                        paro_planner::operator::BoundReferenceId::group_hole(group.0)
+                    });
+                    let mut reference = paro_planner::operator::BoundReference::new(
+                        reference_id,
+                        child.layout.bindings().to_vec(),
+                        child.layout.types().to_vec(),
+                    );
+                    if let Some(facts) = &child.boundary_facts {
+                        reference = reference.with_facts(facts.clone())?;
+                    }
+                    let unique_keys = reference.facts.unique_keys.clone();
+                    let mut child_plan =
+                        OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference));
+                    child_plan.id = child.id;
+                    child_plan.stats = child.stats.clone();
+                    child_plan.stats.unique_keys = unique_keys;
+                    Ok::<_, paro_error::ParoError>(Box::new(child_plan))
                 })?;
-                if columns.iter().copied().collect::<BTreeSet<_>>() != contract.schema.ids() {
+                if child_index != child_states.len() {
                     return Err(paro_error::internal(
-                        "nested group hole changes its referenced group schema",
+                        "native staging costing child arity mismatch",
                     ));
                 }
-                return Ok(Some((
-                    plan,
-                    NodeState {
-                        group,
-                        columns: columns.into_boxed_slice(),
-                        layout: Arc::new(layout.clone()),
-                        names,
-                        region_scope: PlannerRegionScope::group(group),
+                (
+                    id,
+                    stats.clone(),
+                    semantic_operator,
+                    semantic_template,
+                    OwnedLogicalPlan {
+                        id,
+                        stats,
+                        operator: cost_operator,
                     },
-                    None,
-                )));
+                )
             }
-        }
-        let (skeleton, children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
-        let semantic_template = semantic_plan::canonical_template(skeleton.clone());
+        };
         // The canonical extraction template deliberately has no output demand
         // or occurrence statistics. Derive the published schema/facts from the
         // settled occurrence, before erasing those annotations for storage.
-        let semantic_plan = skeleton.clone().assemble(children)?;
         let memo = &mut *session.memo;
         let state = &mut *session.state;
         let options = &session.options;
-        if semantic_plan.id.is_synthetic() && !options.column_stat_scopes.is_empty() {
+        if id.is_synthetic() && !options.column_stat_scopes.is_empty() {
             return Err(paro_error::internal(
                 "synthetic plan id cannot select a column-statistics scope",
             ));
         }
         let column_stats = options
             .column_stat_scopes
-            .get(&semantic_plan.id)
+            .get(&id)
             .unwrap_or(options.column_stats);
         let pending_runtime_filter_facets = &mut session.pending_runtime_filter_facets;
 
@@ -218,9 +313,7 @@ pub(super) fn stage_transformed_expression(
             .iter()
             .map(|child| child.layout.as_ref())
             .collect::<Vec<_>>();
-        let output_layout = semantic_plan
-            .operator
-            .output_layout_from_child_refs(&child_layouts);
+        let output_layout = semantic_operator.output_layout_from_child_refs(&child_layouts);
         let output_bindings = output_layout.bindings();
         let output_types = output_layout.types();
         let child_names = child_states
@@ -228,7 +321,7 @@ pub(super) fn stage_transformed_expression(
             .map(|child| child.names.as_ref())
             .collect::<Vec<_>>();
         let output_names = Arc::<[String]>::from(
-            semantic_plan
+            cost_plan
                 .operator
                 .output_names_from_child_refs(&child_names),
         );
@@ -290,7 +383,7 @@ pub(super) fn stage_transformed_expression(
             })
             .collect::<Vec<_>>();
         let mut logical_properties =
-            derive_logical_properties(&semantic_plan.operator, &child_maximum_cardinalities);
+            derive_logical_properties(&cost_plan.operator, &child_maximum_cardinalities);
         attach_group_column_domains(
             &mut logical_properties,
             &output_bindings,
@@ -298,12 +391,12 @@ pub(super) fn stage_transformed_expression(
             column_stats.as_ref(),
             &schema,
         )?;
-        if let LogicalOperator::CTERef(reference) = &semantic_plan.operator {
+        if let LogicalOperator::CTERef(reference) = &cost_plan.operator {
             logical_properties
                 .cte_references
                 .insert(cte_reference_domain(reference, &output_columns)?);
         }
-        if let LogicalOperator::MaterializedCTE(cte) = &semantic_plan.operator {
+        if let LogicalOperator::MaterializedCTE(cte) = &cost_plan.operator {
             if let Some(producer) = child_states.first() {
                 memo.register_cte_producer(
                     cte.cte_index,
@@ -313,16 +406,15 @@ pub(super) fn stage_transformed_expression(
             }
         }
         let output_rows_hard_upper = logical_properties.maximum_cardinality;
-        let search_candidate = session.search_candidates.remove(&semantic_plan.id);
+        let search_candidate = session.search_candidates.remove(&id);
         if search_candidate.is_some() {
             debug!(
                 target: targets::OPTIMIZER,
                 rule = options.rule.0,
-                operator = ?semantic_plan.operator.op_type(),
+                operator = ?semantic_operator.op_type(),
                 "attached search provider to transformed logical expression"
             );
         }
-        let plan = skeleton;
         // Preserve binding semantics before Query IR interning replaces
         // operator expressions with scalar-arena references.
         // Scalar interning only borrows child column identities.  Cloning each
@@ -333,7 +425,7 @@ pub(super) fn stage_transformed_expression(
             .map(|child| child.columns.as_ref())
             .collect::<Vec<_>>();
         let scalar_roots = intern_operator_scalars(
-            &plan.operator,
+            &semantic_operator,
             &output_columns,
             &child_columns,
             &mut state.binding_ids,
@@ -341,7 +433,7 @@ pub(super) fn stage_transformed_expression(
             &mut state.scalars,
         )?;
         let (operator_fingerprint, operator_encoding) =
-            query_operator_identity(&plan.operator, &scalar_roots, &state.scalars)?;
+            query_operator_identity(&semantic_operator, &scalar_roots, &state.scalars)?;
         let key = LogicalExprKey {
             operator: operator_fingerprint,
             scalars: scalar_roots,
@@ -352,12 +444,8 @@ pub(super) fn stage_transformed_expression(
                 .into_boxed_slice(),
         };
         let logical_identity = key.stable_fingerprint();
-        let mut cardinality = derive_group_cardinality(
-            &semantic_plan.operator,
-            &key.children,
-            &semantic_plan.stats,
-            logical_identity,
-        );
+        let mut cardinality =
+            derive_group_cardinality(&cost_plan.operator, &key.children, &stats, logical_identity);
         if let Some(target) = target {
             cardinality = if let Some(kind) = refined_cardinality_kind {
                 cardinality.with_kind(kind)
@@ -439,9 +527,10 @@ pub(super) fn stage_transformed_expression(
                 existing.cardinality =
                     std::mem::take(&mut existing.cardinality).canonical_with(cardinality.clone());
                 return Ok(Some((
-                    semantic_plan,
                     NodeState {
+                        id,
                         group,
+                        stats: stats.clone(),
                         columns: output_columns.into_boxed_slice(),
                         layout: Arc::new(output_layout.clone()),
                         names: Arc::clone(&output_names),
@@ -449,6 +538,8 @@ pub(super) fn stage_transformed_expression(
                             group,
                             child_states.iter().map(|child| child.region_scope.clone()),
                         ),
+                        boundary_reference_id: None,
+                        boundary_facts: None,
                     },
                     None,
                 )));
@@ -536,25 +627,31 @@ pub(super) fn stage_transformed_expression(
                     // back every recursively staged child and sidecar write;
                     // this expected miss is not an optimizer corruption.
                     return Ok(Some((
-                        semantic_plan,
                         NodeState {
+                            id,
                             group,
+                            stats: stats.clone(),
                             columns: output_columns.into_boxed_slice(),
                             layout: Arc::new(output_layout.clone()),
                             names: Arc::clone(&output_names),
                             region_scope,
+                            boundary_reference_id: None,
+                            boundary_facts: None,
                         },
                         None,
                     )));
                 }
                 return Ok(Some((
-                    semantic_plan,
                     NodeState {
+                        id,
                         group,
+                        stats: stats.clone(),
                         columns: output_columns.into_boxed_slice(),
                         layout: Arc::new(output_layout.clone()),
                         names: Arc::clone(&output_names),
                         region_scope,
+                        boundary_reference_id: None,
+                        boundary_facts: None,
                     },
                     Some(StagedEquivalent {
                         key,
@@ -603,11 +700,8 @@ pub(super) fn stage_transformed_expression(
                 )
             })
             .transpose()?;
-        // Physical admission consumes the bound semantic window. `plan` is
-        // an interned scalar shell with no child ownership at all.
-        let implementations =
-            planner_implementation_set(&semantic_plan, state.rowset_scan_pushdown);
-        if let LogicalOperator::Join(Join::Comparison(join)) = &semantic_plan.operator {
+        let implementations = planner_implementation_set(&cost_plan, state.rowset_scan_pushdown);
+        if let LogicalOperator::Join(Join::Comparison(join)) = &cost_plan.operator {
             debug!(
                 target: targets::OPTIMIZER,
                 rule = options.rule.0,
@@ -626,11 +720,11 @@ pub(super) fn stage_transformed_expression(
             runtime_filter_candidate.then(|| std::iter::once(group).collect::<BTreeSet<_>>());
         let metadata = PlannerOperatorMetadata {
             origin_rule: Some(options.rule),
-            operator_type: semantic_plan.operator.op_type(),
+            operator_type: semantic_operator.op_type(),
             operator_fingerprint,
             provided: ProvidedProperties {
                 ordering: derive_provided_ordering(
-                    &semantic_plan.operator,
+                    &cost_plan.operator,
                     &output_columns,
                     child_states.first().map(|child| child.columns.as_ref()),
                     &state.binding_ids,
@@ -643,44 +737,41 @@ pub(super) fn stage_transformed_expression(
                 mutation_safety: ProvidedMutationSafety::NotApplicable,
                 representation: ProvidedRepresentation::Flat,
                 replayability: ProvidedReplayability::OnePass,
-                result_guarantee: provided_result_guarantee(&semantic_plan.operator),
+                result_guarantee: provided_result_guarantee(&cost_plan.operator),
             },
             local_cost: planner_operator_cost(
-                &semantic_plan,
+                &cost_plan,
                 child_states.len(),
                 output_rows_hard_upper,
                 &child_maximum_cardinalities,
                 state.scan_access_cost,
             )?,
             implementations,
-            grant_dependency: planner_grant_dependency(&semantic_plan.operator),
-            spillable: planner_operator_spillable(&semantic_plan.operator),
+            grant_dependency: planner_grant_dependency(&cost_plan.operator),
+            spillable: planner_operator_spillable(&cost_plan.operator),
             cost_facts: planner_cost_facts(
-                &semantic_plan,
+                &cost_plan,
                 column_stats.as_ref(),
                 &state.binding_ids,
                 state.scan_access_cost,
             )?,
             output_columns: output_columns.clone().into_boxed_slice(),
-            child_layouts: semantic_plan
-                .children()
-                .into_iter()
-                .map(|child| Arc::new(child.output_layout()))
+            child_layouts: child_states
+                .iter()
+                .map(|child| Arc::clone(&child.layout))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             child_required: intern_child_requirements(
                 memo,
                 child_states.iter().map(|child| child.columns.as_ref()),
             )?,
-            child_row_goals: child_row_goals(&semantic_plan.operator, child_states.len()),
+            child_row_goals: child_row_goals(&cost_plan.operator, child_states.len()),
             search,
             input_context: node_context,
             child_context: target_child_context.unwrap_or(node_context),
             required_region_facet: target.and(required_region_facet),
             runtime_filter_region_facet: None,
-            structural_retained_children: planner_structural_retained_children(
-                &semantic_plan.operator,
-            ),
+            structural_retained_children: planner_structural_retained_children(&cost_plan.operator),
             baseline_payload,
         };
         if state.metadata.insert(payload, metadata).is_some() {
@@ -771,13 +862,16 @@ pub(super) fn stage_transformed_expression(
             None
         };
         Ok(Some((
-            semantic_plan,
             NodeState {
+                id,
                 group,
+                stats: stats.clone(),
                 columns: output_columns.into_boxed_slice(),
                 layout: Arc::new(output_layout),
                 names: output_names,
                 region_scope,
+                boundary_reference_id: None,
+                boundary_facts: None,
             },
             staged,
         )))
@@ -886,10 +980,10 @@ pub(super) fn stage_transformed_expression(
                         stats: node.stats,
                         operator,
                     };
-                    let Some(result) = stage_node(
+                    let Some((mut node, staged)) = stage_node(
                         &mut session,
                         NodeStagingRequest {
-                            plan,
+                            input: NodeStagingInput::Owned(plan),
                             target: is_root.then_some(target),
                             required_region_facet: is_root
                                 .then_some(preserved_region_facet)
@@ -912,32 +1006,43 @@ pub(super) fn stage_transformed_expression(
                     else {
                         return Ok(None);
                     };
-                    let (mut plan, node, staged) = result;
-                    if !is_root && !matches!(plan.operator, LogicalOperator::BoundReference(_)) {
-                        session
-                            .facts
-                            .settle_group(session.memo, session.state, node.group)?;
+                    if !is_root {
                         let layout = node.layout.clone();
-                        let facts = session.facts.transport(
-                            session.memo,
-                            session.state,
-                            node.group,
-                            &layout,
-                        )?;
+                        let facts = if let Some(facts) = node.boundary_facts.clone() {
+                            facts
+                        } else {
+                            session
+                                .facts
+                                .settle_group(session.memo, session.state, node.group)?;
+                            session.facts.transport(
+                                session.memo,
+                                session.state,
+                                node.group,
+                                &layout,
+                            )?
+                        };
                         let (types, bindings) = Arc::unwrap_or_clone(layout).into_parts();
+                        let reference_id = node.boundary_reference_id.unwrap_or_else(|| {
+                            paro_planner::operator::BoundReferenceId::node_occurrence(node.id.0)
+                        });
                         let reference = paro_planner::operator::BoundReference::new(
-                            paro_planner::operator::BoundReferenceId::node_occurrence(plan.id.0),
+                            reference_id,
                             bindings,
                             types,
                         )
                         .with_facts(facts)?;
-                        plan.operator = LogicalOperator::BoundReference(reference);
+                        let transport = LogicalPlanNode {
+                            id: node.id,
+                            stats: node.stats.clone(),
+                            operator: LogicalOperator::BoundReference(reference),
+                        };
+                        node.boundary_reference_id = Some(reference_id);
+                        completed.insert(index, (transport, node.clone()));
                     }
                     if is_root {
                         root_result = Some((node, staged));
                     } else {
                         debug_assert!(staged.is_none());
-                        completed.insert(index, (LogicalPlanNode::from_shell(plan), node));
                     }
                 }
                 root_result.ok_or_else(|| paro_error::internal("staging has no completed root"))?
@@ -961,12 +1066,22 @@ pub(super) fn stage_transformed_expression(
                     return Err(paro_error::internal("native staging has no root"));
                 }
                 let mut pending = vec![Frame::Enter(native_plan)];
-                let mut completed = Vec::<(OwnedLogicalPlan, NodeState)>::new();
+                let mut completed = Vec::<(GroupId, NodeState)>::new();
                 let mut visited = 0usize;
                 let mut root_result = None;
                 while let Some(frame) = pending.pop() {
                     match frame {
                         Frame::Enter(plan) => {
+                            if matches!(plan.operator, LogicalOperator::BoundReference(_)) {
+                                if visited == 0 && pending.is_empty() {
+                                    return Err(paro_error::internal(
+                                        "native staging reached a root Memo group hole",
+                                    ));
+                                }
+                                let node = resolve_group_hole(&mut session, plan)?;
+                                completed.push((node.group, node));
+                                continue;
+                            }
                             let (skeleton, children) =
                                 paro_planner::plan::arena::LogicalPlanNode::detach(plan);
                             let is_root = visited == 0 && pending.is_empty();
@@ -998,12 +1113,32 @@ pub(super) fn stage_transformed_expression(
                                 .iter()
                                 .map(|(_, state)| state.clone())
                                 .collect::<Vec<_>>();
-                            let plan = skeleton
-                                .assemble(children.into_iter().map(|(plan, _)| Box::new(plan)))?;
-                            let Some((mut plan, node, staged)) = stage_node(
+                            let mut child_index = 0;
+                            let operator = skeleton.operator.try_map_child_links(&mut |_| {
+                                let group = children
+                                    .get(child_index)
+                                    .map(|(group, _)| *group)
+                                    .ok_or_else(|| {
+                                        paro_error::internal(
+                                            "native staging lost a child group reference",
+                                        )
+                                    })?;
+                                child_index += 1;
+                                Ok::<_, paro_error::ParoError>(group)
+                            })?;
+                            if child_index != children.len() {
+                                return Err(paro_error::internal(
+                                    "native staging child arity mismatch",
+                                ));
+                            }
+                            let Some((mut node, staged)) = stage_node(
                                 &mut session,
                                 NodeStagingRequest {
-                                    plan,
+                                    input: NodeStagingInput::Native {
+                                        id: skeleton.id,
+                                        stats: skeleton.stats,
+                                        operator,
+                                    },
                                     target: is_root.then_some(target),
                                     required_region_facet: is_root
                                         .then_some(preserved_region_facet)
@@ -1026,9 +1161,7 @@ pub(super) fn stage_transformed_expression(
                             else {
                                 return Ok(None);
                             };
-                            if !is_root
-                                && !matches!(plan.operator, LogicalOperator::BoundReference(_))
-                            {
+                            if !is_root {
                                 session.facts.settle_group(
                                     session.memo,
                                     session.state,
@@ -1041,23 +1174,19 @@ pub(super) fn stage_transformed_expression(
                                     node.group,
                                     &layout,
                                 )?;
-                                let (types, bindings) = Arc::unwrap_or_clone(layout).into_parts();
-                                let reference = paro_planner::operator::BoundReference::new(
+                                node.boundary_facts = Some(facts);
+                                node.boundary_reference_id = Some(
                                     paro_planner::operator::BoundReferenceId::node_occurrence(
-                                        plan.id.0,
+                                        node.id.0,
                                     ),
-                                    bindings,
-                                    types,
-                                )
-                                .with_facts(facts)?;
-                                plan.operator = LogicalOperator::BoundReference(reference);
+                                );
                             }
                             visited = visited.saturating_add(1);
                             if is_root {
                                 root_result = Some((node, staged));
                             } else {
                                 debug_assert!(staged.is_none());
-                                completed.push((plan, node));
+                                completed.push((node.group, node));
                             }
                         }
                     }
