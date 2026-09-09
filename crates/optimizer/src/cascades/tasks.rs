@@ -384,10 +384,15 @@ pub struct BoundProof {
 
 impl BoundProof {
     pub fn is_current(&self, registry: &TaskRegistry, memo: &Memo) -> Result<bool> {
-        registry
-            .read_set(self.context.reads)
-            .ok_or_else(|| paro_error::internal("bound proof references unknown read set"))?
-            .is_current(memo)
+        let task_active = matches!(
+            registry.state(self.task),
+            Some(TaskState::Runnable | TaskState::Running | TaskState::Awaiting)
+        );
+        Ok(task_active
+            && registry
+                .read_set(self.context.reads)
+                .ok_or_else(|| paro_error::internal("bound proof references unknown read set"))?
+                .is_current(memo)?)
     }
 }
 
@@ -1461,9 +1466,35 @@ impl TaskRegistry {
         context: BoundContext,
         kind: BoundProofKind,
     ) -> Result<BoundProofId> {
-        if self.task(task).is_none() || self.read_set(context.reads).is_none() {
+        let task_record = self
+            .task(task)
+            .ok_or_else(|| paro_error::internal("bound proof references an unknown task"))?;
+        if self.read_set(context.reads).is_none() {
             return Err(paro_error::internal(
-                "bound proof references unknown task/read set",
+                "bound proof references an unknown read set",
+            ));
+        }
+        if !matches!(
+            task_record.state,
+            TaskState::Runnable | TaskState::Running | TaskState::Awaiting
+        ) {
+            return Err(paro_error::internal(
+                "bound proof must be recorded by an active task",
+            ));
+        }
+        let intent = self
+            .intent(task_record.intent)
+            .ok_or_else(|| paro_error::internal("bound proof task lost its intent"))?;
+        let context_matches = match intent {
+            TaskIntent::Optimize { group, goal } => {
+                self.canonical_group(*group) == self.canonical_group(context.group)
+                    && *goal == context.goal
+            }
+            _ => false,
+        };
+        if !context_matches {
+            return Err(paro_error::internal(
+                "bound proof context does not match its Optimize task",
             ));
         }
         let id = BoundProofId::new(self.bounds.len());
@@ -2163,5 +2194,23 @@ mod tests {
             registry.bound(proof).unwrap().kind,
             BoundProofKind::Lower { value: 10 }
         ));
+
+        assert!(registry
+            .record_lower_bound(
+                task,
+                BoundContext {
+                    group: GroupId::new(1),
+                    goal: goal(),
+                    reads,
+                    search_domain: Fingerprint(8),
+                },
+                11,
+            )
+            .is_err());
+
+        registry.invalidate(task).unwrap();
+        assert!(!registry
+            .bound_is_current(proof, &Memo::new(Default::default()))
+            .unwrap());
     }
 }
