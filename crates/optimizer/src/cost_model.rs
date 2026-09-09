@@ -1,21 +1,46 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
-    ExpressionVisitDecision, OperatorType,
+    ComparisonType, ConjunctionType, Expression, ExpressionIterator, OperatorType,
 };
 use paro_planner::operator::ColumnBinding;
 use paro_planner::plan::CardinalityEstimate;
 use paro_storage::statistics::{ColumnStatistics, NumericStats};
 
 const MIN_SELECTIVITY: f64 = 0.000_001;
+
+mod predicate_view;
+use predicate_view::{PredicateKind, PredicateView};
+
+#[derive(Debug)]
+enum SelectivityStop {
+    Incomplete,
+    Failed(paro_common::error::ParoError),
+}
+
+type SelectivityResult<T> = std::result::Result<T, SelectivityStop>;
+
+/// Admission precedes visiting or retaining another scalar edge. A stopped
+/// analysis has no ranking point: callers must not publish a partial estimate
+/// as a negative match or as completed costing evidence.
+struct SelectivityWork<F>(F);
+
+impl<F: FnMut() -> paro_common::error::Result<bool>> SelectivityWork<F> {
+    fn admit(&mut self) -> SelectivityResult<()> {
+        if (self.0)().map_err(SelectivityStop::Failed)? {
+            Ok(())
+        } else {
+            Err(SelectivityStop::Incomplete)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct SelectivityEstimate {
@@ -218,7 +243,7 @@ impl<'a> StatisticsResolver<'a> {
 
     fn binding(&self, expression: &Expression) -> Option<ColumnBinding> {
         Some(match expression {
-            Expression::ColumnRef(column) => column.binding,
+            Expression::ColumnRef(column) if column.depth == 0 => column.binding,
             Expression::Reference(reference) => *self.positional_bindings?.get(reference.index)?,
             _ => return None,
         })
@@ -271,43 +296,183 @@ impl CostModel {
             .fraction
     }
 
-    fn estimate_selectivity_with_provenance(
+    fn estimate_selectivity_with_provenance<'a, View: PredicateView<'a>>(
         &self,
-        expr: &Expression,
-        resolver: &StatisticsResolver<'_>,
+        expr: View::Node,
+        resolver: &View,
     ) -> SelectivityEstimate {
-        match expr {
-            Expression::Constant(constant) => match &constant.value {
+        self.estimate_selectivity_controlled(expr, resolver, &mut SelectivityWork(|| Ok(true)))
+            .expect("unrestricted selectivity analysis cannot be interrupted")
+    }
+
+    fn estimate_selectivity_controlled<'a, View: PredicateView<'a>>(
+        &self,
+        expr: View::Node,
+        resolver: &View,
+        work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
+    ) -> SelectivityResult<SelectivityEstimate> {
+        work.admit()?;
+        if !matches!(
+            resolver.kind(expr),
+            PredicateKind::And | PredicateKind::Or | PredicateKind::Operator(OperatorType::Not)
+        ) {
+            return Ok(self.estimate_atomic_selectivity(expr, resolver));
+        }
+        let estimates = self.estimate_nodes([expr], resolver, work)?;
+        Ok(estimates[&resolver.key(expr)])
+    }
+
+    pub(crate) fn estimate_native_selectivity(
+        &self,
+        root: crate::cascades::ids::ScalarExprId,
+        arena: &crate::cascades::scalar::ScalarArena,
+        bindings: &crate::cascades::BindingCatalog,
+        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        checkpoint: impl FnMut() -> paro_common::error::Result<bool>,
+    ) -> paro_common::error::Result<Option<f64>> {
+        if arena.get(root).is_none() {
+            return Err(paro_common::error::internal(
+                "native selectivity root is not in its arena",
+            ));
+        }
+        match self.estimate_selectivity_controlled(
+            root,
+            &predicate_view::NativePredicateView {
+                arena,
+                bindings,
+                column_stats,
+            },
+            &mut SelectivityWork(checkpoint),
+        ) {
+            Ok(estimate) => Ok(Some(estimate.fraction)),
+            Err(SelectivityStop::Incomplete) => Ok(None),
+            Err(SelectivityStop::Failed(error)) => Err(error),
+        }
+    }
+
+    fn estimate_nodes<'a, View: PredicateView<'a>>(
+        &self,
+        roots: impl IntoIterator<Item = View::Node>,
+        resolver: &View,
+        work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
+    ) -> SelectivityResult<HashMap<View::Key, SelectivityEstimate>> {
+        enum Combine<Node> {
+            And(Vec<ConjunctionTerm<Node>>),
+            Or(Vec<Node>),
+            Not(Node),
+        }
+        enum Task<Node> {
+            Enter(Node),
+            Finish(Node, Combine<Node>),
+        }
+        let mut pending = Vec::new();
+        for root in roots {
+            work.admit()?;
+            pending.push(Task::Enter(root));
+        }
+        let mut estimates = HashMap::new();
+        while let Some(task) = pending.pop() {
+            work.admit()?;
+            match task {
+                Task::Enter(node) => {
+                    if estimates.contains_key(&resolver.key(node)) {
+                        continue;
+                    }
+                    let combine = match resolver.kind(node) {
+                        PredicateKind::And => {
+                            Some(Combine::And(conjunction_terms([node], resolver, work)?))
+                        }
+                        PredicateKind::Or => {
+                            let mut children = Vec::new();
+                            resolver.try_children(node, |child| {
+                                work.admit()?;
+                                children.push(child);
+                                Ok(())
+                            })?;
+                            Some(Combine::Or(children))
+                        }
+                        PredicateKind::Operator(OperatorType::Not) => {
+                            resolver.operator_child(node, 0).map(Combine::Not)
+                        }
+                        _ => None,
+                    };
+                    if let Some(combine) = combine {
+                        let start = pending.len();
+                        match &combine {
+                            Combine::And(terms) => {
+                                for term in terms {
+                                    work.admit()?;
+                                    if let ConjunctionTerm::Input(input, _, _) = term {
+                                        pending.push(Task::Enter(*input));
+                                    }
+                                }
+                            }
+                            Combine::Or(children) => {
+                                pending.extend(children.iter().copied().map(Task::Enter))
+                            }
+                            Combine::Not(child) => pending.push(Task::Enter(*child)),
+                        }
+                        pending.push(Task::Finish(node, combine));
+                        pending[start..].reverse();
+                    } else {
+                        estimates.insert(
+                            resolver.key(node),
+                            self.estimate_atomic_selectivity(node, resolver),
+                        );
+                    }
+                }
+                Task::Finish(node, combine) => {
+                    let estimate = |child| estimates[&resolver.key(child)];
+                    let value = match combine {
+                        Combine::And(terms) => combine_conjunction_terms(terms, estimate),
+                        Combine::Or(children) => {
+                            disjunction_estimate(children.into_iter().map(estimate))
+                        }
+                        Combine::Not(child) => estimate(child).complement(),
+                    };
+                    estimates.insert(resolver.key(node), value);
+                }
+            }
+        }
+        Ok(estimates)
+    }
+
+    fn estimate_atomic_selectivity<'a, View: PredicateView<'a>>(
+        &self,
+        expr: View::Node,
+        resolver: &View,
+    ) -> SelectivityEstimate {
+        match resolver.kind(expr) {
+            PredicateKind::Constant(value) => match value {
                 Value::Boolean(true) => SelectivityEstimate::proven(1.0),
                 Value::Boolean(false) => SelectivityEstimate::proven(0.0),
                 _ => SelectivityEstimate::estimated(self.defaults.predicate),
             },
-            Expression::Comparison(comparison) => SelectivityEstimate::estimated(
-                self.estimate_comparison_selectivity(comparison, resolver),
+            PredicateKind::Comparison(comparison, left, right) => SelectivityEstimate::estimated(
+                self.estimate_comparison_selectivity(comparison, left, right, resolver),
             ),
-            Expression::Conjunction(conjunction) => match conjunction.conjunction_type {
-                ConjunctionType::And => {
-                    self.estimate_conjunction(conjunction.children.iter(), resolver)
-                }
-                ConjunctionType::Or => disjunction_estimate(
-                    conjunction
-                        .children
-                        .iter()
-                        .map(|child| self.estimate_selectivity_with_provenance(child, resolver)),
-                ),
-            },
-            Expression::Operator(operator) => match operator.operator_type {
+            PredicateKind::Operator(operator) => match operator {
                 OperatorType::Like => SelectivityEstimate::estimated(
-                    match like_pattern_shape(operator.children.get(1)) {
+                    match like_pattern_shape(
+                        resolver
+                            .operator_child(expr, 1)
+                            .and_then(|child| resolver.constant(child)),
+                    ) {
                         LikePatternShape::MatchAll => 1.0,
-                        LikePatternShape::Exact => self
-                            .estimate_exact_like_selectivity(operator.children.first(), resolver),
+                        LikePatternShape::Exact => self.estimate_exact_like_selectivity(
+                            resolver.operator_child(expr, 0),
+                            resolver,
+                        ),
                         LikePatternShape::Wildcard(pattern) => pattern.selectivity(&self.defaults),
                         LikePatternShape::Generic => self.defaults.predicate,
                     },
                 ),
                 OperatorType::ILike => SelectivityEstimate::estimated(
-                    match like_pattern_shape(operator.children.get(1)) {
+                    match like_pattern_shape(
+                        resolver
+                            .operator_child(expr, 1)
+                            .and_then(|child| resolver.constant(child)),
+                    ) {
                         LikePatternShape::MatchAll => 1.0,
                         // Case folding can merge several stored values into one
                         // comparison domain, so the raw column NDV is not a sound
@@ -317,52 +482,43 @@ impl CostModel {
                         LikePatternShape::Generic => self.defaults.predicate,
                     },
                 ),
-                OperatorType::Not => operator.children.first().map_or_else(
-                    || SelectivityEstimate::estimated(self.defaults.predicate),
-                    |child| {
-                        self.estimate_selectivity_with_provenance(child, resolver)
-                            .complement()
-                    },
-                ),
                 OperatorType::IsNull => {
                     SelectivityEstimate::estimated(1.0 - self.defaults.is_not_null)
                 }
                 OperatorType::IsNotNull => {
                     SelectivityEstimate::estimated(self.defaults.is_not_null)
                 }
-                OperatorType::In => SelectivityEstimate::estimated(
-                    self.estimate_in_selectivity(operator.children.as_slice(), resolver),
-                ),
+                OperatorType::In => {
+                    SelectivityEstimate::estimated(self.estimate_in_selectivity(expr, resolver))
+                }
                 OperatorType::NotIn => SelectivityEstimate::estimated(
-                    1.0 - self.estimate_in_selectivity(operator.children.as_slice(), resolver),
+                    1.0 - self.estimate_in_selectivity(expr, resolver),
                 ),
                 _ => SelectivityEstimate::estimated(self.defaults.predicate),
             },
-            Expression::Function(function) => {
-                SelectivityEstimate::estimated(match function.builtin_intrinsic() {
-                    Some(
-                        BuiltinIntrinsicId::FullTextMatch
-                        | BuiltinIntrinsicId::FullTextMatchInternal
-                        | BuiltinIntrinsicId::Bm25
-                        | BuiltinIntrinsicId::Bm25ScoreInternal
-                        | BuiltinIntrinsicId::TsRank
-                        | BuiltinIntrinsicId::TsRankCd
-                        | BuiltinIntrinsicId::ToTsVector
-                        | BuiltinIntrinsicId::PlainToTsQuery
-                        | BuiltinIntrinsicId::ToTsQuery
-                        | BuiltinIntrinsicId::PhraseToTsQuery
-                        | BuiltinIntrinsicId::WebSearchToTsQuery,
-                    ) => self.defaults.fulltext_match,
-                    Some(
-                        BuiltinIntrinsicId::L2Distance
-                        | BuiltinIntrinsicId::L1Distance
-                        | BuiltinIntrinsicId::CosineDistance
-                        | BuiltinIntrinsicId::NegativeInnerProduct
-                        | BuiltinIntrinsicId::SparseDistance,
-                    ) => self.defaults.vector_topk_fraction,
-                    _ => self.defaults.predicate,
-                })
-            }
+            PredicateKind::Function(intrinsic) => SelectivityEstimate::estimated(match intrinsic {
+                Some(
+                    BuiltinIntrinsicId::FullTextMatch
+                    | BuiltinIntrinsicId::FullTextMatchInternal
+                    | BuiltinIntrinsicId::Bm25
+                    | BuiltinIntrinsicId::Bm25ScoreInternal
+                    | BuiltinIntrinsicId::TsRank
+                    | BuiltinIntrinsicId::TsRankCd
+                    | BuiltinIntrinsicId::ToTsVector
+                    | BuiltinIntrinsicId::PlainToTsQuery
+                    | BuiltinIntrinsicId::ToTsQuery
+                    | BuiltinIntrinsicId::PhraseToTsQuery
+                    | BuiltinIntrinsicId::WebSearchToTsQuery,
+                ) => self.defaults.fulltext_match,
+                Some(
+                    BuiltinIntrinsicId::L2Distance
+                    | BuiltinIntrinsicId::L1Distance
+                    | BuiltinIntrinsicId::CosineDistance
+                    | BuiltinIntrinsicId::NegativeInnerProduct
+                    | BuiltinIntrinsicId::SparseDistance,
+                ) => self.defaults.vector_topk_fraction,
+                _ => self.defaults.predicate,
+            }),
             _ => SelectivityEstimate::estimated(self.defaults.predicate),
         }
     }
@@ -452,13 +608,15 @@ impl CostModel {
         }
     }
 
-    fn estimate_comparison_selectivity(
+    fn estimate_comparison_selectivity<'a, View: PredicateView<'a>>(
         &self,
-        expr: &ComparisonExpression,
-        resolver: &StatisticsResolver<'_>,
+        comparison: ComparisonType,
+        left: View::Node,
+        right: View::Node,
+        resolver: &View,
     ) -> f64 {
         let default = if matches!(
-            expr.comparison_type,
+            comparison,
             ComparisonType::LessThan
                 | ComparisonType::LessThanOrEqual
                 | ComparisonType::GreaterThan
@@ -469,11 +627,13 @@ impl CostModel {
             self.defaults.equality
         };
 
-        let Some((column, constant, comparison_type)) = column_constant_comparison(expr) else {
+        let Some((column, constant, comparison_type)) =
+            column_constant_comparison(comparison, left, right, resolver)
+        else {
             return default;
         };
 
-        let Some(stats) = resolver.get(column) else {
+        let Some(stats) = resolver.statistics(column) else {
             return default;
         };
 
@@ -506,73 +666,41 @@ impl CostModel {
     /// the same integral column. Treating `x >= a` and `x < b` as independent
     /// events systematically overestimates bounded intervals; their shared
     /// statistics domain makes the intersection directly measurable.
-    fn estimate_conjunction<'e>(
+    fn estimate_conjunction<'a, View: PredicateView<'a>>(
         &self,
-        expressions: impl IntoIterator<Item = &'e Expression>,
-        resolver: &StatisticsResolver<'_>,
+        expressions: impl IntoIterator<Item = View::Node>,
+        resolver: &View,
     ) -> SelectivityEstimate {
-        let mut flattened = Vec::new();
-        for expression in expressions {
-            flatten_and(expression, &mut flattened);
-        }
-
-        let mut intervals = Vec::<IntegralIntervalEstimate>::new();
-        let mut interval_by_binding = HashMap::<ColumnBinding, usize>::new();
-        let mut interval_for_expression = vec![None; flattened.len()];
-        for (expression_idx, expression) in flattened.iter().copied().enumerate() {
-            let Some(constraint) = integral_range_constraint(expression, resolver) else {
-                continue;
-            };
-            let interval_idx = match interval_by_binding.get(&constraint.binding).copied() {
-                Some(interval_idx) => interval_idx,
-                None => {
-                    let interval_idx = intervals.len();
-                    intervals.push(IntegralIntervalEstimate::new(expression_idx, &constraint));
-                    interval_by_binding.insert(constraint.binding, interval_idx);
-                    interval_idx
-                }
-            };
-            let interval = &mut intervals[interval_idx];
-            if interval.domain != constraint.domain
-                || interval.minimum != constraint.minimum
-                || interval.maximum != constraint.maximum
-            {
-                continue;
-            }
-            interval.intersect(constraint.bound, constraint.constant);
-            interval_for_expression[expression_idx] = Some(interval_idx);
-        }
-
-        column_aware_conjunction_estimate(flattened.iter().enumerate().filter_map(
-            |(expression_idx, expression)| match interval_for_expression[expression_idx] {
-                Some(interval_idx)
-                    if intervals[interval_idx].first_expression == expression_idx =>
-                {
-                    Some((
-                        SelectivityEstimate::estimated(intervals[interval_idx].selectivity()),
-                        Some(intervals[interval_idx].binding),
-                    ))
-                }
-                Some(_) => None,
-                None => Some((
-                    self.estimate_selectivity_with_provenance(expression, resolver),
-                    expression_single_binding(expression, resolver),
-                )),
-            },
-        ))
+        let mut work = SelectivityWork(|| Ok(true));
+        let terms = conjunction_terms(expressions, resolver, &mut work)
+            .expect("unrestricted conjunction analysis cannot be interrupted");
+        let estimates = self
+            .estimate_nodes(
+                terms.iter().filter_map(|term| match term {
+                    ConjunctionTerm::Input(node, _, _) => Some(*node),
+                    ConjunctionTerm::Estimate(..) => None,
+                }),
+                resolver,
+                &mut work,
+            )
+            .expect("unrestricted conjunction analysis cannot be interrupted");
+        combine_conjunction_terms(terms, |node| estimates[&resolver.key(node)])
     }
 
-    fn estimate_in_selectivity(
+    fn estimate_in_selectivity<'a, View: PredicateView<'a>>(
         &self,
-        children: &[Expression],
-        resolver: &StatisticsResolver<'_>,
+        expression: View::Node,
+        resolver: &View,
     ) -> f64 {
-        let Some(column) = children.first() else {
+        let Some(column) = resolver.operator_child(expression, 0) else {
             return self.defaults.predicate;
         };
 
-        let probe_count = children.len().saturating_sub(1).max(1) as f64;
-        let Some(stats) = resolver.get(column) else {
+        let probe_count = resolver
+            .operator_child_count(expression)
+            .saturating_sub(1)
+            .max(1) as f64;
+        let Some(stats) = resolver.statistics(column) else {
             return clamp_selectivity(self.defaults.equality * probe_count);
         };
         let distinct = stats.distinct_evidence().point;
@@ -582,16 +710,16 @@ impl CostModel {
         clamp_selectivity((probe_count / distinct as f64).max(MIN_SELECTIVITY))
     }
 
-    fn estimate_exact_like_selectivity(
+    fn estimate_exact_like_selectivity<'a, View: PredicateView<'a>>(
         &self,
-        candidate: Option<&Expression>,
-        resolver: &StatisticsResolver<'_>,
+        candidate: Option<View::Node>,
+        resolver: &View,
     ) -> f64 {
         let Some(candidate) = candidate else {
             return self.defaults.equality;
         };
         let distinct = resolver
-            .get(candidate)
+            .statistics(candidate)
             .map(|stats| stats.distinct_evidence().point)
             .unwrap_or(0);
         if distinct == 0 {
@@ -602,6 +730,88 @@ impl CostModel {
     }
 }
 
+enum ConjunctionTerm<Node> {
+    Input(Node, Option<ColumnBinding>, u64),
+    Estimate(SelectivityEstimate, Option<ColumnBinding>),
+}
+
+fn combine_conjunction_terms<Node>(
+    terms: Vec<ConjunctionTerm<Node>>,
+    mut estimate: impl FnMut(Node) -> SelectivityEstimate,
+) -> SelectivityEstimate {
+    column_aware_conjunction_estimate(terms.into_iter().map(|term| match term {
+        ConjunctionTerm::Input(node, binding, occurrences) => {
+            let mut value = estimate(node);
+            if occurrences > 1 {
+                let fraction = value.fraction.powf(occurrences as f64);
+                value = if value.proven {
+                    SelectivityEstimate::proven(fraction)
+                } else {
+                    SelectivityEstimate::estimated(fraction)
+                };
+            }
+            (value, binding)
+        }
+        ConjunctionTerm::Estimate(value, binding) => (value, binding),
+    }))
+}
+
+fn conjunction_terms<'a, View: PredicateView<'a>>(
+    expressions: impl IntoIterator<Item = View::Node>,
+    resolver: &View,
+    work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
+) -> SelectivityResult<Vec<ConjunctionTerm<View::Node>>> {
+    let flattened = flatten_and(expressions, resolver, work)?;
+
+    let mut intervals = Vec::<IntegralIntervalEstimate>::new();
+    let mut interval_by_binding = HashMap::<ColumnBinding, usize>::new();
+    let mut interval_for_expression = vec![None; flattened.len()];
+    for (expression_idx, (expression, _)) in flattened.iter().copied().enumerate() {
+        work.admit()?;
+        let Some(constraint) = integral_range_constraint(expression, resolver) else {
+            continue;
+        };
+        let interval_idx = match interval_by_binding.get(&constraint.binding).copied() {
+            Some(interval_idx) => interval_idx,
+            None => {
+                let interval_idx = intervals.len();
+                intervals.push(IntegralIntervalEstimate::new(expression_idx, &constraint));
+                interval_by_binding.insert(constraint.binding, interval_idx);
+                interval_idx
+            }
+        };
+        let interval = &mut intervals[interval_idx];
+        if interval.domain != constraint.domain
+            || interval.minimum != constraint.minimum
+            || interval.maximum != constraint.maximum
+        {
+            continue;
+        }
+        interval.intersect(constraint.bound, constraint.constant);
+        interval_for_expression[expression_idx] = Some(interval_idx);
+    }
+
+    let mut terms = Vec::new();
+    for (expression_idx, (expression, occurrences)) in flattened.into_iter().enumerate() {
+        work.admit()?;
+        match interval_for_expression[expression_idx] {
+            Some(interval_idx) if intervals[interval_idx].first_expression == expression_idx => {
+                terms.push(ConjunctionTerm::Estimate(
+                    SelectivityEstimate::estimated(intervals[interval_idx].selectivity()),
+                    Some(intervals[interval_idx].binding),
+                ));
+            }
+            Some(_) => {}
+            None => terms.push(ConjunctionTerm::Input(
+                expression,
+                resolver.single_binding(expression),
+                occurrences,
+            )),
+        }
+    }
+    Ok(terms)
+}
+
 fn clamp_selectivity(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
@@ -610,24 +820,23 @@ fn clamp_selectivity(value: f64) -> f64 {
     }
 }
 
-fn column_constant_comparison(
-    expression: &ComparisonExpression,
-) -> Option<(&Expression, &Value, ComparisonType)> {
-    match (expression.left.as_ref(), expression.right.as_ref()) {
-        (
-            column @ (Expression::ColumnRef(_) | Expression::Reference(_)),
-            Expression::Constant(constant),
-        ) => Some((column, &constant.value, expression.comparison_type)),
-        (
-            Expression::Constant(constant),
-            column @ (Expression::ColumnRef(_) | Expression::Reference(_)),
-        ) => Some((
-            column,
-            &constant.value,
-            reverse_comparison(expression.comparison_type),
-        )),
-        _ => None,
+fn column_constant_comparison<'a, View: PredicateView<'a>>(
+    comparison: ComparisonType,
+    left: View::Node,
+    right: View::Node,
+    view: &View,
+) -> Option<(View::Node, &'a Value, ComparisonType)> {
+    if view.binding(left).is_some() {
+        if let Some(constant) = view.constant(right) {
+            return Some((left, constant, comparison));
+        }
     }
+    if view.binding(right).is_some() {
+        if let Some(constant) = view.constant(left) {
+            return Some((right, constant, reverse_comparison(comparison)));
+        }
+    }
+    None
 }
 
 fn reverse_comparison(comparison_type: ComparisonType) -> ComparisonType {
@@ -640,37 +849,67 @@ fn reverse_comparison(comparison_type: ComparisonType) -> ComparisonType {
     }
 }
 
-fn flatten_and<'e>(expression: &'e Expression, output: &mut Vec<&'e Expression>) {
-    let mut pending = vec![expression];
-    while let Some(current) = pending.pop() {
-        if let Expression::Conjunction(conjunction) = current {
-            if conjunction.conjunction_type == ConjunctionType::And {
-                pending.extend(conjunction.children.iter().rev());
-                continue;
-            }
-        }
-        output.push(current);
+fn flatten_and<'a, View: PredicateView<'a>>(
+    expressions: impl IntoIterator<Item = View::Node>,
+    view: &View,
+    work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
+) -> SelectivityResult<Vec<(View::Node, u64)>> {
+    // First discover a topological order, then propagate occurrence counts.
+    // Walking paths would expand a tiny shared AND DAG exponentially. Counts
+    // are relevant only to non-shareable evaluations; deterministic repeated
+    // predicates describe one domain. Saturation avoids integer overflow for
+    // more occurrences than floating-point costing can distinguish.
+    let mut pending = Vec::new();
+    let mut counts = HashMap::<View::Key, u64>::new();
+    for expression in expressions {
+        work.admit()?;
+        pending.push((expression, false));
+        let count = counts.entry(view.key(expression)).or_default();
+        *count = count.saturating_add(1);
     }
-}
-
-fn expression_single_binding(
-    expression: &Expression,
-    resolver: &StatisticsResolver<'_>,
-) -> Option<ColumnBinding> {
-    let mut binding = None;
-    let mut ambiguous = false;
-    ExpressionIterator::visit(expression, &mut |node| {
-        let Some(candidate) = resolver.binding(node) else {
-            return ExpressionVisitDecision::Descend;
-        };
-        match binding {
-            None => binding = Some(candidate),
-            Some(existing) if existing != candidate => ambiguous = true,
-            Some(_) => {}
+    let mut seen = HashSet::new();
+    let mut post_order = Vec::new();
+    while let Some((current, finish)) = pending.pop() {
+        work.admit()?;
+        if finish {
+            post_order.push(current);
+            continue;
         }
-        ExpressionVisitDecision::SkipChildren
-    });
-    (!ambiguous).then_some(binding).flatten()
+        if !seen.insert(view.key(current)) {
+            continue;
+        }
+        pending.push((current, true));
+        if matches!(view.kind(current), PredicateKind::And) {
+            view.try_children(current, |child| {
+                work.admit()?;
+                pending.push((child, false));
+                Ok(())
+            })?;
+        }
+    }
+    let mut output = Vec::new();
+    for current in post_order.into_iter().rev() {
+        work.admit()?;
+        let occurrences = counts[&view.key(current)];
+        if matches!(view.kind(current), PredicateKind::And) {
+            view.try_children(current, |child| {
+                work.admit()?;
+                let count = counts.entry(view.key(child)).or_default();
+                *count = count.saturating_add(occurrences);
+                Ok(())
+            })?;
+            continue;
+        }
+        output.push((
+            current,
+            if view.can_share(current) {
+                1
+            } else {
+                occurrences
+            },
+        ));
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -689,15 +928,15 @@ enum IntegralRangeBound {
     Lower { inclusive: bool },
 }
 
-fn integral_range_constraint(
-    expression: &Expression,
-    resolver: &StatisticsResolver<'_>,
+fn integral_range_constraint<'a, View: PredicateView<'a>>(
+    expression: View::Node,
+    resolver: &View,
 ) -> Option<IntegralRangeConstraint> {
-    let Expression::Comparison(comparison) = expression else {
+    let PredicateKind::Comparison(comparison, left, right) = resolver.kind(expression) else {
         return None;
     };
     if !matches!(
-        comparison.comparison_type,
+        comparison,
         ComparisonType::LessThan
             | ComparisonType::LessThanOrEqual
             | ComparisonType::GreaterThan
@@ -705,9 +944,10 @@ fn integral_range_constraint(
     ) {
         return None;
     }
-    let (column, constant, comparison_type) = column_constant_comparison(comparison)?;
+    let (column, constant, comparison_type) =
+        column_constant_comparison(comparison, left, right, resolver)?;
     let binding = resolver.binding(column)?;
-    let stats = resolver.get(column)?;
+    let stats = resolver.statistics(column)?;
     let minimum = ordered_integral_value(&NumericStats::min(stats.statistics())?)?;
     let maximum = ordered_integral_value(&NumericStats::max(stats.statistics())?)?;
     let constant = ordered_integral_value(constant)?;
@@ -1041,11 +1281,8 @@ impl WildcardLikePattern {
     }
 }
 
-fn like_pattern_shape(pattern: Option<&Expression>) -> LikePatternShape {
-    let Some(Expression::Constant(constant)) = pattern else {
-        return LikePatternShape::Generic;
-    };
-    let Value::Varchar(value) = &constant.value else {
+fn like_pattern_shape(pattern: Option<&Value>) -> LikePatternShape {
+    let Some(Value::Varchar(value)) = pattern else {
         return LikePatternShape::Generic;
     };
     if value.contains('_') || value.contains('\\') {
@@ -1076,6 +1313,92 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn selectivity_uses_a_stack_safe_shared_dag_fold() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let model = CostModel::default();
+                for kind in [ConjunctionType::And, ConjunctionType::Or] {
+                    let mut expression = Expression::Constant(
+                        ConstantExpression::new(Value::Boolean(false), LogicalType::Boolean).into(),
+                    );
+                    for _ in 0..10_000 {
+                        expression = Expression::Conjunction(
+                            paro_planner::expression::ConjunctionExpression::new(
+                                kind,
+                                vec![expression.clone(), expression],
+                            )
+                            .into(),
+                        );
+                    }
+                    let mut reads = 0;
+                    let stats = HashMap::new();
+                    let estimate = model
+                        .estimate_selectivity_controlled(
+                            &expression,
+                            &StatisticsResolver::logical(&stats),
+                            &mut SelectivityWork(|| {
+                                reads += 1;
+                                Ok(reads <= 150_000)
+                            }),
+                        )
+                        .unwrap();
+                    assert_eq!(estimate.fraction, 0.0);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn shared_conjunction_counts_evaluations_without_confusing_them_with_domains() {
+        use paro_planner::expression::{ConjunctionExpression, FunctionExpression};
+        let model = CostModel::default();
+        let random = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .unwrap();
+        let volatile = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::LessThan,
+                Expression::Function(
+                    FunctionExpression::new(random, vec![], LogicalType::Double).into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Double(0.5), LogicalType::Double).into(),
+                ),
+            )
+            .into(),
+        );
+        let stable = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        );
+        for (leaf, occurrences) in [(stable, 1), (volatile, 8)] {
+            let point = model.estimate_selectivity(&leaf, &HashMap::new());
+            let mut root = leaf;
+            for _ in 0..3 {
+                root = Expression::Conjunction(
+                    ConjunctionExpression::new(ConjunctionType::And, vec![root.clone(), root])
+                        .into(),
+                );
+            }
+            let estimate = model.estimate_selectivity(&root, &HashMap::new());
+            assert!((estimate - point.powi(occurrences)).abs() < 1e-12);
+        }
+    }
 
     #[test]
     fn sparse_fetch_requires_enough_work_to_amortize_its_frontier() {

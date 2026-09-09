@@ -29,7 +29,6 @@ use crate::aggregate::{
 };
 use crate::context::SharedColumnStatistics;
 use crate::filter::pushdown::FilterPushdown;
-use crate::filter::reorder::ReorderFilter;
 use crate::join::elimination::JoinElimination;
 use crate::limit::pushdown::LimitPushdown;
 use crate::limit::topn::TopNOptimizer;

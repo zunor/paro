@@ -8,6 +8,7 @@ use super::*;
 pub(super) mod cte;
 mod join_region;
 mod matching;
+mod predicate_order;
 pub(super) mod settlement;
 mod staging;
 
@@ -394,6 +395,32 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             None
         };
+        let predicate_order = if matches!(
+            self.transformation,
+            PlannerTransformation::ExpensivePredicatePlacement
+        ) {
+            let state = self
+                .planner_state
+                .read()
+                .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+            let source = ctx
+                .memo()
+                .logical_expr(expr)
+                .ok_or_else(|| paro_error::internal("predicate ordering lost its root"))?;
+            let payload = &state.payloads.logical[source.payload.index()];
+            let Some(order) = predicate_order::permutation(
+                &source.key.scalars,
+                &state,
+                &payload.column_stats,
+                ctx.memo().control(),
+            )?
+            else {
+                return Ok(Box::new([]));
+            };
+            Some(order)
+        } else {
+            None
+        };
         let (
             plan,
             source_stats,
@@ -539,6 +566,27 @@ impl TransformationRule for PlannerTransformationRule {
                     Vec::new()
                 }
             }
+        } else if let Some(order) = predicate_order {
+            // Native analysis has already produced the exact operand order.
+            // Until recipe publication replaces the settlement bridge, move
+            // only the existing immutable scalar handles into that bridge;
+            // never re-run an executable-tree predicate optimizer here.
+            let mut plan = plan;
+            let LogicalOperator::Filter(filter) = &mut plan.operator else {
+                return Err(paro_error::internal(
+                    "native predicate order targets a non-filter",
+                ));
+            };
+            if filter.expressions.len() != order.len() {
+                return Err(paro_error::internal(
+                    "native predicate order changed operand arity",
+                ));
+            }
+            filter.expressions = order
+                .iter()
+                .map(|&ordinal| filter.expressions[ordinal].clone())
+                .collect();
+            vec![plan]
         } else {
             rewrite_planner_expressions(
                 self.transformation,
@@ -906,18 +954,7 @@ fn rewrite_planner_expression(
             return crate::filter::domain_transfer::transfer(plan)
         }
         PlannerTransformation::ExpensivePredicatePlacement => {
-            let mut context = crate::context::OptimizationContext::new(
-                environment.session.clone(),
-                environment.bind_context.clone(),
-            );
-            context.column_stats = Arc::new(column_stats.clone());
-            context.cost_model = environment.cost_model.clone();
-            context.verify_enabled = environment.verify_enabled;
-            let (plan, changed) = ReorderFilter::new().reorder_node(plan, &context);
-            if !changed {
-                return Ok(None);
-            }
-            plan
+            unreachable!("Memo predicate placement consumes native scalar operands")
         }
         PlannerTransformation::CtePartitionedMaterialization => {
             unreachable!("CTE partitioning consumes a native occurrence requirement")

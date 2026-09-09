@@ -30,6 +30,7 @@ pub mod region;
 pub mod rules;
 pub mod scalar;
 mod scalar_lowering;
+pub(crate) use scalar_lowering::BindingCatalog;
 pub mod verifier;
 
 pub use budget::{BudgetDecision, SearchBudget, SearchLedger};

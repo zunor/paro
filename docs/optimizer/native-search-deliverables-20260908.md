@@ -502,3 +502,28 @@ counter and plan digest matches the isolated-seed baseline, but the strict
 The scoped-evidence repair is retained as an architectural/ownership contract;
 these samples do not demonstrate a cold-planning improvement. The timing gate
 was not loosened and its baseline was not replaced.
+
+### Native predicate analysis and bounded scalar walks
+
+Predicate ordering now reads `ScalarExprId` operands and computes each movable
+operand's selectivity once, before rebuilding any bound operator window. Stable
+ties and evaluation fences retain their positions. An unchanged order returns
+before the old settlement/publication path. A changed order still moves the
+existing immutable expression handles through that path; this is **not** a
+claim that relational publication is native. The statistics input also remains
+the payload snapshot pending migration to the observed child-group evidence.
+
+One borrowed predicate-view contract supplies both executable and native scalar
+evidence to the same selectivity algebra. Boolean estimation uses an iterative
+DAG fold; conjunction flattening propagates occurrence counts over a topological
+order instead of expanding paths. Repeatable predicates describe one domain,
+whereas non-shareable predicates retain their evaluation multiplicity. The
+common expression child visitor now has a short-circuiting variant so admission
+can stop a wide node before retaining every child. Native selectivity returns
+no estimate on cooperative interruption and propagates cancellation errors.
+
+Verification includes 169 native/executable estimate comparisons, stable order
+and fence cases, 10,000-level shared AND/OR graphs on a 256 KiB stack, a volatile
+occurrence counterexample, and every interruption prefix of two shared native
+DAGs. Full workspace **6498 passed / 85 ignored**. Cold/SQL and execution
+measurements for this change are still pending; no search budget was changed.

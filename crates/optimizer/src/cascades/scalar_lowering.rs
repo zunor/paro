@@ -1029,6 +1029,170 @@ mod tests {
     use paro_planner::expression::{CaseExpression, ConjunctionExpression, ConstantExpression};
 
     #[test]
+    fn native_selectivity_matches_bound_evidence_without_exporting_scalars() {
+        use paro_planner::expression::{
+            ColumnRefExpression, ComparisonExpression, OperatorExpression, OperatorType,
+        };
+        use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats};
+        use std::sync::Arc;
+        let model = crate::cost_model::CostModel::default();
+        let binding = ColumnBinding::new(1, 0);
+        let mut stats = ColumnStatistics::with_estimated_distinct(
+            BaseStatistics::create_empty(LogicalType::Integer),
+            Some(10),
+        );
+        NumericStats::set_guaranteed_min(stats.statistics_mut(), &Value::Integer(0));
+        NumericStats::set_guaranteed_max(stats.statistics_mut(), &Value::Integer(9));
+        let stats = HashMap::from([(binding, Arc::new(stats))]);
+        let mut bindings = BindingCatalog::default();
+        let mut columns = ColumnCatalog::default();
+        let mut arena = ScalarArena::default();
+        let mut cases = Vec::new();
+        for depth in [0, 1] {
+            for comparison in [
+                ComparisonType::Equal,
+                ComparisonType::NotEqual,
+                ComparisonType::LessThan,
+                ComparisonType::LessThanOrEqual,
+                ComparisonType::GreaterThan,
+                ComparisonType::GreaterThanOrEqual,
+                ComparisonType::DistinctFrom,
+                ComparisonType::NotDistinctFrom,
+            ] {
+                for value in [-1, 0, 4, 9, 10] {
+                    let column = Expression::ColumnRef(
+                        ColumnRefExpression::with_depth(binding, LogicalType::Integer, depth)
+                            .into(),
+                    );
+                    let constant = Expression::Constant(
+                        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+                    );
+                    for (left, right) in [(column.clone(), constant.clone()), (constant, column)] {
+                        cases.push(Expression::Comparison(
+                            ComparisonExpression::new(comparison, left, right).into(),
+                        ));
+                    }
+                }
+            }
+        }
+        for kind in [ConjunctionType::And, ConjunctionType::Or] {
+            for indices in [[0, 31, 78], [3, 7, 15], [80, 83, 87]] {
+                cases.push(Expression::Conjunction(
+                    ConjunctionExpression::new(kind, indices.map(|i| cases[i].clone()).to_vec())
+                        .into(),
+                ));
+            }
+        }
+        for operator in [
+            OperatorType::Not,
+            OperatorType::IsNull,
+            OperatorType::IsNotNull,
+        ] {
+            cases.push(Expression::Operator(
+                OperatorExpression::new(operator, vec![cases[0].clone()], LogicalType::Boolean)
+                    .into(),
+            ));
+        }
+        for expression in cases {
+            let root = intern_expression(&expression, &[], &mut bindings, &mut columns, &mut arena)
+                .unwrap();
+            let before = arena.len();
+            let native = model
+                .estimate_native_selectivity(root, &arena, &bindings, &stats, || Ok(true))
+                .unwrap()
+                .unwrap();
+            let bound = model.estimate_selectivity(&expression, &stats);
+            assert_eq!(native.to_bits(), bound.to_bits(), "{expression:?}");
+            assert_eq!(arena.len(), before);
+        }
+        let mut root = arena
+            .intern(ScalarSpec {
+                kind: ScalarKind::Constant {
+                    value: ScalarLiteral::new(Value::Boolean(false), LogicalType::Boolean),
+                },
+                logical_type: LogicalType::Boolean,
+                children: Box::new([]),
+                local_properties: Default::default(),
+            })
+            .unwrap();
+        for _ in 0..10_000 {
+            // Retain a compact DAG even though it denotes exponentially many
+            // paths. This deliberately does not use conjunction flattening.
+            root = arena
+                .intern(ScalarSpec {
+                    kind: ScalarKind::Or,
+                    logical_type: LogicalType::Boolean,
+                    children: Box::new([root, root]),
+                    local_properties: Default::default(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            model
+                .estimate_native_selectivity(root, &arena, &bindings, &stats, || Ok(true))
+                .unwrap(),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn native_selectivity_never_publishes_an_interrupted_dag_analysis() {
+        let model = crate::cost_model::CostModel::default();
+        let mut arena = ScalarArena::default();
+        let bindings = BindingCatalog::default();
+        let stats = HashMap::new();
+        for kind in [ScalarKind::And, ScalarKind::Or] {
+            let mut root = arena
+                .intern(ScalarSpec {
+                    kind: ScalarKind::Constant {
+                        value: ScalarLiteral::new(Value::Boolean(false), LogicalType::Boolean),
+                    },
+                    logical_type: LogicalType::Boolean,
+                    children: Box::new([]),
+                    local_properties: Default::default(),
+                })
+                .unwrap();
+            for _ in 0..9 {
+                root = arena
+                    .intern(ScalarSpec {
+                        kind: kind.clone(),
+                        logical_type: LogicalType::Boolean,
+                        children: Box::new([root, root]),
+                        local_properties: Default::default(),
+                    })
+                    .unwrap();
+            }
+            let mut full_work = 0;
+            assert_eq!(
+                model
+                    .estimate_native_selectivity(root, &arena, &bindings, &stats, || {
+                        full_work += 1;
+                        Ok(true)
+                    })
+                    .unwrap(),
+                Some(0.0)
+            );
+            assert!(full_work < 110, "shared paths must not expand: {full_work}");
+            for limit in 0..full_work {
+                let mut reads = 0;
+                let result = model
+                    .estimate_native_selectivity(root, &arena, &bindings, &stats, || {
+                        reads += 1;
+                        Ok(reads <= limit)
+                    })
+                    .unwrap();
+                assert!(result.is_none(), "partial estimate published at {limit}");
+                assert_eq!(reads, limit + 1);
+            }
+            assert!(model
+                .estimate_native_selectivity(root, &arena, &bindings, &stats, || {
+                    Err(paro_error::internal("injected cancellation"))
+                })
+                .is_err());
+        }
+    }
+
+    #[test]
     fn post_reduction_scalar_references_do_not_read_the_aggregate_input() {
         use paro_function::aggregate::distributive::{
             count::get_count_star_function, minmax::get_max_function,

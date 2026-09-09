@@ -131,58 +131,77 @@ impl ExpressionIterator {
     }
 
     pub fn enumerate_children<'a>(expr: &'a Expression, mut f: impl FnMut(&'a Expression)) {
+        let result: std::result::Result<(), std::convert::Infallible> =
+            Self::try_enumerate_children(expr, |child| {
+                f(child);
+                Ok(())
+            });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    /// The same child-field contract, with immediate short-circuiting. Budget
+    /// admission and cancellation must be able to stop a wide node before
+    /// retaining all its children, not only before visiting the next parent.
+    pub fn try_enumerate_children<'a, E>(
+        expr: &'a Expression,
+        mut f: impl FnMut(&'a Expression) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         match expr {
             Expression::Aggregate(e) => {
                 for child in &e.children {
-                    f(child);
+                    f(child)?;
                 }
                 if let Some(filter) = &e.filter {
-                    f(filter);
+                    f(filter)?;
                 }
                 for order in &e.order_bys {
-                    f(&order.expression);
+                    f(&order.expression)?;
                 }
             }
             Expression::Case(e) => {
-                f(&e.check);
-                f(&e.result_if_true);
-                f(&e.result_if_false);
+                f(&e.check)?;
+                f(&e.result_if_true)?;
+                f(&e.result_if_false)?;
             }
             Expression::Cast(e) => {
-                f(&e.child);
+                f(&e.child)?;
             }
             Expression::Comparison(e) => {
-                f(&e.left);
-                f(&e.right);
+                f(&e.left)?;
+                f(&e.right)?;
             }
             Expression::Conjunction(e) => {
                 for child in &e.children {
-                    f(child);
+                    f(child)?;
                 }
             }
             Expression::Function(e) => {
                 for child in &e.children {
-                    f(child);
+                    f(child)?;
                 }
             }
             Expression::Operator(e) => {
                 for child in &e.children {
-                    f(child);
+                    f(child)?;
                 }
             }
             Expression::Subquery(e) => {
                 for child in &e.children {
-                    f(child);
+                    f(child)?;
                 }
             }
             Expression::Window(e) => {
-                Self::enumerate_window_children(e, f);
+                Self::try_enumerate_window_children(e, f)?;
             }
             Expression::Constant(_)
             | Expression::ColumnRef(_)
             | Expression::Parameter(_)
             | Expression::Reference(_) => {}
         }
+        Ok(())
     }
 
     pub fn enumerate_children_mut(expr: &mut Expression, mut f: impl FnMut(&mut Expression)) {
@@ -244,36 +263,52 @@ impl ExpressionIterator {
         window: &'a WindowExpression,
         mut f: impl FnMut(&'a Expression),
     ) {
+        let result: std::result::Result<(), std::convert::Infallible> =
+            Self::try_enumerate_window_children(window, |child| {
+                f(child);
+                Ok(())
+            });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    pub fn try_enumerate_window_children<'a, E>(
+        window: &'a WindowExpression,
+        mut f: impl FnMut(&'a Expression) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         match &window.invocation {
             WindowInvocation::Native { arguments, .. } => {
                 for argument in arguments {
-                    f(argument);
+                    f(argument)?;
                 }
             }
             WindowInvocation::Aggregate(aggregate) => {
                 for child in &aggregate.children {
-                    f(child);
+                    f(child)?;
                 }
                 if let Some(filter) = &aggregate.filter {
-                    f(filter);
+                    f(filter)?;
                 }
                 for order in &aggregate.order_bys {
-                    f(&order.expression);
+                    f(&order.expression)?;
                 }
             }
         }
         for partition in &window.partitions {
-            f(partition);
+            f(partition)?;
         }
         for order in &window.orders {
-            f(&order.expression);
+            f(&order.expression)?;
         }
         if let WindowFrameBound::Offset(expr) = &window.frame.start_bound {
-            f(expr);
+            f(expr)?;
         }
         if let WindowFrameBound::Offset(expr) = &window.frame.end_bound {
-            f(expr);
+            f(expr)?;
         }
+        Ok(())
     }
 
     pub fn enumerate_window_children_mut(
@@ -520,6 +555,20 @@ mod tests {
         });
         assert_eq!(children.len(), 7);
         assert_eq!(children[1], LogicalType::Boolean);
+        for stop in 0..children.len() {
+            let mut visits = 0;
+            let result = ExpressionIterator::try_enumerate_children(&expression, |_| {
+                let current = visits;
+                visits += 1;
+                if current == stop {
+                    Err(stop)
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result, Err(stop));
+            assert_eq!(visits, stop + 1);
+        }
     }
 
     #[test]
