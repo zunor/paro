@@ -315,6 +315,17 @@ impl CascadesEngine {
         &self.quality_bundles
     }
 
+    /// Fact producers publish quality results through the same query-local
+    /// registry used by the governor; callers must provide current ReadSet
+    /// and native choice identities.
+    pub fn quality_bundles_mut(&mut self) -> &mut QualityBundleRegistry {
+        &mut self.quality_bundles
+    }
+
+    pub fn governor_mut(&mut self) -> &mut Governor {
+        &mut self.governor
+    }
+
     /// Enable the per-rule phase ledger only for an explicitly requested
     /// diagnostic cohort.  Normal C1 must remain trace-off and allocation-free
     /// with respect to this optional attribution.

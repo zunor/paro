@@ -96,6 +96,10 @@ pub struct BundleInput {
     /// A correctness/provenance witness supplied by the fact producer.  The
     /// registry never synthesizes one from a query name or benchmark label.
     pub applicability_proof: Fingerprint,
+    /// Native choice identities are supplied by the fact producer. The
+    /// registry does not derive a plan identity from CandidateId or retain an
+    /// owned logical tree as a quality result.
+    pub choices: Box<[Fingerprint]>,
     pub candidate: Option<CandidateId>,
 }
 
@@ -314,12 +318,9 @@ impl QualityBundleRegistry {
             reads: input.reads,
             region: input.region,
             // A bundle only publishes native choice identities supplied by
-            // its caller.  It never constructs or owns a plan tree.
-            choices: input
-                .candidate
-                .into_iter()
-                .map(|candidate| Fingerprint(candidate.0 as u128))
-                .collect(),
+            // its caller. It never constructs or owns a plan tree, and it
+            // never manufactures a digest from a candidate integer.
+            choices: input.choices.clone(),
             candidate: input.candidate,
         };
         self.publish_result(id, result.clone());
@@ -390,6 +391,7 @@ mod tests {
             reads: ReadSetId::new(1),
             region: Fingerprint(2),
             applicability_proof: Fingerprint(3),
+            choices: Box::new([Fingerprint(5)]),
             candidate: Some(CandidateId(4)),
         }
     }

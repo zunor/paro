@@ -548,12 +548,12 @@ impl TransformationRule for PlannerTransformationRule {
             return Ok(Box::new([]));
         }
 
-        // These two rules already produce a bounded shell whose descendants
-        // are opaque Memo operands.  Re-settling that shell only to turn it
-        // back into GroupId/ScalarExprId edges is redundant.  Keep the shell
-        // in the session arena and let the native staging pass consume it;
-        // rules which introduce executable owned subtrees retain the full
-        // settlement path below.
+        // These rules produce a bounded shell whose leaves are opaque Memo
+        // operands. Re-settling that shell only to turn it back into
+        // GroupId/ScalarExprId edges is redundant. Keep the shell in the
+        // session arena and let the native staging pass consume it. Rules
+        // which introduce executable leaves or CTE ownership changes retain
+        // the full settlement path below.
         enum PreparedPlan {
             Native {
                 plan: OwnedLogicalPlan,
@@ -578,7 +578,10 @@ impl TransformationRule for PlannerTransformationRule {
 
         let use_native_shell = matches!(
             self.transformation,
-            PlannerTransformation::PredicateTransfer | PlannerTransformation::JoinRegionEnumeration
+            PlannerTransformation::PredicateTransfer
+                | PlannerTransformation::JoinRegionEnumeration
+                | PlannerTransformation::AggregateDimensionDeferral
+                | PlannerTransformation::AggregateJoinSubsumption
         );
         let mut prepared = Vec::with_capacity(plans.len());
         for plan in plans {
@@ -588,11 +591,7 @@ impl TransformationRule for PlannerTransformationRule {
                 retained_group_holes.keys().copied(),
                 &environment.bind_context,
             )?;
-            let use_native_plan = use_native_shell
-                && plan
-                    .children()
-                    .iter()
-                    .all(|child| matches!(child.operator, LogicalOperator::BoundReference(_)));
+            let use_native_plan = use_native_shell && native_shell_is_closed(&plan);
             let (prepared_plan, root_operator, output_layout) = if use_native_plan {
                 let plan =
                     refresh_native_shell_statistics(plan, source_stats.as_ref(), &environment);
@@ -1009,6 +1008,23 @@ fn refresh_native_shell_statistics(
         &mut context,
     );
     plan
+}
+
+/// A native shell may contain transparent operator structure and native scalar
+/// operands, but every leaf must remain a Memo group boundary. In particular,
+/// never bypass settlement for a shell that still contains a real scan/get:
+/// that would turn an owned planner tree into a second source of semantics.
+fn native_shell_is_closed(plan: &OwnedLogicalPlan) -> bool {
+    if matches!(plan.operator, LogicalOperator::BoundReference(_)) {
+        return true;
+    }
+    let mut children = Vec::new();
+    plan.operator
+        .visit_child_links(&mut |child| children.push(child));
+    !children.is_empty()
+        && children
+            .into_iter()
+            .all(|child| native_shell_is_closed(&child))
 }
 
 fn rewrite_planner_expressions(
