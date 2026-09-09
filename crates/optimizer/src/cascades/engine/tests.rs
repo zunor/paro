@@ -974,11 +974,21 @@ fn rule_work_profile_is_opt_in_for_diagnostic_cohorts() {
     let (mut normal, group, goal) = engine(8);
     normal.optimize(group, goal, SearchMode::Memo).unwrap();
     assert!(normal.rule_work_profile().is_empty());
+    assert_eq!(normal.search_milestones(), &SearchMilestones::default());
 
     let (mut diagnostic, group, goal) = engine(8);
     diagnostic.set_rule_work_profile_enabled(true);
     diagnostic.optimize(group, goal, SearchMode::Memo).unwrap();
     assert!(!diagnostic.rule_work_profile().is_empty());
+    assert!(diagnostic
+        .rule_work_profile()
+        .values()
+        .any(|profile| profile.first_discovered_us.is_some()));
+    assert!(diagnostic.search_milestones().first_safe_us.is_some());
+    assert!(diagnostic
+        .search_milestones()
+        .first_optional_ready_us
+        .is_some());
 }
 
 #[test]

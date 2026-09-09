@@ -385,6 +385,7 @@ impl OptimizationInput {
         let rule_allocated_bytes = engine.rule_allocated_bytes().clone();
         let rule_budget_exhaustions = engine.rule_budget_exhaustions().clone();
         let rule_work_profile = engine.rule_work_profile().clone();
+        let search_milestones = engine.search_milestones().clone();
         let mut work_counters = engine.search_work_counters();
         {
             let state = self
@@ -432,6 +433,7 @@ impl OptimizationInput {
             rule_allocated_bytes,
             rule_budget_exhaustions,
             rule_work_profile,
+            search_milestones,
             search_summary,
         })
     }
@@ -452,6 +454,7 @@ pub struct OptimizationOutput {
     pub rule_allocated_bytes: BTreeMap<RuleId, u64>,
     pub rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     pub rule_work_profile: BTreeMap<RuleId, super::engine::RuleWorkProfile>,
+    pub search_milestones: super::engine::SearchMilestones,
     pub search_summary: SearchSummary,
 }
 

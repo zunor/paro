@@ -437,6 +437,36 @@ impl Optimizer {
                     let event = format!("rule.{rule_name}.{phase}");
                     trace.record_value("optimizer", &event, count);
                 }
+                for (phase, elapsed) in [
+                    ("first_discovered_us", profile.first_discovered_us),
+                    ("first_matched_us", profile.first_matched_us),
+                    ("first_applicable_us", profile.first_applicable_us),
+                    ("first_published_us", profile.first_published_us),
+                ] {
+                    if let Some(elapsed) = elapsed {
+                        let event = format!("rule.{rule_name}.{phase}");
+                        trace.record_value("optimizer", &event, elapsed);
+                    }
+                }
+            }
+            for (name, elapsed) in [
+                ("first_safe_us", extraction.search_milestones.first_safe_us),
+                (
+                    "first_optional_ready_us",
+                    extraction.search_milestones.first_optional_ready_us,
+                ),
+                (
+                    "first_optional_selected_us",
+                    extraction.search_milestones.first_optional_selected_us,
+                ),
+                (
+                    "first_logical_publication_us",
+                    extraction.search_milestones.first_logical_publication_us,
+                ),
+            ] {
+                if let Some(elapsed) = elapsed {
+                    trace.record_value("optimizer", name, elapsed);
+                }
             }
             trace.record_event(
                 "optimizer",

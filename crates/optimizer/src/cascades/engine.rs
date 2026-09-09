@@ -205,6 +205,39 @@ pub struct RuleWorkProfile {
     /// Valid rule applications which produced no new expression because the
     /// result was already present.
     pub ineffective: u64,
+    /// Diagnostic-only elapsed offsets from the start of the optimizer call.
+    /// They are optional because the normal trace-off path does not maintain
+    /// a timing clock or phase map.
+    pub first_discovered_us: Option<u64>,
+    pub first_matched_us: Option<u64>,
+    pub first_applicable_us: Option<u64>,
+    pub first_published_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchMilestones {
+    /// First root candidate published by the protected mandatory search.
+    pub first_safe_us: Option<u64>,
+    pub safe_candidate: Option<CandidateId>,
+    /// First root candidate published after optional search began. This is a
+    /// physical readiness observation, not a proof that the candidate is the
+    /// final winner or that optional search is complete.
+    pub first_optional_ready_us: Option<u64>,
+    pub optional_ready_candidate: Option<CandidateId>,
+    /// First root candidate that changed the selected frontier entry after
+    /// optional search began.
+    pub first_optional_selected_us: Option<u64>,
+    pub optional_selected_candidate: Option<CandidateId>,
+    /// First logical publication made by optional transformation search.
+    pub first_logical_publication_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuleWorkPhase {
+    Discovered,
+    Matched,
+    Applicable,
+    Published,
 }
 
 /// The engine is deliberately operator-agnostic. Domain implementations live
@@ -231,6 +264,10 @@ pub struct CascadesEngine {
     /// Rule phase counters are diagnostic-only.  The normal trace-off path
     /// must not pay a BTreeMap lookup for every transformation task.
     collect_rule_work_profile: bool,
+    profile_started_at: Option<Instant>,
+    search_milestones: SearchMilestones,
+    milestone_root: Option<GroupId>,
+    optional_search_started: bool,
     transformation_bindings: u64,
     fact_value_revalidation_hits: u64,
     fact_value_revalidation_misses: u64,
@@ -293,6 +330,10 @@ impl CascadesEngine {
             rule_budget_exhaustions: BTreeMap::new(),
             rule_work_profile: BTreeMap::new(),
             collect_rule_work_profile: false,
+            profile_started_at: None,
+            search_milestones: SearchMilestones::default(),
+            milestone_root: None,
+            optional_search_started: false,
             transformation_bindings: 0,
             fact_value_revalidation_hits: 0,
             fact_value_revalidation_misses: 0,
@@ -352,12 +393,115 @@ impl CascadesEngine {
         self.collect_rule_work_profile = enabled;
     }
 
+    fn begin_diagnostic_profile(&mut self, root: GroupId) {
+        self.search_milestones = SearchMilestones::default();
+        self.milestone_root = self
+            .collect_rule_work_profile
+            .then_some(self.memo.canonical_group(root));
+        self.optional_search_started = false;
+        self.profile_started_at = self.collect_rule_work_profile.then(Instant::now);
+        if self.collect_rule_work_profile {
+            self.rule_work_profile.clear();
+        }
+    }
+
+    fn profile_elapsed_us(&self) -> Option<u64> {
+        self.profile_started_at
+            .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+    }
+
+    fn note_rule_phase(&mut self, rule: RuleId, phase: RuleWorkPhase) {
+        Self::note_rule_phase_at(
+            &mut self.rule_work_profile,
+            self.collect_rule_work_profile,
+            self.profile_started_at,
+            rule,
+            phase,
+        );
+    }
+
+    fn note_rule_phase_at(
+        profiles: &mut BTreeMap<RuleId, RuleWorkProfile>,
+        collect: bool,
+        started_at: Option<Instant>,
+        rule: RuleId,
+        phase: RuleWorkPhase,
+    ) {
+        if !collect {
+            return;
+        }
+        let Some(started_at) = started_at else {
+            return;
+        };
+        let elapsed = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let profile = profiles.entry(rule).or_default();
+        let slot = match phase {
+            RuleWorkPhase::Discovered => &mut profile.first_discovered_us,
+            RuleWorkPhase::Matched => &mut profile.first_matched_us,
+            RuleWorkPhase::Applicable => &mut profile.first_applicable_us,
+            RuleWorkPhase::Published => &mut profile.first_published_us,
+        };
+        slot.get_or_insert(elapsed);
+    }
+
+    fn note_logical_publication(&mut self) {
+        if self.collect_rule_work_profile
+            && self
+                .search_milestones
+                .first_logical_publication_us
+                .is_none()
+        {
+            self.search_milestones.first_logical_publication_us = self.profile_elapsed_us();
+        }
+    }
+
+    fn note_safe_candidate(&mut self, candidate: CandidateId) {
+        if !self.collect_rule_work_profile || self.search_milestones.first_safe_us.is_some() {
+            return;
+        }
+        self.search_milestones.first_safe_us = self.profile_elapsed_us();
+        self.search_milestones.safe_candidate = Some(candidate);
+    }
+
+    fn note_physical_candidate(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        selected_changed: bool,
+    ) {
+        if !self.collect_rule_work_profile
+            || self.optional_search_started
+                && self.milestone_root != Some(self.memo.canonical_group(group))
+        {
+            return;
+        }
+        let Some(candidate) = self
+            .memo
+            .group(group)
+            .and_then(|group| group.winner(goal))
+            .map(|winner| winner.candidate)
+        else {
+            return;
+        };
+        if self.optional_search_started {
+            if self.search_milestones.first_optional_ready_us.is_none() {
+                self.search_milestones.first_optional_ready_us = self.profile_elapsed_us();
+                self.search_milestones.optional_ready_candidate = Some(candidate);
+            }
+            if selected_changed && self.search_milestones.first_optional_selected_us.is_none() {
+                self.search_milestones.first_optional_selected_us = self.profile_elapsed_us();
+                self.search_milestones.optional_selected_candidate = Some(candidate);
+            }
+        }
+    }
+
     pub fn optimize(
         &mut self,
         root: GroupId,
         goal: OptimizationGoal,
         mode: SearchMode,
     ) -> Result<Winner> {
+        self.begin_diagnostic_profile(root);
         // CascadesEngine is also usable with a hand-built Memo. Seal at the
         // actual phase boundary rather than relying on one particular builder
         // to have done so: optional rules may only propagate expression-path
@@ -380,6 +524,7 @@ impl CascadesEngine {
                 .cloned();
             if let Some(incumbent) = &incumbent {
                 self.governor.mark_safe(incumbent.candidate);
+                self.note_safe_candidate(incumbent.candidate);
             }
             self.memo.control().begin_optional();
             if !self.memo.control().checkpoint()? {
@@ -388,6 +533,7 @@ impl CascadesEngine {
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
             }
             self.reset_cost_epoch()?;
+            self.optional_search_started = self.collect_rule_work_profile;
             // The archived mandatory incumbent remains the safe plan for this
             // new cost epoch.  As soon as optional work publishes enough new
             // logical alternatives, mandatory physical work is re-costed
@@ -457,6 +603,7 @@ impl CascadesEngine {
         }
         self.memo.freeze_optimization_contexts()?;
         let root = self.memo.canonical_group(root);
+        self.begin_diagnostic_profile(root);
         if mode == SearchMode::Memo {
             let phase = self.memo.control().incumbent_phase();
             self.mandatory_only = true;
@@ -480,6 +627,7 @@ impl CascadesEngine {
                     .and_then(|optimization| optimization.winners.first())
                 {
                     self.governor.mark_safe(incumbent.winner.candidate);
+                    self.note_safe_candidate(incumbent.winner.candidate);
                 }
             }
             self.memo.control().begin_optional();
@@ -489,6 +637,7 @@ impl CascadesEngine {
                 return incumbent;
             }
             self.reset_cost_epoch()?;
+            self.optional_search_started = self.collect_rule_work_profile;
             self.explore_transformations()?;
             if !self.memo.control().checkpoint()? {
                 return incumbent;
@@ -672,6 +821,7 @@ impl CascadesEngine {
                 expression,
                 rule,
             };
+            self.note_rule_phase(rule, RuleWorkPhase::Discovered);
             if self.collect_rule_work_profile {
                 let profile = self.rule_work_profile.entry(rule).or_default();
                 profile.discovered = profile.discovered.saturating_add(1);
@@ -807,6 +957,7 @@ impl CascadesEngine {
                 continue;
             }
             if self.collect_rule_work_profile {
+                self.note_rule_phase(rule, RuleWorkPhase::Matched);
                 let profile = self.rule_work_profile.entry(rule).or_default();
                 profile.matched = profile
                     .matched
@@ -1160,6 +1311,13 @@ impl CascadesEngine {
                     continue;
                 }
                 if self.collect_rule_work_profile {
+                    Self::note_rule_phase_at(
+                        &mut self.rule_work_profile,
+                        self.collect_rule_work_profile,
+                        self.profile_started_at,
+                        rule,
+                        RuleWorkPhase::Applicable,
+                    );
                     let profile = self.rule_work_profile.entry(rule).or_default();
                     profile.applicable = profile.applicable.saturating_add(1);
                     profile.constructed = profile.constructed.saturating_add(outputs.len() as u64);
@@ -1290,6 +1448,7 @@ impl CascadesEngine {
                     let newly_inserted_expressions = inserted_expressions.clone();
                     let (appended_groups, locally_written_groups) = context.commit()?;
                     let changed_cte_readers = self.memo.take_changed_cte_readers();
+                    self.note_logical_publication();
                     self.publish_transformation_task(
                         transformation_task,
                         locally_written_groups
@@ -1319,6 +1478,7 @@ impl CascadesEngine {
                     effective_insertions_since_recost = effective_insertions_since_recost
                         .saturating_add(inserted_expressions.len());
                     if self.collect_rule_work_profile {
+                        self.note_rule_phase(rule, RuleWorkPhase::Published);
                         self.rule_work_profile.entry(rule).or_default().published = self
                             .rule_work_profile
                             .get(&rule)
@@ -1469,6 +1629,10 @@ impl CascadesEngine {
 
     pub fn rule_work_profile(&self) -> &BTreeMap<RuleId, RuleWorkProfile> {
         &self.rule_work_profile
+    }
+
+    pub fn search_milestones(&self) -> &SearchMilestones {
+        &self.search_milestones
     }
 
     pub fn search_work_counters(&self) -> BTreeMap<&'static str, u64> {
@@ -2487,7 +2651,8 @@ impl CascadesEngine {
                     physical_fingerprint: fingerprint,
                     joint_cost_proof,
                 };
-                self.memo.record_winner(group, goal, winner)?;
+                let selected_changed = self.memo.record_winner(group, goal, winner)?;
+                self.note_physical_candidate(group, goal, selected_changed);
             }
         }
         Ok(())
