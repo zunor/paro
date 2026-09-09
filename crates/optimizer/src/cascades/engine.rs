@@ -371,7 +371,12 @@ impl CascadesEngine {
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
             }
             self.reset_cost_epoch()?;
-            self.explore_transformations()?;
+            // The archived mandatory incumbent remains the safe plan for this
+            // new cost epoch.  As soon as optional work publishes enough new
+            // logical alternatives, mandatory physical work is re-costed
+            // incrementally below; this keeps the incumbent fallback semantics
+            // intact when cancellation happens before the first publication.
+            self.explore_transformations_with_interleave(Some((root, goal)))?;
         }
         self.optimize_group(root, goal)?;
         super::verifier::MemoVerifier::verify(&self.memo, None)?;
@@ -612,9 +617,18 @@ impl CascadesEngine {
     }
 
     fn explore_transformations(&mut self) -> Result<()> {
+        self.explore_transformations_with_interleave(None)
+    }
+
+    fn explore_transformations_with_interleave(
+        &mut self,
+        interleave: Option<(GroupId, OptimizationGoal)>,
+    ) -> Result<()> {
         self.memo.control().begin_optional();
         self.memo.seal_optional_group_budget();
         let mut agenda = StableAgenda::default();
+        let mut effective_insertions_since_recost = 0usize;
+        const INTERLEAVE_BATCH: usize = 8;
         for group_index in 0..self.memo.group_count() {
             let group = GroupId::new(group_index);
             if self.memo.canonical_group(group) == group {
@@ -1283,6 +1297,8 @@ impl CascadesEngine {
                     }
                     *self.effective_rule_insertions.entry(rule).or_default() +=
                         u64::try_from(inserted_expressions.len()).unwrap_or(u64::MAX);
+                    effective_insertions_since_recost = effective_insertions_since_recost
+                        .saturating_add(inserted_expressions.len());
                     if self.collect_rule_work_profile {
                         self.rule_work_profile.entry(rule).or_default().published = self
                             .rule_work_profile
@@ -1342,6 +1358,23 @@ impl CascadesEngine {
                 for target in inserted_groups {
                     self.schedule_transformation_dependents(target, &mut agenda)?;
                 }
+            }
+            if effective_insertions_since_recost >= INTERLEAVE_BATCH {
+                if let Some((root, goal)) = interleave {
+                    // Interleaving only the mandatory physical baseline keeps
+                    // optional search budget accounting equivalent to the
+                    // legacy final costing pass.  It still makes newly
+                    // published logical alternatives executable and lets
+                    // later rules observe their physical readiness.
+                    let result = {
+                        self.mandatory_only = true;
+                        let result = self.optimize_group(root, goal);
+                        self.mandatory_only = false;
+                        result
+                    };
+                    result?;
+                }
+                effective_insertions_since_recost = 0;
             }
         }
         Ok(())
