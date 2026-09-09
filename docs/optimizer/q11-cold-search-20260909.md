@@ -7,8 +7,102 @@ Normal release timing and allocation-instrumented attribution remain separate.
 
 The starting revision is `3dbcfc95`, with 1287.412 ms cold planning, 456,605,696
 bytes median peak RSS, 49,521 winner proposals and 13,212 frontier truncations.
-The last complete Q11 execution comparison passed at ratio 0.942894 with 95%
+The starting revision's complete Q11 execution comparison passed at ratio 0.942894 with 95%
 CI [0.929616, 0.958304]. Both measurements describe `3d31841f`, not later code.
+
+## Current verified checkpoint — 100 ms is NOT achieved
+
+Normal-release original Q11, five independent processes, unchanged immutable
+SF1 input seed, four workers and 2 GB:
+
+| Metric | Review baseline (`3d31841f`) | Current code (`7a3a36e2`) |
+| --- | ---: | ---: |
+| Cold EXPLAIN median | 1287.412 ms | 705.661 ms |
+| Optimizer median | about 1280.5 ms | 698.706 ms |
+| Median peak RSS | 456,605,696 bytes | 256,016,384 bytes |
+| Logical groups / expressions | 1022 / 1582 | 1022 / 1582 |
+| Winner proposals | 49,521 | 26,888 |
+| Frontier truncation obligations | 13,212 | 0 |
+| Child-product omission obligations | 144 | 86 |
+| Search complete | false | false |
+
+The cold gate passes against the exact review baseline with a maximum ratio
+of 1.0, including all omission-count checks. Against the older isolated-seed
+baseline it still fails on seven omission categories (dimension deferral,
+optional groups, CTE demand, rule fires, child products, CTE inline and aggregate
+subsumption). That older bounded-search quality gap is not silently blessed.
+No budget limit, optional deadline, enabled-rule set, or original SQL was
+changed in this round.
+
+Current code also passes `make static`, 6,528 workspace tests (85 ignored),
+strict server Clippy with `alloc-metrics`, and the full fresh-instance SQL
+suite, **184/184**. The first SQL run's two
+memory-setting display failures were fixture launch configuration (`1GB`
+instead of `1073741824`), not product changes. One deliberately reviewed
+baseline update (`26385443`) records `k < 5 AND k >= 2` evaluation order;
+the fixture's result and cardinality estimate are unchanged. The independent
+ten-case plan-quality gate passes against the review baseline: maximum
+q-error 2.0, no worsened q-error or plan-quality metric.
+
+The final execution comparator at `26385443` (only SQL test changes since
+`7a3a36e2`) uses seven fresh process blocks and 70 paired samples per engine.
+All 90 rows match, digest
+`9108a5b43530c24778abc0d8d3bf1ee218a9815eb0d15310bb4d7c6bcc5f2c78`.
+Paro median is **98.222 ms**, DuckDB **104.719 ms**, paired ratio **0.948372**,
+hierarchical 95% CI **[0.932114, 0.976202]**. First-statement medians remain
+**831.288 vs 109.412 ms**. Execution is faster; cold statement latency is not.
+
+Evidence files in `benchmark/report/`:
+
+- `q11-cold-immutable-boundary-views-20260909.json`
+- `q11-allocation-search-contracts-20260909.json` (instrumented, attribution only)
+- `q11-search-contracts-plan-quality-20260909.json`
+- `q11-execution-immutable-boundary-views-20260909.json`
+
+All collectors finished with valid build/harness/seed attestations. Test and
+benchmark servers were owned, isolated, and stopped; the input seed was not
+used as a live database or modified. Detailed source changes and intermediate
+measurements follow; their historical test counts/timings are not final claims.
+
+### Remaining architectural work, not completed deliverables
+
+The new allocation profile attributes **1,395,132,794 bytes** to Memo search:
+**921,859,225 bytes** to rule discovery/application and **473,273,569 bytes**
+outside those scopes. The largest rule allocations are join-region enumeration
+(288,665,074), predicate transfer (244,898,099), and dimension deferral
+(81,229,266). Published shared source-response payload is just 1,481,560 bytes;
+it is no longer the main live-memory amplifier. Instrumented EXPLAIN time
+(715.479 ms, one process) is not mixed into the normal-release latency result.
+
+Earlier 661.3/461.0 ms rule subtotals in this log sum diagnostics for rules
+which published outputs. They exclude discovery/attempt work of zero-output
+rules and are **not complete rule-time totals**. The allocation totals above
+cover all rule scopes; elapsed rows for insertions and attempts overlap and
+must not be added together.
+
+The next high-leverage change is native rule input **and output**, not another
+cache layered around the same tree round trip:
+
+1. A binding should expose native operator/scalar IDs, opaque child GroupRefs,
+   and specifically requested fact handles. A cheap applicable proof must run
+   before any legacy transport/settlement work. No-match evidence must remain
+   subscribed and cancellation/work admission must precede construction.
+2. Predicate transfer and join-region enumeration should produce only changed
+   native terms, retaining unchanged GroupRefs. Publication must derive local
+   facts from those inputs and never instantiate, settle and restage unchanged
+   consumed shells. Output demand and execution carriers remain separate.
+3. Child continuation requirements and conservative phase/source lower bounds
+   must precede scalar winner collapse or incumbent-based branch-and-bound.
+   The current phase-memory correction does not itself provide those proofs.
+4. Predicate scheduling still lacks calibrated per-kernel evaluation work and
+   a common residual-container contract beyond Filter (review F6/F7). Planning
+   memory admission also remains incomplete: shared ownership is not an
+   allocation budget. These are open, not claimed resolved by this checkpoint.
+
+Acceptance remains the independent closure/cost oracles, cold gate without
+shrinking search budgets, complete SQL/q-error gates, and qualified original
+Q11 execution below DuckDB. The measured improvements do not establish that
+100 ms is reachable merely by multiplying speculative per-operation targets.
 
 ## Design constraints
 
