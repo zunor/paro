@@ -911,16 +911,13 @@ impl CascadesEngine {
                         binding: binding.clone(),
                     },
                     // Discovery and application have different scopes. The
-                    // task identity must retain both: a narrower application
-                    // fact read cannot erase a frontier read that made this
-                    // exact binding eligible in the first place.
-                    ReadSet::new(
-                        binding_set
-                            .reads
-                            .iter()
-                            .copied()
-                            .chain(application_reads.iter().copied()),
-                    ),
+                    // discovery task retains the frontier observation that
+                    // produced this exact binding; the application task
+                    // records only the facts it actually consumes. A child
+                    // group may publish a new peer expression after the
+                    // binding was discovered without invalidating the
+                    // already-exact application.
+                    ReadSet::new(application_reads.iter().copied()),
                     &self.memo,
                 )? {
                     TaskRequest::Leader(task) => {
@@ -1274,14 +1271,15 @@ impl CascadesEngine {
                     self.complete_transformation_task(transformation_task)?;
                 } else {
                     let newly_inserted_expressions = inserted_expressions.clone();
-                    let appended_groups = context.commit()?;
+                    let (appended_groups, locally_written_groups) = context.commit()?;
                     let changed_cte_readers = self.memo.take_changed_cte_readers();
                     self.publish_transformation_task(
                         transformation_task,
-                        std::iter::once(group)
+                        locally_written_groups
+                            .into_iter()
+                            .chain(std::iter::once(group))
                             .chain(appended_groups.iter().copied())
-                            .chain(changed_cte_readers.iter().copied())
-                            .chain(fact_reads.iter().map(|read| read.group)),
+                            .chain(changed_cte_readers.iter().copied()),
                     )?;
                     release_transformation_output_reservations(
                         &mut self.memo,
@@ -2025,7 +2023,13 @@ impl CascadesEngine {
         }
         match result {
             Ok(()) => {
-                let complete = self.memo.search_obligations().is_empty();
+                // A physical task's cursor describes its own recipe and
+                // child-frontier domain. Global logical budget/rule
+                // obligations are reported by Memo, but must not make every
+                // completed physical task resumable: doing so re-enumerates
+                // all implementations whenever an unrelated logical rule
+                // leaves an obligation behind.
+                let complete = !self.memo.control().deadline_reached();
                 let cursor = self.task_registry.advance_cursor(
                     task,
                     Cursor {

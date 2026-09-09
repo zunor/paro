@@ -168,6 +168,39 @@ fn search_accounting_retains_fact_snapshots_and_savepoints_share_regions() {
 }
 
 #[test]
+fn transformation_transaction_restores_existing_group_facts_and_reports_writes() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let rollback_group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let original = memo.group(group).unwrap().cardinality.clone();
+    let _checkpoint = memo.transformation_savepoint();
+    memo.group_mut(group).unwrap().cardinality =
+        GroupCardinality::new(Fingerprint(17), CardinalityRecipeKind::Statistics, 1, 4, 9);
+    let written = memo.take_transformation_written_groups();
+    assert_eq!(written, BTreeSet::from([group]));
+    // Re-open a fresh transaction shape for the rollback assertion. The
+    // first journal was consumed to verify its publication write set.
+    let checkpoint = memo.transformation_savepoint();
+    let rollback_original = memo.group(rollback_group).unwrap().cardinality.clone();
+    memo.group_mut(rollback_group).unwrap().cardinality =
+        GroupCardinality::new(Fingerprint(18), CardinalityRecipeKind::Statistics, 2, 5, 10);
+    memo.rollback_transformation(checkpoint).unwrap();
+    assert_eq!(
+        memo.group(rollback_group).unwrap().cardinality,
+        rollback_original
+    );
+    assert_ne!(memo.group(group).unwrap().cardinality, original);
+}
+
+#[test]
 fn rule_history_is_expression_local_and_duplicate_expr_is_deduped() {
     let mut memo = Memo::new(SearchBudget::default());
     let group = memo.create_group(

@@ -3,7 +3,7 @@
 
 //! Stable rule and implementation registries used by Direct and Memo search.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use paro_common::error::{self as paro_error, Result};
@@ -478,11 +478,13 @@ impl<'a> TransformContext<'a> {
         }
     }
 
-    pub(crate) fn commit(mut self) -> Result<Box<[GroupId]>> {
+    pub(crate) fn commit(mut self) -> Result<(Box<[GroupId]>, BTreeSet<GroupId>)> {
         let Some(savepoint) = self.memo_savepoint.take() else {
-            return Ok(Box::new([]));
+            return Ok((Box::new([]), BTreeSet::new()));
         };
-        self.memo.appended_groups_since(&savepoint)
+        let appended_groups = self.memo.appended_groups_since(&savepoint)?;
+        let written_groups = self.memo.take_transformation_written_groups();
+        Ok((appended_groups, written_groups))
     }
 }
 

@@ -1248,6 +1248,12 @@ pub struct Memo {
     cte_type_insertions: Vec<(usize, CteColumnId)>,
     changed_cte_domains: BTreeSet<usize>,
     failed_search_obligations: BTreeSet<super::budget::SearchObligation>,
+    /// Existing-group fact mutations made by the active transformation
+    /// transaction.  Appended groups are handled by the savepoint lengths;
+    /// these snapshots keep a rejected staging attempt from leaking a merged
+    /// contract/statistics update into the live Memo.
+    transformation_group_snapshots:
+        Option<BTreeMap<GroupId, (LogicalProperties, GroupCardinality)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1307,6 +1313,7 @@ impl Memo {
             cte_type_insertions: Vec::new(),
             changed_cte_domains: BTreeSet::new(),
             failed_search_obligations: BTreeSet::new(),
+            transformation_group_snapshots: None,
         }
     }
 
@@ -1602,6 +1609,11 @@ impl Memo {
     /// Physical expressions, winners, and property sets are not writable in
     /// this search phase and therefore are intentionally absent.
     pub(crate) fn transformation_savepoint(&mut self) -> TransformationSavepoint {
+        debug_assert!(
+            self.transformation_group_snapshots.is_none(),
+            "nested Memo transformation savepoints are not supported"
+        );
+        self.transformation_group_snapshots = Some(BTreeMap::new());
         TransformationSavepoint {
             group_count: self.groups.len(),
             logical_expression_count: self.logical_exprs.len(),
@@ -1626,6 +1638,18 @@ impl Memo {
             return Err(paro_error::internal(
                 "transformation rollback exceeds the current Memo generation",
             ));
+        }
+        if let Some(snapshots) = self.transformation_group_snapshots.take() {
+            for (group, (logical_properties, cardinality)) in snapshots {
+                let Some(group) = self.groups.get_mut(group.index()) else {
+                    return Err(paro_error::internal(
+                        "transformation rollback lost an existing Memo group",
+                    ));
+                };
+                group.logical_properties = logical_properties;
+                group.cardinality = cardinality;
+                group.invalidate_fact_fingerprints();
+            }
         }
         for index in (savepoint.logical_expression_count..self.logical_exprs.len()).rev() {
             let id = LogicalExprId::new(index);
@@ -1725,6 +1749,17 @@ impl Memo {
             .filter(|group| self.canonical_group(*group) == *group)
             .collect::<Vec<_>>()
             .into_boxed_slice())
+    }
+
+    /// Finish the active transformation write journal and return the exact
+    /// existing groups whose logical facts were touched.  This is consumed by
+    /// task publication; a transformation must not exempt every bound input
+    /// merely because it happened to read that input.
+    pub(crate) fn take_transformation_written_groups(&mut self) -> BTreeSet<GroupId> {
+        self.transformation_group_snapshots
+            .take()
+            .map(|snapshots| snapshots.into_keys().collect())
+            .unwrap_or_default()
     }
 
     pub fn regions(&self) -> &RegionForest {
@@ -1917,8 +1952,31 @@ impl Memo {
         self.groups.get(self.canonical_group(id).index())
     }
 
+    fn record_transformation_group_write(&mut self, id: GroupId) {
+        if self.transformation_group_snapshots.is_none() {
+            return;
+        }
+        let id = self.canonical_group(id);
+        let already_recorded = self
+            .transformation_group_snapshots
+            .as_ref()
+            .is_some_and(|snapshots| snapshots.contains_key(&id));
+        if already_recorded {
+            return;
+        }
+        let Some(group) = self.groups.get(id.index()) else {
+            return;
+        };
+        let snapshot = (group.logical_properties.clone(), group.cardinality.clone());
+        self.transformation_group_snapshots
+            .as_mut()
+            .expect("transformation snapshot disappeared")
+            .insert(id, snapshot);
+    }
+
     pub fn group_mut(&mut self, id: GroupId) -> Option<&mut Group> {
         let id = self.canonical_group(id);
+        self.record_transformation_group_write(id);
         let group = self.groups.get_mut(id.index())?;
         group.invalidate_fact_fingerprints();
         Some(group)
@@ -2362,6 +2420,7 @@ impl Memo {
                 "seed proof may only initialize a newly-created Memo group",
             ));
         }
+        self.record_transformation_group_write(target);
         let id = LogicalExprId::new(self.logical_exprs.len());
         self.logical_exprs.push(LogicalExpr {
             id,

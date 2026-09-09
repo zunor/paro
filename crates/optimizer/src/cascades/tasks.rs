@@ -170,11 +170,29 @@ pub struct ReadSet {
 
 impl ReadSet {
     pub fn new(reads: impl IntoIterator<Item = PatternRead>) -> Self {
-        let mut reads = reads.into_iter().collect::<Vec<_>>();
-        reads.sort_unstable();
-        reads.dedup();
+        // A task may combine a discovery frontier read with a later fact
+        // read for the same group. Keep one read per group so a stale fact
+        // snapshot cannot survive beside a current application read and
+        // make an otherwise valid local publication fail. A frontier read
+        // remains part of the contract; the fact/statistics fields follow
+        // the last observation supplied by the caller, which is the current
+        // application observation in the production path.
+        let mut merged = BTreeMap::<GroupId, PatternRead>::new();
+        for read in reads {
+            if let Some(previous) = merged.get_mut(&read.group) {
+                let frontier = read
+                    .logical_frontier_revision
+                    .or(previous.logical_frontier_revision);
+                *previous = PatternRead {
+                    logical_frontier_revision: frontier,
+                    ..read
+                };
+            } else {
+                merged.insert(read.group, read);
+            }
+        }
         Self {
-            reads: reads.into_boxed_slice(),
+            reads: merged.into_values().collect(),
         }
     }
 
@@ -1100,6 +1118,11 @@ impl TaskRegistry {
         if !current || !canonical {
             self.rollback_segment(task)?;
             self.invalidate(task)?;
+            let intent = self.intent(
+                self.task(task)
+                    .ok_or_else(|| paro_error::internal("task lost its intent"))?
+                    .intent,
+            );
             let stale = self.read_set(reads).and_then(|read_set| {
                 read_set
                     .reads()
@@ -1110,9 +1133,11 @@ impl TaskRegistry {
                     })
                     .copied()
             });
+            let current =
+                stale.and_then(|read| PatternRead::facts_from_group(memo, read.group).ok());
             return Err(paro_error::internal(
                 format!(
-                    "task publication rejected an obsolete read or group identity: task={task:?}, written={locally_written_groups:?}, stale_read={stale:?}, canonical={canonical}"
+                    "task publication rejected an obsolete read or group identity: task={task:?}, intent={intent:?}, written={locally_written_groups:?}, stale_read={stale:?}, current_read={current:?}, canonical={canonical}"
                 ),
             ));
         }
