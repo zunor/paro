@@ -1823,12 +1823,18 @@ impl CascadesEngine {
             }
         };
         self.task_registry.start(task)?;
-        if self
-            .memo
-            .group(group)
-            .and_then(|group| group.winner(goal))
-            .is_some()
-            || self.infeasible_goals.contains(&(group, goal))
+        let task_has_residual_work = self
+            .task_registry
+            .task(task)
+            .and_then(|record| self.task_registry.cursor(record.cursor))
+            .is_some_and(|cursor| !cursor.complete);
+        if !task_has_residual_work
+            && (self
+                .memo
+                .group(group)
+                .and_then(|group| group.winner(goal))
+                .is_some()
+                || self.infeasible_goals.contains(&(group, goal)))
         {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
             let cursor = self.task_registry.advance_cursor(

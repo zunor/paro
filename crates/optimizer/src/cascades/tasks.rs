@@ -464,7 +464,33 @@ impl TaskRegistry {
                 .ok_or_else(|| paro_error::internal("task evaluation index is corrupt"))?
                 .state;
             return match state {
-                TaskState::Completed | TaskState::Failed => {
+                TaskState::Completed => {
+                    let incomplete = self
+                        .task(task)
+                        .and_then(|record| record.outcome.as_ref())
+                        .and_then(|outcome| match outcome {
+                            TaskOutcome::Progress { cursor } => self.cursor(*cursor),
+                            _ => None,
+                        })
+                        .is_some_and(|cursor| !cursor.complete);
+                    if incomplete {
+                        // A completed invocation may only have consumed a
+                        // prefix of its search domain. Keep the exact task
+                        // identity and cursor, but reopen the evaluation so
+                        // its residual obligations can be scheduled.
+                        self.task_mut(task)?.state = TaskState::Runnable;
+                        self.task_mut(task)?.outcome = None;
+                        Ok(TaskRequest::Leader(task))
+                    } else {
+                        self.profile.reused_evaluations =
+                            self.profile.reused_evaluations.saturating_add(1);
+                        Ok(TaskRequest::Reused {
+                            task,
+                            outcome: self.task(task).and_then(|record| record.outcome.clone()),
+                        })
+                    }
+                }
+                TaskState::Failed => {
                     self.profile.reused_evaluations =
                         self.profile.reused_evaluations.saturating_add(1);
                     Ok(TaskRequest::Reused {
@@ -797,6 +823,9 @@ impl TaskRegistry {
         if !matches!(state, TaskState::Runnable | TaskState::Running) {
             return Err(paro_error::internal("task is not runnable for completion"));
         }
+        if self.segments.contains_key(&task) {
+            self.commit_segment(task)?;
+        }
         self.finish(task, TaskState::Completed, Some(outcome))
     }
 
@@ -823,6 +852,61 @@ impl TaskRegistry {
         self.complete(task, outcome)
     }
 
+    /// Publish a task's local objects and either complete it or register its
+    /// unresolved dependencies in one linearizable single-worker operation.
+    /// The read-set check happens before publication; a stale task rolls back
+    /// only its own segment and cannot notify consumers with obsolete data.
+    pub fn publish_current(
+        &mut self,
+        task: TaskId,
+        memo: &Memo,
+        dependencies: impl IntoIterator<Item = TaskId>,
+        outcome: TaskOutcome,
+    ) -> Result<Vec<TaskWakeup>> {
+        let dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        let reads = self
+            .task(task)
+            .ok_or_else(|| paro_error::internal("unknown task publication"))?
+            .read_set;
+        let current = self
+            .read_set(reads)
+            .ok_or_else(|| paro_error::internal("task publication lost its read set"))?
+            .is_current(memo)?;
+        let intent = self
+            .task(task)
+            .and_then(|record| self.intent(record.intent))
+            .ok_or_else(|| paro_error::internal("task publication lost its intent"))?;
+        let canonical = match intent {
+            TaskIntent::Optimize { group, .. } => self.canonical_group(*group) == *group,
+            _ => true,
+        };
+        if !current || !canonical {
+            self.rollback_segment(task)?;
+            self.invalidate(task)?;
+            return Err(paro_error::internal(
+                "task publication rejected an obsolete read or group identity",
+            ));
+        }
+
+        if self.segments.contains_key(&task) {
+            self.commit_segment(task)?;
+        }
+        let ready = self.register_awaiting_after_publish(task, dependencies.clone())?;
+        if ready {
+            self.complete_current(task, memo, outcome)
+        } else {
+            let cursor = self
+                .task(task)
+                .ok_or_else(|| paro_error::internal("task publication lost its cursor"))?
+                .cursor;
+            self.task_mut(task)?.outcome = Some(TaskOutcome::Awaiting {
+                cursor,
+                dependencies: dependencies.into_boxed_slice(),
+            });
+            Ok(Vec::new())
+        }
+    }
+
     pub fn suspend(&mut self, task: TaskId, outcome: TaskOutcome) -> Result<Vec<TaskWakeup>> {
         if !matches!(
             self.state(task),
@@ -830,10 +914,12 @@ impl TaskRegistry {
         ) {
             return Err(paro_error::internal("task is not runnable for suspension"));
         }
+        self.rollback_segment(task)?;
         self.finish(task, TaskState::Suspended, Some(outcome))
     }
 
     pub fn fail(&mut self, task: TaskId, detail: impl Into<String>) -> Result<Vec<TaskWakeup>> {
+        self.rollback_segment(task)?;
         self.finish(
             task,
             TaskState::Failed,
@@ -857,6 +943,7 @@ impl TaskRegistry {
         if self.task(task).is_none() {
             return Err(paro_error::internal("unknown task invalidation"));
         }
+        self.rollback_segment(task)?;
         let cursor = self
             .task(task)
             .map(|record| record.cursor)
@@ -1212,6 +1299,43 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_progress_reopens_the_same_task_for_continuation() {
+        let mut registry = TaskRegistry::default();
+        let intent = TaskIntent::Discover {
+            expression: LogicalExprId::new(1),
+            rule: RuleId::new(2),
+        };
+        let TaskRequest::Leader(task) = registry.request(intent.clone(), ReadSet::empty()).unwrap()
+        else {
+            panic!("request did not lead")
+        };
+        registry.start(task).unwrap();
+        let cursor = registry
+            .advance_cursor(
+                task,
+                Cursor {
+                    position: 3,
+                    complete: false,
+                },
+            )
+            .unwrap();
+        registry
+            .complete(task, TaskOutcome::Progress { cursor })
+            .unwrap();
+
+        let continuation = registry.request(intent, ReadSet::empty()).unwrap();
+        assert!(matches!(continuation, TaskRequest::Leader(next) if next == task));
+        assert_eq!(registry.state(task), Some(TaskState::Runnable));
+        assert_eq!(
+            registry.cursor(cursor),
+            Some(Cursor {
+                position: 3,
+                complete: false
+            })
+        );
+    }
+
+    #[test]
     fn dependency_completion_wakes_waiter_without_lost_wakeup() {
         let mut registry = TaskRegistry::default();
         let make = |registry: &mut TaskRegistry, expression| match registry
@@ -1282,6 +1406,73 @@ mod tests {
     }
 
     #[test]
+    fn publication_commits_local_segment_before_waiting_and_wakes_parent() {
+        let mut registry = TaskRegistry::default();
+        let parent = match registry
+            .request(
+                TaskIntent::Discover {
+                    expression: LogicalExprId::new(0),
+                    rule: RuleId::new(1),
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        let child = match registry
+            .request(
+                TaskIntent::Discover {
+                    expression: LogicalExprId::new(1),
+                    rule: RuleId::new(1),
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        registry.start(parent).unwrap();
+        registry.start(child).unwrap();
+        registry.reserve_once(parent, 0, 4).unwrap();
+        let object = registry.allocate_object(parent).unwrap();
+        let memo = Memo::new(Default::default());
+        let wakeups = registry
+            .publish_current(
+                parent,
+                &memo,
+                [child],
+                TaskOutcome::Progress {
+                    cursor: CursorId::new(0),
+                },
+            )
+            .unwrap();
+        assert!(wakeups.is_empty());
+        assert_eq!(registry.state(parent), Some(TaskState::Awaiting));
+        assert_eq!(registry.published_owner(object), Some(parent));
+        assert_eq!(registry.reserved_units(), 0);
+        assert_eq!(registry.committed_units(), 4);
+
+        let wakeups = registry.complete(child, TaskOutcome::Infeasible).unwrap();
+        assert!(wakeups.iter().any(|wakeup| wakeup.task == parent));
+        assert_eq!(registry.state(parent), Some(TaskState::Runnable));
+        registry.start(parent).unwrap();
+        registry
+            .publish_current(
+                parent,
+                &memo,
+                [],
+                TaskOutcome::Progress {
+                    cursor: CursorId::new(0),
+                },
+            )
+            .unwrap();
+        assert_eq!(registry.state(parent), Some(TaskState::Completed));
+    }
+
+    #[test]
     fn local_rollback_does_not_delete_another_task_publication() {
         let (mut registry, a) = registry_with_task();
         let b = match registry
@@ -1333,6 +1524,34 @@ mod tests {
         assert_eq!(registry.canonical_group(GroupId::new(4)), GroupId::new(2));
         assert_eq!(registry.state(task), Some(TaskState::Invalidated));
         assert_eq!(registry.profile().invalidated, 1);
+    }
+
+    #[test]
+    fn invalidation_rolls_back_only_the_redirected_task_segment() {
+        let mut registry = TaskRegistry::default();
+        let task = match registry
+            .request(
+                TaskIntent::Optimize {
+                    group: GroupId::new(4),
+                    goal: goal(),
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        registry.start(task).unwrap();
+        registry.reserve_once(task, 0, 2).unwrap();
+        let object = registry.allocate_object(task).unwrap();
+        registry
+            .redirect_group(GroupId::new(4), GroupId::new(2))
+            .unwrap();
+        assert_eq!(registry.state(task), Some(TaskState::Invalidated));
+        assert!(!registry.is_published(object));
+        assert_eq!(registry.reserved_units(), 0);
+        assert_eq!(registry.committed_units(), 0);
     }
 
     #[test]
