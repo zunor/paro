@@ -192,6 +192,25 @@ the same stable diagnostic witness as before. Budget limits and charged units
 are unchanged. Independent scalar accounting covers mixed reservations,
 execution, refunds, zero/max limits, merge cycles and rollback.
 
+At `5b7ed48e`, 1,045 optimizer tests and strict workspace/all-target Clippy
+pass. Five normal processes give median EXPLAIN **806.858 ms**, optimizer
+802.242 ms and RSS 262,750,208 bytes. Every search counter remains identical
+to `76e475ff`. This is a reduction in bookkeeping, not a smaller search.
+
+## Incremental subscription membership
+
+Refreshing a task's read cursors previously removed every reverse-index
+membership and reinserted all of them, even if only the revision changed.
+The engine now computes the sorted group-set delta and mutates only added or
+removed memberships. Facts-only and frontier cursors for the same group still
+produce one subscription. The wake-up path borrows its existing subscriber set
+instead of copying it. Application fact observations update a sorted unique
+cursor vector in place, preserving an earlier frontier read on later
+facts-only accesses. A 16,384-case set-difference oracle includes duplicate
+group cursors with changed revisions; real engine tests retain negative-match
+and application-only wake-ups. No dependency is removed merely because the
+latest binding did not read it.
+
 ## Immutable source-response payloads
 
 Candidates now share immutable source-work snapshots. Ordinary parent

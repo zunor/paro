@@ -1757,7 +1757,7 @@ fn later_binding_observations_keep_all_application_fact_subscriptions() {
     let fact_read = PatternRead::from_group(engine.memo(), evidence).unwrap();
     engine
         .transformation_fact_observations
-        .insert(task, Box::new([fact_read]));
+        .insert(task, vec![fact_read]);
     engine
         .seed_transformation_observation(task, &[root_read, fact_read])
         .unwrap();
@@ -1772,6 +1772,93 @@ fn later_binding_observations_keep_all_application_fact_subscriptions() {
         .logical_properties
         .maximum_cardinality = Some(1);
     assert!(!engine.transformation_observation_is_current(task).unwrap());
+}
+
+#[test]
+fn subscription_delta_matches_an_independent_set_difference() {
+    fn reads(mask: u32, revision: u64) -> Vec<PatternRead> {
+        let mut result = Vec::new();
+        for group in 0..7 {
+            if mask & (1 << group) == 0 {
+                continue;
+            }
+            // A single subscription can carry both a facts-only and a
+            // frontier read; revision changes must not rewrite membership.
+            for frontier in [None, Some(revision)] {
+                result.push(PatternRead {
+                    group: GroupId(group),
+                    logical_frontier_revision: frontier,
+                    logical_fact_fingerprint: Fingerprint(revision.into()),
+                    statistics_snapshot_fingerprint: Fingerprint(u128::from(revision) + 1),
+                });
+            }
+        }
+        result
+    }
+    for before in 0..128 {
+        for after in 0..128 {
+            let left = reads(before, 10);
+            let right = reads(after, 20);
+            let a = left.iter().map(|read| read.group).collect::<BTreeSet<_>>();
+            let b = right.iter().map(|read| read.group).collect::<BTreeSet<_>>();
+            let expected = a
+                .difference(&b)
+                .map(|group| (*group, false))
+                .chain(b.difference(&a).map(|group| (*group, true)))
+                .collect::<BTreeSet<_>>();
+            let mut actual = Vec::new();
+            visit_read_group_delta(&left, &right, |group, subscribe| {
+                actual.push((group, subscribe))
+            });
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "no duplicate membership mutations"
+            );
+            assert_eq!(actual.into_iter().collect::<BTreeSet<_>>(), expected);
+        }
+    }
+}
+
+#[test]
+fn repeated_fact_cursors_update_in_place_without_downgrading_frontier_reads() {
+    let (mut engine, root, _) = engine_with_budget(super::super::budget::SearchBudget::default());
+    let task = TransformationTaskId {
+        group: root,
+        expression: engine.memo().group(root).unwrap().logical_exprs()[0],
+        rule: RuleId(904),
+    };
+    let frontier = PatternRead::from_group(engine.memo(), root).unwrap();
+    let mut observations = BTreeMap::new();
+    CascadesEngine::merge_transformation_fact_reads(
+        engine.memo(),
+        &mut observations,
+        task,
+        &[frontier],
+    )
+    .unwrap();
+    let allocation = observations[&task].as_ptr();
+    for maximum in 0..100 {
+        engine
+            .memo_mut()
+            .group_mut(root)
+            .unwrap()
+            .logical_properties
+            .maximum_cardinality = Some(maximum);
+        let facts = PatternRead::facts_from_group(engine.memo(), root).unwrap();
+        CascadesEngine::merge_transformation_fact_reads(
+            engine.memo(),
+            &mut observations,
+            task,
+            &[facts],
+        )
+        .unwrap();
+        assert_eq!(
+            observations[&task].as_slice(),
+            &[PatternRead::from_group(engine.memo(), root).unwrap()]
+        );
+        assert_eq!(observations[&task].as_ptr(), allocation);
+    }
 }
 
 #[test]

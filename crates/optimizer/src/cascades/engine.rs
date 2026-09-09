@@ -192,7 +192,9 @@ pub struct CascadesEngine {
     /// A task that declined a match is recorded as well: a later child
     /// alternative may make that same pattern applicable.
     transformation_observations: BTreeMap<TransformationTaskId, Box<[PatternRead]>>,
-    transformation_fact_observations: BTreeMap<TransformationTaskId, Box<[PatternRead]>>,
+    /// Sorted unique group cursors, updated in place when another binding
+    /// reads a previously known fact. Do not reconstruct a tree map per read.
+    transformation_fact_observations: BTreeMap<TransformationTaskId, Vec<PatternRead>>,
     /// Collision-safe exact bindings already evaluated under these facts.
     /// Discovery can wake a task without invalidating its earlier bindings.
     transformation_applications: BindingApplications,
@@ -1238,8 +1240,7 @@ impl CascadesEngine {
             .transformation_subscribers
             .get(&group)
             .into_iter()
-            .flat_map(|subscribers| subscribers.iter().copied())
-            .collect::<BTreeSet<_>>();
+            .flat_map(|subscribers| subscribers.iter().copied());
         for subscriber in subscribers {
             let expression_ref =
                 self.memo
@@ -1333,19 +1334,24 @@ impl CascadesEngine {
         }
         dependencies.sort_unstable();
         dependencies.dedup();
-        if let Some(previous) = self.transformation_observations.get(&task) {
-            for read in previous {
-                if let Some(subscribers) = self.transformation_subscribers.get_mut(&read.group) {
-                    subscribers.remove(&task);
-                }
+        let previous = self
+            .transformation_observations
+            .get(&task)
+            .map_or(&[][..], AsRef::as_ref);
+        // A revision change updates the observation, not the subscription.
+        // Only added/removed group memberships mutate the reverse index.
+        // Shared discovery/application reads can contain several cursors for
+        // one group; the subscription is still a single membership.
+        visit_read_group_delta(previous, &dependencies, |group, subscribe| {
+            if subscribe {
+                self.transformation_subscribers
+                    .entry(group)
+                    .or_default()
+                    .insert(task);
+            } else if let Some(subscribers) = self.transformation_subscribers.get_mut(&group) {
+                subscribers.remove(&task);
             }
-        }
-        for read in dependencies.iter().copied() {
-            self.transformation_subscribers
-                .entry(read.group)
-                .or_default()
-                .insert(task);
-        }
+        });
         self.transformation_observations
             .insert(task, dependencies.into_boxed_slice());
         Ok(())
@@ -1353,33 +1359,28 @@ impl CascadesEngine {
 
     fn merge_transformation_fact_reads(
         memo: &Memo,
-        observations: &mut BTreeMap<TransformationTaskId, Box<[PatternRead]>>,
+        observations: &mut BTreeMap<TransformationTaskId, Vec<PatternRead>>,
         task: TransformationTaskId,
         fact_reads: &[PatternRead],
     ) -> Result<()> {
         if fact_reads.is_empty() {
             return Ok(());
         }
-        let mut reads = observations
-            .get(&task)
-            .into_iter()
-            .flat_map(|reads| reads.iter())
-            .map(|read| (read.group, *read))
-            .collect::<BTreeMap<_, _>>();
+        let reads = observations.entry(task).or_default();
         for read in fact_reads.iter().copied() {
             // A facts-only access must not downgrade an earlier frontier
             // access made by another binding of this task.
-            let read = if reads
-                .get(&read.group)
-                .is_some_and(|previous| previous.logical_frontier_revision.is_some())
-            {
-                PatternRead::from_group(memo, read.group)?
-            } else {
-                read
-            };
-            reads.insert(read.group, read);
+            match reads.binary_search_by_key(&read.group, |previous| previous.group) {
+                Ok(index) => {
+                    reads[index] = if reads[index].logical_frontier_revision.is_some() {
+                        PatternRead::from_group(memo, read.group)?
+                    } else {
+                        read
+                    };
+                }
+                Err(index) => reads.insert(index, read),
+            }
         }
-        observations.insert(task, reads.into_values().collect());
         Ok(())
     }
 
@@ -2819,6 +2820,39 @@ fn retained_source_cost(
         .min()
         .unwrap_or(SCALE as u32);
     base_cost.retain_work(expected.min(upper), upper)
+}
+
+/// Set difference over sorted group cursors, without allocating temporary
+/// group sets. The same group may have several distinct revision/facet reads.
+fn visit_read_group_delta(
+    previous: &[PatternRead],
+    next: &[PatternRead],
+    mut visit: impl FnMut(GroupId, bool),
+) {
+    debug_assert!(previous
+        .windows(2)
+        .all(|pair| pair[0].group <= pair[1].group));
+    debug_assert!(next.windows(2).all(|pair| pair[0].group <= pair[1].group));
+    let (mut left, mut right) = (0, 0);
+    while left < previous.len() || right < next.len() {
+        let before = previous.get(left).map(|read| read.group);
+        let after = next.get(right).map(|read| read.group);
+        let group = match (before, after) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        if before != after {
+            visit(group, after == Some(group));
+        }
+        while previous.get(left).is_some_and(|read| read.group == group) {
+            left += 1;
+        }
+        while next.get(right).is_some_and(|read| read.group == group) {
+            right += 1;
+        }
+    }
 }
 
 fn transformation_dependency_fingerprint(dependencies: &[PatternRead]) -> Fingerprint {
