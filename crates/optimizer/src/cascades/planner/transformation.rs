@@ -12,7 +12,8 @@ pub(super) mod settlement;
 mod staging;
 
 use staging::{
-    stage_transformed_expression, StagingRegionRequirements, StagingRequest, StagingTarget,
+    stage_transformed_expression, StagingInput, StagingRegionRequirements, StagingRequest,
+    StagingTarget,
 };
 
 fn settle_with_session_arena(
@@ -750,30 +751,18 @@ impl TransformationRule for PlannerTransformationRule {
                     } = prepared;
                     let (plan, column_stats, column_stat_scopes) = match plan {
                         PreparedPlan::Native { plan, column_stats } => {
-                            let plan = state.staging_arena.import(plan)?;
-                            let view = state.staging_arena.plan(plan)?;
-                            group_hole_guard.validate_arena(&view)?;
-                            if environment.verify_enabled {
-                                crate::verify::verify_arena_plan(&view, || {
-                                    environment.session.cancellation.check()
-                                })?;
-                            }
-                            let plan = semantic_plan::freeze_arena_output_layout(
-                                plan,
-                                &source_output_columns,
-                                state,
-                            )?;
-                            (plan, column_stats, HashMap::new())
+                            group_hole_guard.validate_owned(&plan)?;
+                            (StagingInput::Native(plan), column_stats, HashMap::new())
                         }
                         PreparedPlan::Settled {
                             plan,
                             column_stats,
                             scopes,
-                        } => (plan, column_stats, scopes),
+                        } => (StagingInput::Arena(plan), column_stats, scopes),
                     };
                     let Some(expression) = stage_transformed_expression(
                         StagingRequest {
-                            plan,
+                            input: plan,
                             input_facts: facts.clone(),
                             column_stats,
                             column_stat_scopes,
@@ -1347,6 +1336,38 @@ impl GroupHoleTransportGuard {
         if seen.len() != self.templates.len() {
             return Err(paro_error::internal(
                 "settlement removed a protected Memo group hole",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_owned(&self, plan: &OwnedLogicalPlan) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        plan.try_visit_pre_order(|node| {
+            let LogicalOperator::BoundReference(reference) = &node.operator else {
+                return Ok(());
+            };
+            let template = self.templates.get(&reference.reference_id).ok_or_else(|| {
+                paro_error::internal("native staging introduced an unregistered Memo group hole")
+            })?;
+            if !seen.insert(reference.reference_id) {
+                return Err(paro_error::internal(
+                    "native staging duplicated an opaque Memo group-hole occurrence",
+                ));
+            }
+            if reference.bindings != template.bindings
+                || reference.types() != template.types
+                || reference.facts != template.facts
+            {
+                return Err(paro_error::internal(
+                    "native transformation changed an immutable Memo boundary",
+                ));
+            }
+            Ok(())
+        })?;
+        if seen.len() != self.templates.len() {
+            return Err(paro_error::internal(
+                "native transformation removed a protected Memo group hole",
             ));
         }
         Ok(())

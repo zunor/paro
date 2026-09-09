@@ -13,8 +13,17 @@ pub(super) struct StagedEquivalent {
     pub(super) cardinality: GroupCardinality,
 }
 
+pub(super) enum StagingInput {
+    /// A settled occurrence already owned by the session arena.
+    Arena(paro_planner::plan::arena::PlanIndex),
+    /// A closed native shell whose leaves are immutable Memo group holes.
+    /// Keeping this input owned avoids importing the shell into a second
+    /// arena merely to detach it again during Memo publication.
+    Native(OwnedLogicalPlan),
+}
+
 pub(super) struct StagingRequest {
-    pub(super) plan: paro_planner::plan::arena::PlanIndex,
+    pub(super) input: StagingInput,
     pub(super) input_facts: boundary::BoundarySnapshot,
     pub(super) column_stats: SharedColumnStatistics,
     pub(super) column_stat_scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
@@ -47,7 +56,7 @@ pub(super) fn stage_transformed_expression(
     state: &mut PlannerTransformState,
 ) -> Result<Option<StagedEquivalent>> {
     let StagingRequest {
-        plan,
+        input,
         input_facts,
         column_stats,
         column_stat_scopes,
@@ -745,9 +754,16 @@ pub(super) fn stage_transformed_expression(
         )))
     }
 
-    let plan_view = state.staging_arena.plan(plan)?;
-    let provider_roots =
-        crate::search::optimizer::SearchOptimizer::candidate_arena_roots(&plan_view)?;
+    let provider_roots = match &input {
+        StagingInput::Arena(plan) => {
+            let plan_view = state.staging_arena.plan(*plan)?;
+            crate::search::optimizer::SearchOptimizer::candidate_arena_roots(&plan_view)?
+        }
+        // A native shell has no real Get/scan leaf. Search providers require
+        // an owned scan occurrence and therefore cannot be produced from this
+        // direct GroupRef path; such rules remain on the settled path.
+        StagingInput::Native(_) => Vec::new(),
+    };
     let search_context = if !provider_roots.is_empty() {
         let session_context = state
             .session
@@ -806,90 +822,219 @@ pub(super) fn stage_transformed_expression(
             facts: input_facts,
             search_candidates,
         };
-        use paro_planner::plan::arena::{LogicalPlanNode, PlanIndex};
-        let root_index = plan;
-        session.state.staging_arena.get(root_index)?;
-        let mut completed = BTreeMap::<PlanIndex, (LogicalPlanNode<()>, NodeState)>::new();
-        let mut root_result = None;
-        let Some(post_order) = session
-            .state
-            .staging_arena
-            .post_order_controlled(root_index, || session.memo.control().checkpoint())?
-        else {
-            return Ok(None);
-        };
-        for index in post_order {
-            if !session.memo.control().checkpoint()? {
-                return Ok(None);
-            }
-            if let Some(statement) = &session.state.session {
-                statement.cancellation.check()?;
-            }
-            let node = session.state.staging_arena.get(index)?.clone();
-            let is_root = index == root_index;
-            let mut child_states = Vec::new();
-            let operator = node.operator.try_map_child_links(&mut |child| {
-                let (transport, state) = completed
-                    .get(&child)
-                    .ok_or_else(|| paro_error::internal("staging lost an arena input"))?;
-                child_states.push(state.clone());
-                transport.instantiate(transport.id, []).map(Box::new)
-            })?;
-            let plan = OwnedLogicalPlan {
-                id: node.id,
-                stats: node.stats,
-                operator,
-            };
-            let Some(result) = stage_node(
-                &mut session,
-                NodeStagingRequest {
-                    plan,
-                    target: is_root.then_some(target),
-                    required_region_facet: is_root.then_some(preserved_region_facet).flatten(),
-                    inherited_runtime_filter_facet: is_root
-                        .then_some(inherited_runtime_filter_facet)
-                        .flatten(),
-                    node_context: if is_root {
-                        input_context
+        let (root, staged) = match input {
+            StagingInput::Arena(root_index) => {
+                use paro_planner::plan::arena::{LogicalPlanNode, PlanIndex};
+                session.state.staging_arena.get(root_index)?;
+                let mut completed = BTreeMap::<PlanIndex, (LogicalPlanNode<()>, NodeState)>::new();
+                let mut root_result = None;
+                let Some(post_order) = session
+                    .state
+                    .staging_arena
+                    .post_order_controlled(root_index, || session.memo.control().checkpoint())?
+                else {
+                    return Ok(None);
+                };
+                for index in post_order {
+                    if !session.memo.control().checkpoint()? {
+                        return Ok(None);
+                    }
+                    if let Some(statement) = &session.state.session {
+                        statement.cancellation.check()?;
+                    }
+                    let node = session.state.staging_arena.get(index)?.clone();
+                    let is_root = index == root_index;
+                    let mut child_states = Vec::new();
+                    let operator = node.operator.try_map_child_links(&mut |child| {
+                        let (transport, state) = completed
+                            .get(&child)
+                            .ok_or_else(|| paro_error::internal("staging lost an arena input"))?;
+                        child_states.push(state.clone());
+                        transport.instantiate(transport.id, []).map(Box::new)
+                    })?;
+                    let plan = OwnedLogicalPlan {
+                        id: node.id,
+                        stats: node.stats,
+                        operator,
+                    };
+                    let Some(result) = stage_node(
+                        &mut session,
+                        NodeStagingRequest {
+                            plan,
+                            target: is_root.then_some(target),
+                            required_region_facet: is_root
+                                .then_some(preserved_region_facet)
+                                .flatten(),
+                            inherited_runtime_filter_facet: is_root
+                                .then_some(inherited_runtime_filter_facet)
+                                .flatten(),
+                            node_context: if is_root {
+                                input_context
+                            } else {
+                                child_context
+                            },
+                            target_child_context: is_root.then_some(child_context),
+                            refined_cardinality_kind: is_root
+                                .then_some(refined_cardinality_kind)
+                                .flatten(),
+                        },
+                        child_states,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let (mut plan, node, staged) = result;
+                    if !is_root && !matches!(plan.operator, LogicalOperator::BoundReference(_)) {
+                        session
+                            .facts
+                            .settle_group(session.memo, session.state, node.group)?;
+                        let layout = Arc::new(plan.output_layout());
+                        let facts = session.facts.transport(
+                            session.memo,
+                            session.state,
+                            node.group,
+                            &layout,
+                        )?;
+                        let (types, bindings) = Arc::unwrap_or_clone(layout).into_parts();
+                        let reference = paro_planner::operator::BoundReference::new(
+                            paro_planner::operator::BoundReferenceId::node_occurrence(plan.id.0),
+                            bindings,
+                            types,
+                        )
+                        .with_facts(facts)?;
+                        plan.operator = LogicalOperator::BoundReference(reference);
+                    }
+                    if is_root {
+                        root_result = Some((node, staged));
                     } else {
-                        child_context
+                        debug_assert!(staged.is_none());
+                        completed.insert(index, (LogicalPlanNode::from_shell(plan), node));
+                    }
+                }
+                root_result.ok_or_else(|| paro_error::internal("staging has no completed root"))?
+            }
+            StagingInput::Native(native_plan) => {
+                enum Frame {
+                    Enter(OwnedLogicalPlan),
+                    Exit {
+                        skeleton: paro_planner::plan::arena::LogicalPlanNode<()>,
+                        arity: usize,
+                        is_root: bool,
                     },
-                    target_child_context: is_root.then_some(child_context),
-                    refined_cardinality_kind: is_root.then_some(refined_cardinality_kind).flatten(),
-                },
-                child_states,
-            )?
-            else {
-                return Ok(None);
-            };
-            let (mut plan, node, staged) = result;
-            if !is_root && !matches!(plan.operator, LogicalOperator::BoundReference(_)) {
-                session
-                    .facts
-                    .settle_group(session.memo, session.state, node.group)?;
-                let layout = Arc::new(plan.output_layout());
-                let facts =
-                    session
-                        .facts
-                        .transport(session.memo, session.state, node.group, &layout)?;
-                let (types, bindings) = Arc::unwrap_or_clone(layout).into_parts();
-                let reference = paro_planner::operator::BoundReference::new(
-                    paro_planner::operator::BoundReferenceId::node_occurrence(plan.id.0),
-                    bindings,
-                    types,
-                )
-                .with_facts(facts)?;
-                plan.operator = LogicalOperator::BoundReference(reference);
+                }
+
+                let mut node_count = 0usize;
+                native_plan.try_visit_pre_order(|_| {
+                    node_count = node_count.saturating_add(1);
+                    Ok(())
+                })?;
+                if node_count == 0 {
+                    return Err(paro_error::internal("native staging has no root"));
+                }
+                let mut pending = vec![Frame::Enter(native_plan)];
+                let mut completed = Vec::<(OwnedLogicalPlan, NodeState)>::new();
+                let mut visited = 0usize;
+                let mut root_result = None;
+                while let Some(frame) = pending.pop() {
+                    match frame {
+                        Frame::Enter(plan) => {
+                            let (skeleton, children) =
+                                paro_planner::plan::arena::LogicalPlanNode::detach(plan);
+                            let is_root = visited == 0 && pending.is_empty();
+                            pending.push(Frame::Exit {
+                                skeleton,
+                                arity: children.len(),
+                                is_root,
+                            });
+                            pending.extend(
+                                children.into_iter().rev().map(|child| Frame::Enter(*child)),
+                            );
+                        }
+                        Frame::Exit {
+                            skeleton,
+                            arity,
+                            is_root,
+                        } => {
+                            if !session.memo.control().checkpoint()? {
+                                return Ok(None);
+                            }
+                            if let Some(statement) = &session.state.session {
+                                statement.cancellation.check()?;
+                            }
+                            let start = completed.len().checked_sub(arity).ok_or_else(|| {
+                                paro_error::internal("native staging lost an input")
+                            })?;
+                            let children = completed.drain(start..).collect::<Vec<_>>();
+                            let child_states = children
+                                .iter()
+                                .map(|(_, state)| state.clone())
+                                .collect::<Vec<_>>();
+                            let plan = skeleton
+                                .assemble(children.into_iter().map(|(plan, _)| Box::new(plan)))?;
+                            let Some((mut plan, node, staged)) = stage_node(
+                                &mut session,
+                                NodeStagingRequest {
+                                    plan,
+                                    target: is_root.then_some(target),
+                                    required_region_facet: is_root
+                                        .then_some(preserved_region_facet)
+                                        .flatten(),
+                                    inherited_runtime_filter_facet: is_root
+                                        .then_some(inherited_runtime_filter_facet)
+                                        .flatten(),
+                                    node_context: if is_root {
+                                        input_context
+                                    } else {
+                                        child_context
+                                    },
+                                    target_child_context: is_root.then_some(child_context),
+                                    refined_cardinality_kind: is_root
+                                        .then_some(refined_cardinality_kind)
+                                        .flatten(),
+                                },
+                                child_states,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            if !is_root
+                                && !matches!(plan.operator, LogicalOperator::BoundReference(_))
+                            {
+                                session.facts.settle_group(
+                                    session.memo,
+                                    session.state,
+                                    node.group,
+                                )?;
+                                let layout = Arc::new(plan.output_layout());
+                                let facts = session.facts.transport(
+                                    session.memo,
+                                    session.state,
+                                    node.group,
+                                    &layout,
+                                )?;
+                                let (types, bindings) = Arc::unwrap_or_clone(layout).into_parts();
+                                let reference = paro_planner::operator::BoundReference::new(
+                                    paro_planner::operator::BoundReferenceId::node_occurrence(
+                                        plan.id.0,
+                                    ),
+                                    bindings,
+                                    types,
+                                )
+                                .with_facts(facts)?;
+                                plan.operator = LogicalOperator::BoundReference(reference);
+                            }
+                            visited = visited.saturating_add(1);
+                            if is_root {
+                                root_result = Some((node, staged));
+                            } else {
+                                debug_assert!(staged.is_none());
+                                completed.push((plan, node));
+                            }
+                        }
+                    }
+                }
+                root_result.ok_or_else(|| paro_error::internal("native staging has no root"))?
             }
-            if is_root {
-                root_result = Some((node, staged));
-            } else {
-                debug_assert!(staged.is_none());
-                completed.insert(index, (LogicalPlanNode::from_shell(plan), node));
-            }
-        }
-        let Some((root, staged)) = root_result else {
-            return Err(paro_error::internal("staging has no completed root"));
         };
         if !session.nested_group_holes.is_empty() {
             return Err(paro_error::internal(
@@ -1063,10 +1208,12 @@ mod tests {
         let staged = stage_transformed_expression(
             StagingRequest {
                 input_facts: boundary::BoundarySnapshot::default(),
-                plan: state
-                    .staging_arena
-                    .import(union(project(2), project(3)))
-                    .unwrap(),
+                input: StagingInput::Arena(
+                    state
+                        .staging_arena
+                        .import(union(project(2), project(3)))
+                        .unwrap(),
+                ),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),
                 target: StagingTarget {
@@ -1118,7 +1265,7 @@ mod tests {
         let plan = state.staging_arena.import(make_plan()).unwrap();
         let staged = stage_transformed_expression(
             StagingRequest {
-                plan,
+                input: StagingInput::Arena(plan),
                 input_facts: boundary::BoundarySnapshot::default(),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),
@@ -1155,6 +1302,66 @@ mod tests {
             panic!("expected canonical filter template")
         };
         assert!(template.projection_map.is_all());
+    }
+
+    #[test]
+    fn native_shell_stages_without_importing_a_second_arena() {
+        use paro_planner::operator::{BoundReference, Filter};
+
+        let make_plan = || Filter::new(test_base_get(0, 70_101, "native_source", 10), vec![]);
+        let mut input = MemoBuilder::build(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(make_plan())),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let root = input.root;
+        let root_expression = input.memo.group(root).unwrap().logical_exprs()[0];
+        let source = input
+            .memo
+            .logical_expr(root_expression)
+            .unwrap()
+            .key
+            .children[0];
+        let source_plan = test_base_get(0, 70_101, "native_source", 10);
+        let bindings = source_plan.get_column_bindings();
+        let types = source_plan.types();
+        let reference_id = paro_planner::operator::BoundReferenceId::group_hole(70_101);
+        let reference = BoundReference::new(reference_id, bindings, types);
+        let native = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference)),
+            vec![],
+        )));
+        let mut state = input.planner_state.write().unwrap();
+        state.session = Some(TestStatementContextBuilder::minimal().build());
+        let arena_len = state.staging_arena.len();
+        let staged = stage_transformed_expression(
+            StagingRequest {
+                input: StagingInput::Native(native),
+                input_facts: boundary::BoundarySnapshot::default(),
+                column_stats: Arc::new(HashMap::new()),
+                column_stat_scopes: HashMap::new(),
+                target: StagingTarget {
+                    group: root,
+                    rule: RuleId(999),
+                    budget_class: TransformationBudgetClass::Local,
+                    input_context: OptimizationContextId(0),
+                    child_context: OptimizationContextId(0),
+                    refined_cardinality_kind: None,
+                },
+                regions: StagingRegionRequirements {
+                    preserved_facet: None,
+                    extended_required_facets: Box::new([]),
+                    inherited_runtime_filter_facet: None,
+                },
+                nested_group_holes: BTreeMap::from([(reference_id, source)]),
+            },
+            &mut input.memo,
+            &mut state,
+        )
+        .unwrap();
+        assert!(staged.is_some());
+        assert_eq!(state.staging_arena.len(), arena_len);
     }
 
     #[test]
@@ -1198,7 +1405,9 @@ mod tests {
                     memo.create_group(schema, properties, cardinality);
                     stage_transformed_expression(
                         StagingRequest {
-                            plan: state.staging_arena.import(staged_plan).unwrap(),
+                            input: StagingInput::Arena(
+                                state.staging_arena.import(staged_plan).unwrap(),
+                            ),
                             input_facts: boundary::BoundarySnapshot::default(),
                             column_stats: Arc::new(HashMap::new()),
                             column_stat_scopes: HashMap::new(),
@@ -1266,7 +1475,9 @@ mod tests {
                 |memo, state| {
                     stage_transformed_expression(
                         StagingRequest {
-                            plan: state.staging_arena.import(transformed).unwrap(),
+                            input: StagingInput::Arena(
+                                state.staging_arena.import(transformed).unwrap(),
+                            ),
                             input_facts: boundary::BoundarySnapshot::default(),
                             column_stats: Arc::new(HashMap::new()),
                             column_stat_scopes: HashMap::new(),
