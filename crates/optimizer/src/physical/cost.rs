@@ -682,6 +682,27 @@ impl SearchCost {
     /// rounding, or projection of a ranking/feasibility axis is used here.
     /// Source response is a separate, goal-dependent contract checked by Memo.
     pub(crate) fn continuation_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.compare_continuation(other, None)
+    }
+
+    /// A goal propagates one objective to every child. Reporting-only resource
+    /// vectors do not become independent ranking objectives. Retain work/span
+    /// separately for latency (a parent can reverse their local max), and keep
+    /// every memory/admission coordinate regardless of objective.
+    pub(crate) fn continuation_cmp_for(
+        &self,
+        other: &Self,
+        objective: super::objective::ObjectiveProfile,
+    ) -> Option<Ordering> {
+        self.compare_continuation(other, Some(objective))
+    }
+
+    fn compare_continuation(
+        &self,
+        other: &Self,
+        objective: Option<super::objective::ObjectiveProfile>,
+    ) -> Option<Ordering> {
+        use super::objective::ObjectiveProfile;
         if self.max_parallel_tasks != other.max_parallel_tasks
             || self.output_pipeline_tasks != other.output_pipeline_tasks
             || self.external_workers != other.external_workers
@@ -703,16 +724,33 @@ impl SearchCost {
                 observe!(self.$field$(.$member)*.partial_cmp(&other.$field$(.$member)*));
             };
         }
-        axis!(score.range.expected);
+        if matches!(
+            objective,
+            None | Some(ObjectiveProfile::Latency | ObjectiveProfile::Throughput)
+        ) {
+            axis!(score.range.expected);
+        }
         axis!(score.risk_adjusted);
-        axis!(score.range.upper);
-        axis!(work_latency.expected);
-        axis!(work_latency.upper);
-        axis!(critical_path.expected);
-        axis!(critical_path.upper);
+        if matches!(objective, None | Some(ObjectiveProfile::Robustness)) {
+            axis!(score.range.upper);
+        }
+        if matches!(objective, None | Some(ObjectiveProfile::Latency)) {
+            axis!(work_latency.expected);
+            axis!(critical_path.expected);
+        }
+        if objective.is_none() {
+            axis!(work_latency.upper);
+            axis!(critical_path.upper);
+        }
         axis!(non_revocable_memory_upper);
         axis!(minimum_memory_bytes);
-        axis!(revocable_memory_target);
+        // The elastic delta is relative to a candidate-specific floor. Two
+        // candidates with the same absolute operating point do not trade off
+        // memory merely because one proves a smaller non-revocable floor.
+        observe!(Some(
+            self.preferred_memory_bytes()
+                .cmp(&other.preferred_memory_bytes())
+        ));
         axis!(peak_memory_upper);
         observe!(Some(
             self.memory_completion
@@ -720,19 +758,24 @@ impl SearchCost {
         ));
         axis!(spill_bytes_expected);
         axis!(external_worker_slots_upper);
-        for (left, right) in self
-            .resources_expected
-            .iter()
-            .zip(&other.resources_expected)
-        {
-            observe!(left.partial_cmp(right));
-        }
-        for (left, right) in self
-            .resources_risk_upper
-            .iter()
-            .zip(&other.resources_risk_upper)
-        {
-            observe!(left.partial_cmp(right));
+        if objective.is_none() {
+            for (left, right) in self
+                .resources_expected
+                .iter()
+                .zip(&other.resources_expected)
+            {
+                observe!(left.partial_cmp(right));
+            }
+            for (left, right) in self
+                .resources_risk_upper
+                .iter()
+                .zip(&other.resources_risk_upper)
+            {
+                observe!(left.partial_cmp(right));
+            }
+        } else if objective == Some(ObjectiveProfile::Throughput) {
+            observe!(self.resources_expected[ResourceDimension::Cpu as usize]
+                .partial_cmp(&other.resources_expected[ResourceDimension::Cpu as usize]));
         }
         Some(result)
     }
@@ -745,6 +788,114 @@ const _: () = {
 #[cfg(test)]
 mod memory_tests {
     use super::*;
+
+    #[test]
+    fn goal_pruning_is_monotone_under_independently_enumerated_continuations() {
+        use super::super::objective::ObjectiveProfile;
+        let mut candidates = Vec::new();
+        for work in [10.0, 12.0] {
+            for span in [4.0, 10.0] {
+                for floor in [1, 3] {
+                    for risk in [20.0, 24.0] {
+                        candidates.push(SearchCost {
+                            score: ScoreSummary {
+                                range: CompactRange::new(0.0, work, risk).unwrap(),
+                                risk_adjusted: risk,
+                            },
+                            work_latency: CompactRange::new(0.0, work, risk).unwrap(),
+                            critical_path: CompactRange::new(0.0, span, risk).unwrap(),
+                            max_parallel_tasks: 4,
+                            output_pipeline_tasks: 4,
+                            minimum_memory_bytes: floor,
+                            non_revocable_memory_upper: floor,
+                            revocable_memory_target: 8 - floor,
+                            peak_memory_upper: 8,
+                            resources_expected: [work, 100.0 - work, 0.0, 0.0, 0.0, 0.0],
+                            resources_risk_upper: [risk, 100.0 - risk, 0.0, 0.0, 0.0, 0.0],
+                            ..SearchCost::ZERO
+                        });
+                    }
+                }
+            }
+        }
+        for objective in [
+            ObjectiveProfile::Latency,
+            ObjectiveProfile::Throughput,
+            ObjectiveProfile::Memory,
+            ObjectiveProfile::Robustness,
+        ] {
+            for left in &candidates {
+                for right in &candidates {
+                    if !matches!(
+                        left.continuation_cmp_for(right, objective),
+                        Some(Ordering::Less | Ordering::Equal)
+                    ) {
+                        continue;
+                    }
+                    for work in [0.0, 100.0] {
+                        for span in [0.0, 40.0] {
+                            for parent_floor in [0, 4] {
+                                // Independent task/footprint oracle. Do not call
+                                // SearchCost composition or ObjectiveProfile::compare.
+                                let key = |child: &SearchCost| {
+                                    let w = child.work_latency.expected + work;
+                                    let s = child.critical_path.expected + span;
+                                    let expected = child.score.range.expected + work;
+                                    let risk = child.score.risk_adjusted + work;
+                                    let peak = (child.peak_memory_upper)
+                                        .max(parent_floor + child.preferred_memory_bytes())
+                                        as f64;
+                                    match objective {
+                                        ObjectiveProfile::Latency => {
+                                            vec![(w / 4.0).max(s), w, expected, risk, peak]
+                                        }
+                                        ObjectiveProfile::Throughput => vec![
+                                            child.resources_expected[0] + work,
+                                            expected,
+                                            risk,
+                                            peak,
+                                        ],
+                                        ObjectiveProfile::Memory => vec![peak, risk, 0.0],
+                                        ObjectiveProfile::Robustness => {
+                                            vec![child.score.range.upper + work, risk, peak]
+                                        }
+                                    }
+                                };
+                                assert!(
+                                    key(left) <= key(right),
+                                    "{objective:?} left={left:?} right={right:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let low_floor = candidates[0];
+        let higher_floor = SearchCost {
+            minimum_memory_bytes: 3,
+            non_revocable_memory_upper: 3,
+            revocable_memory_target: 5,
+            ..low_floor
+        };
+        assert_eq!(
+            low_floor.continuation_cmp_for(&higher_floor, ObjectiveProfile::Latency),
+            Some(Ordering::Less)
+        );
+        let different_resources = SearchCost {
+            resources_expected: [100.0; RESOURCE_DIMS],
+            resources_risk_upper: [200.0; RESOURCE_DIMS],
+            ..low_floor
+        };
+        assert_eq!(
+            low_floor.continuation_cmp_for(&different_resources, ObjectiveProfile::Latency),
+            Some(Ordering::Equal)
+        );
+        assert_ne!(
+            low_floor.continuation_cmp_for(&different_resources, ObjectiveProfile::Throughput),
+            Some(Ordering::Equal)
+        );
+    }
 
     #[test]
     fn continuation_equivalence_ignores_only_non_ranking_lower_evidence() {

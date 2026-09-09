@@ -2238,6 +2238,87 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
 }
 
 #[test]
+fn retained_memory_matches_an_independent_phase_footprint_oracle() {
+    let mut points = Vec::new();
+    for floor in [0, 10, 20] {
+        for elastic in [0, 30] {
+            for extra_peak in [0, 10] {
+                points.push(SearchCost {
+                    non_revocable_memory_upper: floor,
+                    minimum_memory_bytes: floor,
+                    revocable_memory_target: elastic,
+                    peak_memory_upper: floor + elastic + extra_peak,
+                    ..SearchCost::ZERO
+                });
+            }
+        }
+    }
+    // Enumerate real phases independently of the summary-composition helper:
+    // each input runs alone or overlaps retained parent state, never another
+    // sibling. One elastic query pool services the largest active working set.
+    for &local in &points {
+        for &left in &points {
+            for &right in &points {
+                for mask in 0..4 {
+                    let children = [left, right];
+                    let phases = [
+                        vec![local],
+                        vec![left],
+                        vec![right],
+                        if mask & 1 != 0 {
+                            vec![local, left]
+                        } else {
+                            vec![]
+                        },
+                        if mask & 2 != 0 {
+                            vec![local, right]
+                        } else {
+                            vec![]
+                        },
+                    ];
+                    let mut floor = 0;
+                    let mut preferred = 0;
+                    let mut peak = 0;
+                    for phase in phases {
+                        let phase_floor = phase.iter().map(|p| p.minimum_memory_bytes).sum::<u64>();
+                        let elastic = phase
+                            .iter()
+                            .map(|p| p.revocable_memory_target)
+                            .max()
+                            .unwrap_or(0);
+                        floor = floor.max(phase_floor);
+                        preferred = preferred.max(phase_floor + elastic);
+                        peak = peak
+                            .max(phase.iter().map(|p| p.peak_memory_upper).max().unwrap_or(0))
+                            .max(phase_floor + elastic);
+                    }
+                    let actual = compose_candidate_cost_with_sources(
+                        local,
+                        None,
+                        &children,
+                        &[&[], &[]],
+                        CostComposition::RetainedState {
+                            overlapping_children: mask,
+                        },
+                    )
+                    .unwrap()
+                    .cost;
+                    assert_eq!(
+                        (
+                            actual.minimum_memory_bytes,
+                            actual.preferred_memory_bytes(),
+                            actual.peak_memory_upper
+                        ),
+                        (floor, preferred, peak),
+                        "local={local:?} children={children:?} mask={mask}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn sideways_filter_attributes_one_predicate_cost_across_union_sources() {
     let left_source = WorkSourceId(8);
     let right_source = WorkSourceId(9);

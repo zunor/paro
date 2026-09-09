@@ -771,7 +771,12 @@ impl WinnerFrontier {
         let old_selected = self.selected().map(|entry| entry.physical_fingerprint);
 
         if self.candidates.iter().any(|incumbent| {
-            match winner_continuation_cmp(incumbent, &winner, &self.filterable_sources) {
+            match winner_continuation_cmp(
+                incumbent,
+                &winner,
+                &self.filterable_sources,
+                goal.objective,
+            ) {
                 Some(std::cmp::Ordering::Less) => true,
                 Some(std::cmp::Ordering::Equal) => {
                     winner_tie_break(incumbent) <= winner_tie_break(&winner)
@@ -783,7 +788,12 @@ impl WinnerFrontier {
         }
 
         self.candidates.retain(|incumbent| {
-            match winner_continuation_cmp(&winner, incumbent, &self.filterable_sources) {
+            match winner_continuation_cmp(
+                &winner,
+                incumbent,
+                &self.filterable_sources,
+                goal.objective,
+            ) {
                 Some(std::cmp::Ordering::Less) => false,
                 Some(std::cmp::Ordering::Equal) => {
                     winner_tie_break(&winner) >= winner_tie_break(incumbent)
@@ -841,11 +851,12 @@ fn winner_continuation_cmp(
     left: &Winner,
     right: &Winner,
     sources: &BTreeSet<super::rules::WorkSourceId>,
+    objective: ObjectiveProfile,
 ) -> Option<std::cmp::Ordering> {
     // A physical goal declares every source an ancestor may filter. Preserve
     // that exact response frontier, but do not retain irrelevant source
     // histories forever across a closed root/sharing boundary.
-    let order = left.cost.continuation_cmp(&right.cost)?;
+    let order = left.cost.continuation_cmp_for(&right.cost, objective)?;
     source_response_equal(left, right, sources).then_some(order)
 }
 

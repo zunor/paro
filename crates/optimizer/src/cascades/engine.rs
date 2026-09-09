@@ -2707,10 +2707,32 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
         let retained_minimum = local_cost
             .minimum_memory_bytes
             .saturating_add(overlapping_minimum);
+        let overlapping_preferred = child_costs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
+            .map(|(_, child)| child.preferred_memory_bytes())
+            .max()
+            .unwrap_or(0);
+        // Price the actual overlap phase in absolute memory coordinates.
+        // Adding its floor to the *global* sequential elastic delta let an
+        // unrelated child's larger floor reduce this phase's preferred peak.
+        // Only overlapping non-revocable floors add; elastic working sets
+        // share the query pool. Both terms are monotone in floor/preferred.
+        let retained_preferred = local_cost
+            .preferred_memory_bytes()
+            .saturating_add(overlapping_minimum)
+            .max(
+                local_cost
+                    .minimum_memory_bytes
+                    .saturating_add(overlapping_preferred),
+            );
+        let sequential_preferred = cost.preferred_memory_bytes();
         cost.minimum_memory_bytes = cost.minimum_memory_bytes.max(retained_minimum);
-        cost.revocable_memory_target = cost
-            .revocable_memory_target
-            .max(local_cost.revocable_memory_target);
+        cost.revocable_memory_target = sequential_preferred
+            .max(retained_preferred)
+            .max(cost.minimum_memory_bytes)
+            .saturating_sub(cost.minimum_memory_bytes);
         // Revocable operator state is governed by one shared query pool.
         // Overlapping spillable working sets therefore compose by maximum;
         // only their non-revocable portions must be added.
@@ -2720,7 +2742,7 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
             .max(overlapping_peak)
             .max(retained_non_revocable)
             .max(retained_minimum)
-            .max(retained_minimum.saturating_add(cost.revocable_memory_target));
+            .max(cost.preferred_memory_bytes());
     }
     cost.validate()?;
     Ok(ComposedCost {

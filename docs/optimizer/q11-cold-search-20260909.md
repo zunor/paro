@@ -107,3 +107,33 @@ retained for proofs but does not create a new ranking axis. Incomparable source
 responses are still preserved. No floating tolerance or search-budget change is
 involved. A 120-permutation independent frontier oracle now includes duplicate
 operating points with differing lower evidence and requires one stable winner.
+
+Five normal processes at `7eb4463f` give a median 1363.160 ms (optimizer
+1358.144 ms), RSS 444,547,072 bytes. Proposals fall only from 49,521 to 48,599,
+and frontier obligations from 13,212 to 13,144. Logical groups/expressions,
+bindings and settlement hit/miss counts are unchanged. Thus lower-evidence
+duplication is real but does **not** explain most of the regression. The filter
+schedule cache records 306 builds, 630 hits and no rollback removals.
+
+## Goal-visible cost coordinates and phase memory
+
+Cost pruning now takes the goal's objective, also used by portfolio pruning.
+Latency preserves expected work, span, scalar work and risk tie-break axes;
+throughput additionally observes CPU work, and robustness observes upper work.
+Reporting-only per-resource vectors and unused upper spans are not additional
+objectives. Every goal still preserves memory/forward-progress/admission
+contracts, output task supply, capacity and demanded source response. This is
+not a scalar winner approximation: work/span and memory tradeoffs still need a
+frontier until continuation requirements can represent them directly.
+
+Memory comparisons use the **absolute preferred operating point**, not an
+elastic delta relative to each candidate's different floor. This requires the
+composition law to be monotone in those coordinates. The old overlap law added
+the retained-phase floor to the *whole-plan* elastic delta; an unrelated
+sequential child's larger floor could therefore make an overlap phase cheaper
+in memory. The new law composes real phase footprints: floors add within an
+overlap, elastic working sets share the pool, and sequential phases take maxima.
+An independent oracle enumerates all phases for 12³ input/local operating-point
+triples and four overlap masks. A separate oracle checks objective pruning
+under independently priced work/span/memory continuations. 1,039 optimizer
+tests and strict workspace/all-target Clippy pass; Q11 timing is pending.

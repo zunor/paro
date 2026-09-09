@@ -142,7 +142,8 @@ impl<P> PhysicalPlanPortfolio<P> {
                         && variant
                             .admissible_classes
                             .is_subset(&other.admissible_classes)
-                        && other.cost.dominates(&variant.cost)
+                        && other.cost.continuation_cmp_for(&variant.cost, objective)
+                            == Some(std::cmp::Ordering::Less)
                 })
             })
             .map(|(index, _)| index)
