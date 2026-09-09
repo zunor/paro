@@ -1,0 +1,440 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Small, independent search and publication oracles.
+//!
+//! These models intentionally do not call the production cost comparator or
+//! task state machine. They provide a finite reference domain for D3-C/D4:
+//! a production change can be checked against the same semantic inputs while
+//! its internal representation and scheduling remain free to evolve.
+
+#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OracleCandidate {
+    pub id: u8,
+    pub cost: u64,
+    pub required_source: u8,
+    pub required_grant: u8,
+    pub shared_owner: u8,
+    pub continuation_class: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleContext {
+    pub source_demand: u8,
+    pub grant: u8,
+    pub shared_owner: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetedOracleResult {
+    pub winner: Option<OracleCandidate>,
+    pub omitted: bool,
+}
+
+fn admissible(candidate: OracleCandidate, context: OracleContext) -> bool {
+    candidate.required_source & !context.source_demand == 0
+        && candidate.required_grant <= context.grant
+        && candidate.shared_owner == context.shared_owner
+}
+
+fn better(left: OracleCandidate, right: OracleCandidate) -> bool {
+    (left.cost, left.continuation_class, left.id) < (right.cost, right.continuation_class, right.id)
+}
+
+/// Exhaustively choose the parent-observable winner for a context.
+pub fn exhaustive_winner(
+    candidates: impl IntoIterator<Item = OracleCandidate>,
+    context: OracleContext,
+) -> Option<OracleCandidate> {
+    candidates
+        .into_iter()
+        .filter(|candidate| admissible(*candidate, context))
+        .fold(None, |winner, candidate| match winner {
+            Some(current) if !better(candidate, current) => Some(current),
+            _ => Some(candidate),
+        })
+}
+
+/// Evaluate only a finite prefix and keep the omission explicit. A prefix
+/// winner is an anytime result, never a proof that the complete domain was
+/// searched.
+pub fn budgeted_winner(
+    candidates: &[OracleCandidate],
+    context: OracleContext,
+    budget: usize,
+) -> BudgetedOracleResult {
+    BudgetedOracleResult {
+        winner: exhaustive_winner(candidates.iter().copied().take(budget), context),
+        omitted: candidates.len() > budget,
+    }
+}
+
+#[cfg(test)]
+fn permutations<T: Copy>(items: &[T]) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut result = Vec::new();
+    for index in 0..items.len() {
+        let mut rest = items.to_vec();
+        let head = rest.remove(index);
+        for mut tail in permutations(&rest) {
+            let mut permutation = Vec::with_capacity(items.len());
+            permutation.push(head);
+            permutation.append(&mut tail);
+            result.push(permutation);
+        }
+    }
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+enum ReferenceTaskState {
+    Runnable,
+    Running,
+    Awaiting,
+    Completed,
+    Failed,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, Default)]
+#[cfg(test)]
+struct ReferenceTask {
+    state: Option<ReferenceTaskState>,
+    dependencies: BTreeSet<u32>,
+    objects: BTreeSet<u32>,
+    reserved_units: u64,
+}
+
+#[derive(Debug, Default)]
+#[cfg(test)]
+struct ReferencePublicationKernel {
+    tasks: BTreeMap<u32, ReferenceTask>,
+    next_object: u32,
+    published_owner: BTreeMap<u32, u32>,
+}
+
+#[cfg(test)]
+impl ReferencePublicationKernel {
+    fn create(&mut self, task: u32) {
+        self.tasks.insert(
+            task,
+            ReferenceTask {
+                state: Some(ReferenceTaskState::Runnable),
+                ..ReferenceTask::default()
+            },
+        );
+    }
+
+    fn start(&mut self, task: u32) {
+        assert_eq!(self.tasks[&task].state, Some(ReferenceTaskState::Runnable));
+        self.tasks.get_mut(&task).unwrap().state = Some(ReferenceTaskState::Running);
+    }
+
+    fn reserve_and_allocate(&mut self, task: u32, units: u64) -> u32 {
+        self.tasks.get_mut(&task).unwrap().reserved_units += units;
+        let object = self.next_object;
+        self.next_object += 1;
+        self.tasks.get_mut(&task).unwrap().objects.insert(object);
+        object
+    }
+
+    fn commit(&mut self, task: u32) {
+        let units = self.tasks.get_mut(&task).unwrap().reserved_units;
+        self.tasks.get_mut(&task).unwrap().reserved_units = 0;
+        let objects = self.tasks[&task].objects.clone();
+        for object in objects {
+            self.published_owner.insert(object, task);
+        }
+        assert!(units > 0);
+    }
+
+    fn await_dependencies(&mut self, task: u32, dependencies: impl IntoIterator<Item = u32>) {
+        let unresolved = dependencies
+            .into_iter()
+            .filter(|dependency| {
+                !matches!(
+                    self.tasks[dependency].state,
+                    Some(ReferenceTaskState::Completed | ReferenceTaskState::Failed)
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        self.tasks.get_mut(&task).unwrap().dependencies = unresolved.clone();
+        self.tasks.get_mut(&task).unwrap().state = Some(if unresolved.is_empty() {
+            ReferenceTaskState::Runnable
+        } else {
+            ReferenceTaskState::Awaiting
+        });
+    }
+
+    fn complete(&mut self, task: u32) {
+        self.tasks.get_mut(&task).unwrap().state = Some(ReferenceTaskState::Completed);
+        for dependent in self.tasks.values_mut() {
+            dependent.dependencies.remove(&task);
+            if dependent.dependencies.is_empty()
+                && dependent.state == Some(ReferenceTaskState::Awaiting)
+            {
+                dependent.state = Some(ReferenceTaskState::Runnable);
+            }
+        }
+    }
+
+    fn fail(&mut self, task: u32) {
+        let objects = std::mem::take(&mut self.tasks.get_mut(&task).unwrap().objects);
+        for object in objects {
+            self.published_owner.remove(&object);
+        }
+        self.tasks.get_mut(&task).unwrap().reserved_units = 0;
+        self.tasks.get_mut(&task).unwrap().state = Some(ReferenceTaskState::Failed);
+    }
+
+    fn redirect(&mut self, task: u32) {
+        let objects = std::mem::take(&mut self.tasks.get_mut(&task).unwrap().objects);
+        for object in objects {
+            self.published_owner.remove(&object);
+        }
+        self.tasks.get_mut(&task).unwrap().reserved_units = 0;
+        self.tasks.get_mut(&task).unwrap().state = Some(ReferenceTaskState::Invalidated);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cascades::ids::{LogicalExprId, RuleId};
+    use crate::cascades::memo::Memo;
+    use crate::cascades::tasks::{CursorId, ReadSet, TaskIntent, TaskOutcome, TaskRegistry};
+
+    fn candidates() -> [OracleCandidate; 5] {
+        [
+            OracleCandidate {
+                id: 1,
+                cost: 5,
+                required_source: 0b01,
+                required_grant: 2,
+                shared_owner: 7,
+                continuation_class: 1,
+            },
+            OracleCandidate {
+                id: 2,
+                cost: 7,
+                required_source: 0b10,
+                required_grant: 2,
+                shared_owner: 7,
+                continuation_class: 0,
+            },
+            OracleCandidate {
+                id: 3,
+                cost: 3,
+                required_source: 0b11,
+                required_grant: 4,
+                shared_owner: 7,
+                continuation_class: 0,
+            },
+            OracleCandidate {
+                id: 4,
+                cost: 1,
+                required_source: 0b01,
+                required_grant: 1,
+                shared_owner: 9,
+                continuation_class: 0,
+            },
+            OracleCandidate {
+                id: 5,
+                cost: 9,
+                required_source: 0,
+                required_grant: 1,
+                shared_owner: 7,
+                continuation_class: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn exhaustive_context_oracle_is_invariant_to_insertion_order() {
+        let context = OracleContext {
+            source_demand: 0b11,
+            grant: 2,
+            shared_owner: 7,
+        };
+        let expected = exhaustive_winner(candidates(), context).unwrap();
+        for permutation in permutations(&candidates()) {
+            assert_eq!(exhaustive_winner(permutation, context), Some(expected));
+        }
+    }
+
+    #[test]
+    fn context_oracle_preserves_parent_observable_source_and_ownership() {
+        assert_eq!(
+            exhaustive_winner(
+                candidates(),
+                OracleContext {
+                    source_demand: 0b10,
+                    grant: 2,
+                    shared_owner: 7,
+                },
+            )
+            .unwrap()
+            .id,
+            2
+        );
+        assert_eq!(
+            exhaustive_winner(
+                candidates(),
+                OracleContext {
+                    source_demand: 0b01,
+                    grant: 2,
+                    shared_owner: 9,
+                },
+            )
+            .unwrap()
+            .id,
+            4
+        );
+    }
+
+    #[test]
+    fn budgeted_context_oracle_reports_omitted_candidates() {
+        let all = candidates();
+        let result = budgeted_winner(
+            &all,
+            OracleContext {
+                source_demand: 0b11,
+                grant: 4,
+                shared_owner: 7,
+            },
+            2,
+        );
+        assert_eq!(result.winner.unwrap().id, 1);
+        assert!(result.omitted);
+        assert_eq!(
+            exhaustive_winner(
+                all,
+                OracleContext {
+                    source_demand: 0b11,
+                    grant: 4,
+                    shared_owner: 7,
+                },
+            )
+            .unwrap()
+            .id,
+            3
+        );
+    }
+
+    #[test]
+    fn publication_oracle_matches_wait_publish_fail_and_redirect_contracts() {
+        let mut reference = ReferencePublicationKernel::default();
+        reference.create(0);
+        reference.create(1);
+        reference.start(0);
+        reference.start(1);
+        let _parent_object = reference.reserve_and_allocate(0, 4);
+        let child_object = reference.reserve_and_allocate(1, 3);
+        reference.commit(1);
+        reference.await_dependencies(0, [1]);
+        assert_eq!(
+            reference.tasks[&0].state,
+            Some(ReferenceTaskState::Awaiting)
+        );
+        reference.complete(1);
+        assert_eq!(
+            reference.tasks[&0].state,
+            Some(ReferenceTaskState::Runnable)
+        );
+        reference.create(2);
+        reference.start(2);
+        let failed_reference_object = reference.reserve_and_allocate(2, 5);
+        reference.fail(2);
+        assert!(!reference
+            .published_owner
+            .contains_key(&failed_reference_object));
+        reference.create(3);
+        reference.start(3);
+        let redirected_reference_object = reference.reserve_and_allocate(3, 2);
+        reference.redirect(3);
+        assert!(!reference
+            .published_owner
+            .contains_key(&redirected_reference_object));
+
+        let mut production = TaskRegistry::default();
+        let make_task = |registry: &mut TaskRegistry, expression| match registry
+            .request(
+                TaskIntent::Discover {
+                    expression,
+                    rule: RuleId::new(1),
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            crate::cascades::tasks::TaskRequest::Leader(task) => task,
+            request => panic!("unexpected request: {request:?}"),
+        };
+        let parent = make_task(&mut production, LogicalExprId::new(0));
+        let child = make_task(&mut production, LogicalExprId::new(1));
+        production.start(parent).unwrap();
+        production.start(child).unwrap();
+        production.reserve_once(parent, 0, 4).unwrap();
+        let parent_object = production.allocate_object(parent).unwrap();
+        production.reserve_once(child, 0, 3).unwrap();
+        let production_child_object = production.allocate_object(child).unwrap();
+        production.commit_segment(child).unwrap();
+        let memo = Memo::new(Default::default());
+        production
+            .publish_current(
+                parent,
+                &memo,
+                [child],
+                TaskOutcome::Progress {
+                    cursor: CursorId::new(0),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            production.state(parent),
+            Some(crate::cascades::tasks::TaskState::Awaiting)
+        );
+        assert_eq!(
+            production.published_owner(production_child_object),
+            Some(child)
+        );
+        assert_eq!(reference.published_owner.get(&child_object), Some(&1));
+        production.complete(child, TaskOutcome::Infeasible).unwrap();
+        production.start(parent).unwrap();
+        production
+            .publish_current(
+                parent,
+                &memo,
+                [],
+                TaskOutcome::Progress {
+                    cursor: CursorId::new(0),
+                },
+            )
+            .unwrap();
+        assert_eq!(production.published_owner(parent_object), Some(parent));
+        assert_eq!(
+            production.state(parent),
+            Some(crate::cascades::tasks::TaskState::Completed)
+        );
+
+        let failed = make_task(&mut production, LogicalExprId::new(2));
+        production.start(failed).unwrap();
+        production.reserve_once(failed, 0, 5).unwrap();
+        let failed_object = production.allocate_object(failed).unwrap();
+        production.fail(failed, "oracle rollback").unwrap();
+        assert!(!production.is_published(failed_object));
+
+        let redirected = make_task(&mut production, LogicalExprId::new(3));
+        production.start(redirected).unwrap();
+        production.reserve_once(redirected, 0, 2).unwrap();
+        let redirected_object = production.allocate_object(redirected).unwrap();
+        production.invalidate(redirected).unwrap();
+        assert!(!production.is_published(redirected_object));
+    }
+}

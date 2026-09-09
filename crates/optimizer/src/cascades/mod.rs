@@ -26,6 +26,7 @@ pub mod ids {
     pub use crate::physical::identity::*;
 }
 pub mod memo;
+pub mod oracle;
 pub mod properties {
     pub use crate::physical::requirements::*;
 }
