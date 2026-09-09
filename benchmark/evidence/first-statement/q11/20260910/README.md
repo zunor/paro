@@ -107,3 +107,23 @@ Paro time than the preceding 90-row check, but it is still far from parity and
 does not pass M1–M3. The diagnostic cohort remains excluded from C1. The
 report and block/diagnostic logs are archived as `q11-d2-native-cost-v1.*` in
 this directory.
+
+## SQL regression rerun — default memory, high FD limit — 2026-09-10
+
+The earlier `Too many open files` reproduction was rerun from a fresh data
+directory with the default server memory limit (`1073741824` bytes) and only
+the process soft `nofile` limit raised to `60000`. The complete suite passed:
+
+`184 passed, 0 failed, 0 skipped, 0 new` in `65.35s`.
+
+The FD sampler tracked the server across runner-controlled restarts. New
+server PIDs began around `13–18` descriptors; the longest observed lifetimes
+grew from `14→123`, `15→253`, and `17→405` descriptors while data-heavy cases
+were active. This is bounded per observed run and is consistent with the
+tablet/index workload exhausting a low process capacity envelope; it is not a
+monotonic-leak proof. The default-memory semantic rerun therefore closes the
+configuration confounder, while resource-lifecycle leak analysis remains a
+separate follow-up if a lower limit still reproduces the failure.
+
+The `-v2` artifacts are the exact current rerun: report, empty error file,
+runner log, and raw FD samples. The server was shut down after the run.
