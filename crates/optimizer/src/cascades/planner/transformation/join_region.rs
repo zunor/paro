@@ -193,6 +193,13 @@ pub(super) fn try_native_enumeration(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Vec<NativeShell>> {
+    // Avoid even allocating native plan identities for a binary join. The
+    // preflight only counts structurally reorderable children; the complete
+    // shell guard below remains authoritative for projections and opaque
+    // boundaries.
+    if native_pattern_atom_count(binding, memo, state)? < 3 {
+        return Ok(Vec::new());
+    }
     let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
         return Ok(Vec::new());
     };
@@ -205,7 +212,10 @@ pub(super) fn try_native_enumeration(
     if !collect_native_join_input(&shell, shell.root, &layouts, true, &mut input)? {
         return Ok(Vec::new());
     }
-    if input.atoms.len() < 2 {
+    // A binary join has no alternative join order to enumerate. Keeping it on
+    // the existing path also avoids spending native node identities for a
+    // transformation that cannot reduce search work.
+    if input.atoms.len() < 3 {
         return Ok(Vec::new());
     }
 
@@ -302,6 +312,45 @@ pub(super) fn try_native_enumeration(
         })?);
     }
     Ok(shells)
+}
+
+fn native_pattern_atom_count(
+    operand: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<usize> {
+    let PatternOperand::Expression {
+        expression,
+        children,
+        ..
+    } = operand
+    else {
+        return Ok(1);
+    };
+    let logical = memo
+        .logical_expr(*expression)
+        .ok_or_else(|| paro_error::internal("native join preflight lost its expression"))?;
+    let operator = &state
+        .payloads
+        .logical
+        .get(logical.payload.index())
+        .ok_or_else(|| paro_error::internal("native join preflight lost its operator"))?
+        .semantic_template
+        .operator;
+    let reorderable = match operator {
+        LogicalOperator::Filter(filter) => filter
+            .expressions
+            .iter()
+            .all(|expression| !expression.evaluation_properties().is_reorder_fence()),
+        LogicalOperator::Join(join) => RelationManager::join_shell_is_reorderable(join),
+        _ => false,
+    };
+    if !reorderable {
+        return Ok(1);
+    }
+    children.iter().try_fold(0usize, |count, child| {
+        native_pattern_atom_count(child, memo, state).map(|atoms| count.saturating_add(atoms))
+    })
 }
 
 struct NativeJoinAtom {
