@@ -12,8 +12,8 @@ pub(super) mod settlement;
 mod staging;
 
 use staging::{
-    stage_transformed_expression, StagingInput, StagingRegionRequirements, StagingRequest,
-    StagingTarget,
+    stage_transformed_expression, NativeShell, StagingInput, StagingRegionRequirements,
+    StagingRequest, StagingTarget,
 };
 
 fn settle_with_session_arena(
@@ -557,7 +557,7 @@ impl TransformationRule for PlannerTransformationRule {
         // the full settlement path below.
         enum PreparedPlan {
             Native {
-                plan: OwnedLogicalPlan,
+                shell: NativeShell,
                 column_stats: SharedColumnStatistics,
             },
             Settled {
@@ -569,7 +569,6 @@ impl TransformationRule for PlannerTransformationRule {
 
         struct PreparedAlternative {
             plan: PreparedPlan,
-            group_hole_guard: GroupHoleTransportGuard,
             preserved_region_facet: Option<Fingerprint>,
             extended_required_region_facets: Box<[Fingerprint]>,
             input_context: OptimizationContextId,
@@ -598,9 +597,11 @@ impl TransformationRule for PlannerTransformationRule {
                     refresh_native_shell_statistics(plan, source_stats.as_ref(), &environment);
                 let root_operator = plan.operator.op_type();
                 let output_layout = plan.output_layout();
+                group_hole_guard.validate_owned(&plan)?;
+                let shell = NativeShell::from_owned(plan)?;
                 (
                     PreparedPlan::Native {
-                        plan,
+                        shell,
                         column_stats: source_stats.clone(),
                     },
                     root_operator,
@@ -722,7 +723,6 @@ impl TransformationRule for PlannerTransformationRule {
             }
             prepared.push(PreparedAlternative {
                 plan: prepared_plan,
-                group_hole_guard,
                 preserved_region_facet,
                 extended_required_region_facets: extended_required_region_facets.into_boxed_slice(),
                 input_context: output_input_context,
@@ -742,7 +742,6 @@ impl TransformationRule for PlannerTransformationRule {
                 for prepared in prepared {
                     let PreparedAlternative {
                         plan,
-                        group_hole_guard,
                         preserved_region_facet,
                         extended_required_region_facets,
                         input_context,
@@ -750,10 +749,10 @@ impl TransformationRule for PlannerTransformationRule {
                         nested_group_holes,
                     } = prepared;
                     let (plan, column_stats, column_stat_scopes) = match plan {
-                        PreparedPlan::Native { plan, column_stats } => {
-                            group_hole_guard.validate_owned(&plan)?;
-                            (StagingInput::Native(plan), column_stats, HashMap::new())
-                        }
+                        PreparedPlan::Native {
+                            shell,
+                            column_stats,
+                        } => (StagingInput::Native(shell), column_stats, HashMap::new()),
                         PreparedPlan::Settled {
                             plan,
                             column_stats,

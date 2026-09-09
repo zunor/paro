@@ -17,9 +17,122 @@ pub(super) enum StagingInput {
     /// A settled occurrence already owned by the session arena.
     Arena(paro_planner::plan::arena::PlanIndex),
     /// A closed native shell whose leaves are immutable Memo group holes.
-    /// Keeping this input owned avoids importing the shell into a second
-    /// arena merely to detach it again during Memo publication.
-    Native(OwnedLogicalPlan),
+    /// The shell is already flattened in post-order, so staging maps its
+    /// child links to Memo groups without detaching/assembling an owned tree
+    /// or importing it into a second arena.
+    Native(NativeShell),
+}
+
+#[derive(Debug)]
+pub(super) struct NativeShell {
+    pub(super) nodes: Box<[NativeNode]>,
+    pub(super) root: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct NativeNode {
+    pub(super) id: paro_planner::plan::PlanNodeId,
+    pub(super) stats: NodeStats,
+    pub(super) operator: LogicalOperator<NativeChild>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum NativeChild {
+    Node(usize),
+    Group {
+        id: paro_planner::plan::PlanNodeId,
+        stats: NodeStats,
+        layout: paro_planner::operator::LogicalOutputLayout,
+        names: Arc<[String]>,
+        reference: paro_planner::operator::BoundReference,
+    },
+}
+
+impl NativeShell {
+    /// Lower an already-validated closed owned shell exactly once. The output
+    /// is a compact post-order node list; real descendants become node
+    /// indices and Memo holes keep their immutable BoundReference facts.
+    pub(super) fn from_owned(root: OwnedLogicalPlan) -> Result<Self> {
+        enum Frame {
+            Enter(OwnedLogicalPlan),
+            Exit {
+                skeleton: paro_planner::plan::arena::LogicalPlanNode<()>,
+                arity: usize,
+            },
+        }
+
+        let mut pending = vec![Frame::Enter(root)];
+        let mut completed = Vec::<NativeChild>::new();
+        let mut nodes = Vec::<NativeNode>::new();
+        while let Some(frame) = pending.pop() {
+            match frame {
+                Frame::Enter(plan) => {
+                    if matches!(&plan.operator, LogicalOperator::BoundReference(_)) {
+                        let layout = plan.output_layout();
+                        let names = Arc::<[String]>::from(plan.output_names());
+                        let (id, stats, operator) = plan.into_parts();
+                        let LogicalOperator::BoundReference(reference) = operator else {
+                            unreachable!("bound-reference match changed while consuming plan")
+                        };
+                        completed.push(NativeChild::Group {
+                            id,
+                            stats,
+                            layout,
+                            names,
+                            reference,
+                        });
+                        continue;
+                    }
+                    let (skeleton, children) =
+                        paro_planner::plan::arena::LogicalPlanNode::detach(plan);
+                    let arity = children.len();
+                    pending.push(Frame::Exit { skeleton, arity });
+                    pending.extend(children.into_iter().rev().map(|child| Frame::Enter(*child)));
+                }
+                Frame::Exit { skeleton, arity } => {
+                    let start = completed.len().checked_sub(arity).ok_or_else(|| {
+                        paro_error::internal("native shell lost a child while flattening")
+                    })?;
+                    let children = completed.drain(start..).collect::<Vec<_>>();
+                    let mut children = children.into_iter();
+                    let operator = skeleton.operator.try_map_child_links(&mut |_| {
+                        children.next().ok_or_else(|| {
+                            paro_error::internal("native shell child arity mismatch")
+                        })
+                    })?;
+                    if children.next().is_some() {
+                        return Err(paro_error::internal(
+                            "native shell retained excess child links",
+                        ));
+                    }
+                    let id = nodes.len();
+                    nodes.push(NativeNode {
+                        id: skeleton.id,
+                        stats: skeleton.stats,
+                        operator,
+                    });
+                    completed.push(NativeChild::Node(id));
+                }
+            }
+        }
+        let NativeChild::Node(root) = completed
+            .pop()
+            .ok_or_else(|| paro_error::internal("native shell has no non-bound-reference root"))?
+        else {
+            return Err(paro_error::internal(
+                "native shell root must not be a Memo group hole",
+            ));
+        };
+        if !completed.is_empty() {
+            return Err(paro_error::internal(
+                "native shell flattening left detached roots",
+            ));
+        }
+        Ok(Self {
+            nodes: nodes.into_boxed_slice(),
+            root,
+        })
+    }
 }
 
 pub(super) struct StagingRequest {
@@ -133,11 +246,23 @@ pub(super) fn stage_transformed_expression(
     ) -> Result<NodeState> {
         let layout = plan.output_layout();
         let names = Arc::<[String]>::from(plan.output_names());
-        let LogicalOperator::BoundReference(reference) = &plan.operator else {
+        let (id, stats, operator) = plan.into_parts();
+        let LogicalOperator::BoundReference(reference) = operator else {
             return Err(paro_error::internal(
                 "native staging expected a Memo group hole",
             ));
         };
+        resolve_group_hole_reference(session, id, stats, layout, names, reference)
+    }
+
+    fn resolve_group_hole_reference(
+        session: &mut StagingSession<'_>,
+        id: paro_planner::plan::PlanNodeId,
+        stats: NodeStats,
+        layout: paro_planner::operator::LogicalOutputLayout,
+        names: Arc<[String]>,
+        reference: paro_planner::operator::BoundReference,
+    ) -> Result<NodeState> {
         let group = session
             .nested_group_holes
             .remove(&reference.reference_id)
@@ -176,9 +301,9 @@ pub(super) fn stage_transformed_expression(
             ));
         }
         Ok(NodeState {
-            id: plan.id,
+            id,
             group,
-            stats: plan.stats.clone(),
+            stats,
             columns: columns.into_boxed_slice(),
             layout: Arc::new(layout),
             names,
@@ -1047,148 +1172,118 @@ pub(super) fn stage_transformed_expression(
                 }
                 root_result.ok_or_else(|| paro_error::internal("staging has no completed root"))?
             }
-            StagingInput::Native(native_plan) => {
-                enum Frame {
-                    Enter(OwnedLogicalPlan),
-                    Exit {
-                        skeleton: paro_planner::plan::arena::LogicalPlanNode<()>,
-                        arity: usize,
-                        is_root: bool,
-                    },
+            StagingInput::Native(native) => {
+                if native.nodes.is_empty() || native.root >= native.nodes.len() {
+                    return Err(paro_error::internal("native staging has no valid root"));
                 }
-
-                let mut node_count = 0usize;
-                native_plan.try_visit_pre_order(|_| {
-                    node_count = node_count.saturating_add(1);
-                    Ok(())
-                })?;
-                if node_count == 0 {
-                    return Err(paro_error::internal("native staging has no root"));
-                }
-                let mut pending = vec![Frame::Enter(native_plan)];
-                let mut completed = Vec::<(GroupId, NodeState)>::new();
-                let mut visited = 0usize;
+                let node_count = native.nodes.len();
+                let root_index = native.root;
+                let mut completed = Vec::<Option<(GroupId, NodeState)>>::with_capacity(node_count);
                 let mut root_result = None;
-                while let Some(frame) = pending.pop() {
-                    match frame {
-                        Frame::Enter(plan) => {
-                            if matches!(plan.operator, LogicalOperator::BoundReference(_)) {
-                                if visited == 0 && pending.is_empty() {
-                                    return Err(paro_error::internal(
-                                        "native staging reached a root Memo group hole",
-                                    ));
-                                }
-                                let node = resolve_group_hole(&mut session, plan)?;
-                                completed.push((node.group, node));
-                                continue;
-                            }
-                            let (skeleton, children) =
-                                paro_planner::plan::arena::LogicalPlanNode::detach(plan);
-                            let is_root = visited == 0 && pending.is_empty();
-                            pending.push(Frame::Exit {
-                                skeleton,
-                                arity: children.len(),
-                                is_root,
-                            });
-                            pending.extend(
-                                children.into_iter().rev().map(|child| Frame::Enter(*child)),
-                            );
-                        }
-                        Frame::Exit {
-                            skeleton,
-                            arity,
-                            is_root,
-                        } => {
-                            if !session.memo.control().checkpoint()? {
-                                return Ok(None);
-                            }
-                            if let Some(statement) = &session.state.session {
-                                statement.cancellation.check()?;
-                            }
-                            let start = completed.len().checked_sub(arity).ok_or_else(|| {
-                                paro_error::internal("native staging lost an input")
-                            })?;
-                            let children = completed.drain(start..).collect::<Vec<_>>();
-                            let child_states = children
-                                .iter()
-                                .map(|(_, state)| state.clone())
-                                .collect::<Vec<_>>();
-                            let mut child_index = 0;
-                            let operator = skeleton.operator.try_map_child_links(&mut |_| {
-                                let group = children
-                                    .get(child_index)
-                                    .map(|(group, _)| *group)
-                                    .ok_or_else(|| {
-                                        paro_error::internal(
-                                            "native staging lost a child group reference",
+                for (index, native_node) in native.nodes.into_vec().into_iter().enumerate() {
+                    if !session.memo.control().checkpoint()? {
+                        return Ok(None);
+                    }
+                    if let Some(statement) = &session.state.session {
+                        statement.cancellation.check()?;
+                    }
+                    let is_root = index == root_index;
+                    let mut child_states = Vec::new();
+                    let operator =
+                        native_node
+                            .operator
+                            .try_map_child_links(&mut |child| match child {
+                                NativeChild::Node(child_index) => {
+                                    let (group, state) = completed
+                                        .get(child_index)
+                                        .and_then(Option::as_ref)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            paro_error::internal(
+                                            "native staging referenced an incomplete child node",
                                         )
-                                    })?;
-                                child_index += 1;
-                                Ok::<_, paro_error::ParoError>(group)
+                                        })?;
+                                    child_states.push(state);
+                                    Ok::<_, paro_error::ParoError>(group)
+                                }
+                                NativeChild::Group {
+                                    id,
+                                    stats,
+                                    layout,
+                                    names,
+                                    reference,
+                                } => {
+                                    let node = resolve_group_hole_reference(
+                                        &mut session,
+                                        id,
+                                        stats,
+                                        layout,
+                                        names,
+                                        reference,
+                                    )?;
+                                    let group = node.group;
+                                    child_states.push(node);
+                                    Ok::<_, paro_error::ParoError>(group)
+                                }
                             })?;
-                            if child_index != children.len() {
-                                return Err(paro_error::internal(
-                                    "native staging child arity mismatch",
-                                ));
-                            }
-                            let Some((mut node, staged)) = stage_node(
-                                &mut session,
-                                NodeStagingRequest {
-                                    input: NodeStagingInput::Native {
-                                        id: skeleton.id,
-                                        stats: skeleton.stats,
-                                        operator,
-                                    },
-                                    target: is_root.then_some(target),
-                                    required_region_facet: is_root
-                                        .then_some(preserved_region_facet)
-                                        .flatten(),
-                                    inherited_runtime_filter_facet: is_root
-                                        .then_some(inherited_runtime_filter_facet)
-                                        .flatten(),
-                                    node_context: if is_root {
-                                        input_context
-                                    } else {
-                                        child_context
-                                    },
-                                    target_child_context: is_root.then_some(child_context),
-                                    refined_cardinality_kind: is_root
-                                        .then_some(refined_cardinality_kind)
-                                        .flatten(),
-                                },
-                                child_states,
-                            )?
-                            else {
-                                return Ok(None);
-                            };
-                            if !is_root {
-                                session.facts.settle_group(
-                                    session.memo,
-                                    session.state,
-                                    node.group,
-                                )?;
-                                let layout = node.layout.clone();
-                                let facts = session.facts.transport(
-                                    session.memo,
-                                    session.state,
-                                    node.group,
-                                    &layout,
-                                )?;
-                                node.boundary_facts = Some(facts);
-                                node.boundary_reference_id = Some(
-                                    paro_planner::operator::BoundReferenceId::node_occurrence(
-                                        node.id.0,
-                                    ),
-                                );
-                            }
-                            visited = visited.saturating_add(1);
-                            if is_root {
-                                root_result = Some((node, staged));
+                    let Some((mut node, staged)) = stage_node(
+                        &mut session,
+                        NodeStagingRequest {
+                            input: NodeStagingInput::Native {
+                                id: native_node.id,
+                                stats: native_node.stats,
+                                operator,
+                            },
+                            target: is_root.then_some(target),
+                            required_region_facet: is_root
+                                .then_some(preserved_region_facet)
+                                .flatten(),
+                            inherited_runtime_filter_facet: is_root
+                                .then_some(inherited_runtime_filter_facet)
+                                .flatten(),
+                            node_context: if is_root {
+                                input_context
                             } else {
-                                debug_assert!(staged.is_none());
-                                completed.push((node.group, node));
-                            }
+                                child_context
+                            },
+                            target_child_context: is_root.then_some(child_context),
+                            refined_cardinality_kind: is_root
+                                .then_some(refined_cardinality_kind)
+                                .flatten(),
+                        },
+                        child_states,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    if is_root {
+                        if root_result.replace((node, staged)).is_some() {
+                            return Err(paro_error::internal(
+                                "native staging encountered multiple roots",
+                            ));
                         }
+                    } else {
+                        session
+                            .facts
+                            .settle_group(session.memo, session.state, node.group)?;
+                        let layout = node.layout.clone();
+                        let facts = session.facts.transport(
+                            session.memo,
+                            session.state,
+                            node.group,
+                            &layout,
+                        )?;
+                        node.boundary_facts = Some(facts);
+                        node.boundary_reference_id = Some(
+                            paro_planner::operator::BoundReferenceId::node_occurrence(node.id.0),
+                        );
+                        if completed.len() != index {
+                            return Err(paro_error::internal(
+                                "native staging node order is not post-order",
+                            ));
+                        }
+                        completed.push(Some((node.group, node)));
+                        debug_assert!(staged.is_none());
                     }
                 }
                 root_result.ok_or_else(|| paro_error::internal("native staging has no root"))?
@@ -1493,6 +1588,7 @@ mod tests {
         let mut state = input.planner_state.write().unwrap();
         state.session = Some(TestStatementContextBuilder::minimal().build());
         let arena_len = state.staging_arena.len();
+        let native = NativeShell::from_owned(native).unwrap();
         let staged = stage_transformed_expression(
             StagingRequest {
                 input: StagingInput::Native(native),
