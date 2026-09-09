@@ -874,7 +874,7 @@ pub(super) fn stage_transformed_expression(
                     bindings,
                     types,
                 )
-                .with_facts(facts);
+                .with_facts(facts)?;
                 plan.operator = LogicalOperator::BoundReference(reference);
             }
             if is_root {

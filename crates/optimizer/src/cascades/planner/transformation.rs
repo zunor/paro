@@ -1142,7 +1142,7 @@ impl GroupHoleTransportGuard {
                         reference.reference_id,
                         GroupHoleTransportTemplate {
                             bindings: reference.bindings.clone(),
-                            types: reference.types.clone(),
+                            types: reference.types().to_vec(),
                             facts: reference.facts.clone(),
                         },
                     )
@@ -1175,7 +1175,7 @@ impl GroupHoleTransportGuard {
                 ));
             }
             if reference.bindings != template.bindings
-                || reference.types != template.types
+                || reference.types() != template.types
                 || reference.facts != template.facts
             {
                 return Err(paro_error::internal(

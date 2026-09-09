@@ -8,7 +8,7 @@ use paro_common::types::LogicalType;
 use paro_storage::statistics::{
     BaseStatistics, ColumnStatistics, DistinctProvenance, EstimatedNumericDistribution,
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::ColumnBinding;
 
@@ -155,7 +155,6 @@ pub struct BoundReference {
     /// survives optimizer passes that rebuild an operator shell.
     pub reference_id: BoundReferenceId,
     pub bindings: Vec<ColumnBinding>,
-    pub types: Vec<LogicalType>,
     /// Immutable evidence resolved by the owning Memo, never by choosing or
     /// reconstructing a representative input tree.
     pub facts: Arc<BoundRelationFacts>,
@@ -175,7 +174,7 @@ pub struct BoundSourceColumn {
 /// complete source-column coverage. Unknown and partially covered paths must
 /// not be confused with a covered path containing zero rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundRelationFacts {
+pub struct BoundRelationFactValues {
     /// A finite effect-free derivation proves that this equivalence class is
     /// safe to evaluate independently again on the same inputs. Splitting a
     /// sharing owner requires this proof; commuting evaluation requires more.
@@ -199,7 +198,7 @@ pub struct BoundRelationFacts {
     pub contains_control_region: bool,
 }
 
-impl Default for BoundRelationFacts {
+impl Default for BoundRelationFactValues {
     fn default() -> Self {
         Self {
             can_replay: false,
@@ -215,6 +214,85 @@ impl Default for BoundRelationFacts {
     }
 }
 
+/// Published, typed evidence. Values are mutable only before publication;
+/// derived column views cannot outlive an edit to their evidence or schema.
+/// Cloning/sharing this snapshot never recreates sketches or derived columns.
+#[derive(Debug)]
+pub struct BoundRelationFacts {
+    values: BoundRelationFactValues,
+    types: Vec<LogicalType>,
+    columns: OnceLock<Vec<Arc<ColumnStatistics>>>,
+}
+
+impl std::ops::Deref for BoundRelationFacts {
+    type Target = BoundRelationFactValues;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl PartialEq for BoundRelationFacts {
+    fn eq(&self, other: &Self) -> bool {
+        self.types == other.types && self.values == other.values
+    }
+}
+impl Eq for BoundRelationFacts {}
+
+impl BoundRelationFacts {
+    pub fn new(values: BoundRelationFactValues, types: Vec<LogicalType>) -> Self {
+        Self {
+            values,
+            types,
+            columns: OnceLock::new(),
+        }
+    }
+
+    pub fn values(&self) -> &BoundRelationFactValues {
+        &self.values
+    }
+
+    pub fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+
+    pub fn column_statistics(&self) -> &[Arc<ColumnStatistics>] {
+        self.columns.get_or_init(|| self.derive_column_statistics())
+    }
+
+    fn derive_column_statistics(&self) -> Vec<Arc<ColumnStatistics>> {
+        self.types
+            .iter()
+            .enumerate()
+            .map(|(ordinal, ty)| {
+                let domain = self
+                    .column_domains
+                    .get(ordinal)
+                    .copied()
+                    .unwrap_or_default();
+                let values = self.column_values.get(ordinal).and_then(Option::as_ref);
+                let mut base = values
+                    .map(|value| value.statistics().clone())
+                    .unwrap_or_else(|| BaseStatistics::create_unknown(ty.clone()));
+                base.set_distinct_count(0);
+                let mut column = ColumnStatistics::with_estimated_distinct_provenance(
+                    base,
+                    domain
+                        .expected_distinct
+                        .map(|distinct| usize::try_from(distinct).unwrap_or(usize::MAX)),
+                    domain.provenance,
+                )
+                .with_estimated_numeric_distribution(
+                    values.and_then(BoundColumnValues::distribution),
+                );
+                if let Some(upper) = domain.guaranteed_distinct_upper {
+                    column = column.with_guaranteed_distinct_upper(upper);
+                }
+                Arc::new(column)
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BoundColumnDomain {
     pub expected_distinct: Option<u64>,
@@ -227,44 +305,11 @@ pub struct BoundColumnDomain {
 
 impl BoundReference {
     pub fn column_statistics(&self) -> Vec<Arc<ColumnStatistics>> {
-        self.types
-            .iter()
-            .enumerate()
-            .map(|(ordinal, ty)| {
-                let domain = self
-                    .facts
-                    .column_domains
-                    .get(ordinal)
-                    .copied()
-                    .unwrap_or_default();
-                let mut base = self
-                    .facts
-                    .column_values
-                    .get(ordinal)
-                    .and_then(Option::as_ref)
-                    .map(|value| value.statistics().clone())
-                    .unwrap_or_else(|| BaseStatistics::create_unknown(ty.clone()));
-                base.set_distinct_count(0);
-                let mut column = ColumnStatistics::with_estimated_distinct_provenance(
-                    base,
-                    domain
-                        .expected_distinct
-                        .map(|distinct| usize::try_from(distinct).unwrap_or(usize::MAX)),
-                    domain.provenance,
-                )
-                .with_estimated_numeric_distribution(
-                    self.facts
-                        .column_values
-                        .get(ordinal)
-                        .and_then(Option::as_ref)
-                        .and_then(|value| value.distribution),
-                );
-                if let Some(upper) = domain.guaranteed_distinct_upper {
-                    column = column.with_guaranteed_distinct_upper(upper);
-                }
-                Arc::new(column)
-            })
-            .collect()
+        self.facts.column_statistics().to_vec()
+    }
+
+    pub fn types(&self) -> &[LogicalType] {
+        self.facts.types()
     }
     pub fn new(
         reference_id: BoundReferenceId,
@@ -275,21 +320,77 @@ impl BoundReference {
         Self {
             reference_id,
             bindings,
-            types,
-            facts: Arc::new(BoundRelationFacts::default()),
+            facts: Arc::new(BoundRelationFacts::new(
+                BoundRelationFactValues::default(),
+                types,
+            )),
         }
     }
 
-    pub fn with_facts(mut self, facts: Arc<BoundRelationFacts>) -> Self {
-        assert_eq!(self.bindings.len(), facts.source_lineage.len());
+    pub fn with_facts(
+        mut self,
+        facts: Arc<BoundRelationFacts>,
+    ) -> paro_common::error::Result<Self> {
+        if self.types() != facts.types()
+            || (!facts.source_lineage.is_empty()
+                && self.bindings.len() != facts.source_lineage.len())
+        {
+            return Err(paro_common::error::internal(
+                "bound evidence changes its typed output contract",
+            ));
+        }
         self.facts = facts;
-        self
+        Ok(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_snapshots_share_derived_columns_without_mutable_cache_dependencies() {
+        let make = |point, ty| {
+            Arc::new(BoundRelationFacts::new(
+                BoundRelationFactValues {
+                    column_domains: vec![BoundColumnDomain {
+                        expected_distinct: Some(point),
+                        guaranteed_distinct_upper: Some(100),
+                        provenance: DistinctProvenance::Derived,
+                    }],
+                    ..Default::default()
+                },
+                vec![ty],
+            ))
+        };
+        let original = make(3, LogicalType::Integer);
+        let equal = make(3, LogicalType::Integer);
+        let columns = original.column_statistics();
+        assert!(Arc::ptr_eq(&columns[0], &original.column_statistics()[0]));
+        assert_eq!(original, equal, "derived views are not evidence identity");
+        let replacement = make(7, LogicalType::Integer);
+        assert_ne!(original, replacement);
+        assert_eq!(columns[0].distinct_evidence().point, 3);
+        assert_eq!(
+            replacement.column_statistics()[0].distinct_evidence().point,
+            7
+        );
+        assert_eq!(columns[0].guaranteed_distinct_upper(), Some(100));
+        let reference = BoundReference::new(
+            BoundReferenceId::input_ordinal(0),
+            vec![ColumnBinding::new(0, 0)],
+            vec![LogicalType::Integer],
+        )
+        .with_facts(original.clone())
+        .unwrap();
+        assert!(Arc::ptr_eq(&reference.column_statistics()[0], &columns[0]));
+        assert!(reference.with_facts(make(3, LogicalType::BigInt)).is_err());
+        // Destruction of the source snapshot cannot invalidate a published
+        // read-only column handle, or mutate another evidence generation.
+        let retained = columns[0].clone();
+        drop(original);
+        assert_eq!(retained.distinct_evidence().point, 3);
+    }
 
     #[test]
     fn distribution_transport_has_a_value_identity_and_never_becomes_a_bound() {
@@ -310,10 +411,13 @@ mod tests {
             vec![ColumnBinding::new(7, 0)],
             vec![LogicalType::Double],
         );
-        reference.facts = Arc::new(BoundRelationFacts {
-            column_values: vec![Some(values)],
-            ..BoundRelationFacts::default()
-        });
+        reference.facts = Arc::new(BoundRelationFacts::new(
+            BoundRelationFactValues {
+                column_values: vec![Some(values)],
+                ..BoundRelationFactValues::default()
+            },
+            vec![LogicalType::Double],
+        ));
         let restored = reference.column_statistics().remove(0);
         assert_eq!(
             restored.estimated_numeric_distribution(),

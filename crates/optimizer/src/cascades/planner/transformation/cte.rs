@@ -833,7 +833,14 @@ mod tests {
         let LogicalOperator::BoundReference(producer) = &mut cte.cte_query.operator else {
             panic!("lost group hole")
         };
-        Arc::make_mut(&mut producer.facts).can_replay = false;
+        let mut values = producer.facts.values().clone();
+        values.can_replay = false;
+        producer.facts = Arc::new(
+            paro_planner::operator::bound_reference::BoundRelationFacts::new(
+                values,
+                producer.types().to_vec(),
+            ),
+        );
         let original_holes = plan.group_holes.clone();
         assert!(requirement
             .inline(plan.plan, &mut plan.group_holes, &input.bind_context)
@@ -1707,7 +1714,7 @@ impl CteRequirement {
                 key.layout.bindings().to_vec(),
                 key.layout.types().to_vec(),
             )
-            .with_facts(transport);
+            .with_facts(transport)?;
             holes.insert(reference_id, key.group);
             let input = OwnedLogicalPlan::new(bind, LogicalOperator::BoundReference(reference));
             let project = OwnedLogicalPlan::new(
@@ -1825,9 +1832,9 @@ impl CteRequirement {
             let input = paro_planner::operator::BoundReference::new(
                 paro_planner::operator::BoundReferenceId::group_hole(bind_context.next_plan_id().0),
                 producer.bindings.clone(),
-                producer.types.clone(),
+                producer.types().to_vec(),
             )
-            .with_facts(producer.facts.clone());
+            .with_facts(producer.facts.clone())?;
             holes.insert(input.reference_id, self.producer);
             let mut input_plan =
                 OwnedLogicalPlan::new(bind_context, LogicalOperator::BoundReference(input));

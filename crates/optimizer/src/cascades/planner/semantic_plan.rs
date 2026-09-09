@@ -59,7 +59,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
             layout.types().to_vec(),
         );
         if let Some(facts) = facts {
-            reference = reference.with_facts(facts);
+            reference = reference.with_facts(facts)?;
         }
         let unique_keys = reference.facts.unique_keys.clone();
         let mut plan = OwnedLogicalPlan::new(

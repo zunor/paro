@@ -303,7 +303,8 @@ impl SettlementCache {
             fact.layout.bindings().to_vec(),
             fact.layout.types().to_vec(),
         );
-        let mut domain = paro_planner::operator::bound_reference::BoundRelationFacts::default();
+        let mut domain =
+            paro_planner::operator::bound_reference::BoundRelationFactValues::default();
         domain.cardinality = fact.stats.estimated_cardinality;
         domain.maximum_cardinality = fact.maximum;
         domain.unique_keys = fact.stats.unique_keys.clone();
@@ -334,7 +335,12 @@ impl SettlementCache {
                     .map(Some)
             })
             .collect::<Result<Vec<_>>>()?;
-        reference.facts = Arc::new(domain);
+        reference.facts = Arc::new(
+            paro_planner::operator::bound_reference::BoundRelationFacts::new(
+                domain,
+                fact.layout.types().to_vec(),
+            ),
+        );
         Ok(OwnedLogicalPlan {
             id: PlanNodeId::SYNTHETIC,
             stats: fact.stats.clone(),

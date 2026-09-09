@@ -314,7 +314,7 @@ impl LogicalPlanDeepCopy {
                 let mut copied = crate::operator::BoundReference::new(
                     reference.reference_id,
                     reference.bindings.clone(),
-                    reference.types.clone(),
+                    reference.types().to_vec(),
                 );
                 copied.facts = reference.facts.clone();
                 LogicalOperator::BoundReference(copied)

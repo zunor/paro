@@ -6,7 +6,9 @@
 use super::*;
 use crate::cascades::scalar::ScalarKind;
 use paro_common::runtime_value::Value;
-use paro_planner::operator::bound_reference::{BoundRelationFacts, BoundSourceColumn};
+use paro_planner::operator::bound_reference::{
+    BoundRelationFactValues, BoundRelationFacts, BoundSourceColumn,
+};
 use paro_planner::plan::{UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, UniqueKeyProvenance};
 
 #[cfg(test)]
@@ -78,6 +80,14 @@ struct GroupFactValue {
 struct GroupFacts {
     value: GroupFactValue,
     fingerprint: std::sync::OnceLock<Fingerprint>,
+    transports: std::sync::Mutex<HashMap<u64, Vec<BoundaryTransport>>>,
+}
+
+#[derive(Debug)]
+struct BoundaryTransport {
+    layout: PlannerBindingLayout,
+    columns: Box<[ColumnId]>,
+    facts: Arc<BoundRelationFacts>,
 }
 
 impl From<GroupFactValue> for GroupFacts {
@@ -85,6 +95,7 @@ impl From<GroupFactValue> for GroupFacts {
         Self {
             value,
             fingerprint: std::sync::OnceLock::new(),
+            transports: std::sync::Mutex::default(),
         }
     }
 }
@@ -803,42 +814,70 @@ impl BoundarySnapshot {
             .get(&group)
             .ok_or_else(|| paro_error::internal("unobserved Memo boundary"))?;
         let columns = layout_column_ids(state, layout)?;
+        // The immutable evidence value owns its typed views. Revision changes
+        // with the same value can reuse them; changed evidence cannot. Hashing
+        // indexes a collision bucket only, with the complete layout and column
+        // mapping compared before reuse (never an address-only cache key).
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        columns.hash(&mut hasher);
+        layout.bindings().hash(&mut hasher);
+        layout.types().hash(&mut hasher);
+        let key = hasher.finish();
+        let mut transports = facts
+            .transports
+            .lock()
+            .map_err(|_| paro_error::internal("boundary transport cache poisoned"))?;
+        if let Some(cached) = transports.get(&key).into_iter().flatten().find(|entry| {
+            entry.columns.as_ref() == columns && entry.layout.as_ref() == layout.as_ref()
+        }) {
+            return Ok(cached.facts.clone());
+        }
         let unique_keys = facts.keys_in_layout(layout, &columns);
         let grouping_unique_keys = unique_keys
             .iter()
             .filter(|key| key.null_semantics == UniqueKeyNullSemantics::NullsEqual)
             .cloned()
             .collect();
-        Ok(Arc::new(BoundRelationFacts {
-            can_replay: facts.can_replay,
-            cardinality: self.cardinality(memo, group),
-            maximum_cardinality: facts.maximum_cardinality,
-            column_domains: columns
-                .iter()
-                .map(|column| {
-                    let domain = facts.column_domains.get(column);
-                    paro_planner::operator::bound_reference::BoundColumnDomain {
-                        expected_distinct: domain.and_then(|domain| domain.expected()),
-                        guaranteed_distinct_upper: domain
-                            .and_then(|domain| domain.guaranteed_upper),
-                        provenance: domain
-                            .map(|domain| domain.provenance)
-                            .unwrap_or(paro_storage::statistics::DistinctProvenance::Unknown),
-                    }
-                })
-                .collect(),
-            column_values: columns
-                .iter()
-                .map(|column| facts.column_values.get(column).cloned())
-                .collect(),
-            unique_keys,
-            grouping_unique_keys,
-            source_lineage: columns
-                .iter()
-                .map(|column| facts.lineage.get(column).cloned().flatten())
-                .collect(),
-            contains_control_region: facts.control,
-        }))
+        let transport = Arc::new(BoundRelationFacts::new(
+            BoundRelationFactValues {
+                can_replay: facts.can_replay,
+                cardinality: self.cardinality(memo, group),
+                maximum_cardinality: facts.maximum_cardinality,
+                column_domains: columns
+                    .iter()
+                    .map(|column| {
+                        let domain = facts.column_domains.get(column);
+                        paro_planner::operator::bound_reference::BoundColumnDomain {
+                            expected_distinct: domain.and_then(|domain| domain.expected()),
+                            guaranteed_distinct_upper: domain
+                                .and_then(|domain| domain.guaranteed_upper),
+                            provenance: domain
+                                .map(|domain| domain.provenance)
+                                .unwrap_or(paro_storage::statistics::DistinctProvenance::Unknown),
+                        }
+                    })
+                    .collect(),
+                column_values: columns
+                    .iter()
+                    .map(|column| facts.column_values.get(column).cloned())
+                    .collect(),
+                unique_keys,
+                grouping_unique_keys,
+                source_lineage: columns
+                    .iter()
+                    .map(|column| facts.lineage.get(column).cloned().flatten())
+                    .collect(),
+                contains_control_region: facts.control,
+            },
+            layout.types().to_vec(),
+        ));
+        transports.entry(key).or_default().push(BoundaryTransport {
+            layout: layout.clone(),
+            columns: columns.into_boxed_slice(),
+            facts: transport.clone(),
+        });
+        Ok(transport)
     }
 
     fn derive(

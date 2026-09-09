@@ -1056,7 +1056,7 @@ fn derive_local_output_layout<Child>(
             LogicalOutputLayout::for_table(get.table_index, get.returned_types.clone())
         }
         LogicalOperator::BoundReference(reference) => {
-            LogicalOutputLayout::new(reference.types.clone(), reference.bindings.clone())
+            LogicalOutputLayout::new(reference.types().to_vec(), reference.bindings.clone())
         }
         LogicalOperator::Filter(filter) => {
             required_output_layout(first, "filter child").project_for(&filter.projection_map, mode)

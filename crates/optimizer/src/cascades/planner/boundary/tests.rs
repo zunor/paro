@@ -133,6 +133,65 @@ fn native_predicate_statistics_follow_observed_input_facts_not_payload_snapshots
 }
 
 #[test]
+fn boundary_transports_are_typed_immutable_views_of_one_fact_value() {
+    let mut input = input(project(source(0), 9), SearchBudget::default());
+    let expr = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let logical = input.memo.logical_expr(expr).unwrap();
+    let child = logical.key.children[0];
+    let column = input.memo.group(child).unwrap().schema.columns()[0].id;
+    let state = input.planner_state.read().unwrap();
+    let layout = state.metadata[&logical.payload].child_layouts[0].clone();
+    let binding = PatternOperand::Expression {
+        group: input.root,
+        expression: expr,
+        children: Box::new([PatternOperand::Group(child)]),
+    };
+    let mut prior = None;
+    for point in [3, 7] {
+        input
+            .memo
+            .group_mut(child)
+            .unwrap()
+            .logical_properties
+            .column_domains
+            .insert(column, GroupColumnDomain::new(Some(point), None).unwrap());
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let snapshot = BoundarySnapshot::read(
+            &mut context,
+            &state,
+            &binding,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .unwrap();
+        let transport = snapshot
+            .transport(context.memo(), &state, child, &layout)
+            .unwrap();
+        let same_layout = Arc::new(layout.as_ref().clone());
+        let reused = snapshot
+            .transport(context.memo(), &state, child, &same_layout)
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&transport, &reused),
+            "layout value, not its allocation, owns transport identity"
+        );
+        assert!(Arc::ptr_eq(
+            &transport.column_statistics()[0],
+            &reused.column_statistics()[0]
+        ));
+        assert_eq!(
+            transport.column_statistics()[0].distinct_evidence().point,
+            point
+        );
+        if let Some(prior) = prior {
+            assert!(!Arc::ptr_eq(&transport, &prior));
+            assert_eq!(prior.column_statistics()[0].distinct_evidence().point, 3);
+        }
+        prior = Some(transport);
+    }
+}
+
+#[test]
 fn native_column_evidence_keeps_distribution_without_an_ndv_point() {
     use paro_storage::statistics::{BaseStatistics, EstimatedNumericDistribution};
     let distribution = EstimatedNumericDistribution::normal(30.0, 4.0).unwrap();

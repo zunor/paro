@@ -1288,7 +1288,9 @@ mod tests {
 
     #[test]
     fn memo_relation_uses_its_domain_instead_of_the_original_shell_snapshot() {
-        use paro_planner::operator::bound_reference::{BoundColumnDomain, BoundRelationFacts};
+        use paro_planner::operator::bound_reference::{
+            BoundColumnDomain, BoundRelationFactValues, BoundRelationFacts,
+        };
         use paro_planner::operator::BoundReference;
         let session = make_test_session();
         let context = BindContext::new();
@@ -1298,15 +1300,18 @@ mod tests {
             vec![binding],
             vec![LogicalType::Integer],
         );
-        reference.facts = Arc::new(BoundRelationFacts {
-            cardinality: Some(CardinalityEstimate::exact(100)),
-            column_domains: vec![BoundColumnDomain {
-                expected_distinct: Some(17),
-                guaranteed_distinct_upper: Some(20),
-                provenance: DistinctProvenance::Derived,
-            }],
-            ..BoundRelationFacts::default()
-        });
+        reference.facts = Arc::new(BoundRelationFacts::new(
+            BoundRelationFactValues {
+                cardinality: Some(CardinalityEstimate::exact(100)),
+                column_domains: vec![BoundColumnDomain {
+                    expected_distinct: Some(17),
+                    guaranteed_distinct_upper: Some(20),
+                    provenance: DistinctProvenance::Derived,
+                }],
+                ..BoundRelationFactValues::default()
+            },
+            reference.types().to_vec(),
+        ));
         let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference));
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(100));
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());

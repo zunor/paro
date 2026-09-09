@@ -261,6 +261,30 @@ contract covers aggregate/window modifier edges and short-circuits errors.
 Tests cover a 2^50-occurrence shared DAG, 10,000-deep scalar, repeated local
 bindings, correlated bindings, unchanged siblings and idempotent substitution.
 
+At `34bcea6a`, five normal processes give median EXPLAIN **706.872 ms**,
+optimizer 701.766 ms and RSS 263,995,392 bytes. Plan and all old search
+counters are unchanged; settlement imports improve to 13,699 hits / 5,785
+misses, planner imports to 6,999 / 5,478. There is no search-budget change.
+
+## Typed immutable boundary views
+
+Bound relation facts now have a mutable construction value and a separate
+immutable publication object. The publication owns the aligned type domain
+and lazily derived column-statistics handles. A bound reference reads its
+types from that object, not a second independently mutable vector. Attaching
+facts with a different type domain is a diagnosed contract error. Replacing
+evidence creates a new publication; there is no cache requiring callers to
+remember to invalidate public mutable fields.
+
+Each immutable Memo fact value also owns its layout-specific transport views.
+An internal hash indexes collision buckets; complete column mappings and
+layout values establish equality. Fresh layout allocations with the same
+content reuse the view, while changed evidence cannot reuse old statistics.
+Views are neither keyed by unguarded addresses nor retained by a global cache.
+Tests check shared handles, evidence replacement, typed attachment rejection,
+layout-value reuse and real Memo evidence mutation. All 1,053 optimizer and
+289 planner tests and strict workspace/all-target Clippy pass.
+
 ## Immutable source-response payloads
 
 Candidates now share immutable source-work snapshots. Ordinary parent
