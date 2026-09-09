@@ -2757,6 +2757,7 @@ impl Memo {
         // so their intersection is valid for the complete equivalence class.
         canonical_group.logical_properties = merged_logical_properties;
         canonical_group.cardinality = merged_cardinality;
+        secondary_group.cardinality = GroupCardinality::default();
         canonical_group.ledger.merge_from(&secondary_group.ledger);
         canonical_group
             .logical_exprs
