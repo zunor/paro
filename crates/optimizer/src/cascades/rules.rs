@@ -351,15 +351,24 @@ impl<'a> TransformContext<'a> {
             .memo
             .group_ledger_mut(self.group)
             .ok_or_else(|| paro_error::internal("fact reader lost its owner"))?;
-        let mut event = StableFingerprintBuilder::default();
-        event.write_bytes(b"paro.memo.fact-read-work.v1");
-        event.write_u64(self.group.0 as u64);
-        event.write_u64(ledger.consumed(dimension) as u64);
-        Ok(ledger.admit_optional_units(
+        let decision = ledger.admit_executed_work(
             dimension,
-            event.finish(),
             u32::try_from(units).unwrap_or(u32::MAX),
-        ) != super::budget::BudgetDecision::Exhausted)
+            |consumed| {
+                let mut event = StableFingerprintBuilder::default();
+                event.write_bytes(b"paro.memo.fact-read-work.v1");
+                event.write_u64(self.group.0 as u64);
+                event.write_u64(consumed as u64);
+                event.finish()
+            },
+        );
+        match decision {
+            super::budget::BudgetDecision::Allowed => Ok(true),
+            super::budget::BudgetDecision::Exhausted => Ok(false),
+            _ => Err(paro_error::internal(
+                "fact work requires a configured occurrence budget",
+            )),
+        }
     }
 
     pub fn record_fact_read(&mut self, read: PatternRead) {

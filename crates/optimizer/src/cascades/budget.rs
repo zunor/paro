@@ -281,10 +281,12 @@ pub enum BudgetDecision {
     Unconfigured,
 }
 
-/// Optional budget consumption is keyed by stable semantic events. Replaying a
-/// task or merging groups cannot manufacture fresh credit.
+/// Optional candidate reservations have semantic identities. Executed work
+/// instead has monotone occurrence meters. Neither replaying a task nor
+/// merging groups can manufacture fresh credit.
 #[derive(Debug)]
 pub struct SearchLedger {
+    owner: u64,
     budget: Arc<SearchBudget>,
     limit_overrides: BTreeMap<BudgetDimension, u32>,
     consumed: BTreeMap<BudgetDimension, BudgetUsage>,
@@ -323,13 +325,9 @@ struct LedgerJournal {
 }
 
 impl LedgerJournal {
-    fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+    fn new(owner: u64) -> Self {
         Self {
-            owner: NEXT_OWNER
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                .expect("search ledger identity space exhausted"),
+            owner,
             revision: 0,
             changes: Vec::new(),
         }
@@ -351,13 +349,31 @@ impl LedgerJournal {
 /// a query-global group budget admits another node.
 #[derive(Debug, Clone, Default)]
 struct BudgetUsage {
+    /// Refundable reservations for distinct semantic tasks.
     units: u32,
     events: BTreeMap<Fingerprint, u32>,
+    /// Actual work is not an idempotent task. Meter one monotone prefix per
+    /// originating ledger, not an event per visit. Origin prefixes make
+    /// repeated/transitive group merges idempotent without forgetting work
+    /// executed before a transaction was rolled back.
+    executed_units: u32,
+    executed: BTreeMap<u64, u32>,
+}
+
+impl BudgetUsage {
+    fn total(&self) -> u32 {
+        self.units.saturating_add(self.executed_units)
+    }
 }
 
 impl SearchLedger {
     pub fn new(budget: impl Into<Arc<SearchBudget>>) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
         Self {
+            owner: NEXT_OWNER
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("search ledger identity space exhausted"),
             budget: budget.into(),
             limit_overrides: BTreeMap::new(),
             consumed: BTreeMap::new(),
@@ -400,7 +416,7 @@ impl SearchLedger {
         // homogeneous batch. Charge only the newly observed suffix; silently
         // treating it as a duplicate would make the budget non-conservative.
         let additional = units - previous;
-        if usage.units.saturating_add(additional) > limit {
+        if additional > limit.saturating_sub(usage.total()) || usage.total() > limit {
             self.exhaustion_events.insert((dimension, event));
             return BudgetDecision::Exhausted;
         }
@@ -417,10 +433,39 @@ impl SearchLedger {
         BudgetDecision::Allowed
     }
 
+    /// Admit real traversal/allocation work before it occurs. Each call is a
+    /// new occurrence; it cannot be refunded or deduplicated like a candidate
+    /// reservation. Only a rejected admission needs a diagnostic identity.
+    /// The callback keeps stable omission evidence out of the admitted hot path.
+    pub fn admit_executed_work(
+        &mut self,
+        dimension: BudgetDimension,
+        units: u32,
+        exhaustion_event: impl FnOnce(u32) -> Fingerprint,
+    ) -> BudgetDecision {
+        if units == 0 {
+            return BudgetDecision::Allowed;
+        }
+        let Some(limit) = self.limit(dimension) else {
+            return BudgetDecision::Unconfigured;
+        };
+        let usage = self.consumed.entry(dimension).or_default();
+        let total = usage.total();
+        if units > limit.saturating_sub(total) || total > limit {
+            self.exhaustion_events
+                .insert((dimension, exhaustion_event(total)));
+            return BudgetDecision::Exhausted;
+        }
+        let prefix = usage.executed.entry(self.owner).or_default();
+        *prefix = prefix.saturating_add(units);
+        usage.executed_units = usage.executed_units.saturating_add(units);
+        BudgetDecision::Allowed
+    }
+
     pub fn consumed(&self, dimension: BudgetDimension) -> usize {
         self.consumed
             .get(&dimension)
-            .map_or(0, |usage| usage.units as usize)
+            .map_or(0, |usage| usage.total() as usize)
     }
 
     pub fn set_limit(&mut self, dimension: BudgetDimension, limit: u32) {
@@ -480,6 +525,14 @@ impl SearchLedger {
     pub fn merge_from(&mut self, other: &Self) {
         for (&dimension, usage) in &other.consumed {
             let target = self.consumed.entry(dimension).or_default();
+            for (&owner, &prefix) in &usage.executed {
+                let existing = target.executed.entry(owner).or_default();
+                if prefix > *existing {
+                    target.executed_units =
+                        target.executed_units.saturating_add(prefix - *existing);
+                    *existing = prefix;
+                }
+            }
             for (&event, &units) in &usage.events {
                 let existing = target.events.entry(event).or_default();
                 if units > *existing {
@@ -511,7 +564,9 @@ impl SearchLedger {
     /// Restore reservations to a transactional savepoint while retaining
     /// evidence that the abandoned attempt reached a search boundary.
     pub(crate) fn checkpoint(&mut self) -> LedgerCheckpoint {
-        let journal = self.journal.get_or_insert_with(LedgerJournal::new);
+        let journal = self
+            .journal
+            .get_or_insert_with(|| LedgerJournal::new(self.owner));
         LedgerCheckpoint {
             owner: journal.owner,
             length: journal.changes.len(),
@@ -684,6 +739,139 @@ mod tests {
             ledger.admit_optional_units(BudgetDimension::RuleWorkPerGroup, Fingerprint(11), 1,),
             BudgetDecision::Allowed
         );
+    }
+
+    #[test]
+    fn actual_work_is_metered_without_events_or_refundable_credit() {
+        let dimension = BudgetDimension::RuleWorkPerGroup;
+        let mut ledger = SearchLedger::new(SearchBudget::default());
+        ledger.set_limit(dimension, 10);
+        let origin = ledger.checkpoint();
+        for _ in 0..3 {
+            assert_eq!(
+                ledger.admit_executed_work(dimension, 2, |_| panic!("allowed work has no event")),
+                BudgetDecision::Allowed
+            );
+        }
+        assert_eq!(ledger.consumed(dimension), 6);
+        assert_eq!(ledger.consumed[&dimension].executed.len(), 1);
+        assert!(ledger.consumed[&dimension].events.is_empty());
+        assert_eq!(ledger.checkpoint().length, origin.length);
+        assert_eq!(
+            ledger.admit_optional_units(dimension, Fingerprint(1), 3),
+            BudgetDecision::Allowed
+        );
+        assert_eq!(ledger.consumed(dimension), 9);
+        assert_eq!(
+            ledger.admit_executed_work(dimension, 2, |used| Fingerprint(u128::from(used))),
+            BudgetDecision::Exhausted
+        );
+        assert_eq!(ledger.consumed(dimension), 9);
+        ledger.rollback_to_preserving_exhaustion(origin).unwrap();
+        assert_eq!(ledger.consumed(dimension), 6);
+        assert_eq!(
+            ledger.exhaustion_events().copied().collect::<Vec<_>>(),
+            vec![(dimension, Fingerprint(9))]
+        );
+        assert!(!ledger.release_optional_reservation(dimension, Fingerprint(1)));
+        assert_eq!(
+            ledger.admit_executed_work(dimension, 4, |_| panic!("exact fit")),
+            BudgetDecision::Allowed
+        );
+        assert_eq!(
+            ledger.admit_optional(dimension, Fingerprint(2)),
+            BudgetDecision::Exhausted
+        );
+    }
+
+    #[test]
+    fn work_prefix_union_survives_merge_cycles_and_rollback() {
+        let dimension = BudgetDimension::RuleWorkPerGroup;
+        let mut left = SearchLedger::new(SearchBudget::default());
+        let mut right = SearchLedger::new(SearchBudget::default());
+        let mut third = SearchLedger::new(SearchBudget::default());
+        assert_ne!(left.owner, right.owner);
+        left.admit_executed_work(dimension, 3, |_| panic!("enough credit"));
+        right.admit_executed_work(dimension, 4, |_| panic!("enough credit"));
+        let checkpoint = left.checkpoint();
+        left.merge_from(&right);
+        left.merge_from(&right);
+        assert_eq!(left.consumed(dimension), 7);
+        third.merge_from(&left);
+        third.merge_from(&right);
+        assert_eq!(third.consumed(dimension), 7);
+        right.admit_executed_work(dimension, 1, |_| panic!("enough credit"));
+        left.merge_from(&right);
+        assert_eq!(left.consumed(dimension), 8);
+        left.admit_executed_work(dimension, 1, |_| panic!("enough credit"));
+        right.merge_from(&left);
+        assert_eq!(right.consumed(dimension), 9);
+        right.admit_executed_work(dimension, 1, |_| panic!("enough credit"));
+        third.merge_from(&right);
+        left.merge_from(&third);
+        assert_eq!(left.consumed(dimension), 10);
+        left.rollback_to_preserving_exhaustion(checkpoint).unwrap();
+        assert_eq!(
+            left.consumed(dimension),
+            10,
+            "physical work cannot be undone"
+        );
+        assert_eq!(left.consumed[&dimension].executed.len(), 2);
+        assert!(left.consumed[&dimension].events.is_empty());
+    }
+
+    #[test]
+    fn work_admission_matches_an_independent_occurrence_ledger() {
+        let dimension = BudgetDimension::RuleWorkPerGroup;
+        for limit in [0, 1, 7, 31, u32::MAX] {
+            let mut ledger = SearchLedger::new(SearchBudget::default());
+            ledger.set_limit(dimension, limit);
+            let mut actual = 0_u64;
+            let mut reservations = BTreeMap::<u128, u32>::new();
+            for step in 0..150_u32 {
+                let key = u128::from(step % 11);
+                let units = if step == 149 { u32::MAX } else { step % 5 + 1 };
+                if step % 3 == 0 {
+                    ledger.release_optional_reservation(dimension, Fingerprint(key));
+                    reservations.remove(&key);
+                } else {
+                    let reserved: u64 = reservations.values().map(|value| u64::from(*value)).sum();
+                    let work = step % 3 == 1;
+                    let old = if work {
+                        0
+                    } else {
+                        reservations.get(&key).copied().unwrap_or(0)
+                    };
+                    let extra = u64::from(units.saturating_sub(old));
+                    let expected = if units <= old {
+                        BudgetDecision::Duplicate
+                    } else if actual + reserved + extra > u64::from(limit) {
+                        BudgetDecision::Exhausted
+                    } else {
+                        BudgetDecision::Allowed
+                    };
+                    let decision = if work {
+                        ledger.admit_executed_work(dimension, units, |_| Fingerprint(key))
+                    } else {
+                        ledger.admit_optional_units(dimension, Fingerprint(key), units)
+                    };
+                    assert_eq!(decision, expected, "limit {limit}, step {step}");
+                    if decision == BudgetDecision::Allowed {
+                        if work {
+                            actual += extra;
+                        } else {
+                            reservations.insert(key, units);
+                        }
+                    }
+                }
+                let total = actual
+                    + reservations
+                        .values()
+                        .map(|value| u64::from(*value))
+                        .sum::<u64>();
+                assert_eq!(ledger.consumed(dimension) as u64, total);
+            }
+        }
     }
 
     #[test]

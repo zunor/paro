@@ -170,6 +170,28 @@ ceilings in both insertion orders; exhaustive parent selection is its oracle.
 Another test covers 8,192 singleton anchors inside a required region. All 1,042
 optimizer tests pass; normal timing follows this commit.
 
+Five normal processes at `76e475ff`: median EXPLAIN **966.227 ms**, optimizer
+961.552 ms, RSS 283,312,128 bytes. Every search counter matches `07b6a0b2`,
+including groups, logical/physical expressions, bindings, settlements,
+proposals, frontier distribution, and all omission counts. Rule-attributed
+time falls from 661.3 to 461.0 ms in the respective median samples. The source
+payload-sharing revision itself had reduced RSS to 276,086,784 bytes.
+
+## Occurrence work is not a semantic reservation
+
+Fact reads previously hashed `(group, consumed credit)` and kept a distinct
+event-map entry at every admission, despite each read being new actual work.
+The ledger now distinguishes refundable, idempotent candidate reservations
+from nonrefundable executed-work meters. Each originating ledger contributes
+one monotone prefix per dimension. Merging prefixes takes their maximum;
+different origins add. Repeated and transitive group merges therefore cannot
+duplicate credit or double-charge the same executed prefix. Rollback preserves
+executed work and omission evidence while restoring candidate reservations.
+Successful fact-work admission hashes/stores no event; only failure constructs
+the same stable diagnostic witness as before. Budget limits and charged units
+are unchanged. Independent scalar accounting covers mixed reservations,
+execution, refunds, zero/max limits, merge cycles and rollback.
+
 ## Immutable source-response payloads
 
 Candidates now share immutable source-work snapshots. Ordinary parent
