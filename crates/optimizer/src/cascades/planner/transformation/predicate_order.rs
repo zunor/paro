@@ -6,10 +6,10 @@
 
 use super::*;
 
-pub(super) fn permutation(
+pub(super) fn permutation<'a>(
     roots: &[ScalarExprId],
-    state: &PlannerTransformState,
-    statistics: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    state: &'a PlannerTransformState,
+    statistics: impl Fn(ColumnId) -> Option<crate::cost_model::ColumnPredicateEvidence<'a>>,
     control: &crate::cascades::control::SearchControl,
 ) -> Result<Option<Box<[usize]>>> {
     if !control.checkpoint()? {
@@ -40,7 +40,7 @@ pub(super) fn permutation(
                 root,
                 &state.scalars,
                 &state.binding_ids,
-                statistics,
+                &statistics,
                 || control.checkpoint(),
             )?
             else {
@@ -125,21 +125,16 @@ mod tests {
             state.scalars.len(),
             state.columns.len(),
         );
-        let order = permutation(
-            &root.key.scalars,
-            &state,
-            &HashMap::new(),
-            input.memo.control(),
-        )
-        .unwrap()
-        .unwrap();
+        let order = permutation(&root.key.scalars, &state, |_| None, input.memo.control())
+            .unwrap()
+            .unwrap();
         assert_eq!(&*order, &[1, 0, 2, 4, 5, 3]);
         let ordered: Vec<_> = order
             .iter()
             .map(|&ordinal| root.key.scalars[ordinal])
             .collect();
         assert!(
-            permutation(&ordered, &state, &HashMap::new(), input.memo.control())
+            permutation(&ordered, &state, |_| None, input.memo.control())
                 .unwrap()
                 .is_none()
         );

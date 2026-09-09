@@ -1098,7 +1098,17 @@ mod tests {
                 .unwrap();
             let before = arena.len();
             let native = model
-                .estimate_native_selectivity(root, &arena, &bindings, &stats, || Ok(true))
+                .estimate_native_selectivity(
+                    root,
+                    &arena,
+                    &bindings,
+                    |column| {
+                        stats
+                            .get(&bindings.relation_binding(column)?)
+                            .map(|s| s.as_ref().into())
+                    },
+                    || Ok(true),
+                )
                 .unwrap()
                 .unwrap();
             let bound = model.estimate_selectivity(&expression, &stats);
@@ -1129,7 +1139,7 @@ mod tests {
         }
         assert_eq!(
             model
-                .estimate_native_selectivity(root, &arena, &bindings, &stats, || Ok(true))
+                .estimate_native_selectivity(root, &arena, &bindings, |_| None, || Ok(true))
                 .unwrap(),
             Some(0.0)
         );
@@ -1140,7 +1150,6 @@ mod tests {
         let model = crate::cost_model::CostModel::default();
         let mut arena = ScalarArena::default();
         let bindings = BindingCatalog::default();
-        let stats = HashMap::new();
         for kind in [ScalarKind::And, ScalarKind::Or] {
             let mut root = arena
                 .intern(ScalarSpec {
@@ -1165,10 +1174,16 @@ mod tests {
             let mut full_work = 0;
             assert_eq!(
                 model
-                    .estimate_native_selectivity(root, &arena, &bindings, &stats, || {
-                        full_work += 1;
-                        Ok(true)
-                    })
+                    .estimate_native_selectivity(
+                        root,
+                        &arena,
+                        &bindings,
+                        |_| None,
+                        || {
+                            full_work += 1;
+                            Ok(true)
+                        }
+                    )
                     .unwrap(),
                 Some(0.0)
             );
@@ -1176,18 +1191,28 @@ mod tests {
             for limit in 0..full_work {
                 let mut reads = 0;
                 let result = model
-                    .estimate_native_selectivity(root, &arena, &bindings, &stats, || {
-                        reads += 1;
-                        Ok(reads <= limit)
-                    })
+                    .estimate_native_selectivity(
+                        root,
+                        &arena,
+                        &bindings,
+                        |_| None,
+                        || {
+                            reads += 1;
+                            Ok(reads <= limit)
+                        },
+                    )
                     .unwrap();
                 assert!(result.is_none(), "partial estimate published at {limit}");
                 assert_eq!(reads, limit + 1);
             }
             assert!(model
-                .estimate_native_selectivity(root, &arena, &bindings, &stats, || {
-                    Err(paro_error::internal("injected cancellation"))
-                })
+                .estimate_native_selectivity(
+                    root,
+                    &arena,
+                    &bindings,
+                    |_| None,
+                    || { Err(paro_error::internal("injected cancellation")) }
+                )
                 .is_err());
         }
     }

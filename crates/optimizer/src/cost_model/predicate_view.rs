@@ -5,10 +5,32 @@
 //! Native operands stay in their arena; no executable expression is exported.
 
 use super::*;
-use crate::cascades::ids::ScalarExprId;
+use crate::cascades::ids::{ColumnId, ScalarExprId};
 use crate::cascades::scalar::{ComparisonOp, ScalarArena, ScalarKind};
 use crate::cascades::BindingCatalog;
 use paro_external::routine::identity::RoutineCallIdentity;
+use paro_storage::statistics::{BaseStatistics, EstimatedNumericDistribution};
+
+/// Borrowed costing evidence, not an allocation containing a reconstructed
+/// storage sketch. A ranking point and a value distribution are independent
+/// facets; neither absence may erase the other. No field here proves an NDV
+/// upper bound or a complete storage observation.
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnPredicateEvidence<'a> {
+    pub(crate) point: Option<u64>,
+    pub(crate) values: Option<&'a BaseStatistics>,
+    pub(crate) distribution: Option<EstimatedNumericDistribution>,
+}
+
+impl<'a> From<&'a ColumnStatistics> for ColumnPredicateEvidence<'a> {
+    fn from(column: &'a ColumnStatistics) -> Self {
+        Self {
+            point: Some(column.distinct_evidence().point).filter(|point| *point != 0),
+            values: Some(column.statistics()),
+            distribution: column.estimated_numeric_distribution(),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum PredicateKind<'a, Node> {
@@ -40,7 +62,7 @@ pub(super) trait PredicateView<'a> {
     fn operator_child(&self, node: Self::Node, index: usize) -> Option<Self::Node>;
     fn operator_child_count(&self, node: Self::Node) -> usize;
     fn binding(&self, node: Self::Node) -> Option<ColumnBinding>;
-    fn statistics(&self, node: Self::Node) -> Option<&'a ColumnStatistics>;
+    fn statistics(&self, node: Self::Node) -> Option<ColumnPredicateEvidence<'a>>;
     fn unresolved_column(&self, _node: Self::Node) -> bool {
         false
     }
@@ -136,8 +158,8 @@ impl<'a> PredicateView<'a> for StatisticsResolver<'a> {
         StatisticsResolver::binding(self, node)
     }
 
-    fn statistics(&self, node: Self::Node) -> Option<&'a ColumnStatistics> {
-        self.get(node).map(Arc::as_ref)
+    fn statistics(&self, node: Self::Node) -> Option<ColumnPredicateEvidence<'a>> {
+        self.get(node).map(|column| column.as_ref().into())
     }
 
     fn unresolved_column(&self, node: Self::Node) -> bool {
@@ -146,13 +168,15 @@ impl<'a> PredicateView<'a> for StatisticsResolver<'a> {
     }
 }
 
-pub(crate) struct NativePredicateView<'a> {
+pub(crate) struct NativePredicateView<'a, F> {
     pub(crate) arena: &'a ScalarArena,
     pub(crate) bindings: &'a BindingCatalog,
-    pub(crate) column_stats: &'a HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    pub(crate) column_stats: F,
 }
 
-impl<'a> PredicateView<'a> for NativePredicateView<'a> {
+impl<'a, F: Fn(ColumnId) -> Option<ColumnPredicateEvidence<'a>>> PredicateView<'a>
+    for NativePredicateView<'a, F>
+{
     type Node = ScalarExprId;
     type Key = ScalarExprId;
 
@@ -241,8 +265,11 @@ impl<'a> PredicateView<'a> for NativePredicateView<'a> {
         self.bindings.relation_binding(column)
     }
 
-    fn statistics(&self, node: Self::Node) -> Option<&'a ColumnStatistics> {
-        self.column_stats.get(&self.binding(node)?).map(Arc::as_ref)
+    fn statistics(&self, node: Self::Node) -> Option<ColumnPredicateEvidence<'a>> {
+        let ScalarKind::Column(column) = self.arena.get(node)?.kind else {
+            return None;
+        };
+        (self.column_stats)(column)
     }
 
     fn single_binding(&self, node: Self::Node) -> Option<ColumnBinding> {

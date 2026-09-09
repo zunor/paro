@@ -527,3 +527,31 @@ and fence cases, 10,000-level shared AND/OR graphs on a 256 KiB stack, a volatil
 occurrence counterexample, and every interruption prefix of two shared native
 DAGs. Full workspace **6498 passed / 85 ignored**. Cold/SQL and execution
 measurements for this change are still pending; no search budget was changed.
+
+At `c8508141`, `native-q11-cold-native-predicate-analysis-20260909.json`
+records median **1435.703 ms**, RSS **350,552,064 bytes**, with every search
+counter identical to the isolated-seed baseline. The unchanged strict gate
+**fails** (wall/optimizer time 1.060x, RSS 1.003x); this is not a demonstrated
+speedup. The separate instrumented report
+`native-q11-allocation-native-predicate-analysis-20260909.json` attributes
+**2,318,937,763 bytes** of allocation traffic to Memo exploration. Rule-attempt
+time is led by predicate transfer (225.496 ms), join-region enumeration
+(129.553 ms), dimension sharing (91.444 ms) and CTE partitioning (79.681 ms).
+Predicate ordering accounts for only 16.775 ms of this diagnostic run. These
+single-run instrumented times are attribution, not a latency comparison.
+
+### Borrowed, read-tracked selectivity evidence
+
+Native predicate analysis now resolves `ColumnId` directly against the observed
+input group's immutable evidence, rather than the source payload's old
+`ColumnStatistics` map. NDV ranking points, numeric bounds and aggregate
+distributions remain independent borrowed facets. Missing NDV does not erase a
+distribution, and no HLL or bound-reference transport is reconstructed. An
+unobserved group is rejected instead of silently falling back to a sidecar.
+
+A real Memo/fact-reader test keeps a deliberately stale payload estimate while
+updating the child domain twice: the child read invalidates and the native
+estimate follows each new point. A separate test retains a distribution without
+an NDV point. Optimizer **1029 tests**, full workspace **6500 passed / 85
+ignored**, and strict workspace/all-target Clippy pass. Post-change SQL/cold
+validation is pending for this follow-up.

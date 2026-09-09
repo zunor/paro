@@ -17,6 +17,7 @@ use paro_storage::statistics::{ColumnStatistics, NumericStats};
 const MIN_SELECTIVITY: f64 = 0.000_001;
 
 mod predicate_view;
+pub(crate) use predicate_view::ColumnPredicateEvidence;
 use predicate_view::{PredicateKind, PredicateView};
 
 #[derive(Debug)]
@@ -322,12 +323,12 @@ impl CostModel {
         Ok(estimates[&resolver.key(expr)])
     }
 
-    pub(crate) fn estimate_native_selectivity(
+    pub(crate) fn estimate_native_selectivity<'a>(
         &self,
         root: crate::cascades::ids::ScalarExprId,
-        arena: &crate::cascades::scalar::ScalarArena,
-        bindings: &crate::cascades::BindingCatalog,
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        arena: &'a crate::cascades::scalar::ScalarArena,
+        bindings: &'a crate::cascades::BindingCatalog,
+        column_stats: impl Fn(crate::cascades::ids::ColumnId) -> Option<ColumnPredicateEvidence<'a>>,
         checkpoint: impl FnMut() -> paro_common::error::Result<bool>,
     ) -> paro_common::error::Result<Option<f64>> {
         if arena.get(root).is_none() {
@@ -639,14 +640,14 @@ impl CostModel {
 
         match comparison_type {
             ComparisonType::Equal | ComparisonType::NotDistinctFrom => {
-                let distinct = stats.distinct_evidence().point;
+                let distinct = stats.point.unwrap_or(0);
                 if distinct == 0 {
                     return default;
                 }
                 (1.0 / distinct as f64).max(MIN_SELECTIVITY)
             }
             ComparisonType::NotEqual | ComparisonType::DistinctFrom => {
-                let distinct = stats.distinct_evidence().point;
+                let distinct = stats.point.unwrap_or(0);
                 if distinct == 0 {
                     return default;
                 }
@@ -703,7 +704,7 @@ impl CostModel {
         let Some(stats) = resolver.statistics(column) else {
             return clamp_selectivity(self.defaults.equality * probe_count);
         };
-        let distinct = stats.distinct_evidence().point;
+        let distinct = stats.point.unwrap_or(0);
         if distinct == 0 {
             return clamp_selectivity(self.defaults.equality * probe_count);
         }
@@ -720,7 +721,7 @@ impl CostModel {
         };
         let distinct = resolver
             .statistics(candidate)
-            .map(|stats| stats.distinct_evidence().point)
+            .and_then(|stats| stats.point)
             .unwrap_or(0);
         if distinct == 0 {
             self.defaults.equality
@@ -948,8 +949,8 @@ fn integral_range_constraint<'a, View: PredicateView<'a>>(
         column_constant_comparison(comparison, left, right, resolver)?;
     let binding = resolver.binding(column)?;
     let stats = resolver.statistics(column)?;
-    let minimum = ordered_integral_value(&NumericStats::min(stats.statistics())?)?;
-    let maximum = ordered_integral_value(&NumericStats::max(stats.statistics())?)?;
+    let minimum = ordered_integral_value(&NumericStats::min(stats.values?)?)?;
+    let maximum = ordered_integral_value(&NumericStats::max(stats.values?)?)?;
     let constant = ordered_integral_value(constant)?;
     if minimum.domain != maximum.domain
         || minimum.domain != constant.domain
@@ -1052,14 +1053,16 @@ impl IntegralIntervalEstimate {
 /// Integral domains use their exact number of representable values so that
 /// inclusive and exclusive predicates differ at the endpoints. Floating-point
 /// domains use the conventional continuous uniform approximation.
-fn estimate_range_selectivity(
-    stats: &ColumnStatistics,
+fn estimate_range_selectivity<'a>(
+    stats: impl Into<ColumnPredicateEvidence<'a>>,
     constant: &Value,
     comparison_type: ComparisonType,
 ) -> Option<f64> {
-    if let Some(distribution) = stats.estimated_numeric_distribution() {
+    let stats = stats.into();
+    let values = stats.values?;
+    if let Some(distribution) = stats.distribution {
         let constant =
-            crate::statistics::aggregate_filter::numeric_value(constant, stats.get_type())
+            crate::statistics::aggregate_filter::numeric_value(constant, values.get_type())
                 .filter(|value| value.is_finite())?;
         return crate::statistics::aggregate_filter::normal_comparison_selectivity(
             distribution.mean(),
@@ -1068,8 +1071,8 @@ fn estimate_range_selectivity(
             comparison_type,
         );
     }
-    let minimum = NumericStats::min(stats.statistics())?;
-    let maximum = NumericStats::max(stats.statistics())?;
+    let minimum = NumericStats::min(values)?;
+    let maximum = NumericStats::max(values)?;
 
     if let (Some(minimum), Some(maximum), Some(constant)) = (
         ordered_integral_value(&minimum),

@@ -407,11 +407,16 @@ impl TransformationRule for PlannerTransformationRule {
                 .memo()
                 .logical_expr(expr)
                 .ok_or_else(|| paro_error::internal("predicate ordering lost its root"))?;
-            let payload = &state.payloads.logical[source.payload.index()];
+            let [input] = source.key.children.as_ref() else {
+                return Err(paro_error::internal(
+                    "native filter has no unique input group",
+                ));
+            };
+            let columns = facts.columns(ctx.memo(), *input)?;
             let Some(order) = predicate_order::permutation(
                 &source.key.scalars,
                 &state,
-                &payload.column_stats,
+                |column| columns.selectivity(column),
                 ctx.memo().control(),
             )?
             else {

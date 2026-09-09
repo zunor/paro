@@ -112,6 +112,10 @@ impl BoundColumnValues {
         &self.statistics
     }
 
+    pub fn distribution(&self) -> Option<EstimatedNumericDistribution> {
+        self.distribution
+    }
+
     pub fn encoding(&self) -> &[u8] {
         &self.encoding
     }

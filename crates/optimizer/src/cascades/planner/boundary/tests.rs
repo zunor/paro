@@ -28,6 +28,123 @@ fn input(plan: OwnedLogicalPlan, budget: SearchBudget) -> OptimizationInput {
 }
 
 #[test]
+fn native_predicate_statistics_follow_observed_input_facts_not_payload_snapshots() {
+    use paro_planner::expression::{ComparisonExpression, ComparisonType};
+    use paro_planner::operator::{Filter, Get};
+    let binding = ColumnBinding::new(0, 0);
+    let predicate = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Integer).into()),
+            Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            ),
+        )
+        .into(),
+    );
+    let mut source = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+        Get::new_without_table(0, vec!["k".into()], vec![LogicalType::Integer]),
+    )));
+    source.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10));
+    let mut input = input(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            source,
+            vec![predicate],
+        ))),
+        SearchBudget::default(),
+    );
+    let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let expression = input.memo.logical_expr(root_expression).unwrap();
+    let child = expression.key.children[0];
+    let scalar = expression.key.scalars[0];
+    let payload = expression.payload;
+    let column = input.memo.group(child).unwrap().schema.columns()[0].id;
+    let pattern = PatternOperand::Expression {
+        group: input.root,
+        expression: root_expression,
+        children: Box::new([PatternOperand::Group(child)]),
+    };
+    // This stale sidecar describes neither observation below. Reading it
+    // instead of the subscribed Memo input would always estimate 1/100.
+    input.planner_state.write().unwrap().payloads.logical[payload.index()].column_stats =
+        Arc::new(HashMap::from([(
+            binding,
+            Arc::new(ColumnStatistics::with_estimated_distinct(
+                paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Integer),
+                Some(100),
+            )),
+        )]));
+    let state = input.planner_state.read().unwrap();
+    let mut previous_reads = Vec::<PatternRead>::new();
+    for point in [2, 5] {
+        input
+            .memo
+            .group_mut(child)
+            .unwrap()
+            .logical_properties
+            .column_domains
+            .insert(column, GroupColumnDomain::new(Some(point), None).unwrap());
+        if !previous_reads.is_empty() {
+            assert!(previous_reads
+                .iter()
+                .any(|read| !read.is_current(&input.memo).unwrap()));
+        }
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let snapshot = BoundarySnapshot::read(
+            &mut context,
+            &state,
+            &pattern,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .unwrap();
+        let columns = snapshot.columns(context.memo(), child).unwrap();
+        let native = state
+            .cost_model
+            .estimate_native_selectivity(
+                scalar,
+                &state.scalars,
+                &state.binding_ids,
+                |column| columns.selectivity(column),
+                || Ok(true),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(native, 1.0 / point as f64);
+        previous_reads = context.take_fact_reads();
+        assert!(previous_reads.iter().any(|read| read.group == child));
+    }
+    assert!(BoundarySnapshot::default()
+        .columns(&input.memo, child)
+        .is_err());
+}
+
+#[test]
+fn native_column_evidence_keeps_distribution_without_an_ndv_point() {
+    use paro_storage::statistics::{BaseStatistics, EstimatedNumericDistribution};
+    let distribution = EstimatedNumericDistribution::normal(30.0, 4.0).unwrap();
+    let column = ColumnStatistics::with_estimated_distinct(
+        BaseStatistics::create_empty(LogicalType::Double),
+        None,
+    )
+    .with_estimated_numeric_distribution(Some(distribution));
+    let id = ColumnId(3);
+    let facts = GroupFacts::from(GroupFactValue {
+        column_values: BTreeMap::from([(
+            id,
+            paro_planner::operator::bound_reference::BoundColumnValues::from_column(&column)
+                .unwrap(),
+        )]),
+        ..Default::default()
+    });
+    let evidence = BoundaryColumns(&facts).selectivity(id).unwrap();
+    assert_eq!(evidence.point, None);
+    assert_eq!(evidence.values.unwrap().get_type(), &LogicalType::Double);
+    assert_eq!(evidence.distribution, Some(distribution));
+    assert!(BoundaryColumns(&facts).selectivity(ColumnId(4)).is_none());
+}
+
+#[test]
 fn boundary_value_identity_retains_which_operand_owns_each_fact() {
     let mut memo = Memo::new(SearchBudget::default());
     let groups = (0..2)
