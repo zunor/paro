@@ -16,6 +16,7 @@ use super::calibration::{
 };
 use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
 use super::enforcer::{EnforcementPlanner, EnforcerStep};
+use super::governor::{Governor, PlanMilestone, PlanningPolicy};
 use super::grant::{derive_grant_sensitivity, verify_grant_sharing, GrantSensitivitySummary};
 use super::ids::{
     AdmissibleGrantSetId, Fingerprint, GroupId, ImplementationId, LogicalExprId, PhysicalExprId,
@@ -242,6 +243,7 @@ pub struct CascadesEngine {
     /// expressions, candidates and facts; this registry only coordinates
     /// resumable work and publication state.
     task_registry: TaskRegistry,
+    governor: Governor,
 }
 
 impl CascadesEngine {
@@ -281,6 +283,8 @@ impl CascadesEngine {
             physical_subproblem_evaluations: 0,
             physical_implementation_requests: 0,
             task_registry: TaskRegistry::default(),
+            governor: Governor::new(PlanningPolicy::default())
+                .expect("default planning policy must be valid"),
         }
     }
 
@@ -294,6 +298,10 @@ impl CascadesEngine {
 
     pub fn task_registry(&self) -> &TaskRegistry {
         &self.task_registry
+    }
+
+    pub fn governor(&self) -> &Governor {
+        &self.governor
     }
 
     /// Enable the per-rule phase ledger only for an explicitly requested
@@ -329,8 +337,13 @@ impl CascadesEngine {
                 .group(root)
                 .and_then(|group| group.winner(goal))
                 .cloned();
+            if let Some(incumbent) = &incumbent {
+                self.governor.mark_safe(incumbent.candidate);
+            }
             self.memo.control().begin_optional();
             if !self.memo.control().checkpoint()? {
+                self.governor
+                    .resource_stop(BudgetDimension::SearchCandidate);
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
             }
             self.reset_cost_epoch()?;
@@ -412,9 +425,18 @@ impl CascadesEngine {
             // that case, but still permit the requested bounded search.
             if incumbent.is_ok() {
                 super::verifier::MemoVerifier::verify(&self.memo, None)?;
+                if let Some(incumbent) = incumbent
+                    .as_ref()
+                    .ok()
+                    .and_then(|optimization| optimization.winners.first())
+                {
+                    self.governor.mark_safe(incumbent.winner.candidate);
+                }
             }
             self.memo.control().begin_optional();
             if !self.memo.control().checkpoint()? {
+                self.governor
+                    .resource_stop(BudgetDimension::SearchCandidate);
                 return incumbent;
             }
             self.reset_cost_epoch()?;
@@ -1324,6 +1346,22 @@ impl CascadesEngine {
             ),
             ("task_registry_invalidation_count", task_profile.invalidated),
             ("task_registry_awaiting_count", task_profile.awaiting),
+            (
+                "governor_milestone",
+                match self.governor.milestone() {
+                    PlanMilestone::None => 0,
+                    PlanMilestone::PSafe => 1,
+                    PlanMilestone::PReady => 2,
+                },
+            ),
+            (
+                "governor_search_complete",
+                u64::from(self.governor.is_search_complete()),
+            ),
+            (
+                "governor_calibration_unavailable",
+                u64::from(self.governor.last_calibration_status().is_some()),
+            ),
         ])
     }
 

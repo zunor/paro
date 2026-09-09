@@ -18,6 +18,7 @@ pub mod cost {
 }
 pub mod enforcer;
 pub mod engine;
+pub mod governor;
 pub mod grant;
 pub mod planner;
 pub mod ids {
@@ -42,6 +43,10 @@ pub use column::{
 };
 pub use cost::{CompactRange, SearchCost};
 pub use engine::{CascadesEngine, GrantOptimization, GrantWinner, SearchMode};
+pub use governor::{
+    CalibrationScope, EconomicDecision, EconomicSignal, Governor, GovernorSnapshot, GovernorStop,
+    PlanMilestone, PlanningPolicy,
+};
 pub use grant::{GrantSensitivitySummary, GrantSharingProof};
 pub use ids::*;
 pub use memo::{Memo, OptimizationGoal, Winner};
