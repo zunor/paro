@@ -97,6 +97,7 @@ mod costing;
 mod extraction;
 mod identity;
 mod implementation;
+mod scalar_facts;
 mod semantic_plan;
 mod state;
 mod transformation;
@@ -840,6 +841,14 @@ impl MemoBuilder {
                     let group = memo.create_group(schema, logical_properties, cardinality);
                     let (payload, baseline_payload) =
                         payloads.push_logical(PlannerLogicalPayload {
+                            scalar_facts: scalar_facts::NativeScalarFacts::derive(
+                                &semantic_template.operator,
+                                &key.scalars,
+                                &scalars,
+                                &binding_ids,
+                                &columns,
+                                || memo.control().checkpoint(),
+                            )?.ok_or_else(|| paro_error::internal("initial scalar evidence requires an incumbent phase"))?,
                             semantic_template,
                             operator_encoding: operator_encoding.clone(),
                             column_stats: candidate_stats.clone(),

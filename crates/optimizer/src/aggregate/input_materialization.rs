@@ -47,9 +47,8 @@ pub fn optimize_plan(
     Ok((plan, changed))
 }
 
-/// Scalar-only prerequisite used by Memo root dispatch. Join alternatives can
-/// decide where a candidate is placed, but can never manufacture a narrowing,
-/// total aggregate input when the aggregate shell has none.
+/// Executable-IR oracle for differential testing of native scalar evidence.
+#[cfg(test)]
 pub(crate) fn recognizes_aggregate<Child>(operator: &LogicalOperator<Child>) -> bool {
     let LogicalOperator::Aggregate(aggregate) = operator else {
         return false;

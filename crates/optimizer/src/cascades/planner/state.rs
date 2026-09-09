@@ -88,6 +88,7 @@ pub(super) struct PlannerLogicalPayload {
     /// value for lookup but compares the bytes before declaring equivalence.
     pub(super) operator_encoding: Box<[u8]>,
     pub(super) column_stats: SharedColumnStatistics,
+    pub(super) scalar_facts: super::scalar_facts::NativeScalarFacts,
 }
 
 #[derive(Debug)]

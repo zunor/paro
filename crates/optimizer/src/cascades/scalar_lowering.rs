@@ -1100,13 +1100,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(roots.len(), 5);
-        let refs = |root| {
+        let refs = |root| -> std::collections::BTreeSet<ColumnId> {
             arena
                 .get(root)
                 .unwrap()
                 .properties
-                .referenced_columns
-                .clone()
+                .local_columns()
+                .collect()
         };
         assert_eq!(refs(roots[0]), [ids[0]].into());
         assert_eq!(refs(roots[2]), [ids[2]].into());
@@ -1404,7 +1404,7 @@ mod tests {
         assert_eq!(arena.len(), 10_001);
         assert_eq!(arena.get(root).unwrap().children.len(), 10_000);
         assert_eq!(
-            arena.get(root).unwrap().properties.referenced_columns.len(),
+            arena.get(root).unwrap().properties.column_references.len(),
             10_000
         );
         drop(expression);

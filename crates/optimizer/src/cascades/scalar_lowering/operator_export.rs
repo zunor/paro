@@ -99,13 +99,13 @@ pub(crate) fn export_operator_scalars<Child>(
                         .get(id)
                         .ok_or_else(|| paro_error::internal("native join operand is unknown"))?
                         .properties
-                        .referenced_columns
-                        .iter()
-                        .all(|column| child_contains(child, *column)))
+                        .local_columns()
+                        .all(|column| child_contains(child, column)))
                 };
                 // Scalar canonicalization may exchange comparison operands.
                 // Execution's join conditions have side-specific coordinates;
-                // restore those from ColumnId membership, never old payloads.
+                // restore those from local ColumnId membership, never old
+                // payloads. Outer invocation values are not child columns.
                 if !(belongs(left, 0)? && belongs(right, 1)?) {
                     if !(belongs(right, 0)? && belongs(left, 1)?) {
                         return Err(paro_error::internal(
@@ -235,6 +235,50 @@ mod tests {
             .to_string()
             .contains("child domains"));
         }
+    }
+
+    #[test]
+    fn correlated_operands_are_owned_by_the_invocation_not_a_join_child() {
+        let mut arena = ScalarArena::default();
+        let mut bindings = BindingCatalog::default();
+        let mut columns = ColumnCatalog::default();
+        let outer = Expression::ColumnRef(
+            ColumnRefExpression::with_depth(ColumnBinding::new(9, 0), LogicalType::Integer, 2)
+                .into(),
+        );
+        let right = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+        );
+        let mut operator = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+            JoinType::Inner,
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+            vec![JoinCondition::equality(outer.clone(), right.clone())],
+        )));
+        let roots = super::super::intern_operator_scalars(
+            &operator,
+            &[],
+            &[Box::<[ColumnId]>::default(), Box::<[ColumnId]>::default()],
+            &mut bindings,
+            &mut columns,
+            &mut arena,
+        )
+        .unwrap();
+        let right_column = *bindings.get(1, 0, &LogicalType::Integer).unwrap();
+        export_operator_scalars(
+            &mut operator,
+            &roots,
+            &arena,
+            &bindings,
+            |side, column| side == 1 && column == right_column,
+            || Ok(()),
+        )
+        .unwrap();
+        let LogicalOperator::Join(Join::Comparison(join)) = operator else {
+            unreachable!()
+        };
+        assert!(join.conditions[0].left.equals(&outer));
+        assert!(join.conditions[0].right.equals(&right));
     }
 
     #[test]

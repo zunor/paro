@@ -71,8 +71,8 @@ pub fn optimize_plan_with_change(plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, b
     .expect("detail subsumption traversal cannot fail")
 }
 
-/// Allocation-free root predicate shared with Memo rule dispatch. Descendant
-/// alternatives cannot make an aggregate with the wrong algebra eligible.
+/// Executable-IR oracle for differential testing of native scalar evidence.
+#[cfg(test)]
 pub(crate) fn recognizes_outer_aggregate<Child>(operator: &LogicalOperator<Child>) -> bool {
     matches!(operator, LogicalOperator::Aggregate(aggregate) if AggregateJoinSubsumption::outer_sum(aggregate).is_some())
 }

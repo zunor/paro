@@ -527,7 +527,19 @@ pub(super) fn stage_transformed_expression(
             }
         }
 
+        let Some(scalar_facts) = super::super::scalar_facts::NativeScalarFacts::derive(
+            &semantic_template.operator,
+            &key.scalars,
+            &state.scalars,
+            &state.binding_ids,
+            &state.columns,
+            || memo.control().checkpoint(),
+        )?
+        else {
+            return Ok(None);
+        };
         let (payload, baseline_payload) = state.payloads.push_logical(PlannerLogicalPayload {
+            scalar_facts,
             semantic_template,
             operator_encoding: operator_encoding.clone(),
             column_stats: column_stats.clone(),

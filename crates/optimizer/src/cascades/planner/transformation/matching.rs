@@ -1488,9 +1488,11 @@ pub(super) fn matches_transformation_root(
         let Some(payload) = state.payloads.logical.get(expr.payload.index()) else {
             return false;
         };
-        return crate::aggregate::join_subsumption::recognizes_outer_aggregate(
-            &payload.semantic_template.operator,
-        );
+        return payload
+            .scalar_facts
+            .aggregate
+            .as_ref()
+            .is_some_and(|facts| facts.subsumable_sum_input.is_some());
     }
     if matches!(
         transformation,
@@ -1499,9 +1501,11 @@ pub(super) fn matches_transformation_root(
         let Some(payload) = state.payloads.logical.get(expr.payload.index()) else {
             return false;
         };
-        return crate::aggregate::input_materialization::recognizes_aggregate(
-            &payload.semantic_template.operator,
-        );
+        return payload
+            .scalar_facts
+            .aggregate
+            .as_ref()
+            .is_some_and(|facts| !facts.materializable_inputs.is_empty());
     }
     transformation_root_operator_matches(
         transformation,
@@ -1579,6 +1583,70 @@ fn transformation_root_operator_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_root_dispatch_uses_published_native_evidence_not_executable_payloads() {
+        use paro_common::runtime_value::Value;
+        use paro_common::types::LogicalType;
+        use paro_function::aggregate::distributive::sum::get_sum_function;
+        use paro_planner::expression::{
+            AggregateExpression, ColumnRefExpression, ConstantExpression,
+        };
+        use paro_planner::operator::{Aggregate, Get};
+        let (function, _) = get_sum_function().bind(&[LogicalType::BigInt]).unwrap();
+        let ty = function.return_type.clone();
+        let sum = Expression::Aggregate(
+            AggregateExpression::new(
+                function,
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::BigInt).into(),
+                )],
+                ty,
+            )
+            .into(),
+        );
+        let plan =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
+                1,
+                2,
+                3,
+                OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                    Get::new_without_table(0, vec!["k".into()], vec![LogicalType::BigInt]),
+                ))),
+                vec![],
+                vec![],
+                vec![sum],
+                vec![],
+            ))));
+        let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        let expression = input
+            .memo
+            .logical_expr(input.memo.group(input.root).unwrap().logical_exprs()[0])
+            .unwrap();
+        let mut state = input.planner_state.write().unwrap();
+        assert!(matches_transformation_root(
+            PlannerTransformation::AggregateJoinSubsumption,
+            expression,
+            &state
+        ));
+        // Keep the shape/arity but poison the old executable scalar. The
+        // imported native operands and their immutable evidence do not change.
+        let LogicalOperator::Aggregate(aggregate) = &mut state.payloads.logical
+            [expression.payload.index()]
+        .semantic_template
+        .operator
+        else {
+            unreachable!()
+        };
+        aggregate.aggregates[0] = Expression::Constant(
+            ConstantExpression::new(Value::BigInt(99), LogicalType::BigInt).into(),
+        );
+        assert!(matches_transformation_root(
+            PlannerTransformation::AggregateJoinSubsumption,
+            expression,
+            &state
+        ));
+    }
 
     #[test]
     fn detail_subsumption_keeps_unconsumed_relations_as_group_inputs() {

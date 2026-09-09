@@ -43,6 +43,13 @@ pub(crate) struct BindingCatalog {
 }
 
 impl BindingCatalog {
+    /// Read relational ownership without rebuilding an executable scalar.
+    /// Private reducer slots cannot satisfy a relational placement proof.
+    pub(crate) fn relation_binding(&self, column: ColumnId) -> Option<ColumnBinding> {
+        let key = self.by_column.get(&column)?;
+        (key.domain == BindingDomain::Relation).then_some(key.binding)
+    }
+
     pub(crate) fn get(
         &self,
         table_index: usize,

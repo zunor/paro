@@ -122,9 +122,18 @@ impl Default for ScalarLocalProperties {
     }
 }
 
+/// A value dependency includes its lexical scope. The same ColumnId can occur
+/// both locally and in an enclosing invocation; neither occurrence subsumes
+/// the other when proving predicate placement or input ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScalarColumnReference {
+    pub column: ColumnId,
+    pub depth: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalarProperties {
-    pub referenced_columns: BTreeSet<ColumnId>,
+    pub column_references: BTreeSet<ScalarColumnReference>,
     pub volatility: Volatility,
     pub may_error: bool,
     pub has_side_effects: bool,
@@ -133,6 +142,19 @@ pub struct ScalarProperties {
 }
 
 impl ScalarProperties {
+    pub fn local_columns(&self) -> impl Iterator<Item = ColumnId> + '_ {
+        self.column_references
+            .iter()
+            .filter(|reference| reference.depth == 0)
+            .map(|reference| reference.column)
+    }
+
+    pub fn has_outer_references(&self) -> bool {
+        self.column_references
+            .iter()
+            .any(|reference| reference.depth != 0)
+    }
+
     /// Re-evaluating the same immutable input is weaker than commuting with
     /// a row-removing operator. A deterministic SQL error remains the same
     /// error on replay; it does not authorize evaluation on new input rows.
@@ -382,10 +404,15 @@ impl ScalarArena {
     }
 
     fn derive_properties(&self, spec: &ScalarSpec) -> Result<ScalarProperties> {
-        let mut referenced_columns = BTreeSet::new();
-        if let ScalarKind::Column(column) | ScalarKind::CorrelatedColumn { column, .. } = spec.kind
-        {
-            referenced_columns.insert(column);
+        let mut column_references = BTreeSet::new();
+        match spec.kind {
+            ScalarKind::Column(column) => {
+                column_references.insert(ScalarColumnReference { column, depth: 0 });
+            }
+            ScalarKind::CorrelatedColumn { column, depth } => {
+                column_references.insert(ScalarColumnReference { column, depth });
+            }
+            _ => {}
         }
         let mut volatility = spec.local_properties.volatility;
         let mut may_error = spec.local_properties.may_error;
@@ -396,7 +423,7 @@ impl ScalarArena {
             let child = self
                 .get(*id)
                 .ok_or_else(|| paro_error::internal("unknown scalar child"))?;
-            referenced_columns.extend(child.properties.referenced_columns.iter().copied());
+            column_references.extend(child.properties.column_references.iter().copied());
             volatility = volatility.max(child.properties.volatility);
             may_error |= child.properties.may_error;
             has_side_effects |= child.properties.has_side_effects;
@@ -406,7 +433,7 @@ impl ScalarArena {
         deterministic &=
             volatility != Volatility::Volatile && !has_side_effects && !depends_on_external_state;
         Ok(ScalarProperties {
-            referenced_columns,
+            column_references,
             volatility,
             may_error,
             has_side_effects,
@@ -546,6 +573,73 @@ mod tests {
         let second = column(&mut arena, 1);
         assert_eq!(first, second);
         assert_eq!(arena.len(), 1);
+    }
+
+    #[test]
+    fn dependency_evidence_retains_every_lexical_occurrence_after_substitution() {
+        let mut arena = ScalarArena::default();
+        let local = column(&mut arena, 1);
+        let mut roots = vec![local];
+        for depth in [1, 2] {
+            roots.push(
+                arena
+                    .intern(ScalarSpec {
+                        kind: ScalarKind::CorrelatedColumn {
+                            column: ColumnId(1),
+                            depth,
+                        },
+                        logical_type: LogicalType::BigInt,
+                        children: Box::new([]),
+                        local_properties: Default::default(),
+                    })
+                    .unwrap(),
+            );
+        }
+        let root = arena
+            .intern(ScalarSpec {
+                kind: ScalarKind::Case,
+                logical_type: LogicalType::BigInt,
+                children: roots.into_boxed_slice(),
+                local_properties: Default::default(),
+            })
+            .unwrap();
+        let properties = &arena.get(root).unwrap().properties;
+        assert_eq!(
+            properties.local_columns().collect::<Vec<_>>(),
+            [ColumnId(1)]
+        );
+        assert!(properties.has_outer_references());
+        assert_eq!(
+            properties.column_references,
+            [0, 1, 2]
+                .map(|depth| ScalarColumnReference {
+                    column: ColumnId(1),
+                    depth
+                })
+                .into()
+        );
+        let replacement = column(&mut arena, 7);
+        let changed = arena
+            .substitute_columns(root, |_| Some(replacement), || Ok(()))
+            .unwrap();
+        assert_eq!(
+            arena.get(changed).unwrap().properties.column_references,
+            [
+                ScalarColumnReference {
+                    column: ColumnId(7),
+                    depth: 0
+                },
+                ScalarColumnReference {
+                    column: ColumnId(1),
+                    depth: 1
+                },
+                ScalarColumnReference {
+                    column: ColumnId(1),
+                    depth: 2
+                },
+            ]
+            .into()
+        );
     }
 
     #[test]

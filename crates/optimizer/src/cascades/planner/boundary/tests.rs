@@ -464,6 +464,7 @@ fn finite_replay_proof_survives_a_recursive_identity_alternative() {
         .column_stats
         .clone();
     let (payload, _) = state.payloads.push_logical(PlannerLogicalPayload {
+        scalar_facts: Default::default(),
         semantic_template: paro_planner::plan::arena::LogicalPlanNode::from_shell(
             OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
                 paro_planner::operator::Filter::new(source(0), vec![]),
