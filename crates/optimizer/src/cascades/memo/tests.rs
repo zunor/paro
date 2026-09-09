@@ -1137,6 +1137,22 @@ fn group_merge_rejects_output_contract_change() {
 }
 
 #[test]
+fn group_merge_rejects_unknown_group_without_mutating_union_find() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let known = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let unknown = GroupId::new(99);
+
+    assert!(memo.merge_groups(known, unknown).is_err());
+    assert_eq!(memo.canonical_group(known), known);
+    assert_eq!(memo.group_merges, 0);
+    assert_eq!(memo.logical_frontier_revision, 0);
+}
+
+#[test]
 fn group_merge_intersects_independently_proven_cardinality_bounds() {
     let mut memo = Memo::new(SearchBudget::default());
     let mut loose = LogicalProperties::default();

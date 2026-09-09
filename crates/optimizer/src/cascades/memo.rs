@@ -2683,6 +2683,11 @@ impl Memo {
     }
 
     pub fn merge_groups(&mut self, left: GroupId, right: GroupId) -> Result<GroupId> {
+        if left.index() >= self.parents.len() || right.index() >= self.parents.len() {
+            return Err(paro_error::internal(
+                "cannot merge Memo groups with an unknown group id",
+            ));
+        }
         let left = self.canonical_group(left);
         let right = self.canonical_group(right);
         if left == right {
@@ -2709,13 +2714,34 @@ impl Memo {
                 self.groups[secondary.index()].logical_properties,
             )));
         }
-        self.advance_cte_registry_revision()?;
-        self.parents[secondary.index()] = canonical;
-        self.group_merges = self.group_merges.saturating_add(1);
-        self.logical_frontier_revision = self
+
+        // All operations below the union-find redirect are part of one
+        // observable merge. Validate every fallible step against temporary
+        // values before mutating `parents` or either group; otherwise a
+        // statistics value-hull error or revision overflow could leave a
+        // redirect whose facts and subscriptions no longer describe the same
+        // equivalence class.
+        let next_cte_registry_revision = self
+            .cte_registry_revision
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("Memo CTE registry revision overflow"))?;
+        let next_logical_frontier_revision = self
             .logical_frontier_revision
             .checked_add(1)
             .ok_or_else(|| paro_error::internal("Memo frontier revision overflow"))?;
+        let mut merged_logical_properties =
+            self.groups[canonical.index()].logical_properties.clone();
+        merged_logical_properties
+            .merge_equivalent_facts(&self.groups[secondary.index()].logical_properties)?;
+        let merged_cardinality = self.groups[canonical.index()]
+            .cardinality
+            .clone()
+            .canonical_with(self.groups[secondary.index()].cardinality.clone());
+
+        self.cte_registry_revision = next_cte_registry_revision;
+        self.parents[secondary.index()] = canonical;
+        self.group_merges = self.group_merges.saturating_add(1);
+        self.logical_frontier_revision = next_logical_frontier_revision;
 
         let (canonical_group, secondary_group) =
             two_groups_mut(&mut self.groups, canonical.index(), secondary.index());
@@ -2729,11 +2755,8 @@ impl Memo {
         // bounds (for example, a decorrelated plan can prove a tighter cap
         // than its dependent form). Both proofs describe the same relation,
         // so their intersection is valid for the complete equivalence class.
-        canonical_group
-            .logical_properties
-            .merge_equivalent_facts(&secondary_group.logical_properties)?;
-        canonical_group.cardinality = std::mem::take(&mut canonical_group.cardinality)
-            .canonical_with(std::mem::take(&mut secondary_group.cardinality));
+        canonical_group.logical_properties = merged_logical_properties;
+        canonical_group.cardinality = merged_cardinality;
         canonical_group.ledger.merge_from(&secondary_group.ledger);
         canonical_group
             .logical_exprs
