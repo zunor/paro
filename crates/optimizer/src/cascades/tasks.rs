@@ -520,6 +520,29 @@ impl TaskRegistry {
     }
 
     pub fn request(&mut self, intent: TaskIntent, reads: ReadSet) -> Result<TaskRequest> {
+        self.request_with_current_reads(intent, reads, None)
+    }
+
+    /// Request a task while checking the actual Memo revisions represented by
+    /// its ReadSet.  The plain `request` method remains useful to the small
+    /// registry state-machine tests, but production callers must use this
+    /// entry point so a completed outcome cannot be reused merely because the
+    /// structural ReadSet has the same shape.
+    pub fn request_current(
+        &mut self,
+        intent: TaskIntent,
+        reads: ReadSet,
+        memo: &Memo,
+    ) -> Result<TaskRequest> {
+        self.request_with_current_reads(intent, reads, Some(memo))
+    }
+
+    fn request_with_current_reads(
+        &mut self,
+        intent: TaskIntent,
+        reads: ReadSet,
+        memo: Option<&Memo>,
+    ) -> Result<TaskRequest> {
         self.profile.requests = self.profile.requests.saturating_add(1);
         let kind = intent.kind();
         let profile = self.kind_profile_mut(kind);
@@ -529,6 +552,24 @@ impl TaskRegistry {
         let inputs = self.intern_input_revision(read_set)?;
         let evaluation = EvaluationKey { intent, inputs };
         if let Some(task) = self.evaluations.get(&evaluation).copied() {
+            let state = self
+                .task(task)
+                .ok_or_else(|| paro_error::internal("task evaluation index is corrupt"))?
+                .state;
+            if !matches!(state, TaskState::Running)
+                && !matches!(state, TaskState::Invalidated)
+                && memo.is_some_and(|memo| {
+                    self.read_set(read_set)
+                        .is_none_or(|read_set| !read_set.is_current(memo).unwrap_or(false))
+                })
+            {
+                // Keep the exact task/evaluation identity, but discard its
+                // outcome and local segment before reopening it.  This is
+                // selective invalidation: unrelated tasks retain their
+                // completed results and the task's continuation cursor is
+                // still available to the new leader.
+                self.invalidate(task)?;
+            }
             let state = self
                 .task(task)
                 .ok_or_else(|| paro_error::internal("task evaluation index is corrupt"))?
@@ -621,6 +662,33 @@ impl TaskRegistry {
             .tasks
             .iter()
             .filter(|task| task.state != TaskState::Invalidated)
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        for task in tasks.iter().copied() {
+            self.invalidate(task)?;
+        }
+        Ok(tasks.len())
+    }
+
+    /// Invalidate only tasks whose result is owned by the physical costing
+    /// epoch. Logical discovery/transform tasks keep their exact cursor and
+    /// observations across a cost-frontier reset; a later ReadSet change will
+    /// wake them through the normal current-read request path.
+    pub fn invalidate_physical_tasks(&mut self) -> Result<usize> {
+        let tasks = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.state != TaskState::Invalidated
+                    && self.intent(task.intent).is_some_and(|intent| {
+                        matches!(
+                            intent,
+                            TaskIntent::Implement { .. }
+                                | TaskIntent::Optimize { .. }
+                                | TaskIntent::Cost { .. }
+                        )
+                    })
+            })
             .map(|task| task.id)
             .collect::<Vec<_>>();
         for task in tasks.iter().copied() {
@@ -1377,8 +1445,12 @@ impl TaskRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cascades::ids::PropertySetId;
-    use crate::cascades::memo::{GrantGoalKey, RowGoal};
+    use crate::cascades::column::GroupSchema;
+    use crate::cascades::ids::{LogicalPayloadId, PropertySetId};
+    use crate::cascades::memo::{
+        EquivalenceProof, GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties,
+        RowGoal,
+    };
     use crate::cascades::rules::PatternOperand;
     use crate::physical::ObjectiveProfile;
 
@@ -1536,6 +1608,96 @@ mod tests {
         assert_eq!(read_set, ReadSetId::new(0));
         let next = registry.request(intent, ReadSet::new([])).unwrap();
         assert!(matches!(next, TaskRequest::Reused { .. }));
+    }
+
+    #[test]
+    fn current_request_reopens_a_completed_task_after_its_read_advances() {
+        let mut memo = Memo::new(Default::default());
+        let group = memo.create_group(
+            GroupSchema::new([]).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let read = PatternRead::from_group(&memo, group).unwrap();
+        let mut registry = TaskRegistry::default();
+        let intent = TaskIntent::Discover {
+            expression: LogicalExprId::new(0),
+            rule: RuleId::new(2),
+        };
+        let TaskRequest::Leader(task) = registry
+            .request_current(intent.clone(), ReadSet::new([read]), &memo)
+            .unwrap()
+        else {
+            panic!("initial request did not lead")
+        };
+        registry.start(task).unwrap();
+        let read_id = registry.intern_read_set(ReadSet::new([read]));
+        registry
+            .complete(task, TaskOutcome::NoChange { reads: read_id })
+            .unwrap();
+        memo.insert_logical(
+            group,
+            LogicalExprKey {
+                operator: Fingerprint(1),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(1),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+        let next = registry
+            .request_current(intent, ReadSet::new([read]), &memo)
+            .unwrap();
+        assert!(matches!(next, TaskRequest::Leader(reopened) if reopened == task));
+        assert_eq!(registry.state(task), Some(TaskState::Runnable));
+    }
+
+    #[test]
+    fn physical_epoch_invalidation_preserves_logical_tasks() {
+        let mut registry = TaskRegistry::default();
+        let physical = match registry
+            .request(
+                TaskIntent::Optimize {
+                    group: GroupId::new(0),
+                    goal: goal(),
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        let logical = match registry
+            .request(
+                TaskIntent::Discover {
+                    expression: LogicalExprId::new(1),
+                    rule: RuleId::new(2),
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        registry.start(physical).unwrap();
+        registry.start(logical).unwrap();
+        registry
+            .complete(physical, TaskOutcome::Infeasible)
+            .unwrap();
+        registry
+            .complete(
+                logical,
+                TaskOutcome::NoChange {
+                    reads: ReadSetId::new(0),
+                },
+            )
+            .unwrap();
+        assert_eq!(registry.invalidate_physical_tasks().unwrap(), 1);
+        assert_eq!(registry.state(physical), Some(TaskState::Invalidated));
+        assert_eq!(registry.state(logical), Some(TaskState::Completed));
     }
 
     #[test]

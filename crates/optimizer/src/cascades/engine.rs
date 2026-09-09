@@ -390,11 +390,14 @@ impl CascadesEngine {
 
     fn reset_cost_epoch(&mut self) -> Result<()> {
         self.memo.clear_cost_frontiers()?;
-        self.recipes.clear();
+        // Physical recipes are immutable descriptions of already-admitted
+        // implementations. Keep them across a fact/cost epoch so only the
+        // affected winner frontiers are recomposed; rebuilding every recipe
+        // made a grant or logical refresh pay the same construction cost
+        // again. New logical expressions still add recipes incrementally.
         self.infeasible_goals.clear();
         self.grant_sensitivity.clear();
-        self.region_candidates.clear();
-        self.task_registry.invalidate_all()?;
+        self.task_registry.invalidate_physical_tasks()?;
         Ok(())
     }
 
@@ -901,7 +904,7 @@ impl CascadesEngine {
                         },
                     )?
                     .into_vec();
-                let transformation_task = match self.task_registry.request(
+                let transformation_task = match self.task_registry.request_current(
                     TaskIntent::Transform {
                         expression,
                         rule,
@@ -918,6 +921,7 @@ impl CascadesEngine {
                             .copied()
                             .chain(application_reads.iter().copied()),
                     ),
+                    &self.memo,
                 )? {
                     TaskRequest::Leader(task) => {
                         self.task_registry.start(task)?;
@@ -1948,10 +1952,11 @@ impl CascadesEngine {
         let group = self.memo.canonical_group(group);
         self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
         let read_set = ReadSet::new([PatternRead::from_group(&self.memo, group)?]);
-        let task = match self
-            .task_registry
-            .request(TaskIntent::Optimize { group, goal }, read_set)?
-        {
+        let task = match self.task_registry.request_current(
+            TaskIntent::Optimize { group, goal },
+            read_set,
+            &self.memo,
+        )? {
             TaskRequest::Leader(task) => task,
             TaskRequest::Reused { .. } => {
                 self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
