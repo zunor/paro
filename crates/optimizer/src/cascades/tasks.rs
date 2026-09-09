@@ -20,7 +20,7 @@ use super::ids::{
     PhysicalExprId, RuleId,
 };
 use super::memo::{Memo, OptimizationGoal};
-use super::rules::{PatternBinding, PatternRead};
+use super::rules::{PatternBinding, PatternOperand, PatternRead};
 
 macro_rules! task_id_type {
     ($name:ident) => {
@@ -582,6 +582,8 @@ impl TaskRegistry {
         reads: ReadSet,
         memo: &Memo,
     ) -> Result<TaskRequest> {
+        let intent = canonicalize_task_intent(memo, intent);
+        let reads = canonicalize_read_set(memo, reads);
         self.request_with_current_reads(intent, reads, Some(memo))
     }
 
@@ -1531,6 +1533,54 @@ impl TaskRegistry {
     }
 }
 
+fn canonicalize_task_intent(memo: &Memo, intent: TaskIntent) -> TaskIntent {
+    match intent {
+        TaskIntent::Optimize { group, goal } => TaskIntent::Optimize {
+            group: memo.canonical_group(group),
+            goal,
+        },
+        TaskIntent::Transform {
+            expression,
+            rule,
+            binding,
+        } => TaskIntent::Transform {
+            expression,
+            rule,
+            binding: PatternBinding {
+                root: canonicalize_pattern_operand(memo, binding.root),
+                fingerprint: binding.fingerprint,
+            },
+        },
+        other => other,
+    }
+}
+
+fn canonicalize_pattern_operand(memo: &Memo, operand: PatternOperand) -> PatternOperand {
+    match operand {
+        PatternOperand::Expression {
+            group,
+            expression,
+            children,
+        } => PatternOperand::Expression {
+            group: memo.canonical_group(group),
+            expression,
+            children: children
+                .into_vec()
+                .into_iter()
+                .map(|child| canonicalize_pattern_operand(memo, child))
+                .collect(),
+        },
+        PatternOperand::Group(group) => PatternOperand::Group(memo.canonical_group(group)),
+    }
+}
+
+fn canonicalize_read_set(memo: &Memo, reads: ReadSet) -> ReadSet {
+    ReadSet::new(reads.reads.into_vec().into_iter().map(|mut read| {
+        read.group = memo.canonical_group(read.group);
+        read
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2114,6 +2164,105 @@ mod tests {
         assert_eq!(registry.state(transform), Some(TaskState::Invalidated));
         assert_eq!(registry.state(reader), Some(TaskState::Invalidated));
         assert_eq!(registry.profile().invalidated, 2);
+    }
+
+    #[test]
+    fn current_request_canonicalizes_merged_group_aliases_in_identity_and_reads() {
+        let mut memo = Memo::new(Default::default());
+        let canonical = memo.create_group(
+            GroupSchema::new([]).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let secondary = memo.create_group(
+            GroupSchema::new([]).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+
+        let mut registry = TaskRegistry::default();
+        let old = match registry
+            .request(
+                TaskIntent::Optimize {
+                    group: secondary,
+                    goal: goal(),
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        registry.start(old).unwrap();
+        memo.merge_groups(canonical, secondary).unwrap();
+        registry
+            .redirect_group(secondary, canonical)
+            .expect("registry redirect should invalidate the old alias");
+
+        let mut aliased_read = PatternRead::from_group(&memo, canonical).unwrap();
+        aliased_read.group = secondary;
+        let request = registry
+            .request_current(
+                TaskIntent::Optimize {
+                    group: secondary,
+                    goal: goal(),
+                },
+                ReadSet::single(aliased_read),
+                &memo,
+            )
+            .unwrap();
+        let TaskRequest::Leader(current) = request else {
+            panic!("merged alias unexpectedly reused an old task: {request:?}");
+        };
+        assert_ne!(current, old);
+        assert!(matches!(
+            registry.intent(registry.task(current).unwrap().intent),
+            Some(TaskIntent::Optimize { group, .. }) if *group == canonical
+        ));
+        assert_eq!(
+            registry
+                .read_set(registry.task(current).unwrap().read_set)
+                .unwrap()
+                .reads()[0]
+                .group,
+            canonical
+        );
+
+        let binding = PatternBinding {
+            root: PatternOperand::Expression {
+                group: secondary,
+                expression: LogicalExprId::new(41),
+                children: Box::new([PatternOperand::Group(secondary)]),
+            },
+            fingerprint: Fingerprint(42),
+        };
+        let transform = match registry
+            .request_current(
+                TaskIntent::Transform {
+                    expression: LogicalExprId::new(41),
+                    rule: RuleId::new(43),
+                    binding,
+                },
+                ReadSet::empty(),
+                &memo,
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            registry.intent(registry.task(transform).unwrap().intent),
+            Some(TaskIntent::Transform {
+                binding: PatternBinding {
+                    root: PatternOperand::Expression { group, children, .. },
+                    ..
+                },
+                ..
+            }) if *group == canonical
+                && children.as_ref() == [PatternOperand::Group(canonical)]
+        ));
     }
 
     #[test]
