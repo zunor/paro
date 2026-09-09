@@ -2151,6 +2151,13 @@ impl Memo {
         self.physical_exprs.len()
     }
 
+    /// Number of query-local optimization contexts currently interned. The
+    /// value is diagnostic evidence for demand-driven context growth; callers
+    /// must not use it as a substitute for a context identity or cache.
+    pub fn optimization_context_count(&self) -> usize {
+        self.optimization_contexts.len()
+    }
+
     pub fn exhaustion_counts(&self) -> BTreeMap<BudgetDimension, u64> {
         let mut counts = BTreeMap::new();
         for (dimension, _) in self.global_ledger.exhaustion_events() {

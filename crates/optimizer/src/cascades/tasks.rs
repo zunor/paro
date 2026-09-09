@@ -318,6 +318,10 @@ pub struct TaskKindProfile {
     pub unique_intents: u64,
     pub unique_evaluations: u64,
     pub reused_evaluations: u64,
+    /// An existing exact evaluation reopened after an incomplete cursor,
+    /// suspension, or invalidation. This is distinct from a first leader and
+    /// from a completed evaluation consumed as a reuse.
+    pub reopened_evaluations: u64,
     pub single_flight_subscriptions: u64,
     pub started: u64,
     pub completed: u64,
@@ -331,7 +335,12 @@ pub struct TaskRegistryProfile {
     pub requests: u64,
     pub unique_intents: u64,
     pub unique_evaluations: u64,
+    /// Number of distinct physical `(group, goal)` subproblems represented by
+    /// the exact task-intent catalog. This is diagnostic-only and is derived
+    /// from the same identity table; it is not a second cache.
+    pub unique_subproblems: u64,
     pub reused_evaluations: u64,
+    pub reopened_evaluations: u64,
     pub single_flight_subscriptions: u64,
     pub started: u64,
     pub completed: u64,
@@ -490,6 +499,12 @@ impl TaskRegistry {
         let mut profile = self.profile.clone();
         profile.unique_intents = self.intents.len() as u64;
         profile.unique_evaluations = self.evaluations.len() as u64;
+        profile.unique_subproblems = self
+            .intents
+            .iter()
+            .filter_map(TaskIntent::subproblem_key)
+            .collect::<BTreeSet<_>>()
+            .len() as u64;
         profile.by_kind = TaskKind::ALL
             .into_iter()
             .zip(self.kind_profiles.iter().cloned())
@@ -619,6 +634,7 @@ impl TaskRegistry {
                         // its residual obligations can be scheduled.
                         self.task_mut(task)?.state = TaskState::Runnable;
                         self.task_mut(task)?.outcome = None;
+                        self.record_reopened_evaluation(kind);
                         Ok(TaskRequest::Leader(task))
                     } else {
                         self.profile.reused_evaluations =
@@ -644,6 +660,7 @@ impl TaskRegistry {
                 TaskState::Invalidated | TaskState::Suspended => {
                     self.task_mut(task)?.state = TaskState::Runnable;
                     self.task_mut(task)?.outcome = None;
+                    self.record_reopened_evaluation(kind);
                     Ok(TaskRequest::Leader(task))
                 }
                 TaskState::Runnable | TaskState::Running | TaskState::Awaiting => {
@@ -675,6 +692,12 @@ impl TaskRegistry {
         let profile = self.kind_profile_mut(kind);
         profile.unique_evaluations = profile.unique_evaluations.saturating_add(1);
         Ok(TaskRequest::Leader(task))
+    }
+
+    fn record_reopened_evaluation(&mut self, kind: TaskKind) {
+        self.profile.reopened_evaluations = self.profile.reopened_evaluations.saturating_add(1);
+        let profile = self.kind_profile_mut(kind);
+        profile.reopened_evaluations = profile.reopened_evaluations.saturating_add(1);
     }
 
     pub fn task_count(&self) -> usize {
@@ -1782,6 +1805,43 @@ mod tests {
                 complete: false
             })
         );
+        let profile = registry.profile();
+        assert_eq!(profile.reopened_evaluations, 1);
+        assert_eq!(
+            profile
+                .by_kind
+                .get(&TaskKind::Discover)
+                .unwrap()
+                .reopened_evaluations,
+            1
+        );
+    }
+
+    #[test]
+    fn profile_counts_exact_unique_physical_subproblems() {
+        let mut registry = TaskRegistry::default();
+        let first_goal = goal();
+        let second_goal = OptimizationGoal {
+            row_goal: RowGoal::AtMost(1),
+            ..first_goal
+        };
+        for (group, requested_goal) in [
+            (GroupId::new(0), first_goal),
+            (GroupId::new(0), first_goal),
+            (GroupId::new(1), first_goal),
+            (GroupId::new(0), second_goal),
+        ] {
+            registry
+                .request(
+                    TaskIntent::Optimize {
+                        group,
+                        goal: requested_goal,
+                    },
+                    ReadSet::empty(),
+                )
+                .unwrap();
+        }
+        assert_eq!(registry.profile().unique_subproblems, 3);
     }
 
     #[test]

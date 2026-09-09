@@ -1501,6 +1501,10 @@ impl CascadesEngine {
                 "physical_implementation_request_count",
                 self.physical_implementation_requests,
             ),
+            (
+                "optimization_context_count",
+                self.memo.optimization_context_count() as u64,
+            ),
             ("task_registry_request_count", task_profile.requests),
             (
                 "task_registry_unique_intent_count",
@@ -1510,13 +1514,25 @@ impl CascadesEngine {
                 "task_registry_unique_evaluation_count",
                 task_profile.unique_evaluations,
             ),
+            (
+                "task_registry_unique_subproblem_count",
+                task_profile.unique_subproblems,
+            ),
             ("task_registry_reuse_count", task_profile.reused_evaluations),
+            (
+                "task_registry_reopened_evaluation_count",
+                task_profile.reopened_evaluations,
+            ),
             (
                 "task_registry_single_flight_subscription_count",
                 task_profile.single_flight_subscriptions,
             ),
             ("task_registry_invalidation_count", task_profile.invalidated),
             ("task_registry_awaiting_count", task_profile.awaiting),
+            (
+                "child_combination_event_count",
+                self.child_combination_events.len() as u64,
+            ),
             (
                 "governor_milestone",
                 match self.governor.milestone() {
