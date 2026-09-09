@@ -79,3 +79,31 @@ server log, and FD samples are archived here.
 
 Neither D6 nor D3-A changes the C1 gate: Q11 is still far from DuckDB and M1–M3
 remain unpassed.
+
+## D2 native-cost bridge check — 2026-09-10
+
+The `7c96a433` build removes the last shallow `OwnedLogicalPlan` compatibility
+view from closed native staging. Operator implementation admission, local cost,
+and cost facts now consume the native operator plus child `NodeState` facts;
+the owned settlement path remains unchanged for real scan/search leaves and
+source-lineage-dependent capabilities. Native cost facts intentionally leave
+source-lineage fields unknown until a boundary adapter proves them, so this
+batch does not enable runtime-filter lineage or other source-sensitive optional
+paths from a native shell.
+
+The release binary and source were clean and matched the report. A five-block
+normal trace-off C1 comparison with the binary protocol, four execution
+threads, 2 GiB, private per-process data copies, and complete result
+verification produced:
+
+- Paro C1 median `1162.751666 ms`; DuckDB `108.201250 ms`;
+- fresh-block ratio `10.818597`, 95% CI `[10.685760, 10.987346]`;
+- normal trace-off W ratio `2.728626`;
+- diagnostic optimizer `840.093 ms`, lower/admit `0.499 ms`, pipeline init
+  `0.049 ms`, first page `329.111 ms`, and fetch drain `329.893 ms`.
+
+The C1 result is a valid fresh-process measurement and shows a lower absolute
+Paro time than the preceding 90-row check, but it is still far from parity and
+does not pass M1–M3. The diagnostic cohort remains excluded from C1. The
+report and block/diagnostic logs are archived as `q11-d2-native-cost-v1.*` in
+this directory.
