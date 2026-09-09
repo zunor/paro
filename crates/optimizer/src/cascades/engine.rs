@@ -1390,7 +1390,7 @@ impl CascadesEngine {
             .task_read_set(task)
             .ok_or_else(|| paro_error::internal("transformation task lost its read set"))?;
         self.task_registry
-            .complete(task, TaskOutcome::NoChange { reads })?;
+            .complete_current(task, &self.memo, TaskOutcome::NoChange { reads })?;
         Ok(())
     }
 
