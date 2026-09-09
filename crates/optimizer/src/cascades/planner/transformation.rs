@@ -12,8 +12,8 @@ pub(super) mod settlement;
 mod staging;
 
 use staging::{
-    stage_transformed_expression, NativeShell, StagingInput, StagingRegionRequirements,
-    StagingRequest, StagingTarget,
+    stage_transformed_expression, NativeChild, NativeNode, NativeShell, StagingInput,
+    StagingRegionRequirements, StagingRequest, StagingTarget,
 };
 
 fn settle_with_session_arena(
@@ -392,6 +392,22 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             None
         };
+        // PredicateTransfer can consume the exact matched shell directly for
+        // the conservative INNER/CROSS side-local subset. Keep the legacy
+        // owned-plan path available for every shape that needs a richer
+        // FilterPushdown semantic pass.
+        let direct_native = if matches!(
+            self.transformation,
+            PlannerTransformation::PredicateTransfer
+        ) {
+            let state = self
+                .planner_state
+                .read()
+                .expect("planner transform state poisoned");
+            try_native_predicate_transfer(&binding.root, ctx.memo(), &state, &facts)?
+        } else {
+            None
+        };
         let (
             plan,
             source_stats,
@@ -408,16 +424,20 @@ impl TransformationRule for PlannerTransformationRule {
                 .planner_state
                 .read()
                 .expect("planner transform state poisoned");
-            let Some(instantiated) = semantic_plan::instantiate_bound_plan_with_group_holes(
-                ctx.memo(),
-                &state,
-                &binding.root,
-                Some(&facts),
-            )?
-            else {
-                return Ok(Box::new([]));
+            let (plan, nested_group_holes) = if direct_native.is_none() {
+                let Some(instantiated) = semantic_plan::instantiate_bound_plan_with_group_holes(
+                    ctx.memo(),
+                    &state,
+                    &binding.root,
+                    Some(&facts),
+                )?
+                else {
+                    return Ok(Box::new([]));
+                };
+                (Some(instantiated.plan), instantiated.group_holes)
+            } else {
+                (None, BTreeMap::new())
             };
-            let plan = instantiated.plan;
             let logical = ctx
                 .memo()
                 .logical_expr(expr)
@@ -450,7 +470,7 @@ impl TransformationRule for PlannerTransformationRule {
                 metadata.input_context,
                 metadata.child_context,
                 metadata.output_columns.clone(),
-                instantiated.group_holes,
+                nested_group_holes,
                 PlannerRuleEnvironment {
                     control: ctx.memo().control().clone(),
                     bind_context: state.bind_context.clone(),
@@ -464,88 +484,92 @@ impl TransformationRule for PlannerTransformationRule {
             )
         };
         let mut cte_restriction = None;
-        let plans = if matches!(
-            self.transformation,
-            PlannerTransformation::CteInline
-                | PlannerTransformation::CteFilterPushdown
-                | PlannerTransformation::CtePartitionedMaterialization
-                | PlannerTransformation::CteDemandPushdown
-        ) {
-            let state = self
-                .planner_state
-                .read()
-                .expect("planner transform state poisoned");
-            let requirement = cte::CteRequirement::from_binding(binding, ctx.memo(), &state)?;
-            debug!(target: targets::OPTIMIZER, owner = requirement.owner.index(), producer = requirement.producer.index(), base_producer = requirement.base_producer.index(), "bound native CTE requirement");
-            if requirement.owner != ctx.memo().canonical_group(target_group)
-                || requirement.sharing_owner != source_region.map(|(facet, _)| facet)
-            {
-                return Err(paro_error::internal("CTE inline changed sharing ownership"));
-            }
-            if matches!(self.transformation, PlannerTransformation::CteInline) {
-                drop(state);
-                requirement
-                    .inline(plan, &mut nested_group_holes, &environment.bind_context)?
-                    .into_iter()
-                    .collect()
-            } else if matches!(
+        let plans = if let Some(plan) = plan {
+            if matches!(
                 self.transformation,
-                PlannerTransformation::CtePartitionedMaterialization
+                PlannerTransformation::CteInline
+                    | PlannerTransformation::CteFilterPushdown
+                    | PlannerTransformation::CtePartitionedMaterialization
+                    | PlannerTransformation::CteDemandPushdown
             ) {
-                drop(state);
-                let mut state = self
+                let state = self
                     .planner_state
-                    .write()
+                    .read()
                     .expect("planner transform state poisoned");
-                let (cte_partition_labels, staging_arena) = state.cte_partition_state_mut();
-                requirement.partitions(
-                    plan,
-                    &mut nested_group_holes,
-                    &environment.bind_context,
-                    cte_partition_labels,
-                    staging_arena,
-                )?
-            } else {
-                let restricted = if matches!(
+                let requirement = cte::CteRequirement::from_binding(binding, ctx.memo(), &state)?;
+                debug!(target: targets::OPTIMIZER, owner = requirement.owner.index(), producer = requirement.producer.index(), base_producer = requirement.base_producer.index(), "bound native CTE requirement");
+                if requirement.owner != ctx.memo().canonical_group(target_group)
+                    || requirement.sharing_owner != source_region.map(|(facet, _)| facet)
+                {
+                    return Err(paro_error::internal("CTE inline changed sharing ownership"));
+                }
+                if matches!(self.transformation, PlannerTransformation::CteInline) {
+                    drop(state);
+                    requirement
+                        .inline(plan, &mut nested_group_holes, &environment.bind_context)?
+                        .into_iter()
+                        .collect()
+                } else if matches!(
                     self.transformation,
-                    PlannerTransformation::CteDemandPushdown
+                    PlannerTransformation::CtePartitionedMaterialization
                 ) {
-                    requirement.restrict_key_domain(
+                    drop(state);
+                    let mut state = self
+                        .planner_state
+                        .write()
+                        .expect("planner transform state poisoned");
+                    let (cte_partition_labels, staging_arena) = state.cte_partition_state_mut();
+                    requirement.partitions(
                         plan,
                         &mut nested_group_holes,
-                        ctx.memo(),
-                        &state,
-                        &facts,
+                        &environment.bind_context,
+                        cte_partition_labels,
+                        staging_arena,
                     )?
                 } else {
-                    requirement.restrict_predicate_domain(plan, ctx.memo(), &state)?
-                };
-                if let Some((plan, proof)) = restricted {
-                    drop(state);
-                    let plan = requirement.close_domain(
-                        plan,
-                        &proof,
-                        ctx.memo(),
-                        &mut self
-                            .planner_state
-                            .write()
-                            .expect("planner transform state poisoned"),
-                    )?;
-                    cte_restriction = Some((requirement.producer, proof));
-                    vec![plan]
-                } else {
-                    Vec::new()
+                    let restricted = if matches!(
+                        self.transformation,
+                        PlannerTransformation::CteDemandPushdown
+                    ) {
+                        requirement.restrict_key_domain(
+                            plan,
+                            &mut nested_group_holes,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                        )?
+                    } else {
+                        requirement.restrict_predicate_domain(plan, ctx.memo(), &state)?
+                    };
+                    if let Some((plan, proof)) = restricted {
+                        drop(state);
+                        let plan = requirement.close_domain(
+                            plan,
+                            &proof,
+                            ctx.memo(),
+                            &mut self
+                                .planner_state
+                                .write()
+                                .expect("planner transform state poisoned"),
+                        )?;
+                        cte_restriction = Some((requirement.producer, proof));
+                        vec![plan]
+                    } else {
+                        Vec::new()
+                    }
                 }
+            } else {
+                rewrite_planner_expressions(
+                    self.transformation,
+                    plan,
+                    source_stats.as_ref(),
+                    &environment,
+                )?
             }
         } else {
-            rewrite_planner_expressions(
-                self.transformation,
-                plan,
-                source_stats.as_ref(),
-                &environment,
-            )?
+            Vec::new()
         };
-        if plans.is_empty() {
+        if plans.is_empty() && direct_native.is_none() {
             return Ok(Box::new([]));
         }
 
@@ -583,78 +607,113 @@ impl TransformationRule for PlannerTransformationRule {
                 | PlannerTransformation::AggregateDimensionDeferral
                 | PlannerTransformation::AggregateJoinSubsumption
         );
-        let mut prepared = Vec::with_capacity(plans.len());
-        for plan in plans {
-            let retained_group_holes = retained_group_holes(&plan, &nested_group_holes)?;
-            let group_hole_guard = GroupHoleTransportGuard::capture(
-                &plan,
-                retained_group_holes.keys().copied(),
-                &environment.bind_context,
-            )?;
-            let use_native_plan = use_native_shell && native_shell_is_closed(&plan);
-            let (prepared_plan, root_operator, output_layout) = if use_native_plan {
-                let plan =
-                    refresh_native_shell_statistics(plan, source_stats.as_ref(), &environment);
-                let root_operator = plan.operator.op_type();
-                let output_layout = plan.output_layout();
-                group_hole_guard.validate_owned(&plan)?;
-                let shell = NativeShell::from_owned(plan)?;
-                (
-                    PreparedPlan::Native {
-                        shell,
-                        column_stats: source_stats.clone(),
-                    },
-                    root_operator,
-                    output_layout,
-                )
-            } else {
-                let settled = {
-                    let mut planner_state = self
-                        .planner_state
-                        .write()
-                        .expect("planner transform state poisoned");
-                    settle_with_session_arena(&mut planner_state, plan, &environment)?
+        enum PlanCandidate {
+            Native(NativeShell),
+            Owned(OwnedLogicalPlan),
+        }
+
+        let mut candidates = Vec::with_capacity(plans.len() + usize::from(direct_native.is_some()));
+        if let Some(shell) = direct_native {
+            candidates.push(PlanCandidate::Native(shell));
+        }
+        candidates.extend(plans.into_iter().map(PlanCandidate::Owned));
+
+        let mut prepared = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let (prepared_plan, root_operator, output_layout, retained_group_holes) =
+                match candidate {
+                    PlanCandidate::Native(shell) => {
+                        let root_operator = shell.root_operator().op_type();
+                        let output_layout = shell.root_layout()?;
+                        (
+                            PreparedPlan::Native {
+                                shell,
+                                column_stats: source_stats.clone(),
+                            },
+                            root_operator,
+                            output_layout,
+                            BTreeMap::new(),
+                        )
+                    }
+                    PlanCandidate::Owned(plan) => {
+                        let retained_group_holes =
+                            retained_group_holes(&plan, &nested_group_holes)?;
+                        let group_hole_guard = GroupHoleTransportGuard::capture(
+                            &plan,
+                            retained_group_holes.keys().copied(),
+                            &environment.bind_context,
+                        )?;
+                        let use_native_plan = use_native_shell && native_shell_is_closed(&plan);
+                        if use_native_plan {
+                            let plan = refresh_native_shell_statistics(
+                                plan,
+                                source_stats.as_ref(),
+                                &environment,
+                            );
+                            let root_operator = plan.operator.op_type();
+                            let output_layout = plan.output_layout();
+                            group_hole_guard.validate_owned(&plan)?;
+                            let shell = NativeShell::from_owned(plan)?;
+                            (
+                                PreparedPlan::Native {
+                                    shell,
+                                    column_stats: source_stats.clone(),
+                                },
+                                root_operator,
+                                output_layout,
+                                retained_group_holes,
+                            )
+                        } else {
+                            let settled = {
+                                let mut planner_state = self
+                                    .planner_state
+                                    .write()
+                                    .expect("planner transform state poisoned");
+                                settle_with_session_arena(&mut planner_state, plan, &environment)?
+                            };
+                            let Some(settlement::SettledExpression {
+                                plan,
+                                statistics: column_stats,
+                                scopes,
+                            }) = settled
+                            else {
+                                return Ok(Box::new([]));
+                            };
+                            let mut state = self
+                                .planner_state
+                                .write()
+                                .expect("planner transform state poisoned");
+                            let view = state.staging_arena.plan(plan)?;
+                            group_hole_guard.validate_arena(&view)?;
+                            if environment.verify_enabled {
+                                crate::verify::verify_arena_plan(&view, || {
+                                    environment.session.cancellation.check()
+                                })?;
+                            }
+                            // The target Memo group owns the output contract. Settlement
+                            // may legitimately widen child carriers for predicates and
+                            // ordering, but the transformed root must be frozen back to
+                            // the group's exact binding layout before staging.
+                            let plan = semantic_plan::freeze_arena_output_layout(
+                                plan,
+                                &source_output_columns,
+                                &mut state,
+                            )?;
+                            let root_operator = state.staging_arena.get(plan)?.operator.op_type();
+                            let output_layout = state.staging_arena.output_layout(plan)?.clone();
+                            (
+                                PreparedPlan::Settled {
+                                    plan,
+                                    column_stats,
+                                    scopes,
+                                },
+                                root_operator,
+                                output_layout,
+                                retained_group_holes,
+                            )
+                        }
+                    }
                 };
-                let Some(settlement::SettledExpression {
-                    plan,
-                    statistics: column_stats,
-                    scopes,
-                }) = settled
-                else {
-                    return Ok(Box::new([]));
-                };
-                let mut state = self
-                    .planner_state
-                    .write()
-                    .expect("planner transform state poisoned");
-                let view = state.staging_arena.plan(plan)?;
-                group_hole_guard.validate_arena(&view)?;
-                if environment.verify_enabled {
-                    crate::verify::verify_arena_plan(&view, || {
-                        environment.session.cancellation.check()
-                    })?;
-                }
-                // The target Memo group owns the output contract. Settlement
-                // may legitimately widen child carriers for predicates and
-                // ordering, but the transformed root must be frozen back to
-                // the group's exact binding layout before staging.
-                let plan = semantic_plan::freeze_arena_output_layout(
-                    plan,
-                    &source_output_columns,
-                    &mut state,
-                )?;
-                let root_operator = state.staging_arena.get(plan)?.operator.op_type();
-                let output_layout = state.staging_arena.output_layout(plan)?.clone();
-                (
-                    PreparedPlan::Settled {
-                        plan,
-                        column_stats,
-                        scopes,
-                    },
-                    root_operator,
-                    output_layout,
-                )
-            };
             let mut preserved_region_facet = None;
             let mut extended_required_region_facets = enclosing_required_region_facets.clone();
             let output_input_context = source_input_context;
@@ -924,6 +983,253 @@ struct PlannerRuleEnvironment {
     cost_model: crate::cost_model::CostModel,
     budget: SearchBudget,
     verify_enabled: bool,
+}
+
+/// Apply the part of PredicateTransfer that only needs the matched operator
+/// shell.  A pattern binding already contains the exact join/filter operators
+/// and Memo group holes, so routing a side-local predicate does not require an
+/// `OwnedLogicalPlan` or a representative subtree.
+///
+/// This deliberately implements the conservative side-local subset first:
+/// predicates that reference one side of an INNER/CROSS join are safe to move
+/// below that join; mixed-side, constant, fenced, and outer-join predicates
+/// stay on the legacy path.  Declining those cases is important because a
+/// native fast path must not turn missing semantic coverage into an accepted
+/// no-op.
+fn try_native_predicate_transfer(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: &boundary::BoundarySnapshot,
+) -> Result<Option<NativeShell>> {
+    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+        return Ok(None);
+    };
+    let root = shell.root;
+    let LogicalOperator::Filter(filter) = shell.nodes[root].operator.clone() else {
+        return Ok(None);
+    };
+    let NativeChild::Node(join_index) = filter.child.clone() else {
+        return Ok(None);
+    };
+    let join_operator = shell
+        .nodes
+        .get(join_index)
+        .ok_or_else(|| paro_error::internal("native predicate shell lost its join child"))?
+        .operator
+        .clone();
+    let (left, right, inner) = match join_operator.clone() {
+        LogicalOperator::Join(Join::Comparison(join))
+            if join.join_type == JoinType::Inner
+                && join.duplicate_eliminated_columns.is_empty()
+                && !join.delim_flipped
+                && !crate::expression::comparison_join_has_evaluation_fence(&join) =>
+        {
+            (join.left, join.right, true)
+        }
+        LogicalOperator::Join(Join::Cross(join)) => (join.left, join.right, true),
+        _ => return Ok(None),
+    };
+    if !inner {
+        return Ok(None);
+    }
+    if filter
+        .expressions
+        .iter()
+        .any(|expression| expression.evaluation_properties().is_reorder_fence())
+    {
+        return Ok(None);
+    }
+
+    let layouts = shell.layouts()?;
+    let child_layout =
+        |child: &NativeChild| -> Result<paro_planner::operator::LogicalOutputLayout> {
+            match child {
+                NativeChild::Node(index) => layouts.get(*index).cloned().ok_or_else(|| {
+                    paro_error::internal("native predicate shell referenced an unknown node")
+                }),
+                NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
+                    Ok(layout.clone())
+                }
+            }
+        };
+    let left_tables = child_layout(&left)?
+        .bindings()
+        .iter()
+        .map(|binding| binding.table_index)
+        .collect::<BTreeSet<_>>();
+    let right_tables = child_layout(&right)?
+        .bindings()
+        .iter()
+        .map(|binding| binding.table_index)
+        .collect::<BTreeSet<_>>();
+    let mut left_filters = Vec::new();
+    let mut right_filters = Vec::new();
+    let mut remaining = Vec::new();
+    for expression in filter.expressions {
+        if expression.evaluation_properties().is_reorder_fence() {
+            remaining.push(expression);
+            continue;
+        }
+        let mut tables = BTreeSet::new();
+        crate::expression::traversal::visit_expression(&expression, &mut |candidate| {
+            if let Expression::ColumnRef(column) = candidate {
+                tables.insert(column.binding.table_index);
+            }
+        });
+        if !tables.is_empty() && tables.is_subset(&left_tables) && tables.is_disjoint(&right_tables)
+        {
+            left_filters.push(expression);
+        } else if !tables.is_empty()
+            && tables.is_subset(&right_tables)
+            && tables.is_disjoint(&left_tables)
+        {
+            right_filters.push(expression);
+        } else {
+            remaining.push(expression);
+        }
+    }
+    if left_filters.is_empty() && right_filters.is_empty() {
+        return Ok(None);
+    }
+
+    let join_stats = shell
+        .nodes
+        .get(join_index)
+        .map(|node| node.stats.clone())
+        .unwrap_or_default();
+    let mut nodes = shell.nodes.into_vec();
+    let add_filter =
+        |nodes: &mut Vec<NativeNode>, child: NativeChild, expressions: Vec<Expression>| {
+            let index = nodes.len();
+            nodes.push(NativeNode {
+                id: state.bind_context.next_plan_id(),
+                stats: NodeStats::default(),
+                operator: LogicalOperator::Filter(paro_planner::operator::Filter {
+                    expressions,
+                    child,
+                    projection_map: paro_planner::operator::ProjectionMap::all(),
+                }),
+            });
+            index
+        };
+    let left = if left_filters.is_empty() {
+        left
+    } else {
+        NativeChild::Node(add_filter(&mut nodes, left, left_filters))
+    };
+    let right = if right_filters.is_empty() {
+        right
+    } else {
+        NativeChild::Node(add_filter(&mut nodes, right, right_filters))
+    };
+    let join = match join_operator {
+        LogicalOperator::Join(Join::Comparison(mut join)) => {
+            join.left = left;
+            join.right = right;
+            LogicalOperator::Join(Join::Comparison(join))
+        }
+        LogicalOperator::Join(Join::Cross(mut join)) => {
+            join.left = left;
+            join.right = right;
+            LogicalOperator::Join(Join::Cross(join))
+        }
+        _ => return Ok(None),
+    };
+    let joined = nodes.len();
+    nodes.push(NativeNode {
+        id: state.bind_context.next_plan_id(),
+        stats: join_stats,
+        operator: join,
+    });
+    let root = if remaining.is_empty()
+        && filter
+            .projection_map
+            .is_identity(layouts.get(join_index).map_or(0, |layout| layout.len()))
+    {
+        joined
+    } else {
+        let root = nodes.len();
+        nodes.push(NativeNode {
+            id: state.bind_context.next_plan_id(),
+            stats: NodeStats::default(),
+            operator: LogicalOperator::Filter(paro_planner::operator::Filter {
+                expressions: remaining,
+                child: NativeChild::Node(joined),
+                projection_map: filter.projection_map,
+            }),
+        });
+        root
+    };
+    compact_native_shell(NativeShell {
+        nodes: nodes.into_boxed_slice(),
+        root,
+    })
+    .map(Some)
+}
+
+fn compact_native_shell(shell: NativeShell) -> Result<NativeShell> {
+    fn visit(
+        index: usize,
+        nodes: &[NativeNode],
+        marks: &mut [u8],
+        order: &mut Vec<usize>,
+    ) -> Result<()> {
+        let node = nodes
+            .get(index)
+            .ok_or_else(|| paro_error::internal("native shell references an unknown node"))?;
+        match marks[index] {
+            1 => return Err(paro_error::internal("native shell contains a child cycle")),
+            2 => return Ok(()),
+            _ => {}
+        }
+        marks[index] = 1;
+        let mut children = Vec::new();
+        node.operator
+            .visit_child_links(&mut |child| children.push(child));
+        for child in children {
+            if let NativeChild::Node(index) = child {
+                visit(*index, nodes, marks, order)?;
+            }
+        }
+        marks[index] = 2;
+        order.push(index);
+        Ok(())
+    }
+
+    if shell.nodes.is_empty() || shell.root >= shell.nodes.len() {
+        return Err(paro_error::internal("native shell has no compactable root"));
+    }
+    let root = shell.root;
+    let nodes = shell.nodes.into_vec();
+    let mut marks = vec![0_u8; nodes.len()];
+    let mut order = Vec::new();
+    visit(root, &nodes, &mut marks, &mut order)?;
+    let mut remap = vec![usize::MAX; nodes.len()];
+    let mut compacted = Vec::with_capacity(order.len());
+    for old_index in order {
+        let node = &nodes[old_index];
+        let operator = node
+            .operator
+            .clone()
+            .try_map_child_links(&mut |child| {
+                Ok::<_, std::convert::Infallible>(match child {
+                    NativeChild::Node(index) => NativeChild::Node(remap[index]),
+                    other => other,
+                })
+            })
+            .expect("native shell child remapping cannot fail");
+        remap[old_index] = compacted.len();
+        compacted.push(NativeNode {
+            id: node.id,
+            stats: node.stats.clone(),
+            operator,
+        });
+    }
+    Ok(NativeShell {
+        nodes: compacted.into_boxed_slice(),
+        root: remap[root],
+    })
 }
 
 /// Recompute facts for one native transformation shell without entering the

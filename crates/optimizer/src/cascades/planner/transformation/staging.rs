@@ -23,13 +23,13 @@ pub(super) enum StagingInput {
     Native(NativeShell),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct NativeShell {
     pub(super) nodes: Box<[NativeNode]>,
     pub(super) root: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct NativeNode {
     pub(super) id: paro_planner::plan::PlanNodeId,
     pub(super) stats: NodeStats,
@@ -39,6 +39,19 @@ pub(super) struct NativeNode {
 #[derive(Debug, Clone)]
 pub(super) enum NativeChild {
     Node(usize),
+    /// A pattern binding that already names the Memo group it consumes.  This
+    /// variant is used by native rule producers; unlike `Group`, it does not
+    /// need a temporary BoundReferenceId → GroupId side map during staging.
+    /// The reference still carries the immutable facts/layout contract used by
+    /// the native cost and statistics paths.
+    MemoGroup {
+        group: GroupId,
+        id: paro_planner::plan::PlanNodeId,
+        stats: NodeStats,
+        layout: paro_planner::operator::LogicalOutputLayout,
+        names: Arc<[String]>,
+        reference: paro_planner::operator::BoundReference,
+    },
     Group {
         id: paro_planner::plan::PlanNodeId,
         stats: NodeStats,
@@ -49,6 +62,221 @@ pub(super) enum NativeChild {
 }
 
 impl NativeShell {
+    /// Build a closed native shell directly from an exact pattern binding.
+    ///
+    /// The generic planner transformation path needs an `OwnedLogicalPlan` so
+    /// legacy rules can inspect a subtree. Native rules already have the exact
+    /// operator payload and the group-hole pattern, so rebuilding that tree is
+    /// pure transport overhead. This constructor preserves the operator
+    /// payload, attaches the Memo-owned boundary facts, and records only a
+    /// post-order vector of native nodes.
+    pub(super) fn from_pattern(
+        memo: &Memo,
+        state: &PlannerTransformState,
+        binding: &PatternOperand,
+        facts: &boundary::BoundarySnapshot,
+    ) -> Result<Option<Self>> {
+        struct Built {
+            child: NativeChild,
+            layout: Arc<paro_planner::operator::LogicalOutputLayout>,
+            names: Arc<[String]>,
+        }
+
+        fn group(
+            memo: &Memo,
+            state: &PlannerTransformState,
+            facts: &boundary::BoundarySnapshot,
+            group: GroupId,
+            layout: &PlannerBindingLayout,
+        ) -> Result<Built> {
+            if layout.bindings().len() != layout.types().len() {
+                return Err(paro_error::internal(
+                    "native pattern group has inconsistent binding/type arity",
+                ));
+            }
+            let group = memo.canonical_group(group);
+            let transport = facts.transport(memo, state, group, layout)?;
+            let reference_id = paro_planner::operator::BoundReferenceId::group_hole(
+                state.bind_context.next_plan_id().0,
+            );
+            let reference = paro_planner::operator::BoundReference::new(
+                reference_id,
+                layout.bindings().to_vec(),
+                layout.types().to_vec(),
+            )
+            .with_facts(transport)?;
+            let mut stats = NodeStats::default();
+            stats.estimated_cardinality = facts.cardinality(memo, group);
+            stats.unique_keys = reference.facts.unique_keys.clone();
+            let names = (0..layout.bindings().len())
+                .map(|index| format!("__bound_reference_{index}"))
+                .collect::<Vec<_>>()
+                .into();
+            Ok(Built {
+                child: NativeChild::MemoGroup {
+                    group,
+                    id: state.bind_context.next_plan_id(),
+                    stats,
+                    layout: layout.as_ref().clone(),
+                    names: Arc::clone(&names),
+                    reference,
+                },
+                layout: layout.clone(),
+                names,
+            })
+        }
+
+        fn expression(
+            memo: &Memo,
+            state: &PlannerTransformState,
+            facts: &boundary::BoundarySnapshot,
+            operand: &PatternOperand,
+            nodes: &mut Vec<NativeNode>,
+            expected_layout: Option<&PlannerBindingLayout>,
+        ) -> Result<Option<Built>> {
+            match operand {
+                PatternOperand::Group(group_id) => {
+                    let Some(layout) = expected_layout else {
+                        return Err(paro_error::internal(
+                            "native pattern root cannot be an untyped Memo group",
+                        ));
+                    };
+                    Ok(Some(group(memo, state, facts, *group_id, layout)?))
+                }
+                PatternOperand::Expression {
+                    group: _group,
+                    expression: expression_id,
+                    children,
+                } => {
+                    let logical = memo.logical_expr(*expression_id).ok_or_else(|| {
+                        paro_error::internal("native pattern references an unknown expression")
+                    })?;
+                    let payload = state
+                        .payloads
+                        .logical
+                        .get(logical.payload.index())
+                        .ok_or_else(|| {
+                            paro_error::internal("native pattern references an unknown payload")
+                        })?;
+                    let metadata = state.metadata.get(&logical.payload).ok_or_else(|| {
+                        paro_error::internal("native pattern payload has no metadata")
+                    })?;
+                    if children.len() != metadata.child_layouts.len() {
+                        return Err(paro_error::internal(
+                            "native pattern child arity disagrees with metadata",
+                        ));
+                    }
+                    let mut built_children = Vec::with_capacity(children.len());
+                    for (child, layout) in children.iter().zip(&metadata.child_layouts) {
+                        let Some(built) =
+                            expression(memo, state, facts, child, nodes, Some(layout))?
+                        else {
+                            return Ok(None);
+                        };
+                        built_children.push(built);
+                    }
+                    let mut child_iter = built_children.iter().map(|child| child.child.clone());
+                    let operator = payload
+                        .semantic_template
+                        .operator
+                        .clone()
+                        .try_map_child_links(&mut |_| {
+                            child_iter.next().ok_or_else(|| {
+                                paro_error::internal("native pattern lost an operator child")
+                            })
+                        })?;
+                    if child_iter.next().is_some() {
+                        return Err(paro_error::internal(
+                            "native pattern retained excess operator children",
+                        ));
+                    }
+                    let child_layouts = built_children
+                        .iter()
+                        .map(|child| child.layout.as_ref())
+                        .collect::<Vec<_>>();
+                    let layout = Arc::new(operator.output_layout_from_child_refs(&child_layouts));
+                    let child_names = built_children
+                        .iter()
+                        .map(|child| child.names.as_ref())
+                        .collect::<Vec<_>>();
+                    let names: Arc<[String]> =
+                        operator.output_names_from_child_refs(&child_names).into();
+                    let mut stats = NodeStats::default();
+                    stats.estimated_cardinality = facts.cardinality(
+                        memo,
+                        match operand {
+                            PatternOperand::Expression { group, .. } => *group,
+                            PatternOperand::Group(_) => unreachable!(),
+                        },
+                    );
+                    let node_index = nodes.len();
+                    nodes.push(NativeNode {
+                        id: state.bind_context.next_plan_id(),
+                        stats,
+                        operator,
+                    });
+                    Ok(Some(Built {
+                        child: NativeChild::Node(node_index),
+                        layout,
+                        names,
+                    }))
+                }
+            }
+        }
+
+        let mut nodes = Vec::new();
+        let Some(root) = expression(memo, state, facts, binding, &mut nodes, None)? else {
+            return Ok(None);
+        };
+        let NativeChild::Node(root) = root.child else {
+            return Err(paro_error::internal(
+                "native pattern root must be an expression",
+            ));
+        };
+        Ok(Some(Self {
+            nodes: nodes.into_boxed_slice(),
+            root,
+        }))
+    }
+
+    pub(super) fn root_operator(&self) -> &LogicalOperator<NativeChild> {
+        &self.nodes[self.root].operator
+    }
+
+    pub(super) fn layouts(&self) -> Result<Vec<paro_planner::operator::LogicalOutputLayout>> {
+        let mut layouts =
+            Vec::<paro_planner::operator::LogicalOutputLayout>::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let child_layouts = {
+                let mut children = Vec::new();
+                node.operator
+                    .visit_child_links(&mut |child| children.push(child));
+                children
+                    .into_iter()
+                    .map(|child| match child {
+                        NativeChild::Node(index) => layouts.get(*index).cloned().ok_or_else(|| {
+                            paro_error::internal(
+                                "native shell layout references an incomplete node",
+                            )
+                        }),
+                        NativeChild::MemoGroup { layout, .. }
+                        | NativeChild::Group { layout, .. } => Ok(layout.clone()),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let refs = child_layouts.iter().collect::<Vec<_>>();
+            layouts.push(node.operator.output_layout_from_child_refs(&refs));
+        }
+        Ok(layouts)
+    }
+
+    pub(super) fn root_layout(&self) -> Result<paro_planner::operator::LogicalOutputLayout> {
+        self.layouts()?
+            .get(self.root)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("native shell has no root layout"))
+    }
+
     /// Lower an already-validated closed owned shell exactly once. The output
     /// is a compact post-order node list; real descendants become node
     /// indices and Memo holes keep their immutable BoundReference facts.
@@ -272,6 +500,30 @@ pub(super) fn stage_transformed_expression(
             .ok_or_else(|| {
                 paro_error::internal("staging reached an unregistered Memo group hole")
             })?;
+        resolve_group_reference(session, group, id, stats, layout, names, reference)
+    }
+
+    fn resolve_direct_group_reference(
+        session: &mut StagingSession<'_>,
+        group: GroupId,
+        id: paro_planner::plan::PlanNodeId,
+        stats: NodeStats,
+        layout: paro_planner::operator::LogicalOutputLayout,
+        names: Arc<[String]>,
+        reference: paro_planner::operator::BoundReference,
+    ) -> Result<NodeState> {
+        resolve_group_reference(session, group, id, stats, layout, names, reference)
+    }
+
+    fn resolve_group_reference(
+        session: &mut StagingSession<'_>,
+        group: GroupId,
+        id: paro_planner::plan::PlanNodeId,
+        stats: NodeStats,
+        layout: paro_planner::operator::LogicalOutputLayout,
+        names: Arc<[String]>,
+        reference: paro_planner::operator::BoundReference,
+    ) -> Result<NodeState> {
         let bindings = layout.bindings();
         let types = layout.types();
         if bindings.len() != types.len() {
@@ -1256,6 +1508,32 @@ pub(super) fn stage_transformed_expression(
                                     child_states.push(state);
                                     Ok::<_, paro_error::ParoError>(group)
                                 }
+                                NativeChild::MemoGroup {
+                                    group,
+                                    id,
+                                    stats,
+                                    layout,
+                                    names,
+                                    reference,
+                                } => {
+                                    let group = session.memo.canonical_group(group);
+                                    let node = resolve_direct_group_reference(
+                                        &mut session,
+                                        group,
+                                        id,
+                                        stats,
+                                        layout,
+                                        names,
+                                        reference,
+                                    )?;
+                                    if node.group != group {
+                                        return Err(paro_error::internal(
+                                        "native Memo group reference changed its group identity",
+                                    ));
+                                    }
+                                    child_states.push(node);
+                                    Ok::<_, paro_error::ParoError>(group)
+                                }
                                 NativeChild::Group {
                                     id,
                                     stats,
@@ -1666,6 +1944,82 @@ mod tests {
         .unwrap();
         assert!(staged.is_some());
         assert_eq!(state.staging_arena.len(), arena_len);
+    }
+
+    #[test]
+    fn direct_memo_group_shell_does_not_consume_legacy_hole_registry() {
+        use paro_planner::operator::{BoundReference, Filter, ProjectionMap};
+
+        let source_plan = test_base_get(0, 70_102, "direct_native_source", 10);
+        let layout = source_plan.output_layout();
+        let names: Arc<[String]> = source_plan.output_names().into();
+        let mut input = MemoBuilder::build(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(source_plan, vec![]))),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let root = input.root;
+        let root_expression = input.memo.group(root).unwrap().logical_exprs()[0];
+        let source = input
+            .memo
+            .logical_expr(root_expression)
+            .unwrap()
+            .key
+            .children[0];
+        let reference_id = paro_planner::operator::BoundReferenceId::group_hole(70_102);
+        let reference = BoundReference::new(
+            reference_id,
+            layout.bindings().to_vec(),
+            layout.types().to_vec(),
+        );
+        let native = NativeShell {
+            nodes: Box::new([NativeNode {
+                id: paro_planner::plan::PlanNodeId(70_103),
+                stats: NodeStats::default(),
+                operator: LogicalOperator::Filter(Filter {
+                    expressions: vec![],
+                    child: NativeChild::MemoGroup {
+                        group: source,
+                        id: paro_planner::plan::PlanNodeId(70_104),
+                        stats: NodeStats::default(),
+                        layout,
+                        names,
+                        reference,
+                    },
+                    projection_map: ProjectionMap::all(),
+                }),
+            }]),
+            root: 0,
+        };
+        let mut state = input.planner_state.write().unwrap();
+        state.session = Some(TestStatementContextBuilder::minimal().build());
+        let staged = stage_transformed_expression(
+            StagingRequest {
+                input: StagingInput::Native(native),
+                input_facts: boundary::BoundarySnapshot::default(),
+                column_stats: Arc::new(HashMap::new()),
+                column_stat_scopes: HashMap::new(),
+                target: StagingTarget {
+                    group: root,
+                    rule: RuleId(1_000),
+                    budget_class: TransformationBudgetClass::Local,
+                    input_context: OptimizationContextId(0),
+                    child_context: OptimizationContextId(0),
+                    refined_cardinality_kind: None,
+                },
+                regions: StagingRegionRequirements {
+                    preserved_facet: None,
+                    extended_required_facets: Box::new([]),
+                    inherited_runtime_filter_facet: None,
+                },
+                nested_group_holes: BTreeMap::new(),
+            },
+            &mut input.memo,
+            &mut state,
+        )
+        .unwrap();
+        assert!(staged.is_some());
     }
 
     #[test]

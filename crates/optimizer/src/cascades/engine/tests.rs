@@ -31,6 +31,7 @@ use crate::cascades::rules::{
     PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PhysicalImplementation,
     RulePromise, SidewaysFilterSource, TransformationBudgetClass, TransformationRule,
 };
+use crate::cascades::tasks::TaskState;
 use crate::physical::ObjectiveProfile;
 
 #[path = "tests/closure.rs"]
