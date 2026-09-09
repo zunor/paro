@@ -91,7 +91,7 @@ PROJECTION  (rows=1)
     Cardinality: [1, 1, 1]
     Output Schema: aggregate_state_1 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
-      Pushed Predicate: k >= 2 AND k < 5
+      Pushed Predicate: k < 5 AND k >= 2
       Cardinality: [9, 19, 29]
       Output Schema: (none)
 
