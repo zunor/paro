@@ -647,17 +647,73 @@ pub struct OptimizationGoal {
     pub context: OptimizationContextId,
 }
 
+/// The phase whose response contract is being requested for a subproblem.
+///
+/// This is part of the context identity even when two phases currently happen
+/// to use the same implementation code. A physical result that is safe to
+/// publish during costing is not automatically an executable image, and an
+/// execution response must not be reused as a logical discovery result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OptimizationPhase {
+    #[default]
+    Physical,
+    Logical,
+    Cost,
+    Admission,
+    Execution,
+}
+
+/// Query-local ownership of a shared artifact. The fingerprint identifies a
+/// semantic owner/producer, never a benchmark case or a physical candidate.
+/// Keeping it in the context prevents an inline and a shared CTE response from
+/// being collapsed merely because their required properties match.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SharedOwnership {
+    #[default]
+    Private,
+    Shared {
+        owner: Fingerprint,
+    },
+    Cte {
+        producer: Fingerprint,
+    },
+}
+
+/// Declares what a caller may consume from a resumable subproblem.
+///
+/// `Prefix` is intentionally distinct from `Complete`: a useful early
+/// frontier cannot be reused as proof that the declared search domain was
+/// exhausted. `ParentResponse` retains the exact parent-visible response
+/// dimension needed by a composition task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ContinuationContract {
+    #[default]
+    Complete,
+    Prefix {
+        frontier: Fingerprint,
+    },
+    ParentResponse {
+        response: Fingerprint,
+    },
+}
+
 /// Canonical execution context for a goal.
 ///
 /// Region membership is expression-path state, not a property of a semantic
 /// group: one group may contain both a sharing owner and an equivalent inline
-/// expression.  Interning the active required facets here lets those
+/// expression. Interning the active required facets here lets those
 /// expressions derive different child goals without cloning semantic groups
-/// or assigning one global region membership to every occurrence.
+/// or assigning one global region membership to every occurrence. The
+/// phase/ownership/continuation fields are also structural identity: they
+/// prevent demand-driven context reuse from silently dropping a parent-visible
+/// response dimension.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OptimizationContext {
     required_region_facets: Box<[Fingerprint]>,
     filterable_sources: BTreeSet<super::rules::WorkSourceId>,
+    phase: OptimizationPhase,
+    ownership: SharedOwnership,
+    continuation: ContinuationContract,
 }
 
 impl OptimizationContext {
@@ -668,7 +724,35 @@ impl OptimizationContext {
         Self {
             required_region_facets: required_region_facets.into_boxed_slice(),
             filterable_sources: BTreeSet::new(),
+            phase: OptimizationPhase::default(),
+            ownership: SharedOwnership::default(),
+            continuation: ContinuationContract::default(),
         }
+    }
+
+    pub fn new_with_contract(
+        required_region_facets: impl IntoIterator<Item = Fingerprint>,
+        phase: OptimizationPhase,
+        ownership: SharedOwnership,
+        continuation: ContinuationContract,
+    ) -> Self {
+        let mut context = Self::new(required_region_facets);
+        context.phase = phase;
+        context.ownership = ownership;
+        context.continuation = continuation;
+        context
+    }
+
+    pub fn with_contract(
+        mut self,
+        phase: OptimizationPhase,
+        ownership: SharedOwnership,
+        continuation: ContinuationContract,
+    ) -> Self {
+        self.phase = phase;
+        self.ownership = ownership;
+        self.continuation = continuation;
+        self
     }
 
     pub fn required_region_facets(&self) -> &[Fingerprint] {
@@ -677,6 +761,18 @@ impl OptimizationContext {
 
     pub fn filterable_sources(&self) -> &BTreeSet<super::rules::WorkSourceId> {
         &self.filterable_sources
+    }
+
+    pub fn phase(&self) -> OptimizationPhase {
+        self.phase
+    }
+
+    pub fn ownership(&self) -> SharedOwnership {
+        self.ownership
+    }
+
+    pub fn continuation(&self) -> ContinuationContract {
+        self.continuation
     }
 }
 
@@ -1932,13 +2028,7 @@ impl Memo {
                 "optimization contexts are immutable after initial Memo binding",
             ));
         }
-        if let Some(id) = self.optimization_context_index.get(&context) {
-            return Ok(*id);
-        }
-        let id = OptimizationContextId::new(self.optimization_contexts.len());
-        self.optimization_contexts.push(context.clone());
-        self.optimization_context_index.insert(context, id);
-        Ok(id)
+        Ok(self.intern_context_value(context))
     }
 
     /// Seal the expression-path context catalog before optional search starts.
@@ -1991,13 +2081,47 @@ impl Memo {
             .cloned()
             .ok_or_else(|| paro_error::internal("source demand has no region context"))?;
         context.filterable_sources = sources;
+        self.intern_demand_context(
+            base,
+            context.filterable_sources,
+            context.phase,
+            context.ownership,
+            context.continuation,
+        )
+    }
+
+    /// Intern a context demanded by an already-bound physical task. Unlike
+    /// the initial expression-path catalog, this method is allowed after the
+    /// catalog is frozen: only an actual child source/response demand can
+    /// create the variant, so optional search cannot pre-expand a context
+    /// powerset.
+    pub(super) fn intern_demand_context(
+        &mut self,
+        base: OptimizationContextId,
+        sources: BTreeSet<super::rules::WorkSourceId>,
+        phase: OptimizationPhase,
+        ownership: SharedOwnership,
+        continuation: ContinuationContract,
+    ) -> Result<OptimizationContextId> {
+        let mut context = self
+            .optimization_context(base)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("demand has no optimization context"))?;
+        context.filterable_sources = sources;
+        context.phase = phase;
+        context.ownership = ownership;
+        context.continuation = continuation;
+        Ok(self.intern_context_value(context))
+    }
+
+    fn intern_context_value(&mut self, context: OptimizationContext) -> OptimizationContextId {
         if let Some(id) = self.optimization_context_index.get(&context) {
-            return Ok(*id);
+            return *id;
         }
         let id = OptimizationContextId::new(self.optimization_contexts.len());
         self.optimization_contexts.push(context.clone());
         self.optimization_context_index.insert(context, id);
-        Ok(id)
+        id
     }
 
     pub fn insert_logical(

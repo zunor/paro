@@ -51,7 +51,10 @@ pub use governor::{
 };
 pub use grant::{GrantSensitivitySummary, GrantSharingProof};
 pub use ids::*;
-pub use memo::{Memo, OptimizationGoal, Winner};
+pub use memo::{
+    ContinuationContract, Memo, OptimizationContext, OptimizationGoal, OptimizationPhase,
+    SharedOwnership, Winner,
+};
 pub use planner::{
     AlternativeOrigin, LogicalAlternative, MemoBuilder, OptimizationInput, OptimizationOutput,
     OptimizedVariant, ResultPresentation, SearchSummary, GRAPH_REGION_ENUMERATOR_RULE,

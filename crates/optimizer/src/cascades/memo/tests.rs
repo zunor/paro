@@ -1935,3 +1935,75 @@ fn optimization_context_catalog_rejects_a_superlinear_initial_state() {
         .expect_err("one expression admits at most two non-root contexts");
     assert!(error.to_string().contains("exceeds its linear bound"));
 }
+
+#[test]
+fn demand_context_identity_preserves_phase_ownership_and_continuation() {
+    let mut memo = Memo::new(SearchBudget::default());
+    memo.freeze_optimization_contexts().unwrap();
+
+    let private = memo
+        .intern_demand_context(
+            OptimizationContextId::new(0),
+            BTreeSet::new(),
+            OptimizationPhase::Physical,
+            SharedOwnership::Private,
+            ContinuationContract::Complete,
+        )
+        .unwrap();
+    let prefix = memo
+        .intern_demand_context(
+            OptimizationContextId::new(0),
+            BTreeSet::new(),
+            OptimizationPhase::Physical,
+            SharedOwnership::Private,
+            ContinuationContract::Prefix {
+                frontier: Fingerprint(17),
+            },
+        )
+        .unwrap();
+    let shared = memo
+        .intern_demand_context(
+            OptimizationContextId::new(0),
+            BTreeSet::new(),
+            OptimizationPhase::Cost,
+            SharedOwnership::Shared {
+                owner: Fingerprint(23),
+            },
+            ContinuationContract::Complete,
+        )
+        .unwrap();
+
+    assert_ne!(private, prefix);
+    assert_ne!(private, shared);
+    assert_eq!(
+        memo.intern_demand_context(
+            OptimizationContextId::new(0),
+            BTreeSet::new(),
+            OptimizationPhase::Physical,
+            SharedOwnership::Private,
+            ContinuationContract::Complete,
+        )
+        .unwrap(),
+        private
+    );
+    assert_eq!(
+        memo.optimization_context(prefix).unwrap().phase(),
+        OptimizationPhase::Physical
+    );
+    assert_eq!(
+        memo.optimization_context(prefix).unwrap().continuation(),
+        ContinuationContract::Prefix {
+            frontier: Fingerprint(17)
+        }
+    );
+    assert_eq!(
+        memo.optimization_context(shared).unwrap().ownership(),
+        SharedOwnership::Shared {
+            owner: Fingerprint(23)
+        }
+    );
+    // Region compatibility is intentionally narrower than full response
+    // identity: these contexts may share region membership, but not a task
+    // result or continuation.
+    assert!(memo.same_region_context(private, prefix));
+}
