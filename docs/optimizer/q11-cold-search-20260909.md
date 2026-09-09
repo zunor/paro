@@ -148,6 +148,28 @@ not to an irreducible 256-way source-response partition. The median sample still
 spends 233.8 ms in predicate transfer and 134.8 ms in join-region enumeration;
 the sub-100 ms target is not closed.
 
+Five normal processes at `07b6a0b2` (immutable source payload sharing) give
+1186.363 ms median EXPLAIN. This removes payload duplication but does not show
+an additional latency improvement over the preceding change.
+
+## Region ownership normalization
+
+A separate macOS sampling run on the original Q11 (owned private dataset
+copy, normal release) observed 163 region-normalization stack samples out of
+919 optimizer samples. This is diagnostic attribution, not a timed benchmark.
+The work is charged to rules because staging republishes their region facets;
+it is not owned-expression materialization. Singleton scopes cannot partially
+overlap any set, so their equality classes are now coalesced independently of
+composite overlap closure. Laminar validation and parent construction use one
+reverse-size membership pass, replacing two all-pairs scans. Final node scope
+and facet payloads are moved rather than cloned.
+
+No admission ceiling, facet priority, or normalization schedule changes. An
+independent ordered-set model checks 512 mixed scope families under six optional
+ceilings in both insertion orders; exhaustive parent selection is its oracle.
+Another test covers 8,192 singleton anchors inside a required region. All 1,042
+optimizer tests pass; normal timing follows this commit.
+
 ## Immutable source-response payloads
 
 Candidates now share immutable source-work snapshots. Ordinary parent
