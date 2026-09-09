@@ -98,14 +98,29 @@ fn native_predicate_statistics_follow_observed_input_facts_not_payload_snapshots
         )
         .unwrap()
         .unwrap();
-        let columns = snapshot.columns(context.memo(), child).unwrap();
+        let columns = &snapshot.groups[&context.memo().canonical_group(child)];
         let native = state
             .cost_model
             .estimate_native_selectivity(
                 scalar,
                 &state.scalars,
                 &state.binding_ids,
-                |column| columns.selectivity(column),
+                |column| {
+                    Some(crate::cost_model::ColumnPredicateEvidence {
+                        point: columns
+                            .column_domains
+                            .get(&column)
+                            .and_then(|domain| domain.expected()),
+                        values: columns
+                            .column_values
+                            .get(&column)
+                            .map(|values| values.statistics()),
+                        distribution: columns
+                            .column_values
+                            .get(&column)
+                            .and_then(|values| values.distribution()),
+                    })
+                },
                 || Ok(true),
             )
             .unwrap()
@@ -114,9 +129,7 @@ fn native_predicate_statistics_follow_observed_input_facts_not_payload_snapshots
         previous_reads = context.take_fact_reads();
         assert!(previous_reads.iter().any(|read| read.group == child));
     }
-    assert!(BoundarySnapshot::default()
-        .columns(&input.memo, child)
-        .is_err());
+    assert!(!BoundarySnapshot::default().groups.contains_key(&child));
 }
 
 #[test]
@@ -137,11 +150,11 @@ fn native_column_evidence_keeps_distribution_without_an_ndv_point() {
         )]),
         ..Default::default()
     });
-    let evidence = BoundaryColumns(&facts).selectivity(id).unwrap();
-    assert_eq!(evidence.point, None);
-    assert_eq!(evidence.values.unwrap().get_type(), &LogicalType::Double);
-    assert_eq!(evidence.distribution, Some(distribution));
-    assert!(BoundaryColumns(&facts).selectivity(ColumnId(4)).is_none());
+    assert!(!facts.column_domains.contains_key(&id));
+    let values = &facts.column_values[&id];
+    assert_eq!(values.statistics().get_type(), &LogicalType::Double);
+    assert_eq!(values.distribution(), Some(distribution));
+    assert!(!facts.column_values.contains_key(&ColumnId(4)));
 }
 
 #[test]

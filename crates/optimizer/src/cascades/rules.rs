@@ -21,7 +21,6 @@ use super::memo::{
 use super::properties::ProvidedProperties;
 use super::region::RegionCandidateContract;
 
-pub const EXPENSIVE_PREDICATE_PLACEMENT_RULE: RuleId = RuleId(10_006);
 pub const CTE_INLINE_RULE: RuleId = RuleId(10_007);
 pub const CTE_DEMAND_PUSHDOWN_RULE: RuleId = RuleId(10_008);
 pub const AGGREGATE_POST_REDUCTION_RULE: RuleId = RuleId(10_009);
@@ -44,10 +43,6 @@ pub const PREDICATE_TRANSFER_RULE: RuleId = RuleId(10_026);
 pub const KEY_DOMAIN_TRANSFER_RULE: RuleId = RuleId(10_027);
 
 const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
-    (
-        EXPENSIVE_PREDICATE_PLACEMENT_RULE,
-        "expensive_predicate_placement",
-    ),
     (CTE_INLINE_RULE, "cte_inline"),
     (CTE_DEMAND_PUSHDOWN_RULE, "cte_demand_pushdown"),
     (CTE_FILTER_PUSHDOWN_RULE, "cte_filter_pushdown"),

@@ -94,6 +94,10 @@ pub(super) struct PlannerLogicalPayload {
 #[derive(Debug)]
 pub(super) enum PlannerPhysicalTemplate {
     Logical(LogicalPayloadId),
+    OrderedFilter {
+        logical: LogicalPayloadId,
+        order: super::predicate_order::PredicateOrder,
+    },
     Executable(Box<OwnedLogicalPlan>),
 }
 
@@ -106,6 +110,10 @@ pub(super) struct PlannerPhysicalPayload {
 pub(super) struct PlannerPayloadArena {
     pub(super) logical: Vec<PlannerLogicalPayload>,
     pub(super) physical: Vec<PlannerPhysicalPayload>,
+    filter_orders: BTreeMap<
+        LogicalPayloadId,
+        BTreeMap<super::predicate_order::PredicateOrder, PhysicalPayloadId>,
+    >,
 }
 
 impl PlannerPayloadArena {
@@ -127,6 +135,37 @@ impl PlannerPayloadArena {
 
     pub(super) fn get_physical(&self, id: PhysicalPayloadId) -> Option<&PlannerPhysicalPayload> {
         self.physical.get(id.index())
+    }
+
+    pub(super) fn intern_filter_order(
+        &mut self,
+        logical: LogicalPayloadId,
+        order: super::predicate_order::PredicateOrder,
+    ) -> PhysicalPayloadId {
+        if let Some(id) = self
+            .filter_orders
+            .get(&logical)
+            .and_then(|orders| orders.get(&order))
+        {
+            return *id;
+        }
+        let id = self.push_physical(PlannerPhysicalTemplate::OrderedFilter {
+            logical,
+            order: order.clone(),
+        });
+        self.filter_orders
+            .entry(logical)
+            .or_default()
+            .insert(order, id);
+        id
+    }
+
+    fn truncate_physical(&mut self, len: usize) {
+        self.physical.truncate(len);
+        self.filter_orders.retain(|_, orders| {
+            orders.retain(|_, id| id.index() < len);
+            !orders.is_empty()
+        });
     }
 }
 
@@ -239,8 +278,7 @@ impl PlannerTransformState {
             .logical
             .truncate(savepoint.logical_payload_count);
         self.payloads
-            .physical
-            .truncate(savepoint.physical_payload_count);
+            .truncate_physical(savepoint.physical_payload_count);
         // Payload IDs are append-only within a transaction. Remove the delta
         // by ordered range, not a scan of all earlier immutable metadata.
         self.metadata

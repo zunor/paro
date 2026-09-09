@@ -8,4 +8,3 @@ pub(crate) mod domain_transfer;
 pub mod propagate_result;
 pub mod pullup;
 pub mod pushdown;
-pub mod reorder;

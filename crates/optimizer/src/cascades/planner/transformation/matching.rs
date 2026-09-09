@@ -867,7 +867,6 @@ pub(super) fn scoped_pattern_bindings(
     let scope = match transformation {
         PlannerTransformation::PredicateTransfer => PatternScope::PredicateTransfer,
         PlannerTransformation::KeyDomainTransfer => PatternScope::KeyDomainTransfer,
-        PlannerTransformation::ExpensivePredicatePlacement => PatternScope::Shell,
         PlannerTransformation::TopNIntroduction => PatternScope::TopN,
         PlannerTransformation::LimitPushdown => PatternScope::LimitProjection,
         PlannerTransformation::LatePayloadFetch => PatternScope::LatePayload,
@@ -1544,8 +1543,7 @@ fn transformation_root_operator_matches(
 
     match transformation {
         PlannerTransformation::KeyDomainTransfer => operator == Op::ComparisonJoin,
-        PlannerTransformation::PredicateTransfer
-        | PlannerTransformation::ExpensivePredicatePlacement => operator == Op::Filter,
+        PlannerTransformation::PredicateTransfer => operator == Op::Filter,
         PlannerTransformation::CtePartitionedMaterialization
         | PlannerTransformation::CteInline
         | PlannerTransformation::CteDemandPushdown
@@ -1707,14 +1705,18 @@ mod tests {
         let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
         let child = input.memo.logical_expr(expression).unwrap().key.children[0];
         let state = input.planner_state.read().unwrap();
-        let before = scoped_pattern_bindings(
-            PlannerTransformation::ExpensivePredicatePlacement,
+        let before = enumerate_pattern_bindings(
             input.root,
             expression,
             &input.memo,
-            &state,
-            None,
+            input.memo.budget(),
             BudgetDimension::RuleWorkPerGroup,
+            None,
+            PatternSpec {
+                state: Some(&state),
+                scope: PatternScope::Shell,
+                witness: None,
+            },
         )
         .unwrap();
         assert_eq!(before.completion, PatternEnumerationCompletion::Complete);
@@ -1749,14 +1751,18 @@ mod tests {
             .reads
             .iter()
             .all(|read| read.is_current(&input.memo).unwrap()));
-        let after = scoped_pattern_bindings(
-            PlannerTransformation::ExpensivePredicatePlacement,
+        let after = enumerate_pattern_bindings(
             input.root,
             expression,
             &input.memo,
-            &state,
-            None,
+            input.memo.budget(),
             BudgetDimension::RuleWorkPerGroup,
+            None,
+            PatternSpec {
+                state: Some(&state),
+                scope: PatternScope::Shell,
+                witness: None,
+            },
         )
         .unwrap();
         assert_eq!(before.bindings, after.bindings);

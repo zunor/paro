@@ -24,7 +24,7 @@ use paro_storage::table::table_factory::TableFactory;
 
 use super::*;
 
-fn test_grant_classes() -> [ResourceGrantClass; 1] {
+pub(super) fn test_grant_classes() -> [ResourceGrantClass; 1] {
     [ResourceGrantClass {
         id: super::super::ids::ResourceGrantClassId(0),
         hard_memory_bytes: u64::MAX,

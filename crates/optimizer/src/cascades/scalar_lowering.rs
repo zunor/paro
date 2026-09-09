@@ -143,6 +143,23 @@ pub(crate) fn intern_operator_scalars<Child>(
         roots.push(root);
         Ok(())
     })?;
+    if matches!(operator, LogicalOperator::Filter(_)) {
+        // Logical identity has no preferred evaluation order within a pure,
+        // total segment. Preserve fence positions and occurrence arity; the
+        // physical Filter contract chooses execution order after search.
+        let mut start = 0;
+        for end in 0..=roots.len() {
+            if end == roots.len()
+                || arena
+                    .get(roots[end])
+                    .is_none_or(|node| node.properties.is_evaluation_fence())
+            {
+                roots[start..end]
+                    .sort_by_key(|id| (arena.get(*id).map(|node| node.fingerprint), *id));
+                start = end + 1;
+            }
+        }
+    }
     Ok(roots.into_boxed_slice())
 }
 

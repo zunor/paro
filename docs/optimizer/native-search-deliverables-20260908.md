@@ -571,3 +571,40 @@ including inline-storage spill, and the 10,000-level test uses a nontrivial
 ranking point (not merely constant false) for both AND and OR. Optimizer
 **1030 tests** pass. The cold gate must be rerun to determine the effect; no
 performance improvement is claimed from these unit tests.
+
+At `10209b2a`, `native-q11-cold-borrowed-flat-evidence-20260909.json`
+records **1565.421 ms**, median RSS **376,487,936 bytes**. The unchanged strict
+gate fails (wall 1.156x, RSS 1.077x), including increased search obligations.
+Logical expressions rise from 1833 to 1903 and physical expressions from 2919
+to 3049. Predicate-order publications rise from 37 to 55 compared with the
+preceding instrumented run. Fresh input statistics expose more evaluation
+orders, which the logical rule was incorrectly treating as new relational
+alternatives. The accurate evidence is retained; the logical search layer is
+being corrected, not the timing baseline or budget constants.
+
+### Physical Filter scheduling contract
+
+Pure, total Filter operand segments now have canonical logical identity.
+Evaluation fences and occurrence arity are retained. Physical implementation
+reads the current input group's native evidence and records a stable scheduling
+permutation in its payload and fingerprint. Extraction verifies ownership,
+arity, bijection and fence preservation before exporting selected scalar IDs.
+It never chooses another order using extraction-time statistics. The generic
+WinnerVerifier still replays candidate/cost composition; a planner-specific
+payload verifier adds the scalar scheduling proof.
+
+The logical expensive-predicate-placement rule and unused executable-tree
+reorderer are deleted. This removes redundant logical permutations, not a
+relational transformation or a search-budget allowance. Filter's conservative
+structural work estimate remains unchanged: there is no invented selectivity
+rebate or claim of a completed kernel-specific predicate cost model.
+
+New checks include an independent 720-permutation fence oracle, canonical
+logical identity, exact engine selection/extraction after input facts change,
+malformed proof rejection, intern-cache rollback, and expired scheduling with
+the mandatory baseline retained. Post-change validation is recorded below
+when completed; this design change is not itself evidence of a speedup.
+
+Full workspace **6503 passed / 85 ignored**, optimizer **1032 passed**, and
+strict workspace/all-target Clippy pass. No SQL expected results or search
+budget constants were changed. Fresh cold, SQL and execution checks follow.

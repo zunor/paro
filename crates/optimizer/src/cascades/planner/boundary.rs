@@ -80,29 +80,6 @@ struct GroupFacts {
     fingerprint: std::sync::OnceLock<Fingerprint>,
 }
 
-/// A typed view of one already-observed group's column evidence. Holding this
-/// borrow cannot materialize a representative plan, manufacture storage
-/// statistics, or silently fall back to an expression-local payload snapshot.
-pub(super) struct BoundaryColumns<'a>(&'a GroupFacts);
-
-impl<'a> BoundaryColumns<'a> {
-    pub(super) fn selectivity(
-        &self,
-        column: ColumnId,
-    ) -> Option<crate::cost_model::ColumnPredicateEvidence<'a>> {
-        let domain = self.0.column_domains.get(&column);
-        let values = self.0.column_values.get(&column);
-        if domain.is_none() && values.is_none() {
-            return None;
-        }
-        Some(crate::cost_model::ColumnPredicateEvidence {
-            point: domain.and_then(|domain| domain.expected()),
-            values: values.map(|values| values.statistics()),
-            distribution: values.and_then(|values| values.distribution()),
-        })
-    }
-}
-
 impl From<GroupFactValue> for GroupFacts {
     fn from(value: GroupFactValue) -> Self {
         Self {
@@ -811,15 +788,6 @@ impl BoundarySnapshot {
                 .saturating_add((range.expected_upper - range.expected_lower) / 2),
             max: range.upper,
         })
-    }
-
-    pub(super) fn columns(&self, memo: &Memo, group: GroupId) -> Result<BoundaryColumns<'_>> {
-        self.groups
-            .get(&memo.canonical_group(group))
-            .map(|facts| BoundaryColumns(facts))
-            .ok_or_else(|| {
-                paro_error::internal("native column reader consumed an unobserved group")
-            })
     }
 
     pub(super) fn transport(

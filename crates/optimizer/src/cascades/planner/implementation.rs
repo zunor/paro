@@ -159,10 +159,30 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             .memo
             .logical_expr(expr)
             .ok_or_else(|| paro_error::internal("baseline implementation lost logical expr"))?;
-        let planner_state = self
+        let mut planner_state = self
             .planner_state
-            .read()
+            .write()
             .expect("planner transform state poisoned");
+        let metadata = planner_state
+            .metadata
+            .get(&logical.payload)
+            .ok_or_else(|| paro_error::internal("baseline implementation lost metadata"))?;
+        let (payload, payload_fingerprint) =
+            if metadata.operator_type == LogicalOperatorType::Filter {
+                if let Some(order) = predicate_order::select(logical, &planner_state, ctx.memo)? {
+                    let fingerprint = order.fingerprint(metadata.operator_fingerprint);
+                    (
+                        planner_state
+                            .payloads
+                            .intern_filter_order(logical.payload, order),
+                        fingerprint,
+                    )
+                } else {
+                    (metadata.baseline_payload, metadata.operator_fingerprint)
+                }
+            } else {
+                (metadata.baseline_payload, metadata.operator_fingerprint)
+            };
         let metadata = planner_state
             .metadata
             .get(&logical.payload)
@@ -193,7 +213,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             .into_boxed_slice();
         let mut fingerprint = StableFingerprintBuilder::default();
         fingerprint.write_u64(self.id().0 as u64);
-        fingerprint.write_fingerprint(metadata.operator_fingerprint);
+        fingerprint.write_fingerprint(payload_fingerprint);
         append_grant_fingerprint(&mut fingerprint, metadata.grant_dependency, goal.grant);
         fingerprint.write_u64(
             (self.force_spill
@@ -251,9 +271,9 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 implementation: self.id(),
                 logical: expr,
                 children,
-                payload_fingerprint: metadata.operator_fingerprint,
+                payload_fingerprint,
             },
-            payload: metadata.baseline_payload,
+            payload,
             provided: metadata.provided.clone(),
             child_goals,
             local_cost,

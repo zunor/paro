@@ -4,6 +4,50 @@
 //! Winner extraction from Memo expressions into verified planner trees.
 
 use super::*;
+
+/// Replay the planner-specific semantic contract in addition to the generic
+/// WinnerVerifier's exact candidate/cost tree. Statistics may rank schedules,
+/// but are neither a proof of safe reordering nor an extraction-time choice.
+fn verify_predicate_order(
+    physical: &crate::cascades::memo::PhysicalExpr,
+    logical: &crate::cascades::memo::LogicalExpr,
+    metadata: &PlannerOperatorMetadata,
+    state: &PlannerTransformState,
+) -> Result<()> {
+    let payload = state
+        .payloads
+        .get_physical(physical.payload)
+        .ok_or_else(|| {
+            paro_error::internal("predicate order verifier lost the physical payload")
+        })?;
+    match &payload.template {
+        PlannerPhysicalTemplate::OrderedFilter {
+            logical: owner,
+            order,
+        } => {
+            if *owner != logical.payload
+                || metadata.operator_type != LogicalOperatorType::Filter
+                || physical.key.implementation != PLANNER_BASELINE_IMPLEMENTATION
+                || order.fingerprint(metadata.operator_fingerprint)
+                    != physical.key.payload_fingerprint
+            {
+                return Err(paro_error::internal(
+                    "physical predicate order has the wrong owner or identity",
+                ));
+            }
+            order.verify(&logical.key.scalars, &state.scalars)
+        }
+        PlannerPhysicalTemplate::Logical(owner) => {
+            if *owner != logical.payload {
+                return Err(paro_error::internal(
+                    "physical template has the wrong logical owner",
+                ));
+            }
+            Ok(())
+        }
+        PlannerPhysicalTemplate::Executable(_) => Ok(()),
+    }
+}
 use paro_planner::expression::ReferenceExpression;
 use paro_planner::operator::Projection as LogicalProjection;
 
@@ -108,6 +152,7 @@ pub(super) fn extract_planner_tree(
                 let operator_metadata = state.metadata.get(&logical.payload).ok_or_else(|| {
                     paro_error::internal("winner extraction lost implementation metadata")
                 })?;
+                verify_predicate_order(physical, logical, operator_metadata, state)?;
                 let implementation = selected_implementation_flavor(
                     physical.key.implementation,
                     operator_metadata.implementations,
@@ -290,7 +335,8 @@ pub(super) fn extract_planner_tree(
                     .ok_or_else(|| paro_error::internal("unknown planner physical payload"))?;
                 let mut children = children.into_iter();
                 let mut plan = match &payload.template {
-                    PlannerPhysicalTemplate::Logical(logical) => state
+                    PlannerPhysicalTemplate::Logical(logical)
+                    | PlannerPhysicalTemplate::OrderedFilter { logical, .. } => state
                         .payloads
                         .logical
                         .get(logical.index())
@@ -313,13 +359,20 @@ pub(super) fn extract_planner_tree(
                         "physical extraction produced excess child plans",
                     ));
                 }
-                if matches!(&payload.template, PlannerPhysicalTemplate::Logical(_)) {
+                if !matches!(&payload.template, PlannerPhysicalTemplate::Executable(_)) {
                     let logical = memo.logical_expr(logical).ok_or_else(|| {
                         paro_error::internal("native extraction lost its selected logical operands")
                     })?;
+                    let roots: std::borrow::Cow<'_, [ScalarExprId]> = match &payload.template {
+                        PlannerPhysicalTemplate::OrderedFilter { order, .. } => order
+                            .ordered_roots(&logical.key.scalars, &state.scalars)?
+                            .into_vec()
+                            .into(),
+                        _ => logical.key.scalars.as_ref().into(),
+                    };
                     crate::cascades::scalar_lowering::export_operator_scalars(
                         &mut plan.operator,
-                        &logical.key.scalars,
+                        &roots,
                         &state.scalars,
                         &state.binding_ids,
                         |child, column| {
