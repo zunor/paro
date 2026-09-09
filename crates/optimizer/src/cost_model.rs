@@ -155,6 +155,11 @@ fn disjunction_estimate(
     estimates: impl Iterator<Item = SelectivityEstimate>,
 ) -> SelectivityEstimate {
     let mut estimates = estimates.collect::<Vec<_>>();
+    if estimates.len() == 1 {
+        // OR(p) is p, including its provenance and floating-point point.
+        // Complementing twice introduces drift from the scalar-only form.
+        return estimates[0];
+    }
     // OR is commutative too; canonicalize the miss-probability reduction.
     estimates.sort_by(|left, right| {
         left.fraction
@@ -359,7 +364,7 @@ impl CostModel {
     ) -> SelectivityResult<HashMap<View::Key, SelectivityEstimate>> {
         enum Combine<Node> {
             And(Vec<ConjunctionTerm<Node>>),
-            Or(Vec<Node>),
+            Or(AssociativeTerms<Node>),
             Not(Node),
         }
         enum Task<Node> {
@@ -383,15 +388,12 @@ impl CostModel {
                         PredicateKind::And => {
                             Some(Combine::And(conjunction_terms([node], resolver, work)?))
                         }
-                        PredicateKind::Or => {
-                            let mut children = Vec::new();
-                            resolver.try_children(node, |child| {
-                                work.admit()?;
-                                children.push(child);
-                                Ok(())
-                            })?;
-                            Some(Combine::Or(children))
-                        }
+                        PredicateKind::Or => Some(Combine::Or(flatten_associative(
+                            [node],
+                            resolver,
+                            ConjunctionType::Or,
+                            work,
+                        )?)),
                         PredicateKind::Operator(OperatorType::Not) => {
                             resolver.operator_child(node, 0).map(Combine::Not)
                         }
@@ -409,7 +411,7 @@ impl CostModel {
                                 }
                             }
                             Combine::Or(children) => {
-                                pending.extend(children.iter().copied().map(Task::Enter))
+                                pending.extend(children.iter().map(|(node, _)| Task::Enter(*node)))
                             }
                             Combine::Not(child) => pending.push(Task::Enter(*child)),
                         }
@@ -426,9 +428,15 @@ impl CostModel {
                     let estimate = |child| estimates[&resolver.key(child)];
                     let value = match combine {
                         Combine::And(terms) => combine_conjunction_terms(terms, estimate),
-                        Combine::Or(children) => {
-                            disjunction_estimate(children.into_iter().map(estimate))
-                        }
+                        Combine::Or(children) => disjunction_estimate(children.into_iter().map(
+                            |(child, occurrences)| {
+                                repeat_selectivity(
+                                    estimate(child),
+                                    occurrences,
+                                    ConjunctionType::Or,
+                                )
+                            },
+                        )),
                         Combine::Not(child) => estimate(child).complement(),
                     };
                     estimates.insert(resolver.key(node), value);
@@ -736,23 +744,34 @@ enum ConjunctionTerm<Node> {
     Estimate(SelectivityEstimate, Option<ColumnBinding>),
 }
 
+fn repeat_selectivity(
+    value: SelectivityEstimate,
+    occurrences: u64,
+    kind: ConjunctionType,
+) -> SelectivityEstimate {
+    if occurrences <= 1 {
+        return value;
+    }
+    let fraction = match kind {
+        ConjunctionType::And => value.fraction.powf(occurrences as f64),
+        ConjunctionType::Or => 1.0 - (1.0 - value.fraction).powf(occurrences as f64),
+    };
+    if value.proven {
+        SelectivityEstimate::proven(fraction)
+    } else {
+        SelectivityEstimate::estimated(fraction)
+    }
+}
+
 fn combine_conjunction_terms<Node>(
     terms: Vec<ConjunctionTerm<Node>>,
     mut estimate: impl FnMut(Node) -> SelectivityEstimate,
 ) -> SelectivityEstimate {
     column_aware_conjunction_estimate(terms.into_iter().map(|term| match term {
-        ConjunctionTerm::Input(node, binding, occurrences) => {
-            let mut value = estimate(node);
-            if occurrences > 1 {
-                let fraction = value.fraction.powf(occurrences as f64);
-                value = if value.proven {
-                    SelectivityEstimate::proven(fraction)
-                } else {
-                    SelectivityEstimate::estimated(fraction)
-                };
-            }
-            (value, binding)
-        }
+        ConjunctionTerm::Input(node, binding, occurrences) => (
+            repeat_selectivity(estimate(node), occurrences, ConjunctionType::And),
+            binding,
+        ),
         ConjunctionTerm::Estimate(value, binding) => (value, binding),
     }))
 }
@@ -762,7 +781,7 @@ fn conjunction_terms<'a, View: PredicateView<'a>>(
     resolver: &View,
     work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
 ) -> SelectivityResult<Vec<ConjunctionTerm<View::Node>>> {
-    let flattened = flatten_and(expressions, resolver, work)?;
+    let flattened = flatten_associative(expressions, resolver, ConjunctionType::And, work)?;
 
     let mut intervals = Vec::<IntegralIntervalEstimate>::new();
     let mut interval_by_binding = HashMap::<ColumnBinding, usize>::new();
@@ -850,13 +869,87 @@ fn reverse_comparison(comparison_type: ComparisonType) -> ComparisonType {
     }
 }
 
-fn flatten_and<'a, View: PredicateView<'a>>(
+type AssociativeTerms<Node> = smallvec::SmallVec<[(Node, u64); 8]>;
+
+fn same_boolean_kind<Node>(kind: ConjunctionType, node: PredicateKind<'_, Node>) -> bool {
+    matches!(
+        (kind, node),
+        (ConjunctionType::And, PredicateKind::And) | (ConjunctionType::Or, PredicateKind::Or)
+    )
+}
+
+/// Flat predicate vectors need no topological order or path-count table.
+/// A checked shallow pass proves that case, while nested/shared graphs use
+/// the same occurrence algebra through the general DAG path below. Inline
+/// storage is an implementation detail, never a search-space cutoff.
+fn flatten_associative<'a, View: PredicateView<'a>>(
     expressions: impl IntoIterator<Item = View::Node>,
     view: &View,
+    kind: ConjunctionType,
     work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
-) -> SelectivityResult<Vec<(View::Node, u64)>> {
+) -> SelectivityResult<AssociativeTerms<View::Node>> {
+    let mut shallow = smallvec::SmallVec::<[View::Node; 8]>::new();
+    let mut nested = false;
+    for expression in expressions {
+        work.admit()?;
+        if same_boolean_kind(kind, view.kind(expression)) {
+            view.try_children(expression, |child| {
+                work.admit()?;
+                nested |= same_boolean_kind(kind, view.kind(child));
+                shallow.push(child);
+                Ok(())
+            })?;
+        } else {
+            shallow.push(expression);
+        }
+    }
+    if nested {
+        return flatten_associative_dag(shallow, view, kind, work);
+    }
+    let mut terms = AssociativeTerms::<View::Node>::new();
+    let mut positions = None::<HashMap<View::Key, usize>>;
+    for node in shallow {
+        work.admit()?;
+        if positions.is_none() && terms.len() == terms.inline_size() {
+            positions = Some(
+                terms
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (node, _))| (view.key(*node), index))
+                    .collect(),
+            );
+        }
+        let position = if let Some(positions) = &positions {
+            positions.get(&view.key(node)).copied()
+        } else {
+            // At most the inline capacity comparisons. Once spilled, use a
+            // key index so wide filters cannot turn this into quadratic work.
+            terms
+                .iter()
+                .position(|(seen, _)| view.key(*seen) == view.key(node))
+        };
+        if let Some(position) = position {
+            if !view.can_share(node) {
+                terms[position].1 = terms[position].1.saturating_add(1);
+            }
+        } else {
+            if let Some(positions) = &mut positions {
+                positions.insert(view.key(node), terms.len());
+            }
+            terms.push((node, 1));
+        }
+    }
+    Ok(terms)
+}
+
+fn flatten_associative_dag<'a, View: PredicateView<'a>>(
+    expressions: impl IntoIterator<Item = View::Node>,
+    view: &View,
+    kind: ConjunctionType,
+    work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
+) -> SelectivityResult<AssociativeTerms<View::Node>> {
     // First discover a topological order, then propagate occurrence counts.
-    // Walking paths would expand a tiny shared AND DAG exponentially. Counts
+    // Walking paths would expand a tiny shared boolean DAG exponentially. Counts
     // are relevant only to non-shareable evaluations; deterministic repeated
     // predicates describe one domain. Saturation avoids integer overflow for
     // more occurrences than floating-point costing can distinguish.
@@ -880,7 +973,7 @@ fn flatten_and<'a, View: PredicateView<'a>>(
             continue;
         }
         pending.push((current, true));
-        if matches!(view.kind(current), PredicateKind::And) {
+        if same_boolean_kind(kind, view.kind(current)) {
             view.try_children(current, |child| {
                 work.admit()?;
                 pending.push((child, false));
@@ -888,11 +981,11 @@ fn flatten_and<'a, View: PredicateView<'a>>(
             })?;
         }
     }
-    let mut output = Vec::new();
+    let mut output = AssociativeTerms::new();
     for current in post_order.into_iter().rev() {
         work.admit()?;
         let occurrences = counts[&view.key(current)];
-        if matches!(view.kind(current), PredicateKind::And) {
+        if same_boolean_kind(kind, view.kind(current)) {
             view.try_children(current, |child| {
                 work.admit()?;
                 let count = counts.entry(view.key(child)).or_default();
@@ -1324,8 +1417,22 @@ mod tests {
             .spawn(|| {
                 let model = CostModel::default();
                 for kind in [ConjunctionType::And, ConjunctionType::Or] {
-                    let mut expression = Expression::Constant(
-                        ConstantExpression::new(Value::Boolean(false), LogicalType::Boolean).into(),
+                    let mut expression = Expression::Comparison(
+                        ComparisonExpression::new(
+                            ComparisonType::Equal,
+                            Expression::ColumnRef(
+                                ColumnRefExpression::new(
+                                    ColumnBinding::new(1, 0),
+                                    LogicalType::Integer,
+                                )
+                                .into(),
+                            ),
+                            Expression::Constant(
+                                ConstantExpression::new(Value::Integer(1), LogicalType::Integer)
+                                    .into(),
+                            ),
+                        )
+                        .into(),
                     );
                     for _ in 0..10_000 {
                         expression = Expression::Conjunction(
@@ -1348,7 +1455,7 @@ mod tests {
                             }),
                         )
                         .unwrap();
-                    assert_eq!(estimate.fraction, 0.0);
+                    assert_eq!(estimate.fraction, model.defaults.equality);
                 }
             })
             .unwrap()
@@ -1357,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_conjunction_counts_evaluations_without_confusing_them_with_domains() {
+    fn shared_boolean_nodes_count_evaluations_without_confusing_them_with_domains() {
         use paro_planner::expression::{ConjunctionExpression, FunctionExpression};
         let model = CostModel::default();
         let random = paro_function::scalar::math::get_random_function()
@@ -1389,17 +1496,92 @@ mod tests {
             )
             .into(),
         );
-        for (leaf, occurrences) in [(stable, 1), (volatile, 8)] {
-            let point = model.estimate_selectivity(&leaf, &HashMap::new());
-            let mut root = leaf;
-            for _ in 0..3 {
-                root = Expression::Conjunction(
-                    ConjunctionExpression::new(ConjunctionType::And, vec![root.clone(), root])
-                        .into(),
-                );
+        for kind in [ConjunctionType::And, ConjunctionType::Or] {
+            for (leaf, occurrences) in [(stable.clone(), 1), (volatile.clone(), 8)] {
+                let point = model.estimate_selectivity(&leaf, &HashMap::new());
+                let mut root = leaf;
+                for _ in 0..3 {
+                    root = Expression::Conjunction(
+                        ConjunctionExpression::new(kind, vec![root.clone(), root]).into(),
+                    );
+                }
+                let estimate = model.estimate_selectivity(&root, &HashMap::new());
+                let expected = match kind {
+                    ConjunctionType::And => point.powi(occurrences),
+                    ConjunctionType::Or => 1.0 - (1.0 - point).powi(occurrences),
+                };
+                assert!((estimate - expected).abs() < 1e-12);
             }
-            let estimate = model.estimate_selectivity(&root, &HashMap::new());
-            assert!((estimate - point.powi(occurrences)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn flat_and_dag_term_paths_agree_with_an_independent_occurrence_oracle() {
+        use paro_planner::expression::ConjunctionExpression;
+        let leaves = (0..24)
+            .map(|value| {
+                Expression::Comparison(
+                    ComparisonExpression::new(
+                        ComparisonType::Equal,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(1, value),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                        Expression::Constant(
+                            ConstantExpression::new(
+                                Value::Integer(value as i32),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                    )
+                    .into(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stats = HashMap::new();
+        let view = StatisticsResolver::logical(&stats);
+        for kind in [ConjunctionType::And, ConjunctionType::Or] {
+            for count in 0..=leaves.len() {
+                let flat: Vec<_> = leaves[..count]
+                    .iter()
+                    .chain(leaves[..count].iter().rev())
+                    .cloned()
+                    .collect();
+                let shared =
+                    Expression::Conjunction(ConjunctionExpression::new(kind, flat.clone()).into());
+                let nested = Expression::Conjunction(
+                    ConjunctionExpression::new(kind, vec![shared.clone(), shared]).into(),
+                );
+                let mut paths = vec![&nested];
+                let mut oracle = HashMap::new();
+                // Deliberately enumerate occurrences in this bounded test;
+                // production analysis may not expand shared DAG paths.
+                while let Some(node) = paths.pop() {
+                    if let Expression::Conjunction(conjunction) = node {
+                        paths.extend(&conjunction.children);
+                    } else {
+                        oracle.insert(node.allocation_identity(), 1u64);
+                    }
+                }
+                for (roots, expect_inline) in [
+                    (flat.iter().collect::<Vec<_>>(), count <= 8),
+                    (vec![&nested], count <= 8),
+                ] {
+                    let actual =
+                        flatten_associative(roots, &view, kind, &mut SelectivityWork(|| Ok(true)))
+                            .unwrap();
+                    assert_eq!(!actual.spilled(), expect_inline);
+                    let actual: HashMap<_, _> = actual
+                        .into_iter()
+                        .map(|(node, occurrences)| (node.allocation_identity(), occurrences))
+                        .collect();
+                    assert_eq!(actual, oracle);
+                }
+            }
         }
     }
 

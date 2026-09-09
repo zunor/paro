@@ -555,3 +555,19 @@ estimate follows each new point. A separate test retains a distribution without
 an NDV point. Optimizer **1029 tests**, full workspace **6500 passed / 85
 ignored**, and strict workspace/all-target Clippy pass. Post-change SQL/cold
 validation is pending for this follow-up.
+
+The selectivity walker now proves a flat predicate input with one shallow pass
+and uses inline leaf storage there; only nested associative graphs construct a
+topological/path-count table. A wide flat input switches to a key index instead
+of retaining linear duplicate lookup. This is an algorithmic representation
+choice, not a search-budget limit. Common column/literal comparisons resolve
+their single statistical binding without an auxiliary graph walk. Shared OR
+domains now have the same idempotence contract as AND domains; volatile
+occurrences still use their independent evaluation count. `OR(p)` retains p's
+point exactly instead of rounding it through two complements.
+
+An independent bounded occurrence enumerator checks flat and nested forms,
+including inline-storage spill, and the 10,000-level test uses a nontrivial
+ranking point (not merely constant false) for both AND and OR. Optimizer
+**1030 tests** pass. The cold gate must be rerun to determine the effect; no
+performance improvement is claimed from these unit tests.

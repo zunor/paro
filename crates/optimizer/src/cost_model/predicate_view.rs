@@ -75,6 +75,10 @@ pub(super) trait PredicateView<'a> {
     }
 
     fn single_binding(&self, node: Self::Node) -> Option<ColumnBinding> {
+        self.scan_single_binding(node)
+    }
+
+    fn scan_single_binding(&self, node: Self::Node) -> Option<ColumnBinding> {
         let mut binding = None;
         let mut pending = vec![node];
         let mut seen = HashSet::new();
@@ -165,6 +169,21 @@ impl<'a> PredicateView<'a> for StatisticsResolver<'a> {
     fn unresolved_column(&self, node: Self::Node) -> bool {
         matches!(node, Expression::ColumnRef(column) if column.depth != 0)
             || matches!(node, Expression::Reference(_) if self.binding(node).is_none())
+    }
+
+    fn single_binding(&self, node: Self::Node) -> Option<ColumnBinding> {
+        match self.kind(node) {
+            PredicateKind::Constant(_) => None,
+            PredicateKind::Comparison(comparison, left, right) => {
+                if let Some((column, _, _)) =
+                    column_constant_comparison(comparison, left, right, self)
+                {
+                    return self.binding(column);
+                }
+                self.scan_single_binding(node)
+            }
+            _ => self.scan_single_binding(node),
+        }
     }
 }
 
