@@ -66,6 +66,26 @@ pub enum TaskKind {
     Cost,
 }
 
+impl TaskKind {
+    const ALL: [Self; 5] = [
+        Self::Discover,
+        Self::Transform,
+        Self::Implement,
+        Self::Optimize,
+        Self::Cost,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Discover => 0,
+            Self::Transform => 1,
+            Self::Implement => 2,
+            Self::Optimize => 3,
+            Self::Cost => 4,
+        }
+    }
+}
+
 /// The semantic work requested by a task.  Physical goals are deliberately
 /// absent from discovery/transformation identities: a new grant does not
 /// recreate a logical equivalence closure.
@@ -425,7 +445,10 @@ pub struct TaskRegistry {
     reserved_units: u64,
     reservation_limit: Option<u64>,
     profile: TaskRegistryProfile,
-    kind_profiles: BTreeMap<TaskKind, TaskKindProfile>,
+    // A task kind is a closed, five-value enum. Keep its diagnostic counters
+    // in fixed slots so normal requests do not mutate a tree or allocate a
+    // map entry on the first task of each kind.
+    kind_profiles: [TaskKindProfile; 5],
     group_redirects: BTreeMap<GroupId, GroupId>,
     group_revisions: BTreeMap<GroupId, u64>,
 }
@@ -439,12 +462,16 @@ impl TaskRegistry {
         let mut profile = self.profile.clone();
         profile.unique_intents = self.intents.len() as u64;
         profile.unique_evaluations = self.evaluations.len() as u64;
-        profile.by_kind = self.kind_profiles.clone();
+        profile.by_kind = TaskKind::ALL
+            .into_iter()
+            .zip(self.kind_profiles.iter().cloned())
+            .filter(|(_, profile)| profile != &TaskKindProfile::default())
+            .collect();
         profile
     }
 
     fn kind_profile_mut(&mut self, kind: TaskKind) -> &mut TaskKindProfile {
-        self.kind_profiles.entry(kind).or_default()
+        &mut self.kind_profiles[kind.index()]
     }
 
     pub fn intern_intent(&mut self, intent: TaskIntent) -> TaskIntentId {
