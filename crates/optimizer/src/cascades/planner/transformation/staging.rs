@@ -83,6 +83,7 @@ pub(super) fn stage_transformed_expression(
         group: GroupId,
         columns: Box<[ColumnId]>,
         layout: Arc<paro_planner::operator::LogicalOutputLayout>,
+        names: Arc<[String]>,
         region_scope: PlannerRegionScope,
     }
 
@@ -147,6 +148,7 @@ pub(super) fn stage_transformed_expression(
                 .and_then(|reference_id| session.nested_group_holes.remove(&reference_id))
             {
                 let layout = plan.output_layout();
+                let names = Arc::<[String]>::from(plan.output_names());
                 let bindings = layout.bindings();
                 let types = layout.types();
                 if bindings.len() != types.len() {
@@ -185,6 +187,7 @@ pub(super) fn stage_transformed_expression(
                         group,
                         columns: columns.into_boxed_slice(),
                         layout: Arc::new(layout.clone()),
+                        names,
                         region_scope: PlannerRegionScope::group(group),
                     },
                     None,
@@ -220,7 +223,15 @@ pub(super) fn stage_transformed_expression(
             .output_layout_from_child_refs(&child_layouts);
         let output_bindings = output_layout.bindings();
         let output_types = output_layout.types();
-        let output_names = semantic_plan.output_names();
+        let child_names = child_states
+            .iter()
+            .map(|child| child.names.as_ref())
+            .collect::<Vec<_>>();
+        let output_names = Arc::<[String]>::from(
+            semantic_plan
+                .operator
+                .output_names_from_child_refs(&child_names),
+        );
         if output_bindings.len() != output_types.len() {
             return Err(paro_error::internal(
                 "transformed plan output binding/type arity mismatch",
@@ -433,6 +444,7 @@ pub(super) fn stage_transformed_expression(
                         group,
                         columns: output_columns.into_boxed_slice(),
                         layout: Arc::new(output_layout.clone()),
+                        names: Arc::clone(&output_names),
                         region_scope: PlannerRegionScope::new(
                             group,
                             child_states.iter().map(|child| child.region_scope.clone()),
@@ -529,6 +541,7 @@ pub(super) fn stage_transformed_expression(
                             group,
                             columns: output_columns.into_boxed_slice(),
                             layout: Arc::new(output_layout.clone()),
+                            names: Arc::clone(&output_names),
                             region_scope,
                         },
                         None,
@@ -540,6 +553,7 @@ pub(super) fn stage_transformed_expression(
                         group,
                         columns: output_columns.into_boxed_slice(),
                         layout: Arc::new(output_layout.clone()),
+                        names: Arc::clone(&output_names),
                         region_scope,
                     },
                     Some(StagedEquivalent {
@@ -762,6 +776,7 @@ pub(super) fn stage_transformed_expression(
                 group,
                 columns: output_columns.into_boxed_slice(),
                 layout: Arc::new(output_layout),
+                names: output_names,
                 region_scope,
             },
             staged,

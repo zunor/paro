@@ -229,6 +229,143 @@ impl LogicalOperator {
         derive_output_names(self)
     }
 
+    /// Derive presentation names from already-completed child names.  This is
+    /// the local counterpart of [`Self::output_names`]; post-order optimizer
+    /// passes can reuse child state instead of recursively walking the owned
+    /// subtree once for every staging node.
+    pub fn output_names_from_child_refs(&self, child_names: &[&[String]]) -> Vec<String> {
+        let mut arity = 0;
+        self.visit_child_links(&mut |_| arity += 1);
+        debug_assert_eq!(child_names.len(), arity);
+        let child = |index: usize| {
+            child_names
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| panic!("logical output names lost child {index}"))
+        };
+        match self {
+            LogicalOperator::Get(get) => get.names.clone(),
+            LogicalOperator::BoundReference(reference) => (0..reference.bindings.len())
+                .map(|index| format!("__bound_reference_{index}"))
+                .collect(),
+            LogicalOperator::Filter(filter) => {
+                project_output_names(child(0).to_vec(), &filter.projection_map)
+            }
+            LogicalOperator::Projection(projection) => projection.visible_names.clone(),
+            LogicalOperator::RowFetch(fetch) => {
+                let mut names = child(0).to_vec();
+                for source in &fetch.sources {
+                    names.extend(source.needed_columns.iter().filter_map(|&ordinal| {
+                        source
+                            .table
+                            .columns
+                            .get(ordinal)
+                            .map(|column| column.name.clone())
+                    }));
+                }
+                names
+            }
+            LogicalOperator::ExternalProject(project) => project.output_names.clone(),
+            LogicalOperator::ExternalTable(table) => table.output_columns.clone(),
+            LogicalOperator::Limit(_) | LogicalOperator::Distinct(_) => child(0).to_vec(),
+            LogicalOperator::Order(order) => {
+                project_output_names(child(0).to_vec(), &order.projection_map)
+            }
+            LogicalOperator::TopN(topn) => {
+                project_output_names(child(0).to_vec(), &topn.projection_map)
+            }
+            LogicalOperator::CreateTable(_)
+            | LogicalOperator::CreateRoutine(_)
+            | LogicalOperator::Alter(_)
+            | LogicalOperator::CreateSequence(_)
+            | LogicalOperator::CreateSchema(_)
+            | LogicalOperator::CreateIndex(_)
+            | LogicalOperator::CreateView(_)
+            | LogicalOperator::Drop(_)
+            | LogicalOperator::CreatePropertyGraph(_)
+            | LogicalOperator::DropPropertyGraph(_)
+            | LogicalOperator::RefreshPropertyGraph(_)
+            | LogicalOperator::DummyScan => Vec::new(),
+            LogicalOperator::Aggregate(aggregate) => {
+                let mut names = Vec::with_capacity(
+                    aggregate.groups.len()
+                        + aggregate.aggregates.len()
+                        + aggregate.grouping_functions.len(),
+                );
+                for (index, group) in aggregate.groups.iter().enumerate() {
+                    names.push(expression_output_name(group, index, "group"));
+                }
+                for (index, aggregate) in aggregate.aggregates.iter().enumerate() {
+                    names.push(expression_output_name(aggregate, index, "agg"));
+                }
+                for index in 0..aggregate.grouping_functions.len() {
+                    names.push(format!("grouping_{}", index + 1));
+                }
+                names
+            }
+            LogicalOperator::Insert(_)
+            | LogicalOperator::Delete(_)
+            | LogicalOperator::Update(_) => vec!["count".to_string()],
+            LogicalOperator::ExpressionGet(values) => values.names.clone(),
+            LogicalOperator::Join(join) => {
+                let mut outputs = child_names.iter().map(|names| (*names).to_vec()).collect();
+                finish_join_names(join, &mut outputs)
+            }
+            LogicalOperator::DelimGet(delim) => delim.chunk_names.clone(),
+            LogicalOperator::DependentJoin(join) => {
+                let mut outputs = child_names.iter().map(|names| (*names).to_vec()).collect();
+                finish_dependent_join_names(join, &mut outputs)
+            }
+            LogicalOperator::SetOperation(_setop) => child(0).to_vec(),
+            LogicalOperator::Window(window) => {
+                let mut names = child(0).to_vec();
+                names.extend(
+                    window
+                        .expressions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, expression)| window_output_name(expression, index)),
+                );
+                names
+            }
+            LogicalOperator::Explain(_) => vec!["QUERY PLAN".to_string()],
+            LogicalOperator::EmptyResult(_) => child(0).to_vec(),
+            LogicalOperator::MaterializedCTE(_) => child(1).to_vec(),
+            LogicalOperator::RecursiveCTE(cte) => cte.column_names.clone(),
+            LogicalOperator::CTERef(cte) => cte.column_names.clone(),
+            LogicalOperator::TableFunctionGet(function) => function.get_names(),
+            LogicalOperator::SearchScan(search) => search.output_names.clone(),
+            LogicalOperator::FullTextFilterScan(scan) => {
+                project_output_names(scan.get.names.clone(), &scan.projection_map)
+            }
+            LogicalOperator::CopyTo(copy) => copy.names.clone(),
+            LogicalOperator::GraphMatch(graph) => graph
+                .columns
+                .iter()
+                .map(|column| column.alias.clone())
+                .collect(),
+            LogicalOperator::GraphScan(_) => {
+                vec!["local_vertex_id".to_string(), "rowid".to_string()]
+            }
+            LogicalOperator::GraphExpand(expand) => {
+                let mut names = child(0).to_vec();
+                names.extend([
+                    "edge_rowid".to_string(),
+                    "target_local_id".to_string(),
+                    "target_rowid".to_string(),
+                ]);
+                if expand.has_path_functions {
+                    names.extend([
+                        "path_length".to_string(),
+                        "path_vertices".to_string(),
+                        "path_edges".to_string(),
+                    ]);
+                }
+                names
+            }
+        }
+    }
+
     pub fn types(&self) -> Vec<LogicalType> {
         self.output_layout().into_types()
     }
@@ -735,6 +872,25 @@ fn finish_join_names(join: &Join, outputs: &mut Vec<Vec<String>>) -> Vec<String>
             left
         }
     }
+}
+
+fn finish_dependent_join_names(
+    join: &DependentJoin,
+    outputs: &mut Vec<Vec<String>>,
+) -> Vec<String> {
+    let mut left = match &join.kind {
+        DependentJoinKind::Mark { .. } => pop_output_names(outputs),
+        DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => {
+            let right = pop_output_names(outputs);
+            let mut left = pop_output_names(outputs);
+            left.extend(right);
+            left
+        }
+    };
+    if matches!(&join.kind, DependentJoinKind::Mark { .. }) {
+        left.push("mark".to_string());
+    }
+    left
 }
 
 fn project_output_names(names: Vec<String>, projection: &ProjectionMap) -> Vec<String> {
@@ -1703,6 +1859,23 @@ mod tests {
             bindings,
             vec![ColumnBinding::new(10, 1), ColumnBinding::new(99, 0)]
         );
+    }
+
+    #[test]
+    fn local_output_names_match_recursive_derivation() {
+        for (name, operator) in sample_non_leaf_operators() {
+            let child_names = operator
+                .children()
+                .into_iter()
+                .map(|child| child.output_names())
+                .collect::<Vec<_>>();
+            let child_refs = child_names.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            assert_eq!(
+                operator.output_names(),
+                operator.output_names_from_child_refs(&child_refs),
+                "local output-name reduction changed {name}"
+            );
+        }
     }
 
     #[test]
