@@ -608,3 +608,34 @@ when completed; this design change is not itself evidence of a speedup.
 Full workspace **6503 passed / 85 ignored**, optimizer **1032 passed**, and
 strict workspace/all-target Clippy pass. No SQL expected results or search
 budget constants were changed. Fresh cold, SQL and execution checks follow.
+
+Post-change evidence at `3d31841f`:
+
+- `native-q11-cold-physical-filter-order-20260909.json`: five fresh processes,
+  median **1287.412 ms**, median peak RSS **456,605,696 bytes**. Wall time is
+  about 4.9% below the isolated-seed baseline, but the overall gate **fails**:
+  RSS is 1.306x and several search-obligation counts increased. There are 1022
+  groups, 1582 logical expressions, 2785 physical expressions, 49,521 winner
+  proposals and 22,185 published winners. Winner-frontier exhaustion records
+  rise to 13,212. There are no deadline expirations or rule failures, but
+  `search_complete=0`. Reduced logical duplication has not closed physical
+  frontier growth or the cold-planning target.
+- `native-q11-execution-physical-filter-order-20260909.json`: original Q11,
+  seven fresh-process blocks, 70 samples per engine. All 90 result rows match
+  (digest `9108a5b43530c24778abc0d8d3bf1ee218a9815eb0d15310bb4d7c6bcc5f2c78`).
+  Paro median **97.939 ms**, DuckDB **104.244 ms**; paired ratio **0.942894**,
+  hierarchical 95% CI **[0.929616, 0.958304]**. Warmed execution meets the target
+  at this revision. First-statement medians remain **1408.124 ms** versus
+  **107.700 ms**, so this is not cold-planning parity.
+- `native-plan-quality-physical-filter-order-20260909.json`: all ten fixture
+  observations complete, with max q-error two. The baseline comparison is
+  **not accepted**: the gate rejects differing corpus/collector/settings
+  contracts against `native-plan-quality-scalar-operands-20260909.json`.
+  The rejected comparison is retained; it is not reported as a passing gate.
+- SQL regress has not been rerun after this scheduling change. The previous
+  184/184 result at `8e86d939` does not validate `3d31841f`.
+
+Work is paused at the user's request. All collectors have exited and their
+server ports are closed. No subsequent optimization or SQL run was started.
+Native relational publication, query-owned planning-memory admission, physical
+frontier growth, final validation and cold parity remain open deliveries.
