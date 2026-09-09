@@ -80,6 +80,30 @@ server log, and FD samples are archived here.
 Neither D6 nor D3-A changes the C1 gate: Q11 is still far from DuckDB and M1–M3
 remain unpassed.
 
+## D3-A source composition scratch check — 2026-09-10
+
+The `e1bfeb48` build keeps the borrowed child source-lane list in inline
+task-local storage and extends source lanes directly when no sideways filter
+is present. This is a same-policy allocation change: it does not change child
+frontier enumeration, cost composition, candidate ordering, or the budget
+ledger.
+
+The release binary and source were clean and matched the report. The five-block
+normal trace-off binary-protocol comparison used four execution threads, 2 GiB,
+private per-process data copies, and complete result verification:
+
+- Paro C1 median `1156.122500 ms`, p95 `1167.702250 ms`;
+- DuckDB C1 median `107.627042 ms`, p95 `117.824500 ms`;
+- fresh-block ratio `10.579539`, 95% CI `[10.234566, 10.808773]`;
+- normal trace-off W ratio `2.719851`.
+
+The independent diagnostic block measured a client C1 of `1155.088917 ms`,
+with optimizer phase ending at `831.386 ms` and first page ready at
+`1152.702 ms`; the diagnostic trace is excluded from C1. The result is a
+valid fresh-process measurement, but it does not establish a causal latency
+gain or pass M1–M3. The report and all normal/diagnostic server logs are
+archived with the `q11-d3a-source-composition-v1.*` prefix.
+
 ## D2 native-cost bridge check — 2026-09-10
 
 The `7c96a433` build removes the last shallow `OwnedLogicalPlan` compatibility
