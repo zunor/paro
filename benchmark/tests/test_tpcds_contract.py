@@ -15,6 +15,7 @@ from benchmark_evidence import (  # noqa: E402
     hierarchical_abba_ratio,
     paired_order_balanced_ratio,
 )
+from tpcds_compare import hierarchical_cold_ratio  # noqa: E402
 from tpcds_result_contract import (  # noqa: E402
     ColumnContract,
     ResultContractError,
@@ -181,6 +182,28 @@ class TpcdsResultContractTests(unittest.TestCase):
 
         self.assertEqual(result["process_blocks"], 2)
         self.assertEqual(result["samples_per_engine"], 12)
+
+    def test_hierarchical_cold_ratio_uses_one_sample_per_fresh_block(self) -> None:
+        result = hierarchical_cold_ratio(
+            [
+                {"cold_statement_ms": {"paro": 90.0, "duckdb": 100.0}},
+                {"cold_statement_ms": {"paro": 110.0, "duckdb": 100.0}},
+            ],
+            bootstrap_samples=100,
+        )
+
+        self.assertEqual(result["process_blocks"], 2)
+        self.assertEqual(result["samples_per_engine"], 2)
+        self.assertEqual(result["resampling_unit"], "fresh_process_block_only")
+        self.assertAlmostEqual(result["ratio"], (0.9 * 1.1) ** 0.5, places=6)
+
+    def test_hierarchical_cold_ratio_rejects_missing_or_nonpositive_samples(self) -> None:
+        with self.assertRaises(ValueError):
+            hierarchical_cold_ratio([{"cold_statement_ms": {"paro": 90.0}}])
+        with self.assertRaises(ValueError):
+            hierarchical_cold_ratio(
+                [{"cold_statement_ms": {"paro": 0.0, "duckdb": 100.0}}]
+            )
 
 
 if __name__ == "__main__":

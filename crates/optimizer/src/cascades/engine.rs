@@ -4,6 +4,7 @@
 //! Deterministic mandatory-baseline plus bounded optional Cascades search.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use paro_common::error::{self as paro_error, Result};
@@ -164,6 +165,30 @@ struct BindingApplication {
 
 type BindingApplications = BTreeMap<(TransformationTaskId, Fingerprint), Vec<BindingApplication>>;
 
+/// Per-rule work phases used by the cold-search attribution report.  These
+/// counters deliberately describe the existing single-worker engine; they do
+/// not imply parallel width or a completed search frontier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleWorkProfile {
+    /// Transformation tasks that reached the matcher.
+    pub discovered: u64,
+    /// Exact bindings returned by the matcher.
+    pub matched: u64,
+    /// Bindings for which the rule returned at least one output.
+    pub applicable: u64,
+    /// Output alternatives constructed by the rule before Memo duplicate
+    /// elimination/publication.
+    pub constructed: u64,
+    /// Alternatives that became new Memo logical expressions.
+    pub published: u64,
+    /// Bindings rejected by an error, empty result, output-contract violation,
+    /// or invalid/duplicate publication attempt.
+    pub rejected: u64,
+    /// Valid rule applications which produced no new expression because the
+    /// result was already present.
+    pub ineffective: u64,
+}
+
 /// The engine is deliberately operator-agnostic. Domain implementations live
 /// in the registry; this type owns stable scheduling, budgets, enforcement,
 /// recursive goal optimization, and winner verification.
@@ -173,7 +198,7 @@ pub struct CascadesEngine {
     memo: Memo,
     registry: ImplementationRegistry,
     enforcement: EnforcementPlanner,
-    recipes: BTreeMap<(PhysicalExprId, OptimizationGoal, Fingerprint), CostRecipe>,
+    recipes: BTreeMap<(PhysicalExprId, OptimizationGoal, Fingerprint), Arc<CostRecipe>>,
     implemented_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     infeasible_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     active_goals: BTreeSet<(GroupId, OptimizationGoal)>,
@@ -185,6 +210,10 @@ pub struct CascadesEngine {
     rule_elapsed: BTreeMap<RuleId, Duration>,
     rule_allocated_bytes: BTreeMap<RuleId, u64>,
     rule_budget_exhaustions: BTreeMap<RuleId, u64>,
+    rule_work_profile: BTreeMap<RuleId, RuleWorkProfile>,
+    /// Rule phase counters are diagnostic-only.  The normal trace-off path
+    /// must not pay a BTreeMap lookup for every transformation task.
+    collect_rule_work_profile: bool,
     transformation_bindings: u64,
     fact_value_revalidation_hits: u64,
     fact_value_revalidation_misses: u64,
@@ -202,6 +231,14 @@ pub struct CascadesEngine {
     /// Subscribers are woken only after a Memo transaction commits.
     transformation_subscribers: BTreeMap<GroupId, BTreeSet<TransformationTaskId>>,
     region_candidates: BTreeMap<super::ids::RegionId, BTreeSet<Fingerprint>>,
+    /// Physical context work is keyed by the complete OptimizationGoal, not
+    /// by group alone.  These counters make context reuse visible without
+    /// retaining a second cache or changing the publication protocol.
+    physical_subproblem_requests: u64,
+    physical_subproblem_reuses: u64,
+    physical_subproblem_evaluations: u64,
+    physical_implementation_requests: u64,
+    physical_implementation_reuses: u64,
 }
 
 impl CascadesEngine {
@@ -227,6 +264,8 @@ impl CascadesEngine {
             rule_elapsed: BTreeMap::new(),
             rule_allocated_bytes: BTreeMap::new(),
             rule_budget_exhaustions: BTreeMap::new(),
+            rule_work_profile: BTreeMap::new(),
+            collect_rule_work_profile: false,
             transformation_bindings: 0,
             fact_value_revalidation_hits: 0,
             fact_value_revalidation_misses: 0,
@@ -235,6 +274,11 @@ impl CascadesEngine {
             transformation_applications: BTreeMap::new(),
             transformation_subscribers: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
+            physical_subproblem_requests: 0,
+            physical_subproblem_reuses: 0,
+            physical_subproblem_evaluations: 0,
+            physical_implementation_requests: 0,
+            physical_implementation_reuses: 0,
         }
     }
 
@@ -244,6 +288,13 @@ impl CascadesEngine {
 
     pub fn memo_mut(&mut self) -> &mut Memo {
         &mut self.memo
+    }
+
+    /// Enable the per-rule phase ledger only for an explicitly requested
+    /// diagnostic cohort.  Normal C1 must remain trace-off and allocation-free
+    /// with respect to this optional attribution.
+    pub fn set_rule_work_profile_enabled(&mut self, enabled: bool) {
+        self.collect_rule_work_profile = enabled;
     }
 
     pub fn optimize(
@@ -535,6 +586,10 @@ impl CascadesEngine {
                 expression,
                 rule,
             };
+            if self.collect_rule_work_profile {
+                let profile = self.rule_work_profile.entry(rule).or_default();
+                profile.discovered = profile.discovered.saturating_add(1);
+            }
             let budget_class = {
                 let rule_impl = self
                     .registry
@@ -664,6 +719,12 @@ impl CascadesEngine {
             }
             if binding_set.bindings.is_empty() {
                 continue;
+            }
+            if self.collect_rule_work_profile {
+                let profile = self.rule_work_profile.entry(rule).or_default();
+                profile.matched = profile
+                    .matched
+                    .saturating_add(binding_set.bindings.len() as u64);
             }
             self.transformation_bindings = self
                 .transformation_bindings
@@ -892,6 +953,12 @@ impl CascadesEngine {
                 let outputs = match outputs_result {
                     Ok(outputs) => outputs,
                     Err(error) => {
+                        if self.collect_rule_work_profile {
+                            self.rule_work_profile.entry(rule).or_default().rejected = self
+                                .rule_work_profile
+                                .get(&rule)
+                                .map_or(1, |profile| profile.rejected.saturating_add(1));
+                        }
                         context.rollback()?;
                         self.seed_transformation_observation(task_id, &binding_set.reads)?;
                         release_transformation_output_reservations(
@@ -913,6 +980,12 @@ impl CascadesEngine {
                     }
                 };
                 if outputs.is_empty() {
+                    if self.collect_rule_work_profile {
+                        self.rule_work_profile.entry(rule).or_default().rejected = self
+                            .rule_work_profile
+                            .get(&rule)
+                            .map_or(1, |profile| profile.rejected.saturating_add(1));
+                    }
                     context.rollback()?;
                     let mut observed = binding_set.reads.to_vec();
                     observed.extend(application_reads.iter().copied());
@@ -934,6 +1007,12 @@ impl CascadesEngine {
                     continue;
                 }
                 if outputs.len() > output_events.len() {
+                    if self.collect_rule_work_profile {
+                        self.rule_work_profile.entry(rule).or_default().rejected = self
+                            .rule_work_profile
+                            .get(&rule)
+                            .map_or(1, |profile| profile.rejected.saturating_add(1));
+                    }
                     context.rollback()?;
                     release_transformation_output_reservations(
                         &mut self.memo,
@@ -958,6 +1037,11 @@ impl CascadesEngine {
                         );
                     }
                     continue;
+                }
+                if self.collect_rule_work_profile {
+                    let profile = self.rule_work_profile.entry(rule).or_default();
+                    profile.applicable = profile.applicable.saturating_add(1);
+                    profile.constructed = profile.constructed.saturating_add(outputs.len() as u64);
                 }
                 let insertion = (|| -> Result<TransformationInsertion> {
                     let mut inserted_groups = BTreeSet::new();
@@ -1038,6 +1122,12 @@ impl CascadesEngine {
                 } = match insertion {
                     Ok(result) => result,
                     Err(error) => {
+                        if self.collect_rule_work_profile {
+                            self.rule_work_profile.entry(rule).or_default().rejected = self
+                                .rule_work_profile
+                                .get(&rule)
+                                .map_or(1, |profile| profile.rejected.saturating_add(1));
+                        }
                         context.rollback()?;
                         release_transformation_output_reservations(
                             &mut self.memo,
@@ -1067,6 +1157,12 @@ impl CascadesEngine {
                         &output_events,
                         output_dimension,
                     )?;
+                    if self.collect_rule_work_profile {
+                        self.rule_work_profile.entry(rule).or_default().ineffective = self
+                            .rule_work_profile
+                            .get(&rule)
+                            .map_or(1, |profile| profile.ineffective.saturating_add(1));
+                    }
                 } else {
                     let newly_inserted_expressions = inserted_expressions.clone();
                     let appended_groups = context.commit()?;
@@ -1088,6 +1184,16 @@ impl CascadesEngine {
                     }
                     *self.effective_rule_insertions.entry(rule).or_default() +=
                         u64::try_from(inserted_expressions.len()).unwrap_or(u64::MAX);
+                    if self.collect_rule_work_profile {
+                        self.rule_work_profile.entry(rule).or_default().published = self
+                            .rule_work_profile
+                            .get(&rule)
+                            .map_or(inserted_expressions.len() as u64, |profile| {
+                                profile
+                                    .published
+                                    .saturating_add(inserted_expressions.len() as u64)
+                            });
+                    }
                     let saturates_binding = self
                         .registry
                         .transformation(rule)
@@ -1162,6 +1268,10 @@ impl CascadesEngine {
         &self.rule_budget_exhaustions
     }
 
+    pub fn rule_work_profile(&self) -> &BTreeMap<RuleId, RuleWorkProfile> {
+        &self.rule_work_profile
+    }
+
     pub fn search_work_counters(&self) -> BTreeMap<&'static str, u64> {
         BTreeMap::from([
             ("winner_proposal_count", self.memo.winner_proposal_count()),
@@ -1174,6 +1284,26 @@ impl CascadesEngine {
             (
                 "fact_value_revalidation_miss_count",
                 self.fact_value_revalidation_misses,
+            ),
+            (
+                "physical_subproblem_request_count",
+                self.physical_subproblem_requests,
+            ),
+            (
+                "physical_subproblem_reuse_count",
+                self.physical_subproblem_reuses,
+            ),
+            (
+                "physical_subproblem_evaluation_count",
+                self.physical_subproblem_evaluations,
+            ),
+            (
+                "physical_implementation_request_count",
+                self.physical_implementation_requests,
+            ),
+            (
+                "physical_implementation_reuse_count",
+                self.physical_implementation_reuses,
             ),
         ])
     }
@@ -1386,7 +1516,11 @@ impl CascadesEngine {
 
     fn enumerate_implementations(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
         let group = self.memo.canonical_group(group);
+        self.physical_implementation_requests =
+            self.physical_implementation_requests.saturating_add(1);
         if !self.implemented_goals.insert((group, goal)) {
+            self.physical_implementation_reuses =
+                self.physical_implementation_reuses.saturating_add(1);
             return Ok(());
         }
         let mut agenda = StableAgenda::default();
@@ -1550,7 +1684,6 @@ impl CascadesEngine {
                         );
                     return Ok(());
                 }
-                admitted.insert(candidate.physical_fingerprint);
             }
             let decision = self
                 .memo
@@ -1577,17 +1710,30 @@ impl CascadesEngine {
             candidate.provided,
         )?;
         let recipe_key = (physical, goal, candidate.physical_fingerprint);
-        self.recipes.entry(recipe_key).or_insert(CostRecipe {
-            child_goals: candidate.child_goals,
-            local_cost: candidate.local_cost,
-            source_filter_apply_cost: candidate.source_filter_apply_cost,
-            task_supply: candidate.task_supply,
-            cost_composition: candidate.cost_composition,
-            spillable: candidate.spillable,
-            enforcer_cost_input: candidate.enforcer_cost_input,
-            physical_fingerprint: candidate.physical_fingerprint,
-            region: candidate.region,
-        });
+        // Do not publish a region fingerprint or allocate a persistent cost
+        // recipe until the candidate has crossed the Memo publication
+        // boundary.  The previous order left region admission state behind
+        // when the physical/group budget rejected the candidate, and built a
+        // throwaway `CostRecipe` for duplicate physical keys.
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.recipes.entry(recipe_key) {
+            if let Some(region) = &candidate.region {
+                self.region_candidates
+                    .entry(region.region)
+                    .or_default()
+                    .insert(candidate.physical_fingerprint);
+            }
+            entry.insert(Arc::new(CostRecipe {
+                child_goals: candidate.child_goals,
+                local_cost: candidate.local_cost,
+                source_filter_apply_cost: candidate.source_filter_apply_cost,
+                task_supply: candidate.task_supply,
+                cost_composition: candidate.cost_composition,
+                spillable: candidate.spillable,
+                enforcer_cost_input: candidate.enforcer_cost_input,
+                physical_fingerprint: candidate.physical_fingerprint,
+                region: candidate.region,
+            }));
+        }
         Ok(())
     }
 
@@ -1596,6 +1742,7 @@ impl CascadesEngine {
             return Ok(());
         }
         let group = self.memo.canonical_group(group);
+        self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
         if self
             .memo
             .group(group)
@@ -1603,8 +1750,11 @@ impl CascadesEngine {
             .is_some()
             || self.infeasible_goals.contains(&(group, goal))
         {
+            self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
             return Ok(());
         }
+        self.physical_subproblem_evaluations =
+            self.physical_subproblem_evaluations.saturating_add(1);
         if !self.active_goals.insert((group, goal)) {
             return Err(paro_error::internal(
                 "ordinary Memo group formed a recursive optimization cycle; use RecursiveRegion",
@@ -1648,10 +1798,12 @@ impl CascadesEngine {
                         (physical, goal, Fingerprint::default())
                             ..=(physical, goal, Fingerprint(u128::MAX)),
                     )
-                    .map(|((physical, _, _), recipe)| (*physical, recipe.clone())),
+                    .map(|((physical, _, fingerprint), recipe)| {
+                        (*physical, *fingerprint, Arc::clone(recipe))
+                    }),
             );
         }
-        for (physical, recipe) in recipes {
+        for (physical, _recipe_fingerprint, recipe) in recipes {
             if !self.memo.control().checkpoint()? {
                 break;
             }
@@ -1778,10 +1930,10 @@ impl CascadesEngine {
                     .iter()
                     .map(|winner| winner.source_work.as_ref())
                     .collect::<Vec<_>>();
-                let Some(local_cost) = fit_local_retained_state_to_grant(
+                let Some(local_cost) = fit_local_retained_state_to_grant_ref(
                     recipe.local_cost,
                     &child_costs,
-                    recipe.cost_composition.clone(),
+                    &recipe.cost_composition,
                     recipe.spillable,
                     recipe.enforcer_cost_input,
                 )?
@@ -1810,12 +1962,12 @@ impl CascadesEngine {
                 if let Some(apply) = recipe.source_filter_apply_cost {
                     local_cost = local_cost.replace_work(SearchCost::ZERO, apply)?;
                 }
-                let composed = compose_candidate_cost_with_sources_at(
+                let composed = compose_candidate_cost_with_sources_at_ref(
                     local_cost,
                     recipe.source_filter_apply_cost,
                     &child_costs,
                     &child_source_work_refs,
-                    recipe.cost_composition.clone(),
+                    &recipe.cost_composition,
                     self.memo.calibration(),
                 )?;
                 let source_work = composed.source_work;
@@ -2131,10 +2283,21 @@ fn resolve_region_boundary_endpoint(
     }
 }
 
+#[cfg(test)]
 fn fit_local_retained_state_to_grant(
-    mut local_cost: SearchCost,
+    local_cost: SearchCost,
     child_costs: &[SearchCost],
     composition: CostComposition,
+    spillable: bool,
+    grant: EnforcerCostInput,
+) -> Result<Option<SearchCost>> {
+    fit_local_retained_state_to_grant_ref(local_cost, child_costs, &composition, spillable, grant)
+}
+
+fn fit_local_retained_state_to_grant_ref(
+    mut local_cost: SearchCost,
+    child_costs: &[SearchCost],
+    composition: &CostComposition,
     spillable: bool,
     grant: EnforcerCostInput,
 ) -> Result<Option<SearchCost>> {
@@ -2449,13 +2612,31 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
     composition: CostComposition,
     calibration: &MachineCalibrationBundle,
 ) -> Result<ComposedCost> {
+    compose_candidate_cost_with_sources_at_ref(
+        local_cost,
+        source_filter_apply_cost,
+        child_costs,
+        child_source_work,
+        &composition,
+        calibration,
+    )
+}
+
+pub(crate) fn compose_candidate_cost_with_sources_at_ref(
+    local_cost: SearchCost,
+    source_filter_apply_cost: Option<SearchCost>,
+    child_costs: &[SearchCost],
+    child_source_work: &[&[SourceWork]],
+    composition: &CostComposition,
+    calibration: &MachineCalibrationBundle,
+) -> Result<ComposedCost> {
     if child_costs.len() != child_source_work.len() {
         return Err(paro_error::internal(
             "cost composition has no source-work evidence for one or more children",
         ));
     }
     let mut cost = local_cost;
-    if composition == CostComposition::LocalOnly {
+    if matches!(composition, CostComposition::LocalOnly) {
         cost.validate()?;
         return Ok(ComposedCost {
             cost,
@@ -2465,7 +2646,7 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
     if let CostComposition::Source {
         source,
         source_rows,
-    } = &composition
+    } = composition
     {
         if !child_costs.is_empty() {
             return Err(paro_error::internal(

@@ -918,6 +918,7 @@ PROJECTION  (rows=1)
   ->  AGGREGATE  (rows=1)
     Aggregates: count_star(*), min(public.agg_phase0.x), max(public.agg_phase0.x)
     ->  ROWSET_SCAN on public.agg_phase0  (rows=6)
+      Column IDs: 1
       Columns: x
 
 SELECT
@@ -943,6 +944,7 @@ PROJECTION  (rows=1)
     ->  PROJECTION  (rows=6)
       Output: px
       ->  ROWSET_SCAN on public.agg_phase0  (rows=6)
+        Column IDs: 1
         Columns: x
 
 SELECT
@@ -965,6 +967,7 @@ PROJECTION  (rows=1)
   ->  AGGREGATE  (rows=1)
     Aggregates: min(public.agg_phase0.y), max(public.agg_phase0.y)
     ->  ROWSET_SCAN on public.agg_phase0  (rows=6)
+      Column IDs: 2
       Columns: y
 
 SELECT

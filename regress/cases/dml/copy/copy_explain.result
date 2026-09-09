@@ -14,6 +14,7 @@ COPY_TO_FILE  (rows=1)
   ->  PROJECTION  (rows=3)
     Output: dml_copy_explain_src.id, dml_copy_explain_src.name
     ->  ROWSET_SCAN on public.dml_copy_explain_src  (rows=3)
+      Column IDs: 0, 1
       Columns: id, name
 
 COPY dml_copy_explain_src

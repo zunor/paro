@@ -28,7 +28,9 @@ import psycopg
 from psycopg import sql
 
 from benchmark_evidence import (ImmutableDataSeed, isolated_paro_server, build_benchmark_server,
-                                content_digest, repository_identity, tree_digest)
+                                STATEMENT_TRACE_SCHEMA_VERSION, content_digest,
+                                parse_statement_trace_log, repository_identity,
+                                statement_fingerprint, tree_digest, validate_statement_trace)
 
 COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physical_search",
               "memo_exploration", "physical_extraction", "winner_verification"}
@@ -94,8 +96,11 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
            seed: ImmutableDataSeed) -> dict[str, Any]:
     result: dict[str, Any] = {"block": block, "status": "error"}
     log = args.report.with_suffix(f".{name}.{block}.parod.log")
+    trace_sample_id = f"{name}.block{block}"
     with isolated_paro_server(binary, seed, args.listen, log,
-                           max_memory=args.memory_limit, threads=args.threads) as server:
+                           max_memory=args.memory_limit, threads=args.threads,
+                           statement_trace=True,
+                           trace_sample_id=trace_sample_id) as server:
         result["server"] = server.identity()
         assert server.process is not None
         with ProcessWatchdog(server.process, args.watchdog_seconds,
@@ -131,6 +136,25 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
         result["peak_rss_bytes"] = watchdog.peak_rss
         if watchdog.failure:
             result.update(status="error", error=watchdog.failure)
+    result["phase_trace_schema_version"] = STATEMENT_TRACE_SCHEMA_VERSION
+    result["trace_query_fingerprint"] = statement_fingerprint("EXPLAIN " + query)
+    try:
+        result["statement_traces"] = parse_statement_trace_log(log)
+        result["target_statement_traces"] = [
+            trace for trace in result["statement_traces"]
+            if trace["query_fingerprint"] == result["trace_query_fingerprint"]
+        ]
+        if result.get("status") == "ok":
+            if len(result["target_statement_traces"]) != 1:
+                raise ValueError("cold sample must have exactly one target operation trace")
+            validate_statement_trace(
+                result["target_statement_traces"][0],
+                expected_process_id=result["server"]["pid"],
+                expected_sample_id=trace_sample_id,
+                expected_query_fingerprint=result["trace_query_fingerprint"],
+            )
+    except Exception as error:
+        result.update(status="error", error=f"{type(error).__name__}: {error}")
     return result
 
 
@@ -161,7 +185,7 @@ def main() -> int:
     harness_files = (Path(__file__).resolve(), Path(__file__).with_name("benchmark_evidence.py"),
                      root / "benchmark/harness/cold_planning_gate.py")
     report: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 5,
         "configuration": {key: getattr(args, key) for key in ("process_blocks", "threads", "memory_limit",
                              "watchdog_seconds", "rss_limit_mb", "alloc_metrics")},
         "evidence": {"build": build, "dataset_sha256": seed.sha256,
@@ -174,8 +198,38 @@ def main() -> int:
         "queries": [{"name": path.stem, "path": str(path.resolve()), "sql_sha256": content_digest(path),
                      "samples": []} for path in args.query],
     }
+    report["configuration"].update({
+        "planning_dop": 1,
+        "execution_dop": args.threads,
+        "resource_envelope": {
+            "service_cpu_limit": args.threads,
+            "memory_limit": args.memory_limit,
+            "concurrent_target_statements": 1,
+            "page_cache_policy": "private_copy_per_process; OS cache not flushed",
+        },
+        "cohort": "diagnostic",
+        "trace_mode": "on",
+        "latency_tracks": {
+            "C0": {"status": "uncovered", "auxiliary": "startup_to_ready_ms"},
+            "C1": {"status": "uncovered", "reason": "EXPLAIN is not the target C1"},
+            "C2": {"status": "uncovered", "reason": "partial diagnostic interval only"},
+            "W": "not measured by cold-planning collector",
+        },
+        "model_gates": {
+            "version": 1,
+            "G-Stats": {
+                "status": "registered_not_admitted",
+                "thresholds": {"q_error_p95_max": 2.0, "q_error_max": 4.0},
+            },
+            "G-Cost": {
+                "status": "registered_not_admitted",
+                "thresholds": {"phase_time_prediction_p95_ratio_max": 1.25},
+            },
+        },
+    })
     report["configuration"]["runtime_environment"] = {
         "RUST_LOG": os.environ.get("RUST_LOG"),
+        "PARO_STATEMENT_TRACE": "1",
     }
     for path, observation in zip(args.query, report["queries"], strict=True):
         query = path.read_text().strip()

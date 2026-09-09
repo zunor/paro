@@ -95,11 +95,13 @@ ORDER_BY  (rows=2)
             Join Type: LEFT
             Join Condition: c.customer_key = o.customer_key
             ->  ROWSET_SCAN on public.singleton_customer c  (rows=3)
+              Column IDs: 0
               Columns: customer_key
             ->  AGGREGATE  (rows=2)
               Group Key: o.customer_key
               Aggregates: count_star(*)
               ->  ROWSET_SCAN on public.singleton_orders_large o  (rows=4050)
+                Column IDs: 1
                 Columns: customer_key
                 Pushed Predicate: comment NOT LIKE "%special%requests%"
 

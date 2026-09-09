@@ -5,8 +5,8 @@ use crate::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DdlApplyContext, EffectiveSettings,
     QueryResources, RuntimeLimits, SessionDiagnostics, SessionMetadataProvider, SessionRandom,
     StatementAuthContext, StatementCancellation, StatementEnvironment, StatementInput,
-    StatementOptions, StatementTimeContext, StatementView, TransactionView, TxnAdmissionState,
-    WriteGuard,
+    StatementOptions, StatementTimeContext, StatementTrace, StatementView, TransactionView,
+    TxnAdmissionState, WriteGuard,
 };
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -78,6 +78,8 @@ pub struct StatementContext {
     pub session_metadata: Arc<dyn SessionMetadataProvider>,
     /// Mutable diagnostics owned by this client session, never by the process.
     pub diagnostics: Arc<SessionDiagnostics>,
+    /// Optional phase recorder shared by compiler, admission and execution.
+    pub statement_trace: Option<Arc<StatementTrace>>,
 }
 
 impl std::fmt::Debug for StatementContext {
@@ -98,6 +100,10 @@ impl StatementContext {
     ) -> Option<paro_storage::index::graph::GraphReadSnapshot> {
         self.graph_snapshots
             .read(self.services.graph_index.as_ref(), id)
+    }
+
+    pub fn statement_trace(&self) -> Option<Arc<StatementTrace>> {
+        self.statement_trace.clone()
     }
 
     pub fn current_database(&self) -> &str {

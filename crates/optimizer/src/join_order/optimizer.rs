@@ -921,11 +921,18 @@ impl JoinOrderOptimizer {
                 plan
             };
 
-            Ok(Some(self.attach_remaining_filters(
-                duplicate_plan_preserving_indices(&result, bind_context.shared().as_ref()),
-                &node.set,
-                used_filters,
-            )))
+            // `result` is freshly reconstructed for this DP frontier member.
+            // The old path deep-copied the complete subtree here only to give
+            // every node fresh occurrence ids, repeating the physical search's
+            // largest allocation. Re-label the already-owned nodes in one
+            // post-order pass instead; relation plans were copied at their
+            // ownership boundary above, so no sibling candidate is aliased.
+            let result = self.attach_remaining_filters(result, &node.set, used_filters);
+            let (result, ()) = result.try_fold_post_order(|mut plan, _| {
+                plan.id = bind_context.next_plan_id();
+                Ok((plan, ()))
+            })?;
+            Ok(Some(result))
         }
     }
 

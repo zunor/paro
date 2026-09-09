@@ -548,6 +548,38 @@ impl TransformationRule for PlannerTransformationRule {
             return Ok(Box::new([]));
         }
 
+        // These two rules already produce a bounded shell whose descendants
+        // are opaque Memo operands.  Re-settling that shell only to turn it
+        // back into GroupId/ScalarExprId edges is redundant.  Keep the shell
+        // in the session arena and let the native staging pass consume it;
+        // rules which introduce executable owned subtrees retain the full
+        // settlement path below.
+        enum PreparedPlan {
+            Native {
+                plan: OwnedLogicalPlan,
+                column_stats: SharedColumnStatistics,
+            },
+            Settled {
+                plan: paro_planner::plan::arena::PlanIndex,
+                column_stats: SharedColumnStatistics,
+                scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
+            },
+        }
+
+        struct PreparedAlternative {
+            plan: PreparedPlan,
+            group_hole_guard: GroupHoleTransportGuard,
+            preserved_region_facet: Option<Fingerprint>,
+            extended_required_region_facets: Box<[Fingerprint]>,
+            input_context: OptimizationContextId,
+            child_context: OptimizationContextId,
+            nested_group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
+        }
+
+        let use_native_shell = matches!(
+            self.transformation,
+            PlannerTransformation::PredicateTransfer | PlannerTransformation::JoinRegionEnumeration
+        );
         let mut prepared = Vec::with_capacity(plans.len());
         for plan in plans {
             let retained_group_holes = retained_group_holes(&plan, &nested_group_holes)?;
@@ -556,25 +588,43 @@ impl TransformationRule for PlannerTransformationRule {
                 retained_group_holes.keys().copied(),
                 &environment.bind_context,
             )?;
-            let settled = {
-                let mut planner_state = self
+            let use_native_plan = use_native_shell
+                && plan
+                    .children()
+                    .iter()
+                    .all(|child| matches!(child.operator, LogicalOperator::BoundReference(_)));
+            let (prepared_plan, root_operator, output_layout) = if use_native_plan {
+                let plan =
+                    refresh_native_shell_statistics(plan, source_stats.as_ref(), &environment);
+                let root_operator = plan.operator.op_type();
+                let output_layout = plan.output_layout();
+                (
+                    PreparedPlan::Native {
+                        plan,
+                        column_stats: source_stats.clone(),
+                    },
+                    root_operator,
+                    output_layout,
+                )
+            } else {
+                let settled = {
+                    let mut planner_state = self
+                        .planner_state
+                        .write()
+                        .expect("planner transform state poisoned");
+                    settle_with_session_arena(&mut planner_state, plan, &environment)?
+                };
+                let Some(settlement::SettledExpression {
+                    plan,
+                    statistics: column_stats,
+                    scopes,
+                }) = settled
+                else {
+                    return Ok(Box::new([]));
+                };
+                let mut state = self
                     .planner_state
                     .write()
-                    .expect("planner transform state poisoned");
-                settle_with_session_arena(&mut planner_state, plan, &environment)?
-            };
-            let Some(settlement::SettledExpression {
-                plan,
-                statistics: column_stats,
-                scopes,
-            }) = settled
-            else {
-                return Ok(Box::new([]));
-            };
-            {
-                let state = self
-                    .planner_state
-                    .read()
                     .expect("planner transform state poisoned");
                 let view = state.staging_arena.plan(plan)?;
                 group_hole_guard.validate_arena(&view)?;
@@ -583,22 +633,27 @@ impl TransformationRule for PlannerTransformationRule {
                         environment.session.cancellation.check()
                     })?;
                 }
-            }
-            // The target Memo group owns the output contract. Settlement may
-            // legitimately widen child carriers for predicates and ordering,
-            // but the transformed root must be frozen back to the group's
-            // exact binding layout before equivalence validation and staging.
-            let mut state = self
-                .planner_state
-                .write()
-                .expect("planner transform state poisoned");
-            let plan = semantic_plan::freeze_arena_output_layout(
-                plan,
-                &source_output_columns,
-                &mut state,
-            )?;
-            let root_operator = state.staging_arena.get(plan)?.operator.op_type();
-            drop(state);
+                // The target Memo group owns the output contract. Settlement
+                // may legitimately widen child carriers for predicates and
+                // ordering, but the transformed root must be frozen back to
+                // the group's exact binding layout before staging.
+                let plan = semantic_plan::freeze_arena_output_layout(
+                    plan,
+                    &source_output_columns,
+                    &mut state,
+                )?;
+                let root_operator = state.staging_arena.get(plan)?.operator.op_type();
+                let output_layout = state.staging_arena.output_layout(plan)?.clone();
+                (
+                    PreparedPlan::Settled {
+                        plan,
+                        column_stats,
+                        scopes,
+                    },
+                    root_operator,
+                    output_layout,
+                )
+            };
             let mut preserved_region_facet = None;
             let mut extended_required_region_facets = enclosing_required_region_facets.clone();
             let output_input_context = source_input_context;
@@ -645,16 +700,14 @@ impl TransformationRule for PlannerTransformationRule {
                     return Ok(Box::new([]));
                 }
             }
-            let state = self
-                .planner_state
-                .read()
-                .expect("planner transform state poisoned");
-            let output_layout = state.staging_arena.output_layout(plan)?;
             if !transformed_layout_matches_group_contract(
-                output_layout,
+                &output_layout,
                 target_group,
                 ctx.memo(),
-                &state,
+                &self
+                    .planner_state
+                    .read()
+                    .expect("planner transform state poisoned"),
             )? {
                 debug!(
                     target: targets::OPTIMIZER,
@@ -667,17 +720,15 @@ impl TransformationRule for PlannerTransformationRule {
                 );
                 continue;
             }
-            drop(state);
-            prepared.push((
-                plan,
-                column_stats,
-                scopes,
+            prepared.push(PreparedAlternative {
+                plan: prepared_plan,
+                group_hole_guard,
                 preserved_region_facet,
-                extended_required_region_facets.into_boxed_slice(),
-                output_input_context,
-                output_child_context,
-                retained_group_holes,
-            ));
+                extended_required_region_facets: extended_required_region_facets.into_boxed_slice(),
+                input_context: output_input_context,
+                child_context: output_child_context,
+                nested_group_holes: retained_group_holes,
+            });
         }
         if prepared.is_empty() {
             return Ok(Box::new([]));
@@ -688,17 +739,39 @@ impl TransformationRule for PlannerTransformationRule {
             PlannerTransformState::rollback_to,
             |memo, state| {
                 let mut staged = Vec::with_capacity(prepared.len());
-                for (
-                    plan,
-                    column_stats,
-                    column_stat_scopes,
-                    preserved_region_facet,
-                    extended_required_region_facets,
-                    input_context,
-                    child_context,
-                    nested_group_holes,
-                ) in prepared
-                {
+                for prepared in prepared {
+                    let PreparedAlternative {
+                        plan,
+                        group_hole_guard,
+                        preserved_region_facet,
+                        extended_required_region_facets,
+                        input_context,
+                        child_context,
+                        nested_group_holes,
+                    } = prepared;
+                    let (plan, column_stats, column_stat_scopes) = match plan {
+                        PreparedPlan::Native { plan, column_stats } => {
+                            let plan = state.staging_arena.import(plan)?;
+                            let view = state.staging_arena.plan(plan)?;
+                            group_hole_guard.validate_arena(&view)?;
+                            if environment.verify_enabled {
+                                crate::verify::verify_arena_plan(&view, || {
+                                    environment.session.cancellation.check()
+                                })?;
+                            }
+                            let plan = semantic_plan::freeze_arena_output_layout(
+                                plan,
+                                &source_output_columns,
+                                state,
+                            )?;
+                            (plan, column_stats, HashMap::new())
+                        }
+                        PreparedPlan::Settled {
+                            plan,
+                            column_stats,
+                            scopes,
+                        } => (plan, column_stats, scopes),
+                    };
                     let Some(expression) = stage_transformed_expression(
                         StagingRequest {
                             plan,
@@ -864,6 +937,78 @@ struct PlannerRuleEnvironment {
     cost_model: crate::cost_model::CostModel,
     budget: SearchBudget,
     verify_enabled: bool,
+}
+
+/// Recompute facts for one native transformation shell without entering the
+/// general settlement cache.  Native rule outputs are closed over
+/// BoundReference children, so a single local propagation/gather pass is
+/// sufficient; walking and re-importing the same shell through a second arena
+/// would only add ownership traffic.  The child references remain immutable
+/// Memo contracts and are never exported as owned descendants.
+fn refresh_native_shell_statistics(
+    plan: OwnedLogicalPlan,
+    source_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    environment: &PlannerRuleEnvironment,
+) -> OwnedLogicalPlan {
+    let children = plan.children();
+    let child_layouts = children
+        .iter()
+        .map(|child| child.output_layout())
+        .collect::<Vec<_>>();
+    let child_maximum_cardinalities = children
+        .iter()
+        .map(|child| match &child.operator {
+            LogicalOperator::BoundReference(reference) => reference.facts.maximum_cardinality,
+            _ => child
+                .stats
+                .estimated_cardinality
+                .map(|estimate| estimate.max),
+        })
+        .collect::<Vec<_>>();
+    let mut context = crate::context::OptimizationContext::new(
+        environment.session.clone(),
+        environment.bind_context.clone(),
+    );
+    context.cost_model = environment.cost_model.clone();
+    for child in &children {
+        match &child.operator {
+            LogicalOperator::BoundReference(reference) => {
+                for (binding, statistics) in reference
+                    .bindings
+                    .iter()
+                    .copied()
+                    .zip(reference.column_statistics())
+                {
+                    context.column_stats_mut().insert(binding, statistics);
+                }
+            }
+            _ => {
+                for binding in child.get_column_bindings() {
+                    if let Some(statistics) = source_stats.get(&binding) {
+                        context
+                            .column_stats_mut()
+                            .insert(binding, statistics.clone());
+                    }
+                }
+            }
+        }
+    }
+    let input_column_stats = context.column_stats.clone();
+    let mut propagator =
+        StatisticsPropagator::with_statistics_map(context.column_stats.as_ref().clone());
+    let plan = plan.map_operator(|operator| {
+        propagator.propagate_operator(environment.session.as_ref(), operator)
+    });
+    context.column_stats = Arc::new(propagator.take_statistics_map());
+    let mut gathering = StatisticsGathering::new();
+    let (plan, _output, _maximum) = gathering.gather_local(
+        plan,
+        &child_layouts,
+        &child_maximum_cardinalities,
+        input_column_stats,
+        &mut context,
+    );
+    plan
 }
 
 fn rewrite_planner_expressions(

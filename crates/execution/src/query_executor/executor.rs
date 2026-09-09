@@ -55,6 +55,10 @@ impl Executor {
         let result_types = compiled.result_types();
         let is_query = !result_names.is_empty();
         let started_at = Instant::now();
+        let statement_trace = self.session.statement_trace();
+        if let Some(trace) = &statement_trace {
+            trace.record_event("execution", "executor_entry");
+        }
         debug!(
             target: targets::EXECUTOR,
             is_query,
@@ -73,10 +77,31 @@ impl Executor {
         // the two here turns a precise unavailable/misconfigured error into a
         // misleading "no physical variant" planning failure.
         let external_worker_slots = self.session.python_execution_slot_limit();
-        let (program, execution_lease) =
-            self.admit_program(&compiled, &query_memory_pool, external_worker_slots)?;
+        if let Some(trace) = &statement_trace {
+            trace.record_event("admission", "admission_entry");
+        }
+        let admission_started = Instant::now();
+        let admitted = self.admit_program(&compiled, &query_memory_pool, external_worker_slots);
+        if let Some(trace) = &statement_trace {
+            trace.record_span("admission", "lower_and_admit", admission_started);
+        }
+        let (program, execution_lease) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                if let Some(trace) = &statement_trace {
+                    trace.record_event("admission", "admission_error");
+                }
+                return Err(error);
+            }
+        };
         if let Some(lease) = execution_lease {
             query_memory_pool.install_execution_lease(lease)?;
+            if let Some(trace) = &statement_trace {
+                trace.record_event("admission", "resource_grant_published");
+            }
+        }
+        if let Some(trace) = &statement_trace {
+            trace.record_event("execution", "pipeline_dispatch_entry");
         }
         let handler = self.execute_program(
             &program,
@@ -86,6 +111,10 @@ impl Executor {
             allocator,
             query_memory_pool,
         )?;
+        if let Some(trace) = &statement_trace {
+            trace.record_event("execution", "result_handler_ready");
+            trace.record_event("execution", "executor_return");
+        }
         debug!(
             target: targets::EXECUTOR,
             is_query,
@@ -112,7 +141,12 @@ impl Executor {
         let mut memory_ceiling =
             u64::try_from(query_memory_pool.capacity_bytes()).unwrap_or(u64::MAX);
         let mut external_ceiling = available_external_worker_slots;
+        let mut admission_attempt = 0_u64;
         loop {
+            admission_attempt = admission_attempt.saturating_add(1);
+            if let Some(trace) = self.session.statement_trace() {
+                trace.record_value("admission", "admission_attempt", admission_attempt);
+            }
             let program = compiled.program().admit_for_execution(
                 memory_ceiling,
                 available_parallel_tasks,
@@ -120,8 +154,28 @@ impl Executor {
                 &|plan| super::compiled::physical_plan_dependencies_available(plan, &self.session),
             )?;
             let Some(resources) = program.execution_resources() else {
+                if let Some(trace) = self.session.statement_trace() {
+                    trace.record_event("admission", "resource_contract_absent");
+                }
                 return Ok((program, None));
             };
+            if let Some(trace) = self.session.statement_trace() {
+                trace.record_value(
+                    "admission",
+                    "working_set_memory_bytes",
+                    resources.working_set_memory_bytes,
+                );
+                trace.record_value(
+                    "admission",
+                    "max_parallel_tasks",
+                    u64::from(resources.max_parallel_tasks),
+                );
+                trace.record_value(
+                    "admission",
+                    "external_worker_slots",
+                    u64::from(resources.external_worker_slots),
+                );
+            }
             let external_workers = if resources.external_worker_slots == 0 {
                 None
             } else {
@@ -134,6 +188,9 @@ impl Executor {
                 {
                     Some(lease) => Some(lease),
                     None => {
+                        if let Some(trace) = self.session.statement_trace() {
+                            trace.record_event("admission", "external_capacity_retry");
+                        }
                         external_ceiling = 0;
                         continue;
                     }
@@ -154,6 +211,9 @@ impl Executor {
                 ));
             }
             memory_ceiling = memory_ceiling.min(resources.working_set_memory_bytes - 1);
+            if let Some(trace) = self.session.statement_trace() {
+                trace.record_event("admission", "memory_capacity_retry");
+            }
         }
     }
 
@@ -166,6 +226,7 @@ impl Executor {
         allocator: Arc<dyn paro_common::allocator::Allocator>,
         query_memory_pool: Arc<QueryMemoryPool>,
     ) -> Result<ResultHandler> {
+        let pipeline_started = Instant::now();
         let execution =
             if result_types.is_empty() && !self.session.input.requires_background_execution() {
                 program_executor::execute_program(
@@ -184,6 +245,9 @@ impl Executor {
                     allocator.clone(),
                 )?
             };
+        if let Some(trace) = self.session.statement_trace() {
+            trace.record_span("execution", "pipeline_initialized", pipeline_started);
+        }
         ResultHandler::from_program_execution(
             result_names,
             result_types,

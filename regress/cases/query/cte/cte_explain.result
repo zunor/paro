@@ -22,16 +22,16 @@ FROM peers AS p
 JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 QUERY PLAN
-MATERIALIZED_CTE  (rows=1)
+MATERIALIZED_CTE  (rows=0)
   CTE Name: base
   Materialization: MATERIALIZED
   Reference Count: 3
   ->  VALUES  (rows=5)
-  ->  ORDER_BY  (rows=1)
+  ->  ORDER_BY  (rows=0)
     Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
-    ->  PROJECTION  (rows=1)
+    ->  PROJECTION  (rows=0)
       Output: p.id, p.peer_id, a.total
-      ->  HASH_JOIN  (rows=1)
+      ->  HASH_JOIN  (rows=0)
         Join Type: INNER
         Join Condition: a.grp = p.grp
         ->  PROJECTION  (rows=3)

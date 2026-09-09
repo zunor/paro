@@ -20,6 +20,7 @@ mod statement_graphs;
 mod statement_input;
 mod statement_options;
 mod statement_time;
+mod statement_trace;
 mod statement_view;
 mod txn_admission;
 mod write_class;
@@ -52,7 +53,9 @@ pub use query_resources::{
     QueryResourceGovernance, QueryResources,
 };
 pub use runtime_limits::RuntimeLimits;
-pub use session_diagnostics::{OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics};
+pub use session_diagnostics::{
+    OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics, StatementCacheDecision,
+};
 pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,
     SettingRow,
@@ -68,6 +71,10 @@ pub use statement_graphs::StatementGraphSnapshots;
 pub use statement_input::StatementInput;
 pub use statement_options::{ExplainOutputType, StatementOptions, StatementSource};
 pub use statement_time::StatementTimeContext;
+pub use statement_trace::{
+    fingerprint as statement_fingerprint, StatementTrace, StatementTraceEvent,
+    StatementTraceSnapshot, STATEMENT_TRACE_SCHEMA_VERSION,
+};
 pub use statement_view::StatementView;
 pub use txn_admission::{
     catalog_object_resource, ddl_lock_requests, dml_table_lock_requests, schema_resource,

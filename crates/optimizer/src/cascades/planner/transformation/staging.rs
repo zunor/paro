@@ -295,13 +295,17 @@ pub(super) fn stage_transformed_expression(
         let plan = skeleton;
         // Preserve binding semantics before Query IR interning replaces
         // operator expressions with scalar-arena references.
+        // Scalar interning only borrows child column identities.  Cloning each
+        // `Box<[ColumnId]>` here made every post-order staging node copy the
+        // complete child layout before the native Memo key was built.
+        let child_columns = child_states
+            .iter()
+            .map(|child| child.columns.as_ref())
+            .collect::<Vec<_>>();
         let scalar_roots = intern_operator_scalars(
             &plan.operator,
             &output_columns,
-            &child_states
-                .iter()
-                .map(|child| child.columns.clone())
-                .collect::<Vec<_>>(),
+            &child_columns,
             &mut state.binding_ids,
             &mut state.columns,
             &mut state.scalars,

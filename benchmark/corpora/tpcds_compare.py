@@ -15,7 +15,7 @@ import statistics
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import _duckdb
 import duckdb
@@ -24,12 +24,16 @@ from psycopg import sql
 
 from benchmark_evidence import (
     ImmutableDataSeed,
+    STATEMENT_TRACE_SCHEMA_VERSION,
     isolated_paro_server,
     build_benchmark_server,
     content_digest,
     hierarchical_abba_ratio,
+    parse_statement_trace_log,
     repository_identity,
+    statement_fingerprint,
     tree_digest,
+    validate_statement_trace,
 )
 from tpcds_result_contract import (
     ColumnContract,
@@ -73,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", type=int, default=99)
     parser.add_argument("--warmups-per-process", type=int, default=1)
     parser.add_argument("--process-blocks", type=int, default=5)
+    parser.add_argument("--diagnostic-process-blocks", type=int, default=1)
     parser.add_argument("--measurement-rounds-per-process", type=int, default=3)
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
     parser.add_argument("--random-seed", type=int, default=0)
@@ -107,15 +112,6 @@ def extension_digest(module: Any) -> dict[str, str | None]:
     }
 
 
-def timed_fetch(
-    execute: Callable[[], tuple[list[tuple[Any, ...]], tuple[ColumnContract, ...]]]
-) -> tuple[list[tuple[Any, ...]], tuple[ColumnContract, ...], float]:
-    started = time.perf_counter_ns()
-    rows, schema = execute()
-    elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-    return rows, schema, elapsed_ms
-
-
 def percentile(samples: list[float], fraction: float) -> float:
     ordered = sorted(samples)
     rank = max(0, min(len(ordered) - 1, round((len(ordered) - 1) * fraction)))
@@ -128,6 +124,53 @@ def timing_summary(samples: list[float]) -> dict[str, Any]:
         "minimum_ms": round(min(samples), 6),
         "median_ms": round(statistics.median(samples), 6),
         "p95_ms": round(percentile(samples, 0.95), 6),
+    }
+
+
+def hierarchical_cold_ratio(
+    blocks: list[dict[str, Any]], bootstrap_samples: int = 10_000
+) -> dict[str, Any]:
+    """Compare one cold observation per engine in each fresh process block.
+
+    Cold samples are deliberately kept out of the warm ABBA distribution. A
+    fresh process block is the resampling unit; there is no within-block IID
+    resampling to pretend exists for a first statement.
+    """
+    if not blocks:
+        raise ValueError("cold comparison has no process blocks")
+    ratios = []
+    for block in blocks:
+        cold = block.get("cold_statement_ms") or {}
+        try:
+            paro = float(cold["paro"])
+            duckdb = float(cold["duckdb"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "each process block must contain one cold sample per engine"
+            ) from error
+        if paro <= 0.0 or duckdb <= 0.0:
+            raise ValueError("cold timings must be positive")
+        ratios.append(paro / duckdb)
+
+    ratio = statistics.geometric_mean(ratios)
+    rng = random.Random(0)
+    bootstrap = [
+        statistics.geometric_mean(
+            [ratios[rng.randrange(len(ratios))] for _ in ratios]
+        )
+        for _ in range(bootstrap_samples)
+    ]
+    bootstrap.sort()
+    low = bootstrap[int(0.025 * (len(bootstrap) - 1))]
+    high = bootstrap[int(0.975 * (len(bootstrap) - 1))]
+    return {
+        "ratio": round(ratio, 6),
+        "hierarchical_confidence_interval_95": [round(low, 6), round(high, 6)],
+        "process_block_ratios": [round(value, 6) for value in ratios],
+        "process_blocks": len(ratios),
+        "samples_per_engine": len(ratios),
+        "bootstrap_samples": bootstrap_samples,
+        "resampling_unit": "fresh_process_block_only",
     }
 
 
@@ -158,8 +201,11 @@ def _duckdb_worker(channel: Any, database: str, threads: int, memory_limit: str)
             started = time.perf_counter_ns()
             result = connection.execute(query)
             rows = result.fetchall()
-            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+            # Native result metadata is part of the engine-side timer. The
+            # canonical Python schema conversion happens after the worker
+            # reports elapsed_ms, just as it does for Paro.
             description = [(column[0], str(column[1])) for column in result.description or ()]
+            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
             channel.send(
                 {
                     "status": "ok",
@@ -250,13 +296,80 @@ def configure_paro(connection: psycopg.Connection[Any], args: argparse.Namespace
         )
 
 
+def run_paro_raw(
+    connection: psycopg.Connection[Any], query: str, binary_result: bool
+) -> tuple[list[tuple[Any, ...]], tuple[Any, ...]]:
+    with connection.cursor(binary=binary_result) as cursor:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        return rows, tuple(cursor.description or ())
+
+
+def collect_statement_cache_evidence(
+    connection: psycopg.Connection[Any], query: str
+) -> dict[str, Any]:
+    """Read the lightweight miss side-channel after, never before, C1."""
+    fingerprint = statement_fingerprint(query)
+    prefix = f"statement_plan_cache/{fingerprint:016x}/"
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM paro_optimizers()")
+            columns = [column.name for column in cursor.description or ()]
+            rows = cursor.fetchall()
+        indexes = {
+            column.rsplit(".", 1)[-1]: index
+            for index, column in enumerate(columns)
+        }
+        name_index = indexes["name"]
+        kind_index = indexes["kind"]
+        value_index = indexes["metric_value"]
+        unit_index = indexes["metric_unit"]
+        matches = [
+            row
+            for row in rows
+            if str(row[kind_index]) == "evidence"
+            and str(row[unit_index]) == "count"
+            and str(row[name_index]).startswith(prefix)
+        ]
+        if len(matches) != 1:
+            return {
+                "status": "uncovered",
+                "query_fingerprint": fingerprint,
+                "reason": "post-timer cache decision was missing or ambiguous",
+                "matching_rows": len(matches),
+            }
+        name = str(matches[0][name_index])
+        occurrence = int(name.rsplit("/", 1)[1])
+        cache_hit = int(matches[0][value_index]) == 1
+        return {
+            "status": "verified",
+            "query_fingerprint": fingerprint,
+            "occurrence": occurrence,
+            "cache_hit": cache_hit,
+            "source": "paro_optimizers_post_timer_side_channel",
+        }
+    except (IndexError, KeyError, TypeError, ValueError, psycopg.Error) as error:
+        return {
+            "status": "uncovered",
+            "query_fingerprint": fingerprint,
+            "reason": f"post-timer cache decision could not be read: {error}",
+        }
+
+
 def run_paro(
     connection: psycopg.Connection[Any], query: str, binary_result: bool
 ) -> tuple[list[tuple[Any, ...]], tuple[ColumnContract, ...]]:
-    with connection.cursor(binary=binary_result) as cursor:
-        cursor.execute(query)
-        schema = paro_schema(cursor.description or ())
-        return cursor.fetchall(), schema
+    rows, description = run_paro_raw(connection, query, binary_result)
+    return rows, paro_schema(description)
+
+
+def timed_run_paro(
+    connection: psycopg.Connection[Any], query: str, binary_result: bool
+) -> tuple[list[tuple[Any, ...]], tuple[ColumnContract, ...], float]:
+    started = time.perf_counter_ns()
+    rows, description = run_paro_raw(connection, query, binary_result)
+    elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+    return rows, paro_schema(description), elapsed_ms
 
 
 def metadata_inventory_from_rows(
@@ -363,12 +476,14 @@ def main() -> int:
     if (
         args.warmups_per_process < 1
         or args.process_blocks < 2
+        or args.diagnostic_process_blocks < 1
         or args.measurement_rounds_per_process < 1
     ):
         raise SystemExit(
             "warmups-per-process must be at least one so cached and cold-statement "
             "latencies have distinct, auditable scopes; process-blocks must be at least two; "
-            "measurement-rounds-per-process must be at least one"
+            "measurement-rounds-per-process must be at least one; diagnostic-process-blocks "
+            "must be positive"
         )
     if args.bootstrap_samples < 100:
         raise SystemExit("bootstrap-samples must be at least 100")
@@ -383,7 +498,7 @@ def main() -> int:
         Path(__file__).with_name("tpcds_setup.py").resolve(),
     ]
     report: dict[str, Any] = {
-        "schema_version": 6,
+        "schema_version": 8,
         "corpus": "TPC-DS",
         "scale_factor": 1,
         "query_range": [args.start, args.end],
@@ -413,15 +528,79 @@ def main() -> int:
             "statement_timeout_seconds": args.statement_timeout_seconds,
             "warmups_per_process": args.warmups_per_process,
             "process_blocks": args.process_blocks,
+            "diagnostic_process_blocks": args.diagnostic_process_blocks,
             "measurement_rounds_per_process": args.measurement_rounds_per_process,
             "samples_per_process_per_engine": args.measurement_rounds_per_process * 2,
             "samples_per_engine": (
                 args.process_blocks * args.measurement_rounds_per_process * 2
             ),
             "optimizer_verify": True,
+            "planning_dop": 1,
+            "execution_dop": args.threads,
+            "cohorts": {
+                "normal": {
+                    "purpose": "primary C1/W",
+                    "statement_trace": False,
+                    "statement_cache_evidence": True,
+                    "allocation_profile": False,
+                },
+                "diagnostic": {
+                    "purpose": "same-operation phase attribution",
+                    "statement_trace": True,
+                    "statement_cache_evidence": True,
+                    "excluded_from_c1": True,
+                },
+            },
+            "resource_envelope": {
+                "service_cpu_limit": args.threads,
+                "memory_limit": args.memory_limit,
+                "concurrent_target_statements": 1,
+                "page_cache_policy": "private_copy_per_process; OS cache not flushed",
+            },
+            "latency_tracks": {
+                "C0": {
+                    "name": "first_result_from_process_start",
+                    "status": "uncovered",
+                    "auxiliary": "managed_server.startup_to_ready_ms",
+                },
+                "C1": {
+                    "name": "cold_first_statement",
+                    "timer": "client perf_counter_ns around execute/fetch/native result metadata",
+                    "cohort": "normal_trace_off",
+                    "primary_gate": True,
+                },
+                "C2": {
+                    "name": "first_noncompile_path",
+                    "timer": "same-operation interval union after compiler return",
+                    "status": "diagnostic_only_until_interval_union_is_complete",
+                    "diagnostic_only": True,
+                },
+                "W": {
+                    "name": "steady_state",
+                    "timer": "execute/fetch/native result metadata after cold sample and cache warmup",
+                    "execution_quality_gate": True,
+                },
+            },
             "timing_scope": {
                 "steady_state": "execute_fetch_and_result_metadata_after_instance_plan_cache_warmup",
-                "cold_statement": "first_statement_compile_execute_fetch_and_result_metadata",
+                "cold_statement": "first_statement_parse_compile_admit_execute_fetch_and_native_result_metadata",
+                "native_result_metadata": "included_in_each_engine_timer",
+                "canonical_schema_conversion": "outside_each_engine_timer",
+                "server_phase_trace": {
+                    "schema_version": STATEMENT_TRACE_SCHEMA_VERSION,
+                    "clock": "server_monotonic_relative",
+                    "target": "paro::statement_trace",
+                    "correlation": "process_id_session_id_operation_id_sample_id_sequence",
+                    "client_timer": "perf_counter_ns",
+                    "clock_subtraction": False,
+                    "cohort": "diagnostic_only",
+                },
+            },
+            "status_semantics": {
+                "evidence": "trace/schema/identity/complete-result validation",
+                "regression": "paired normal trace-off C1 comparison against declared baseline",
+                "milestone": "pre-registered C1/quality/resource thresholds",
+                "model": "G-Stats/G-Cost admitted only after declared calibration",
             },
             "validation_scope": "outside_timed_region_every_sample",
             "measurement_order": (
@@ -430,6 +609,37 @@ def main() -> int:
             "paro_input_isolation": "private_copy_per_process",
             "paro_result_format": args.paro_result_format,
             "random_seed": args.random_seed,
+            "runtime_environment": {
+                "RUST_LOG": os.environ.get("RUST_LOG"),
+                "PARO_STATEMENT_CACHE_EVIDENCE": "1",
+            },
+        },
+        "model_gates": {
+            "version": 1,
+            "G-Stats": {
+                "status": "registered_not_admitted",
+                "scope": "declared semantic occurrences plus held-out cardinality families",
+                "thresholds": {
+                    "q_error_p95_max": 2.0,
+                    "q_error_max": 4.0,
+                    "conditional_domain_coverage_min": 1.0,
+                },
+            },
+            "G-Cost": {
+                "status": "registered_not_admitted",
+                "scope": "fresh-process phase trace and candidate replay on the declared envelope",
+                "thresholds": {
+                    "phase_time_prediction_p95_ratio_max": 1.25,
+                    "candidate_selection_loss_p95_ratio_max": 1.10,
+                    "held_out_coverage_min": 1.0,
+                },
+            },
+        },
+        "manifest": {
+            "version": 1,
+            "family": "TPC-DS SF1",
+            "held_out_required": True,
+            "unsupported_scope": "queries outside the declared range or metadata track",
         },
         "validation": {
             "rows": "typed_full_multiset_digest_every_sample",
@@ -461,6 +671,7 @@ def main() -> int:
                 oracle_log,
                 max_memory=args.memory_limit,
                 threads=args.threads,
+                statement_trace=False,
             )
             with oracle_server_context as oracle_server, DuckDBProcess(
                 args.duckdb_database, args.threads, args.memory_limit
@@ -526,6 +737,8 @@ def main() -> int:
                     block_log,
                     max_memory=args.memory_limit,
                     threads=args.threads,
+                    statement_trace=False,
+                    cache_evidence=True,
                 )
                 with block_server_context as block_server, DuckDBProcess(
                     args.duckdb_database, args.threads, args.memory_limit
@@ -541,16 +754,24 @@ def main() -> int:
                         if rng.getrandbits(1):
                             cold_order.reverse()
                         cold_statement_ms: dict[str, float] = {}
+                        cold_cache_evidence: dict[str, Any] = {
+                            "status": "uncovered",
+                            "reason": "Paro cold observation was not reached",
+                        }
                         for engine in cold_order:
                             if engine == "paro":
-                                rows, sample_schema, elapsed_ms = timed_fetch(
-                                    lambda: run_paro(paro, query, binary_result)
+                                rows, sample_schema, elapsed_ms = timed_run_paro(
+                                    paro, query, binary_result
                                 )
                             else:
                                 rows, sample_schema, elapsed_ms = duck_process.execute(query)
                             validate_sample(f"{engine} cold statement", rows, sample_schema)
                             cold_samples[engine].append(elapsed_ms)
                             cold_statement_ms[engine] = round(elapsed_ms, 6)
+                            if engine == "paro":
+                                cold_cache_evidence = collect_statement_cache_evidence(
+                                    paro, query
+                                )
 
                         # The measured cold statement is also the first warmup.
                         # Additional warmups are deliberately outside both timed scopes.
@@ -573,8 +794,10 @@ def main() -> int:
                                 )
                         block = {
                             "block": block_number,
+                            "cohort": "normal",
                             "cold_order": cold_order,
                             "cold_statement_ms": cold_statement_ms,
+                            "cold_miss_evidence": cold_cache_evidence,
                             "measurement_round_orders": round_orders,
                             "paro_ms": [],
                             "duckdb_ms": [],
@@ -584,8 +807,8 @@ def main() -> int:
                         for order in round_orders:
                             for engine in order:
                                 if engine == "paro":
-                                    rows, sample_schema, elapsed_ms = timed_fetch(
-                                        lambda: run_paro(paro, query, binary_result)
+                                    rows, sample_schema, elapsed_ms = timed_run_paro(
+                                        paro, query, binary_result
                                     )
                                 else:
                                     rows, sample_schema, elapsed_ms = duck_process.execute(
@@ -595,17 +818,113 @@ def main() -> int:
                                 samples[engine].append(elapsed_ms)
                                 sample_digests[engine].append(digest)
                                 block[f"{engine}_ms"].append(round(elapsed_ms, 6))
-                        blocks.append(block)
                     finally:
                         paro.close()
+                trace_events = parse_statement_trace_log(block_log)
+                if trace_events:
+                    raise AssertionError(
+                        "normal C1 block emitted diagnostic trace despite trace-off configuration"
+                    )
+                block["statement_trace"] = {
+                    "schema_version": STATEMENT_TRACE_SCHEMA_VERSION,
+                    "enabled": False,
+                    "verified_empty": True,
+                }
+                blocks.append(block)
+
+            diagnostic_blocks: list[dict[str, Any]] = []
+            for diagnostic_block_number in range(args.diagnostic_process_blocks):
+                diagnostic_log = args.report.with_suffix(
+                    f".q{query_id}.diagnostic{diagnostic_block_number:03d}.parod.log"
+                )
+                diagnostic_sample_id = (
+                    f"q{query_id}.diagnostic.block{diagnostic_block_number}"
+                )
+                with isolated_paro_server(
+                    server_binary,
+                    seed,
+                    args.listen,
+                    diagnostic_log,
+                    max_memory=args.memory_limit,
+                    threads=args.threads,
+                    statement_trace=True,
+                    trace_sample_id=diagnostic_sample_id,
+                    cache_evidence=True,
+                ) as diagnostic_server:
+                    diagnostic_server_identity = diagnostic_server.identity()
+                    diagnostic_paro = open_paro_connection(args)
+                    try:
+                        diagnostic_rows, diagnostic_schema, diagnostic_ms = timed_run_paro(
+                            diagnostic_paro, query, binary_result
+                        )
+                        validate_sample(
+                            "diagnostic Paro", diagnostic_rows, diagnostic_schema
+                        )
+                    finally:
+                        diagnostic_paro.close()
+                diagnostic_traces = parse_statement_trace_log(diagnostic_log)
+                target_traces = [
+                    trace
+                    for trace in diagnostic_traces
+                    if trace["query_fingerprint"] == statement_fingerprint(query)
+                ]
+                if len(target_traces) != 1:
+                    raise AssertionError(
+                        "diagnostic cohort must have exactly one target operation trace"
+                    )
+                validate_statement_trace(
+                    target_traces[0],
+                    expected_process_id=diagnostic_server_identity["pid"],
+                    expected_sample_id=diagnostic_sample_id,
+                    expected_query_fingerprint=statement_fingerprint(query),
+                )
+                diagnostic_blocks.append({
+                    "block": diagnostic_block_number,
+                    "cohort": "diagnostic",
+                    "client_ms": round(diagnostic_ms, 6),
+                    "paro_server": diagnostic_server_identity,
+                    "statement_traces": diagnostic_traces,
+                    "target_statement_traces": target_traces,
+                })
 
             paro_timing = timing_summary(samples["paro"])
             duckdb_timing = timing_summary(samples["duckdb"])
-            crossover = hierarchical_abba_ratio(blocks, args.bootstrap_samples)
-            ratio = crossover["ratio"]
-            confidence_high = crossover["hierarchical_confidence_interval_95"][1]
+            warm_crossover = hierarchical_abba_ratio(blocks, args.bootstrap_samples)
+            warm_ratio = warm_crossover["ratio"]
+            cold_crossover = hierarchical_cold_ratio(blocks, args.bootstrap_samples)
+            cold_ratio = cold_crossover["ratio"]
+            cold_confidence_high = cold_crossover[
+                "hierarchical_confidence_interval_95"
+            ][1]
             verify_measurement_inputs(repo_root, server_binary, args, report)
-            evidence_qualifies = metadata_symmetric and confidence_high < 1
+            trace_off_verified = all(
+                item["statement_trace"]["verified_empty"] for item in blocks
+            )
+            cold_miss_evidence = {
+                "status": (
+                    "verified"
+                    if all(
+                        item.get("cold_miss_evidence", {}).get("status") == "verified"
+                        and not item["cold_miss_evidence"].get("cache_hit", True)
+                        for item in blocks
+                    )
+                    else "uncovered"
+                ),
+                "samples": [item.get("cold_miss_evidence") for item in blocks],
+                "method": "post_timer_statement_plan_cache_side_channel",
+            }
+            cold_miss_verified = cold_miss_evidence["status"] == "verified"
+            c1_p50_not_slower = (
+                statistics.median(cold_samples["paro"])
+                <= statistics.median(cold_samples["duckdb"])
+            )
+            evidence_qualifies = (
+                metadata_symmetric
+                and cold_confidence_high <= 1
+                and c1_p50_not_slower
+                and trace_off_verified
+                and cold_miss_verified
+            )
             result.update(
                 status="passed",
                 rows=len(paro_rows),
@@ -629,20 +948,45 @@ def main() -> int:
                     "duckdb": len(sample_digests["duckdb"]),
                 },
                 process_blocks=blocks,
+                diagnostic_cohort={
+                    "process_blocks": diagnostic_blocks,
+                    "trace_schema_version": STATEMENT_TRACE_SCHEMA_VERSION,
+                    "excluded_from_c1": True,
+                    "client_ms": timing_summary(
+                        [item["client_ms"] for item in diagnostic_blocks]
+                    ),
+                },
                 cold_statement={
                     "paro": timing_summary(cold_samples["paro"]),
                     "duckdb": timing_summary(cold_samples["duckdb"]),
+                    "crossover": cold_crossover,
+                    "cohort": "normal_trace_off",
+                    "trace_enabled": False,
+                    "trace_off_verified": trace_off_verified,
+                    "trace_query_fingerprint": statement_fingerprint(query),
+                    "cold_miss_evidence": cold_miss_evidence,
+                },
+                warmup_and_steady_state={
+                    "paro": paro_timing,
+                    "duckdb": duckdb_timing,
+                    "crossover": warm_crossover,
                 },
                 paro=paro_timing,
                 duckdb=duckdb_timing,
-                crossover=crossover,
-                paro_over_duckdb=round(ratio, 6),
+                crossover=warm_crossover,
+                cold_crossover=cold_crossover,
+                paro_over_duckdb=round(cold_ratio, 6),
+                warm_paro_over_duckdb=round(warm_ratio, 6),
                 faster_than_duckdb=evidence_qualifies,
                 evidence_qualification=(
                     "qualified"
                     if evidence_qualifies
-                    else "requires symmetric metadata and CI upper bound below one"
+                    else "requires verified cold miss, C1 p50 non-regression and C1 CI upper bound at most one"
                 ),
+                evidence_status=("EvidenceValid" if cold_miss_verified else "EvidenceUncovered"),
+                regression_status="RegressionCompared",
+                milestone_status="MilestoneNotPassed",
+                model_status="ModelNotAdmitted",
             )
         except Exception as error:
             failures += 1
@@ -655,12 +999,15 @@ def main() -> int:
         )
         write_report(args.report, report)
         if result["status"] == "passed":
-            confidence = result["crossover"]["hierarchical_confidence_interval_95"]
+            c1_confidence = result["cold_crossover"][
+                "hierarchical_confidence_interval_95"
+            ]
             print(
-                f"TPC-DS {query_id}: Paro {result['paro']['median_ms']:.3f} ms, "
-                f"DuckDB {result['duckdb']['median_ms']:.3f} ms, "
+                f"TPC-DS {query_id}: C1 Paro {result['cold_statement']['paro']['median_ms']:.3f} ms, "
+                f"DuckDB {result['cold_statement']['duckdb']['median_ms']:.3f} ms, "
                 f"ratio {result['paro_over_duckdb']:.3f}, "
-                f"hierarchical 95% CI [{confidence[0]:.3f}, {confidence[1]:.3f}]",
+                f"95% CI [{c1_confidence[0]:.3f}, {c1_confidence[1]:.3f}]; "
+                f"W ratio {result['warm_paro_over_duckdb']:.3f}",
                 flush=True,
             )
         else:

@@ -385,6 +385,68 @@ impl Optimizer {
         self.ctx
             .profiler
             .record_search_summary(&extraction.search_summary);
+        if let Some(trace) = self.ctx.session.statement_trace() {
+            let summary = &extraction.search_summary;
+            trace.record_value("optimizer", "memo_group_count", summary.groups);
+            trace.record_value(
+                "optimizer",
+                "memo_logical_expression_count",
+                summary.logical_expressions,
+            );
+            trace.record_value(
+                "optimizer",
+                "memo_physical_expression_count",
+                summary.physical_expressions,
+            );
+            trace.record_value(
+                "optimizer",
+                "transformation_apply_attempt_count",
+                extraction.rule_attempts.values().copied().sum(),
+            );
+            trace.record_value(
+                "optimizer",
+                "transformation_inserted_count",
+                extraction.rule_insertions.values().copied().sum(),
+            );
+            trace.record_value(
+                "optimizer",
+                "transformation_allocated_bytes",
+                extraction.rule_allocated_bytes.values().copied().sum(),
+            );
+            trace.record_value(
+                "optimizer",
+                "transformation_budget_exhaustion_count",
+                extraction.rule_budget_exhaustions.values().copied().sum(),
+            );
+            for (name, count) in &summary.work_counters {
+                trace.record_value("optimizer", name, *count);
+            }
+            for (rule, profile) in &extraction.rule_work_profile {
+                let rule_name = crate::cascades::rules::transformation_rule_name(*rule)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("unknown_rule_{}", rule.0));
+                for (phase, count) in [
+                    ("discovered", profile.discovered),
+                    ("matched", profile.matched),
+                    ("applicable", profile.applicable),
+                    ("constructed", profile.constructed),
+                    ("published", profile.published),
+                    ("rejected", profile.rejected),
+                    ("ineffective", profile.ineffective),
+                ] {
+                    let event = format!("rule.{rule_name}.{phase}");
+                    trace.record_value("optimizer", &event, count);
+                }
+            }
+            trace.record_event(
+                "optimizer",
+                if summary.is_complete() {
+                    "search_complete"
+                } else {
+                    "search_incomplete"
+                },
+            );
+        }
         self.ctx.profiler.record(
             match mode {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,

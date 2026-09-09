@@ -343,6 +343,8 @@ impl PhysicalPlan {
         let node = self.node(id);
         ExplainNode {
             node_id: Some((id.index() + 1) as u64),
+            logical_node_id: (!node.label.logical_plan_node.is_synthetic())
+                .then_some(u64::from(node.label.logical_plan_node.0)),
             operator_name: explain_operator_name(&node.kind).to_string(),
             relation_name: explain_relation_name(&node.kind),
             relation_alias: explain_relation_alias(&node.kind),
@@ -617,6 +619,15 @@ fn collect_explain_properties(
         }
         PhysicalNodeKind::RowsetScan(spec) => {
             let scan_formatter = ExplainExpressionFormatter::new(&output_names);
+            let column_ids = spec
+                .column_projection
+                .columns()
+                .iter()
+                .map(|column| column.to_string())
+                .collect::<Vec<_>>();
+            if !column_ids.is_empty() {
+                push_list_property(&mut properties, "Column IDs", &column_ids);
+            }
             if !output_names.is_empty() {
                 push_list_property(&mut properties, "Columns", &output_names);
             }

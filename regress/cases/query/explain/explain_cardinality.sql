@@ -24,6 +24,7 @@ WHERE score >= 20
 ORDER BY score DESC, id
 LIMIT 2;
 
+-- @normalize explain_logical_ids
 -- @query json
 EXPLAIN
 SELECT id

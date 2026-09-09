@@ -249,6 +249,7 @@ mod tests {
             generic_plan: None,
             generic_plan_uses: 0,
             source: PreparedStatementSource::Sql,
+            statement_trace: None,
         }
     }
 
@@ -271,6 +272,7 @@ mod tests {
             completion: None,
             created_generation: 0,
             transaction_owned: true,
+            statement_trace: None,
         }
     }
 

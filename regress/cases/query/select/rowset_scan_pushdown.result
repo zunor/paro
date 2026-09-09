@@ -73,6 +73,7 @@ PROJECTION  (rows=6)
   Cardinality: [3, 6, 10]
   Output Schema: payload VARCHAR
   ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+    Column IDs: 4
     Columns: payload
     Pushed Predicate: k = 3
     Late Materialize: auto
@@ -148,10 +149,12 @@ PROJECTION  (rows=1)
       Cardinality: [10, 19, 29]
       Output Schema: (none)
       ->  ROWSET_SCAN on public.rowset_pushdown_case c  (rows=64)
+        Column IDs: 1
         Columns: k
         Cardinality: [64, 64, 64]
         Output Schema: c.k INTEGER
       ->  ROWSET_SCAN on public.rowset_pushdown_dim d  (rows=3)
+        Column IDs: 0
         Columns: k
         Cardinality: [3, 3, 3]
         Output Schema: d.k INTEGER
@@ -173,6 +176,7 @@ PROJECTION  (rows=5)
       Cardinality: [64, 64, 64]
       Output Schema: id INTEGER, public.rowset_pushdown_case.score INTEGER
       ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=64)
+        Column IDs: 0, 3
         Columns: id, score
         Cardinality: [64, 64, 64]
         Output Schema: public.rowset_pushdown_case.id INTEGER, public.rowset_pushdown_case.score INTEGER
@@ -280,6 +284,7 @@ PROJECTION  (rows=3)
         Cardinality: [1666, 3333, 5000]
         Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
         ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
+          Column IDs: 0
           Columns: id, rowid
           Pushed Predicate: phone IN ('13x', '31y')
           Cardinality: [1666, 3333, 5000]
@@ -317,6 +322,7 @@ ROW_FETCH  (rows=3)
       Cardinality: [500, 1000, 1501]
       Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
       ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=1000)
+        Column IDs: 0, 1
         Columns: id, __matched_prefix_1_2, rowid
         Pushed Predicate: phone HAS PREFIX IN ("13", "31")
         Late Materialize: auto

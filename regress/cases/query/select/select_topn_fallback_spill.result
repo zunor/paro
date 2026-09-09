@@ -17,6 +17,7 @@ PROJECTION  (rows=3)
     ->  PROJECTION  (rows=7000)
       Output: id, score
       ->  ROWSET_SCAN on public.topn_fallback_spill_case  (rows=7000)
+        Column IDs: 0, 1
         Columns: id, score
 
 SELECT id
@@ -40,6 +41,7 @@ TOP_N  (rows=5)
   ->  PROJECTION  (rows=7000)
     Output: id
     ->  ROWSET_SCAN on public.topn_fallback_spill_case  (rows=7000)
+      Column IDs: 0
       Columns: id
 
 SELECT id

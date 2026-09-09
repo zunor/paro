@@ -50,6 +50,39 @@ def plan_metrics(root: dict[str, Any]) -> dict[str, int]:
             "materialized_cte_nodes": counts.get("MATERIALIZED_CTE", 0)}
 
 
+def plan_occurrences(root: dict[str, Any], selected: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Capture structural plan occurrences without using runtime coordinates."""
+    occurrences: list[dict[str, Any]] = []
+
+    def visit(node: dict[str, Any], path: tuple[int, ...]) -> None:
+        properties = node.get("properties", {})
+        if not isinstance(properties, dict):
+            raise ValueError("EXPLAIN properties must be an object")
+        occurrence = {
+            "path": list(path),
+            "physical_node_id": node.get("node_id"),
+            "logical_node_id": node.get("logical_node_id"),
+            "operator": node.get("operator"),
+            "relation": node.get("relation"),
+            "estimated_rows": node.get("estimated_rows"),
+            "column_ids": properties.get("Column IDs", []),
+            "selected": node is selected,
+        }
+        if not isinstance(occurrence["column_ids"], list):
+            raise ValueError("EXPLAIN Column IDs must be an array")
+        occurrences.append(occurrence)
+        children = node.get("children", [])
+        if not isinstance(children, list):
+            raise ValueError("EXPLAIN children must be an array")
+        for index, child in enumerate(children):
+            if not isinstance(child, dict):
+                raise ValueError("EXPLAIN child must be an object")
+            visit(child, (*path, index))
+
+    visit(root, ())
+    return occurrences
+
+
 def validate_selector(selector: dict[str, Any]) -> None:
     if not isinstance(selector, dict):
         raise ValueError("semantic boundary selector must be an object")
@@ -102,6 +135,10 @@ def capture(connection: Any, case: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("unsupported EXPLAIN format")
     root = document["plan"]
     selected = select_boundary(root, case.get("selector"))
+    occurrences = plan_occurrences(root, selected)
+    selected_occurrences = [item for item in occurrences if item["selected"]]
+    if len(selected_occurrences) != 1:
+        raise ValueError("selected semantic boundary has no unique plan occurrence")
     result_rows = len(connection.execute(query, prepare=False).fetchall())
     expected_result = case.get("expected_result_rows", case["expected_rows"])
     if result_rows != expected_result:
@@ -112,10 +149,22 @@ def capture(connection: Any, case: dict[str, Any]) -> dict[str, Any]:
     actual = len(connection.execute(oracle, prepare=False).fetchall()) if oracle else result_rows
     if actual != case["expected_rows"]:
         raise ValueError(f"{case['query']}: expected {case['expected_rows']} rows, got {actual}")
+    selected_occurrence = selected_occurrences[0]
     return {"query": case["query"], "sql_sha256": digest(query), "status": "ok",
             "operator": selected["operator"], "estimated_rows": selected["estimated_rows"],
             "actual_rows": actual, "result_rows": result_rows, "boundary_node_id": selected["node_id"],
-            "plan": document, "plan_metrics": plan_metrics(root)}
+            "boundary_logical_node_id": selected.get("logical_node_id"),
+            "plan": document, "plan_metrics": plan_metrics(root),
+            "plan_occurrences": occurrences,
+            "statistics_evidence": {
+                "schema_version": 1,
+                "source": "independent_semantic_boundary_oracle",
+                "coordinate_system": "physical_plan_occurrence_with_logical_node_id",
+                "physical_node_id": selected_occurrence["physical_node_id"],
+                "logical_node_id": selected_occurrence["logical_node_id"],
+                "estimated_rows": selected["estimated_rows"],
+                "actual_rows": actual,
+            }}
 
 
 def main() -> int:

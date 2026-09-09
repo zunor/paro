@@ -96,6 +96,21 @@ def validate(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise ValueError(f"{query}: full result cardinality oracle failed")
         if not item.get("operator") or not item.get("plan"):
             raise ValueError(f"{query}: missing captured plan")
+        occurrences = item.get("plan_occurrences")
+        if occurrences is not None:
+            if not isinstance(occurrences, list) or not occurrences:
+                raise ValueError(f"{query}: missing plan occurrence evidence")
+            selected = [occurrence for occurrence in occurrences if occurrence.get("selected")]
+            if len(selected) != 1:
+                raise ValueError(f"{query}: semantic boundary occurrence is not unique")
+            statistics_evidence = item.get("statistics_evidence")
+            if not isinstance(statistics_evidence, dict) or statistics_evidence.get("schema_version") != 1:
+                raise ValueError(f"{query}: missing statistics evidence")
+            if (statistics_evidence.get("physical_node_id") != selected[0].get("physical_node_id")
+                    or statistics_evidence.get("logical_node_id") != selected[0].get("logical_node_id")
+                    or cardinality(statistics_evidence.get("estimated_rows")) != cardinality(item["estimated_rows"])
+                    or cardinality(statistics_evidence.get("actual_rows")) != cardinality(item["actual_rows"])):
+                raise ValueError(f"{query}: statistics evidence does not match selected plan occurrence")
         for metric in case.get("nonincreasing_metrics", []):
             cardinality(item.get("plan_metrics", {}).get(metric))
         result[query] = item

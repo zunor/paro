@@ -150,6 +150,7 @@ async fn execute_prepare<S: ProtocolResultSink>(
         generic_plan,
         generic_plan_uses: 0,
         source: PreparedStatementSource::Sql,
+        statement_trace: None,
     };
 
     session.state.add_prepared_statement(entry);
@@ -358,6 +359,7 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
         completion: None,
         created_generation: 0,
         transaction_owned: session.has_active_transaction(),
+        statement_trace: None,
     };
     session.state.add_portal(portal);
 

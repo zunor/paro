@@ -34,6 +34,7 @@ async fn test_reset_session_state_preserves_active_statement_scope() {
             generic_plan: None,
             generic_plan_uses: 0,
             source: PreparedStatementSource::Sql,
+            statement_trace: None,
         });
     session.state.enable_profiler();
     session

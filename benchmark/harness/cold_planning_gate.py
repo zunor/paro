@@ -13,11 +13,84 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-VERSION = 3
+VERSION = 5
+TRACE_SCHEMA_VERSION = 2
 COUNTERS = ("search_complete", "memo_group_count", "memo_logical_expression_count",
             "memo_physical_expression_count", "settlement_local_hit_count", "settlement_local_miss_count",
             "search_rule_failure_count", "search_deadline_reached")
 METRICS = ("explain_wall_ms", "optimizer_ms", "peak_rss_bytes")
+
+
+def validate_trace(
+    trace: dict[str, Any],
+    *,
+    process_id: int,
+    sample_id: str,
+    fingerprint: int | None = None,
+    require_cold: bool,
+) -> None:
+    if trace.get("schema_version") != TRACE_SCHEMA_VERSION:
+        raise ValueError("unsupported statement trace schema")
+    if trace.get("process_id") != process_id:
+        raise ValueError("statement trace belongs to another process")
+    if trace.get("trace_sample_id") != sample_id:
+        raise ValueError("statement trace belongs to another sample")
+    if trace.get("operation_id") != trace.get("statement_id"):
+        raise ValueError("operation identity does not match statement identity")
+    if fingerprint is not None and trace.get("query_fingerprint") != fingerprint:
+        raise ValueError("statement trace query identity differs from sample")
+    events = trace.get("events")
+    if not isinstance(events, list) or not events:
+        raise ValueError("statement trace has no events")
+    sequences = [event.get("sequence") for event in events]
+    if sequences != list(range(len(events))):
+        raise ValueError("statement trace sequence is not unique and contiguous")
+    elapsed: list[int] = []
+    positions: dict[str, list[int]] = {}
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or not isinstance(event.get("phase"), str) \
+                or not event["phase"] or not isinstance(event.get("event"), str) \
+                or not event["event"]:
+            raise ValueError("statement trace has an invalid event record")
+        event_elapsed = event.get("elapsed_us")
+        if (isinstance(event_elapsed, bool) or not isinstance(event_elapsed, int)
+                or event_elapsed < 0):
+            raise ValueError("statement trace elapsed time is invalid")
+        elapsed.append(event_elapsed)
+        for field in ("duration_us", "value"):
+            field_value = event.get(field)
+            if (field_value is not None
+                    and (isinstance(field_value, bool)
+                         or not isinstance(field_value, int)
+                         or field_value < 0)):
+                raise ValueError(f"statement trace {field} is invalid")
+        positions.setdefault(event["event"], []).append(index)
+    if elapsed != sorted(elapsed):
+        raise ValueError("statement trace elapsed time is not monotonic")
+    terminals = [name for name in ("statement_complete", "statement_error", "statement_aborted")
+                 if name in positions]
+    if len(terminals) != 1 or positions[terminals[0]][0] != len(events) - 1:
+        raise ValueError("statement trace has no unique final lifecycle state")
+    if require_cold:
+        for required in (
+            "parse_entry", "compiler_call_entry", "compiler_call_return",
+            "statement_scope_begin", "statement_scope_return",
+        ):
+            if len(positions.get(required, [])) != 1:
+                raise ValueError(f"statement trace requires exactly one {required}")
+        if terminals != ["statement_complete"]:
+            raise ValueError("cold statement trace did not complete successfully")
+        if len(positions.get("plan_cache_miss", [])) != 1:
+            raise ValueError("cold statement trace does not prove one cache miss")
+        if any(positions.get(name) for name in ("plan_cache_hit", "instance_plan_cache_hit")):
+            raise ValueError("cold statement trace contains a cache hit")
+        order = {name: values[0] for name, values in positions.items() if len(values) == 1}
+        if not (order["parse_entry"] < order["compiler_call_entry"]
+                < order["compiler_call_return"]):
+            raise ValueError("parse/compiler trace order is invalid")
+        if not (order["statement_scope_begin"] < order["statement_scope_return"]
+                < order[terminals[0]]):
+            raise ValueError("statement lifecycle order is invalid")
 
 
 def positive(value: Any) -> float:
@@ -34,8 +107,13 @@ def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     if report.get("invalidated"):
         raise ValueError("measurement provenance was invalidated")
     evidence = report["evidence"]
-    if set(report["configuration"]["runtime_environment"]) != {"RUST_LOG"}:
-        raise ValueError("missing runtime logging configuration")
+    runtime_environment = report["configuration"]["runtime_environment"]
+    if set(runtime_environment) != {"RUST_LOG", "PARO_STATEMENT_TRACE"} \
+            or runtime_environment.get("PARO_STATEMENT_TRACE") != "1":
+        raise ValueError("diagnostic trace configuration is not explicit")
+    if (report["configuration"].get("cohort") != "diagnostic"
+            or report["configuration"].get("trace_mode") != "on"):
+        raise ValueError("cold planning gate requires the diagnostic cohort")
     for value in (evidence["build"]["binary_sha256"], evidence["build"]["source"]["commit"],
                   evidence["build"]["source"]["working_tree_sha256"], evidence["harness_sha256"],
                   evidence["dataset_sha256"]):
@@ -86,6 +164,45 @@ def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 raise ValueError("advisory rule failure in a performance sample")
             if sample["counters"]["search_deadline_reached"]:
                 raise ValueError("deadline-limited search is not qualifying latency evidence")
+            if sample.get("phase_trace_schema_version") != TRACE_SCHEMA_VERSION \
+                    or not sample.get("statement_traces"):
+                raise ValueError("missing per-statement phase trace evidence")
+            traces = sample["statement_traces"]
+            if not isinstance(traces, list) or not traces:
+                raise ValueError("malformed per-statement phase trace evidence")
+            server = sample["server"]
+            sample_id = server.get("statement_trace_sample_id")
+            if server.get("statement_trace") is not True or not isinstance(sample_id, str) \
+                    or not sample_id:
+                raise ValueError("diagnostic trace configuration is not attested")
+            expected_process_id = server["pid"]
+            for item in traces:
+                validate_trace(
+                    item,
+                    process_id=expected_process_id,
+                    sample_id=sample_id,
+                    require_cold=False,
+                )
+            target_traces = sample.get("target_statement_traces")
+            if not isinstance(target_traces, list) or len(target_traces) != 1:
+                raise ValueError("phase trace is not uniquely correlated with the measured target")
+            all_keys = {
+                (item.get("process_id"), item.get("session_id"), item.get("statement_id"))
+                for item in traces
+            }
+            target_keys = {
+                (item.get("process_id"), item.get("session_id"), item.get("statement_id"))
+                for item in target_traces
+            }
+            if len(target_keys) != 1 or not target_keys.issubset(all_keys):
+                raise ValueError("target trace is not an operation from this sample")
+            validate_trace(
+                target_traces[0],
+                process_id=expected_process_id,
+                sample_id=sample_id,
+                fingerprint=sample.get("trace_query_fingerprint"),
+                require_cold=True,
+            )
         result[query["name"]] = samples
     return result
 

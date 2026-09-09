@@ -32,6 +32,7 @@ PROJECTION  (rows=32)
   Output: part, id, score, rn
   ->  WINDOW  (rows=32)
     ->  ROWSET_SCAN on public.window_spill_test  (rows=32)
+      Column IDs: 0, 1, 2
       Columns: part, id, score
 
 SET force_external = DEFAULT;
@@ -53,6 +54,7 @@ PROJECTION  (rows=8)
   Output: part, id, score, rn, rk, lead_score, lag_score
   ->  WINDOW  (rows=8)
     ->  ROWSET_SCAN on public.window_spill_test  (rows=8)
+      Column IDs: 0, 1, 2
       Columns: part, id, score
       Pushed Predicate: part IN (1, 2)
       Late Materialize: auto
@@ -105,6 +107,7 @@ PROJECTION  (rows=69)
   Output: part, id, rn
   ->  WINDOW  (rows=69)
     ->  ROWSET_SCAN on public.window_large_partition_test  (rows=69)
+      Column IDs: 0, 1
       Columns: part, id
 
 SET force_external = true;

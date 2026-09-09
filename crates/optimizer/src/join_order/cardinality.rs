@@ -10,6 +10,7 @@ use std::sync::Arc;
 use paro_common::logging::targets;
 use paro_planner::expression::{ConjunctionType, Expression};
 use paro_planner::operator::{ColumnBinding, JoinType};
+use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
 use tracing::trace;
 
 use crate::cost_model::SelectivityDefaults;
@@ -153,7 +154,7 @@ pub struct CardinalityHelper {
 struct BindingCardinalityStats {
     distinct_count: usize,
     relation_cardinality: usize,
-    has_expected_distinct: bool,
+    evidence: DistinctEvidence,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -307,6 +308,35 @@ impl DistinctDomainEstimate {
         }
     }
 
+    /// Convert provenance into a domain contract. Only a complete storage
+    /// observation may become an HLL-like equality denominator. Partial
+    /// sketches use their covered row envelope. Derived points remain useful
+    /// for cost ranking, but stay on the non-HLL path because they are not a
+    /// proof of a complete storage domain.
+    fn from_evidence(evidence: DistinctEvidence, relation_cardinality: usize) -> Self {
+        let evidence = evidence.normalized();
+        let row_bound = relation_cardinality.max(1);
+        match evidence.provenance {
+            DistinctProvenance::ObservedFull => {
+                Self::observed((evidence.point as usize).min(row_bound))
+            }
+            DistinctProvenance::ObservedPartial { total_rows, .. } => {
+                let upper = evidence.upper.unwrap_or(total_rows).min(row_bound as u64) as usize;
+                Self::upper_bound(upper)
+            }
+            DistinctProvenance::Derived => {
+                let point = evidence.point.min(row_bound as u64) as usize;
+                Self::upper_bound(point.max(1))
+            }
+            DistinctProvenance::Unknown => Self::upper_bound(
+                evidence
+                    .upper
+                    .unwrap_or(row_bound as u64)
+                    .min(row_bound as u64) as usize,
+            ),
+        }
+    }
+
     fn value(self) -> usize {
         if self.has_hll {
             self.hll_max.max(1)
@@ -425,7 +455,7 @@ impl CardinalityEstimator {
                     BindingCardinalityStats {
                         distinct_count: count.distinct_count,
                         relation_cardinality: stats.cardinality,
-                        has_expected_distinct: count.has_expected_distinct,
+                        evidence: count.evidence,
                     },
                 )
             }));
@@ -513,19 +543,35 @@ impl CardinalityEstimator {
                     continue;
                 }
 
-                if distinct_count.has_expected_distinct && relation_to_tdom.has_distinct_count_hll {
-                    relation_to_tdom.distinct_count_hll = relation_to_tdom
-                        .distinct_count_hll
-                        .max(distinct_count.distinct_count);
-                } else if distinct_count.has_expected_distinct
-                    && !relation_to_tdom.has_distinct_count_hll
-                {
-                    relation_to_tdom.has_distinct_count_hll = true;
-                    relation_to_tdom.distinct_count_hll = distinct_count.distinct_count;
-                } else {
-                    relation_to_tdom.distinct_count_no_hll = relation_to_tdom
-                        .distinct_count_no_hll
-                        .min(distinct_count.distinct_count);
+                match distinct_count.evidence.provenance {
+                    DistinctProvenance::ObservedFull => {
+                        if relation_to_tdom.has_distinct_count_hll {
+                            relation_to_tdom.distinct_count_hll = relation_to_tdom
+                                .distinct_count_hll
+                                .max(distinct_count.distinct_count);
+                        } else {
+                            relation_to_tdom.has_distinct_count_hll = true;
+                            relation_to_tdom.distinct_count_hll = distinct_count.distinct_count;
+                        }
+                    }
+                    DistinctProvenance::ObservedPartial { total_rows, .. } => {
+                        let upper = distinct_count
+                            .evidence
+                            .upper
+                            .unwrap_or(total_rows)
+                            .min(stats.cardinality.max(1) as u64)
+                            as usize;
+                        relation_to_tdom.distinct_count_no_hll =
+                            relation_to_tdom.distinct_count_no_hll.min(upper.max(1));
+                    }
+                    DistinctProvenance::Derived => {
+                        if let Some(upper) = distinct_count.evidence.upper {
+                            let upper = upper.min(stats.cardinality.max(1) as u64) as usize;
+                            relation_to_tdom.distinct_count_no_hll =
+                                relation_to_tdom.distinct_count_no_hll.min(upper.max(1));
+                        }
+                    }
+                    DistinctProvenance::Unknown => {}
                 }
                 break;
             }
@@ -765,11 +811,10 @@ impl CardinalityEstimator {
                     continue;
                 }
                 let distinct = binding_stats.get(&vertex.binding).map(|binding| {
-                    if binding.has_expected_distinct {
-                        DistinctDomainEstimate::observed(binding.distinct_count)
-                    } else {
-                        DistinctDomainEstimate::upper_bound(binding.distinct_count)
-                    }
+                    DistinctDomainEstimate::from_evidence(
+                        binding.evidence,
+                        binding.relation_cardinality,
+                    )
                 });
                 let distinct = distinct.unwrap_or(fallback_distinct);
                 equality_scratch.vertex_domains[index] = Some(distinct);
@@ -1093,12 +1138,13 @@ impl CardinalityEstimator {
                         // an upper bound: it may tighten the configured prior,
                         // but must not inflate that prior as if the derived
                         // relation had been observed after its filters.
-                        let matched_fraction =
-                            if preserved.has_expected_distinct && filtering.has_expected_distinct {
-                                domain_fraction
-                            } else {
-                                domain_fraction.min(self.selectivity_defaults.semi_anti_match)
-                            };
+                        let matched_fraction = if preserved.evidence.is_complete_observation()
+                            && filtering.evidence.is_complete_observation()
+                        {
+                            domain_fraction
+                        } else {
+                            domain_fraction.min(self.selectivity_defaults.semi_anti_match)
+                        };
                         (
                             matched_fraction,
                             1.0 / preserved.relation_cardinality.max(1) as f64,
@@ -2217,6 +2263,48 @@ mod tests {
         assert_eq!(filter_with_domains.distinct_count_hll, 100);
         assert!(filter_with_domains.has_distinct_count_hll);
         assert_eq!(filter_with_domains.get_distinct_count(), 100);
+    }
+
+    #[test]
+    fn partial_sketch_is_an_upper_bound_not_a_complete_equality_domain() {
+        let estimate = DistinctDomainEstimate::from_evidence(
+            DistinctEvidence {
+                lower: 8,
+                upper: None,
+                point: 8,
+                provenance: DistinctProvenance::ObservedPartial {
+                    observed_rows: 8,
+                    total_rows: 800,
+                },
+            },
+            800,
+        );
+
+        assert!(!estimate.has_hll);
+        assert_eq!(estimate.value(), 800);
+    }
+
+    #[test]
+    fn unknown_distinct_evidence_does_not_shrink_the_total_domain() {
+        let estimate = DistinctDomainEstimate::from_evidence(DistinctEvidence::default(), 321);
+
+        assert!(!estimate.has_hll);
+        assert_eq!(estimate.value(), 321);
+    }
+
+    #[test]
+    fn derived_point_without_a_proof_stays_out_of_the_observed_domain_path() {
+        let estimate = DistinctDomainEstimate::from_evidence(
+            DistinctEvidence {
+                point: 7,
+                provenance: DistinctProvenance::Derived,
+                ..DistinctEvidence::default()
+            },
+            321,
+        );
+
+        assert!(!estimate.has_hll);
+        assert_eq!(estimate.value(), 7);
     }
 
     #[test]

@@ -969,6 +969,18 @@ fn optional_transformation_can_improve_mandatory_baseline() {
 }
 
 #[test]
+fn rule_work_profile_is_opt_in_for_diagnostic_cohorts() {
+    let (mut normal, group, goal) = engine(8);
+    normal.optimize(group, goal, SearchMode::Memo).unwrap();
+    assert!(normal.rule_work_profile().is_empty());
+
+    let (mut diagnostic, group, goal) = engine(8);
+    diagnostic.set_rule_work_profile_enabled(true);
+    diagnostic.optimize(group, goal, SearchMode::Memo).unwrap();
+    assert!(!diagnostic.rule_work_profile().is_empty());
+}
+
+#[test]
 fn zero_wall_budget_returns_a_verified_incumbent_without_charging_work() {
     let budget = super::super::budget::SearchBudget {
         optional_time_limit: Some(Duration::ZERO),

@@ -754,14 +754,17 @@ impl Connection {
 
         self.extended_query_pipeline_open = false;
         let session = self.session.as_mut().expect("session must be initialized");
-        if session.is_in_implicit_block() {
+        let implicit_commit = session.is_in_implicit_block();
+        let commit_result = if implicit_commit {
             if session.is_transaction_failed() {
-                session.rollback_implicit_transaction()?;
+                session.rollback_implicit_transaction()
             } else {
-                session.end_implicit_transaction_block()?;
+                session.end_implicit_transaction_block()
             }
-        }
-        Ok(())
+        } else {
+            Ok(())
+        };
+        Ok(session.finish_protocol_statement_traces(commit_result, implicit_commit)?)
     }
 
     async fn handle_extended_query_protocol_error(

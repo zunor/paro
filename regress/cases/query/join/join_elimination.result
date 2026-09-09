@@ -15,6 +15,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: l.id, l.payload
   ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+    Column IDs: 0, 1
     Columns: id, payload
 
 EXPLAIN
@@ -29,8 +30,10 @@ PROJECTION  (rows=3)
     Build Index: integer_build_time
     Join Condition: l.id = r.id
     ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+      Column IDs: 0
       Columns: id
     ->  ROWSET_SCAN on public.join_elim_right_unique r  (rows=2)
+      Column IDs: 0, 1
       Columns: id, note
 
 SELECT r.id, r.note
@@ -49,6 +52,7 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: r.id, r.note
   ->  ROWSET_SCAN on public.join_elim_right r  (rows=2)
+    Column IDs: 0, 1
     Columns: id, note
 
 SELECT l.id
@@ -73,8 +77,10 @@ PROJECTION  (rows=3)
     Build Index: integer_build_time
     Join Condition: l.id = r.id
     ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+      Column IDs: 0
       Columns: id
     ->  ROWSET_SCAN on public.join_elim_right_nonunique r  (rows=2)
+      Column IDs: 0
       Columns: id
 
 SET disabled_optimizer_rules = 'no_such_rule';
@@ -99,8 +105,10 @@ PROJECTION  (rows=3)
     Build Index: integer_build_time
     Join Condition: l.id = r.id
     ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+      Column IDs: 0, 1
       Columns: id, payload
     ->  ROWSET_SCAN on public.join_elim_right_unique r  (rows=2)
+      Column IDs: 0
       Columns: id
 
 RESET disabled_optimizer_rules;
@@ -114,6 +122,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: l.id, l.payload
   ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+    Column IDs: 0, 1
     Columns: id, payload
 
 SELECT name, kind, metric_unit, metric_value > 0 AS observed

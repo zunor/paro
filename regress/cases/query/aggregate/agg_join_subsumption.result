@@ -61,6 +61,7 @@ ORDER_BY  (rows=4)
         Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=1727d46a70d17a8ccb5de08dee4dfdc2
         Join Condition: p.order_key = order_key
         ->  ROWSET_SCAN on public.agg_sub_preserved p  (rows=6)
+          Column IDs: 0, 1
           Columns: order_key, label
         ->  PROJECTION  (rows=3)
           Output: order_key, partial_aggregate
@@ -69,6 +70,7 @@ ORDER_BY  (rows=4)
             Aggregates: sum(public.agg_sub_detail.quantity)
             Having: sum(public.agg_sub_detail.quantity) > 100.00
             ->  ROWSET_SCAN on public.agg_sub_detail  (rows=8)
+              Column IDs: 0, 1
               Columns: order_key, quantity
 
 SELECT

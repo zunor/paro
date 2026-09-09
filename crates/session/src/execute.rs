@@ -22,7 +22,10 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
 use paro_compiler::{compile_statement, compile_statement_with_parameter_types};
-use paro_context::{StatementCancellation, StatementInput, StatementOptions, StatementSource};
+use paro_context::{
+    statement_fingerprint, StatementCancellation, StatementInput, StatementOptions,
+    StatementSource, StatementTrace,
+};
 use paro_execution::query_executor::compiled::ExecutionRequest;
 use paro_execution::query_executor::executor::Executor;
 use paro_execution::query_executor::stream::FetchState;
@@ -62,20 +65,44 @@ impl Session {
     ) -> Result<()> {
         self.clear_protocol_unnamed_objects();
 
+        let parse_started = Instant::now();
+        let parse_trace = self.new_statement_trace(sql, 0, parse_started);
+        if let Some(trace) = &parse_trace {
+            trace.record_event("frontend", "parse_entry");
+        }
         let statements = match paro_parser::parse(sql) {
             Ok(stmts) => stmts,
             Err(e) => {
                 let err = paro_error::from_parser(e.to_string());
+                if let Some(trace) = parse_trace {
+                    trace.record_span("frontend", "parse_sql", parse_started);
+                    trace.record_event("frontend", "parse_error");
+                    trace.record_event("frontend", "parse_exit");
+                    self.publish_statement_trace(trace.snapshot());
+                }
                 sink.error(&err).await?;
                 return Err(err);
             }
         };
 
+        let parse_elapsed = parse_started.elapsed();
         if statements.is_empty() {
+            if let Some(trace) = parse_trace {
+                trace.record_duration("frontend", "parse_sql", parse_elapsed);
+                trace.record_value("frontend", "statements_parsed", 0);
+                trace.record_event("frontend", "parse_exit");
+                trace.record_event("frontend", "parse_empty");
+                self.publish_statement_trace(trace.snapshot());
+            }
             return Ok(());
         }
 
         let stmt_count = statements.len();
+        if stmt_count == 1 {
+            if let Some(trace) = &parse_trace {
+                trace.record_event("frontend", "parse_exit");
+            }
+        }
         let use_implicit = stmt_count > 1 && self.is_auto_commit();
         debug!(
             target: targets::SESSION,
@@ -95,8 +122,29 @@ impl Session {
         for (stmt_index, stmt_with_format) in statements.into_iter().enumerate() {
             let stmt = stmt_with_format.stmt;
             let statement_format = stmt_with_format.format;
+            let query_str = stmt.to_string();
+            let trace = if stmt_count == 1 {
+                parse_trace.clone()
+            } else {
+                self.new_statement_trace(&query_str, stmt_index, parse_started)
+            };
+            if let Some(trace) = &trace {
+                if stmt_count > 1 {
+                    // The parser has already returned the individual ASTs, so
+                    // this event is the per-statement attribution point.  The
+                    // full parse duration remains explicit below and is not
+                    // silently charged to compiler time.
+                    trace.record_event("frontend", "parse_entry");
+                }
+                trace.record_duration("frontend", "parse_sql", parse_elapsed);
+                trace.record_value("frontend", "statements_parsed", stmt_count as u64);
+                if stmt_count > 1 {
+                    trace.record_event("frontend", "parse_exit");
+                }
+                trace.record_event("frontend", "parse_complete");
+            }
             match self
-                .execute_statement(stmt, statement_format, stmt_index, sink)
+                .execute_statement(stmt, statement_format, stmt_index, trace, sink)
                 .await
             {
                 Ok(()) => {}
@@ -143,10 +191,17 @@ impl Session {
         stmt: Statement,
         statement_format: Option<String>,
         stmt_index: usize,
+        statement_trace: Option<Arc<StatementTrace>>,
         sink: &mut S,
     ) -> Result<()> {
         if self.is_transaction_failed() && !is_allowed_in_failed_transaction(&stmt) {
-            return Err(paro_error::transaction_aborted());
+            let error = paro_error::transaction_aborted();
+            if let Some(trace) = statement_trace {
+                trace.record_event("lifecycle", "statement_scope_rejected");
+                trace.record_event("lifecycle", "statement_error");
+                self.publish_statement_trace(trace.snapshot());
+            }
+            return Err(error);
         }
 
         let initial_completion = initial_statement_completion(&stmt);
@@ -170,7 +225,7 @@ impl Session {
         );
 
         let result = self
-            .run_in_statement_scope(&query_str, async move |session| {
+            .run_in_statement_scope_with_trace(&query_str, statement_trace, async move |session| {
                 session
                     .execute_frontend_route(route, statement_format, sink)
                     .await
@@ -368,6 +423,7 @@ impl Session {
             && matches!(stmt, Statement::Query(_))
             && require_new_transaction;
 
+        let snapshot_started = Instant::now();
         let ctx = self.freeze_statement_context_with_input(
             StatementOptions {
                 statement_format,
@@ -378,6 +434,9 @@ impl Session {
                 .expect("query pipeline requires an active statement scope"),
             input,
         );
+        if let Some(trace) = ctx.statement_trace() {
+            trace.record_span("frontend", "statement_snapshot", snapshot_started);
+        }
 
         debug!(
             target: targets::QUERY,
@@ -388,6 +447,23 @@ impl Session {
         let cached_plan = shared_plan_cache_eligible
             .then(|| self.reusable_instance_query_plan(&stmt, &[], ctx.as_ref()))
             .flatten();
+        if shared_plan_cache_eligible {
+            self.record_statement_cache_decision(
+                statement_fingerprint(&stmt.to_string()),
+                cached_plan.is_some(),
+            );
+        }
+        if let Some(trace) = ctx.statement_trace() {
+            trace.record_event(
+                "compile",
+                if cached_plan.is_some() {
+                    "plan_cache_hit"
+                } else {
+                    "plan_cache_miss"
+                },
+            );
+            trace.record_event("compile", "compiler_call_entry");
+        }
         let compile_result = if let Some(plan) = cached_plan.as_ref() {
             debug!(
                 target: targets::QUERY,
@@ -411,6 +487,9 @@ impl Session {
                 None => compile_statement(ctx.clone(), stmt.clone()),
             }
         };
+        if let Some(trace) = ctx.statement_trace() {
+            trace.record_event("compile", "compiler_call_return");
+        }
         let compiled = match compile_result {
             Ok(c) => c,
             Err(e) => {
@@ -435,6 +514,9 @@ impl Session {
                 ctx.as_ref(),
                 compiled.clone(),
             );
+            if let Some(trace) = ctx.statement_trace() {
+                trace.record_event("compile", "plan_cache_publish");
+            }
         }
         debug!(
             target: targets::QUERY,
@@ -444,8 +526,12 @@ impl Session {
             "Statement compilation completed"
         );
 
+        let trace = ctx.statement_trace();
         let executor = Executor::new(ctx);
         self.set_executor(executor);
+        if let Some(trace) = trace {
+            trace.record_event("execution", "executor_initialized");
+        }
         debug!(
             target: targets::EXECUTOR,
             session_id = self.id,
@@ -477,21 +563,76 @@ impl Session {
                 let mut rows = 0usize;
                 let emits_rows = compiled.is_query() && !matches!(stmt, Statement::Copy(_));
                 if emits_rows {
+                    let metadata_started = Instant::now();
                     sink.start_result(&result_names, &result_types).await?;
+                    if let Some(trace) = self
+                        .active_query()
+                        .and_then(|query| query.statement_trace())
+                    {
+                        trace.record_span("protocol", "result_metadata_sent", metadata_started);
+                    }
 
+                    let fetch_started = Instant::now();
+                    let mut first_page = false;
                     loop {
                         match stream.fetch_state()? {
                             FetchState::Ready(chunk) => {
-                                rows += chunk.len();
+                                let chunk_rows = chunk.len();
+                                rows += chunk_rows;
+                                if !first_page {
+                                    first_page = true;
+                                    if let Some(trace) = self
+                                        .active_query()
+                                        .and_then(|query| query.statement_trace())
+                                    {
+                                        trace.record_span(
+                                            "execution",
+                                            "first_page_ready",
+                                            fetch_started,
+                                        );
+                                    }
+                                }
                                 sink.push_chunk(chunk).await?;
+                                if let Some(trace) = self
+                                    .active_query()
+                                    .and_then(|query| query.statement_trace())
+                                {
+                                    trace.record_value(
+                                        "protocol",
+                                        "result_chunk_delivered",
+                                        chunk_rows as u64,
+                                    );
+                                }
                             }
                             FetchState::Pending => {
                                 stream.wait_for_progress().await?;
                             }
-                            FetchState::Exhausted => break,
+                            FetchState::Exhausted => {
+                                if !first_page {
+                                    if let Some(trace) = self
+                                        .active_query()
+                                        .and_then(|query| query.statement_trace())
+                                    {
+                                        trace.record_span(
+                                            "execution",
+                                            "first_page_empty",
+                                            fetch_started,
+                                        );
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
+                    if let Some(trace) = self
+                        .active_query()
+                        .and_then(|query| query.statement_trace())
+                    {
+                        trace.record_span("execution", "fetch_drain", fetch_started);
+                        trace.record_value("execution", "rows_returned", rows as u64);
+                    }
                 } else {
+                    let fetch_started = Instant::now();
                     loop {
                         match stream.fetch_state()? {
                             FetchState::Ready(chunk) => {
@@ -512,11 +653,25 @@ impl Session {
                             FetchState::Exhausted => break,
                         }
                     }
+                    if let Some(trace) = self
+                        .active_query()
+                        .and_then(|query| query.statement_trace())
+                    {
+                        trace.record_span("execution", "fetch_drain", fetch_started);
+                        trace.record_value("execution", "rows_returned", rows as u64);
+                    }
                 }
 
                 let completion =
                     completion_override.unwrap_or_else(|| infer_statement_completion(&stmt, rows));
+                let completion_started = Instant::now();
                 sink.finish_result(&completion).await?;
+                if let Some(trace) = self
+                    .active_query()
+                    .and_then(|query| query.statement_trace())
+                {
+                    trace.record_span("protocol", "command_complete_sent", completion_started);
+                }
 
                 debug!(
                     target: targets::EXECUTOR,
@@ -527,12 +682,25 @@ impl Session {
                 );
 
                 if require_new_transaction {
+                    let commit_started = Instant::now();
                     self.commit_auto_transaction()?;
+                    if let Some(trace) = self
+                        .active_query()
+                        .and_then(|query| query.statement_trace())
+                    {
+                        trace.record_span("transaction", "commit_published", commit_started);
+                    }
                 }
 
                 Ok(())
             }
             Err(e) => {
+                if let Some(trace) = self
+                    .active_query()
+                    .and_then(|query| query.statement_trace())
+                {
+                    trace.record_event("execution", "pipeline_error");
+                }
                 error!(
                     target: targets::EXECUTOR,
                     session_id = self.id,

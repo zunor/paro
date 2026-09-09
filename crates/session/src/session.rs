@@ -35,7 +35,8 @@ use paro_context::{
     CompileEnvironmentKey, CursorSummary, DatabaseSnapshotIdentity, EffectiveSettings,
     ExecutionResources, PreparedStatementSummary, QueryResources, RuntimeLimits,
     SessionMetadataRows, StatementCancelReason, StatementCancellation, StatementContext,
-    StatementEnvironment, StatementInput, StatementOptions, StatementSource, StatementView,
+    StatementEnvironment, StatementInput, StatementOptions, StatementSource, StatementTrace,
+    StatementTraceSnapshot, StatementView,
 };
 use paro_execution::operators::graph::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
@@ -53,6 +54,7 @@ use std::ops::AsyncFnOnce;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const STARTUP_SERVER_ENCODING: &str = "UTF8";
 const STARTUP_CLIENT_ENCODING: &str = "UTF8";
@@ -62,6 +64,8 @@ const STARTUP_INTEGER_DATETIMES: &str = "on";
 const STARTUP_STANDARD_CONFORMING_STRINGS: &str = "on";
 const STARTUP_IS_SUPERUSER: &str = "on";
 const MAX_COPY_STDIN_MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
+
+static NEXT_STATEMENT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Session-scoped state for a single client connection.
 pub struct Session {
@@ -95,6 +99,9 @@ pub struct Session {
     pub current_database: Arc<DatabaseHandle>,
     /// Per-query execution state owned by the currently running front-end statement.
     active_query: Option<ActiveQueryContext>,
+    /// Extended-protocol statements whose command completed but whose pipeline
+    /// still awaits Sync/ReadyForQuery (and, when applicable, implicit commit).
+    pending_protocol_traces: Vec<Arc<StatementTrace>>,
     /// Registered state manager for extensible session state
     registered_state: RegisteredStateManager,
     /// In-flight COPY FROM STDIN payload and queue-metadata memory waterline.
@@ -114,8 +121,25 @@ struct StatementScopeGuard<'a> {
 }
 
 impl<'a> StatementScopeGuard<'a> {
-    fn enter(session: &'a mut Session, query: &str) -> Result<Self> {
-        session.begin_statement_scope(query)?;
+    fn enter(
+        session: &'a mut Session,
+        query: &str,
+        statement_trace: Option<Arc<StatementTrace>>,
+    ) -> Result<Self> {
+        if let Err(error) = session.begin_statement_scope(query) {
+            if let Some(statement_trace) = statement_trace {
+                statement_trace.record_event("lifecycle", "statement_scope_rejected");
+                statement_trace.record_event("lifecycle", "statement_error");
+                session.publish_statement_trace(statement_trace.snapshot());
+            }
+            return Err(error);
+        }
+        if let Some(statement_trace) = statement_trace {
+            session
+                .active_query_mut()
+                .expect("statement scope must own an active query")
+                .set_statement_trace(statement_trace);
+        }
         let guard = Self {
             session,
             finished: false,
@@ -127,6 +151,13 @@ impl<'a> StatementScopeGuard<'a> {
             query,
             "statement scope started"
         );
+        if let Some(statement_trace) = guard
+            .session
+            .active_query()
+            .and_then(ActiveQueryContext::statement_trace)
+        {
+            statement_trace.record_event("lifecycle", "statement_scope_begin");
+        }
         Ok(guard)
     }
 
@@ -134,11 +165,11 @@ impl<'a> StatementScopeGuard<'a> {
         self.session
     }
 
-    fn finish(mut self, error: Option<&ParoError>) {
+    fn finish(mut self, error: Option<&ParoError>, publish_success: bool) {
         // Mark first so a panic in an extension callback cannot trigger a
         // second cleanup attempt while this guard unwinds.
         self.finished = true;
-        self.session.finish_statement_scope(error);
+        self.session.finish_statement_scope(error, publish_success);
     }
 }
 
@@ -251,6 +282,34 @@ impl Session {
         options: StatementOptions,
         cancellation: StatementCancellation,
         input: StatementInput,
+    ) -> Arc<StatementContext> {
+        self.freeze_statement_context_with_input_and_trace(options, cancellation, input, None)
+    }
+
+    /// Freeze a context for a protocol operation that started before an active
+    /// Execute scope existed (for example extended-protocol Parse). The trace
+    /// must travel with the immutable context so compiler events cannot be
+    /// mistaken for a later portal-only execution.
+    pub(crate) fn freeze_statement_context_with_trace(
+        &self,
+        options: StatementOptions,
+        cancellation: StatementCancellation,
+        statement_trace: Option<Arc<StatementTrace>>,
+    ) -> Arc<StatementContext> {
+        self.freeze_statement_context_with_input_and_trace(
+            options,
+            cancellation,
+            StatementInput::default(),
+            statement_trace,
+        )
+    }
+
+    fn freeze_statement_context_with_input_and_trace(
+        &self,
+        options: StatementOptions,
+        cancellation: StatementCancellation,
+        input: StatementInput,
+        statement_trace: Option<Arc<StatementTrace>>,
     ) -> Arc<StatementContext> {
         let settings = Arc::new(EffectiveSettings::new(self.effective_settings.clone()));
         let runtime_tuning = self.instance.runtime_tuning().snapshot();
@@ -530,6 +589,12 @@ impl Session {
             graph_registry: self.instance.graph_manager().clone(),
             session_metadata: self.session_metadata.clone(),
             diagnostics: self.diagnostics.clone(),
+            statement_trace: statement_trace.or_else(|| {
+                self.active_query
+                    .as_ref()
+                    .and_then(ActiveQueryContext::statement_trace)
+                    .cloned()
+            }),
         })
     }
 
@@ -643,6 +708,7 @@ impl Session {
             execution_control,
             current_database,
             active_query: None,
+            pending_protocol_traces: Vec::new(),
             registered_state: RegisteredStateManager::new(),
             copy_stdin_inflight_memory_limit: default_copy_stdin_inflight_memory_limit,
             session_memory_budget: Arc::new(SessionMemoryBudget::new(
@@ -930,10 +996,147 @@ impl Session {
     where
         F: AsyncFnOnce(&mut Session) -> Result<T>,
     {
-        let mut scope = StatementScopeGuard::enter(self, query)?;
+        let trace = self.new_statement_trace(query, 0, Instant::now());
+        self.run_in_statement_scope_with_trace(query, trace, operation)
+            .await
+    }
+
+    pub(crate) async fn run_in_statement_scope_with_trace<T, F>(
+        &mut self,
+        query: &str,
+        statement_trace: Option<Arc<StatementTrace>>,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: AsyncFnOnce(&mut Session) -> Result<T>,
+    {
+        let mut scope = StatementScopeGuard::enter(self, query, statement_trace)?;
         let result = operation(scope.session()).await;
-        scope.finish(result.as_ref().err());
+        scope.finish(result.as_ref().err(), true);
         result
+    }
+
+    /// Run a protocol operation whose successful scope return is not yet the
+    /// terminal statement event (for example a portal suspended after a page).
+    /// Errors still publish immediately; the caller publishes the terminal
+    /// snapshot once the final page/command-complete boundary is known.
+    pub(crate) async fn run_in_statement_scope_with_trace_and_publish<T, F>(
+        &mut self,
+        query: &str,
+        statement_trace: Option<Arc<StatementTrace>>,
+        publish_success: bool,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: AsyncFnOnce(&mut Session) -> Result<T>,
+    {
+        let mut scope = StatementScopeGuard::enter(self, query, statement_trace)?;
+        let result = operation(scope.session()).await;
+        scope.finish(result.as_ref().err(), publish_success);
+        result
+    }
+
+    pub(crate) fn new_statement_trace(
+        &self,
+        query: &str,
+        statement_index: usize,
+        started_at: Instant,
+    ) -> Option<Arc<StatementTrace>> {
+        StatementTrace::enabled().then(|| {
+            Arc::new(StatementTrace::new(
+                NEXT_STATEMENT_TRACE_ID.fetch_add(1, Ordering::Relaxed),
+                statement_index,
+                query,
+                started_at,
+            ))
+        })
+    }
+
+    pub(crate) fn publish_statement_trace(&self, trace: StatementTraceSnapshot) {
+        self.diagnostics.publish_statement_trace(trace.clone());
+        let trace_sample_id = std::env::var("PARO_STATEMENT_TRACE_SAMPLE").unwrap_or_default();
+        for event in trace.events {
+            tracing::info!(
+                target: targets::STATEMENT_TRACE,
+                process_id = std::process::id(),
+                session_id = self.id,
+                trace_sample_id = %trace_sample_id,
+                schema_version = trace.schema_version,
+                statement_id = trace.statement_id,
+                operation_id = trace.statement_id,
+                statement_index = trace.statement_index,
+                query_len = trace.query_len,
+                query_fingerprint = trace.query_fingerprint,
+                sequence = event.sequence,
+                phase = %event.phase,
+                event = %event.event,
+                elapsed_us = event.elapsed_us,
+                duration_us = event.duration_us.unwrap_or(0),
+                has_duration = event.duration_us.is_some(),
+                value = event.value.unwrap_or(0),
+                has_value = event.value.is_some(),
+                "statement trace event"
+            );
+        }
+    }
+
+    /// Record only the cache decision when the benchmark requests a
+    /// trace-off cold-miss side channel. The decision is read after the timed
+    /// statement and therefore does not serialize a per-event trace to the
+    /// normal C1 log.
+    pub(crate) fn record_statement_cache_decision(&self, query_fingerprint: u64, cache_hit: bool) {
+        let enabled = std::env::var("PARO_STATEMENT_CACHE_EVIDENCE")
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(false);
+        if enabled {
+            self.diagnostics
+                .publish_statement_cache_decision(query_fingerprint, cache_hit);
+        }
+    }
+
+    /// Hold an extended-protocol trace until Sync has completed the pipeline.
+    /// CommandComplete is not the client-visible completion boundary: the
+    /// connection may still commit its implicit transaction and send
+    /// ReadyForQuery.
+    pub(crate) fn defer_protocol_statement_trace(&mut self, trace: Arc<StatementTrace>) {
+        self.pending_protocol_traces.push(trace);
+    }
+
+    /// Close all extended-protocol traces at the pipeline boundary. The commit
+    /// result is deliberately passed in so a failed commit becomes an error
+    /// terminal state instead of publishing a false successful sample.
+    pub fn finish_protocol_statement_traces(
+        &mut self,
+        commit_result: Result<()>,
+        implicit_commit: bool,
+    ) -> Result<()> {
+        let traces = std::mem::take(&mut self.pending_protocol_traces);
+        match commit_result {
+            Ok(()) => {
+                for trace in traces {
+                    if implicit_commit {
+                        trace.record_event("transaction", "implicit_commit_published");
+                    }
+                    trace.record_event("protocol", "ready_for_query_queued");
+                    trace.record_event("lifecycle", "statement_complete");
+                    self.publish_statement_trace(trace.snapshot());
+                }
+                Ok(())
+            }
+            Err(error) => {
+                for trace in traces {
+                    trace.record_event("transaction", "implicit_commit_error");
+                    trace.record_event("lifecycle", "statement_error");
+                    self.publish_statement_trace(trace.snapshot());
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Creates the active statement state. Callers must use
@@ -958,12 +1161,22 @@ impl Session {
     }
 
     /// Finishes active statement state after `run_in_statement_scope`'s operation.
-    fn finish_statement_scope(&mut self, error: Option<&ParoError>) {
+    fn finish_statement_scope(&mut self, error: Option<&ParoError>, publish_success: bool) {
         let ctx = self
             .active_query
             .take()
             .expect("statement scope completion requires an active statement");
         let elapsed = ctx.elapsed();
+        if let Some(statement_trace) = ctx.statement_trace().cloned() {
+            statement_trace.record_event("lifecycle", "statement_scope_return");
+            if error.is_some() {
+                statement_trace.record_event("lifecycle", "statement_error");
+                self.publish_statement_trace(statement_trace.snapshot());
+            } else if publish_success {
+                statement_trace.record_event("lifecycle", "statement_complete");
+                self.publish_statement_trace(statement_trace.snapshot());
+            }
+        }
         self.execution_control.finish_statement(ctx.control());
         self.registered_state.notify_query_end(error);
         tracing::trace!(
@@ -982,6 +1195,10 @@ impl Session {
             return;
         };
         let elapsed = ctx.elapsed();
+        if let Some(statement_trace) = ctx.statement_trace().cloned() {
+            statement_trace.record_event("lifecycle", "statement_aborted");
+            self.publish_statement_trace(statement_trace.snapshot());
+        }
         self.execution_control.finish_statement(ctx.control());
 
         let error = paro_error::internal("statement scope ended before producing a result");

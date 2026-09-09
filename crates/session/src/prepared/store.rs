@@ -8,6 +8,7 @@ use crate::completion::StatementCompletion;
 use crate::dispatch::UtilityCommand;
 use crate::prepared::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
+use paro_context::StatementTrace;
 use paro_execution::query_executor::compiled::{
     CompiledStatement, ExecutionRequest, ResultColumnDesc,
 };
@@ -47,6 +48,8 @@ pub struct PreparedStatementEntry {
     /// Successful generic-plan selections by SQL EXECUTE or protocol Bind.
     pub generic_plan_uses: i64,
     pub source: PreparedStatementSource,
+    /// Trace started at protocol Parse and carried into the first Bind/portal.
+    pub statement_trace: Option<Arc<StatementTrace>>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +79,8 @@ pub struct PortalEntry {
     pub completion: Option<StatementCompletion>,
     pub created_generation: u64,
     pub transaction_owned: bool,
+    /// Trace for the protocol operation currently consuming this portal.
+    pub statement_trace: Option<Arc<StatementTrace>>,
 }
 
 #[derive(Debug, Default)]
@@ -306,6 +311,7 @@ mod tests {
             generic_plan: None,
             generic_plan_uses: 0,
             source: PreparedStatementSource::Protocol,
+            statement_trace: None,
         }
     }
 
@@ -332,6 +338,7 @@ mod tests {
             completion: None,
             created_generation: 0,
             transaction_owned,
+            statement_trace: None,
         }
     }
 

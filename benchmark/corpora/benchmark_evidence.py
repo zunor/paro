@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 import random
+import re
 import socket
 import statistics
 import subprocess
@@ -38,6 +39,198 @@ def tree_digest(root: Path, include: tuple[str, ...] | None = None) -> str:
         digest.update(b"\0")
         digest.update(bytes.fromhex(content_digest(path)))
     return digest.hexdigest()
+
+
+_STATEMENT_TRACE_FIELD = re.compile(
+    r"(?P<key>process_id|session_id|operation_id|trace_sample_id|schema_version|"
+    r"statement_id|statement_index|query_len|query_fingerprint|sequence|phase|event|"
+    r"elapsed_us|duration_us|has_duration|value|has_value)=(?P<value>\"[^\"]*\"|\S+)"
+)
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+STATEMENT_TRACE_SCHEMA_VERSION = 2
+
+
+def parse_statement_trace_log(path: Path) -> list[dict[str, Any]]:
+    """Decode trace events without repairing malformed ordering or identity."""
+    traces: dict[tuple[int, int, int], dict[str, Any]] = {}
+    if not path.is_file():
+        return []
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+    ):
+        # tracing_subscriber may retain ANSI styling when stdout/stderr is
+        # redirected to a harness log. Styling can wrap both field names and
+        # separators, so normalize before applying the machine-field parser.
+        line = _ANSI_ESCAPE.sub("", raw_line)
+        if "paro::statement_trace" not in line:
+            continue
+        if "statement trace event" not in line:
+            raise ValueError(f"line {line_number}: malformed statement trace record")
+        record = line.split("statement trace event", 1)[1]
+        matches = list(_STATEMENT_TRACE_FIELD.finditer(record))
+        fields = {
+            match.group("key"): match.group("value").strip('"') for match in matches
+        }
+        if len(fields) != len(matches):
+            raise ValueError(f"line {line_number}: duplicate statement trace field")
+        required = (
+            "process_id", "session_id", "operation_id", "trace_sample_id",
+            "schema_version", "statement_id", "statement_index", "query_len",
+            "query_fingerprint", "sequence", "phase", "event", "elapsed_us",
+            "duration_us", "has_duration", "value", "has_value",
+        )
+        missing = [key for key in required if key not in fields]
+        if missing:
+            raise ValueError(
+                f"line {line_number}: missing statement trace fields: {', '.join(missing)}"
+            )
+        try:
+            process_id = int(fields["process_id"])
+            session_id = int(fields["session_id"])
+            operation_id = int(fields["operation_id"])
+            schema_version = int(fields["schema_version"])
+            statement_id = int(fields["statement_id"])
+            statement_index = int(fields["statement_index"])
+            query_len = int(fields["query_len"])
+            query_fingerprint = int(fields["query_fingerprint"])
+            sequence = int(fields["sequence"])
+            elapsed_us = int(fields["elapsed_us"])
+            duration_us = (
+                int(fields["duration_us"]) if fields["has_duration"] == "true" else None
+            )
+            value = int(fields["value"]) if fields["has_value"] == "true" else None
+        except ValueError as error:
+            raise ValueError(f"line {line_number}: invalid statement trace integer") from error
+        if fields["has_duration"] not in ("true", "false"):
+            raise ValueError(f"line {line_number}: invalid has_duration flag")
+        if fields["has_value"] not in ("true", "false"):
+            raise ValueError(f"line {line_number}: invalid has_value flag")
+        if operation_id != statement_id:
+            raise ValueError(f"line {line_number}: operation and statement identities differ")
+        key = (process_id, session_id, statement_id)
+        trace = traces.setdefault(
+            key,
+            {
+                "process_id": process_id,
+                "session_id": session_id,
+                "operation_id": operation_id,
+                "trace_sample_id": fields["trace_sample_id"],
+                "schema_version": schema_version,
+                "statement_id": statement_id,
+                "statement_index": statement_index,
+                "query_len": query_len,
+                "query_fingerprint": query_fingerprint,
+                "events": [],
+            },
+        )
+        identity = {
+            "trace_sample_id": fields["trace_sample_id"],
+            "schema_version": schema_version,
+            "statement_index": statement_index,
+            "query_len": query_len,
+            "query_fingerprint": query_fingerprint,
+        }
+        if any(trace[field] != value for field, value in identity.items()):
+            raise ValueError(f"line {line_number}: statement trace identity changed")
+        trace["events"].append({
+            "sequence": sequence,
+            "phase": fields["phase"],
+            "event": fields["event"],
+            "elapsed_us": elapsed_us,
+            "duration_us": duration_us,
+            "value": value,
+        })
+    return sorted(
+        traces.values(),
+        key=lambda trace: (trace["process_id"], trace["session_id"], trace["statement_id"]),
+    )
+
+
+def statement_fingerprint(value: str) -> int:
+    """Match the deterministic FNV-1a fingerprint used by the Rust trace."""
+    result = 0xCBF29CE484222325
+    for byte in value.encode("utf-8"):
+        result ^= byte
+        result = (result * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return result
+
+
+def validate_statement_trace(
+    trace: dict[str, Any],
+    *,
+    expected_process_id: int | None = None,
+    expected_sample_id: str | None = None,
+    expected_query_fingerprint: int | None = None,
+    require_complete: bool = True,
+) -> None:
+    """Validate one protocol operation; never merge event names across traces."""
+    if trace.get("schema_version") != STATEMENT_TRACE_SCHEMA_VERSION:
+        raise ValueError("unsupported statement trace schema")
+    if trace.get("operation_id") != trace.get("statement_id"):
+        raise ValueError("operation identity does not match statement identity")
+    if expected_process_id is not None and trace.get("process_id") != expected_process_id:
+        raise ValueError("statement trace belongs to another process")
+    if expected_sample_id is not None and trace.get("trace_sample_id") != expected_sample_id:
+        raise ValueError("statement trace belongs to another sample")
+    if (expected_query_fingerprint is not None
+            and trace.get("query_fingerprint") != expected_query_fingerprint):
+        raise ValueError("statement trace query identity differs from sample")
+    events = trace.get("events")
+    if not isinstance(events, list) or not events:
+        raise ValueError("statement trace has no events")
+    sequences = [event.get("sequence") for event in events]
+    if sequences != list(range(len(events))):
+        raise ValueError("statement trace sequence is not unique and contiguous")
+    elapsed: list[int] = []
+    positions: dict[str, list[int]] = {}
+    for index, event in enumerate(events):
+        if not isinstance(event.get("phase"), str) or not event["phase"]:
+            raise ValueError("statement trace has an invalid phase")
+        if not isinstance(event.get("event"), str) or not event["event"]:
+            raise ValueError("statement trace has an invalid event")
+        event_elapsed = event.get("elapsed_us")
+        if (isinstance(event_elapsed, bool) or not isinstance(event_elapsed, int)
+                or event_elapsed < 0):
+            raise ValueError("statement trace elapsed time is not finite and non-negative")
+        elapsed.append(event_elapsed)
+        for field in ("duration_us", "value"):
+            field_value = event.get(field)
+            if (field_value is not None
+                    and (isinstance(field_value, bool)
+                         or not isinstance(field_value, int)
+                         or field_value < 0)):
+                raise ValueError(f"statement trace {field} is invalid")
+        positions.setdefault(event["event"], []).append(index)
+    if elapsed != sorted(elapsed):
+        raise ValueError("statement trace elapsed time is not monotonic")
+    terminal = [
+        name for name in ("statement_complete", "statement_error", "statement_aborted")
+        if name in positions
+    ]
+    if len(terminal) != 1:
+        raise ValueError("statement trace has no unique terminal state")
+    if require_complete and terminal != ["statement_complete"]:
+        raise ValueError("cold statement trace did not complete successfully")
+    if positions[terminal[0]][0] != len(events) - 1:
+        raise ValueError("statement trace terminal state is not last")
+    if require_complete:
+        for required in (
+            "parse_entry", "compiler_call_entry", "compiler_call_return",
+            "statement_scope_begin", "statement_scope_return",
+        ):
+            if len(positions.get(required, [])) != 1:
+                raise ValueError(f"statement trace requires exactly one {required}")
+        if len(positions.get("plan_cache_miss", [])) != 1:
+            raise ValueError("cold statement trace does not prove one cache miss")
+        if any(positions.get(name) for name in ("plan_cache_hit", "instance_plan_cache_hit")):
+            raise ValueError("cold statement trace contains a cache hit")
+        order = {name: values[0] for name, values in positions.items() if len(values) == 1}
+        if not (order["parse_entry"] < order["compiler_call_entry"]
+                < order["compiler_call_return"]):
+            raise ValueError("parse/compiler trace order is invalid")
+        if not (order["statement_scope_begin"] < order["statement_scope_return"]
+                < order[terminal[0]]):
+            raise ValueError("statement lifecycle order is invalid")
 
 
 def _validate_seed_files(root: Path) -> None:
@@ -99,14 +292,20 @@ class ImmutableDataSeed:
 @contextmanager
 def isolated_paro_server(binary: Path, seed: ImmutableDataSeed, listen: str,
                          log_path: Path, *, max_memory: str,
-                         threads: int) -> Iterator["ManagedParoServer"]:
+                         threads: int,
+                         statement_trace: bool = False,
+                         trace_sample_id: str | None = None,
+                         cache_evidence: bool = False) -> Iterator["ManagedParoServer"]:
     """Every oracle and measurement process starts from the same verified input."""
     if log_path.resolve().is_relative_to(seed.path):
         raise ValueError("benchmark logs must not write into the immutable seed")
     with seed.snapshot() as snapshot:
         with ManagedParoServer(binary, snapshot.path, listen, log_path,
                                max_memory=max_memory, threads=threads,
-                               input_snapshot=snapshot.identity()) as server:
+                               input_snapshot=snapshot.identity(),
+                               statement_trace=statement_trace,
+                               trace_sample_id=trace_sample_id,
+                               cache_evidence=cache_evidence) as server:
             yield server
 
 
@@ -287,6 +486,9 @@ class ManagedParoServer:
         max_memory: str,
         threads: int,
         input_snapshot: dict[str, str] | None = None,
+        statement_trace: bool = False,
+        trace_sample_id: str | None = None,
+        cache_evidence: bool = False,
     ) -> None:
         self.binary = binary.resolve()
         self.data_dir = data_dir.resolve()
@@ -295,9 +497,15 @@ class ManagedParoServer:
         self.max_memory = max_memory
         self.threads = max(1, threads)
         self.input_snapshot = input_snapshot
+        self.statement_trace = statement_trace
+        self.trace_sample_id = trace_sample_id
+        self.cache_evidence = cache_evidence
         self.process: subprocess.Popen[bytes] | None = None
         self._log = None
         self._started_ns: int | None = None
+        self._started_monotonic_ns: int | None = None
+        self._ready_ns: int | None = None
+        self._ready_monotonic_ns: int | None = None
 
     def start(self) -> None:
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
@@ -315,6 +523,25 @@ class ManagedParoServer:
             pass
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = self.log_path.open("wb")
+        environment = os.environ.copy()
+        if self.statement_trace:
+            environment["PARO_STATEMENT_TRACE"] = "1"
+            if self.trace_sample_id is not None:
+                environment["PARO_STATEMENT_TRACE_SAMPLE"] = self.trace_sample_id
+            else:
+                environment.pop("PARO_STATEMENT_TRACE_SAMPLE", None)
+        else:
+            # A benchmark process may inherit the diagnostic setting from its
+            # parent shell. False must be an effective child configuration,
+            # not merely a report label.
+            environment.pop("PARO_STATEMENT_TRACE", None)
+            environment.pop("PARO_STATEMENT_TRACE_SAMPLE", None)
+        if self.cache_evidence:
+            environment["PARO_STATEMENT_CACHE_EVIDENCE"] = "1"
+        else:
+            environment.pop("PARO_STATEMENT_CACHE_EVIDENCE", None)
+        self._started_ns = time.time_ns()
+        self._started_monotonic_ns = time.monotonic_ns()
         self.process = subprocess.Popen(
             [
                 str(self.binary),
@@ -327,13 +554,13 @@ class ManagedParoServer:
                 "--threads",
                 str(self.threads),
                 "--log-level",
-                "warn",
+                "info" if self.statement_trace else "warn",
             ],
             stdout=self._log,
             stderr=subprocess.STDOUT,
             cwd=self.binary.parent,
+            env=environment,
         )
-        self._started_ns = time.time_ns()
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -342,6 +569,8 @@ class ManagedParoServer:
                 )
             try:
                 with socket.create_connection((host, port), timeout=0.25):
+                    self._ready_ns = time.time_ns()
+                    self._ready_monotonic_ns = time.monotonic_ns()
                     return
             except OSError:
                 time.sleep(0.05)
@@ -370,9 +599,19 @@ class ManagedParoServer:
             "input_snapshot": self.input_snapshot,
             "listen": self.listen,
             "log": str(self.log_path),
+            "statement_trace": self.statement_trace,
+            "statement_trace_sample_id": self.trace_sample_id,
+            "statement_cache_evidence": self.cache_evidence,
             "owned_by_harness": True,
             "launch_argv": list(self.process.args),
             "started_unix_ns": self._started_ns,
+            "ready_unix_ns": self._ready_ns,
+            "startup_to_ready_ms": (
+                (self._ready_monotonic_ns - self._started_monotonic_ns) / 1_000_000
+                if (self._started_monotonic_ns is not None
+                    and self._ready_monotonic_ns is not None)
+                else None
+            ),
             "binary_stat": {
                 "device": self.binary.stat().st_dev,
                 "inode": self.binary.stat().st_ino,

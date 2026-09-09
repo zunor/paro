@@ -309,6 +309,7 @@ impl OptimizationInput {
             self.force_spill,
         )?;
         let mut engine = CascadesEngine::new(self.memo, registry);
+        engine.set_rule_work_profile_enabled(paro_context::StatementTrace::enabled());
         if let Some(session) = &self.planner_state.read().unwrap().session {
             engine
                 .memo_mut()
@@ -383,6 +384,7 @@ impl OptimizationInput {
         let rule_elapsed = engine.rule_elapsed().clone();
         let rule_allocated_bytes = engine.rule_allocated_bytes().clone();
         let rule_budget_exhaustions = engine.rule_budget_exhaustions().clone();
+        let rule_work_profile = engine.rule_work_profile().clone();
         let mut work_counters = engine.search_work_counters();
         {
             let state = self
@@ -429,6 +431,7 @@ impl OptimizationInput {
             rule_elapsed,
             rule_allocated_bytes,
             rule_budget_exhaustions,
+            rule_work_profile,
             search_summary,
         })
     }
@@ -448,6 +451,7 @@ pub struct OptimizationOutput {
     pub rule_elapsed: BTreeMap<RuleId, std::time::Duration>,
     pub rule_allocated_bytes: BTreeMap<RuleId, u64>,
     pub rule_budget_exhaustions: BTreeMap<RuleId, u64>,
+    pub rule_work_profile: BTreeMap<RuleId, super::engine::RuleWorkProfile>,
     pub search_summary: SearchSummary,
 }
 
@@ -815,13 +819,17 @@ impl MemoBuilder {
                         }
                         _ => None,
                     };
+                    // Scalar interning borrows the child layouts; do not copy
+                    // every `ColumnId` array while constructing each Memo
+                    // node in the initial post-order walk.
+                    let child_columns = child_states
+                        .iter()
+                        .map(|state| state.columns.as_ref())
+                        .collect::<Vec<_>>();
                     let scalar_roots = intern_operator_scalars(
                         &plan.operator,
                         &output_columns,
-                        &child_states
-                            .iter()
-                            .map(|state| state.columns.clone())
-                            .collect::<Vec<_>>(),
+                        &child_columns,
                         &mut binding_ids,
                         &mut columns,
                         &mut scalars,

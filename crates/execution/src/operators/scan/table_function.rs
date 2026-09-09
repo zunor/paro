@@ -1059,6 +1059,23 @@ fn populate_paro_optimizers(
                 invocation_count: entry.invocation_count,
             })
             .collect::<Vec<_>>();
+        let mut entries = entries;
+        entries.extend(
+            ctx.diagnostics
+                .statement_cache_snapshot()
+                .into_iter()
+                .map(|decision| OptimizerData {
+                    name: format!(
+                        "statement_plan_cache/{:016x}/{}",
+                        decision.query_fingerprint, decision.occurrence
+                    ),
+                    kind: "evidence".to_string(),
+                    last_elapsed_us: 0,
+                    metric_value: i64::from(decision.cache_hit),
+                    metric_unit: "count".to_string(),
+                    invocation_count: 1,
+                }),
+        );
         populate_optimizer_data(state, entries);
     }
 }

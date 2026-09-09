@@ -84,8 +84,10 @@ PROJECTION  (rows=2)
         Group Key: f.key_a
         Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
         ->  ROWSET_SCAN on public.agg_defer_fact f  (rows=12000)
+          Column IDs: 0, 2, 3
           Columns: key_a, amount, keep
       ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)
+        Column IDs: 0, 1
         Columns: key_a, payload
 
 SELECT

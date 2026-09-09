@@ -29,6 +29,7 @@ _OPTIONAL_SCHEDULER_RUNTIME_RE = re.compile(
 )
 _JSON_OPERATOR_TIMING_RE = re.compile(r'"(startup_time_ms|total_time_ms)"\s*:\s*[\d.]+')
 _JSON_OPERATOR_COUNTERS_RE = re.compile(r'"(rows|loops)"\s*:\s*\d+')
+_JSON_LOGICAL_NODE_ID_RE = re.compile(r'("logical_node_id"\s*:\s*)\d+')
 _PROFILE_LINE_RE = re.compile(
     r"PROFILE schema_version=(\d+) query_id=\d+ events=\d+ "
     r"parallelism=\d+ workers=\d+ worker_utilization=[\d.]+ "
@@ -195,6 +196,18 @@ def normalize_explain_search_ids(lines: list[str]) -> list[str]:
     return [_SEARCH_EXPLAIN_ID_RE.sub(_replace, line) for line in lines]
 
 
+def normalize_explain_logical_ids(lines: list[str]) -> list[str]:
+    """Normalize per-bind logical node ids while preserving node order."""
+    canonical_ids: dict[str, int] = {}
+
+    def _replace(match: re.Match[str]) -> str:
+        raw_id = match.group(0).rsplit(":", 1)[-1].strip()
+        canonical_id = canonical_ids.setdefault(raw_id, len(canonical_ids) + 1)
+        return f'{match.group(1)}{canonical_id}'
+
+    return [_JSON_LOGICAL_NODE_ID_RE.sub(_replace, line) for line in lines]
+
+
 def normalize_explain_cte_ids(lines: list[str]) -> list[str]:
     """Normalize allocated CTE ids while preserving identity relationships."""
     canonical_ids: dict[str, int] = {}
@@ -304,6 +317,7 @@ def normalize_python_runtime_retry_hint(lines: list[str]) -> list[str]:
 # stable: normalize repo-local regress fixture/report absolute paths.
 # stable: normalize volatile transaction/catalog ids in concurrency errors.
 # stable: normalize volatile search definition/generation/root ids in EXPLAIN output.
+# stable: normalize per-bind logical node ids while preserving plan order.
 # stable: normalize allocated CTE ids while preserving repeated-id equality.
 # transitional: legacy alias kept for gradual migration from explain_runtime.
 NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
@@ -314,6 +328,7 @@ NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_adaptive_runtime": normalize_explain_adaptive_runtime,
     "explain_routine_ids": normalize_explain_routine_ids,
     "explain_search_ids": normalize_explain_search_ids,
+    "explain_logical_ids": normalize_explain_logical_ids,
     "explain_schema_order": normalize_explain_schema_order,
     "explain_cte_ids": normalize_explain_cte_ids,
     "explain_external_runtime": normalize_explain_external_runtime,

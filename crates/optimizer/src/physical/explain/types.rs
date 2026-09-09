@@ -240,6 +240,10 @@ impl ExplainProperty {
 #[derive(Debug, Clone)]
 pub struct ExplainNode {
     pub node_id: Option<ExplainNodeId>,
+    /// Logical occurrence that produced this physical node.  This is an
+    /// explicit cross-layer identity; runtime pipeline/operator ids are a
+    /// different coordinate system and must not be inferred from it.
+    pub logical_node_id: Option<u64>,
     pub operator_name: String,
     pub relation_name: Option<String>,
     pub relation_alias: Option<String>,
@@ -294,6 +298,12 @@ impl ExplainNode {
         let mut object = Map::new();
         if let Some(node_id) = self.node_id {
             object.insert("node_id".to_string(), JsonValue::from(node_id));
+        }
+        if let Some(logical_node_id) = self.logical_node_id {
+            object.insert(
+                "logical_node_id".to_string(),
+                JsonValue::from(logical_node_id),
+            );
         }
         object.insert(
             "operator".to_string(),
