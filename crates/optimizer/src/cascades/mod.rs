@@ -31,6 +31,7 @@ pub mod region;
 pub mod rules;
 pub mod scalar;
 mod scalar_lowering;
+pub mod tasks;
 pub(crate) use scalar_lowering::BindingCatalog;
 pub mod verifier;
 
@@ -59,4 +60,10 @@ pub use rules::{
     CostComposition, ImplementationRegistry, PhysicalImplementation, TransformationRule,
 };
 pub use scalar::{ScalarArena, ScalarKind, ScalarNode, ScalarProperties};
+pub use tasks::{
+    BoundContext, BoundProof, BoundProofId, BoundProofKind, CompletionObligation,
+    CompletionObligationId, Cursor, CursorId, EvaluationId, EvaluationKey, InputRevisionId,
+    ReadSet, ReadSetId, ReservationId, StopReason, TaskId, TaskIntent, TaskIntentId, TaskObjectId,
+    TaskOutcome, TaskRegistry, TaskRequest, TaskState, TaskWakeup,
+};
 pub use verifier::{MemoVerifier, WinnerVerifier};

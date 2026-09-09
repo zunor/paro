@@ -36,6 +36,7 @@ use super::rules::{
     PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof,
     SourceWork, SourceWorkData, TaskSupplyContract, TransformContext,
 };
+use super::tasks::{Cursor, ReadSet, TaskIntent, TaskOutcome, TaskRegistry, TaskRequest};
 use crate::physical::{ResourceGrantClass, SpillPolicy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +240,10 @@ pub struct CascadesEngine {
     physical_subproblem_evaluations: u64,
     physical_implementation_requests: u64,
     physical_implementation_reuses: u64,
+    /// Shared task identity/progress protocol.  Memo remains the owner of
+    /// expressions, candidates and facts; this registry only coordinates
+    /// resumable work and publication state.
+    task_registry: TaskRegistry,
 }
 
 impl CascadesEngine {
@@ -279,6 +284,7 @@ impl CascadesEngine {
             physical_subproblem_evaluations: 0,
             physical_implementation_requests: 0,
             physical_implementation_reuses: 0,
+            task_registry: TaskRegistry::default(),
         }
     }
 
@@ -288,6 +294,10 @@ impl CascadesEngine {
 
     pub fn memo_mut(&mut self) -> &mut Memo {
         &mut self.memo
+    }
+
+    pub fn task_registry(&self) -> &TaskRegistry {
+        &self.task_registry
     }
 
     /// Enable the per-rule phase ledger only for an explicitly requested
@@ -347,6 +357,7 @@ impl CascadesEngine {
         self.infeasible_goals.clear();
         self.grant_sensitivity.clear();
         self.region_candidates.clear();
+        self.task_registry.invalidate_all()?;
         Ok(())
     }
 
@@ -1742,6 +1753,20 @@ impl CascadesEngine {
             return Ok(());
         }
         let group = self.memo.canonical_group(group);
+        let read_set = ReadSet::new([PatternRead::from_group(&self.memo, group)?]);
+        let task = match self
+            .task_registry
+            .request(TaskIntent::Optimize { group, goal }, read_set)?
+        {
+            TaskRequest::Leader(task) => task,
+            TaskRequest::Reused { .. } => return Ok(()),
+            TaskRequest::Subscriber { task, .. } => {
+                return Err(paro_error::internal(format!(
+                    "recursive optimization request is already in flight for task {task:?}"
+                )))
+            }
+        };
+        self.task_registry.start(task)?;
         self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
         if self
             .memo
@@ -1751,11 +1776,30 @@ impl CascadesEngine {
             || self.infeasible_goals.contains(&(group, goal))
         {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
+            let cursor = self.task_registry.advance_cursor(
+                task,
+                Cursor {
+                    position: self.memo.physical_expr_count() as u64,
+                    complete: true,
+                },
+            )?;
+            let outcome = if self
+                .memo
+                .group(group)
+                .and_then(|group| group.winner(goal))
+                .is_some()
+            {
+                TaskOutcome::Progress { cursor }
+            } else {
+                TaskOutcome::Infeasible
+            };
+            self.task_registry.complete(task, outcome)?;
             return Ok(());
         }
         self.physical_subproblem_evaluations =
             self.physical_subproblem_evaluations.saturating_add(1);
         if !self.active_goals.insert((group, goal)) {
+            let _ = self.task_registry.invalidate(task);
             return Err(paro_error::internal(
                 "ordinary Memo group formed a recursive optimization cycle; use RecursiveRegion",
             ));
@@ -1771,7 +1815,34 @@ impl CascadesEngine {
         {
             self.infeasible_goals.insert((group, goal));
         }
-        result
+        match result {
+            Ok(()) => {
+                let complete = self.memo.search_obligations().is_empty();
+                let cursor = self.task_registry.advance_cursor(
+                    task,
+                    Cursor {
+                        position: self.memo.physical_expr_count() as u64,
+                        complete,
+                    },
+                )?;
+                let outcome = if self
+                    .memo
+                    .group(group)
+                    .and_then(|group| group.winner(goal))
+                    .is_some()
+                {
+                    TaskOutcome::Progress { cursor }
+                } else {
+                    TaskOutcome::Infeasible
+                };
+                self.task_registry.complete(task, outcome)?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.task_registry.invalidate(task);
+                Err(error)
+            }
+        }
     }
 
     fn optimize_group_inner(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
