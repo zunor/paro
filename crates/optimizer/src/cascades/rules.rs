@@ -192,7 +192,7 @@ pub enum PatternEnumerationCompletion {
 /// One explicitly bound Memo operand. Expression nodes name the exact logical
 /// alternative consumed by a matcher; group nodes are preserved holes which
 /// a transformation deliberately does not inspect.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PatternOperand {
     Expression {
         group: GroupId,
@@ -211,13 +211,19 @@ impl PatternOperand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PatternBinding {
     pub root: PatternOperand,
     pub fingerprint: Fingerprint,
 }
 
 impl PatternBinding {
+    pub fn root_group(&self) -> GroupId {
+        match &self.root {
+            PatternOperand::Expression { group, .. } | PatternOperand::Group(group) => *group,
+        }
+    }
+
     pub fn root_expression(&self) -> LogicalExprId {
         self.root
             .expression()

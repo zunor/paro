@@ -20,7 +20,7 @@ use super::ids::{
     PhysicalExprId, RuleId,
 };
 use super::memo::{Memo, OptimizationGoal};
-use super::rules::PatternRead;
+use super::rules::{PatternBinding, PatternRead};
 
 macro_rules! task_id_type {
     ($name:ident) => {
@@ -78,7 +78,10 @@ pub enum TaskIntent {
     Transform {
         expression: LogicalExprId,
         rule: RuleId,
-        binding: Fingerprint,
+        /// Exact structural binding identity. The digest remains inside the
+        /// binding as a deterministic bucket, but is never the sole task
+        /// identity because colliding bindings must remain independent.
+        binding: PatternBinding,
     },
     Implement {
         expression: LogicalExprId,
@@ -167,6 +170,17 @@ impl ReadSet {
         self.reads
             .iter()
             .try_fold(true, |current, read| Ok(current && read.is_current(memo)?))
+    }
+
+    fn is_current_except(
+        &self,
+        memo: &Memo,
+        locally_written_groups: &BTreeSet<GroupId>,
+    ) -> Result<bool> {
+        self.reads.iter().try_fold(true, |current, read| {
+            Ok(current
+                && (locally_written_groups.contains(&read.group) || read.is_current(memo)?))
+        })
     }
 }
 
@@ -596,16 +610,17 @@ impl TaskRegistry {
                     .intent(task.intent)
                     .and_then(|intent| match intent {
                         TaskIntent::Optimize { group, .. } => Some(*group),
+                        TaskIntent::Transform { binding, .. } => Some(binding.root_group()),
                         _ => None,
                     })
                     .is_some_and(|group| {
-                        let group = self.canonical_group(group);
-                        group == from || group == to
+                        group == from || group == to || self.canonical_group(group) == to
                     });
                 let read_group = self.read_set(task.read_set).is_some_and(|reads| {
                     reads.reads().iter().any(|read| {
-                        let group = self.canonical_group(read.group);
-                        group == from || group == to
+                        read.group == from
+                            || read.group == to
+                            || self.canonical_group(read.group) == to
                     })
                 });
                 intent_group || read_group
@@ -863,7 +878,51 @@ impl TaskRegistry {
         dependencies: impl IntoIterator<Item = TaskId>,
         outcome: TaskOutcome,
     ) -> Result<Vec<TaskWakeup>> {
+        self.publish_current_with_local_mutation(
+            task,
+            memo,
+            std::iter::empty(),
+            dependencies,
+            outcome,
+        )
+    }
+
+    /// Publish after the task has committed a local Memo mutation. The
+    /// caller must name exactly the groups it wrote while owning this task;
+    /// reads of every other group are still revalidated. This preserves the
+    /// publication protocol for the common transformation shape where the
+    /// output is inserted into the same group whose frontier was read, while
+    /// retaining a fail-closed check for unrelated concurrent changes.
+    pub fn publish_current_after_local_mutation(
+        &mut self,
+        task: TaskId,
+        memo: &Memo,
+        locally_written_groups: impl IntoIterator<Item = GroupId>,
+        dependencies: impl IntoIterator<Item = TaskId>,
+        outcome: TaskOutcome,
+    ) -> Result<Vec<TaskWakeup>> {
+        self.publish_current_with_local_mutation(
+            task,
+            memo,
+            locally_written_groups,
+            dependencies,
+            outcome,
+        )
+    }
+
+    fn publish_current_with_local_mutation(
+        &mut self,
+        task: TaskId,
+        memo: &Memo,
+        locally_written_groups: impl IntoIterator<Item = GroupId>,
+        dependencies: impl IntoIterator<Item = TaskId>,
+        outcome: TaskOutcome,
+    ) -> Result<Vec<TaskWakeup>> {
         let dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        let locally_written_groups = locally_written_groups
+            .into_iter()
+            .map(|group| self.canonical_group(group))
+            .collect::<BTreeSet<_>>();
         let reads = self
             .task(task)
             .ok_or_else(|| paro_error::internal("unknown task publication"))?
@@ -871,7 +930,7 @@ impl TaskRegistry {
         let current = self
             .read_set(reads)
             .ok_or_else(|| paro_error::internal("task publication lost its read set"))?
-            .is_current(memo)?;
+            .is_current_except(memo, &locally_written_groups)?;
         let intent = self
             .task(task)
             .and_then(|record| self.intent(record.intent))
@@ -883,8 +942,20 @@ impl TaskRegistry {
         if !current || !canonical {
             self.rollback_segment(task)?;
             self.invalidate(task)?;
+            let stale = self.read_set(reads).and_then(|read_set| {
+                read_set
+                    .reads()
+                    .iter()
+                    .find(|read| {
+                        !locally_written_groups.contains(&read.group)
+                            && !read.is_current(memo).unwrap_or(false)
+                    })
+                    .copied()
+            });
             return Err(paro_error::internal(
-                "task publication rejected an obsolete read or group identity",
+                format!(
+                    "task publication rejected an obsolete read or group identity: task={task:?}, written={locally_written_groups:?}, stale_read={stale:?}, canonical={canonical}"
+                ),
             ));
         }
 
@@ -893,7 +964,7 @@ impl TaskRegistry {
         }
         let ready = self.register_awaiting_after_publish(task, dependencies.clone())?;
         if ready {
-            self.complete_current(task, memo, outcome)
+            self.complete(task, outcome)
         } else {
             let cursor = self
                 .task(task)
@@ -1218,6 +1289,7 @@ mod tests {
     use super::*;
     use crate::cascades::ids::PropertySetId;
     use crate::cascades::memo::{GrantGoalKey, RowGoal};
+    use crate::cascades::rules::PatternOperand;
     use crate::physical::ObjectiveProfile;
 
     fn goal() -> OptimizationGoal {
@@ -1524,6 +1596,56 @@ mod tests {
         assert_eq!(registry.canonical_group(GroupId::new(4)), GroupId::new(2));
         assert_eq!(registry.state(task), Some(TaskState::Invalidated));
         assert_eq!(registry.profile().invalidated, 1);
+    }
+
+    #[test]
+    fn group_redirect_invalidates_transform_intents_and_read_subscribers() {
+        let mut registry = TaskRegistry::default();
+        let transform = match registry
+            .request(
+                TaskIntent::Transform {
+                    expression: LogicalExprId::new(7),
+                    rule: RuleId::new(8),
+                    binding: PatternBinding {
+                        root: PatternOperand::Group(GroupId::new(4)),
+                        fingerprint: Fingerprint(9),
+                    },
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        let reader = match registry
+            .request(
+                TaskIntent::Discover {
+                    expression: LogicalExprId::new(10),
+                    rule: RuleId::new(11),
+                },
+                ReadSet::new([PatternRead {
+                    group: GroupId::new(4),
+                    logical_frontier_revision: None,
+                    logical_fact_fingerprint: Fingerprint(12),
+                    statistics_snapshot_fingerprint: Fingerprint(13),
+                }]),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        registry.start(transform).unwrap();
+        registry.start(reader).unwrap();
+
+        registry
+            .redirect_group(GroupId::new(4), GroupId::new(2))
+            .unwrap();
+
+        assert_eq!(registry.state(transform), Some(TaskState::Invalidated));
+        assert_eq!(registry.state(reader), Some(TaskState::Invalidated));
+        assert_eq!(registry.profile().invalidated, 2);
     }
 
     #[test]

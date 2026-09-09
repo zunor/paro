@@ -38,7 +38,9 @@ use super::rules::{
     PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof,
     SourceWork, SourceWorkData, TaskSupplyContract, TransformContext,
 };
-use super::tasks::{Cursor, ReadSet, TaskIntent, TaskOutcome, TaskRegistry, TaskRequest};
+use super::tasks::{
+    Cursor, ReadSet, StopReason, TaskId, TaskIntent, TaskOutcome, TaskRegistry, TaskRequest,
+};
 use crate::physical::{ResourceGrantClass, SpillPolicy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -885,6 +887,33 @@ impl CascadesEngine {
                         },
                     )?
                     .into_vec();
+                let transformation_task = match self.task_registry.request(
+                    TaskIntent::Transform {
+                        expression,
+                        rule,
+                        binding: binding.clone(),
+                    },
+                    // Discovery and application have different scopes. The
+                    // task identity must retain both: a narrower application
+                    // fact read cannot erase a frontier read that made this
+                    // exact binding eligible in the first place.
+                    ReadSet::new(
+                        binding_set
+                            .reads
+                            .iter()
+                            .copied()
+                            .chain(application_reads.iter().copied()),
+                    ),
+                )? {
+                    TaskRequest::Leader(task) => {
+                        self.task_registry.start(task)?;
+                        task
+                    }
+                    // The current engine is single-worker. An exact in-flight
+                    // binding must not be evaluated twice; a future worker
+                    // consumes the same registry wakeup instead.
+                    TaskRequest::Subscriber { .. } | TaskRequest::Reused { .. } => continue,
+                };
                 let dependency_version =
                     transformation_binding_fingerprint(read_version, binding.fingerprint);
                 // `applied_rules` remains an audit of whether this rule has ever
@@ -899,6 +928,7 @@ impl CascadesEngine {
                     .admit_optional(fire_dimension, event);
                 if admitted == BudgetDecision::Exhausted {
                     *self.rule_budget_exhaustions.entry(rule).or_default() += 1;
+                    self.complete_transformation_task(transformation_task)?;
                     continue;
                 }
                 // Reserve the complete bounded frontier before the rule may append
@@ -943,6 +973,7 @@ impl CascadesEngine {
                     *self.rule_budget_exhaustions.entry(rule).or_default() += 1;
                 }
                 if output_events.is_empty() {
+                    self.complete_transformation_task(transformation_task)?;
                     continue;
                 }
                 *self.rule_attempts.entry(rule).or_default() += 1;
@@ -973,6 +1004,7 @@ impl CascadesEngine {
                             &output_events,
                             output_dimension,
                         )?;
+                        self.fail_transformation_task(transformation_task, error.to_string())?;
                         return Err(error);
                     }
                 }
@@ -985,6 +1017,10 @@ impl CascadesEngine {
                             group,
                             &output_events,
                             output_dimension,
+                        )?;
+                        self.suspend_transformation_task(
+                            transformation_task,
+                            StopReason::Deadline,
                         )?;
                         stopped?;
                         break 'tasks;
@@ -1026,6 +1062,7 @@ impl CascadesEngine {
                         );
                         self.memo
                             .record_failed_rule(group, rule, event, error.to_string());
+                        self.complete_transformation_task(transformation_task)?;
                         continue;
                     }
                 };
@@ -1054,6 +1091,7 @@ impl CascadesEngine {
                         &output_events,
                         output_dimension,
                     )?;
+                    self.complete_transformation_task(transformation_task)?;
                     continue;
                 }
                 if outputs.len() > output_events.len() {
@@ -1086,6 +1124,7 @@ impl CascadesEngine {
                             "rule exceeded its binding output contract",
                         );
                     }
+                    self.complete_transformation_task(transformation_task)?;
                     continue;
                 }
                 if self.collect_rule_work_profile {
@@ -1194,6 +1233,7 @@ impl CascadesEngine {
                         );
                         self.memo
                             .record_failed_rule(group, rule, event, error.to_string());
+                        self.complete_transformation_task(transformation_task)?;
                         continue;
                     }
                 };
@@ -1213,9 +1253,18 @@ impl CascadesEngine {
                             .get(&rule)
                             .map_or(1, |profile| profile.ineffective.saturating_add(1));
                     }
+                    self.complete_transformation_task(transformation_task)?;
                 } else {
                     let newly_inserted_expressions = inserted_expressions.clone();
                     let appended_groups = context.commit()?;
+                    let changed_cte_readers = self.memo.take_changed_cte_readers();
+                    self.publish_transformation_task(
+                        transformation_task,
+                        std::iter::once(group)
+                            .chain(appended_groups.iter().copied())
+                            .chain(changed_cte_readers.iter().copied())
+                            .chain(fact_reads.iter().map(|read| read.group)),
+                    )?;
                     release_transformation_output_reservations(
                         &mut self.memo,
                         group,
@@ -1271,7 +1320,7 @@ impl CascadesEngine {
                         }
                     }
                     inserted_groups.extend(appended_groups.iter().copied());
-                    inserted_groups.extend(self.memo.take_changed_cte_readers());
+                    inserted_groups.extend(changed_cte_readers.iter().copied());
                     for (owner, inserted) in newly_inserted_expressions {
                         self.schedule_transformation_expression(owner, inserted, &mut agenda)?;
                     }
@@ -1295,6 +1344,54 @@ impl CascadesEngine {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn complete_transformation_task(&mut self, task: TaskId) -> Result<()> {
+        let reads = self
+            .task_registry
+            .task_read_set(task)
+            .ok_or_else(|| paro_error::internal("transformation task lost its read set"))?;
+        self.task_registry
+            .complete(task, TaskOutcome::NoChange { reads })?;
+        Ok(())
+    }
+
+    fn publish_transformation_task(
+        &mut self,
+        task: TaskId,
+        locally_written_groups: impl IntoIterator<Item = GroupId>,
+    ) -> Result<()> {
+        let cursor = self.task_registry.advance_cursor(
+            task,
+            Cursor {
+                position: 1,
+                complete: true,
+            },
+        )?;
+        self.task_registry.publish_current_after_local_mutation(
+            task,
+            &self.memo,
+            locally_written_groups,
+            std::iter::empty(),
+            TaskOutcome::Progress { cursor },
+        )?;
+        Ok(())
+    }
+
+    fn suspend_transformation_task(&mut self, task: TaskId, reason: StopReason) -> Result<()> {
+        let cursor = self
+            .task_registry
+            .task(task)
+            .map(|record| record.cursor)
+            .ok_or_else(|| paro_error::internal("transformation task lost its cursor"))?;
+        self.task_registry
+            .suspend(task, TaskOutcome::Suspended { cursor, reason })?;
+        Ok(())
+    }
+
+    fn fail_transformation_task(&mut self, task: TaskId, detail: impl Into<String>) -> Result<()> {
+        self.task_registry.fail(task, detail)?;
         Ok(())
     }
 
