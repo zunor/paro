@@ -1235,7 +1235,7 @@ fn shared_child_product_is_lazy_and_uses_immutable_candidate_references() {
         candidate: crate::cascades::ids::CandidateId::new(0),
     };
     let frontiers = vec![vec![candidate; 2]; 64];
-    let mut batch = child_winner_combinations(frontiers, 8);
+    let mut batch = child_winner_combinations(&frontiers, 8);
     assert!(matches!(
         batch.completion,
         EnumerationCompletion::BudgetLimited {

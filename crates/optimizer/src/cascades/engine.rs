@@ -2321,13 +2321,29 @@ impl CascadesEngine {
                     }),
             );
         }
+        // Reuse the query-local frontier and cost scratch across recipes. The
+        // vectors contain only immutable candidate handles; rebuilding their
+        // backing allocations for every physical recipe made the same parent
+        // pay an avoidable allocation cost before any candidate was compared.
+        let mut child_frontiers = Vec::<Vec<ChildWinnerRef>>::new();
+        let mut child_selections = Vec::<ChildWinnerRef>::new();
+        let mut child_costs = Vec::<SearchCost>::new();
+        let mut child_fingerprints = Vec::<Fingerprint>::new();
         for (physical, _recipe_fingerprint, recipe) in recipes {
             if !self.memo.control().checkpoint()? {
                 break;
             }
-            let mut child_frontiers = Vec::with_capacity(recipe.child_goals.len());
+            child_frontiers.resize_with(recipe.child_goals.len(), Vec::new);
+            for frontier in child_frontiers.iter_mut() {
+                frontier.clear();
+            }
             let mut children_feasible = true;
-            for (child, child_goal) in recipe.child_goals.iter().copied() {
+            for ((child, child_goal), frontier_out) in recipe
+                .child_goals
+                .iter()
+                .copied()
+                .zip(child_frontiers.iter_mut())
+            {
                 self.optimize_group(child, child_goal)?;
                 let Some(frontier) = self
                     .memo
@@ -2345,17 +2361,12 @@ impl CascadesEngine {
                     children_feasible = false;
                     break;
                 };
-                child_frontiers.push(
-                    frontier
-                        .candidates()
-                        .iter()
-                        .map(|winner| ChildWinnerRef {
-                            group: child,
-                            goal: child_goal,
-                            candidate: winner.candidate,
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                frontier_out.reserve(frontier.candidates().len());
+                frontier_out.extend(frontier.candidates().iter().map(|winner| ChildWinnerRef {
+                    group: child,
+                    goal: child_goal,
+                    candidate: winner.candidate,
+                }));
             }
             if !children_feasible {
                 continue;
@@ -2373,7 +2384,7 @@ impl CascadesEngine {
                     )
                     .saturating_add(1);
             let mut combinations =
-                child_winner_combinations(child_frontiers, admitted_combination_limit);
+                child_winner_combinations(&child_frontiers, admitted_combination_limit);
             let (completion, first_omitted_ordinal, omitted_at_least) =
                 match combinations.completion {
                     EnumerationCompletion::Complete => ("complete", None, 0),
@@ -2412,9 +2423,12 @@ impl CascadesEngine {
                 "enumerated bounded child frontier product"
             );
             let child_frontier_count = recipe.child_goals.len();
-            let mut child_selections = Vec::with_capacity(child_frontier_count);
-            let mut child_costs = Vec::with_capacity(child_frontier_count);
-            let mut child_fingerprints = Vec::with_capacity(child_frontier_count);
+            child_selections.clear();
+            child_selections.reserve(child_frontier_count);
+            child_costs.clear();
+            child_costs.reserve(child_frontier_count);
+            child_fingerprints.clear();
+            child_fingerprints.reserve(child_frontier_count);
             while let Some(ordinal) = combinations.combinations.next_into(&mut child_selections) {
                 if !self.memo.control().checkpoint()? {
                     break;
@@ -2970,8 +2984,8 @@ enum EnumerationCompletion {
 }
 
 #[derive(Debug)]
-struct ChildCombinationBatch {
-    combinations: ChildWinnerCombinations,
+struct ChildCombinationBatch<'a> {
+    combinations: ChildWinnerCombinations<'a>,
     completion: EnumerationCompletion,
 }
 
@@ -2979,13 +2993,13 @@ struct ChildCombinationBatch {
 /// trees/source-work histories. Storage is linear in the input frontier width
 /// even if their Cartesian product overflows usize.
 #[derive(Debug)]
-struct ChildWinnerCombinations {
-    frontiers: Vec<Vec<ChildWinnerRef>>,
+struct ChildWinnerCombinations<'a> {
+    frontiers: &'a [Vec<ChildWinnerRef>],
     next: usize,
     end: usize,
 }
 
-impl Iterator for ChildWinnerCombinations {
+impl Iterator for ChildWinnerCombinations<'_> {
     type Item = Vec<ChildWinnerRef>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -3000,7 +3014,7 @@ impl Iterator for ChildWinnerCombinations {
     }
 }
 
-impl ChildWinnerCombinations {
+impl ChildWinnerCombinations<'_> {
     /// Fill a caller-owned selection buffer so repeated products do not
     /// allocate one Vec per candidate combination.
     fn next_into(&mut self, result: &mut Vec<ChildWinnerRef>) -> Option<usize> {
@@ -3020,13 +3034,13 @@ impl ChildWinnerCombinations {
     }
 }
 
-impl ExactSizeIterator for ChildWinnerCombinations {}
+impl ExactSizeIterator for ChildWinnerCombinations<'_> {}
 
 /// Admit only the remaining child-product credit plus a rejection witness.
 fn child_winner_combinations(
-    frontiers: Vec<Vec<ChildWinnerRef>>,
+    frontiers: &[Vec<ChildWinnerRef>],
     admitted_limit: usize,
-) -> ChildCombinationBatch {
+) -> ChildCombinationBatch<'_> {
     let admitted_limit = admitted_limit.max(1);
     let witness_limit = admitted_limit.saturating_add(1);
     let total = frontiers.iter().fold(1_usize, |product, frontier| {
