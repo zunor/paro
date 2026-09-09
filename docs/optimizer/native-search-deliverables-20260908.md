@@ -455,3 +455,40 @@ rechecks source, executable, harness, SQL, CSV data and the read-only DuckDB fil
 arguments and all declared evidence inputs. Old reports are retained as their
 original evidence, not silently upgraded to this stronger contract. A new
 same-seed/same-harness cold baseline and Q11 execution confirmation are required.
+
+The new protocol was subsequently validated at `50a0986d`:
+
+- `native-q11-cold-isolated-seed-20260909.json` (v3): five fresh processes,
+  median **1353.844 ms**, median peak RSS **349,536,256 bytes**. The standalone
+  cold gate passes. This establishes a new protocol baseline, not a measured
+  improvement over a report with a different harness or input digest.
+- `native-q11-execution-isolated-seed-20260909.json` (v6): complete 90-row
+  results match, 70 samples per engine, seven process blocks. Paro median
+  **99.3088 ms**, DuckDB **104.6223 ms**; paired ratio **0.956968**, hierarchical
+  95% CI **[0.941149, 0.978082]**. Q11 warmed execution remains faster with the
+  stronger isolation contract. First-statement medians remain **1507.979 ms**
+  versus **108.497 ms**; cold parity is not attained.
+- Both reports record the same immutable seed digest
+  `b9824a5e83b0548615733a50b2ee385786bc125592be09d87fa72db0e50fd0c7`, with an
+  independently verified private input copy for every server process.
+
+### Native operator-local scalar evidence
+
+Scalar dependencies now retain `(ColumnId, lexical depth)` rather than merging
+local and correlated occurrences. Substitution rederives the scoped evidence;
+physical join operand ownership consults only local columns. A correlated
+invocation value is not incorrectly required to belong to either input schema.
+
+Aggregate root dispatch reads immutable evidence published from native scalar
+IDs, not executable expression payloads: plain-SUM subsumption eligibility and
+total narrowing inputs with no other live uses of their raw columns. The fact
+is computed once per published shell, not once per attempted rule match. One
+hundred scalar/modifier/grouping combinations agree with the executable-IR
+oracle; separate tests cover lexical scopes, repeated candidates, raw-input
+liveness, and poisoning a legacy payload after publication. This closes two
+root-dispatch consumers, **not the remaining rule output/settlement bridge**.
+Derivation checks cooperative interruption before reads and collection work;
+an interrupted attempt publishes no fact, never a false negative. Every possible
+interruption prefix in the narrowing-evidence fixture is tested. At this change,
+full workspace **6493 passed / 85 ignored**, optimizer **1022 passed**, and
+strict workspace/all-target Clippy passes. New cold and SQL evidence is pending.
