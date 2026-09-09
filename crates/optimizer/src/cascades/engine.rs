@@ -2000,7 +2000,8 @@ impl CascadesEngine {
             } else {
                 TaskOutcome::Infeasible
             };
-            self.task_registry.complete(task, outcome)?;
+            self.task_registry
+                .complete_current(task, &self.memo, outcome)?;
             return Ok(());
         }
         self.physical_subproblem_evaluations =
@@ -2042,7 +2043,13 @@ impl CascadesEngine {
                 } else {
                     TaskOutcome::Infeasible
                 };
-                self.task_registry.complete(task, outcome)?;
+                self.task_registry.publish_current_after_local_mutation(
+                    task,
+                    &self.memo,
+                    [group],
+                    std::iter::empty(),
+                    outcome,
+                )?;
                 Ok(())
             }
             Err(error) => {
