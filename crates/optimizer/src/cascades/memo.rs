@@ -771,19 +771,25 @@ impl WinnerFrontier {
         let old_selected = self.selected().map(|entry| entry.physical_fingerprint);
 
         if self.candidates.iter().any(|incumbent| {
-            winner_dominates(incumbent, &winner, &self.filterable_sources)
-                || (costs_equal(&incumbent.cost, &winner.cost)
-                    && source_response_equal(incumbent, &winner, &self.filterable_sources)
-                    && winner_tie_break(incumbent) <= winner_tie_break(&winner))
+            match winner_continuation_cmp(incumbent, &winner, &self.filterable_sources) {
+                Some(std::cmp::Ordering::Less) => true,
+                Some(std::cmp::Ordering::Equal) => {
+                    winner_tie_break(incumbent) <= winner_tie_break(&winner)
+                }
+                _ => false,
+            }
         }) {
             return FrontierInsertion::default();
         }
 
         self.candidates.retain(|incumbent| {
-            !(winner_dominates(&winner, incumbent, &self.filterable_sources)
-                || costs_equal(&winner.cost, &incumbent.cost)
-                    && source_response_equal(&winner, incumbent, &self.filterable_sources)
-                    && winner_tie_break(&winner) < winner_tie_break(incumbent))
+            match winner_continuation_cmp(&winner, incumbent, &self.filterable_sources) {
+                Some(std::cmp::Ordering::Less) => false,
+                Some(std::cmp::Ordering::Equal) => {
+                    winner_tie_break(&winner) >= winner_tie_break(incumbent)
+                }
+                _ => true,
+            }
         });
         // Removal preserves the existing ordering. Insert after exact ties,
         // as a stable full sort would, without sorting the whole frontier for
@@ -819,6 +825,9 @@ fn source_response_equal(
     right: &Winner,
     sources: &BTreeSet<super::rules::WorkSourceId>,
 ) -> bool {
+    if sources.is_empty() {
+        return true;
+    }
     left.source_work
         .iter()
         .filter(|lane| sources.contains(&lane.source))
@@ -828,25 +837,20 @@ fn source_response_equal(
             .filter(|lane| sources.contains(&lane.source)))
 }
 
-fn winner_dominates(
+fn winner_continuation_cmp(
     left: &Winner,
     right: &Winner,
     sources: &BTreeSet<super::rules::WorkSourceId>,
-) -> bool {
+) -> Option<std::cmp::Ordering> {
     // A physical goal declares every source an ancestor may filter. Preserve
     // that exact response frontier, but do not retain irrelevant source
     // histories forever across a closed root/sharing boundary.
-    source_response_equal(left, right, sources)
-        && left.cost.output_pipeline_tasks == right.cost.output_pipeline_tasks
-        && left.cost.dominates(&right.cost)
+    let order = left.cost.continuation_cmp(&right.cost)?;
+    source_response_equal(left, right, sources).then_some(order)
 }
 
 fn winner_tie_break(winner: &Winner) -> (PhysicalExprId, Fingerprint) {
     (winner.expression, winner.physical_fingerprint)
-}
-
-fn costs_equal(left: &SearchCost, right: &SearchCost) -> bool {
-    left == right
 }
 
 fn compare_objective(

@@ -669,59 +669,72 @@ impl SearchCost {
     }
 
     pub fn dominates(&self, other: &Self) -> bool {
-        let no_worse = self.score.range.expected <= other.score.range.expected
-            && self.score.risk_adjusted <= other.score.risk_adjusted
-            && self.score.range.upper <= other.score.range.upper
-            && self.work_latency.expected <= other.work_latency.expected
-            && self.work_latency.upper <= other.work_latency.upper
-            && self.critical_path.expected <= other.critical_path.expected
-            && self.critical_path.upper <= other.critical_path.upper
-            && self.non_revocable_memory_upper <= other.non_revocable_memory_upper
-            && self.minimum_memory_bytes <= other.minimum_memory_bytes
-            && self.revocable_memory_target <= other.revocable_memory_target
-            && self.peak_memory_upper <= other.peak_memory_upper
-            && self
-                .memory_completion
-                .no_worse_than(other.memory_completion)
-            && self.spill_bytes_expected <= other.spill_bytes_expected
-            && self.external_worker_slots_upper <= other.external_worker_slots_upper
-            && self
-                .resources_expected
-                .iter()
-                .zip(other.resources_expected.iter())
-                .all(|(left, right)| left <= right)
-            && self
-                .resources_risk_upper
-                .iter()
-                .zip(other.resources_risk_upper.iter())
-                .all(|(left, right)| left <= right);
-        let strictly_better = self.score.range.expected < other.score.range.expected
-            || self.score.risk_adjusted < other.score.risk_adjusted
-            || self.score.range.upper < other.score.range.upper
-            || self.work_latency.expected < other.work_latency.expected
-            || self.work_latency.upper < other.work_latency.upper
-            || self.critical_path.expected < other.critical_path.expected
-            || self.critical_path.upper < other.critical_path.upper
-            || self.non_revocable_memory_upper < other.non_revocable_memory_upper
-            || self.minimum_memory_bytes < other.minimum_memory_bytes
-            || self.revocable_memory_target < other.revocable_memory_target
-            || self.peak_memory_upper < other.peak_memory_upper
-            || self
-                .memory_completion
-                .strictly_better_than(other.memory_completion)
-            || self.spill_bytes_expected < other.spill_bytes_expected
-            || self.external_worker_slots_upper < other.external_worker_slots_upper
-            || self
-                .resources_expected
-                .iter()
-                .zip(other.resources_expected.iter())
-                .any(|(left, right)| left < right)
-            || self
-                .resources_risk_upper
-                .iter()
-                .zip(other.resources_risk_upper.iter())
-                .any(|(left, right)| left < right);
-        no_worse && strictly_better
+        self.continuation_cmp(other) == Some(Ordering::Less)
+    }
+
+    /// Partial order of the cost coordinates a physical continuation can
+    /// observe. Equality belongs to this same relation: using full struct
+    /// equality for ties retained unlimited candidates differing only in a
+    /// lower-bound estimate, even though neither dominated the other.
+    ///
+    /// Lower bounds remain attached to the selected candidate as evidence;
+    /// they are not ranking objectives or resource requirements. No epsilon,
+    /// rounding, or projection of a ranking/feasibility axis is used here.
+    /// Source response is a separate, goal-dependent contract checked by Memo.
+    pub(crate) fn continuation_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.max_parallel_tasks != other.max_parallel_tasks
+            || self.output_pipeline_tasks != other.output_pipeline_tasks
+            || self.external_workers != other.external_workers
+        {
+            return None;
+        }
+        let mut result = Ordering::Equal;
+        macro_rules! observe {
+            ($comparison:expr) => {
+                match $comparison? {
+                    Ordering::Equal => {}
+                    order if result == Ordering::Equal || result == order => result = order,
+                    _ => return None,
+                }
+            };
+        }
+        macro_rules! axis {
+            ($field:ident $(.$member:ident)*) => {
+                observe!(self.$field$(.$member)*.partial_cmp(&other.$field$(.$member)*));
+            };
+        }
+        axis!(score.range.expected);
+        axis!(score.risk_adjusted);
+        axis!(score.range.upper);
+        axis!(work_latency.expected);
+        axis!(work_latency.upper);
+        axis!(critical_path.expected);
+        axis!(critical_path.upper);
+        axis!(non_revocable_memory_upper);
+        axis!(minimum_memory_bytes);
+        axis!(revocable_memory_target);
+        axis!(peak_memory_upper);
+        observe!(Some(
+            self.memory_completion
+                .preference_cmp(other.memory_completion)
+        ));
+        axis!(spill_bytes_expected);
+        axis!(external_worker_slots_upper);
+        for (left, right) in self
+            .resources_expected
+            .iter()
+            .zip(&other.resources_expected)
+        {
+            observe!(left.partial_cmp(right));
+        }
+        for (left, right) in self
+            .resources_risk_upper
+            .iter()
+            .zip(&other.resources_risk_upper)
+        {
+            observe!(left.partial_cmp(right));
+        }
+        Some(result)
     }
 }
 
@@ -732,6 +745,63 @@ const _: () = {
 #[cfg(test)]
 mod memory_tests {
     use super::*;
+
+    #[test]
+    fn continuation_equivalence_ignores_only_non_ranking_lower_evidence() {
+        let cost = SearchCost {
+            score: ScoreSummary {
+                range: CompactRange::new(0.0, 10.0, 100.0).unwrap(),
+                risk_adjusted: 55.0,
+            },
+            work_latency: CompactRange::new(0.0, 20.0, 200.0).unwrap(),
+            critical_path: CompactRange::new(0.0, 20.0, 200.0).unwrap(),
+            ..SearchCost::ZERO
+        };
+        let mut other = cost;
+        other.score.range.lower = 5.0;
+        other.work_latency.lower = 10.0;
+        other.critical_path.lower = 10.0;
+        assert_ne!(cost, other);
+        assert_eq!(cost.continuation_cmp(&other), Some(Ordering::Equal));
+        assert!(!cost.dominates(&other));
+        assert!(!other.dominates(&cost));
+        for objective in [
+            super::super::objective::ObjectiveProfile::Latency,
+            super::super::objective::ObjectiveProfile::Throughput,
+            super::super::objective::ObjectiveProfile::Memory,
+            super::super::objective::ObjectiveProfile::Robustness,
+        ] {
+            assert_eq!(objective.compare(&cost, &other), Ordering::Equal);
+            for parent in [SearchCost::ZERO, cost, other] {
+                assert_eq!(
+                    objective.compare(
+                        &cost.sequential(parent).unwrap(),
+                        &other.sequential(parent).unwrap()
+                    ),
+                    Ordering::Equal
+                );
+            }
+        }
+        // Capacity and external identity are observable by continuations,
+        // even when all scalar objective coordinates happen to be equal.
+        for distinct in [
+            SearchCost {
+                max_parallel_tasks: 4,
+                ..cost
+            },
+            SearchCost {
+                output_pipeline_tasks: 4,
+                ..cost
+            },
+            SearchCost {
+                external_workers: ExternalWorkerRequirementSetId(1),
+                ..cost
+            },
+        ] {
+            assert_eq!(cost.continuation_cmp(&distinct), None);
+            assert_eq!(distinct.continuation_cmp(&cost), None);
+        }
+    }
 
     #[test]
     fn sequential_composition_preserves_preferred_memory_below_the_hard_peak() {

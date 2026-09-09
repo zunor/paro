@@ -763,7 +763,10 @@ fn bounded_winner_frontier_reports_an_anytime_obligation() {
 
 #[test]
 fn incremental_frontier_matches_an_independent_exhaustive_pareto_oracle() {
-    let samples = [(1_u64, 100_u64), (2, 10), (3, 1), (3, 80), (4, 1)];
+    // Two entries have identical continuation coordinates but independent
+    // lower-bound evidence. They represent one operating point, not an extra
+    // Pareto axis. Enumerating all orders also checks the exact-tie winner.
+    let samples = [(1_u64, 100_u64), (2, 10), (3, 1), (1, 100), (4, 1)];
     let mut expected = samples
         .iter()
         .copied()
@@ -776,6 +779,7 @@ fn incremental_frontier_matches_an_independent_exhaustive_pareto_oracle() {
         })
         .collect::<Vec<_>>();
     expected.sort_unstable();
+    expected.dedup();
     let goal = OptimizationGoal {
         required: PropertySetId(0),
         row_goal: RowGoal::All,
@@ -800,10 +804,20 @@ fn incremental_frontier_matches_an_independent_exhaustive_pareto_oracle() {
                             let (work, memory) = samples[index];
                             let cost = SearchCost {
                                 score: ScoreSummary {
-                                    range: CompactRange::point(work as f64).unwrap(),
+                                    range: CompactRange::new(
+                                        index as f64 / 10.0,
+                                        work as f64,
+                                        work as f64,
+                                    )
+                                    .unwrap(),
                                     risk_adjusted: work as f64,
                                 },
-                                critical_path: CompactRange::point(work as f64).unwrap(),
+                                critical_path: CompactRange::new(
+                                    index as f64 / 20.0,
+                                    work as f64,
+                                    work as f64,
+                                )
+                                .unwrap(),
                                 peak_memory_upper: memory,
                                 revocable_memory_target: memory,
                                 ..SearchCost::ZERO
@@ -838,6 +852,10 @@ fn incremental_frontier_matches_an_independent_exhaustive_pareto_oracle() {
                             })
                             .collect::<Vec<_>>();
                         assert_eq!(actual, expected, "insertion order {order:?}");
+                        assert_eq!(
+                            frontier.selected().unwrap().expression,
+                            PhysicalExprId::new(0)
+                        );
                     }
                 }
             }

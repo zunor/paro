@@ -86,3 +86,24 @@ search admission.
 Validation: 1,036 optimizer and 664 execution tests pass (two optimizer doc
 tests ignored), and strict workspace/all-target Clippy passes. This revision
 has not yet been timed; the cache is not claimed to close the cold target.
+
+## A concrete frontier-amplification mechanism
+
+The opt-in vector trace (`q11-cold-frontier-vectors-20260909.json`, not a normal
+timing run) contains 3,328 candidates from the 13 capped frontiers. In group
+30, the first three candidates have identical expected work, upper work,
+latency, resource vectors, memory proof and task supply; only their work/span
+**lower estimates** differ. All are retained by the old code: strict dominance
+does not compare lower estimates, while its separate equality check compares
+the entire `SearchCost`. The gap admits duplicate continuation operating points
+and lets their child combinations multiply. Many other candidates have genuine
+resource tradeoffs; this finding does not justify scalar top-k or explain every
+retained candidate.
+
+Dominance and equality now use one partial continuation comparison. All prior
+ranking/resource coordinates remain; task capacity, output supply, and external
+worker identity are explicit equality domains. Candidate lower evidence is
+retained for proofs but does not create a new ranking axis. Incomparable source
+responses are still preserved. No floating tolerance or search-budget change is
+involved. A 120-permutation independent frontier oracle now includes duplicate
+operating points with differing lower evidence and requires one stable winner.
