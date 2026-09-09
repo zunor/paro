@@ -265,6 +265,20 @@ pub struct TaskWakeup {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskKindProfile {
+    pub requests: u64,
+    pub unique_intents: u64,
+    pub unique_evaluations: u64,
+    pub reused_evaluations: u64,
+    pub single_flight_subscriptions: u64,
+    pub started: u64,
+    pub completed: u64,
+    pub suspended: u64,
+    pub invalidated: u64,
+    pub awaiting: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskRegistryProfile {
     pub requests: u64,
     pub unique_intents: u64,
@@ -280,6 +294,10 @@ pub struct TaskRegistryProfile {
     pub reservation_reuses: u64,
     pub reservation_rejections: u64,
     pub bound_proofs: u64,
+    /// Diagnostic attribution by semantic task kind. The values are derived
+    /// from the same exact TaskIntent state machine; no second task ledger is
+    /// maintained for profiling.
+    pub by_kind: BTreeMap<TaskKind, TaskKindProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,6 +425,7 @@ pub struct TaskRegistry {
     reserved_units: u64,
     reservation_limit: Option<u64>,
     profile: TaskRegistryProfile,
+    kind_profiles: BTreeMap<TaskKind, TaskKindProfile>,
     group_redirects: BTreeMap<GroupId, GroupId>,
     group_revisions: BTreeMap<GroupId, u64>,
 }
@@ -420,13 +439,20 @@ impl TaskRegistry {
         let mut profile = self.profile.clone();
         profile.unique_intents = self.intents.len() as u64;
         profile.unique_evaluations = self.evaluations.len() as u64;
+        profile.by_kind = self.kind_profiles.clone();
         profile
+    }
+
+    fn kind_profile_mut(&mut self, kind: TaskKind) -> &mut TaskKindProfile {
+        self.kind_profiles.entry(kind).or_default()
     }
 
     pub fn intern_intent(&mut self, intent: TaskIntent) -> TaskIntentId {
         if let Some(id) = self.intent_index.get(&intent).copied() {
             return id;
         }
+        let profile = self.kind_profile_mut(intent.kind());
+        profile.unique_intents = profile.unique_intents.saturating_add(1);
         let id = TaskIntentId::new(self.intents.len());
         self.intents.push(intent.clone());
         self.intent_index.insert(intent, id);
@@ -468,6 +494,9 @@ impl TaskRegistry {
 
     pub fn request(&mut self, intent: TaskIntent, reads: ReadSet) -> Result<TaskRequest> {
         self.profile.requests = self.profile.requests.saturating_add(1);
+        let kind = intent.kind();
+        let profile = self.kind_profile_mut(kind);
+        profile.requests = profile.requests.saturating_add(1);
         let intent = self.intern_intent(intent);
         let read_set = self.intern_read_set(reads);
         let inputs = self.intern_input_revision(read_set)?;
@@ -498,6 +527,8 @@ impl TaskRegistry {
                     } else {
                         self.profile.reused_evaluations =
                             self.profile.reused_evaluations.saturating_add(1);
+                        let profile = self.kind_profile_mut(kind);
+                        profile.reused_evaluations = profile.reused_evaluations.saturating_add(1);
                         Ok(TaskRequest::Reused {
                             task,
                             outcome: self.task(task).and_then(|record| record.outcome.clone()),
@@ -507,6 +538,8 @@ impl TaskRegistry {
                 TaskState::Failed => {
                     self.profile.reused_evaluations =
                         self.profile.reused_evaluations.saturating_add(1);
+                    let profile = self.kind_profile_mut(kind);
+                    profile.reused_evaluations = profile.reused_evaluations.saturating_add(1);
                     Ok(TaskRequest::Reused {
                         task,
                         outcome: self.task(task).and_then(|record| record.outcome.clone()),
@@ -521,6 +554,9 @@ impl TaskRegistry {
                     let waiter = self.add_waiter(task)?;
                     self.profile.single_flight_subscriptions =
                         self.profile.single_flight_subscriptions.saturating_add(1);
+                    let profile = self.kind_profile_mut(kind);
+                    profile.single_flight_subscriptions =
+                        profile.single_flight_subscriptions.saturating_add(1);
                     Ok(TaskRequest::Subscriber { task, waiter })
                 }
             };
@@ -540,6 +576,8 @@ impl TaskRegistry {
             obligations: BTreeSet::new(),
         });
         self.evaluations.insert(evaluation, task);
+        let profile = self.kind_profile_mut(kind);
+        profile.unique_evaluations = profile.unique_evaluations.saturating_add(1);
         Ok(TaskRequest::Leader(task))
     }
 
@@ -667,6 +705,11 @@ impl TaskRegistry {
     }
 
     pub fn start(&mut self, task: TaskId) -> Result<()> {
+        let kind = self
+            .task(task)
+            .and_then(|record| self.intent(record.intent))
+            .ok_or_else(|| paro_error::internal("task lost its intent"))?
+            .kind();
         let record = self.task_mut(task)?;
         if record.state != TaskState::Runnable {
             return Err(paro_error::internal(format!(
@@ -676,6 +719,8 @@ impl TaskRegistry {
         }
         record.state = TaskState::Running;
         self.profile.started = self.profile.started.saturating_add(1);
+        let profile = self.kind_profile_mut(kind);
+        profile.started = profile.started.saturating_add(1);
         Ok(())
     }
 
@@ -690,6 +735,11 @@ impl TaskRegistry {
         task: TaskId,
         dependencies: impl IntoIterator<Item = TaskId>,
     ) -> Result<bool> {
+        let kind = self
+            .task(task)
+            .and_then(|record| self.intent(record.intent))
+            .ok_or_else(|| paro_error::internal("task lost its intent"))?
+            .kind();
         let dependencies = dependencies
             .into_iter()
             .filter(|dependency| *dependency != task)
@@ -725,6 +775,8 @@ impl TaskRegistry {
         }
         if !unresolved.is_empty() {
             self.profile.awaiting = self.profile.awaiting.saturating_add(1);
+            let profile = self.kind_profile_mut(kind);
+            profile.awaiting = profile.awaiting.saturating_add(1);
         }
         for dependency in unresolved {
             self.dependents.entry(dependency).or_default().insert(task);
@@ -790,6 +842,11 @@ impl TaskRegistry {
         state: TaskState,
         outcome: Option<TaskOutcome>,
     ) -> Result<Vec<TaskWakeup>> {
+        let kind = self
+            .task(task)
+            .and_then(|record| self.intent(record.intent))
+            .ok_or_else(|| paro_error::internal("task lost its intent"))?
+            .kind();
         let obligations = self
             .task(task)
             .ok_or_else(|| paro_error::internal("unknown task completion"))?
@@ -816,13 +873,19 @@ impl TaskRegistry {
         }
         match state {
             TaskState::Completed => {
-                self.profile.completed = self.profile.completed.saturating_add(1)
+                self.profile.completed = self.profile.completed.saturating_add(1);
+                let profile = self.kind_profile_mut(kind);
+                profile.completed = profile.completed.saturating_add(1);
             }
             TaskState::Suspended => {
-                self.profile.suspended = self.profile.suspended.saturating_add(1)
+                self.profile.suspended = self.profile.suspended.saturating_add(1);
+                let profile = self.kind_profile_mut(kind);
+                profile.suspended = profile.suspended.saturating_add(1);
             }
             TaskState::Invalidated => {
-                self.profile.invalidated = self.profile.invalidated.saturating_add(1)
+                self.profile.invalidated = self.profile.invalidated.saturating_add(1);
+                let profile = self.kind_profile_mut(kind);
+                profile.invalidated = profile.invalidated.saturating_add(1);
             }
             _ => {}
         }
@@ -1337,6 +1400,84 @@ mod tests {
             TaskRequest::Subscriber { task, .. } if task == first
         ));
         assert_eq!(registry.task_count(), 1);
+    }
+
+    #[test]
+    fn task_profile_attributes_requests_by_exact_semantic_kind() {
+        let mut registry = TaskRegistry::default();
+        let discover_intent = TaskIntent::Discover {
+            expression: LogicalExprId::new(1),
+            rule: RuleId::new(2),
+        };
+        let task = match registry
+            .request(discover_intent.clone(), ReadSet::empty())
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            registry
+                .request(discover_intent.clone(), ReadSet::empty())
+                .unwrap(),
+            TaskRequest::Subscriber { task: subscribed, .. } if subscribed == task
+        ));
+        registry.start(task).unwrap();
+        registry
+            .complete(
+                task,
+                TaskOutcome::NoChange {
+                    reads: ReadSetId::new(0),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.request(discover_intent, ReadSet::empty()).unwrap(),
+            TaskRequest::Reused { task: reused, .. } if reused == task
+        ));
+
+        let transform = match registry
+            .request(
+                TaskIntent::Transform {
+                    expression: LogicalExprId::new(3),
+                    rule: RuleId::new(4),
+                    binding: PatternBinding {
+                        root: PatternOperand::Group(GroupId::new(5)),
+                        fingerprint: Fingerprint(6),
+                    },
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        registry.start(transform).unwrap();
+        registry
+            .complete(
+                transform,
+                TaskOutcome::NoChange {
+                    reads: ReadSetId::new(0),
+                },
+            )
+            .unwrap();
+
+        let profile = registry.profile();
+        let discover = profile.by_kind.get(&TaskKind::Discover).unwrap();
+        assert_eq!(discover.requests, 3);
+        assert_eq!(discover.unique_intents, 1);
+        assert_eq!(discover.unique_evaluations, 1);
+        assert_eq!(discover.single_flight_subscriptions, 1);
+        assert_eq!(discover.reused_evaluations, 1);
+        assert_eq!(discover.started, 1);
+        assert_eq!(discover.completed, 1);
+        let transform_profile = profile.by_kind.get(&TaskKind::Transform).unwrap();
+        assert_eq!(transform_profile.requests, 1);
+        assert_eq!(transform_profile.unique_intents, 1);
+        assert_eq!(transform_profile.unique_evaluations, 1);
+        assert_eq!(transform_profile.started, 1);
+        assert_eq!(transform_profile.completed, 1);
     }
 
     #[test]

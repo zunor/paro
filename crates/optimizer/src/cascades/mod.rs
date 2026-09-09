@@ -78,7 +78,7 @@ pub use tasks::{
     BoundContext, BoundProof, BoundProofId, BoundProofKind, CompletionObligation,
     CompletionObligationId, Cursor, CursorId, EvaluationId, EvaluationKey, InputRevisionId,
     ReadSet, ReadSetId, ReservationId, StopReason, SubproblemKey, TaskId, TaskIntent, TaskIntentId,
-    TaskKind, TaskObjectId, TaskOutcome, TaskRegistry, TaskRegistryProfile, TaskRequest, TaskState,
-    TaskWakeup,
+    TaskKind, TaskKindProfile, TaskObjectId, TaskOutcome, TaskRegistry, TaskRegistryProfile,
+    TaskRequest, TaskState, TaskWakeup,
 };
 pub use verifier::{MemoVerifier, WinnerVerifier};
