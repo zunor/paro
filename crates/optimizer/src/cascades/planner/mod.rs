@@ -404,6 +404,12 @@ impl OptimizationInput {
                 state.settlement_cache.invalidation_visits,
             );
             work_counters.extend(state.payloads.schedule_counters());
+            let (hits, misses) = state.scalars.bound_import_counts();
+            work_counters.insert("memo_scalar_import_hits", hits);
+            work_counters.insert("memo_scalar_import_misses", misses);
+            let (hits, misses) = state.settlement_cache.bound_import_counts();
+            work_counters.insert("settlement_scalar_import_hits", hits);
+            work_counters.insert("settlement_scalar_import_misses", misses);
         }
         let search_summary = SearchSummary {
             groups: u64::try_from(engine.memo().canonical_group_count()).unwrap_or(u64::MAX),

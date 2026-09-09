@@ -33,6 +33,7 @@ struct BindingKey {
 /// scalar scopes; no complete query map is cloned for a rule attempt.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BindingCatalog {
+    identity: super::super::catalog_identity::CatalogIdentity,
     entries: BTreeMap<BindingKey, ColumnId>,
     by_column: BTreeMap<ColumnId, BindingKey>,
     insertions: Vec<BindingKey>,
@@ -43,6 +44,9 @@ pub(crate) struct BindingCatalog {
 }
 
 impl BindingCatalog {
+    pub(super) fn version(&self) -> super::super::catalog_identity::CatalogVersion {
+        self.identity.version()
+    }
     /// Read relational ownership without rebuilding an executable scalar.
     /// Private reducer slots cannot satisfy a relational placement proof.
     pub(crate) fn relation_binding(&self, column: ColumnId) -> Option<ColumnBinding> {
@@ -208,6 +212,9 @@ impl BindingCatalog {
             return Err(paro_error::internal(
                 "binding catalog rollback exceeds its insertion journal",
             ));
+        }
+        if checkpoint < self.insertions.len() {
+            self.identity.invalidate();
         }
         while self.insertions.len() > checkpoint {
             let key = self.insertions.pop().expect("journal length was checked");

@@ -10,6 +10,7 @@
 
 pub mod budget;
 pub mod calibration;
+mod catalog_identity;
 pub mod column;
 pub mod control;
 pub mod cost {

@@ -211,6 +211,39 @@ group cursors with changed revisions; real engine tests retain negative-match
 and application-only wake-ups. No dependency is removed merely because the
 latest binding did not read it.
 
+At `6e070f6c`, 1,047 optimizer tests and strict workspace/all-target Clippy
+pass. Five fresh processes give median EXPLAIN **745.784 ms**, optimizer
+739.025 ms and RSS 260,849,664 bytes. Every search counter is unchanged from
+the work-meter revision. The complete original Q11 execution comparison
+(`q11-execution-search-contracts-20260909.json`, seven process blocks, five
+paired measurement rounds per block) agrees on all 90 rows: Paro median
+99.504 ms, DuckDB 105.283 ms, paired ratio 0.948355 with hierarchical 95% CI
+[0.93526, 0.96228]. First statement is still 867.569 vs 108.162 ms; this is
+not a claim that cold performance is competitive or that 100 ms is reached.
+
+## Immutable bound-root imports
+
+The remaining local recipe/staging paths repeatedly import the same immutable
+bound scalar roots into their native scalar arenas. Imports now cache canonical
+`ScalarExprId`s by a weak source-allocation witness and the exact positional
+reference domain. Binding and column catalogs have process-local validity
+tokens: appends preserve them, forks and rollback invalidate them. Scalar
+rollback clears cached target IDs before ordinal reuse. These tokens are never
+part of plan identity or deterministic search ordering.
+
+A weak witness retains neither the source payload nor its descendants. An
+outstanding weak reference makes `Arc::make_mut` detach even a unique payload,
+so mutation cannot silently preserve a cached identity. Dead weak control blocks
+are collected geometrically. Only successful root imports are cached; errors,
+pending conjunction prefixes, and runtime evaluation occurrences are not.
+Native scalar interning and exact semantic identities remain unchanged.
+
+Tests cover independent positional domains, each namespace's rollback, catalog
+forks, mutation, failed imports, and reclamation of 5,000 temporary source roots.
+All 1,051 optimizer and 286 planner tests pass. Four diagnostic counters expose
+hits/misses separately for settlement and planner imports; timing follows after
+the source snapshot is committed.
+
 ## Immutable source-response payloads
 
 Candidates now share immutable source-work snapshots. Ordinary parent

@@ -5,7 +5,7 @@
 //! immutable node; mutation detaches only that node, never its descendant DAG.
 
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use super::*;
 
@@ -14,6 +14,25 @@ use super::*;
 /// must also hold a liveness witness; an address alone may be reused after drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpressionIdentity(usize);
+
+/// A non-owning witness for a source-IR import. Keeping this weak allocation
+/// prevents address reuse; it does not retain the payload or its descendants.
+/// Mutable access detaches an Arc with outstanding weak references, so even
+/// formerly unique in-place edits cannot preserve a cached immutable identity.
+#[derive(Debug, Clone)]
+pub struct ExpressionWitness {
+    identity: ExpressionIdentity,
+    allocation: Weak<dyn Send + Sync>,
+}
+
+impl ExpressionWitness {
+    pub fn is_alive(&self) -> bool {
+        self.allocation.strong_count() != 0
+    }
+    pub fn matches(&self, expression: &Expression) -> bool {
+        self.identity == expression.allocation_identity() && self.is_alive()
+    }
+}
 
 /// The complete owned-child contract of a scalar payload. Destruction consumes
 /// these edges iteratively, including aggregate modifiers and window frames.
@@ -78,6 +97,17 @@ impl<T: ExpressionPayload> SharedExpressionPayload<T> {
     pub(crate) fn release_into(&mut self, pending: &mut Vec<Expression>) {
         if let Some(payload) = self.inner.take().and_then(Arc::into_inner) {
             payload.value.into_expression_children(pending);
+        }
+    }
+}
+
+impl<T: ExpressionPayload + Send + Sync + 'static> SharedExpressionPayload<T> {
+    pub(crate) fn witness(&self) -> ExpressionWitness {
+        let allocation: Arc<dyn Send + Sync> =
+            self.inner.as_ref().expect("live scalar payload").clone();
+        ExpressionWitness {
+            identity: self.allocation_identity(),
+            allocation: Arc::downgrade(&allocation),
         }
     }
 }
@@ -294,6 +324,37 @@ mod tests {
             panic!("expected constant")
         };
         Arc::downgrade(payload.inner.as_ref().unwrap())
+    }
+
+    #[test]
+    fn import_witness_does_not_pin_payloads_or_survive_mutation() {
+        let mut expression = leaf();
+        let witness = expression.witness();
+        let identity = expression.allocation_identity();
+        assert!(witness.matches(&expression));
+        let Expression::Constant(payload) = &mut expression else {
+            unreachable!()
+        };
+        payload.value = Value::Boolean(false);
+        assert_ne!(identity, expression.allocation_identity());
+        assert!(!witness.matches(&expression));
+        assert!(!witness.is_alive());
+        let current = expression.witness();
+        drop(expression);
+        assert!(!current.is_alive());
+
+        let child = leaf();
+        let child_witness = child.witness();
+        let parent = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::And, vec![child, leaf()]).into(),
+        );
+        let parent_witness = parent.witness();
+        drop(parent);
+        assert!(!parent_witness.is_alive());
+        assert!(
+            !child_witness.is_alive(),
+            "weak root witness retains no descendants"
+        );
     }
 
     #[test]

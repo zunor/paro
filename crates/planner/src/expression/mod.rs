@@ -40,7 +40,9 @@ pub use iterator::{ExpressionIterator, ExpressionVisitDecision};
 pub use operator_expression::{OperatorExpression, OperatorType};
 pub use parameter_expression::ParameterExpression;
 pub use reference_expression::ReferenceExpression;
-pub use shared_payload::{ExpressionIdentity, ExpressionPayload, SharedExpressionPayload};
+pub use shared_payload::{
+    ExpressionIdentity, ExpressionPayload, ExpressionWitness, SharedExpressionPayload,
+};
 pub use subquery_expression::{SubqueryExpression, SubqueryPlanningState, SubqueryType};
 pub use window_expression::{
     OrderByExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,

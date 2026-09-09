@@ -213,6 +213,9 @@ fn intern_columns_into(
 }
 
 impl SettlementCache {
+    pub(in crate::cascades::planner) fn bound_import_counts(&self) -> (u64, u64) {
+        self.scalars.bound_import_counts()
+    }
     pub(in crate::cascades::planner) fn discard_stale_recipes(&mut self, arena: &LogicalPlanArena) {
         if self
             .recipe_prefix

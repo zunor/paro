@@ -77,6 +77,24 @@ impl Expression {
         }
     }
 
+    pub fn witness(&self) -> super::ExpressionWitness {
+        match self {
+            Self::Constant(value) => value.witness(),
+            Self::ColumnRef(value) => value.witness(),
+            Self::Function(value) => value.witness(),
+            Self::Cast(value) => value.witness(),
+            Self::Conjunction(value) => value.witness(),
+            Self::Case(value) => value.witness(),
+            Self::Comparison(value) => value.witness(),
+            Self::Operator(value) => value.witness(),
+            Self::Parameter(value) => value.witness(),
+            Self::Reference(value) => value.witness(),
+            Self::Aggregate(value) => value.witness(),
+            Self::Subquery(value) => value.witness(),
+            Self::Window(value) => value.witness(),
+        }
+    }
+
     pub(crate) fn release_children_into(&mut self, pending: &mut Vec<Expression>) {
         match self {
             Self::Constant(value) => value.release_into(pending),

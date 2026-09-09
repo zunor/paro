@@ -42,11 +42,15 @@ pub struct ColumnDesc {
 
 #[derive(Debug, Clone, Default)]
 pub struct ColumnCatalog {
+    identity: super::catalog_identity::CatalogIdentity,
     columns: Vec<ColumnDesc>,
     by_origin: BTreeMap<ColumnOrigin, ColumnId>,
 }
 
 impl ColumnCatalog {
+    pub(super) fn version(&self) -> super::catalog_identity::CatalogVersion {
+        self.identity.version()
+    }
     /// Intern a semantic column identity. Rules cannot allocate anonymous
     /// temporary columns: the normalized origin key owns the ID.
     pub fn intern(
@@ -102,6 +106,9 @@ impl ColumnCatalog {
             return Err(paro_error::internal(
                 "column catalog rollback exceeds the current generation",
             ));
+        }
+        if len < self.columns.len() {
+            self.identity.invalidate();
         }
         for column in self.columns[len..].iter().rev() {
             if self.by_origin.remove(&column.origin) != Some(column.id) {

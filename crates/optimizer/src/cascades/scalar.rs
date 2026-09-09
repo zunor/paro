@@ -203,6 +203,7 @@ pub struct ScalarSpec {
 pub struct ScalarArena {
     nodes: Vec<ScalarNode>,
     by_fingerprint: BTreeMap<Fingerprint, Vec<ScalarExprId>>,
+    pub(super) bound_imports: super::scalar_lowering::imports::BoundImportCache,
 }
 
 impl ScalarArena {
@@ -218,6 +219,10 @@ impl ScalarArena {
         self.nodes.is_empty()
     }
 
+    pub(crate) fn bound_import_counts(&self) -> (u64, u64) {
+        (self.bound_imports.hits, self.bound_imports.misses)
+    }
+
     /// Roll an append-only scalar generation back without cloning the DAG.
     /// Fingerprint buckets may contain collisions, so remove ids rather than
     /// assuming one bucket entry per node.
@@ -226,6 +231,9 @@ impl ScalarArena {
             return Err(paro_error::internal(
                 "scalar arena rollback exceeds the current generation",
             ));
+        }
+        if len < self.nodes.len() {
+            self.bound_imports.clear();
         }
         for index in (len..self.nodes.len()).rev() {
             let id = ScalarExprId::new(index);

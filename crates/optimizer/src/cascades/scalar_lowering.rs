@@ -31,6 +31,7 @@ use super::scalar::{
 
 mod bindings;
 mod fields;
+pub(super) mod imports;
 mod operator_export;
 pub(crate) use bindings::BindingCatalog;
 pub(crate) use operator_export::export_operator_scalars;
@@ -184,6 +185,27 @@ fn get_reference_columns(
 }
 
 pub(crate) fn intern_expression(
+    expression: &Expression,
+    reference_columns: &[ColumnId],
+    binding_ids: &mut BindingCatalog,
+    columns: &mut ColumnCatalog,
+    arena: &mut ScalarArena,
+) -> Result<ScalarExprId> {
+    let domain = imports::BoundImportDomain(binding_ids.version(), columns.version());
+    if let Some(root) = arena
+        .bound_imports
+        .lookup(domain, expression, reference_columns)
+    {
+        return Ok(root);
+    }
+    let root = lower_expression(expression, reference_columns, binding_ids, columns, arena)?;
+    arena
+        .bound_imports
+        .insert(expression, reference_columns, root);
+    Ok(root)
+}
+
+fn lower_expression(
     expression: &Expression,
     reference_columns: &[ColumnId],
     binding_ids: &mut BindingCatalog,
