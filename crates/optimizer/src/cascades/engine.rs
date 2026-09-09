@@ -1949,7 +1949,7 @@ impl CascadesEngine {
         }
         let group = self.memo.canonical_group(group);
         self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
-        let read_set = ReadSet::new([PatternRead::from_group(&self.memo, group)?]);
+        let read_set = ReadSet::single(PatternRead::from_group(&self.memo, group)?);
         let task = match self.task_registry.request_current(
             TaskIntent::Optimize { group, goal },
             read_set,

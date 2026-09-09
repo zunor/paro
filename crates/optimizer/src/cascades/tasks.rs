@@ -169,6 +169,16 @@ pub struct ReadSet {
 }
 
 impl ReadSet {
+    /// Build the overwhelmingly common one-group read without constructing a
+    /// temporary ordered map.  A single read already satisfies the canonical
+    /// one-read-per-group invariant, so this is the allocation-free part of
+    /// the normalization performed by [`Self::new`].
+    pub fn single(read: PatternRead) -> Self {
+        Self {
+            reads: Box::new([read]),
+        }
+    }
+
     pub fn new(reads: impl IntoIterator<Item = PatternRead>) -> Self {
         // A task may combine a discovery frontier read with a later fact
         // read for the same group. Keep one read per group so a stale fact
@@ -1524,6 +1534,18 @@ mod tests {
             TaskRequest::Subscriber { task, .. } if task == first
         ));
         assert_eq!(registry.task_count(), 1);
+    }
+
+    #[test]
+    fn single_read_uses_the_same_canonical_shape_as_general_normalization() {
+        let read = PatternRead {
+            group: GroupId::new(7),
+            logical_frontier_revision: Some(3),
+            logical_fact_fingerprint: Fingerprint(11),
+            statistics_snapshot_fingerprint: Fingerprint(13),
+        };
+
+        assert_eq!(ReadSet::single(read), ReadSet::new([read]));
     }
 
     #[test]
