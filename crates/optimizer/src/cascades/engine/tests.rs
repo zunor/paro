@@ -925,6 +925,61 @@ fn engine_with_budget(
     (CascadesEngine::new(memo, registry), group, goal)
 }
 
+#[test]
+fn engine_group_merge_redirects_tasks_and_discards_stale_transform_state() {
+    let (mut engine, canonical_source, goal) = engine(0);
+    let secondary = engine.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let task = match engine
+        .task_registry
+        .request(
+            TaskIntent::Optimize {
+                group: secondary,
+                goal,
+            },
+            ReadSet::empty(),
+        )
+        .unwrap()
+    {
+        TaskRequest::Leader(task) => task,
+        request => panic!("unexpected merge task request: {request:?}"),
+    };
+    engine.task_registry.start(task).unwrap();
+
+    let transform_task = TransformationTaskId {
+        group: secondary,
+        expression: LogicalExprId::new(0),
+        rule: RuleId::new(77),
+    };
+    engine
+        .transformation_subscribers
+        .entry(secondary)
+        .or_default()
+        .insert(transform_task);
+    engine.transformation_observations.insert(
+        transform_task,
+        Box::new([PatternRead::from_group(&engine.memo, secondary).unwrap()]),
+    );
+
+    let canonical = engine.merge_groups(canonical_source, secondary).unwrap();
+
+    assert_eq!(canonical, canonical_source);
+    assert_eq!(engine.memo.canonical_group(secondary), canonical);
+    assert_eq!(engine.task_registry.canonical_group(secondary), canonical);
+    assert_eq!(
+        engine.task_registry.state(task),
+        Some(TaskState::Invalidated)
+    );
+    assert!(engine.transformation_observations.is_empty());
+    assert!(!engine
+        .transformation_subscribers
+        .values()
+        .any(|tasks| tasks.contains(&transform_task)));
+}
+
 fn transformation_chain_engine(
     depth: usize,
     root_operator: Fingerprint,

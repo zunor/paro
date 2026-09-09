@@ -36,11 +36,12 @@ use super::region::{
 use super::rules::WorkSourceId;
 use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PatternEnumerationCompletion,
-    PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof,
-    SourceWork, SourceWorkData, TaskSupplyContract, TransformContext,
+    PatternOperand, PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork,
+    SourceRetentionProof, SourceWork, SourceWorkData, TaskSupplyContract, TransformContext,
 };
 use super::tasks::{
     Cursor, ReadSet, StopReason, TaskId, TaskIntent, TaskOutcome, TaskRegistry, TaskRequest,
+    TaskState,
 };
 use crate::physical::{ResourceGrantClass, SpillPolicy};
 
@@ -362,6 +363,33 @@ impl CascadesEngine {
 
     pub fn memo_mut(&mut self) -> &mut Memo {
         &mut self.memo
+    }
+
+    /// Merge equivalent Memo groups through the same owner/redirect protocol
+    /// used by resumable tasks. Callers that change group identity must use
+    /// this entry point instead of mutating `Memo` directly: the Memo merge
+    /// clears affected frontiers, while the registry invalidates stale task
+    /// outcomes and the engine drops only transformation observations that
+    /// read the merged equivalence class.
+    pub fn merge_groups(&mut self, left: GroupId, right: GroupId) -> Result<GroupId> {
+        let left = self.memo.canonical_group(left);
+        let right = self.memo.canonical_group(right);
+        if left == right {
+            return Ok(left);
+        }
+        let (secondary, expected_canonical) = if left < right {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let canonical = self.memo.merge_groups(left, right)?;
+        debug_assert_eq!(canonical, expected_canonical);
+        // Memo::merge_groups validates the output contract and completes its
+        // union-find update before this call. Redirecting afterward ensures a
+        // failed Memo validation cannot invalidate a live task in advance.
+        let _ = self.task_registry.redirect_group(secondary, canonical)?;
+        self.discard_merged_transformation_state(secondary, canonical);
+        Ok(canonical)
     }
 
     pub fn task_registry(&self) -> &TaskRegistry {
@@ -1923,6 +1951,49 @@ impl CascadesEngine {
         Ok(())
     }
 
+    /// A group merge changes the semantic identity of every transformation
+    /// observation that read either side. Those tasks have already been
+    /// invalidated by `TaskRegistry::redirect_group`; removing only their
+    /// reverse-index entries prevents a stale no-match/application payload
+    /// from being resurrected when the exact task identity is reopened.
+    fn discard_merged_transformation_state(&mut self, secondary: GroupId, canonical: GroupId) {
+        let touches_group =
+            |group: GroupId| group == secondary || self.memo.canonical_group(group) == canonical;
+        let touches_reads =
+            |reads: &[PatternRead]| reads.iter().any(|read| touches_group(read.group));
+        let mut affected = BTreeSet::new();
+        for (task, reads) in &self.transformation_observations {
+            if task.group == secondary || touches_reads(reads) {
+                affected.insert(*task);
+            }
+        }
+        for (task, reads) in &self.transformation_fact_observations {
+            if task.group == secondary || touches_reads(reads) {
+                affected.insert(*task);
+            }
+        }
+        for ((task, _), applications) in &self.transformation_applications {
+            if task.group == secondary
+                || applications.iter().any(|application| {
+                    pattern_operand_touches_group(&application.binding.root, secondary, canonical)
+                })
+            {
+                affected.insert(*task);
+            }
+        }
+        self.transformation_observations
+            .retain(|task, _| !affected.contains(task));
+        self.transformation_fact_observations
+            .retain(|task, _| !affected.contains(task));
+        self.transformation_applications
+            .retain(|(task, _), _| !affected.contains(task));
+        self.transformation_subscribers.remove(&secondary);
+        self.transformation_subscribers.remove(&canonical);
+        for subscribers in self.transformation_subscribers.values_mut() {
+            subscribers.retain(|task| !affected.contains(task));
+        }
+    }
+
     fn enumerate_implementations(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
         let group = self.memo.canonical_group(group);
         self.physical_implementation_requests =
@@ -2706,6 +2777,25 @@ impl CascadesEngine {
         paro_error::internal(format!(
             "no feasible physical plan exists for Memo group {group:?} with goal {goal:?}; required={required:?}, logical={logical:?}, physical={physical:?}"
         ))
+    }
+}
+
+fn pattern_operand_touches_group(
+    operand: &PatternOperand,
+    secondary: GroupId,
+    canonical: GroupId,
+) -> bool {
+    match operand {
+        PatternOperand::Group(group) => *group == secondary || *group == canonical,
+        PatternOperand::Expression {
+            group, children, ..
+        } => {
+            *group == secondary
+                || *group == canonical
+                || children
+                    .iter()
+                    .any(|child| pattern_operand_touches_group(child, secondary, canonical))
+        }
     }
 }
 
