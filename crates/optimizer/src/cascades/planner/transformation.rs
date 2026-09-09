@@ -392,21 +392,25 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             None
         };
-        // PredicateTransfer can consume the exact matched shell directly for
-        // the conservative INNER/CROSS side-local subset. Keep the legacy
-        // owned-plan path available for every shape that needs a richer
-        // FilterPushdown semantic pass.
-        let direct_native = if matches!(
-            self.transformation,
-            PlannerTransformation::PredicateTransfer
-        ) {
+        // These two search rules can consume the exact matched shell directly
+        // for their conservative native subsets. Keep the legacy owned-plan
+        // path available for every shape that needs richer semantic handling.
+        let direct_native = {
             let state = self
                 .planner_state
                 .read()
                 .expect("planner transform state poisoned");
-            try_native_predicate_transfer(&binding.root, ctx.memo(), &state, &facts)?
-        } else {
-            None
+            match self.transformation {
+                PlannerTransformation::PredicateTransfer => {
+                    try_native_predicate_transfer(&binding.root, ctx.memo(), &state, &facts)?
+                        .into_iter()
+                        .collect()
+                }
+                PlannerTransformation::JoinRegionEnumeration => {
+                    join_region::try_native_enumeration(&binding.root, ctx.memo(), &state, &facts)?
+                }
+                _ => Vec::new(),
+            }
         };
         let (
             plan,
@@ -424,7 +428,7 @@ impl TransformationRule for PlannerTransformationRule {
                 .planner_state
                 .read()
                 .expect("planner transform state poisoned");
-            let (plan, nested_group_holes) = if direct_native.is_none() {
+            let (plan, nested_group_holes) = if direct_native.is_empty() {
                 let Some(instantiated) = semantic_plan::instantiate_bound_plan_with_group_holes(
                     ctx.memo(),
                     &state,
@@ -569,7 +573,7 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             Vec::new()
         };
-        if plans.is_empty() && direct_native.is_none() {
+        if plans.is_empty() && direct_native.is_empty() {
             return Ok(Box::new([]));
         }
 
@@ -612,10 +616,8 @@ impl TransformationRule for PlannerTransformationRule {
             Owned(OwnedLogicalPlan),
         }
 
-        let mut candidates = Vec::with_capacity(plans.len() + usize::from(direct_native.is_some()));
-        if let Some(shell) = direct_native {
-            candidates.push(PlanCandidate::Native(shell));
-        }
+        let mut candidates = Vec::with_capacity(plans.len() + direct_native.len());
+        candidates.extend(direct_native.into_iter().map(PlanCandidate::Native));
         candidates.extend(plans.into_iter().map(PlanCandidate::Owned));
 
         let mut prepared = Vec::with_capacity(candidates.len());

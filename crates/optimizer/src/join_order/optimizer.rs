@@ -134,6 +134,16 @@ pub struct JoinOrderOptimizer {
     max_frontier_size: usize,
 }
 
+/// The graph side of join enumeration is independent from the representation
+/// used to reconstruct a candidate. Native rule producers use this result to
+/// rebuild a `NativeShell` directly, while the compatibility entry point
+/// below still reconstructs `OwnedLogicalPlan` values for legacy callers.
+pub(crate) struct JoinGraphEnumeration {
+    pub(crate) final_plans: Vec<DPJoinNode>,
+    pub(crate) filter_infos: Vec<Arc<FilterInfo>>,
+    pub(crate) root_filters: Vec<Expression>,
+}
+
 impl JoinOrderOptimizer {
     /// Create a new JoinOrderOptimizer.
     pub fn new(selectivity_defaults: SelectivityDefaults) -> Self {
@@ -294,17 +304,61 @@ impl JoinOrderOptimizer {
         let mut filters = Vec::new();
         self.extract_join_relations(ctx, bind_context, &plan, &mut filters, true)?;
 
-        // Check if we have enough relations to optimize
-        if self.relation_manager.num_relations() < 2 {
+        let relation_manager = std::mem::take(&mut self.relation_manager);
+        let column_stats = std::mem::take(&mut self.column_stats);
+        let Some(graph) =
+            self.enumerate_relation_graph(filters, region_outputs, relation_manager, column_stats)?
+        else {
             return Ok(Vec::new());
+        };
+
+        let mut result = Vec::with_capacity(graph.final_plans.len());
+        for final_plan in graph.final_plans {
+            debug!(
+                target: targets::OPTIMIZER,
+                shape = %final_plan.compact_shape(),
+                cardinality = final_plan.cardinality,
+                cost = final_plan.cost,
+                peak_build_bytes = final_plan.peak_build_bytes,
+                "reconstructing join-order frontier member"
+            );
+            let Some(reconstructed) =
+                self.reconstruct_plan(bind_context, &final_plan, &mut HashSet::new())?
+            else {
+                continue;
+            };
+            result.push(self.attach_filter_expressions(reconstructed, graph.root_filters.clone()));
+        }
+        Ok(result)
+    }
+
+    /// Enumerate a prepared relation graph without requiring an owned plan for
+    /// each atomic relation. This is the shared graph kernel for the legacy
+    /// reconstruction path and native transformation producers.
+    pub(crate) fn enumerate_relation_graph(
+        &mut self,
+        filters: Vec<ExtractedFilter>,
+        region_outputs: HashMap<ColumnBinding, LogicalType>,
+        relation_manager: RelationManager,
+        column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    ) -> Result<Option<JoinGraphEnumeration>> {
+        self.relation_manager = relation_manager;
+        self.column_stats = column_stats;
+        self.set_manager = JoinRelationSetManager::new();
+        self.query_graph = QueryGraphEdges::new();
+        self.cost_model.reset();
+        self.filter_infos.clear();
+        self.plans.clear();
+
+        if self.relation_manager.num_relations() < 2 {
+            return Ok(None);
         }
 
-        // Extract edges from filters
-        let extracted_predicates = self
+        let Some(extracted_predicates) = self
             .relation_manager
-            .extract_edges(&filters, &mut self.set_manager);
-        let Some(extracted_predicates) = extracted_predicates else {
-            return Ok(Vec::new());
+            .extract_edges(&filters, &mut self.set_manager)
+        else {
+            return Ok(None);
         };
         let filter_infos = extracted_predicates.graph_filters;
         let inferred_filters =
@@ -317,12 +371,8 @@ impl JoinOrderOptimizer {
             .chain(inferred_filters)
             .collect();
 
-        // Initialize cardinality estimator
         self.cost_model.init_equivalent_relations(&filter_infos);
-
-        // Build query graph
         for filter_info in &filter_infos {
-            // Get the left and right sets from the filter
             if let (Some(left_set), Some(right_set)) =
                 (filter_info.left_set(), filter_info.right_set())
             {
@@ -337,8 +387,6 @@ impl JoinOrderOptimizer {
                     Some(filter_info.clone()),
                 );
             } else if filter_info.set.count() > 1 {
-                // Multi-relation filter without explicit left/right
-                // Create edges between all pairs
                 let relations = filter_info.set.relations();
                 for i in 0..relations.len() {
                     for j in (i + 1)..relations.len() {
@@ -356,12 +404,9 @@ impl JoinOrderOptimizer {
             }
         }
 
-        // Initialize cost model
         let stats = self.relation_manager.get_relation_stats();
         self.cost_model
             .init_cost_model(&mut self.set_manager, &stats);
-
-        // Create plan enumerator
         let mut enumerator = PlanEnumerator::with_budget(
             &self.query_graph,
             &mut self.set_manager,
@@ -371,47 +416,21 @@ impl JoinOrderOptimizer {
             self.max_pairs,
             self.max_frontier_size,
         );
-
-        // Initialize leaf plans
         enumerator.init_leaf_plans();
-
-        // Solve join order
         if enumerator.solve_join_order() != EnumerationOutcome::Complete {
-            // The original tree remains authoritative when pair enumeration
-            // is exhausted or a cut cannot preserve its logical semantics.
-            return Ok(Vec::new());
+            return Ok(None);
         }
-
         let final_plans = enumerator.get_final_plans().to_vec();
         if final_plans.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         self.plans = enumerator.get_plans().clone();
-
-        // Drop enumerator to release mutable borrow
         drop(enumerator);
-
-        let mut result = Vec::with_capacity(final_plans.len());
-        for final_plan in final_plans {
-            debug!(
-                target: targets::OPTIMIZER,
-                shape = %final_plan.compact_shape(),
-                cardinality = final_plan.cardinality,
-                cost = final_plan.cost,
-                peak_build_bytes = final_plan.peak_build_bytes,
-                "reconstructing join-order frontier member"
-            );
-            let Some(reconstructed) =
-                self.reconstruct_plan(bind_context, &final_plan, &mut HashSet::new())?
-            else {
-                continue;
-            };
-            result.push(self.attach_filter_expressions(
-                reconstructed,
-                extracted_predicates.root_filters.clone(),
-            ));
-        }
-        Ok(result)
+        Ok(Some(JoinGraphEnumeration {
+            final_plans,
+            filter_infos: self.filter_infos.clone(),
+            root_filters: extracted_predicates.root_filters,
+        }))
     }
 
     /// Fold relation-local predicates into the leaf statistics consumed by DP.

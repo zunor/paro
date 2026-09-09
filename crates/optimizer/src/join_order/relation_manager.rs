@@ -265,6 +265,42 @@ impl RelationManager {
             .push(SingleJoinRelation::new(op, parent, stats));
     }
 
+    /// Add an atomic relation when the caller already owns a native operator
+    /// shell.
+    ///
+    /// Join enumeration only needs the relation-to-column namespace and its
+    /// statistics. Requiring callers to manufacture an `OwnedLogicalPlan`
+    /// (or a dummy `Get`) just to populate those two pieces reintroduces the
+    /// tree bridge that native rule producers are meant to avoid. The
+    /// relation manager keeps a transport-only `DummyScan` marker for this
+    /// path; native reconstruction owns the real child reference.
+    pub(crate) fn add_relation_shape(
+        &mut self,
+        table_indices: impl IntoIterator<Item = usize>,
+        stats: RelationStats,
+    ) {
+        let relation_id = self.relations.len();
+        for table_index in table_indices {
+            match self.relation_mapping.entry(table_index) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(relation_id);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    debug_assert_eq!(
+                        *entry.get(),
+                        relation_id,
+                        "table index {table_index} belongs to multiple join relations"
+                    );
+                }
+            }
+        }
+        self.relations.push(SingleJoinRelation::new(
+            LogicalOperator::DummyScan,
+            None,
+            stats,
+        ));
+    }
+
     /// Get the relation ID for a table index.
     pub fn get_relation_id(&self, table_index: usize) -> Option<usize> {
         self.relation_mapping.get(&table_index).copied()
