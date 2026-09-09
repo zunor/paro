@@ -57,6 +57,15 @@ task_id_type!(TaskObjectId);
 task_id_type!(BoundProofId);
 task_id_type!(CompletionObligationId);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TaskKind {
+    Discover,
+    Transform,
+    Implement,
+    Optimize,
+    Cost,
+}
+
 /// The semantic work requested by a task.  Physical goals are deliberately
 /// absent from discovery/transformation identities: a new grant does not
 /// recreate a logical equivalence closure.
@@ -85,6 +94,38 @@ pub enum TaskIntent {
         goal: OptimizationGoal,
         children: Box<[CandidateId]>,
     },
+}
+
+impl TaskIntent {
+    pub const fn kind(&self) -> TaskKind {
+        match self {
+            Self::Discover { .. } => TaskKind::Discover,
+            Self::Transform { .. } => TaskKind::Transform,
+            Self::Implement { .. } => TaskKind::Implement,
+            Self::Optimize { .. } => TaskKind::Optimize,
+            Self::Cost { .. } => TaskKind::Cost,
+        }
+    }
+
+    pub fn subproblem_key(&self) -> Option<SubproblemKey> {
+        match self {
+            Self::Optimize { group, goal } => Some(SubproblemKey {
+                group: *group,
+                goal: *goal,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical physical subproblem identity.  The complete goal remains part
+/// of the key: source response, memory completion, task supply and grant
+/// differences are observable parent dimensions and cannot be collapsed to a
+/// single winner per group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubproblemKey {
+    pub group: GroupId,
+    pub goal: OptimizationGoal,
 }
 
 /// Exact input revision of one task.  A revision is interned from the actual
@@ -207,6 +248,24 @@ pub struct TaskWakeup {
     pub task: TaskId,
     pub waiter: Option<WaiterId>,
     pub outcome: Option<TaskOutcome>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskRegistryProfile {
+    pub requests: u64,
+    pub unique_intents: u64,
+    pub unique_evaluations: u64,
+    pub reused_evaluations: u64,
+    pub single_flight_subscriptions: u64,
+    pub started: u64,
+    pub completed: u64,
+    pub suspended: u64,
+    pub invalidated: u64,
+    pub awaiting: u64,
+    pub reservation_attempts: u64,
+    pub reservation_reuses: u64,
+    pub reservation_rejections: u64,
+    pub bound_proofs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,11 +392,21 @@ pub struct TaskRegistry {
     committed_units: u64,
     reserved_units: u64,
     reservation_limit: Option<u64>,
+    profile: TaskRegistryProfile,
+    group_redirects: BTreeMap<GroupId, GroupId>,
+    group_revisions: BTreeMap<GroupId, u64>,
 }
 
 impl TaskRegistry {
     pub fn set_reservation_limit(&mut self, limit: Option<u64>) {
         self.reservation_limit = limit;
+    }
+
+    pub fn profile(&self) -> TaskRegistryProfile {
+        let mut profile = self.profile.clone();
+        profile.unique_intents = self.intents.len() as u64;
+        profile.unique_evaluations = self.evaluations.len() as u64;
+        profile
     }
 
     pub fn intern_intent(&mut self, intent: TaskIntent) -> TaskIntentId {
@@ -384,6 +453,7 @@ impl TaskRegistry {
     }
 
     pub fn request(&mut self, intent: TaskIntent, reads: ReadSet) -> Result<TaskRequest> {
+        self.profile.requests = self.profile.requests.saturating_add(1);
         let intent = self.intern_intent(intent);
         let read_set = self.intern_read_set(reads);
         let inputs = self.intern_input_revision(read_set)?;
@@ -394,10 +464,14 @@ impl TaskRegistry {
                 .ok_or_else(|| paro_error::internal("task evaluation index is corrupt"))?
                 .state;
             return match state {
-                TaskState::Completed | TaskState::Failed => Ok(TaskRequest::Reused {
-                    task,
-                    outcome: self.task(task).and_then(|record| record.outcome.clone()),
-                }),
+                TaskState::Completed | TaskState::Failed => {
+                    self.profile.reused_evaluations =
+                        self.profile.reused_evaluations.saturating_add(1);
+                    Ok(TaskRequest::Reused {
+                        task,
+                        outcome: self.task(task).and_then(|record| record.outcome.clone()),
+                    })
+                }
                 TaskState::Invalidated | TaskState::Suspended => {
                     self.task_mut(task)?.state = TaskState::Runnable;
                     self.task_mut(task)?.outcome = None;
@@ -405,6 +479,8 @@ impl TaskRegistry {
                 }
                 TaskState::Runnable | TaskState::Running | TaskState::Awaiting => {
                     let waiter = self.add_waiter(task)?;
+                    self.profile.single_flight_subscriptions =
+                        self.profile.single_flight_subscriptions.saturating_add(1);
                     Ok(TaskRequest::Subscriber { task, waiter })
                 }
             };
@@ -456,6 +532,67 @@ impl TaskRegistry {
         self.task(id).map(|task| task.state)
     }
 
+    pub fn canonical_group(&self, mut group: GroupId) -> GroupId {
+        while let Some(parent) = self.group_redirects.get(&group).copied() {
+            if parent == group {
+                break;
+            }
+            group = parent;
+        }
+        group
+    }
+
+    pub fn group_revision(&self, group: GroupId) -> u64 {
+        self.group_revisions
+            .get(&self.canonical_group(group))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Publish a Memo group redirect into the same task protocol.  Existing
+    /// evaluations that read either side are invalidated before a caller can
+    /// request work against the canonical group, so stale proofs cannot be
+    /// silently reused after merge/reinsert.
+    pub fn redirect_group(&mut self, from: GroupId, to: GroupId) -> Result<Vec<TaskWakeup>> {
+        let from = self.canonical_group(from);
+        let to = self.canonical_group(to);
+        if from == to {
+            return Ok(Vec::new());
+        }
+        self.group_redirects.insert(from, to);
+        let revision = self.group_revisions.entry(to).or_default();
+        *revision = revision.saturating_add(1);
+        let affected = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                let intent_group = self
+                    .intent(task.intent)
+                    .and_then(|intent| match intent {
+                        TaskIntent::Optimize { group, .. } => Some(*group),
+                        _ => None,
+                    })
+                    .is_some_and(|group| {
+                        let group = self.canonical_group(group);
+                        group == from || group == to
+                    });
+                let read_group = self.read_set(task.read_set).is_some_and(|reads| {
+                    reads.reads().iter().any(|read| {
+                        let group = self.canonical_group(read.group);
+                        group == from || group == to
+                    })
+                });
+                intent_group || read_group
+            })
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        let mut wakeups = Vec::new();
+        for task in affected {
+            wakeups.extend(self.invalidate(task)?);
+        }
+        Ok(wakeups)
+    }
+
     pub fn evaluation_key(&self, id: TaskId) -> Option<EvaluationKey> {
         self.task(id).map(|task| task.evaluation)
     }
@@ -497,6 +634,7 @@ impl TaskRegistry {
             )));
         }
         record.state = TaskState::Running;
+        self.profile.started = self.profile.started.saturating_add(1);
         Ok(())
     }
 
@@ -543,6 +681,9 @@ impl TaskRegistry {
             } else {
                 TaskState::Awaiting
             };
+        }
+        if !unresolved.is_empty() {
+            self.profile.awaiting = self.profile.awaiting.saturating_add(1);
         }
         for dependency in unresolved {
             self.dependents.entry(dependency).or_default().insert(task);
@@ -632,6 +773,18 @@ impl TaskRegistry {
             record.state = state;
             record.outcome = outcome.clone();
         }
+        match state {
+            TaskState::Completed => {
+                self.profile.completed = self.profile.completed.saturating_add(1)
+            }
+            TaskState::Suspended => {
+                self.profile.suspended = self.profile.suspended.saturating_add(1)
+            }
+            TaskState::Invalidated => {
+                self.profile.invalidated = self.profile.invalidated.saturating_add(1)
+            }
+            _ => {}
+        }
         let mut wakeups = self.take_waiters(task, outcome.clone());
         wakeups.extend(self.wake_dependents(task));
         Ok(wakeups)
@@ -645,6 +798,29 @@ impl TaskRegistry {
             return Err(paro_error::internal("task is not runnable for completion"));
         }
         self.finish(task, TaskState::Completed, Some(outcome))
+    }
+
+    pub fn complete_current(
+        &mut self,
+        task: TaskId,
+        memo: &Memo,
+        outcome: TaskOutcome,
+    ) -> Result<Vec<TaskWakeup>> {
+        let reads = self
+            .task(task)
+            .ok_or_else(|| paro_error::internal("unknown task publication"))?
+            .read_set;
+        if !self
+            .read_set(reads)
+            .ok_or_else(|| paro_error::internal("task publication lost its read set"))?
+            .is_current(memo)?
+        {
+            self.invalidate(task)?;
+            return Err(paro_error::internal(
+                "task publication rejected an obsolete ReadSet",
+            ));
+        }
+        self.complete(task, outcome)
     }
 
     pub fn suspend(&mut self, task: TaskId, outcome: TaskOutcome) -> Result<Vec<TaskWakeup>> {
@@ -749,6 +925,7 @@ impl TaskRegistry {
         slot: u64,
         units: u64,
     ) -> Result<Option<ReservationId>> {
+        self.profile.reservation_attempts = self.profile.reservation_attempts.saturating_add(1);
         if self.task(task).is_none() {
             return Err(paro_error::internal("reservation belongs to unknown task"));
         }
@@ -756,6 +933,7 @@ impl TaskRegistry {
             return Ok(None);
         }
         if let Some(reservation) = self.reservation_slots.get(&(task, slot)).copied() {
+            self.profile.reservation_reuses = self.profile.reservation_reuses.saturating_add(1);
             return Ok(Some(reservation));
         }
         let used = self.committed_units.saturating_add(self.reserved_units);
@@ -763,6 +941,8 @@ impl TaskRegistry {
             .reservation_limit
             .is_some_and(|limit| units > limit.saturating_sub(used))
         {
+            self.profile.reservation_rejections =
+                self.profile.reservation_rejections.saturating_add(1);
             return Ok(None);
         }
         let reservation = ReservationId::new(self.next_reservation as usize);
@@ -919,6 +1099,7 @@ impl TaskRegistry {
             context,
             kind,
         });
+        self.profile.bound_proofs = self.profile.bound_proofs.saturating_add(1);
         Ok(id)
     }
 
@@ -1126,6 +1307,32 @@ mod tests {
         assert_eq!(registry.published_owner(b_object), Some(b));
         assert_eq!(registry.committed_units(), 3);
         assert_eq!(registry.reserved_units(), 0);
+    }
+
+    #[test]
+    fn group_redirect_invalidates_old_subproblem_evaluations() {
+        let mut registry = TaskRegistry::default();
+        let goal = goal();
+        let task = match registry
+            .request(
+                TaskIntent::Optimize {
+                    group: GroupId::new(4),
+                    goal,
+                },
+                ReadSet::empty(),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            _ => unreachable!(),
+        };
+        registry.start(task).unwrap();
+        registry
+            .redirect_group(GroupId::new(4), GroupId::new(2))
+            .unwrap();
+        assert_eq!(registry.canonical_group(GroupId::new(4)), GroupId::new(2));
+        assert_eq!(registry.state(task), Some(TaskState::Invalidated));
+        assert_eq!(registry.profile().invalidated, 1);
     }
 
     #[test]

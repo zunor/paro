@@ -63,7 +63,8 @@ pub use scalar::{ScalarArena, ScalarKind, ScalarNode, ScalarProperties};
 pub use tasks::{
     BoundContext, BoundProof, BoundProofId, BoundProofKind, CompletionObligation,
     CompletionObligationId, Cursor, CursorId, EvaluationId, EvaluationKey, InputRevisionId,
-    ReadSet, ReadSetId, ReservationId, StopReason, TaskId, TaskIntent, TaskIntentId, TaskObjectId,
-    TaskOutcome, TaskRegistry, TaskRequest, TaskState, TaskWakeup,
+    ReadSet, ReadSetId, ReservationId, StopReason, SubproblemKey, TaskId, TaskIntent, TaskIntentId,
+    TaskKind, TaskObjectId, TaskOutcome, TaskRegistry, TaskRegistryProfile, TaskRequest, TaskState,
+    TaskWakeup,
 };
 pub use verifier::{MemoVerifier, WinnerVerifier};

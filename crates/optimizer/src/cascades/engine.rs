@@ -1284,6 +1284,7 @@ impl CascadesEngine {
     }
 
     pub fn search_work_counters(&self) -> BTreeMap<&'static str, u64> {
+        let task_profile = self.task_registry.profile();
         BTreeMap::from([
             ("winner_proposal_count", self.memo.winner_proposal_count()),
             ("published_winner_count", self.memo.published_winner_count()),
@@ -1316,6 +1317,22 @@ impl CascadesEngine {
                 "physical_implementation_reuse_count",
                 self.physical_implementation_reuses,
             ),
+            ("task_registry_request_count", task_profile.requests),
+            (
+                "task_registry_unique_intent_count",
+                task_profile.unique_intents,
+            ),
+            (
+                "task_registry_unique_evaluation_count",
+                task_profile.unique_evaluations,
+            ),
+            ("task_registry_reuse_count", task_profile.reused_evaluations),
+            (
+                "task_registry_single_flight_subscription_count",
+                task_profile.single_flight_subscriptions,
+            ),
+            ("task_registry_invalidation_count", task_profile.invalidated),
+            ("task_registry_awaiting_count", task_profile.awaiting),
         ])
     }
 
