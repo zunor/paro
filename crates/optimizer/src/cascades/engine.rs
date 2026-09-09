@@ -19,8 +19,8 @@ use super::enforcer::{EnforcementPlanner, EnforcerStep};
 use super::governor::{Governor, PlanMilestone, PlanningPolicy};
 use super::grant::{derive_grant_sensitivity, verify_grant_sharing, GrantSensitivitySummary};
 use super::ids::{
-    AdmissibleGrantSetId, Fingerprint, GroupId, ImplementationId, LogicalExprId, PhysicalExprId,
-    ResourceGrantClassId, RuleId, StableFingerprintBuilder,
+    AdmissibleGrantSetId, CandidateId, Fingerprint, GroupId, ImplementationId, LogicalExprId,
+    PhysicalExprId, ResourceGrantClassId, RuleId, StableFingerprintBuilder,
 };
 use super::memo::{
     CandidatePreview, CandidateSummary, ChildWinnerRef, EquivalenceProof, GrantGoalKey,
@@ -137,6 +137,19 @@ struct CostRecipe {
     region: Option<RegionCandidateContract>,
 }
 
+/// Exact query-local identity for one child-frontier combination. The budget
+/// ledger still stores its compact event handle, but the handle is interned
+/// from this full tuple instead of re-hashing the tuple on every hot-path
+/// admission. Candidate IDs remain distinct across frontier pruning and
+/// cost epochs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ChildCombinationIdentity {
+    physical: PhysicalExprId,
+    goal: OptimizationGoal,
+    recipe: Fingerprint,
+    children: Box<[CandidateId]>,
+}
+
 /// Fixed-size evidence used to replay property-enforcement cost. The row
 /// interval is the candidate output estimate; the grant fields make blocking
 /// enforcers part of feasibility rather than an extraction-time surprise.
@@ -242,6 +255,8 @@ pub struct CascadesEngine {
     physical_subproblem_reuses: u64,
     physical_subproblem_evaluations: u64,
     physical_implementation_requests: u64,
+    child_combination_events: BTreeMap<ChildCombinationIdentity, Fingerprint>,
+    next_child_combination_event: u128,
     /// Shared task identity/progress protocol.  Memo remains the owner of
     /// expressions, candidates and facts; this registry only coordinates
     /// resumable work and publication state.
@@ -290,6 +305,8 @@ impl CascadesEngine {
             physical_subproblem_reuses: 0,
             physical_subproblem_evaluations: 0,
             physical_implementation_requests: 0,
+            child_combination_events: BTreeMap::new(),
+            next_child_combination_event: 1,
             task_registry: TaskRegistry::default(),
             governor: Governor::new(PlanningPolicy::default())
                 .expect("default planning policy must be valid"),
@@ -2063,6 +2080,38 @@ impl CascadesEngine {
         }
     }
 
+    fn intern_child_combination_event(
+        &mut self,
+        physical: PhysicalExprId,
+        goal: OptimizationGoal,
+        recipe: Fingerprint,
+        children: &[ChildWinnerRef],
+    ) -> Result<Fingerprint> {
+        let identity = ChildCombinationIdentity {
+            physical,
+            goal,
+            recipe,
+            children: children
+                .iter()
+                .map(|child| child.candidate)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        };
+        if let Some(event) = self.child_combination_events.get(&identity).copied() {
+            return Ok(event);
+        }
+        let event_id = self.next_child_combination_event;
+        self.next_child_combination_event = event_id
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("child-combination event identity exhausted"))?;
+        // The ChildFrontierCombination dimension is owned by this query's
+        // engine, so a monotone interned handle is sufficient and avoids a
+        // cryptographic digest for every repeated combination admission.
+        let event = Fingerprint((1_u128 << 127) | event_id);
+        self.child_combination_events.insert(identity, event);
+        Ok(event)
+    }
+
     fn optimize_group_inner(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
         self.enumerate_implementations(group, goal)?;
         let required = self
@@ -2191,12 +2240,12 @@ impl CascadesEngine {
                     break;
                 }
                 if ordinal > 0 {
-                    let event = child_frontier_combination_event(
+                    let event = self.intern_child_combination_event(
                         physical,
                         goal,
                         recipe.physical_fingerprint,
                         &child_selections,
-                    );
+                    )?;
                     if self
                         .memo
                         .group_ledger_mut(group)
@@ -2817,27 +2866,6 @@ fn child_winner_combinations(
             end: total.min(witness_limit),
         },
     }
-}
-
-fn child_frontier_combination_event(
-    physical: PhysicalExprId,
-    goal: OptimizationGoal,
-    recipe: Fingerprint,
-    children: &[ChildWinnerRef],
-) -> Fingerprint {
-    let mut event = StableFingerprintBuilder::default();
-    event.write_bytes(b"paro.memo.child-frontier-combination.v1");
-    event.write_u64(physical.0 as u64);
-    event.write_u64(goal.required.0 as u64);
-    event.write_u64(goal.row_goal.stable_tag());
-    event.write_u64(goal.objective.stable_tag());
-    event.write_u64(goal.grant.stable_tag());
-    event.write_u64(goal.context.0 as u64);
-    event.write_fingerprint(recipe);
-    for child in children {
-        event.write_u64(child.candidate.0 as u64);
-    }
-    event.finish()
 }
 
 fn resolve_task_supply(

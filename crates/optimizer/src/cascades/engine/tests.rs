@@ -12,7 +12,8 @@ use super::*;
 use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::ids::{
-    AdmissibleGrantSetId, ColumnId, LogicalPayloadId, OptimizationContextId, PhysicalPayloadId,
+    AdmissibleGrantSetId, CandidateId, ColumnId, LogicalPayloadId, OptimizationContextId,
+    PhysicalExprId, PhysicalPayloadId,
 };
 use crate::cascades::memo::{
     GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, OptimizationContext,
@@ -1254,6 +1255,40 @@ fn shared_child_product_is_lazy_and_uses_immutable_candidate_references() {
         1,
         "enumeration cannot allocate Memo nodes"
     );
+}
+
+#[test]
+fn child_combination_event_interning_is_exact() {
+    let (mut engine, group, goal) = engine(0);
+    let left = ChildWinnerRef {
+        group,
+        goal,
+        candidate: CandidateId::new(1),
+    };
+    let right = ChildWinnerRef {
+        group,
+        goal,
+        candidate: CandidateId::new(2),
+    };
+    let first = [left, right];
+    let reordered = [right, left];
+    let event = engine
+        .intern_child_combination_event(PhysicalExprId(7), goal, Fingerprint(11), &first)
+        .unwrap();
+    assert_eq!(
+        event,
+        engine
+            .intern_child_combination_event(PhysicalExprId(7), goal, Fingerprint(11), &first)
+            .unwrap()
+    );
+    assert_ne!(
+        event,
+        engine
+            .intern_child_combination_event(PhysicalExprId(7), goal, Fingerprint(11), &reordered)
+            .unwrap()
+    );
+    assert_eq!(engine.child_combination_events.len(), 2);
+    assert!(event.0 & (1_u128 << 127) != 0);
 }
 
 #[test]
