@@ -61,6 +61,23 @@ impl Memo {
                 source_payload_bytes,
             });
             for (goal, frontier) in &group.winner_frontiers {
+                // Opt-in exact vectors explain which continuation tradeoffs
+                // retain a hot frontier. Never format these in normal builds.
+                if frontier.truncations != 0
+                    && tracing::enabled!(target: "paro::optimizer::frontier", tracing::Level::DEBUG)
+                {
+                    for winner in &frontier.candidates {
+                        tracing::debug!(
+                            target: "paro::optimizer::frontier",
+                            group = group.id.index(),
+                            ?goal,
+                            candidate = winner.candidate.index(),
+                            expression = winner.expression.index(),
+                            cost = ?winner.cost,
+                            "bounded frontier candidate"
+                        );
+                    }
+                }
                 frontiers.push(PhysicalFrontierProfile {
                     group: group.id,
                     goal: *goal,

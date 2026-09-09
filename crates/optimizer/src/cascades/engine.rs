@@ -1875,10 +1875,11 @@ impl CascadesEngine {
                 );
                 let joint_cost_proof =
                     build_joint_cost_proof(&self.memo, group, &recipe, local_cost)?;
-                if self
-                    .memo
-                    .group(group)
-                    .is_some_and(|group| group.logical_exprs().len() > 1)
+                if tracing::enabled!(target: "paro::optimizer", tracing::Level::DEBUG)
+                    && self
+                        .memo
+                        .group(group)
+                        .is_some_and(|group| group.logical_exprs().len() > 1)
                 {
                     let logical_expression = self
                         .memo
