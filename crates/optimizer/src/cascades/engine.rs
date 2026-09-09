@@ -26,6 +26,7 @@ use super::memo::{
     ChildWinnerRef, EquivalenceProof, GrantGoalKey, GroupCardinality, LogicalProperties, Memo,
     OptimizationGoal, Winner,
 };
+use super::quality::QualityBundleRegistry;
 use super::region::{
     JointCostProof, RegionArtifactKind, RegionBoundaryEndpoint, RegionCandidateContract,
     RegionDependencyEdge, RegionDependencyKind,
@@ -244,11 +245,16 @@ pub struct CascadesEngine {
     /// resumable work and publication state.
     task_registry: TaskRegistry,
     governor: Governor,
+    quality_bundles: QualityBundleRegistry,
 }
 
 impl CascadesEngine {
     pub fn new(memo: Memo, registry: ImplementationRegistry) -> Self {
         let budget = memo.budget().clone();
+        let mut quality_bundles = QualityBundleRegistry::default();
+        quality_bundles
+            .register_builtin_f1_f4()
+            .expect("built-in quality bundles must have unique identities");
         Self {
             mandatory_only: false,
             memo,
@@ -285,6 +291,7 @@ impl CascadesEngine {
             task_registry: TaskRegistry::default(),
             governor: Governor::new(PlanningPolicy::default())
                 .expect("default planning policy must be valid"),
+            quality_bundles,
         }
     }
 
@@ -302,6 +309,10 @@ impl CascadesEngine {
 
     pub fn governor(&self) -> &Governor {
         &self.governor
+    }
+
+    pub fn quality_bundles(&self) -> &QualityBundleRegistry {
+        &self.quality_bundles
     }
 
     /// Enable the per-rule phase ledger only for an explicitly requested

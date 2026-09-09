@@ -21,6 +21,7 @@ pub mod engine;
 pub mod governor;
 pub mod grant;
 pub mod planner;
+pub mod quality;
 pub mod ids {
     pub use crate::physical::identity::*;
 }
@@ -56,6 +57,10 @@ pub use planner::{
     SEARCH_REGION_ENUMERATOR_RULE,
 };
 pub use properties::{ProvidedProperties, RequiredProperties};
+pub use quality::{
+    BundleCapability, BundleFact, BundleId, BundleInput, BundleResult, BundleState,
+    PReadyCertificate, QualityBundleRegistry, QualityBundleSpec,
+};
 pub use region::{
     FacetCriticality, JointCostProof, RegionArtifactKind, RegionCandidateContract,
     RegionDependencyEdge, RegionDependencyKind, RegionFacet, RegionFacetKind, RegionForest,
