@@ -492,3 +492,13 @@ an interrupted attempt publishes no fact, never a false negative. Every possible
 interruption prefix in the narrowing-evidence fixture is tested. At this change,
 full workspace **6493 passed / 85 ignored**, optimizer **1022 passed**, and
 strict workspace/all-target Clippy passes. New cold and SQL evidence is pending.
+
+Post-change checks at `8e86d939` (code `d017a4b6`): the fresh release SQL suite
+passes **184/184** in 44.28 s, with no expected-result changes.
+`native-q11-cold-native-scalar-facts-20260909.json` records five fresh-process
+samples, median **1369.585 ms** and median RSS **350,978,048 bytes**. Every search
+counter and plan digest matches the isolated-seed baseline, but the strict
+`--max-ratio 1.0` gate **fails**: wall/optimizer time is 1.012x and RSS is 1.004x.
+The scoped-evidence repair is retained as an architectural/ownership contract;
+these samples do not demonstrate a cold-planning improvement. The timing gate
+was not loosened and its baseline was not replaced.
