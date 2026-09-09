@@ -200,7 +200,6 @@ pub struct CascadesEngine {
     registry: ImplementationRegistry,
     enforcement: EnforcementPlanner,
     recipes: BTreeMap<(PhysicalExprId, OptimizationGoal, Fingerprint), Arc<CostRecipe>>,
-    implemented_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     infeasible_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     active_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     grant_class_sets: BTreeMap<ResourceGrantClassId, AdmissibleGrantSetId>,
@@ -239,7 +238,6 @@ pub struct CascadesEngine {
     physical_subproblem_reuses: u64,
     physical_subproblem_evaluations: u64,
     physical_implementation_requests: u64,
-    physical_implementation_reuses: u64,
     /// Shared task identity/progress protocol.  Memo remains the owner of
     /// expressions, candidates and facts; this registry only coordinates
     /// resumable work and publication state.
@@ -258,7 +256,6 @@ impl CascadesEngine {
                 budget.max_optional_enforcer_chains_per_goal,
             ),
             recipes: BTreeMap::new(),
-            implemented_goals: BTreeSet::new(),
             infeasible_goals: BTreeSet::new(),
             active_goals: BTreeSet::new(),
             grant_class_sets: BTreeMap::new(),
@@ -283,7 +280,6 @@ impl CascadesEngine {
             physical_subproblem_reuses: 0,
             physical_subproblem_evaluations: 0,
             physical_implementation_requests: 0,
-            physical_implementation_reuses: 0,
             task_registry: TaskRegistry::default(),
         }
     }
@@ -353,7 +349,6 @@ impl CascadesEngine {
     fn reset_cost_epoch(&mut self) -> Result<()> {
         self.memo.clear_cost_frontiers()?;
         self.recipes.clear();
-        self.implemented_goals.clear();
         self.infeasible_goals.clear();
         self.grant_sensitivity.clear();
         self.region_candidates.clear();
@@ -1313,10 +1308,6 @@ impl CascadesEngine {
                 "physical_implementation_request_count",
                 self.physical_implementation_requests,
             ),
-            (
-                "physical_implementation_reuse_count",
-                self.physical_implementation_reuses,
-            ),
             ("task_registry_request_count", task_profile.requests),
             (
                 "task_registry_unique_intent_count",
@@ -1546,11 +1537,6 @@ impl CascadesEngine {
         let group = self.memo.canonical_group(group);
         self.physical_implementation_requests =
             self.physical_implementation_requests.saturating_add(1);
-        if !self.implemented_goals.insert((group, goal)) {
-            self.physical_implementation_reuses =
-                self.physical_implementation_reuses.saturating_add(1);
-            return Ok(());
-        }
         let mut agenda = StableAgenda::default();
         let logical_exprs = self
             .memo
@@ -1770,13 +1756,17 @@ impl CascadesEngine {
             return Ok(());
         }
         let group = self.memo.canonical_group(group);
+        self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
         let read_set = ReadSet::new([PatternRead::from_group(&self.memo, group)?]);
         let task = match self
             .task_registry
             .request(TaskIntent::Optimize { group, goal }, read_set)?
         {
             TaskRequest::Leader(task) => task,
-            TaskRequest::Reused { .. } => return Ok(()),
+            TaskRequest::Reused { .. } => {
+                self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
+                return Ok(());
+            }
             TaskRequest::Subscriber { task, .. } => {
                 return Err(paro_error::internal(format!(
                     "recursive optimization request is already in flight for task {task:?}"
@@ -1784,7 +1774,6 @@ impl CascadesEngine {
             }
         };
         self.task_registry.start(task)?;
-        self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
         if self
             .memo
             .group(group)
