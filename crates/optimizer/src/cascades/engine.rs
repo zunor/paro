@@ -2143,7 +2143,7 @@ impl CascadesEngine {
                             .consumed(BudgetDimension::ChildFrontierCombination),
                     )
                     .saturating_add(1);
-            let combinations =
+            let mut combinations =
                 child_winner_combinations(child_frontiers, admitted_combination_limit);
             let (completion, first_omitted_ordinal, omitted_at_least) =
                 match combinations.completion {
@@ -2182,7 +2182,11 @@ impl CascadesEngine {
                 generated_combinations = combinations.combinations.len(),
                 "enumerated bounded child frontier product"
             );
-            for (ordinal, child_selections) in combinations.combinations.enumerate() {
+            let child_frontier_count = recipe.child_goals.len();
+            let mut child_selections = Vec::with_capacity(child_frontier_count);
+            let mut child_costs = Vec::with_capacity(child_frontier_count);
+            let mut child_fingerprints = Vec::with_capacity(child_frontier_count);
+            while let Some(ordinal) = combinations.combinations.next_into(&mut child_selections) {
                 if !self.memo.control().checkpoint()? {
                     break;
                 }
@@ -2203,67 +2207,67 @@ impl CascadesEngine {
                         continue;
                     }
                 }
-                let child_winners = child_selections
-                    .iter()
-                    .map(|child| {
-                        self.memo.resolve_child_winner(*child).ok_or_else(|| {
+                child_costs.clear();
+                child_fingerprints.clear();
+                let (local_cost, source_work, mut cost) = {
+                    let mut child_source_work_refs = Vec::with_capacity(child_frontier_count);
+                    for child in &child_selections {
+                        let winner = self.memo.resolve_child_winner(*child).ok_or_else(|| {
                             paro_error::internal("child product lost an immutable candidate")
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let child_costs = child_winners
-                    .iter()
-                    .map(|winner| winner.cost)
-                    .collect::<Vec<_>>();
-                let child_source_work_refs = child_winners
-                    .iter()
-                    .map(|winner| winner.source_work.as_ref())
-                    .collect::<Vec<_>>();
-                let Some(local_cost) = fit_local_retained_state_to_grant_ref(
-                    recipe.local_cost,
-                    &child_costs,
-                    &recipe.cost_composition,
-                    recipe.spillable,
-                    recipe.enforcer_cost_input,
-                )?
-                else {
-                    tracing::debug!(
-                        target: "paro::optimizer",
-                        memo_group = group.index(),
-                        physical_expression = physical.index(),
-                        local_peak_memory = recipe.local_cost.peak_memory_upper,
-                        spillable = recipe.spillable,
-                        hard_memory = recipe.enforcer_cost_input.hard_memory_bytes,
-                        "physical recipe rejected by its resource grant"
-                    );
-                    continue;
-                };
-                let local_without_source_filter = match recipe.source_filter_apply_cost {
-                    Some(apply) => local_cost.replace_work(apply, SearchCost::ZERO)?,
-                    None => local_cost,
-                };
-                let mut local_cost = resolve_task_supply(
-                    local_without_source_filter,
-                    &child_costs,
-                    &recipe.task_supply,
-                    self.memo.calibration(),
-                )?;
-                if let Some(apply) = recipe.source_filter_apply_cost {
-                    local_cost = local_cost.replace_work(SearchCost::ZERO, apply)?;
-                }
-                let composed = compose_candidate_cost_with_sources_at_ref(
-                    local_cost,
-                    recipe.source_filter_apply_cost,
-                    &child_costs,
-                    &child_source_work_refs,
-                    &recipe.cost_composition,
-                    self.memo.calibration(),
-                )?;
-                let source_work = composed.source_work;
-                let Some(mut cost) =
-                    constrain_composed_cost_to_grant(composed.cost, recipe.enforcer_cost_input)?
-                else {
-                    continue;
+                        })?;
+                        child_costs.push(winner.cost);
+                        child_source_work_refs.push(winner.source_work.as_ref());
+                        child_fingerprints.push(winner.physical_fingerprint);
+                    }
+                    let Some(local_cost) = fit_local_retained_state_to_grant_ref(
+                        recipe.local_cost,
+                        &child_costs,
+                        &recipe.cost_composition,
+                        recipe.spillable,
+                        recipe.enforcer_cost_input,
+                    )?
+                    else {
+                        tracing::debug!(
+                            target: "paro::optimizer",
+                            memo_group = group.index(),
+                            physical_expression = physical.index(),
+                            local_peak_memory = recipe.local_cost.peak_memory_upper,
+                            spillable = recipe.spillable,
+                            hard_memory = recipe.enforcer_cost_input.hard_memory_bytes,
+                            "physical recipe rejected by its resource grant"
+                        );
+                        continue;
+                    };
+                    let local_without_source_filter = match recipe.source_filter_apply_cost {
+                        Some(apply) => local_cost.replace_work(apply, SearchCost::ZERO)?,
+                        None => local_cost,
+                    };
+                    let mut local_cost = resolve_task_supply(
+                        local_without_source_filter,
+                        &child_costs,
+                        &recipe.task_supply,
+                        self.memo.calibration(),
+                    )?;
+                    if let Some(apply) = recipe.source_filter_apply_cost {
+                        local_cost = local_cost.replace_work(SearchCost::ZERO, apply)?;
+                    }
+                    let composed = compose_candidate_cost_with_sources_at_ref(
+                        local_cost,
+                        recipe.source_filter_apply_cost,
+                        &child_costs,
+                        &child_source_work_refs,
+                        &recipe.cost_composition,
+                        self.memo.calibration(),
+                    )?;
+                    let source_work = composed.source_work;
+                    let Some(cost) = constrain_composed_cost_to_grant(
+                        composed.cost,
+                        recipe.enforcer_cost_input,
+                    )?
+                    else {
+                        continue;
+                    };
+                    (local_cost, source_work, cost)
                 };
                 let physical_properties = self
                     .memo
@@ -2311,9 +2315,7 @@ impl CascadesEngine {
                 let fingerprint = enforced_fingerprint(
                     recipe.physical_fingerprint,
                     &enforced.steps,
-                    child_winners
-                        .iter()
-                        .map(|winner| winner.physical_fingerprint),
+                    child_fingerprints.iter().copied(),
                 );
                 let summary = CandidateSummary {
                     expression: physical,
@@ -2408,7 +2410,7 @@ impl CascadesEngine {
                 let winner = Winner {
                     candidate: super::ids::CandidateId::INVALID,
                     expression: physical,
-                    children: child_selections.into_boxed_slice(),
+                    children: child_selections.clone().into_boxed_slice(),
                     enforcers: enforced.steps,
                     enforcer_cost_input: recipe.enforcer_cost_input,
                     provided: enforced.provided,
@@ -2757,23 +2759,34 @@ impl Iterator for ChildWinnerCombinations {
     type Item = Vec<ChildWinnerRef>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next == self.end {
-            return None;
-        }
-        let mut ordinal = self.next;
-        self.next += 1;
         let mut result = Vec::with_capacity(self.frontiers.len());
-        for frontier in self.frontiers.iter().rev() {
-            result.push(frontier[ordinal % frontier.len()]);
-            ordinal /= frontier.len();
-        }
-        result.reverse();
+        self.next_into(&mut result)?;
         Some(result)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.end - self.next;
         (remaining, Some(remaining))
+    }
+}
+
+impl ChildWinnerCombinations {
+    /// Fill a caller-owned selection buffer so repeated products do not
+    /// allocate one Vec per candidate combination.
+    fn next_into(&mut self, result: &mut Vec<ChildWinnerRef>) -> Option<usize> {
+        if self.next == self.end {
+            return None;
+        }
+        let mut ordinal = self.next;
+        self.next += 1;
+        result.clear();
+        result.reserve(self.frontiers.len().saturating_sub(result.capacity()));
+        for frontier in self.frontiers.iter().rev() {
+            result.push(frontier[ordinal % frontier.len()]);
+            ordinal /= frontier.len();
+        }
+        result.reverse();
+        Some(self.next - 1)
     }
 }
 
