@@ -762,6 +762,75 @@ fn bounded_winner_frontier_reports_an_anytime_obligation() {
 }
 
 #[test]
+fn candidate_preview_matches_bounded_frontier_admission() {
+    let goal = OptimizationGoal {
+        required: PropertySetId(0),
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    let winner = |id: u32, score: f64, memory: u64| Winner {
+        candidate: CandidateId::INVALID,
+        expression: PhysicalExprId::new(id as usize),
+        children: Box::new([]),
+        enforcers: Box::new([]),
+        enforcer_cost_input: enforcer_cost_input(),
+        provided: provided(),
+        local_cost: SearchCost {
+            score: ScoreSummary {
+                range: CompactRange::point(score).unwrap(),
+                risk_adjusted: score,
+            },
+            peak_memory_upper: memory,
+            revocable_memory_target: memory,
+            ..SearchCost::ZERO
+        },
+        source_filter_apply_cost: None,
+        cost_composition: CostComposition::Sequential,
+        cost: SearchCost {
+            score: ScoreSummary {
+                range: CompactRange::point(score).unwrap(),
+                risk_adjusted: score,
+            },
+            peak_memory_upper: memory,
+            revocable_memory_target: memory,
+            ..SearchCost::ZERO
+        },
+        source_work: Box::new([]),
+        physical_fingerprint: Fingerprint(id as u128),
+        joint_cost_proof: None,
+    };
+    fn summary(value: &Winner) -> CandidateSummary<'_> {
+        CandidateSummary {
+            expression: value.expression,
+            cost: value.cost,
+            source_work: value.source_work.as_ref(),
+            physical_fingerprint: value.physical_fingerprint,
+        }
+    }
+
+    let first = winner(1, 1.0, 10_000);
+    let mut frontier = WinnerFrontier::default();
+    assert_eq!(
+        frontier.preview(goal, summary(&first), 1),
+        CandidatePreview::Publish
+    );
+    frontier.insert_with_limit(goal, first, 1);
+
+    let worse = winner(2, 2.0, 1);
+    assert_eq!(
+        frontier.preview(goal, summary(&worse), 1),
+        CandidatePreview::Truncated
+    );
+    let better = winner(3, 0.5, 20_000);
+    assert_eq!(
+        frontier.preview(goal, summary(&better), 1),
+        CandidatePreview::Publish
+    );
+}
+
+#[test]
 fn incremental_frontier_matches_an_independent_exhaustive_pareto_oracle() {
     // Two entries have identical continuation coordinates but independent
     // lower-bound evidence. They represent one operating point, not an extra

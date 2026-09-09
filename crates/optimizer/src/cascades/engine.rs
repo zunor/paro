@@ -23,8 +23,8 @@ use super::ids::{
     ResourceGrantClassId, RuleId, StableFingerprintBuilder,
 };
 use super::memo::{
-    ChildWinnerRef, EquivalenceProof, GrantGoalKey, GroupCardinality, LogicalProperties, Memo,
-    OptimizationGoal, Winner,
+    CandidatePreview, CandidateSummary, ChildWinnerRef, EquivalenceProof, GrantGoalKey,
+    GroupCardinality, LogicalProperties, Memo, OptimizationGoal, Winner,
 };
 use super::quality::QualityBundleRegistry;
 use super::region::{
@@ -2304,8 +2304,33 @@ impl CascadesEngine {
                         .iter()
                         .map(|winner| winner.physical_fingerprint),
                 );
-                let joint_cost_proof =
-                    build_joint_cost_proof(&self.memo, group, &recipe, local_cost)?;
+                let summary = CandidateSummary {
+                    expression: physical,
+                    cost,
+                    source_work: source_work.as_ref(),
+                    physical_fingerprint: fingerprint,
+                };
+                match self.memo.candidate_preview(group, goal, summary)? {
+                    CandidatePreview::Rejected => {
+                        self.memo.record_rejected_winner_proposal(
+                            group,
+                            goal,
+                            fingerprint,
+                            false,
+                        )?;
+                        continue;
+                    }
+                    CandidatePreview::Truncated => {
+                        self.memo.record_rejected_winner_proposal(
+                            group,
+                            goal,
+                            fingerprint,
+                            true,
+                        )?;
+                        continue;
+                    }
+                    CandidatePreview::Publish | CandidatePreview::MustMaterialize => {}
+                }
                 if tracing::enabled!(target: "paro::optimizer", tracing::Level::DEBUG)
                     && self
                         .memo
@@ -2367,6 +2392,8 @@ impl CascadesEngine {
                         "costed an equivalent physical candidate"
                     );
                 }
+                let joint_cost_proof =
+                    build_joint_cost_proof(&self.memo, group, &recipe, local_cost)?;
                 let winner = Winner {
                     candidate: super::ids::CandidateId::INVALID,
                     expression: physical,

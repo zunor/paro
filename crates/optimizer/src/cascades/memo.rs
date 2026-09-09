@@ -811,6 +811,34 @@ pub struct Winner {
     pub joint_cost_proof: Option<JointCostProof>,
 }
 
+/// The complete parent-observable portion of a candidate that is needed for
+/// frontier admission.  Child references, enforcer steps and proof/source
+/// payloads are deliberately absent: they are only materialized after this
+/// summary proves that the candidate can enter the bounded frontier.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CandidateSummary<'a> {
+    pub(crate) expression: PhysicalExprId,
+    pub(crate) cost: SearchCost,
+    pub(crate) source_work: &'a [super::rules::SourceWork],
+    pub(crate) physical_fingerprint: Fingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidatePreview {
+    /// The candidate changes the retained frontier and its owned payload must
+    /// be materialized before insertion.
+    Publish,
+    /// The candidate changes the frontier by retiring an incumbent, but the
+    /// bounded position itself is outside the retained prefix.
+    MustMaterialize,
+    /// An incumbent already dominates the candidate; no frontier mutation is
+    /// needed and the owned payload can be skipped.
+    Rejected,
+    /// The candidate is outside the bounded prefix without retiring an
+    /// incumbent.  Record the boundary obligation, but do not persist it.
+    Truncated,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WinnerFrontier {
     // The frontier indexes immutable published candidates. Its reordering and
@@ -836,6 +864,80 @@ impl WinnerFrontier {
 
     pub fn candidates(&self) -> &[Arc<Winner>] {
         &self.candidates
+    }
+
+    /// Check whether a candidate would be published without constructing its
+    /// owned child/proof payload.  The comparison is intentionally identical
+    /// to `insert_with_limit`: source response, continuation cost and stable
+    /// tie-breaks remain visible, so this is not a score-only shortcut.
+    pub(crate) fn preview(
+        &self,
+        goal: OptimizationGoal,
+        candidate: CandidateSummary<'_>,
+        limit: usize,
+    ) -> CandidatePreview {
+        if self.candidates.iter().any(|incumbent| {
+            match winner_continuation_cmp_summary(
+                incumbent,
+                &candidate,
+                &self.filterable_sources,
+                goal.objective,
+            ) {
+                Some(std::cmp::Ordering::Less) => true,
+                Some(std::cmp::Ordering::Equal) => {
+                    winner_tie_break(incumbent) <= summary_tie_break(&candidate)
+                }
+                _ => false,
+            }
+        }) {
+            return CandidatePreview::Rejected;
+        }
+
+        let mut position = 0usize;
+        let mut retires_incumbent = false;
+        for incumbent in &self.candidates {
+            let removed = match summary_continuation_cmp_winner(
+                &candidate,
+                incumbent,
+                &self.filterable_sources,
+                goal.objective,
+            ) {
+                Some(std::cmp::Ordering::Less) => true,
+                Some(std::cmp::Ordering::Equal) => {
+                    summary_tie_break(&candidate) >= winner_tie_break(incumbent)
+                }
+                _ => false,
+            };
+            if removed {
+                retires_incumbent = true;
+                continue;
+            }
+            let order = goal
+                .objective
+                .compare(&incumbent.cost, &candidate.cost)
+                .then_with(|| winner_tie_break(incumbent).cmp(&summary_tie_break(&candidate)));
+            if order.is_gt() {
+                break;
+            }
+            position = position.saturating_add(1);
+        }
+        if position < limit.max(1) {
+            CandidatePreview::Publish
+        } else if retires_incumbent {
+            CandidatePreview::MustMaterialize
+        } else {
+            CandidatePreview::Truncated
+        }
+    }
+
+    fn record_rejected_proposal(&mut self) {
+        self.proposals = self.proposals.saturating_add(1);
+    }
+
+    fn record_truncated_proposal(&mut self) {
+        self.proposals = self.proposals.saturating_add(1);
+        self.truncations = self.truncations.saturating_add(1);
+        self.high_water = self.high_water.max(self.candidates.len().saturating_add(1));
     }
 
     /// Retain the complete non-dominated set, then order it by the explicit
@@ -954,6 +1056,71 @@ fn winner_continuation_cmp(
     // histories forever across a closed root/sharing boundary.
     let order = left.cost.continuation_cmp_for(&right.cost, objective)?;
     source_response_equal(left, right, sources).then_some(order)
+}
+
+fn winner_continuation_cmp_summary(
+    winner: &Winner,
+    summary: &CandidateSummary<'_>,
+    sources: &BTreeSet<super::rules::WorkSourceId>,
+    objective: ObjectiveProfile,
+) -> Option<std::cmp::Ordering> {
+    let order = winner.cost.continuation_cmp_for(&summary.cost, objective)?;
+    let same_sources = if sources.is_empty() {
+        true
+    } else {
+        winner
+            .source_work
+            .iter()
+            .filter(|lane| sources.contains(&lane.source))
+            .eq(summary
+                .source_work
+                .iter()
+                .filter(|lane| sources.contains(&lane.source)))
+    };
+    same_sources.then_some(order)
+}
+
+fn summary_continuation_cmp_winner(
+    summary: &CandidateSummary<'_>,
+    winner: &Winner,
+    sources: &BTreeSet<super::rules::WorkSourceId>,
+    objective: ObjectiveProfile,
+) -> Option<std::cmp::Ordering> {
+    let order = summary.cost.continuation_cmp_for(&winner.cost, objective)?;
+    let same_sources = if sources.is_empty() {
+        true
+    } else {
+        summary
+            .source_work
+            .iter()
+            .filter(|lane| sources.contains(&lane.source))
+            .eq(winner
+                .source_work
+                .iter()
+                .filter(|lane| sources.contains(&lane.source)))
+    };
+    same_sources.then_some(order)
+}
+
+fn summary_tie_break(summary: &CandidateSummary<'_>) -> (PhysicalExprId, Fingerprint) {
+    (summary.expression, summary.physical_fingerprint)
+}
+
+fn winner_frontier_budget_witness(
+    group: GroupId,
+    goal: OptimizationGoal,
+    physical_fingerprint: Fingerprint,
+) -> Fingerprint {
+    let mut witness = StableFingerprintBuilder::default();
+    witness.write_bytes(b"paro.winner-frontier-boundary.v1");
+    witness.write_u64(group.0 as u64);
+    witness.write_u64(goal.required.0 as u64);
+    witness.write_u64(goal.row_goal.stable_tag());
+    witness.write_u64(goal.objective.stable_tag());
+    witness.write_u64(goal.grant.stable_tag());
+    witness.write_u64(goal.context.0 as u64);
+    witness.write_fingerprint(physical_fingerprint);
+    witness.finish()
 }
 
 fn winner_tie_break(winner: &Winner) -> (PhysicalExprId, Fingerprint) {
@@ -2361,18 +2528,10 @@ impl Memo {
                 .insert_with_limit(goal, winner, frontier_limit),
         };
         if insertion.truncated {
-            let mut frontier_witness = StableFingerprintBuilder::default();
-            frontier_witness.write_bytes(b"paro.winner-frontier-boundary.v1");
-            frontier_witness.write_u64(group.0 as u64);
-            frontier_witness.write_u64(goal.required.0 as u64);
-            frontier_witness.write_u64(goal.row_goal.stable_tag());
-            frontier_witness.write_u64(goal.objective.stable_tag());
-            frontier_witness.write_u64(goal.grant.stable_tag());
-            frontier_witness.write_u64(goal.context.0 as u64);
-            frontier_witness.write_fingerprint(physical_fingerprint);
-            self.groups[group.index()]
-                .ledger
-                .record_budget_limited(BudgetDimension::WinnerFrontier, frontier_witness.finish());
+            self.groups[group.index()].ledger.record_budget_limited(
+                BudgetDimension::WinnerFrontier,
+                winner_frontier_budget_witness(group, goal, physical_fingerprint),
+            );
         }
         if let Some(winner) = insertion.published {
             self.winner_candidates.push(WinnerCandidate {
@@ -2382,6 +2541,64 @@ impl Memo {
             });
         }
         Ok(insertion.selected_changed)
+    }
+
+    /// Test the bounded frontier with only the parent-observable summary.
+    /// Callers use this before allocating child/proof payloads for a
+    /// candidate that cannot be published.
+    pub(crate) fn candidate_preview(
+        &self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        candidate: CandidateSummary<'_>,
+    ) -> Result<CandidatePreview> {
+        let group = self.canonical_group(group);
+        let Some(group) = self.group(group) else {
+            return Err(paro_error::internal(
+                "candidate summary references an unknown group",
+            ));
+        };
+        Ok(group
+            .winner_frontier(goal)
+            .map_or(CandidatePreview::Publish, |frontier| {
+                frontier.preview(
+                    goal,
+                    candidate,
+                    self.budget.max_winner_frontier_candidates_per_goal as usize,
+                )
+            }))
+    }
+
+    /// Preserve proposal accounting when a summary proves that the owned
+    /// candidate payload cannot enter the frontier.  No candidate archive or
+    /// child tuple is allocated for this path.
+    pub(crate) fn record_rejected_winner_proposal(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        physical_fingerprint: Fingerprint,
+        truncated: bool,
+    ) -> Result<()> {
+        let group = self.canonical_group(group);
+        let group = self.groups.get_mut(group.index()).ok_or_else(|| {
+            paro_error::internal("candidate rejection references an unknown group")
+        })?;
+        self.winner_proposals = self.winner_proposals.saturating_add(1);
+        group.winner_proposals = group.winner_proposals.saturating_add(1);
+        if let Some(frontier) = group.winner_frontiers.get_mut(&goal) {
+            if truncated {
+                frontier.record_truncated_proposal();
+            } else {
+                frontier.record_rejected_proposal();
+            }
+        }
+        if truncated {
+            group.ledger.record_budget_limited(
+                BudgetDimension::WinnerFrontier,
+                winner_frontier_budget_witness(group.id, goal, physical_fingerprint),
+            );
+        }
+        Ok(())
     }
 
     pub fn winner_proposal_count(&self) -> u64 {
