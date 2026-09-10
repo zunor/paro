@@ -151,3 +151,54 @@ separate follow-up if a lower limit still reproduces the failure.
 
 The `-v2` artifacts are the exact current rerun: report, empty error file,
 runner log, and raw FD samples. The server was shut down after the run.
+
+## Quality recovery and native JoinRegion staging — 2026-09-10
+
+This round follows the quality-first order from the Astra review. The
+optimizer restores the narrow date-domain plan shape and runtime-filter
+installation, and closed native `JoinRegion` staging no longer instantiates
+an owned-IR plan merely to bridge into the native path. Exact local-write
+publication and shared binding-snapshot invalidation were also fixed; the
+semantic peer remains for `PredicateTransfer` shapes whose CTE ownership or
+control-boundary evidence is not yet complete.
+
+The primary artifact is `q11-quality-final-v4.json`. It is a five-block,
+normal trace-off binary-protocol comparison with verified cache misses and
+complete typed results. The source was commit `636977704a1e0f3a577f88bfab17bd2e9f699d5f`
+plus the dirty optimizer worktree recorded in the report
+(`1c295d169e0bd69d869db01c8cbb1502a680fd831e695572910595fb1e601218`); the
+release binary SHA-256 is
+`3ce3423aec68e0cf10107d27b06d0fd19a3ef3e6a10ae847b2512ea2bab18611`.
+
+The normal C1 result is still not a parity result:
+
+- Paro median `1351.074208 ms`, p95 `1464.948750 ms`;
+- DuckDB median `114.389667 ms`, p95 `119.813417 ms`;
+- fresh-block C1 ratio `12.004355`, 95% CI `[11.789249, 12.223560]`;
+- warm W ratio `0.934360`, 95% CI `[0.923636, 0.944423]`.
+
+The trace-on diagnostic cohort is excluded from C1. In the independent D6
+artifact `q11-d6-final-v3.json`, execution was `166.448 ms`, optimizer time
+was about `1267 ms`, `first_optional_ready` and selected were about `860 ms`,
+pipeline initialization was `166.764 ms`, and four runtime filters were
+installed across four workers. This is one diagnostic sample and is not a
+stable execution lower bound.
+
+The five normal server logs and the oracle log are intentionally archived as
+zero-byte files: the normal/oracle processes ran with tracing disabled and
+`warn` logging, while the report itself records the trace-off verification.
+The diagnostic log and the D6 log contain the phase/profile evidence.
+
+The final high-FD SQL regression run passed the semantic CTE and vector cases.
+The complete 184-case run was `173 passed, 11 failed, 0 skipped, 0 new`.
+All 11 failures are stale `EXPLAIN ANALYZE` expected-text mismatches for the
+pre-existing `logical_node_id` coordinate output; after the binding fix there
+were no publication or semantic failures. The exact report, error output, and
+runner log are archived with the `-v3` names. This is not recorded as a clean
+full-suite pass.
+
+D0-A remains independently complete as a measurement-contract delivery.
+D1-Q/D1-C, the complete D2/D3/D4 end state, G-Stats/G-Cost admission, and
+formal D6 optimization remain open; M1–M3 remain unpassed. The next round
+should continue from plan-quality attribution and execution-hotspot evidence,
+not from a trace-expansion project.
