@@ -2451,6 +2451,46 @@ impl CascadesEngine {
             if !children_feasible {
                 continue;
             }
+            // Enforcement depends only on the physical expression and the
+            // parent requirement.  It is invariant across every child
+            // frontier combination; compute it once per recipe instead of
+            // cloning properties and rebuilding the baseline for each
+            // proposal.
+            let physical_properties = self
+                .memo
+                .physical_expr(physical)
+                .ok_or_else(|| {
+                    paro_error::internal("unknown physical expression during enforcement")
+                })?
+                .provided
+                .clone();
+            let Some(enforced) = self
+                .enforcement
+                .canonical_baseline(physical_properties, &required)?
+            else {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    physical_expression = physical.index(),
+                    "physical recipe rejected because its required enforcer is absent from the execution ABI"
+                );
+                continue;
+            };
+            let Some(enforcer_phase) = enforcer_cost(
+                &enforced.steps,
+                recipe.enforcer_cost_input,
+                self.memo.calibration(),
+            )?
+            else {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    physical_expression = physical.index(),
+                    ?enforced.steps,
+                    "physical recipe rejected because its enforcer chain is infeasible"
+                );
+                continue;
+            };
             let admitted_combination_limit =
                 (self.memo.budget().max_child_frontier_combinations_per_group as usize)
                     .saturating_sub(
@@ -2599,41 +2639,6 @@ impl CascadesEngine {
                     };
                     (local_cost, source_work, cost)
                 };
-                let physical_properties = self
-                    .memo
-                    .physical_expr(physical)
-                    .ok_or_else(|| {
-                        paro_error::internal("unknown physical expression during enforcement")
-                    })?
-                    .provided
-                    .clone();
-                let Some(enforced) = self
-                    .enforcement
-                    .canonical_baseline(physical_properties, &required)?
-                else {
-                    tracing::debug!(
-                        target: "paro::optimizer",
-                        memo_group = group.index(),
-                        physical_expression = physical.index(),
-                        "physical recipe rejected because its required enforcer is absent from the execution ABI"
-                    );
-                    continue;
-                };
-                let Some(enforcer_phase) = enforcer_cost(
-                    &enforced.steps,
-                    recipe.enforcer_cost_input,
-                    self.memo.calibration(),
-                )?
-                else {
-                    tracing::debug!(
-                        target: "paro::optimizer",
-                        memo_group = group.index(),
-                        physical_expression = physical.index(),
-                        ?enforced.steps,
-                        "physical recipe rejected because its enforcer chain is infeasible"
-                    );
-                    continue;
-                };
                 let Some(constrained_cost) = constrain_composed_cost_to_grant(
                     enforcer_phase.compose_after(cost)?,
                     recipe.enforcer_cost_input,
@@ -2741,9 +2746,9 @@ impl CascadesEngine {
                     candidate: super::ids::CandidateId::INVALID,
                     expression: physical,
                     children: child_selections.clone().into_boxed_slice(),
-                    enforcers: enforced.steps,
+                    enforcers: enforced.steps.clone(),
                     enforcer_cost_input: recipe.enforcer_cost_input,
-                    provided: enforced.provided,
+                    provided: enforced.provided.clone(),
                     local_cost,
                     source_filter_apply_cost: recipe.source_filter_apply_cost,
                     cost_composition: recipe.cost_composition.clone(),
