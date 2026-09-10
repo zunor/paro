@@ -143,7 +143,9 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
         if watchdog.failure:
             result.update(status="error", error=watchdog.failure)
     result["phase_trace_schema_version"] = STATEMENT_TRACE_SCHEMA_VERSION
-    result["trace_query_fingerprint"] = statement_fingerprint("EXPLAIN " + query)
+    result["trace_query_fingerprint"] = statement_fingerprint(
+        "EXPLAIN " + query + " FORMAT JSON"
+    )
     try:
         result["statement_traces"] = parse_statement_trace_log(log)
         result["target_statement_traces"] = [
