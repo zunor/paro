@@ -1111,10 +1111,12 @@ impl TaskRegistry {
             .ok_or_else(|| paro_error::internal("task publication lost its read set"))?
             .is_current(memo)?
         {
-            self.invalidate(task)?;
-            return Err(paro_error::internal(
-                "task publication rejected an obsolete ReadSet",
-            ));
+            // A task can finish with no local mutation after another task
+            // has advanced one of its observations. That is ordinary
+            // single-flight invalidation, not a query error: discard the
+            // stale completion and let request_current reopen the same
+            // semantic task against the new read set.
+            return self.invalidate(task);
         }
         self.complete(task, outcome)
     }
@@ -1838,6 +1840,54 @@ mod tests {
             .unwrap();
         assert!(matches!(next, TaskRequest::Leader(reopened) if reopened == task));
         assert_eq!(registry.state(task), Some(TaskState::Runnable));
+    }
+
+    #[test]
+    fn stale_no_change_completion_is_invalidated_without_failing_query() {
+        let mut memo = Memo::new(Default::default());
+        let group = memo.create_group(
+            GroupSchema::new([]).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let read = PatternRead::from_group(&memo, group).unwrap();
+        let mut registry = TaskRegistry::default();
+        let intent = TaskIntent::Discover {
+            expression: LogicalExprId::new(0),
+            rule: RuleId::new(2),
+        };
+        let TaskRequest::Leader(task) = registry
+            .request_current(intent.clone(), ReadSet::single(read), &memo)
+            .unwrap()
+        else {
+            panic!("initial request did not lead")
+        };
+        registry.start(task).unwrap();
+        let read_id = registry.intern_read_set(ReadSet::single(read));
+        memo.insert_logical(
+            group,
+            LogicalExprKey {
+                operator: Fingerprint(1),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(1),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+
+        registry
+            .complete_current(task, &memo, TaskOutcome::NoChange { reads: read_id })
+            .unwrap();
+        assert_eq!(registry.state(task), Some(TaskState::Invalidated));
+        let current_read = PatternRead::from_group(&memo, group).unwrap();
+        let TaskRequest::Leader(reopened) = registry
+            .request_current(intent, ReadSet::single(current_read), &memo)
+            .unwrap()
+        else {
+            panic!("stale task was not replaced by a current-read leader")
+        };
+        assert_ne!(reopened, task);
     }
 
     #[test]

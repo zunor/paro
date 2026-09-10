@@ -2300,13 +2300,13 @@ impl CascadesEngine {
         }
         match result {
             Ok(()) => {
-                // A physical task's cursor describes its own recipe and
-                // child-frontier domain. Global logical budget/rule
-                // obligations are reported by Memo, but must not make every
-                // completed physical task resumable: doing so re-enumerates
-                // all implementations whenever an unrelated logical rule
-                // leaves an obligation behind.
-                let complete = !self.memo.control().deadline_reached();
+                // A physical task may have a feasible winner before the
+                // optional search is complete. Keep its cursor resumable
+                // while Memo still carries a budget, deadline, or rule
+                // failure obligation; otherwise a later logical alternative
+                // can never re-enter the child-frontier competition and a
+                // baseline plan may be frozen as the final winner.
+                let complete = self.memo.search_obligations().is_empty();
                 let cursor = self.task_registry.advance_cursor(
                     task,
                     Cursor {
