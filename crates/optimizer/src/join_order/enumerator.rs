@@ -239,9 +239,12 @@ impl<'a> PlanEnumerator<'a> {
         if self.num_relations == 2 {
             let left = self.set_manager.get_relation(0);
             let right = self.set_manager.get_relation(1);
-            let outcome = self.try_emit_pair(&left, &right, &[]);
-            if outcome != EnumerationOutcome::Complete {
-                return outcome;
+            let total = self.set_manager.union(&left, &right);
+            if !self.plans.contains_key(&total) {
+                let outcome = self.try_emit_pair(&left, &right, &[]);
+                if outcome != EnumerationOutcome::Complete {
+                    return outcome;
+                }
             }
         }
         EnumerationOutcome::Complete
@@ -318,7 +321,7 @@ impl<'a> PlanEnumerator<'a> {
         let mut union_sets = Vec::new();
 
         for rel_set in &all_subsets {
-            let neighbor = self.set_manager.get_relation_from_set(rel_set);
+            let neighbor = self.set_manager.get_relation_from_vec(rel_set.clone());
             let new_set = self.set_manager.union(node, &neighbor);
 
             if new_set.count() > node.count() && self.plans.contains_key(&new_set) {
@@ -362,7 +365,7 @@ impl<'a> PlanEnumerator<'a> {
         let mut union_sets = Vec::new();
 
         for rel_set in &all_subsets {
-            let neighbor = self.set_manager.get_relation_from_set(rel_set);
+            let neighbor = self.set_manager.get_relation_from_vec(rel_set.clone());
             let combined_set = self.set_manager.union(right, &neighbor);
 
             debug_assert!(combined_set.count() > right.count());
@@ -483,14 +486,10 @@ impl<'a> PlanEnumerator<'a> {
                 .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
                 .then_with(|| left.compact_shape().cmp(&right.compact_shape()))
         });
-        // Within the exact relation limit, every non-dominated resource
-        // frontier member belongs to the legal search domain. Do not evict a
-        // member merely because it is the N+1th resident entry: that would
-        // make the eventual root winner dependent on insertion order and
-        // invalidate optimality claims. The cap remains an explicit anytime
-        // policy for the greedy/large-graph seed path.
-        if frontier.len() > self.max_frontier_size && self.num_relations > self.exact_relation_limit
-        {
+        // The resident cap is an explicit anytime policy. It can produce a
+        // useful seed, but it is never evidence that the discarded frontier
+        // members cannot improve a parent under another resource grant.
+        if frontier.len() > self.max_frontier_size {
             self.frontier_truncated = true;
             let lowest_memory = frontier
                 .iter()
@@ -638,33 +637,53 @@ impl<'a> PlanEnumerator<'a> {
 /// Get all non-empty subsets of a set of neighbors.
 ///
 /// This generates all 2^n - 1 subsets of the input set.
-fn get_all_neighbor_sets(mut neighbors: Vec<usize>) -> Vec<HashSet<usize>> {
+fn get_all_neighbor_sets(mut neighbors: Vec<usize>) -> Vec<Vec<usize>> {
     neighbors.sort();
 
-    let mut result = Vec::new();
-    let mut added: Vec<HashSet<usize>> = neighbors
-        .iter()
-        .map(|&n| {
-            let mut set = HashSet::new();
-            set.insert(n);
-            set
-        })
-        .collect();
-
-    result.extend(added.clone());
-
-    loop {
-        added = add_super_sets(&added, &neighbors);
-        if added.is_empty() {
-            break;
-        }
-        result.extend(added.clone());
+    // Keep the historical cardinality/lexicographic order, but represent a
+    // subset as a compact sorted Vec. The old HashSet implementation cloned
+    // every partial set at every level and then sorted it again in the set
+    // manager. Join-region enumeration invokes this helper for thousands of
+    // cuts, so the temporary hash tables became a measurable allocation
+    // stream without adding any search coverage.
+    let mut result = Vec::with_capacity(if neighbors.len() < usize::BITS as usize {
+        (1usize << neighbors.len()).saturating_sub(1)
+    } else {
+        0
+    });
+    for size in 1..=neighbors.len() {
+        append_neighbor_subsets(
+            &neighbors,
+            0,
+            size,
+            &mut Vec::with_capacity(size),
+            &mut result,
+        );
     }
-
     result
 }
 
+fn append_neighbor_subsets(
+    neighbors: &[usize],
+    start: usize,
+    remaining: usize,
+    current: &mut Vec<usize>,
+    output: &mut Vec<Vec<usize>>,
+) {
+    if remaining == 0 {
+        output.push(current.clone());
+        return;
+    }
+    let last_start = neighbors.len().saturating_sub(remaining);
+    for index in start..=last_start {
+        current.push(neighbors[index]);
+        append_neighbor_subsets(neighbors, index + 1, remaining - 1, current, output);
+        current.pop();
+    }
+}
+
 /// Add supersets by adding one more neighbor to each existing set.
+#[cfg(test)]
 fn add_super_sets(current: &[HashSet<usize>], all_neighbors: &[usize]) -> Vec<HashSet<usize>> {
     let mut result = Vec::new();
 
