@@ -281,24 +281,24 @@ impl NativeShell {
         let mut layouts =
             Vec::<paro_planner::operator::LogicalOutputLayout>::with_capacity(self.nodes.len());
         for node in &self.nodes {
-            let child_layouts = {
-                let mut children = SmallVec::<[&NativeChild; 2]>::new();
-                node.operator
-                    .visit_child_links(&mut |child| children.push(child));
-                children
-                    .into_iter()
-                    .map(|child| match child {
-                        NativeChild::Node(index) => layouts.get(*index).cloned().ok_or_else(|| {
-                            paro_error::internal(
-                                "native shell layout references an incomplete node",
-                            )
-                        }),
-                        NativeChild::MemoGroup { layout, .. }
-                        | NativeChild::Group { layout, .. } => Ok(layout.clone()),
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            };
-            let refs = child_layouts.iter().collect::<Vec<_>>();
+            let mut children = SmallVec::<[&NativeChild; 2]>::new();
+            node.operator
+                .visit_child_links(&mut |child| children.push(child));
+            let mut child_layouts =
+                SmallVec::<[paro_planner::operator::LogicalOutputLayout; 2]>::with_capacity(
+                    children.len(),
+                );
+            for child in children {
+                child_layouts.push(match child {
+                    NativeChild::Node(index) => layouts.get(*index).cloned().ok_or_else(|| {
+                        paro_error::internal("native shell layout references an incomplete node")
+                    })?,
+                    NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
+                        layout.clone()
+                    }
+                });
+            }
+            let refs = child_layouts.iter().collect::<SmallVec<[_; 2]>>();
             layouts.push(node.operator.output_layout_from_child_refs(&refs));
         }
         Ok(layouts)

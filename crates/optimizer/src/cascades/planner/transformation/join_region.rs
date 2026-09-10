@@ -641,11 +641,10 @@ fn rebuild_native_join(
     if let Some(predicates) = &node.predicates {
         for predicate in predicates.predicates() {
             let filter = predicate.filter();
-            let start_len = conditions.len();
             let append = |comparison: &paro_planner::expression::ComparisonExpression,
                           conditions: &mut Vec<JoinCondition>| {
                 let Some(orientation) = predicate.orientation() else {
-                    return;
+                    return false;
                 };
                 let comparison_type = match comparison.comparison_type {
                     ComparisonType::Equal => JoinComparisonType::Equal,
@@ -675,19 +674,29 @@ fn rebuild_native_join(
                         comparison_type
                     },
                 ));
+                true
             };
-            match &filter.filter {
-                Expression::Comparison(comparison) => append(comparison, &mut conditions),
-                Expression::Conjunction(conjunction) => {
-                    for child in &conjunction.children {
-                        if let Expression::Comparison(comparison) = child {
-                            append(comparison, &mut conditions);
-                        }
-                    }
+            // A join predicate may carry a conjunction with a residual
+            // expression that the native join operator cannot represent.  Do
+            // not consume the filter unless every conjunct was translated;
+            // otherwise the residual would disappear when root_filters are
+            // assembled below.  The conservative fallback keeps the complete
+            // original filter at its enclosing node.
+            let mut translated = Vec::new();
+            let fully_translated = match &filter.filter {
+                Expression::Comparison(comparison) => append(comparison, &mut translated),
+                Expression::Conjunction(conjunction) if !conjunction.children.is_empty() => {
+                    conjunction.children.iter().all(|child| {
+                        let Expression::Comparison(comparison) = child else {
+                            return false;
+                        };
+                        append(comparison, &mut translated)
+                    })
                 }
-                _ => {}
-            }
-            if conditions.len() > start_len && predicate.orientation().is_some() {
+                _ => false,
+            };
+            if fully_translated && !translated.is_empty() {
+                conditions.extend(translated);
                 used_filters.insert(filter.filter_index);
             }
         }
