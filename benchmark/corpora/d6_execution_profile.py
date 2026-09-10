@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import platform
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -24,13 +25,20 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from benchmark.corpora.benchmark_evidence import (
     ImmutableDataSeed,
     build_benchmark_server,
     content_digest,
     isolated_paro_server,
+    parse_statement_trace_log,
     repository_identity,
     statement_fingerprint,
+    STATEMENT_TRACE_SCHEMA_VERSION,
+    validate_statement_trace,
 )
 from benchmark.corpora.cold_planning import ProcessWatchdog
 from benchmark.harness.executor import (
@@ -183,7 +191,28 @@ def _sample(
         result["peak_rss_bytes"] = watchdog.peak_rss
         if watchdog.failure:
             result.update(status="error", error=watchdog.failure)
-    result["query_fingerprint"] = statement_fingerprint(f"EXPLAIN ANALYZE {query}")
+    trace_query_fingerprint = statement_fingerprint(f"EXPLAIN ANALYZE {query}")
+    result["query_fingerprint"] = trace_query_fingerprint
+    result["phase_trace_schema_version"] = STATEMENT_TRACE_SCHEMA_VERSION
+    try:
+        traces = parse_statement_trace_log(log)
+        result["statement_traces"] = traces
+        result["target_statement_traces"] = [
+            trace
+            for trace in traces
+            if trace["query_fingerprint"] == trace_query_fingerprint
+        ]
+        if result.get("status") == "ok":
+            if len(result["target_statement_traces"]) != 1:
+                raise ValueError("D6 sample must have exactly one target statement trace")
+            validate_statement_trace(
+                result["target_statement_traces"][0],
+                expected_process_id=result["server"]["pid"],
+                expected_sample_id=sample_id,
+                expected_query_fingerprint=trace_query_fingerprint,
+            )
+    except Exception as error:
+        result.update(status="error", error=f"{type(error).__name__}: {error}")
     result["pipeline_summary"] = _pipeline_summary(result.get("operators", []))
     return result
 
