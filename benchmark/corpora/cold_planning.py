@@ -115,9 +115,15 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
                     connection.execute(sql.SQL("SET statement_timeout={}").format(
                         sql.Literal(args.watchdog_seconds * 1000)))
                     started = time.perf_counter_ns()
-                    plan = connection.execute("EXPLAIN " + query).fetchall()
+                    # Keep a structural coordinate system for the diagnostic
+                    # plan.  Runtime EXPLAIN ANALYZE operator ids can be
+                    # aligned to these physical node ids; pipeline position
+                    # is not a semantic coordinate.  This query is outside
+                    # normal C1 and remains a diagnostic-only sidecar.
+                    plan = connection.execute("EXPLAIN " + query + " FORMAT JSON").fetchall()
                     result["explain_wall_ms"] = (time.perf_counter_ns() - started) / 1_000_000
                     result["plan"] = "\n".join(str(row[0]) for row in plan)
+                    result["plan_format"] = "json"
                     result["plan_sha256"] = hashlib.sha256(result["plan"].encode()).hexdigest()
                     cursor = connection.execute("SELECT * FROM paro_optimizers()")
                     columns = [column.name for column in cursor.description or ()]
