@@ -64,30 +64,16 @@ pub(crate) struct DPJoinNode {
     /// is kept separate from scalar work so grant-sensitive search can retain
     /// a lower-memory tree even when it is not the scalar-cost winner.
     pub peak_build_bytes: u64,
+    /// Stable tie-break shape, materialized once when the node is created.
+    /// Frontier maintenance compares this value repeatedly; rebuilding a
+    /// recursive String for every comparison made DP pricing pay an
+    /// allocation proportional to the whole join tree.
+    shape: Arc<str>,
 }
 
 impl DPJoinNode {
-    pub(crate) fn compact_shape(&self) -> String {
-        if self.is_leaf {
-            return self
-                .set
-                .relations()
-                .first()
-                .map_or_else(|| "?".to_string(), usize::to_string);
-        }
-        let left = self
-            .left_plan
-            .as_deref()
-            .map_or_else(|| "?".to_string(), Self::compact_shape);
-        let right = self
-            .right_plan
-            .as_deref()
-            .map_or_else(|| "?".to_string(), Self::compact_shape);
-        let build = match self.build_side {
-            JoinBuildSide::Left => "L",
-            JoinBuildSide::Right => "R",
-        };
-        format!("({left} {build} {right})")
+    pub(crate) fn compact_shape(&self) -> &str {
+        &self.shape
     }
 
     /// Create a leaf node (single relation).
@@ -100,6 +86,10 @@ impl DPJoinNode {
         risk_cardinality: f64,
         materialization_cardinality: f64,
     ) -> Self {
+        let shape = set
+            .relations()
+            .first()
+            .map_or_else(|| "?".to_string(), usize::to_string);
         Self {
             set: set.clone(),
             predicates: None,
@@ -116,6 +106,7 @@ impl DPJoinNode {
             materialization_is_reduction_bound: false,
             output_payload_width,
             peak_build_bytes: 0,
+            shape: Arc::from(shape),
         }
     }
 
@@ -126,6 +117,15 @@ impl DPJoinNode {
         right: &DPJoinNode,
         estimate: CostedJoin,
     ) -> Self {
+        let build = match estimate.build_side {
+            JoinBuildSide::Left => "L",
+            JoinBuildSide::Right => "R",
+        };
+        let shape = format!(
+            "({} {build} {})",
+            left.compact_shape(),
+            right.compact_shape()
+        );
         Self {
             set: estimate.combination,
             predicates,
@@ -142,6 +142,7 @@ impl DPJoinNode {
             materialization_is_reduction_bound: estimate.materialization_is_reduction_bound,
             output_payload_width: estimate.output_payload_width,
             peak_build_bytes: estimate.peak_build_bytes,
+            shape: Arc::from(shape),
         }
     }
 }
@@ -1149,6 +1150,7 @@ mod tests {
             materialization_is_reduction_bound: false,
             output_payload_width: cost_model.payload_width(&left_set),
             peak_build_bytes: 0,
+            shape: Arc::from("left"),
         };
 
         let right = DPJoinNode {
@@ -1167,6 +1169,7 @@ mod tests {
             materialization_is_reduction_bound: false,
             output_payload_width: cost_model.payload_width(&right_set),
             peak_build_bytes: 0,
+            shape: Arc::from("right"),
         };
 
         // Compute cost

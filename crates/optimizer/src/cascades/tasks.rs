@@ -371,15 +371,48 @@ pub struct BoundProof {
 
 impl BoundProof {
     pub fn is_current(&self, registry: &TaskRegistry, memo: &Memo) -> Result<bool> {
-        let task_active = matches!(
-            registry.state(self.task),
-            Some(TaskState::Runnable | TaskState::Running | TaskState::Awaiting)
+        let Some(task) = registry.task(self.task) else {
+            return Ok(false);
+        };
+
+        // A proof is scoped to the Optimize intent which produced it.  A
+        // task id alone is not enough: group merges can redirect an old task
+        // while leaving its record addressable in the registry.
+        let context_matches = matches!(
+            registry.intent(task.intent),
+            Some(TaskIntent::Optimize { group, goal })
+                if registry.canonical_group(*group)
+                    == registry.canonical_group(self.context.group)
+                    && *goal == self.context.goal
         );
-        Ok(task_active
-            && registry
-                .read_set(self.context.reads)
-                .ok_or_else(|| paro_error::internal("bound proof references unknown read set"))?
-                .is_current(memo)?)
+        if !context_matches {
+            return Ok(false);
+        }
+
+        // While an owner is still active, the proof is available to the
+        // owner and its dependants. Once the owner completes, retain it only
+        // when the completion outcome explicitly names this certificate.
+        // A normal Progress/NoChange completion must not accidentally turn a
+        // provisional bound into a durable pruning proof.
+        let certified = match task.state {
+            TaskState::Runnable | TaskState::Running | TaskState::Awaiting => true,
+            TaskState::Completed => matches!(
+                task.outcome,
+                Some(
+                    TaskOutcome::ProvenOptimal { certificate, .. }
+                        | TaskOutcome::ProvenNoPlanBelow { certificate, .. }
+                ) if certificate == self.id
+            ),
+            TaskState::Suspended | TaskState::Invalidated | TaskState::Failed => false,
+        };
+        if !certified {
+            return Ok(false);
+        }
+
+        Ok(registry
+            .read_set(self.context.reads)
+            .ok_or_else(|| paro_error::internal("bound proof references unknown read set"))?
+            .is_current(memo)?)
     }
 }
 
@@ -2662,6 +2695,57 @@ mod tests {
         registry.invalidate(task).unwrap();
         assert!(!registry
             .bound_is_current(proof, &Memo::new(Default::default()))
+            .unwrap());
+    }
+
+    #[test]
+    fn completed_proof_remains_current_only_when_completion_names_it() {
+        let (mut registry, task) = registry_with_task();
+        let reads = registry.intern_read_set(ReadSet::empty());
+        let context = BoundContext {
+            group: GroupId::new(0),
+            goal: goal(),
+            reads,
+            search_domain: Fingerprint(17),
+        };
+        let proof = registry
+            .record_no_plan_below(task, context.clone(), 99)
+            .unwrap();
+        registry
+            .complete(
+                task,
+                TaskOutcome::ProvenNoPlanBelow {
+                    threshold: 99,
+                    certificate: proof,
+                },
+            )
+            .unwrap();
+        assert!(registry
+            .bound_is_current(proof, &Memo::new(Default::default()))
+            .unwrap());
+
+        let (mut ordinary_registry, ordinary_task) = registry_with_task();
+        let ordinary_reads = ordinary_registry.intern_read_set(ReadSet::empty());
+        let ordinary_proof = ordinary_registry
+            .record_no_plan_below(
+                ordinary_task,
+                BoundContext {
+                    reads: ordinary_reads,
+                    ..context
+                },
+                99,
+            )
+            .unwrap();
+        ordinary_registry
+            .complete(
+                ordinary_task,
+                TaskOutcome::NoChange {
+                    reads: ordinary_reads,
+                },
+            )
+            .unwrap();
+        assert!(!ordinary_registry
+            .bound_is_current(ordinary_proof, &Memo::new(Default::default()))
             .unwrap());
     }
 }

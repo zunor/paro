@@ -19,6 +19,10 @@ use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnumerationOutcome {
     Complete,
+    /// A plan was produced by a bounded/greedy strategy, but the declared
+    /// search domain was not exhausted.  This is usable as an anytime seed,
+    /// never as an exact join-order proof.
+    Approximate,
     PairBudgetExhausted,
     Ineligible,
     MissingSubplan,
@@ -49,6 +53,7 @@ pub(crate) struct PlanEnumerator<'a> {
     exact_relation_limit: usize,
     max_pairs: usize,
     max_frontier_size: usize,
+    frontier_truncated: bool,
 }
 
 impl<'a> PlanEnumerator<'a> {
@@ -90,6 +95,7 @@ impl<'a> PlanEnumerator<'a> {
             exact_relation_limit,
             max_pairs,
             max_frontier_size: max_frontier_size.max(1),
+            frontier_truncated: false,
         }
     }
 
@@ -119,6 +125,13 @@ impl<'a> PlanEnumerator<'a> {
         if self.num_relations <= self.exact_relation_limit {
             match self.solve_join_order_exactly() {
                 EnumerationOutcome::Complete => {
+                    // Exact DP must retain the whole non-dominated frontier.
+                    // A bounded resident frontier is an anytime policy, not
+                    // an admissible proof that no discarded plan can improve
+                    // a parent under another resource grant.
+                    if self.frontier_truncated {
+                        return EnumerationOutcome::Approximate;
+                    }
                     // Check if we got a final plan
                     let mut all_relations = HashSet::new();
                     for i in 0..self.num_relations {
@@ -146,6 +159,7 @@ impl<'a> PlanEnumerator<'a> {
                 EnumerationOutcome::MissingSubplan => {
                     return EnumerationOutcome::MissingSubplan;
                 }
+                EnumerationOutcome::Approximate => return EnumerationOutcome::Approximate,
                 EnumerationOutcome::PairBudgetExhausted => {}
             }
         }
@@ -212,6 +226,20 @@ impl<'a> PlanEnumerator<'a> {
 
             // Recursively search for neighbors not in exclusion set
             let outcome = self.enumerate_csg_recursive(&start_node, &mut exclusion_set);
+            if outcome != EnumerationOutcome::Complete {
+                return outcome;
+            }
+        }
+
+        // DPccp intentionally enumerates connected cuts.  A two-relation
+        // Cartesian region has no graph neighbor to emit, but its only legal
+        // binary tree is still an exact result. Keep this small completion
+        // case in the exact path instead of silently delegating it to the
+        // greedy seed path.
+        if self.num_relations == 2 {
+            let left = self.set_manager.get_relation(0);
+            let right = self.set_manager.get_relation(1);
+            let outcome = self.try_emit_pair(&left, &right, &[]);
             if outcome != EnumerationOutcome::Complete {
                 return outcome;
             }
@@ -455,7 +483,15 @@ impl<'a> PlanEnumerator<'a> {
                 .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
                 .then_with(|| left.compact_shape().cmp(&right.compact_shape()))
         });
-        if frontier.len() > self.max_frontier_size {
+        // Within the exact relation limit, every non-dominated resource
+        // frontier member belongs to the legal search domain. Do not evict a
+        // member merely because it is the N+1th resident entry: that would
+        // make the eventual root winner dependent on insertion order and
+        // invalidate optimality claims. The cap remains an explicit anytime
+        // policy for the greedy/large-graph seed path.
+        if frontier.len() > self.max_frontier_size && self.num_relations > self.exact_relation_limit
+        {
+            self.frontier_truncated = true;
             let lowest_memory = frontier
                 .iter()
                 .enumerate()
@@ -592,7 +628,10 @@ impl<'a> PlanEnumerator<'a> {
             join_relations.remove(best_left);
             join_relations.push(new_set);
         }
-        EnumerationOutcome::Complete
+        // Greedy enumeration intentionally returns a seed only.  Callers may
+        // execute it as an anytime candidate, but must not advertise it as a
+        // complete proof of the declared join search space.
+        EnumerationOutcome::Approximate
     }
 }
 
@@ -1031,6 +1070,6 @@ mod tests {
         enumerator.init_leaf_plans();
 
         let result = enumerator.solve_join_order();
-        assert_eq!(result, EnumerationOutcome::Complete);
+        assert_eq!(result, EnumerationOutcome::Approximate);
     }
 }
