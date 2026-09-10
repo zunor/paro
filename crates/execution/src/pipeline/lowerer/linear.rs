@@ -7,68 +7,118 @@ impl<'a> PipelineLowerer<'a> {
     pub(crate) fn collect_linear_roles(
         &mut self,
         root: PhysicalPlanNodeId,
-    ) -> Result<(SourceSpec, Vec<TransformSpec>)> {
+    ) -> Result<(SourceSpec, Vec<TransformSpec>, PipelineOperatorLineage)> {
         let mut current = root;
         let mut transforms = Vec::new();
+        let mut transform_lineage = Vec::new();
         loop {
             let node = self.plan.node(current);
             match &node.kind {
                 PhysicalNodeKind::RowsetScan(spec) => {
-                    transforms.reverse();
                     let mut source = RowsetSourceSpec::new(spec.clone());
                     self.attach_owned_hash_join_runtime_filters(current, &mut source)?;
-                    return Ok((SourceSpec::Rowset(source), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::Rowset(source),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::Values(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::Values(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::Values(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::DummyScan(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::Dummy(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::Dummy(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::EmptyResult(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::Empty(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::Empty(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::ChunkScan(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::Chunk(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::Chunk(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::ExpressionScan(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::Expression(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::Expression(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::TableFunctionScan(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::TableFunction(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::TableFunction(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::VectorSearch(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::VectorSearch(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::VectorSearch(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::SparseVectorSearch(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::SparseVectorSearch(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::SparseVectorSearch(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::FullTextSearch(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::FullTextSearch(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::FullTextSearch(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::AdaptiveSearch(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::AdaptiveSearch(spec.clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::AdaptiveSearch(spec.clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::GraphScan(spec) => {
-                    transforms.reverse();
-                    return Ok((SourceSpec::GraphScan(spec.as_ref().clone()), transforms));
+                    return Ok(self.finish_linear_roles(
+                        SourceSpec::GraphScan(spec.as_ref().clone()),
+                        transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
+                    ));
                 }
                 PhysicalNodeKind::CteScan(spec) => {
                     if let Some(handle) = self.recursive_cte_handles.get(&spec.cte_index).copied() {
-                        transforms.reverse();
-                        return Ok((
+                        return Ok(self.finish_linear_roles(
                             SourceSpec::RecursiveTableScan(RecursiveTableScanSourceSpec { handle }),
                             transforms,
+                            transform_lineage,
+                            node.label.logical_plan_node,
                         ));
                     }
                     let handle = *self.cte_handles.get(&spec.cte_index).ok_or_else(|| {
@@ -77,10 +127,11 @@ impl<'a> PipelineLowerer<'a> {
                             spec.cte_index
                         ))
                     })?;
-                    transforms.reverse();
-                    return Ok((
+                    return Ok(self.finish_linear_roles(
                         SourceSpec::CteScan(CteScanSourceSpec { handle }),
                         transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
                     ));
                 }
                 PhysicalNodeKind::DelimScan(spec) => {
@@ -101,27 +152,32 @@ impl<'a> PipelineLowerer<'a> {
                             })?
                         }
                     };
-                    transforms.reverse();
-                    return Ok((
+                    return Ok(self.finish_linear_roles(
                         SourceSpec::DelimScan(DelimScanSourceSpec { handle }),
                         transforms,
+                        transform_lineage,
+                        node.label.logical_plan_node,
                     ));
                 }
                 PhysicalNodeKind::Filter(spec) => {
                     transforms.push(TransformSpec::Filter(spec.clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::Project(spec) => {
                     transforms.push(TransformSpec::Project(spec.clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::Limit(spec) => {
                     transforms.push(TransformSpec::Limit(spec.as_ref().clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::TopN(spec) => {
                     ensure_streaming_topn_supported(spec)?;
                     transforms.push(TransformSpec::StreamingTopN(spec.clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::Sort(_) => {
@@ -166,26 +222,32 @@ impl<'a> PipelineLowerer<'a> {
                         ));
                     }
                     transforms.push(TransformSpec::StreamingWindow(spec.clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphExpand(spec) => {
                     transforms.push(TransformSpec::GraphExpand(spec.as_ref().clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::RowFetch(spec) => {
                     transforms.push(TransformSpec::RowFetch(spec.clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphProject(spec) => {
                     transforms.push(TransformSpec::GraphProject(spec.clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphShortestPath(spec) => {
                     transforms.push(TransformSpec::GraphShortestPath(spec.as_ref().clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::ExternalProject(spec) => {
                     transforms.push(TransformSpec::ExternalProject(spec.clone()));
+                    transform_lineage.push(Some(node.label.logical_plan_node));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::NestedLoopJoin(_)
@@ -230,6 +292,26 @@ impl<'a> PipelineLowerer<'a> {
                 }
             }
         }
+    }
+
+    fn finish_linear_roles(
+        &self,
+        source: SourceSpec,
+        mut transforms: Vec<TransformSpec>,
+        mut transform_lineage: Vec<Option<paro_planner::plan::PlanNodeId>>,
+        source_node: paro_planner::plan::PlanNodeId,
+    ) -> (SourceSpec, Vec<TransformSpec>, PipelineOperatorLineage) {
+        transforms.reverse();
+        transform_lineage.reverse();
+        (
+            source,
+            transforms,
+            PipelineOperatorLineage {
+                source: Some(source_node),
+                transforms: transform_lineage.into_boxed_slice(),
+                sink: None,
+            },
+        )
     }
 
     pub(crate) fn only_child(&self, node_id: PhysicalPlanNodeId) -> Result<PhysicalPlanNodeId> {

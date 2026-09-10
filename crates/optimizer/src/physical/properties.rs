@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use paro_common::vector::VECTOR_SIZE;
-use paro_planner::plan::CardinalityEstimate;
+use paro_planner::plan::{CardinalityEstimate, PlanNodeId};
 
 use crate::physical::cost::SearchCost;
 use crate::physical::identity::{Fingerprint, ResourceGrantClassId};
@@ -161,6 +161,27 @@ pub struct PipelineProperties {
     pub capabilities: ExecutionCapabilities,
     pub memory: MemoryRequirement,
     pub tuning: ExecutionTuning,
+    /// Diagnostic-only semantic coordinates for operators lowered into this
+    /// pipeline.  Runtime ids are allocation order and are not suitable for
+    /// joining an EXPLAIN plan with an execution profile; these coordinates
+    /// retain the physical node's logical-plan identity where lowering can
+    /// prove it.  `None` means that an operator is synthetic, fused, or came
+    /// through a breaker path whose one-to-one correspondence is not known.
+    pub operator_lineage: PipelineOperatorLineage,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PipelineOperatorLineage {
+    pub source: Option<PlanNodeId>,
+    pub transforms: Box<[Option<PlanNodeId>]>,
+    pub sink: Option<PlanNodeId>,
+}
+
+impl PipelineOperatorLineage {
+    #[inline]
+    pub fn transform(&self, index: usize) -> Option<PlanNodeId> {
+        self.transforms.get(index).copied().flatten()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

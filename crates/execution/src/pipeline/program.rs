@@ -344,9 +344,11 @@ impl PipelineProgramBuilder {
         next_operator_id: &mut usize,
     ) -> Result<PipelineProgram> {
         validate_handles(spec, handles)?;
+        let lineage = &spec.properties.operator_lineage;
         let source = self.registry.source_slot(
             &spec.source,
-            RuntimeOperatorOrigin::new(spec.id, OperatorRole::Source, RuntimeRoleOrdinal::new(0)),
+            RuntimeOperatorOrigin::new(spec.id, OperatorRole::Source, RuntimeRoleOrdinal::new(0))
+                .with_logical_plan_node(lineage.source),
             next_runtime_operator_id(next_operator_id),
         )?;
         let transforms = spec
@@ -360,7 +362,8 @@ impl PipelineProgramBuilder {
                         spec.id,
                         OperatorRole::Transform,
                         RuntimeRoleOrdinal::new(idx),
-                    ),
+                    )
+                    .with_logical_plan_node(lineage.transform(idx)),
                     next_runtime_operator_id(next_operator_id),
                 )
             })
@@ -368,7 +371,8 @@ impl PipelineProgramBuilder {
             .into_boxed_slice();
         let sink = self.registry.sink_slot(
             &spec.sink,
-            RuntimeOperatorOrigin::new(spec.id, OperatorRole::Sink, RuntimeRoleOrdinal::new(0)),
+            RuntimeOperatorOrigin::new(spec.id, OperatorRole::Sink, RuntimeRoleOrdinal::new(0))
+                .with_logical_plan_node(lineage.sink),
             next_runtime_operator_id(next_operator_id),
         )?;
         let scratch = scratch_layout_for(spec, handles)?;

@@ -100,6 +100,7 @@ impl PipelinePropertyAccumulator {
             capabilities: self.capabilities,
             memory: self.memory,
             tuning: Default::default(),
+            operator_lineage: Default::default(),
         }
     }
 }

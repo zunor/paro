@@ -1037,7 +1037,7 @@ impl<'a> PipelineLowerer<'a> {
                     chain.transforms.extend(tail.transforms);
                     return Ok(chain);
                 }
-                let (source, transforms) = self.collect_linear_roles(root)?;
+                let (source, transforms, _operator_lineage) = self.collect_linear_roles(root)?;
                 Ok(CollectedProbeChain {
                     source,
                     transforms,

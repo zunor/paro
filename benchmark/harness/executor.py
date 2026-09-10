@@ -611,6 +611,7 @@ def _flatten_explain_profile(raw_json: str) -> list[dict[str, Any]]:
             profiles.append(
                 _operator_profile_entry(
                     node_id=_optional_int(operator.get("runtime_id")),
+                    logical_node_id=_optional_int(operator.get("logical_node_id")),
                     operator=str(operator.get("operator", "")),
                     tree_path=str(index),
                     actual_map=actual_map,
@@ -660,6 +661,7 @@ def _document_profile_fields(document: Mapping[str, Any]) -> dict[str, Any]:
 def _operator_profile_entry(
     *,
     node_id: int | None,
+    logical_node_id: int | None,
     operator: str,
     tree_path: str,
     actual_map: Mapping[str, Any],
@@ -667,6 +669,7 @@ def _operator_profile_entry(
 ) -> dict[str, Any]:
     return {
         "node_id": node_id,
+        "logical_node_id": logical_node_id,
         "operator": operator,
         "tree_path": tree_path,
         "rows": _optional_int(actual_map.get("rows")),
@@ -714,6 +717,7 @@ def _append_operator_profile(
     profiles.append(
         _operator_profile_entry(
             node_id=_optional_int(node.get("node_id")),
+            logical_node_id=_optional_int(node.get("logical_node_id")),
             operator=str(node.get("operator", "")),
             tree_path=tree_path,
             actual_map=actual_map,
@@ -730,7 +734,8 @@ def _append_operator_profile(
 
 
 _TEXT_OPERATOR_RE = re.compile(
-    r"^\s+(SOURCE|TRANSFORM|SINK)\s+#(\d+)\s+([^ ]+)(?:\s+(\(.*\)))?\s*$"
+    r"^\s+(SOURCE|TRANSFORM|SINK)\s+#(\d+)\s+([^ ]+)"
+    r"(?:\s+(\(.*\)))?(?:\s+logical_node_id=(\d+))?\s*$"
 )
 _TEXT_PIPELINE_RE = re.compile(r"^PIPELINE\s+(\d+)\s*$")
 
@@ -748,12 +753,13 @@ def _flatten_explain_profile_text(raw_text: str) -> list[dict[str, Any]]:
         operator_match = _TEXT_OPERATOR_RE.match(line)
         if not operator_match:
             continue
-        role, node_id, operator, actual_suffix = operator_match.groups()
+        role, node_id, operator, actual_suffix, logical_node_id = operator_match.groups()
         actual_map = _parse_text_actual_suffix(actual_suffix)
         tree_path = f"{pipeline_id or '0'}/{role.lower()}/{node_id}"
         profiles.append(
             _operator_profile_entry(
                 node_id=int(node_id),
+                logical_node_id=int(logical_node_id) if logical_node_id is not None else None,
                 operator=operator,
                 tree_path=tree_path,
                 actual_map=actual_map,

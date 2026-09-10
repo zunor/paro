@@ -8,15 +8,43 @@ impl<'a> PipelineLowerer<'a> {
     pub(crate) fn push_pipeline(
         &mut self,
         source: SourceSpec,
-        mut transforms: Vec<TransformSpec>,
+        transforms: Vec<TransformSpec>,
         sink: SinkSpec,
         sink_sharing: SinkSharing,
         output: RowType,
         pipelines: &mut Vec<PipelineSpec>,
     ) -> Result<PipelineChain> {
+        self.push_pipeline_with_lineage(
+            source,
+            transforms,
+            sink,
+            sink_sharing,
+            output,
+            PipelineOperatorLineage::default(),
+            pipelines,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_pipeline_with_lineage(
+        &mut self,
+        source: SourceSpec,
+        mut transforms: Vec<TransformSpec>,
+        sink: SinkSpec,
+        sink_sharing: SinkSharing,
+        output: RowType,
+        mut operator_lineage: PipelineOperatorLineage,
+        pipelines: &mut Vec<PipelineSpec>,
+    ) -> Result<PipelineChain> {
         confirm_covering_runtime_filters(&source, &mut transforms);
-        let transforms = fuse_adjacent_projects(transforms);
-        let properties = self.build_pipeline_properties(&source, &transforms, &sink);
+        if operator_lineage.transforms.len() != transforms.len() {
+            operator_lineage.transforms = std::iter::repeat_n(None, transforms.len()).collect();
+        }
+        let (transforms, transform_lineage) =
+            fuse_adjacent_projects_with_lineage(transforms, operator_lineage.transforms);
+        operator_lineage.transforms = transform_lineage.into_boxed_slice();
+        let mut properties = self.build_pipeline_properties(&source, &transforms, &sink);
+        properties.operator_lineage = operator_lineage;
         let id = self.push_pipeline_stage(
             source,
             transforms,
@@ -175,6 +203,7 @@ pub(super) fn confirm_covering_runtime_filters(
 
 /// Fuse projection chains that only become adjacent after physical operators
 /// are distributed into pipeline producers, notably UNION ALL fan-in.
+#[cfg(test)]
 pub(super) fn fuse_adjacent_projects(transforms: Vec<TransformSpec>) -> Vec<TransformSpec> {
     let mut fused = Vec::with_capacity(transforms.len());
     for transform in transforms {
@@ -193,4 +222,41 @@ pub(super) fn fuse_adjacent_projects(transforms: Vec<TransformSpec>) -> Vec<Tran
         *inner = composed;
     }
     fused
+}
+
+fn fuse_adjacent_projects_with_lineage(
+    transforms: Vec<TransformSpec>,
+    operator_lineage: Box<[Option<paro_planner::plan::PlanNodeId>]>,
+) -> (
+    Vec<TransformSpec>,
+    Vec<Option<paro_planner::plan::PlanNodeId>>,
+) {
+    debug_assert_eq!(transforms.len(), operator_lineage.len());
+    let mut fused = Vec::with_capacity(transforms.len());
+    let mut lineage = Vec::with_capacity(transforms.len());
+    for (transform, logical_node) in transforms.into_iter().zip(operator_lineage.into_vec()) {
+        let TransformSpec::Project(outer) = transform else {
+            fused.push(transform);
+            lineage.push(logical_node);
+            continue;
+        };
+        let Some(TransformSpec::Project(inner)) = fused.last_mut() else {
+            fused.push(TransformSpec::Project(outer));
+            lineage.push(logical_node);
+            continue;
+        };
+        let Some(composed) = outer.compose_over(inner) else {
+            fused.push(TransformSpec::Project(outer));
+            lineage.push(logical_node);
+            continue;
+        };
+        *inner = composed;
+        // The fused executor performs two logical projections as one physical
+        // transform.  Neither individual logical node is a sound one-to-one
+        // execution coordinate, so keep the profile explicitly uncovered.
+        if let Some(last) = lineage.last_mut() {
+            *last = None;
+        }
+    }
+    (fused, lineage)
 }

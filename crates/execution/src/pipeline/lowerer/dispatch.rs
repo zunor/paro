@@ -49,11 +49,25 @@ impl<'a> PipelineLowerer<'a> {
                 dependencies,
             );
         }
-        let (source, mut transforms) = self.collect_linear_roles(root)?;
+        let (source, mut transforms, mut operator_lineage) = self.collect_linear_roles(root)?;
         let source_handles = source.clone();
+        let source_transform_count = operator_lineage.transforms.len();
         transforms.append(&mut consumer_transforms);
-        let pushed =
-            self.push_pipeline(source, transforms, sink, sink_sharing, output, pipelines)?;
+        let mut transform_lineage = operator_lineage.transforms.into_vec();
+        transform_lineage.extend(std::iter::repeat_n(
+            None,
+            transforms.len().saturating_sub(source_transform_count),
+        ));
+        operator_lineage.transforms = transform_lineage.into_boxed_slice();
+        let pushed = self.push_pipeline_with_lineage(
+            source,
+            transforms,
+            sink,
+            sink_sharing,
+            output,
+            operator_lineage,
+            pipelines,
+        )?;
         self.add_source_handle_dependencies(&source_handles, pushed.entry, dependencies)?;
         Ok(pushed.tail)
     }

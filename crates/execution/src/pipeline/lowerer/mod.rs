@@ -14,7 +14,9 @@ use paro_planner::operator::join::{JoinComparisonType, JoinType};
 
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::plan::PhysicalPlan;
-use crate::physical::properties::{NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec};
+use crate::physical::properties::{
+    NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec, PipelineOperatorLineage,
+};
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ClassicIeJoinSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec,

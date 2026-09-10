@@ -9,12 +9,12 @@ use std::fmt::Write;
 use paro_planner::operator::{ExplainFormat, ExplainSpec};
 
 use crate::explain::profiler::{
-    ExplainProfileEvent, ExplainProfileSnapshot, ExplainProfiler, ProfileMorselRange,
-    PROFILE_SCHEMA_VERSION,
+    ExplainProfileEvent, ExplainProfileSnapshot, ExplainProfiler, PROFILE_SCHEMA_VERSION,
+    ProfileMorselRange,
 };
 use crate::explain::types::{
-    ExplainActualStats, ExplainControlRegionStats, ExplainNodeId, ExplainRecursiveCteStats,
-    ExplainRuntimeStats, EXPLAIN_FORMAT_VERSION,
+    EXPLAIN_FORMAT_VERSION, ExplainActualStats, ExplainControlRegionStats, ExplainNodeId,
+    ExplainRecursiveCteStats, ExplainRuntimeStats,
 };
 use crate::memory_runtime::MemoryRuntimeStats;
 use crate::pipeline::StatementProgram;
@@ -56,27 +56,30 @@ fn render_explain_analyze_text(
             for program in programs.pipelines.iter() {
                 lines.push(format!("PIPELINE {}", program.id.index()));
                 lines.push(format!(
-                    "  SOURCE #{} {}{}",
+                    "  SOURCE #{} {}{}{}",
                     program.source.operator_id.index(),
                     program.source.exec.name(),
                     actual_suffix(
                         &snapshot.operators,
                         program.source.operator_id.index() as u64
-                    )
+                    ),
+                    logical_node_suffix(program.source.origin.logical_plan_node)
                 ));
                 for transform in program.transforms.iter() {
                     lines.push(format!(
-                        "  TRANSFORM #{} {}{}",
+                        "  TRANSFORM #{} {}{}{}",
                         transform.operator_id.index(),
                         transform.exec.name(),
-                        actual_suffix(&snapshot.operators, transform.operator_id.index() as u64)
+                        actual_suffix(&snapshot.operators, transform.operator_id.index() as u64),
+                        logical_node_suffix(transform.origin.logical_plan_node)
                     ));
                 }
                 lines.push(format!(
-                    "  SINK #{} {}{}",
+                    "  SINK #{} {}{}{}",
                     program.sink.operator_id.index(),
                     program.sink.exec.name(),
-                    actual_suffix(&snapshot.operators, program.sink.operator_id.index() as u64)
+                    actual_suffix(&snapshot.operators, program.sink.operator_id.index() as u64),
+                    logical_node_suffix(program.sink.origin.logical_plan_node)
                 ));
             }
             render_control_regions_text(&snapshot.control_regions, &mut lines);
@@ -114,6 +117,7 @@ fn render_explain_analyze_json(
                     program.source.operator_id.index(),
                     "source",
                     program.source.exec.name(),
+                    program.source.origin.logical_plan_node,
                     &snapshot.operators,
                 ));
                 for transform in program.transforms.iter() {
@@ -122,6 +126,7 @@ fn render_explain_analyze_json(
                         transform.operator_id.index(),
                         "transform",
                         transform.exec.name(),
+                        transform.origin.logical_plan_node,
                         &snapshot.operators,
                     ));
                 }
@@ -130,6 +135,7 @@ fn render_explain_analyze_json(
                     program.sink.operator_id.index(),
                     "sink",
                     program.sink.exec.name(),
+                    program.sink.origin.logical_plan_node,
                     &snapshot.operators,
                 ));
             }
@@ -168,6 +174,7 @@ const PROFILE_SCHEMA_FIELDS: &[&str] = &[
     "pipeline_id",
     "work_unit_id",
     "operator_id",
+    "logical_node_id",
     "thread_id",
     "morsel_range",
     "phase",
@@ -497,15 +504,23 @@ fn operator_json(
     runtime_id: usize,
     role: &'static str,
     operator: &str,
+    logical_plan_node: Option<paro_planner::plan::PlanNodeId>,
     stats: &HashMap<ExplainNodeId, ExplainActualStats>,
 ) -> serde_json::Value {
     serde_json::json!({
         "pipeline": pipeline,
         "runtime_id": runtime_id,
+        "logical_node_id": logical_plan_node.map(|node| node.0),
         "role": role,
         "operator": operator,
         "actual": actual_json(stats, runtime_id as u64),
     })
+}
+
+fn logical_node_suffix(logical_plan_node: Option<paro_planner::plan::PlanNodeId>) -> String {
+    logical_plan_node
+        .map(|node| format!(" logical_node_id={}", node.0))
+        .unwrap_or_default()
 }
 
 fn recursive_cte_json(stats: &ExplainRecursiveCteStats) -> serde_json::Value {

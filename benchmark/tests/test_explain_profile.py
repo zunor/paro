@@ -59,6 +59,14 @@ class ExplainProfileTests(unittest.TestCase):
             "PIPELINE 0\n  SOURCE #0 ROWSET_SCAN",
         )
 
+    def test_text_profile_keeps_optional_logical_coordinate(self) -> None:
+        profiles = _flatten_explain_profile(
+            "PIPELINE 0\n"
+            "  SOURCE #0 ROWSET_SCAN (actual time=0.1..0.2 rows=1 loops=1) "
+            "logical_node_id=42\n"
+        )
+        self.assertEqual(profiles[0]["logical_node_id"], 42)
+
 
 if __name__ == "__main__":
     unittest.main()
