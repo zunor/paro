@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass, field
 import json
+import re
 import subprocess
 import threading
 import time as time_module
@@ -372,12 +373,21 @@ class BenchmarkExecutor:
     def _fetch_explain_profile_json(self, conn: Any, sql: str) -> str:
         explain_sql = _build_explain_analyze_sql(sql)
         rows = self._execute_sql(conn, explain_sql, fetch=True)
-        if not rows or not rows[0]:
-            raise ValueError("EXPLAIN ANALYZE FORMAT JSON returned no rows")
-        raw = rows[0][0]
-        if not isinstance(raw, str) or not raw.strip():
-            raise ValueError("EXPLAIN ANALYZE FORMAT JSON returned empty payload")
-        return raw
+        if not rows:
+            raise ValueError("EXPLAIN ANALYZE returned no rows")
+        payload_lines: list[str] = []
+        for row in rows:
+            if not row:
+                continue
+            payload = row[0]
+            if isinstance(payload, str) and payload.strip():
+                payload_lines.append(payload)
+        if not payload_lines:
+            raise ValueError("EXPLAIN ANALYZE returned an empty payload")
+        # JSON is normally one row; Paro's text renderer returns one row per
+        # plan/profile line.  Joining here keeps the wire-format distinction
+        # out of the executor and lets the parser below handle both forms.
+        return "\n".join(payload_lines)
 
     def _execute_script(self, conn: Any, script: str) -> None:
         for statement in _split_sql_statements(script):
@@ -506,7 +516,12 @@ def _extract_explain_execution_time_ms(raw_json: str) -> float | None:
     try:
         document = json.loads(raw_json)
     except json.JSONDecodeError:
-        return None
+        match = re.search(
+            r"^\s*Execution Time:\s*([0-9]+(?:\.[0-9]+)?)\s*ms\s*$",
+            raw_json,
+            flags=re.MULTILINE,
+        )
+        return float(match.group(1)) if match else None
     if not isinstance(document, dict):
         return None
     summary = document.get("summary")
@@ -580,8 +595,8 @@ def _read_process_rss_kb(pid: int) -> int | None:
 def _flatten_explain_profile(raw_json: str) -> list[dict[str, Any]]:
     try:
         document = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid explain JSON: {exc}") from exc
+    except json.JSONDecodeError:
+        return _flatten_explain_profile_text(raw_json)
     if not isinstance(document, dict):
         raise ValueError("explain JSON document must be an object")
     operators = document.get("operators")
@@ -667,6 +682,9 @@ def _operator_profile_entry(
         "scheduler_morsel_count": _optional_int(actual_map.get("scheduler_morsel_count")),
         "scheduler_ready_time_us": _optional_int(actual_map.get("scheduler_ready_time_us")),
         "scheduler_wait_time_us": _optional_int(actual_map.get("scheduler_wait_time_us")),
+        "aggregate_hash_max_radix_partition_skew_percent": _optional_int(
+            actual_map.get("aggregate_hash_max_radix_partition_skew_percent")
+        ),
         "output_backpressure_count": _optional_int(
             actual_map.get("output_backpressure_count")
         ),
@@ -709,6 +727,119 @@ def _append_operator_profile(
     for index, child in enumerate(children):
         if isinstance(child, dict):
             _append_operator_profile(child, profiles, f"{tree_path}/{index}", profile_fields)
+
+
+_TEXT_OPERATOR_RE = re.compile(
+    r"^\s+(SOURCE|TRANSFORM|SINK)\s+#(\d+)\s+([^ ]+)(?:\s+(\(.*\)))?\s*$"
+)
+_TEXT_PIPELINE_RE = re.compile(r"^PIPELINE\s+(\d+)\s*$")
+
+
+def _flatten_explain_profile_text(raw_text: str) -> list[dict[str, Any]]:
+    lines = raw_text.splitlines()
+    profile_fields = _text_profile_fields(lines)
+    profiles: list[dict[str, Any]] = []
+    pipeline_id: str | None = None
+    for line in lines:
+        pipeline_match = _TEXT_PIPELINE_RE.match(line.strip())
+        if pipeline_match:
+            pipeline_id = pipeline_match.group(1)
+            continue
+        operator_match = _TEXT_OPERATOR_RE.match(line)
+        if not operator_match:
+            continue
+        role, node_id, operator, actual_suffix = operator_match.groups()
+        actual_map = _parse_text_actual_suffix(actual_suffix)
+        tree_path = f"{pipeline_id or '0'}/{role.lower()}/{node_id}"
+        profiles.append(
+            _operator_profile_entry(
+                node_id=int(node_id),
+                operator=operator,
+                tree_path=tree_path,
+                actual_map=actual_map,
+                profile_fields=profile_fields,
+            )
+        )
+    if not profiles and not any(line.startswith("UTILITY ") for line in lines):
+        raise ValueError("explain text payload contains no pipeline operators")
+    return profiles
+
+
+def _parse_text_actual_suffix(suffix: str | None) -> dict[str, Any]:
+    if not suffix:
+        return {}
+    body = suffix.strip()
+    if not (body.startswith("(") and body.endswith(")")):
+        return {}
+    body = body[1:-1]
+    actual: dict[str, Any] = {}
+    time_match = re.search(
+        r"\bactual\s+time=([+-]?[0-9]+(?:\.[0-9]+)?)\.\.([+-]?[0-9]+(?:\.[0-9]+)?)",
+        body,
+    )
+    if time_match:
+        actual["startup_time_ms"] = float(time_match.group(1))
+        actual["total_time_ms"] = float(time_match.group(2))
+    for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)", body):
+        if key == "time":
+            continue
+        parsed: int | float | str
+        try:
+            if any(character in value for character in ".eE"):
+                parsed = float(value)
+            else:
+                parsed = int(value)
+        except ValueError:
+            parsed = value
+        actual[key] = parsed
+    return actual
+
+
+def _text_profile_fields(lines: list[str]) -> dict[str, Any]:
+    profile_values: dict[str, Any] = {}
+    memory_values: dict[str, Any] = {}
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("PROFILE "):
+            profile_values = _parse_text_key_values(stripped[len("PROFILE ") :])
+        elif stripped.startswith("MEMORY_PROFILE "):
+            memory_values = _parse_text_key_values(stripped[len("MEMORY_PROFILE ") :])
+    return {
+        "profile_schema_version": _optional_int(profile_values.get("schema_version")),
+        "query_id": _optional_int(profile_values.get("query_id")),
+        "profile_event_count": _optional_int(profile_values.get("events")),
+        "profile_parallelism": _optional_int(profile_values.get("parallelism")),
+        "profile_observed_workers": _optional_int(profile_values.get("workers")),
+        "profile_worker_utilization": _optional_float(
+            profile_values.get("worker_utilization")
+        ),
+        "profile_ready_time_us": _optional_int(profile_values.get("ready_time_us")),
+        "profile_wait_time_us": _optional_int(profile_values.get("wait_time_us")),
+        "profile_backpressure_count": _optional_int(profile_values.get("backpressure")),
+        "profile_runtime_filter_installed_count": _optional_int(
+            profile_values.get("runtime_filter_installed")
+        ),
+        "profile_runtime_filter_no_wait_count": _optional_int(
+            profile_values.get("runtime_filter_no_wait")
+        ),
+        "profile_grant_bytes": _optional_int(memory_values.get("grant_bytes")),
+        "profile_revoked_bytes": _optional_int(memory_values.get("revoked_bytes")),
+        "profile_spill_bytes": _optional_int(memory_values.get("spill_bytes")),
+        "profile_yield_latency_us": _optional_int(memory_values.get("yield_latency_us")),
+    }
+
+
+def _parse_text_key_values(payload: str) -> dict[str, int | float | str]:
+    values: dict[str, int | float | str] = {}
+    for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)", payload):
+        try:
+            if any(character in value for character in ".eE"):
+                values[key] = float(value)
+            else:
+                values[key] = int(value)
+        except ValueError:
+            values[key] = value
+    return values
 
 
 def _optional_int(value: Any) -> int | None:
