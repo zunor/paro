@@ -396,7 +396,10 @@ impl TransformationRule for PlannerTransformationRule {
         // These two search rules can consume the exact matched shell directly
         // for their conservative native subsets. Keep the legacy owned-plan
         // path available for every shape that needs richer semantic handling.
-        let direct_native = {
+        let direct_native = if matches!(
+            self.transformation,
+            PlannerTransformation::PredicateTransfer | PlannerTransformation::JoinRegionEnumeration
+        ) {
             let state = self
                 .planner_state
                 .read()
@@ -410,8 +413,10 @@ impl TransformationRule for PlannerTransformationRule {
                 PlannerTransformation::JoinRegionEnumeration => {
                     join_region::try_native_enumeration(&binding.root, ctx.memo(), &state, &facts)?
                 }
-                _ => Vec::new(),
+                _ => unreachable!("native dispatch guard changed"),
             }
+        } else {
+            Vec::new()
         };
         let (
             plan,
@@ -429,7 +434,25 @@ impl TransformationRule for PlannerTransformationRule {
                 .planner_state
                 .read()
                 .expect("planner transform state poisoned");
-            let (plan, nested_group_holes) = if direct_native.is_empty() {
+            // Native producers are deliberately conservative.  A non-empty
+            // native result is not a completeness proof: it may cover only a
+            // side-local predicate subset or only the reorderable part of a
+            // join region.  Always retain the semantic rewrite as a peer
+            // candidate so a partial native result cannot hide a valid
+            // alternative from the Memo search.
+            // JoinRegion's native enumerator has already validated a closed,
+            // reorderable graph and emitted every bounded final plan.  Do not
+            // first materialize the same binding as an OwnedLogicalPlan just
+            // to convert it back into group references below.  Other native
+            // paths (notably PredicateTransfer) may be only a partial
+            // semantic subset, so they deliberately keep their owned peer.
+            let native_join_region_only = matches!(
+                self.transformation,
+                PlannerTransformation::JoinRegionEnumeration
+            ) && !direct_native.is_empty();
+            let (plan, nested_group_holes) = if native_join_region_only {
+                (None, BTreeMap::new())
+            } else {
                 let Some(instantiated) = semantic_plan::instantiate_bound_plan_with_group_holes(
                     ctx.memo(),
                     &state,
@@ -440,8 +463,6 @@ impl TransformationRule for PlannerTransformationRule {
                     return Ok(Box::new([]));
                 };
                 (Some(instantiated.plan), instantiated.group_holes)
-            } else {
-                (None, BTreeMap::new())
             };
             let logical = ctx
                 .memo()
@@ -605,13 +626,7 @@ impl TransformationRule for PlannerTransformationRule {
             nested_group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         }
 
-        let use_native_shell = matches!(
-            self.transformation,
-            PlannerTransformation::PredicateTransfer
-                | PlannerTransformation::JoinRegionEnumeration
-                | PlannerTransformation::AggregateDimensionDeferral
-                | PlannerTransformation::AggregateJoinSubsumption
-        );
+        let use_native_shell = native_shell_staging_allowed(self.transformation);
         enum PlanCandidate {
             Native(NativeShell),
             Owned(OwnedLogicalPlan),
@@ -913,6 +928,22 @@ fn expression_is_only_rule_output(expr: &crate::cascades::memo::LogicalExpr, rul
     proofs_are_only_rule_output(&expr.proofs, rule)
 }
 
+/// Native shell staging is an admission decision, not a generic conversion
+/// shortcut.  PredicateTransfer's direct shell is allowed only for the
+/// separately proven local subset; its complete semantic peer still needs the
+/// settlement path because that path carries producer/consumer ownership and
+/// residual predicate facts.  Treating every closed owned tree as a shell was
+/// the Q11 quality regression: it preserved an executable plan while dropping
+/// the narrow date-domain/partial-aggregate choice.
+fn native_shell_staging_allowed(transformation: PlannerTransformation) -> bool {
+    matches!(
+        transformation,
+        PlannerTransformation::JoinRegionEnumeration
+            | PlannerTransformation::AggregateDimensionDeferral
+            | PlannerTransformation::AggregateJoinSubsumption
+    )
+}
+
 fn proofs_are_only_rule_output(proofs: &BTreeSet<EquivalenceProof>, rule: RuleId) -> bool {
     let mut produced_by_rule = false;
     for proof in proofs {
@@ -1011,6 +1042,15 @@ fn try_native_predicate_transfer(
     let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
         return Ok(None);
     };
+    // CTE references carry producer/consumer ownership and demand domains
+    // that are not represented by a side-local Filter shell.  Moving a
+    // predicate around such a boundary can be row-preserving yet still erase
+    // the producer restriction that makes Q11's narrow partial aggregate
+    // possible.  Leave those bindings to the CTE-aware semantic path until a
+    // native ownership adapter supplies the complete proof.
+    if native_shell_contains_control_boundary(&shell) {
+        return Ok(None);
+    }
     let root = shell.root;
     let LogicalOperator::Filter(filter) = shell.nodes[root].operator.clone() else {
         return Ok(None);
@@ -1108,12 +1148,29 @@ fn try_native_predicate_transfer(
         .map(|node| node.stats.clone())
         .unwrap_or_default();
     let mut nodes = shell.nodes.into_vec();
+    let child_stats = |nodes: &[NativeNode], child: &NativeChild| -> NodeStats {
+        match child {
+            NativeChild::Node(index) => nodes
+                .get(*index)
+                .map(|node| node.stats.clone())
+                .unwrap_or_default(),
+            NativeChild::MemoGroup { stats, .. } | NativeChild::Group { stats, .. } => {
+                stats.clone()
+            }
+        }
+    };
     let add_filter =
         |nodes: &mut Vec<NativeNode>, child: NativeChild, expressions: Vec<Expression>| {
+            // A side-local filter may reduce rows, but a native shell has no
+            // selectivity proof yet. Carry the child range as a conservative
+            // upper/expected estimate instead of defaulting to one row; the
+            // latter makes the direct candidate look artificially cheap and
+            // can displace the complete legacy rewrite in physical search.
+            let stats = child_stats(nodes, &child);
             let index = nodes.len();
             nodes.push(NativeNode {
                 id: state.bind_context.next_plan_id(),
-                stats: NodeStats::default(),
+                stats,
                 operator: LogicalOperator::Filter(paro_planner::operator::Filter {
                     expressions,
                     child,
@@ -1159,9 +1216,10 @@ fn try_native_predicate_transfer(
         joined
     } else {
         let root = nodes.len();
+        let stats = child_stats(&nodes, &NativeChild::Node(joined));
         nodes.push(NativeNode {
             id: state.bind_context.next_plan_id(),
-            stats: NodeStats::default(),
+            stats,
             operator: LogicalOperator::Filter(paro_planner::operator::Filter {
                 expressions: remaining,
                 child: NativeChild::Node(joined),
@@ -1292,6 +1350,28 @@ fn native_predicate_transfer_may_apply(
     let [left, right] = join_children.as_ref() else {
         return Ok(false);
     };
+    // The native shell currently proves only local predicate movement.  Do
+    // not use it as a replacement for the complete semantic rewrite when a
+    // child is already a derived relation: CTE demand, aggregate domains and
+    // producer ownership are encoded by that relation's alternatives, not by
+    // its output columns.  The first native tranche is therefore limited to
+    // an unambiguous pair of base Get groups.  This keeps D2 enabled for the
+    // small safe subset while preventing a partial shell from winning over
+    // Q11's CTE-aware narrow-aggregate chain.
+    if !native_predicate_base_relation_operand(left, memo, state)?
+        || !native_predicate_base_relation_operand(right, memo, state)?
+    {
+        return Ok(false);
+    }
+    let mut visited_groups = BTreeSet::new();
+    if operand_contains_control_boundary(left, memo, state, &mut visited_groups)?
+        || operand_contains_control_boundary(right, memo, state, &mut visited_groups)?
+    {
+        // A CTE/recursive producer is not just another relation: its
+        // consumer demand and sharing owner are part of the rewrite proof.
+        // PredicateTransfer has no native ownership adapter yet.
+        return Ok(false);
+    }
     let Some(left_tables) = operand_tables(left, memo, state)? else {
         return Ok(false);
     };
@@ -1313,6 +1393,126 @@ fn native_predicate_transfer_may_apply(
     }))
 }
 
+fn native_predicate_base_relation_operand(
+    operand: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<bool> {
+    let (group, expression, children) = match operand {
+        PatternOperand::Group(group) => {
+            let group = memo.canonical_group(*group);
+            let Some(group_ref) = memo.group(group) else {
+                return Ok(false);
+            };
+            let [expression] = group_ref.logical_exprs() else {
+                return Ok(false);
+            };
+            (group, *expression, 0)
+        }
+        PatternOperand::Expression {
+            group,
+            expression,
+            children,
+        } => (*group, *expression, children.len()),
+    };
+    if children != 0 || memo.cardinality_dependencies(group).next().is_some() {
+        return Ok(false);
+    }
+    let Some(logical) = memo.logical_expr(expression) else {
+        return Ok(false);
+    };
+    let Some(payload) = state.payloads.logical.get(logical.payload.index()) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        payload.semantic_template.operator,
+        LogicalOperator::Get(_)
+    ))
+}
+
+fn operand_contains_control_boundary(
+    operand: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    visited_groups: &mut BTreeSet<GroupId>,
+) -> Result<bool> {
+    fn operator_is_control<Child>(operator: &LogicalOperator<Child>) -> bool {
+        matches!(
+            operator,
+            LogicalOperator::CTERef(_)
+                | LogicalOperator::MaterializedCTE(_)
+                | LogicalOperator::RecursiveCTE(_)
+        )
+    }
+
+    match operand {
+        PatternOperand::Group(group) => {
+            let group = memo.canonical_group(*group);
+            if !visited_groups.insert(group) {
+                return Ok(false);
+            }
+            if memo.cardinality_dependencies(group).next().is_some() {
+                return Ok(true);
+            }
+            let logical_ids = memo
+                .group(group)
+                .map(|group| group.logical_exprs().to_vec())
+                .unwrap_or_default();
+            for logical_id in logical_ids {
+                let logical = memo.logical_expr(logical_id).ok_or_else(|| {
+                    paro_error::internal("native predicate control scan lost an expression")
+                })?;
+                let payload = state
+                    .payloads
+                    .logical
+                    .get(logical.payload.index())
+                    .ok_or_else(|| {
+                        paro_error::internal("native predicate control scan lost a payload")
+                    })?;
+                if operator_is_control(&payload.semantic_template.operator) {
+                    return Ok(true);
+                }
+                for child in &logical.key.children {
+                    if operand_contains_control_boundary(
+                        &PatternOperand::Group(*child),
+                        memo,
+                        state,
+                        visited_groups,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        PatternOperand::Expression {
+            expression,
+            children,
+            ..
+        } => {
+            let logical = memo.logical_expr(*expression).ok_or_else(|| {
+                paro_error::internal("native predicate control scan lost an expression")
+            })?;
+            let payload = state
+                .payloads
+                .logical
+                .get(logical.payload.index())
+                .ok_or_else(|| {
+                    paro_error::internal("native predicate control scan lost a payload")
+                })?;
+            if operator_is_control(&payload.semantic_template.operator) {
+                return Ok(true);
+            }
+            children.iter().try_fold(false, |found, child| {
+                if found {
+                    return Ok(true);
+                }
+                operand_contains_control_boundary(child, memo, state, visited_groups)
+            })
+        }
+    }
+}
+
 fn is_side_local_tables(tables: &[usize], side_tables: &[usize], other_tables: &[usize]) -> bool {
     !tables.is_empty()
         && tables
@@ -1321,6 +1521,24 @@ fn is_side_local_tables(tables: &[usize], side_tables: &[usize], other_tables: &
         && tables
             .iter()
             .all(|table| other_tables.binary_search(table).is_err())
+}
+
+fn native_shell_contains_control_boundary(shell: &NativeShell) -> bool {
+    shell.nodes.iter().any(|node| {
+        let mut contains = matches!(
+            &node.operator,
+            LogicalOperator::CTERef(_)
+                | LogicalOperator::MaterializedCTE(_)
+                | LogicalOperator::RecursiveCTE(_)
+        );
+        node.operator.visit_child_links(&mut |child| match child {
+            NativeChild::MemoGroup { reference, .. } | NativeChild::Group { reference, .. } => {
+                contains |= reference.facts.contains_control_region;
+            }
+            NativeChild::Node(_) => {}
+        });
+        contains
+    })
 }
 
 fn compact_native_shell(shell: NativeShell) -> Result<NativeShell> {
@@ -1890,6 +2108,16 @@ mod tests {
         assert!(!proofs_are_only_rule_output(
             &normalized_by_another_rule,
             rule
+        ));
+    }
+
+    #[test]
+    fn predicate_transfer_semantic_peer_keeps_ownership_settlement() {
+        assert!(!native_shell_staging_allowed(
+            PlannerTransformation::PredicateTransfer
+        ));
+        assert!(native_shell_staging_allowed(
+            PlannerTransformation::JoinRegionEnumeration
         ));
     }
 }

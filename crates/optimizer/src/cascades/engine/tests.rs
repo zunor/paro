@@ -339,7 +339,10 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
         let proof = build_joint_cost_proof(&memo, owner, &recipe, SearchCost::ZERO)
             .unwrap()
             .expect("region recipe must produce a proof");
-        assert_eq!(proof.region, memo.regions().region_for_facet(facet).unwrap());
+        assert_eq!(
+            proof.region,
+            memo.regions().region_for_facet(facet).unwrap()
+        );
         assert_eq!(proof.owner_group, canonical_owner);
         assert_eq!(proof.boundary_goals[0].0, canonical_first);
         assert_eq!(proof.boundary_goals[1].0, canonical_second);
@@ -1923,6 +1926,7 @@ fn subscription_delta_matches_an_independent_set_difference() {
                 result.push(PatternRead {
                     group: GroupId(group),
                     logical_frontier_revision: frontier,
+                    physical_frontier_revision: None,
                     logical_fact_fingerprint: Fingerprint(revision.into()),
                     statistics_snapshot_fingerprint: Fingerprint(u128::from(revision) + 1),
                 });

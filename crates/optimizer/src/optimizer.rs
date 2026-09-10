@@ -468,6 +468,24 @@ impl Optimizer {
                     trace.record_value("optimizer", name, elapsed);
                 }
             }
+            for (name, candidate) in [
+                (
+                    "first_safe_candidate",
+                    extraction.search_milestones.safe_candidate,
+                ),
+                (
+                    "first_optional_ready_candidate",
+                    extraction.search_milestones.optional_ready_candidate,
+                ),
+                (
+                    "first_optional_selected_candidate",
+                    extraction.search_milestones.optional_selected_candidate,
+                ),
+            ] {
+                if let Some(candidate) = candidate {
+                    trace.record_value("optimizer", name, candidate.index() as u64);
+                }
+            }
             trace.record_event(
                 "optimizer",
                 if summary.is_complete() {

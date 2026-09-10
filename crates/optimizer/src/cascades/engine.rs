@@ -293,6 +293,7 @@ pub struct CascadesEngine {
     physical_subproblem_requests: u64,
     physical_subproblem_reuses: u64,
     physical_subproblem_evaluations: u64,
+    physical_stale_retries: u64,
     physical_implementation_requests: u64,
     child_combination_events: BTreeMap<ChildCombinationIdentity, Fingerprint>,
     next_child_combination_event: u128,
@@ -347,6 +348,7 @@ impl CascadesEngine {
             physical_subproblem_requests: 0,
             physical_subproblem_reuses: 0,
             physical_subproblem_evaluations: 0,
+            physical_stale_retries: 0,
             physical_implementation_requests: 0,
             child_combination_events: BTreeMap::new(),
             next_child_combination_event: 1,
@@ -573,6 +575,11 @@ impl CascadesEngine {
             // logical alternatives, mandatory physical work is re-costed
             // incrementally below; this keeps the incumbent fallback semantics
             // intact when cancellation happens before the first publication.
+            // Re-cost the protected baseline at logical publication batches.
+            // This is the quality-first hand-off: a newly published narrow
+            // aggregate or pushed domain must become executable before a
+            // later parent transformation can decide that the broad plan is
+            // its only available response.
             self.explore_transformations_with_interleave(Some((root, goal)))?;
         }
         self.optimize_group(root, goal)?;
@@ -990,6 +997,14 @@ impl CascadesEngine {
             if binding_set.bindings.is_empty() {
                 continue;
             }
+            // A binding set is a snapshot shared by all exact bindings of the
+            // source expression. Applying one binding may refine a reused
+            // Memo group's facts; the remaining bindings then belong to a new
+            // discovery frontier and must be re-enumerated. Do not submit a
+            // later application with the earlier shared snapshot and rely on
+            // publication to discover the conflict after it has already
+            // committed unrelated local work.
+            let binding_read_set = ReadSet::new(binding_set.reads.iter().copied());
             if self.collect_rule_work_profile {
                 self.note_rule_phase(rule, RuleWorkPhase::Matched);
                 let profile = self.rule_work_profile.entry(rule).or_default();
@@ -1003,6 +1018,14 @@ impl CascadesEngine {
             for binding in binding_set.bindings.iter() {
                 if !self.memo.control().checkpoint()? {
                     break 'tasks;
+                }
+                if !binding_read_set.is_current(&self.memo)? {
+                    // The successful predecessor publication schedules the
+                    // subscribed source task through its locally written
+                    // groups. Re-enter that task with a fresh binding set;
+                    // the remaining bindings from this snapshot are not
+                    // independently valid.
+                    break;
                 }
                 let application_key = (task_id, binding.fingerprint);
                 let previous_application = self
@@ -1112,14 +1135,18 @@ impl CascadesEngine {
                         rule,
                         binding: binding.clone(),
                     },
-                    // Discovery and application have different scopes. The
-                    // discovery task retains the frontier observation that
-                    // produced this exact binding; the application task
-                    // records only the facts it actually consumes. A child
-                    // group may publish a new peer expression after the
-                    // binding was discovered without invalidating the
-                    // already-exact application.
-                    ReadSet::new(application_reads.iter().copied()),
+                    // The application task consumes both the discovery
+                    // frontier and the facts read while constructing this
+                    // exact binding. Keeping both observations is important:
+                    // a later logical alternative can change the binding
+                    // even when the application-local facts are unchanged.
+                    ReadSet::new(
+                        binding_set
+                            .reads
+                            .iter()
+                            .copied()
+                            .chain(application_reads.iter().copied()),
+                    ),
                     &self.memo,
                 )? {
                     TaskRequest::Leader(task) => {
@@ -1481,15 +1508,21 @@ impl CascadesEngine {
                 } else {
                     let newly_inserted_expressions = inserted_expressions.clone();
                     let (appended_groups, locally_written_groups) = context.commit()?;
+                    let locally_written_groups = locally_written_groups
+                        .into_iter()
+                        .map(|group| self.memo.canonical_group(group))
+                        .collect::<BTreeSet<_>>();
                     let changed_cte_readers = self.memo.take_changed_cte_readers();
                     self.note_logical_publication();
                     self.publish_transformation_task(
                         transformation_task,
                         locally_written_groups
-                            .into_iter()
+                            .iter()
+                            .copied()
                             .chain(std::iter::once(group))
                             .chain(appended_groups.iter().copied())
-                            .chain(changed_cte_readers.iter().copied()),
+                            .chain(changed_cte_readers.iter().copied())
+                            .chain(fact_reads.iter().map(|read| read.group)),
                     )?;
                     release_transformation_output_reservations(
                         &mut self.memo,
@@ -1507,6 +1540,7 @@ impl CascadesEngine {
                         group.cardinality =
                             std::mem::take(&mut group.cardinality).canonical_with(cardinality);
                     }
+                    inserted_groups.extend(locally_written_groups);
                     *self.effective_rule_insertions.entry(rule).or_default() +=
                         u64::try_from(inserted_expressions.len()).unwrap_or(u64::MAX);
                     effective_insertions_since_recost = effective_insertions_since_recost
@@ -1695,6 +1729,7 @@ impl CascadesEngine {
                 "physical_subproblem_evaluation_count",
                 self.physical_subproblem_evaluations,
             ),
+            ("physical_stale_retry_count", self.physical_stale_retries),
             (
                 "physical_implementation_request_count",
                 self.physical_implementation_requests,
@@ -2220,13 +2255,47 @@ impl CascadesEngine {
         Ok(())
     }
 
+    /// Capture the physical inputs that one group can observe through its
+    /// currently published recipes.  The parent group is intentionally read
+    /// only through its logical/fact frontier: the task owns its local
+    /// physical writes.  Child physical frontiers are exact dependencies, so
+    /// a newly published child winner creates a new evaluation without
+    /// making every unchanged recursive visit resumable.
+    fn physical_read_set(&self, group: GroupId, goal: OptimizationGoal) -> Result<ReadSet> {
+        let group = self.memo.canonical_group(group);
+        let physical_exprs = self
+            .memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("unknown group during physical read capture"))?
+            .physical_exprs()
+            .to_vec();
+        // The task is allowed to publish into its own group, but subsequent
+        // requests still need to observe physical expressions/frontier
+        // entries published by another owner.  Publication ignores this
+        // local physical write; reuse does not.
+        let mut reads = vec![PatternRead::physical_from_group(&self.memo, group)?];
+        for physical in physical_exprs {
+            for (_, recipe) in self.recipes.range(
+                (physical, goal, Fingerprint::default())..=(physical, goal, Fingerprint(u128::MAX)),
+            ) {
+                for (child, _) in recipe.child_goals.iter().copied() {
+                    reads.push(PatternRead::physical_from_group(&self.memo, child)?);
+                }
+            }
+        }
+        Ok(ReadSet::new(reads))
+    }
+
     fn optimize_group(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
         if !self.memo.control().checkpoint()? {
             return Ok(());
         }
         let group = self.memo.canonical_group(group);
         self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
-        let read_set = ReadSet::single(PatternRead::from_group(&self.memo, group)?);
+        // Child frontiers are part of the exact parent response. Capture them
+        // before requesting the task so a changed child selects a new
+        // evaluation, while an unchanged incomplete task remains reusable.
+        let read_set = self.physical_read_set(group, goal)?;
         let task = match self.task_registry.request_current(
             TaskIntent::Optimize { group, goal },
             read_set,
@@ -2244,6 +2313,7 @@ impl CascadesEngine {
             }
         };
         self.task_registry.start(task)?;
+        let physical_expr_count = self.memo.physical_expr_count() as u64;
         let task_has_residual_work = self
             .task_registry
             .task(task)
@@ -2261,7 +2331,7 @@ impl CascadesEngine {
             let cursor = self.task_registry.advance_cursor(
                 task,
                 Cursor {
-                    position: self.memo.physical_expr_count() as u64,
+                    position: physical_expr_count,
                     complete: true,
                 },
             )?;
@@ -2289,24 +2359,32 @@ impl CascadesEngine {
         }
         let result = self.optimize_group_inner(group, goal);
         self.active_goals.remove(&(group, goal));
-        if result.is_ok()
-            && self
-                .memo
-                .group(group)
-                .and_then(|group| group.winner(goal))
-                .is_none()
-        {
-            self.infeasible_goals.insert((group, goal));
-        }
         match result {
             Ok(()) => {
-                // A physical task may have a feasible winner before the
-                // optional search is complete. Keep its cursor resumable
-                // while Memo still carries a budget, deadline, or rule
-                // failure obligation; otherwise a later logical alternative
-                // can never re-enter the child-frontier competition and a
-                // baseline plan may be frozen as the final winner.
+                if self
+                    .memo
+                    .group(group)
+                    .and_then(|group| group.winner(goal))
+                    .is_none()
+                {
+                    self.infeasible_goals.insert((group, goal));
+                }
+                // A physical task is complete only after its declared search
+                // obligations have been discharged.  This preserves the
+                // quality contract: a budget-limited pass remains resumable
+                // so a later logical publication can re-enter the child
+                // frontier and compete with the incumbent.  The restart
+                // storm seen with this condition is a task lifecycle bug, not
+                // a reason to report an incomplete search as complete.
                 let complete = self.memo.search_obligations().is_empty();
+                // The recursive pass may have created new recipes and child
+                // frontier dependencies. Rebind the running task to the
+                // exact post-child ReadSet before publication; otherwise a
+                // later parent could either miss a child change or retain a
+                // provisional pre-child snapshot.
+                let post_child_reads = self.physical_read_set(group, goal)?;
+                self.task_registry
+                    .replace_current_read_set(task, &self.memo, post_child_reads)?;
                 let cursor = self.task_registry.advance_cursor(
                     task,
                     Cursor {
@@ -2331,6 +2409,14 @@ impl CascadesEngine {
                     std::iter::empty(),
                     outcome,
                 )?;
+                if self
+                    .memo
+                    .group(group)
+                    .and_then(|group| group.winner(goal))
+                    .is_none()
+                {
+                    self.infeasible_goals.insert((group, goal));
+                }
                 Ok(())
             }
             Err(error) => {
@@ -2410,6 +2496,7 @@ impl CascadesEngine {
         let mut child_costs = Vec::<SearchCost>::new();
         let mut child_fingerprints = Vec::<Fingerprint>::new();
         let mut source_work_scratch = Vec::<SourceWork>::new();
+
         for (physical, _recipe_fingerprint, recipe) in recipes {
             if !self.memo.control().checkpoint()? {
                 break;
@@ -3795,6 +3882,8 @@ fn transformation_dependency_fingerprint(dependencies: &[PatternRead]) -> Finger
         builder.write_u64(read.group.0 as u64);
         builder.write_u64(u64::from(read.logical_frontier_revision.is_some()));
         builder.write_u64(read.logical_frontier_revision.unwrap_or_default());
+        builder.write_u64(u64::from(read.physical_frontier_revision.is_some()));
+        builder.write_u64(read.physical_frontier_revision.unwrap_or_default());
         builder.write_fingerprint(read.logical_fact_fingerprint);
         builder.write_fingerprint(read.statistics_snapshot_fingerprint);
     }

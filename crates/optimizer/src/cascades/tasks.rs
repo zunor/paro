@@ -180,29 +180,15 @@ impl ReadSet {
     }
 
     pub fn new(reads: impl IntoIterator<Item = PatternRead>) -> Self {
-        // A task may combine a discovery frontier read with a later fact
-        // read for the same group. Keep one read per group so a stale fact
-        // snapshot cannot survive beside a current application read and
-        // make an otherwise valid local publication fail. A frontier read
-        // remains part of the contract; the fact/statistics fields follow
-        // the last observation supplied by the caller, which is the current
-        // application observation in the production path.
-        let mut merged = BTreeMap::<GroupId, PatternRead>::new();
-        for read in reads {
-            if let Some(previous) = merged.get_mut(&read.group) {
-                let frontier = read
-                    .logical_frontier_revision
-                    .or(previous.logical_frontier_revision);
-                *previous = PatternRead {
-                    logical_frontier_revision: frontier,
-                    ..read
-                };
-            } else {
-                merged.insert(read.group, read);
-            }
-        }
+        // Keep distinct read modes for the same group. A transformation may
+        // consume both the enumerated frontier and a later facts snapshot;
+        // collapsing those observations would silently widen the reuse key
+        // and allow a stale application to survive a changed input.
+        let mut reads = reads.into_iter().collect::<Vec<_>>();
+        reads.sort_unstable();
+        reads.dedup();
         Self {
-            reads: merged.into_values().collect(),
+            reads: reads.into_boxed_slice(),
         }
     }
 
@@ -227,7 +213,8 @@ impl ReadSet {
     ) -> Result<bool> {
         self.reads.iter().try_fold(true, |current, read| {
             Ok(current
-                && (locally_written_groups.contains(&read.group) || read.is_current(memo)?))
+                && (locally_written_groups.contains(&read.group)
+                    || read.is_current_for_publication(memo)?))
         })
     }
 }
@@ -635,14 +622,36 @@ impl TaskRegistry {
                         })
                         .is_some_and(|cursor| !cursor.complete);
                     if incomplete {
-                        // A completed invocation may only have consumed a
-                        // prefix of its search domain. Keep the exact task
-                        // identity and cursor, but reopen the evaluation so
-                        // its residual obligations can be scheduled.
-                        self.task_mut(task)?.state = TaskState::Runnable;
-                        self.task_mut(task)?.outcome = None;
-                        self.record_reopened_evaluation(kind);
-                        Ok(TaskRequest::Leader(task))
+                        if memo.is_some() {
+                            // An incomplete cursor is resumable, not an
+                            // instruction to restart on every recursive
+                            // visit.  The current-read request already
+                            // proved that this exact task domain has not
+                            // changed; the engine will request a new exact
+                            // evaluation when a logical or physical input
+                            // frontier advances.  Keeping the completed
+                            // prefix here prevents a child scan from
+                            // repeatedly reopening the whole parent search.
+                            self.profile.reused_evaluations =
+                                self.profile.reused_evaluations.saturating_add(1);
+                            let profile = self.kind_profile_mut(kind);
+                            profile.reused_evaluations =
+                                profile.reused_evaluations.saturating_add(1);
+                            Ok(TaskRequest::Reused {
+                                task,
+                                outcome: self.task(task).and_then(|record| record.outcome.clone()),
+                            })
+                        } else {
+                            // The legacy, non-Memo registry API has no input
+                            // revision to tell it whether a continuation is
+                            // still current. Preserve its explicit
+                            // continuation behavior for the small state
+                            // machine tests and callers.
+                            self.task_mut(task)?.state = TaskState::Runnable;
+                            self.task_mut(task)?.outcome = None;
+                            self.record_reopened_evaluation(kind);
+                            Ok(TaskRequest::Leader(task))
+                        }
                     } else {
                         self.profile.reused_evaluations =
                             self.profile.reused_evaluations.saturating_add(1);
@@ -867,6 +876,57 @@ impl TaskRegistry {
 
     pub fn task_read_set(&self, id: TaskId) -> Option<ReadSetId> {
         self.task(id).map(|task| task.read_set)
+    }
+
+    /// Refresh the exact input revision of a running task after it has
+    /// recursively materialized its declared dependencies.  A physical
+    /// parent normally captures child frontiers before entering the child
+    /// task; those frontiers are expected to advance during the first
+    /// construction, so treating the provisional snapshot as a failed
+    /// publication would recursively restart the same search.  Rebinding the
+    /// task to the post-child ReadSet keeps selective invalidation exact while
+    /// making the publication point observe the work it actually consumed.
+    pub fn replace_current_read_set(
+        &mut self,
+        task: TaskId,
+        memo: &Memo,
+        reads: ReadSet,
+    ) -> Result<()> {
+        if !matches!(self.state(task), Some(TaskState::Running)) {
+            return Err(paro_error::internal(
+                "only a running task may replace its read set",
+            ));
+        }
+        let reads = canonicalize_read_set(memo, reads);
+        if !reads.is_current(memo)? {
+            return Err(paro_error::internal(
+                "task read set replacement is already obsolete",
+            ));
+        }
+        let (intent, old_evaluation) = {
+            let record = self
+                .task(task)
+                .ok_or_else(|| paro_error::internal("unknown task read-set replacement"))?;
+            (record.intent, record.evaluation)
+        };
+        let read_set = self.intern_read_set(reads);
+        let inputs = self.intern_input_revision(read_set)?;
+        let evaluation = EvaluationKey { intent, inputs };
+        if let Some(existing) = self.evaluations.get(&evaluation).copied() {
+            if existing != task {
+                return Err(paro_error::internal(
+                    "task read-set replacement collides with another evaluation",
+                ));
+            }
+        }
+        if self.evaluations.get(&old_evaluation).copied() == Some(task) {
+            self.evaluations.remove(&old_evaluation);
+        }
+        self.evaluations.insert(evaluation, task);
+        let record = self.task_mut(task)?;
+        record.evaluation = evaluation;
+        record.read_set = read_set;
+        Ok(())
     }
 
     pub fn outcome(&self, id: TaskId) -> Option<&TaskOutcome> {
@@ -1683,6 +1743,7 @@ mod tests {
         let read = PatternRead {
             group: GroupId::new(7),
             logical_frontier_revision: Some(3),
+            physical_frontier_revision: None,
             logical_fact_fingerprint: Fingerprint(11),
             statistics_snapshot_fingerprint: Fingerprint(13),
         };
@@ -1840,6 +1901,73 @@ mod tests {
             .unwrap();
         assert!(matches!(next, TaskRequest::Leader(reopened) if reopened == task));
         assert_eq!(registry.state(task), Some(TaskState::Runnable));
+    }
+
+    #[test]
+    fn current_request_reuses_an_incomplete_prefix_until_its_read_advances() {
+        let mut memo = Memo::new(Default::default());
+        let group = memo.create_group(
+            GroupSchema::new([]).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let read = PatternRead::from_group(&memo, group).unwrap();
+        let mut registry = TaskRegistry::default();
+        let intent = TaskIntent::Optimize {
+            group,
+            goal: goal(),
+        };
+        let TaskRequest::Leader(task) = registry
+            .request_current(intent.clone(), ReadSet::single(read), &memo)
+            .unwrap()
+        else {
+            panic!("initial request did not lead")
+        };
+        registry.start(task).unwrap();
+        let cursor = registry
+            .advance_cursor(
+                task,
+                Cursor {
+                    position: 7,
+                    complete: false,
+                },
+            )
+            .unwrap();
+        registry
+            .complete(task, TaskOutcome::Progress { cursor })
+            .unwrap();
+
+        assert!(matches!(
+            registry
+                .request_current(intent.clone(), ReadSet::single(read), &memo)
+                .unwrap(),
+            TaskRequest::Reused {
+                task: reused,
+                outcome: Some(TaskOutcome::Progress { .. })
+            } if reused == task
+        ));
+        assert_eq!(registry.state(task), Some(TaskState::Completed));
+        assert_eq!(registry.profile().reopened_evaluations, 0);
+
+        memo.insert_logical(
+            group,
+            LogicalExprKey {
+                operator: Fingerprint(2),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(2),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+        let current_read = PatternRead::from_group(&memo, group).unwrap();
+        let TaskRequest::Leader(next) = registry
+            .request_current(intent, ReadSet::single(current_read), &memo)
+            .unwrap()
+        else {
+            panic!("advanced read did not create a fresh physical evaluation")
+        };
+        assert_ne!(next, task);
     }
 
     #[test]
@@ -2231,6 +2359,7 @@ mod tests {
                 ReadSet::new([PatternRead {
                     group: GroupId::new(4),
                     logical_frontier_revision: None,
+                    physical_frontier_revision: None,
                     logical_fact_fingerprint: Fingerprint(12),
                     statistics_snapshot_fingerprint: Fingerprint(13),
                 }]),

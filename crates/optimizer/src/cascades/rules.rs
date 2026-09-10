@@ -257,20 +257,38 @@ pub struct PatternRead {
     /// peer root insertions must not invalidate and recursively wake the same
     /// binding task.
     pub logical_frontier_revision: Option<u64>,
+    /// `Some` for physical tasks which consume the group's published
+    /// physical frontier. The revision is owned by the group so unrelated
+    /// child publications do not invalidate this task. It is deliberately
+    /// absent from transformation reads.
+    pub physical_frontier_revision: Option<u64>,
     pub logical_fact_fingerprint: Fingerprint,
     pub statistics_snapshot_fingerprint: Fingerprint,
 }
 
 impl PatternRead {
     pub fn from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, true)
+        Self::read(memo, group, true, false)
+    }
+
+    /// Read a group for a physical subproblem. In addition to the logical
+    /// frontier and facts, the task observes physical publications so a
+    /// parent cannot reuse a child frontier that changed during a nested
+    /// optimization request.
+    pub fn physical_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
+        Self::read(memo, group, true, true)
     }
 
     pub fn facts_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, false)
+        Self::read(memo, group, false, false)
     }
 
-    fn read(memo: &Memo, group: GroupId, reads_frontier: bool) -> Result<Self> {
+    fn read(
+        memo: &Memo,
+        group: GroupId,
+        reads_frontier: bool,
+        reads_physical_frontier: bool,
+    ) -> Result<Self> {
         let group = memo.canonical_group(group);
         let group_ref = memo
             .group(group)
@@ -281,13 +299,34 @@ impl PatternRead {
             group,
             logical_frontier_revision: reads_frontier
                 .then(|| group_ref.logical_expression_version()),
+            physical_frontier_revision: reads_physical_frontier
+                .then(|| group_ref.physical_frontier_version()),
             logical_fact_fingerprint: group_ref.logical_fact_fingerprint(),
             statistics_snapshot_fingerprint: memo.local_statistics_fingerprint(group),
         })
     }
 
     pub fn is_current(self, memo: &Memo) -> Result<bool> {
-        let current = Self::read(memo, self.group, self.logical_frontier_revision.is_some())?;
+        let current = Self::read(
+            memo,
+            self.group,
+            self.logical_frontier_revision.is_some(),
+            self.physical_frontier_revision.is_some(),
+        )?;
+        Ok(current == self)
+    }
+
+    /// Publication uses the same exact read contract as task reuse. Physical
+    /// children are immutable candidate frontiers, but a parent composed from
+    /// an older child revision must not be recorded as a current completion;
+    /// the engine retries that parent against a fresh targeted ReadSet.
+    pub fn is_current_for_publication(self, memo: &Memo) -> Result<bool> {
+        let current = Self::read(
+            memo,
+            self.group,
+            self.logical_frontier_revision.is_some(),
+            self.physical_frontier_revision.is_some(),
+        )?;
         Ok(current == self)
     }
 }
@@ -382,8 +421,12 @@ impl<'a> TransformContext<'a> {
             let frontier = read
                 .logical_frontier_revision
                 .or(previous.logical_frontier_revision);
+            let physical_frontier = read
+                .physical_frontier_revision
+                .or(previous.physical_frontier_revision);
             *previous = PatternRead {
                 logical_frontier_revision: frontier,
+                physical_frontier_revision: physical_frontier,
                 ..read
             };
         } else {

@@ -1155,6 +1155,10 @@ pub struct Group {
     /// Transformation consumers use it to distinguish a completed match from
     /// one whose child frontier has since changed, including through rollback.
     logical_expression_version: u64,
+    /// Monotone publication cursor for the physical expressions and winner
+    /// frontiers owned by this group. Physical parents subscribe to the
+    /// specific child groups they read instead of a Memo-global generation.
+    physical_frontier_version: u64,
     physical_exprs: Vec<PhysicalExprId>,
     logical_index: BTreeMap<LogicalExprKey, Vec<LogicalExprId>>,
     physical_index: BTreeMap<PhysicalExprKey, PhysicalExprId>,
@@ -1195,6 +1199,10 @@ impl Group {
 
     pub fn physical_exprs(&self) -> &[PhysicalExprId] {
         &self.physical_exprs
+    }
+
+    pub fn physical_frontier_version(&self) -> u64 {
+        self.physical_frontier_version
     }
 
     pub fn winner(&self, goal: OptimizationGoal) -> Option<&Winner> {
@@ -1869,6 +1877,7 @@ impl Memo {
             statistics_read_fingerprint: Mutex::new(None),
             logical_exprs: Vec::new(),
             logical_expression_version: 0,
+            physical_frontier_version: 0,
             physical_exprs: Vec::new(),
             logical_index: BTreeMap::new(),
             physical_index: BTreeMap::new(),
@@ -2516,6 +2525,10 @@ impl Memo {
         let group = &mut self.groups[target.index()];
         group.physical_index.insert(key, id);
         group.physical_exprs.push(id);
+        group.physical_frontier_version = group
+            .physical_frontier_version
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("Memo physical frontier revision overflow"))?;
         Ok(id)
     }
 
@@ -2593,6 +2606,8 @@ impl Memo {
                 .get_mut()
                 .insert_with_limit(goal, winner, frontier_limit),
         };
+        let frontier_changed =
+            insertion.selected_changed || insertion.truncated || insertion.published.is_some();
         if insertion.truncated {
             self.groups[group.index()].ledger.record_budget_limited(
                 BudgetDimension::WinnerFrontier,
@@ -2605,6 +2620,16 @@ impl Memo {
                 goal,
                 winner,
             });
+        }
+        if frontier_changed {
+            let group = self
+                .groups
+                .get_mut(group.index())
+                .ok_or_else(|| paro_error::internal("winner group disappeared"))?;
+            group.physical_frontier_version = group
+                .physical_frontier_version
+                .checked_add(1)
+                .ok_or_else(|| paro_error::internal("Memo physical frontier revision overflow"))?;
         }
         Ok(insertion.selected_changed)
     }
@@ -2766,6 +2791,11 @@ impl Memo {
         canonical_group
             .physical_exprs
             .append(&mut secondary_group.physical_exprs);
+        canonical_group.physical_frontier_version = canonical_group
+            .physical_frontier_version
+            .max(secondary_group.physical_frontier_version)
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("Memo physical frontier revision overflow"))?;
         canonical_group.winner_frontiers.clear();
         secondary_group.winner_frontiers.clear();
 
