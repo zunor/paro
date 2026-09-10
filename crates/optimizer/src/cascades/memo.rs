@@ -849,8 +849,11 @@ pub(crate) enum CandidatePreview {
     /// bounded position itself is outside the retained prefix.
     MustMaterialize,
     /// An incumbent already dominates the candidate; no frontier mutation is
-    /// needed and the owned payload can be skipped.
-    Rejected,
+    /// needed and the owned payload can be skipped. The published candidate
+    /// is retained as a monotone dominance witness, so incremental
+    /// parent-frontier updates do not have to rescan this proposal. The
+    /// witness is valid for the same frozen cost/read context as the summary.
+    Rejected { dominator: CandidateId },
     /// The candidate is outside the bounded prefix without retiring an
     /// incumbent.  Record the boundary obligation, but do not persist it.
     Truncated,
@@ -893,21 +896,23 @@ impl WinnerFrontier {
         candidate: CandidateSummary<'_>,
         limit: usize,
     ) -> CandidatePreview {
-        if self.candidates.iter().any(|incumbent| {
+        if let Some(dominator) = self.candidates.iter().find_map(|incumbent| {
             match winner_continuation_cmp_summary(
                 incumbent,
                 &candidate,
                 &self.filterable_sources,
                 goal.objective,
             ) {
-                Some(std::cmp::Ordering::Less) => true,
-                Some(std::cmp::Ordering::Equal) => {
-                    winner_tie_break(incumbent) <= summary_tie_break(&candidate)
+                Some(std::cmp::Ordering::Less) => Some(incumbent.candidate),
+                Some(std::cmp::Ordering::Equal)
+                    if winner_tie_break(incumbent) <= summary_tie_break(&candidate) =>
+                {
+                    Some(incumbent.candidate)
                 }
-                _ => false,
+                _ => None,
             }
         }) {
-            return CandidatePreview::Rejected;
+            return CandidatePreview::Rejected { dominator };
         }
 
         let mut position = 0usize;

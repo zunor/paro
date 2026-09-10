@@ -843,7 +843,8 @@ fn candidate_preview_matches_bounded_frontier_admission() {
         }
     }
 
-    let first = winner(1, 1.0, 10_000);
+    let mut first = winner(1, 1.0, 10_000);
+    first.candidate = CandidateId::new(41);
     let mut frontier = WinnerFrontier::default();
     assert_eq!(
         frontier.preview(goal, summary(&first), 1),
@@ -860,6 +861,30 @@ fn candidate_preview_matches_bounded_frontier_admission() {
     assert_eq!(
         frontier.preview(goal, summary(&better), 1),
         CandidatePreview::Publish
+    );
+
+    // A published winner is a stable dominance witness.  The witness is
+    // returned before the bounded-position check, so a candidate that is
+    // worse on both axes is not confused with an anytime truncation.
+    let dominated = winner(4, 2.0, 20_000);
+    assert_eq!(
+        frontier.preview(goal, summary(&dominated), 1),
+        CandidatePreview::Rejected {
+            dominator: CandidateId::new(41),
+        }
+    );
+
+    // Replacing the witness with a strictly better published candidate keeps
+    // the same monotone proof: the new winner also dominates the old rejected
+    // proposal through the transitive frontier relation.
+    let mut replacement = winner(5, 0.5, 1);
+    replacement.candidate = CandidateId::new(42);
+    frontier.insert_with_limit(goal, replacement, 1);
+    assert_eq!(
+        frontier.preview(goal, summary(&dominated), 1),
+        CandidatePreview::Rejected {
+            dominator: CandidateId::new(42),
+        }
     );
 }
 

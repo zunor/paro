@@ -208,10 +208,13 @@ struct ChildCombinationIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CombinationAdmission {
+    /// The exact cost has not yet been compared with the parent frontier.
+    Pending,
     /// The exact cost is retained, but the current parent frontier dominated
-    /// the proposal.  A later frontier change may make the same priced
-    /// combination admissible; it must not be re-costed.
-    FrontierRejected,
+    /// the proposal. A published dominator remains a valid proof for this
+    /// frozen cost/read context even when the bounded frontier later evicts
+    /// it, so this combination never needs another admission scan.
+    FrontierRejected { dominator: CandidateId },
     /// The exact cost is retained, but the bounded parent frontier did not
     /// retain the candidate.  This remains an incomplete frontier result,
     /// not a proof that the combination was never useful.
@@ -3567,14 +3570,14 @@ impl CascadesEngine {
             },
         )?;
         match preview {
-            CandidatePreview::Rejected => {
+            CandidatePreview::Rejected { dominator } => {
                 self.memo.record_rejected_winner_proposal(
                     group,
                     goal,
                     cached.physical_fingerprint,
                     false,
                 )?;
-                cached.admission = CombinationAdmission::FrontierRejected;
+                cached.admission = CombinationAdmission::FrontierRejected { dominator };
                 Ok((false, false))
             }
             CandidatePreview::Truncated => {
@@ -3849,7 +3852,7 @@ impl CascadesEngine {
                     .priced
                     .iter()
                     .filter(|(_, cached)| {
-                        cached.admission != CombinationAdmission::Published
+                        matches!(cached.admission, CombinationAdmission::FrontierTruncated)
                             && combination_state.active(&cached.children)
                     })
                     .map(|(children, _)| children.clone())
@@ -4054,7 +4057,7 @@ impl CascadesEngine {
                         cost,
                         source_work,
                         physical_fingerprint: fingerprint,
-                        admission: CombinationAdmission::FrontierRejected,
+                        admission: CombinationAdmission::Pending,
                     },
                 );
                 let (frontier_changed, selected_changed) = self.admit_cached_child_combination(
@@ -4090,7 +4093,7 @@ impl CascadesEngine {
                     .priced
                     .iter()
                     .filter(|(_, cached)| {
-                        cached.admission != CombinationAdmission::Published
+                        matches!(cached.admission, CombinationAdmission::FrontierTruncated)
                             && combination_state.active(&cached.children)
                     })
                     .map(|(children, _)| children.clone())
