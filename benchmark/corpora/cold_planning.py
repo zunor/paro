@@ -27,10 +27,28 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
-from benchmark_evidence import (ImmutableDataSeed, isolated_paro_server, build_benchmark_server,
-                                STATEMENT_TRACE_SCHEMA_VERSION, content_digest,
-                                parse_statement_trace_log, repository_identity,
-                                statement_fingerprint, tree_digest, validate_statement_trace)
+try:
+    # Package imports are used by unit tests and the D6 collector.  Keep the
+    # script form below working for the documented ``python benchmark/corpora``
+    # invocation as well.
+    from benchmark.corpora.benchmark_evidence import (
+        ImmutableDataSeed,
+        isolated_paro_server,
+        build_benchmark_server,
+        STATEMENT_TRACE_SCHEMA_VERSION,
+        content_digest,
+        parse_statement_trace_log,
+        repository_identity,
+        statement_fingerprint,
+        tree_digest,
+        validate_statement_trace,
+    )
+except ModuleNotFoundError:  # pragma: no cover - script-only import path
+    from benchmark_evidence import (ImmutableDataSeed, isolated_paro_server,
+                                    build_benchmark_server, STATEMENT_TRACE_SCHEMA_VERSION,
+                                    content_digest, parse_statement_trace_log,
+                                    repository_identity, statement_fingerprint, tree_digest,
+                                    validate_statement_trace)
 
 COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physical_search",
               "memo_exploration", "physical_extraction", "winner_verification"}
