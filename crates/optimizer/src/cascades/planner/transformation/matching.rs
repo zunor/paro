@@ -1552,10 +1552,11 @@ fn transformation_root_operator_matches(
         PlannerTransformation::AggregatePostReduction => {
             matches!(operator, Op::MaterializedCTE | Op::Projection | Op::Filter)
         }
-        // This transformation currently recognizes a consumed mark below a
-        // transparent wrapper. Until that matcher is expressed with native
-        // group holes, every known root remains a possible carrier.
-        PlannerTransformation::MarkJoinToSemi => true,
+        // The consumer matcher only accepts a projection or filter shell. A
+        // descendant publication cannot change this immutable root operator,
+        // so rejecting every other root here is a complete dispatch proof and
+        // avoids walking its unrelated descendant frontiers.
+        PlannerTransformation::MarkJoinToSemi => matches!(operator, Op::Projection | Op::Filter),
         PlannerTransformation::JoinElimination => matches!(
             operator,
             Op::Projection | Op::Filter | Op::Aggregate | Op::Limit | Op::Order | Op::TopN
@@ -1918,6 +1919,21 @@ mod tests {
         assert!(!transformation_root_operator_matches(
             PlannerTransformation::JoinRegionEnumeration,
             LogicalOperatorType::Projection,
+            true,
+        ));
+        assert!(transformation_root_operator_matches(
+            PlannerTransformation::MarkJoinToSemi,
+            LogicalOperatorType::Projection,
+            true,
+        ));
+        assert!(transformation_root_operator_matches(
+            PlannerTransformation::MarkJoinToSemi,
+            LogicalOperatorType::Filter,
+            true,
+        ));
+        assert!(!transformation_root_operator_matches(
+            PlannerTransformation::MarkJoinToSemi,
+            LogicalOperatorType::Aggregate,
             true,
         ));
     }
