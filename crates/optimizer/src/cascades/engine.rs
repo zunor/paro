@@ -635,6 +635,15 @@ pub struct CascadesEngine {
     physical_subproblem_evaluations: u64,
     physical_stale_retries: u64,
     physical_implementation_requests: u64,
+    /// Logical frontier growth is append-only.  Keep the exact implementation
+    /// visit identity so a later physical recost can discover only newly
+    /// published logical expressions.  The mandatory/optional bit is part of
+    /// the identity: mandatory baseline enumeration deliberately skips
+    /// optional physical alternatives, which must be offered once when the
+    /// optional phase begins.
+    physical_implementation_seen: BTreeSet<(GroupId, OptimizationGoal, LogicalExprId, bool)>,
+    physical_implementation_expression_evaluations: u64,
+    physical_implementation_expression_skips: u64,
     child_combination_events: BTreeMap<ChildCombinationIdentity, Fingerprint>,
     next_child_combination_event: u128,
     child_combination_states:
@@ -706,6 +715,9 @@ impl CascadesEngine {
             physical_subproblem_evaluations: 0,
             physical_stale_retries: 0,
             physical_implementation_requests: 0,
+            physical_implementation_seen: BTreeSet::new(),
+            physical_implementation_expression_evaluations: 0,
+            physical_implementation_expression_skips: 0,
             child_combination_events: BTreeMap::new(),
             next_child_combination_event: 1,
             child_combination_states: BTreeMap::new(),
@@ -759,6 +771,11 @@ impl CascadesEngine {
         // failed Memo validation cannot invalidate a live task in advance.
         let _ = self.task_registry.redirect_group(secondary, canonical)?;
         self.recanonicalize_physical_parents();
+        // Logical and physical expression ids from the two pre-merge groups
+        // no longer describe an isolated implementation domain.  Revisit the
+        // canonical group from its published expressions instead of allowing
+        // a pre-merge visit marker to suppress a valid candidate.
+        self.physical_implementation_seen.clear();
         self.discard_merged_transformation_state(secondary, canonical);
         Ok(canonical)
     }
@@ -2556,6 +2573,14 @@ impl CascadesEngine {
                 self.physical_implementation_requests,
             ),
             (
+                "physical_implementation_expression_evaluation_count",
+                self.physical_implementation_expression_evaluations,
+            ),
+            (
+                "physical_implementation_expression_skip_count",
+                self.physical_implementation_expression_skips,
+            ),
+            (
                 "optimization_context_count",
                 self.memo.optimization_context_count() as u64,
             ),
@@ -2886,7 +2911,18 @@ impl CascadesEngine {
             .ok_or_else(|| paro_error::internal("unknown group during implementation"))?
             .logical_exprs()
             .to_vec();
+        let phase = self.mandatory_only;
         for expression in logical_exprs {
+            let visit = (group, goal, expression, phase);
+            if !self.physical_implementation_seen.insert(visit) {
+                self.physical_implementation_expression_skips = self
+                    .physical_implementation_expression_skips
+                    .saturating_add(1);
+                continue;
+            }
+            self.physical_implementation_expression_evaluations = self
+                .physical_implementation_expression_evaluations
+                .saturating_add(1);
             let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
                 paro_error::internal("unknown logical expression during implementation")
             })?;
