@@ -138,10 +138,20 @@ pub struct JoinOrderOptimizer {
 /// used to reconstruct a candidate. Native rule producers use this result to
 /// rebuild a `NativeShell` directly, while the compatibility entry point
 /// below still reconstructs `OwnedLogicalPlan` values for legacy callers.
+///
+/// The value is safe to share between equal, fact-keyed Memo requests: it
+/// contains only immutable relation sets, predicate descriptions and DP
+/// nodes. Native plan-node identities are allocated later while rebuilding a
+/// shell, so sharing this graph result cannot alias an executable arena.
+#[derive(Debug, Clone)]
 pub(crate) struct JoinGraphEnumeration {
     pub(crate) final_plans: Vec<DPJoinNode>,
     pub(crate) filter_infos: Vec<Arc<FilterInfo>>,
     pub(crate) root_filters: Vec<Expression>,
+    /// Whether this graph exhausted the declared DP domain. Approximate
+    /// graphs are still useful as prioritized seeds, but callers must not use
+    /// them as proof evidence.
+    pub(crate) completion: EnumerationOutcome,
 }
 
 impl JoinOrderOptimizer {
@@ -317,6 +327,7 @@ impl JoinOrderOptimizer {
             debug!(
                 target: targets::OPTIMIZER,
                 shape = %final_plan.compact_shape(),
+                completion = ?graph.completion,
                 cardinality = final_plan.cardinality,
                 cost = final_plan.cost,
                 peak_build_bytes = final_plan.peak_build_bytes,
@@ -417,7 +428,11 @@ impl JoinOrderOptimizer {
             self.max_frontier_size,
         );
         enumerator.init_leaf_plans();
-        if enumerator.solve_join_order() != EnumerationOutcome::Complete {
+        let completion = enumerator.solve_join_order();
+        if !matches!(
+            completion,
+            EnumerationOutcome::Complete | EnumerationOutcome::Approximate
+        ) {
             return Ok(None);
         }
         let final_plans = enumerator.get_final_plans().to_vec();
@@ -430,6 +445,7 @@ impl JoinOrderOptimizer {
             final_plans,
             filter_infos: self.filter_infos.clone(),
             root_filters: extracted_predicates.root_filters,
+            completion,
         }))
     }
 
