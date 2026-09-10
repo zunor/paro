@@ -239,6 +239,8 @@ def main() -> int:
     }
     for path, observation in zip(args.query, report["queries"], strict=True):
         query = path.read_text().strip()
+        while query.endswith(";"):
+            query = query[:-1].rstrip()
         for block in range(args.process_blocks):
             try:
                 # Startup mutates owner/checkpoint metadata even for EXPLAIN.
