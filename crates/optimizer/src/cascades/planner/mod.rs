@@ -7,6 +7,7 @@ mod boundary;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use crate::physical::{ObjectiveProfile, ResourceGrantClass, SpillPolicy};
 use paro_catalog::entry::CatalogEntry;
@@ -44,16 +45,16 @@ use super::calibration::{
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility, GroupSchema};
 use super::cost::ResourceDimension;
 use super::cost::{CompactRange, ScoreSummary, SearchCost};
-use super::engine::{CascadesEngine, SearchMode};
+use super::engine::{CascadesEngine, SearchMode, SearchStopReason};
 use super::ids::{
     AdmissibleGrantSetId, BaseRelationId, ColumnId, Fingerprint, GroupId, ImplementationId,
     LogicalExprId, LogicalPayloadId, OpClassId, OptimizationContextId, PhysicalPayloadId,
     PropertySetId, QualityPolicyId, RuleId, ScalarExprId, SnapshotId, StableFingerprintBuilder,
 };
 use super::memo::{
-    CardinalityEnvelope, CardinalityRecipeKind, ChildWinnerRef, CteReferenceDomain,
-    EquivalenceProof, GrantGoalKey, GroupCardinality, GroupColumnDomain, LogicalExprKey,
-    LogicalProperties, Memo, OptimizationContext, OptimizationGoal, PhysicalExprKey, RowGoal,
+    CardinalityEnvelope, CardinalityRecipeKind, CteReferenceDomain, EquivalenceProof, GrantGoalKey,
+    GroupCardinality, GroupColumnDomain, LogicalExprKey, LogicalProperties, Memo,
+    OptimizationContext, OptimizationGoal, PhysicalExprKey, RowGoal,
 };
 use super::properties::{
     MutationSafetyRequirement, NullOrder, OrderingKey, OrderingRequirement, OrderingScope,
@@ -310,7 +311,8 @@ impl OptimizationInput {
         )?;
         let mut engine = CascadesEngine::new(self.memo, registry);
         engine.set_rule_work_profile_enabled(paro_context::StatementTrace::enabled());
-        if let Some(session) = &self.planner_state.read().unwrap().session {
+        let statement_context = self.planner_state.read().unwrap().session.clone();
+        if let Some(session) = &statement_context {
             engine
                 .memo_mut()
                 .set_cancellation(session.cancellation.clone())?;
@@ -322,6 +324,9 @@ impl OptimizationInput {
             grant_classes.values().copied(),
             self.mode,
         )?;
+        engine.note_search_return();
+        let stop = grant_optimization.stop;
+        let extraction_started = Instant::now();
         let mut variants = Vec::with_capacity(grant_optimization.winners.len());
         debug!(target: targets::OPTIMIZER, groups = engine.memo().group_count(), attempts = ?engine.rule_attempts(), insertions = ?engine.effective_rule_insertions(), "completed Memo search work");
         for grant_winner in grant_optimization.winners {
@@ -345,13 +350,14 @@ impl OptimizationInput {
             }
             let extracted = {
                 let planner_state = self.planner_state.read().unwrap();
-                extract_planner_tree(
+                verify_frozen_candidate_payloads(&grant_winner.frozen, &planner_state)?;
+                extract_frozen_planner_tree(
                     engine.memo(),
                     &planner_state,
                     &self.bind_context,
                     self.root,
                     grant_winner.goal,
-                    winner.candidate,
+                    grant_winner.frozen.clone(),
                     mode,
                 )?
             };
@@ -379,13 +385,65 @@ impl OptimizationInput {
                 cost,
             });
         }
+        let handoff_extraction_us =
+            u64::try_from(extraction_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let rule_insertions = engine.effective_rule_insertions().clone();
         let rule_attempts = engine.rule_attempts().clone();
         let rule_elapsed = engine.rule_elapsed().clone();
         let rule_allocated_bytes = engine.rule_allocated_bytes().clone();
         let rule_budget_exhaustions = engine.rule_budget_exhaustions().clone();
         let rule_work_profile = engine.rule_work_profile().clone();
-        let search_milestones = engine.search_milestones().clone();
+        let mut search_milestones = engine.search_milestones().clone();
+        if !matches!(stop.reason, SearchStopReason::Complete) {
+            search_milestones.handoff_extraction_us = Some(handoff_extraction_us);
+        }
+        if let Some(trace) = statement_context
+            .as_ref()
+            .and_then(|context| context.statement_trace())
+        {
+            let stop_event = match stop.reason {
+                SearchStopReason::Complete => "search_complete",
+                SearchStopReason::Deadline => "search_stop_deadline",
+                SearchStopReason::BudgetLimited => "search_stop_budget_limited",
+                SearchStopReason::RuleFailure => "search_stop_rule_failure",
+            };
+            trace.record_event("optimizer", stop_event);
+            if stop.budget_limited {
+                trace.record_event("optimizer", "search_budget_limited");
+            }
+            for (name, value) in [
+                ("search_deadline_us", stop.configured_deadline_us),
+                ("search_actual_stop_us", stop.actual_stop_us),
+                (
+                    "search_stop_profile_us",
+                    search_milestones.search_stop_profile_us,
+                ),
+                (
+                    "search_return_profile_us",
+                    search_milestones.search_return_profile_us,
+                ),
+                (
+                    "search_timeout_tail_profile_us",
+                    search_milestones.timeout_tail_profile_us,
+                ),
+                (
+                    "search_freeze_elapsed_us",
+                    Some(search_milestones.freeze_elapsed_us),
+                ),
+                (
+                    "search_frozen_candidate_count",
+                    Some(search_milestones.frozen_candidate_count),
+                ),
+                (
+                    "search_handoff_extraction_us",
+                    search_milestones.handoff_extraction_us,
+                ),
+            ] {
+                if let Some(value) = value {
+                    trace.record_value("optimizer", name, value);
+                }
+            }
+        }
         let mut work_counters = engine.search_work_counters();
         {
             let state = self

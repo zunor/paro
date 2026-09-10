@@ -72,6 +72,63 @@ pub(super) struct PresentedWinnerTree {
     pub(super) cost: SearchCost,
 }
 
+/// Validate the planner-owned payload handles captured by the immutable
+/// stop-boundary candidate.  Extraction still uses the Memo for logical
+/// metadata, but this check proves that every selected physical node already
+/// has an executable payload; no later search pass may be required to fill a
+/// missing child or implementation.
+pub(super) fn verify_frozen_candidate_payloads(
+    frozen: &crate::cascades::memo::FrozenCandidate,
+    state: &PlannerTransformState,
+) -> Result<()> {
+    fn visit(
+        frozen: &crate::cascades::memo::FrozenCandidate,
+        state: &PlannerTransformState,
+        seen: &mut std::collections::BTreeSet<crate::cascades::ids::CandidateId>,
+    ) -> Result<()> {
+        if !seen.insert(frozen.reference.candidate) {
+            return Ok(());
+        }
+        if frozen.physical.id != frozen.winner.expression
+            || frozen.logical.id != frozen.physical.key.logical
+            || frozen.physical.key.children.len() != frozen.winner.children.len()
+            || frozen.children.len() != frozen.winner.children.len()
+            || frozen
+                .physical
+                .key
+                .children
+                .iter()
+                .zip(frozen.winner.children.iter())
+                .any(|(group, child)| *group != child.group)
+            || frozen
+                .children
+                .iter()
+                .zip(frozen.winner.children.iter())
+                .any(|(child, reference)| child.reference != *reference)
+        {
+            return Err(paro_error::internal(
+                "frozen candidate lost an exact physical child or logical payload",
+            ));
+        }
+        if state
+            .payloads
+            .get_physical(frozen.physical.payload)
+            .is_none()
+        {
+            return Err(paro_error::internal(
+                "frozen candidate references a missing planner physical payload",
+            ));
+        }
+        for child in frozen.children.iter() {
+            visit(child, state, seen)?;
+        }
+        Ok(())
+    }
+
+    visit(frozen, state, &mut std::collections::BTreeSet::new())
+}
+
+#[cfg(test)]
 pub(super) fn extract_planner_tree(
     memo: &Memo,
     state: &PlannerTransformState,
@@ -81,17 +138,38 @@ pub(super) fn extract_planner_tree(
     candidate: super::super::ids::CandidateId,
     mode: SearchMode,
 ) -> Result<ExtractedWinnerTree> {
-    super::super::verifier::WinnerVerifier::verify_candidate_tree(
-        memo,
-        ChildWinnerRef {
-            group: root,
-            goal,
-            candidate,
-        },
-    )?;
+    let reference = crate::cascades::memo::ChildWinnerRef {
+        group: root,
+        goal,
+        candidate,
+    };
+    super::super::verifier::WinnerVerifier::verify_candidate_tree(memo, reference)?;
+    let frozen = memo.freeze_candidate_tree(reference)?;
+    verify_frozen_candidate_payloads(&frozen, state)?;
+    extract_frozen_planner_tree(memo, state, bind_context, root, goal, frozen, mode)
+}
+
+/// Extract a candidate that was frozen at the search stop boundary. The
+/// selected winner, logical/physical Memo payloads, and every child choice are
+/// read from `frozen`; the live Memo is used only for immutable shared
+/// registries such as required properties, cardinality facts, and calibration.
+pub(super) fn extract_frozen_planner_tree(
+    memo: &Memo,
+    state: &PlannerTransformState,
+    bind_context: &BindContext,
+    root: GroupId,
+    goal: OptimizationGoal,
+    frozen: Arc<crate::cascades::memo::FrozenCandidate>,
+    mode: SearchMode,
+) -> Result<ExtractedWinnerTree> {
+    if frozen.reference.group != memo.canonical_group(root) || frozen.reference.goal != goal {
+        return Err(paro_error::internal(
+            "frozen candidate root does not match the extraction request",
+        ));
+    }
     #[derive(Debug)]
     struct BuildTask {
-        logical: LogicalExprId,
+        logical: Arc<crate::cascades::memo::LogicalExpr>,
         payload: PhysicalPayloadId,
         child_count: usize,
         output_columns: Box<[ColumnId]>,
@@ -107,7 +185,7 @@ pub(super) fn extract_planner_tree(
         Visit {
             group: GroupId,
             goal: OptimizationGoal,
-            candidate: Option<ChildWinnerRef>,
+            frozen: Arc<crate::cascades::memo::FrozenCandidate>,
             occurrence: Fingerprint,
         },
         Build(Box<BuildTask>),
@@ -116,11 +194,7 @@ pub(super) fn extract_planner_tree(
     let mut tasks = vec![Task::Visit {
         group: root,
         goal,
-        candidate: Some(ChildWinnerRef {
-            group: root,
-            goal,
-            candidate,
-        }),
+        frozen,
         occurrence: Fingerprint(0),
     }];
     let mut plans = Vec::new();
@@ -132,23 +206,19 @@ pub(super) fn extract_planner_tree(
             Task::Visit {
                 group,
                 goal,
-                candidate,
+                frozen,
                 occurrence,
             } => {
-                let winner = candidate
-                    .map_or_else(
-                        || memo.group(group).and_then(|group| group.winner(goal)),
-                        |candidate| memo.resolve_child_winner(candidate),
-                    )
-                    .ok_or_else(|| {
-                        paro_error::internal("extraction found no exact group winner")
-                    })?;
-                let physical = memo.physical_expr(winner.expression).ok_or_else(|| {
-                    paro_error::internal("winner physical expression disappeared")
-                })?;
-                let logical = memo.logical_expr(physical.key.logical).ok_or_else(|| {
-                    paro_error::internal("winner extraction lost logical expression")
-                })?;
+                if frozen.reference.group != memo.canonical_group(group)
+                    || frozen.reference.goal != goal
+                {
+                    return Err(paro_error::internal(
+                        "frozen candidate child does not match the extraction request",
+                    ));
+                }
+                let winner = frozen.winner.as_ref();
+                let physical = frozen.physical.as_ref();
+                let logical = frozen.logical.as_ref();
                 let operator_metadata = state.metadata.get(&logical.payload).ok_or_else(|| {
                     paro_error::internal("winner extraction lost implementation metadata")
                 })?;
@@ -232,12 +302,9 @@ pub(super) fn extract_planner_tree(
                 }
                 let mut child_costs = Vec::with_capacity(winner.children.len());
                 let mut child_source_work = Vec::with_capacity(winner.children.len());
-                for child in &winner.children {
-                    let child_winner = memo.resolve_child_winner(*child).ok_or_else(|| {
-                        paro_error::internal("winner extraction lost its exact child candidate")
-                    })?;
-                    child_costs.push(child_winner.cost);
-                    child_source_work.push(child_winner.source_work.as_ref());
+                for child in frozen.children.iter() {
+                    child_costs.push(child.winner.cost);
+                    child_source_work.push(child.winner.source_work.as_ref());
                 }
                 let base_cost = crate::cascades::engine::constrain_composed_cost_to_grant(
                     crate::cascades::engine::compose_candidate_cost_with_sources_at(
@@ -286,7 +353,7 @@ pub(super) fn extract_planner_tree(
                     owned_artifacts,
                 };
                 tasks.push(Task::Build(Box::new(BuildTask {
-                    logical: physical.key.logical,
+                    logical: frozen.logical.clone(),
                     payload: physical.payload,
                     child_count: winner.children.len(),
                     output_columns: operator_metadata.output_columns.clone(),
@@ -302,11 +369,11 @@ pub(super) fn extract_planner_tree(
                         },
                     ),
                 })));
-                for (ordinal, child) in winner.children.iter().enumerate().rev() {
+                for (ordinal, child) in frozen.children.iter().enumerate().rev() {
                     tasks.push(Task::Visit {
-                        group: child.group,
-                        goal: child.goal,
-                        candidate: Some(*child),
+                        group: child.reference.group,
+                        goal: child.reference.goal,
+                        frozen: child.clone(),
                         occurrence: child_occurrence(occurrence, ordinal),
                     });
                 }
@@ -360,9 +427,7 @@ pub(super) fn extract_planner_tree(
                     ));
                 }
                 if !matches!(&payload.template, PlannerPhysicalTemplate::Executable(_)) {
-                    let logical = memo.logical_expr(logical).ok_or_else(|| {
-                        paro_error::internal("native extraction lost its selected logical operands")
-                    })?;
+                    let logical = logical.as_ref();
                     let roots: std::borrow::Cow<'_, [ScalarExprId]> = match &payload.template {
                         PlannerPhysicalTemplate::OrderedFilter { order, .. } => order
                             .ordered_roots(&logical.key.scalars, &state.scalars)?

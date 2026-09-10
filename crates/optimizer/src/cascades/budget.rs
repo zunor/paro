@@ -155,7 +155,16 @@ pub struct SearchBudget {
 impl Default for SearchBudget {
     fn default() -> Self {
         Self {
-            optional_time_limit: Some(std::time::Duration::from_secs(30)),
+            // This is an explicitly opt-in diagnostic override.  It is read
+            // at budget construction so the benchmark can run a real
+            // stop-and-execute process without changing the production
+            // default or replaying a completed search.  Malformed values are
+            // ignored and retain the normal 30 s isolation ceiling.
+            optional_time_limit: std::env::var("PARO_DIAGNOSTIC_SEARCH_STOP_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(std::time::Duration::from_millis)
+                .or(Some(std::time::Duration::from_secs(30))),
             disabled_transformation_rules: BTreeSet::new(),
             // Local and composition shells are separate pools, but both must
             // leave enough headroom for two independent child rewrites to be

@@ -1052,6 +1052,70 @@ fn optional_transformation_can_improve_mandatory_baseline() {
 }
 
 #[test]
+fn frozen_winner_keeps_exact_payload_after_frontier_reset() {
+    let (mut engine, group, goal) = engine(8);
+    let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+    let reference = ChildWinnerRef {
+        group,
+        goal,
+        candidate: winner.candidate,
+    };
+    let frozen = engine.memo().freeze_candidate_tree(reference).unwrap();
+
+    assert_eq!(frozen.reference, reference);
+    assert_eq!(frozen.winner.candidate, winner.candidate);
+    assert_eq!(frozen.physical.id, winner.expression);
+    assert_eq!(frozen.logical.id, frozen.physical.key.logical);
+    assert_eq!(frozen.children.len(), winner.children.len());
+
+    // A later cost epoch may clear the live frontier, but it must not erase
+    // the immutable handoff artifact or require a search pass to reconstruct
+    // its physical payload.
+    engine.memo_mut().clear_cost_frontiers().unwrap();
+    assert_eq!(frozen.winner.candidate, winner.candidate);
+    assert_eq!(frozen.physical.id, winner.expression);
+}
+
+#[test]
+fn grant_deadline_returns_a_frozen_resource_safe_incumbent() {
+    let budget = super::super::budget::SearchBudget {
+        optional_time_limit: Some(Duration::ZERO),
+        ..Default::default()
+    };
+    let (mut engine, group, goal) = engine_with_budget(budget);
+    let optimized = engine
+        .optimize_for_grants(
+            group,
+            goal,
+            AdmissibleGrantSetId(0),
+            [ResourceGrantClass {
+                id: ResourceGrantClassId(1),
+                hard_memory_bytes: 1 << 30,
+                max_parallel_tasks: 1,
+                spill_policy: SpillPolicy::Allowed,
+            }],
+            SearchMode::Memo,
+        )
+        .unwrap();
+
+    assert_eq!(optimized.stop.reason, SearchStopReason::Deadline);
+    assert!(!optimized.stop.budget_limited);
+    assert!(optimized.stop.actual_stop_us.is_some());
+    let winner = &optimized.winners[0];
+    assert_eq!(winner.winner.candidate, winner.frozen.winner.candidate);
+    assert_eq!(winner.frozen.reference.group, group);
+    crate::cascades::verifier::WinnerVerifier::verify_candidate_tree(
+        engine.memo(),
+        ChildWinnerRef {
+            group,
+            goal: winner.goal,
+            candidate: winner.winner.candidate,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn rule_work_profile_is_opt_in_for_diagnostic_cohorts() {
     let (mut normal, group, goal) = engine(8);
     normal.optimize(group, goal, SearchMode::Memo).unwrap();

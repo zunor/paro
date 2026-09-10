@@ -24,8 +24,8 @@ use super::ids::{
     PhysicalExprId, ResourceGrantClassId, RuleId, StableFingerprintBuilder,
 };
 use super::memo::{
-    CandidatePreview, CandidateSummary, ChildWinnerRef, EquivalenceProof, GrantGoalKey,
-    GroupCardinality, LogicalProperties, Memo, OptimizationGoal, Winner,
+    CandidatePreview, CandidateSummary, ChildWinnerRef, EquivalenceProof, FrozenCandidate,
+    GrantGoalKey, GroupCardinality, LogicalProperties, Memo, OptimizationGoal, Winner,
 };
 use super::quality::QualityBundleRegistry;
 use super::region::{
@@ -53,17 +53,43 @@ pub enum SearchMode {
     Memo,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStopReason {
+    Complete,
+    Deadline,
+    BudgetLimited,
+    RuleFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchStop {
+    pub reason: SearchStopReason,
+    /// A deadline can coincide with deterministic budget exhaustion. Keep
+    /// both facts visible instead of collapsing them into one label.
+    pub budget_limited: bool,
+    pub configured_deadline_us: Option<u64>,
+    /// Measured on SearchControl's clock, which includes mandatory incumbent
+    /// construction and therefore matches the configured deadline semantics.
+    pub actual_stop_us: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GrantWinner {
     pub class: ResourceGrantClassId,
     pub goal: OptimizationGoal,
-    pub winner: Winner,
+    /// Shared immutable root winner. The winner carries exact child choices,
+    /// cost composition, source-work and proof evidence.
+    pub winner: Arc<Winner>,
+    /// Frozen selected DAG used to prove that extraction does not depend on a
+    /// later search pass or a mutable frontier.
+    pub frozen: Arc<FrozenCandidate>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GrantOptimization {
     pub sensitivity: GrantSensitivitySummary,
     pub winners: Box<[GrantWinner]>,
+    pub stop: SearchStop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -284,6 +310,17 @@ pub struct SearchMilestones {
     /// populated only in diagnostic cohorts; normal trace-off C1 retains an
     /// empty allocation-free Vec.
     pub search_checkpoints: Vec<SearchCheckpoint>,
+    /// Stop/handoff facts are diagnostic-only.  The actual result contract is
+    /// carried by `GrantOptimization::stop` even when tracing is disabled.
+    pub search_stop_reason: Option<SearchStopReason>,
+    pub search_deadline_us: Option<u64>,
+    pub search_stop_us: Option<u64>,
+    pub search_stop_profile_us: Option<u64>,
+    pub frozen_candidate_count: u64,
+    pub freeze_elapsed_us: u64,
+    pub search_return_profile_us: Option<u64>,
+    pub timeout_tail_profile_us: Option<u64>,
+    pub handoff_extraction_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -589,6 +626,103 @@ impl CascadesEngine {
             .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
     }
 
+    fn search_stop(&self) -> SearchStop {
+        let obligations = self.memo.search_obligations();
+        let budget_limited = obligations.iter().any(|obligation| {
+            matches!(
+                obligation.reason,
+                super::budget::SearchIncompleteReason::Budget(_)
+            )
+        });
+        let reason = if self.memo.control().deadline_reached() {
+            SearchStopReason::Deadline
+        } else if budget_limited {
+            SearchStopReason::BudgetLimited
+        } else if !obligations.is_empty() {
+            SearchStopReason::RuleFailure
+        } else {
+            SearchStopReason::Complete
+        };
+        SearchStop {
+            reason,
+            budget_limited,
+            configured_deadline_us: self.memo.control().optional_time_limit_us(),
+            actual_stop_us: match reason {
+                SearchStopReason::Complete => None,
+                SearchStopReason::Deadline => self
+                    .memo
+                    .control()
+                    .deadline_elapsed_us()
+                    .or_else(|| Some(self.memo.control().elapsed_us())),
+                SearchStopReason::BudgetLimited | SearchStopReason::RuleFailure => {
+                    Some(self.memo.control().elapsed_us())
+                }
+            },
+        }
+    }
+
+    fn note_search_stop(&mut self, stop: SearchStop) {
+        if !self.collect_rule_work_profile {
+            return;
+        }
+        self.search_milestones.search_stop_reason = Some(stop.reason);
+        self.search_milestones.search_deadline_us = stop.configured_deadline_us;
+        self.search_milestones.search_stop_us = stop.actual_stop_us;
+        self.search_milestones.search_stop_profile_us = self.profile_elapsed_us();
+    }
+
+    pub(crate) fn note_search_return(&mut self) {
+        if !self.collect_rule_work_profile {
+            return;
+        }
+        let Some(return_us) = self.profile_elapsed_us() else {
+            return;
+        };
+        self.search_milestones.search_return_profile_us = Some(return_us);
+        self.search_milestones.timeout_tail_profile_us = self
+            .search_milestones
+            .search_stop_profile_us
+            .map(|stop_us| return_us.saturating_sub(stop_us));
+    }
+
+    fn freeze_grant_winner(
+        &mut self,
+        root: GroupId,
+        class: ResourceGrantClassId,
+        goal: OptimizationGoal,
+        winner: Arc<Winner>,
+    ) -> Result<GrantWinner> {
+        let started = Instant::now();
+        let reference = ChildWinnerRef {
+            group: self.memo.canonical_group(root),
+            goal,
+            candidate: winner.candidate,
+        };
+        super::verifier::WinnerVerifier::verify_candidate_tree(&self.memo, reference)?;
+        let frozen = self.memo.freeze_candidate_tree(reference)?;
+        if frozen.winner.candidate != winner.candidate {
+            return Err(paro_error::internal(
+                "frozen winner identity disagrees with the selected grant winner",
+            ));
+        }
+        if self.collect_rule_work_profile {
+            self.search_milestones.frozen_candidate_count = self
+                .search_milestones
+                .frozen_candidate_count
+                .saturating_add(1);
+            self.search_milestones.freeze_elapsed_us = self
+                .search_milestones
+                .freeze_elapsed_us
+                .saturating_add(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        }
+        Ok(GrantWinner {
+            class,
+            goal,
+            winner,
+            frozen,
+        })
+    }
+
     fn record_search_checkpoints(&mut self, root: GroupId) {
         if !self.collect_rule_work_profile
             || self.diagnostic_checkpoint_goals.is_empty()
@@ -882,7 +1016,12 @@ impl CascadesEngine {
                 self.governor
                     .resource_stop(BudgetDimension::SearchCandidate);
                 self.record_search_checkpoints(root);
-                return incumbent;
+                let stop = self.search_stop();
+                self.note_search_stop(stop);
+                return incumbent.map(|mut incumbent| {
+                    incumbent.stop = stop;
+                    incumbent
+                });
             }
             self.reset_cost_epoch()?;
             self.optional_search_started = self.collect_rule_work_profile;
@@ -897,16 +1036,30 @@ impl CascadesEngine {
             self.record_search_checkpoints(root);
             if !self.memo.control().checkpoint()? {
                 self.record_search_checkpoints(root);
-                return incumbent;
+                return self.stop_with_snapshot_or_fallback(
+                    root,
+                    base_goal,
+                    admissible_set,
+                    &classes,
+                    incumbent,
+                );
             }
             let result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
-            if self.memo.control().deadline_reached() && result.is_err() {
+            if self.memo.control().deadline_reached() {
                 self.record_search_checkpoints(root);
-                return incumbent;
+                let fallback = result.or_else(|_| incumbent);
+                return self.stop_with_snapshot_or_fallback(
+                    root,
+                    base_goal,
+                    admissible_set,
+                    &classes,
+                    fallback,
+                );
             }
             if result.is_ok() {
                 self.diagnostic_search_complete = !self.memo.control().deadline_reached()
                     && self.memo.search_obligations().is_empty();
+                self.note_search_stop(self.search_stop());
             }
             self.record_search_checkpoints(root);
             return result;
@@ -915,6 +1068,7 @@ impl CascadesEngine {
         if result.is_ok() {
             self.diagnostic_search_complete = !self.memo.control().deadline_reached()
                 && self.memo.search_obligations().is_empty();
+            self.note_search_stop(self.search_stop());
         }
         self.record_search_checkpoints(root);
         result
@@ -956,13 +1110,9 @@ impl CascadesEngine {
                                 || class.spill_policy == SpillPolicy::Allowed)
                     })
                 })
-                .map(|winner| winner.as_ref().clone())
+                .cloned()
             {
-                winners.push(GrantWinner {
-                    class: class.id,
-                    goal,
-                    winner,
-                });
+                winners.push(self.freeze_grant_winner(root, class.id, goal, winner)?);
             } else {
                 last_infeasible = Some(goal);
             }
@@ -977,7 +1127,108 @@ impl CascadesEngine {
         Ok(GrantOptimization {
             sensitivity,
             winners: winners.into_boxed_slice(),
+            stop: self.search_stop(),
         })
+    }
+
+    /// Capture the newest complete root response already published by the
+    /// interleaved physical queue.  This function performs no optimization:
+    /// it only selects, verifies, and freezes the current frontier entries.
+    /// A class without a qualified post-reset entry inherits its immutable
+    /// mandatory incumbent, if one exists.
+    fn snapshot_grant_classes(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
+        fallback: Option<&GrantOptimization>,
+    ) -> Result<Option<GrantOptimization>> {
+        let root = self.memo.canonical_group(root);
+        let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
+        let mut winners = Vec::with_capacity(classes.len());
+        let mut last_infeasible = None;
+        for class in classes.values().copied() {
+            let goal = OptimizationGoal {
+                grant: sensitivity.goal_for(admissible_set, class),
+                ..base_goal
+            };
+            let current = self
+                .memo
+                .group(root)
+                .and_then(|group| group.winner_frontier(goal))
+                .and_then(|frontier| {
+                    frontier
+                        .candidates()
+                        .iter()
+                        .find(|winner| {
+                            winner.cost.peak_memory_upper <= class.hard_memory_bytes
+                                && (winner.cost.spill_bytes_expected == 0
+                                    || class.spill_policy == SpillPolicy::Allowed)
+                        })
+                        .cloned()
+                });
+            if let Some(winner) = current {
+                winners.push(self.freeze_grant_winner(root, class.id, goal, winner)?);
+                continue;
+            }
+            if let Some(incumbent) = fallback.and_then(|optimization| {
+                optimization
+                    .winners
+                    .iter()
+                    .find(|winner| winner.class == class.id)
+                    .cloned()
+            }) {
+                winners.push(incumbent);
+            } else {
+                last_infeasible = Some(goal);
+            }
+        }
+        if winners.is_empty() {
+            // Keep the caller's original error when neither the current
+            // frontier nor the baseline can satisfy any grant class.
+            let _ = last_infeasible;
+            return Ok(None);
+        }
+        Ok(Some(GrantOptimization {
+            sensitivity,
+            winners: winners.into_boxed_slice(),
+            stop: self.search_stop(),
+        }))
+    }
+
+    fn stop_with_snapshot_or_fallback(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
+        fallback: Result<GrantOptimization>,
+    ) -> Result<GrantOptimization> {
+        let stop = self.search_stop();
+        // A frontier entry that cannot be verified/frozen is not a qualified
+        // candidate.  Keep the already verified mandatory result in that
+        // case; only return the snapshot when the whole grant portfolio can
+        // be published from it.
+        if let Ok(Some(mut snapshot)) = self.snapshot_grant_classes(
+            root,
+            base_goal,
+            admissible_set,
+            classes,
+            fallback.as_ref().ok(),
+        )? {
+            snapshot.stop = stop;
+            self.note_search_stop(stop);
+            return Ok(snapshot);
+        }
+        match fallback {
+            Ok(mut fallback) => {
+                fallback.stop = stop;
+                self.note_search_stop(stop);
+                Ok(fallback)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn grant_sensitivity(&mut self, group: GroupId) -> Result<GrantSensitivitySummary> {

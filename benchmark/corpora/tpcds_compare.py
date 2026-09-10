@@ -612,6 +612,13 @@ def main() -> int:
             "runtime_environment": {
                 "RUST_LOG": os.environ.get("RUST_LOG"),
                 "PARO_STATEMENT_CACHE_EVIDENCE": "1",
+                # Explicit diagnostic-only search deadline.  An absent value
+                # means the production/default policy was used; keep this in
+                # the report so a checkpoint run cannot be mistaken for a
+                # full-search C1 sample.
+                "PARO_DIAGNOSTIC_SEARCH_STOP_MS": os.environ.get(
+                    "PARO_DIAGNOSTIC_SEARCH_STOP_MS"
+                ),
             },
         },
         "model_gates": {

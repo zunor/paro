@@ -811,6 +811,23 @@ pub struct Winner {
     pub joint_cost_proof: Option<JointCostProof>,
 }
 
+/// Immutable, self-contained snapshot of one executable winner DAG.
+///
+/// The Memo remains the owner of the query-wide expression tables and is not
+/// copied at a stop boundary.  A frozen candidate instead retains only the
+/// exact child choices reachable from the root, the corresponding logical and
+/// physical payload handles, and the Winner evidence needed to replay the
+/// resource/property/cost contract.  Shared child candidates remain shared
+/// through `Arc`, so a multi-consumer plan is not expanded once per parent.
+#[derive(Debug, Clone)]
+pub struct FrozenCandidate {
+    pub reference: ChildWinnerRef,
+    pub winner: Arc<Winner>,
+    pub logical: Arc<LogicalExpr>,
+    pub physical: Arc<PhysicalExpr>,
+    pub children: Box<[Arc<FrozenCandidate>]>,
+}
+
 /// The complete parent-observable portion of a candidate that is needed for
 /// frontier admission.  Child references, enforcer steps and proof/source
 /// payloads are deliberately absent: they are only materialized after this
@@ -2705,6 +2722,76 @@ impl Memo {
         (self.canonical_group(candidate.group) == self.canonical_group(child.group)
             && candidate.goal == child.goal)
             .then_some(&candidate.winner)
+    }
+
+    pub fn resolve_child_winner_arc(&self, child: ChildWinnerRef) -> Option<Arc<Winner>> {
+        let candidate = self.winner_candidates.get(child.candidate.index())?;
+        (self.canonical_group(candidate.group) == self.canonical_group(child.group)
+            && candidate.goal == child.goal)
+            .then(|| candidate.winner.clone())
+    }
+
+    /// Freeze exactly one candidate DAG for handoff to extraction/execution.
+    ///
+    /// This deliberately walks only the selected winner and its exact child
+    /// references.  It does not copy Memo groups, frontiers, recipes, or
+    /// unselected alternatives.  A candidate cycle or an unresolved payload
+    /// is rejected at the handoff boundary instead of being repaired by a
+    /// later search pass.
+    pub fn freeze_candidate_tree(&self, root: ChildWinnerRef) -> Result<Arc<FrozenCandidate>> {
+        fn visit(
+            memo: &Memo,
+            reference: ChildWinnerRef,
+            active: &mut BTreeSet<CandidateId>,
+            cache: &mut BTreeMap<CandidateId, Arc<FrozenCandidate>>,
+        ) -> Result<Arc<FrozenCandidate>> {
+            if let Some(frozen) = cache.get(&reference.candidate) {
+                if frozen.reference.group == reference.group
+                    && frozen.reference.goal == reference.goal
+                {
+                    return Ok(frozen.clone());
+                }
+                return Err(paro_error::internal(
+                    "candidate identity was reused with a different group or goal",
+                ));
+            }
+            if !active.insert(reference.candidate) {
+                return Err(paro_error::internal(
+                    "winner candidate DAG contains a cycle",
+                ));
+            }
+            let winner = memo
+                .resolve_child_winner_arc(reference)
+                .ok_or_else(|| paro_error::internal("candidate references an unknown winner"))?;
+            let physical = memo
+                .physical_expr(winner.expression)
+                .cloned()
+                .ok_or_else(|| {
+                    paro_error::internal("candidate references an unknown physical expression")
+                })?;
+            let logical = memo
+                .logical_expr(physical.key.logical)
+                .cloned()
+                .ok_or_else(|| {
+                    paro_error::internal("candidate physical payload lost its logical expression")
+                })?;
+            let mut children = Vec::with_capacity(winner.children.len());
+            for child in winner.children.iter().copied() {
+                children.push(visit(memo, child, active, cache)?);
+            }
+            active.remove(&reference.candidate);
+            let frozen = Arc::new(FrozenCandidate {
+                reference,
+                winner,
+                logical: Arc::new(logical),
+                physical: Arc::new(physical),
+                children: children.into_boxed_slice(),
+            });
+            cache.insert(reference.candidate, frozen.clone());
+            Ok(frozen)
+        }
+
+        visit(self, root, &mut BTreeSet::new(), &mut BTreeMap::new())
     }
 
     pub fn merge_groups(&mut self, left: GroupId, right: GroupId) -> Result<GroupId> {

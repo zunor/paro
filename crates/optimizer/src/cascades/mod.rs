@@ -44,7 +44,9 @@ pub use column::{
     ColumnCatalog, ColumnDesc, ColumnOrigin, ColumnVisibility, GroupColumn, GroupSchema,
 };
 pub use cost::{CompactRange, SearchCost};
-pub use engine::{CascadesEngine, GrantOptimization, GrantWinner, SearchMode};
+pub use engine::{
+    CascadesEngine, GrantOptimization, GrantWinner, SearchMode, SearchStop, SearchStopReason,
+};
 pub use governor::{
     CalibrationScope, EconomicDecision, EconomicSignal, Governor, GovernorSnapshot, GovernorStop,
     PlanMilestone, PlanningPolicy,
@@ -52,8 +54,8 @@ pub use governor::{
 pub use grant::{GrantSensitivitySummary, GrantSharingProof};
 pub use ids::*;
 pub use memo::{
-    ContinuationContract, Memo, OptimizationContext, OptimizationGoal, OptimizationPhase,
-    SharedOwnership, Winner,
+    ContinuationContract, FrozenCandidate, Memo, OptimizationContext, OptimizationGoal,
+    OptimizationPhase, SharedOwnership, Winner,
 };
 pub use planner::{
     AlternativeOrigin, LogicalAlternative, MemoBuilder, OptimizationInput, OptimizationOutput,

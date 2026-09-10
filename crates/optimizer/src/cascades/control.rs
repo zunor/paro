@@ -5,7 +5,7 @@
 //! credits. A search deadline ends exploration; statement cancellation ends the
 //! statement. Neither is an advisory failed equivalence rule.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,10 @@ pub struct SearchControl {
     optional_time_limit: Option<Duration>,
     optional: AtomicBool,
     deadline_reached: AtomicBool,
+    /// First cooperative checkpoint that observed the optional deadline.
+    /// `u64::MAX` is the unset sentinel; recording this separately from the
+    /// return timestamp keeps timeout tail work visible to diagnostics.
+    deadline_at_us: AtomicU64,
     cancellation: Option<StatementCancellation>,
 }
 
@@ -44,6 +48,7 @@ impl SearchControl {
             optional_time_limit,
             optional: AtomicBool::new(false),
             deadline_reached: AtomicBool::new(false),
+            deadline_at_us: AtomicU64::new(u64::MAX),
             cancellation: None,
         }
     }
@@ -76,6 +81,13 @@ impl SearchControl {
             .optional_time_limit
             .is_some_and(|limit| self.started.elapsed() >= limit)
         {
+            let elapsed_us = self.elapsed_us();
+            let _ = self.deadline_at_us.compare_exchange(
+                u64::MAX,
+                elapsed_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             self.deadline_reached.store(true, Ordering::Relaxed);
         }
         Ok(!self.deadline_reached.load(Ordering::Relaxed))
@@ -85,8 +97,34 @@ impl SearchControl {
         self.deadline_reached.load(Ordering::Relaxed)
     }
 
+    /// Elapsed time from creation of the query-local control clock.  The
+    /// optional deadline intentionally includes incumbent construction, so
+    /// reporting must use this clock rather than a phase-local timer.
+    pub fn elapsed_us(&self) -> u64 {
+        self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
+    pub fn optional_time_limit_us(&self) -> Option<u64> {
+        self.optional_time_limit
+            .map(|limit| limit.as_micros().min(u128::from(u64::MAX)) as u64)
+    }
+
+    /// Elapsed time at the first checkpoint that observed the deadline.
+    pub fn deadline_elapsed_us(&self) -> Option<u64> {
+        match self.deadline_at_us.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            elapsed_us => Some(elapsed_us),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn expire(&self) {
+        let _ = self.deadline_at_us.compare_exchange(
+            u64::MAX,
+            self.elapsed_us(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         self.deadline_reached.store(true, Ordering::Relaxed);
     }
 }
