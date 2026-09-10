@@ -4,6 +4,7 @@
 //! Logical equivalence rules and transactional Memo staging.
 
 use super::*;
+use smallvec::SmallVec;
 
 pub(super) mod cte;
 mod join_region;
@@ -1058,16 +1059,20 @@ fn try_native_predicate_transfer(
                 }
             }
         };
-    let left_tables = child_layout(&left)?
+    let mut left_tables = child_layout(&left)?
         .bindings()
         .iter()
         .map(|binding| binding.table_index)
-        .collect::<BTreeSet<_>>();
-    let right_tables = child_layout(&right)?
+        .collect::<SmallVec<[_; 8]>>();
+    let mut right_tables = child_layout(&right)?
         .bindings()
         .iter()
         .map(|binding| binding.table_index)
-        .collect::<BTreeSet<_>>();
+        .collect::<SmallVec<[_; 8]>>();
+    left_tables.sort_unstable();
+    left_tables.dedup();
+    right_tables.sort_unstable();
+    right_tables.dedup();
     let mut left_filters = Vec::new();
     let mut right_filters = Vec::new();
     let mut remaining = Vec::new();
@@ -1076,19 +1081,18 @@ fn try_native_predicate_transfer(
             remaining.push(expression);
             continue;
         }
-        let mut tables = BTreeSet::new();
+        let mut tables = SmallVec::<[usize; 4]>::new();
         crate::expression::traversal::visit_expression(&expression, &mut |candidate| {
             if let Expression::ColumnRef(column) = candidate {
-                tables.insert(column.binding.table_index);
+                if !tables.contains(&column.binding.table_index) {
+                    tables.push(column.binding.table_index);
+                }
             }
         });
-        if !tables.is_empty() && tables.is_subset(&left_tables) && tables.is_disjoint(&right_tables)
-        {
+        tables.sort_unstable();
+        if is_side_local_tables(&tables, &left_tables, &right_tables) {
             left_filters.push(expression);
-        } else if !tables.is_empty()
-            && tables.is_subset(&right_tables)
-            && tables.is_disjoint(&left_tables)
-        {
+        } else if is_side_local_tables(&tables, &right_tables, &left_tables) {
             right_filters.push(expression);
         } else {
             remaining.push(expression);
@@ -1188,7 +1192,7 @@ fn native_predicate_transfer_may_apply(
         operand: &PatternOperand,
         memo: &Memo,
         state: &PlannerTransformState,
-    ) -> Result<Option<BTreeSet<usize>>> {
+    ) -> Result<Option<SmallVec<[usize; 8]>>> {
         let columns = match operand {
             PatternOperand::Group(group) => {
                 let Some(group) = memo.group(*group) else {
@@ -1206,16 +1210,19 @@ fn native_predicate_transfer_may_apply(
                 metadata.output_columns.iter().copied().collect()
             }
         };
-        let mut tables = BTreeSet::new();
+        let mut tables = SmallVec::<[usize; 8]>::new();
         for column in columns {
             let Some(binding) = state.binding_ids.relation_binding(column) else {
                 return Ok(None);
             };
-            tables.insert(binding.table_index);
+            if !tables.contains(&binding.table_index) {
+                tables.push(binding.table_index);
+            }
         }
         if tables.is_empty() {
             Ok(None)
         } else {
+            tables.sort_unstable();
             Ok(Some(tables))
         }
     }
@@ -1292,17 +1299,28 @@ fn native_predicate_transfer_may_apply(
         return Ok(false);
     };
     Ok(filter.expressions.iter().any(|expression| {
-        let mut tables = BTreeSet::new();
+        let mut tables = SmallVec::<[usize; 4]>::new();
         crate::expression::traversal::visit_expression(expression, &mut |candidate| {
             if let Expression::ColumnRef(column) = candidate {
-                tables.insert(column.binding.table_index);
+                if !tables.contains(&column.binding.table_index) {
+                    tables.push(column.binding.table_index);
+                }
             }
         });
-        (!tables.is_empty() && tables.is_subset(&left_tables) && tables.is_disjoint(&right_tables))
-            || (!tables.is_empty()
-                && tables.is_subset(&right_tables)
-                && tables.is_disjoint(&left_tables))
+        tables.sort_unstable();
+        is_side_local_tables(&tables, &left_tables, &right_tables)
+            || is_side_local_tables(&tables, &right_tables, &left_tables)
     }))
+}
+
+fn is_side_local_tables(tables: &[usize], side_tables: &[usize], other_tables: &[usize]) -> bool {
+    !tables.is_empty()
+        && tables
+            .iter()
+            .all(|table| side_tables.binary_search(table).is_ok())
+        && tables
+            .iter()
+            .all(|table| other_tables.binary_search(table).is_err())
 }
 
 fn compact_native_shell(shell: NativeShell) -> Result<NativeShell> {
