@@ -309,6 +309,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
         ),
     ] {
         let recipe = CostRecipe {
+            sequence: 0,
             child_goals: Box::new([(first, goal), (second, goal)]),
             local_cost: SearchCost::ZERO,
             source_filter_apply_cost: None,
@@ -1070,6 +1071,41 @@ fn rule_work_profile_is_opt_in_for_diagnostic_cohorts() {
         .search_milestones()
         .first_optional_ready_us
         .is_some());
+}
+
+#[test]
+fn diagnostic_search_checkpoints_keep_exact_goal_and_candidate_quality() {
+    let (mut engine, group, goal) = engine(8);
+    engine.set_rule_work_profile_enabled(true);
+    engine.optimize(group, goal, SearchMode::Memo).unwrap();
+    let winner = engine
+        .memo()
+        .group(group)
+        .and_then(|group| group.winner(goal))
+        .cloned()
+        .expect("synthetic engine must have a root winner");
+
+    engine.begin_diagnostic_profile(group, std::iter::once(goal));
+    engine.diagnostic_search_complete = true;
+    engine.profile_started_at = Some(Instant::now() - Duration::from_millis(125));
+    engine.record_search_checkpoints(group);
+
+    assert_eq!(engine.search_milestones().search_checkpoints.len(), 5);
+    for checkpoint in &engine.search_milestones().search_checkpoints {
+        assert_eq!(checkpoint.goal, goal);
+        assert!(checkpoint.observed_us >= checkpoint.target_ms * 1_000);
+        assert_eq!(checkpoint.candidate, Some(winner.candidate));
+        assert_eq!(
+            checkpoint.expected_cost,
+            Some(winner.cost.score.range.expected)
+        );
+        assert_eq!(
+            checkpoint.risk_adjusted_cost,
+            Some(winner.cost.score.risk_adjusted)
+        );
+        assert_eq!(checkpoint.upper_cost, Some(winner.cost.score.range.upper));
+        assert!(checkpoint.search_complete);
+    }
 }
 
 #[test]
@@ -1957,6 +1993,54 @@ fn subscription_delta_matches_an_independent_set_difference() {
             assert_eq!(actual.into_iter().collect::<BTreeSet<_>>(), expected);
         }
     }
+}
+
+#[test]
+fn physical_child_frontier_change_is_narrowed_to_dependent_recipes() {
+    let owner = GroupId::new(10);
+    let child = GroupId::new(11);
+    let owner_read = PatternRead {
+        group: owner,
+        logical_frontier_revision: Some(1),
+        physical_frontier_revision: None,
+        logical_fact_fingerprint: Fingerprint(2),
+        statistics_snapshot_fingerprint: Fingerprint(3),
+    };
+    let previous = ReadSet::new([
+        owner_read,
+        PatternRead {
+            group: child,
+            logical_frontier_revision: Some(4),
+            physical_frontier_revision: Some(5),
+            logical_fact_fingerprint: Fingerprint(6),
+            statistics_snapshot_fingerprint: Fingerprint(7),
+        },
+    ]);
+    let current = ReadSet::new([
+        owner_read,
+        PatternRead {
+            group: child,
+            physical_frontier_revision: Some(8),
+            ..previous.reads()[1]
+        },
+    ]);
+
+    assert_eq!(
+        physical_changed_child_groups(owner, Some(&previous), &current),
+        BTreeSet::from([child])
+    );
+    assert!(!physical_read_requires_full_recost(
+        owner,
+        Some(&previous),
+        &current
+    ));
+
+    let missing_child = ReadSet::new([owner_read]);
+    assert!(physical_read_requires_full_recost(
+        owner,
+        Some(&previous),
+        &missing_child
+    ));
 }
 
 #[test]

@@ -396,6 +396,12 @@ pub struct TaskRecord {
     pub evaluation: EvaluationKey,
     pub read_set: ReadSetId,
     pub cursor: CursorId,
+    /// Previous exact evaluation of the same semantic intent.  A changed
+    /// ReadSet creates a new evaluation identity, but the task protocol still
+    /// exposes the predecessor so an owner can carry a safe enumeration
+    /// cursor across an append-only frontier.  The predecessor's outcome is
+    /// never reused as a current result.
+    predecessor: Option<TaskId>,
     pub state: TaskState,
     pub outcome: Option<TaskOutcome>,
     dependencies: BTreeSet<TaskId>,
@@ -455,6 +461,7 @@ pub struct TaskRegistry {
     input_revisions: Vec<ReadSetId>,
     input_revision_index: BTreeMap<ReadSetId, InputRevisionId>,
     evaluations: BTreeMap<EvaluationKey, TaskId>,
+    latest_tasks_by_intent: BTreeMap<TaskIntentId, TaskId>,
     tasks: Vec<TaskRecord>,
     waiters: BTreeMap<WaiterId, Waiter>,
     dependents: BTreeMap<TaskId, BTreeSet<TaskId>>,
@@ -692,12 +699,14 @@ impl TaskRegistry {
         }
         let task = TaskId::new(self.tasks.len());
         let cursor = self.intern_cursor(Cursor::default());
+        let predecessor = self.latest_tasks_by_intent.get(&intent).copied();
         self.tasks.push(TaskRecord {
             id: task,
             intent,
             evaluation,
             read_set,
             cursor,
+            predecessor,
             state: TaskState::Runnable,
             outcome: None,
             dependencies: BTreeSet::new(),
@@ -705,6 +714,7 @@ impl TaskRegistry {
             obligations: BTreeSet::new(),
         });
         self.evaluations.insert(evaluation, task);
+        self.latest_tasks_by_intent.insert(intent, task);
         let profile = self.kind_profile_mut(kind);
         profile.unique_evaluations = profile.unique_evaluations.saturating_add(1);
         Ok(TaskRequest::Leader(task))
@@ -878,6 +888,10 @@ impl TaskRegistry {
         self.task(id).map(|task| task.read_set)
     }
 
+    pub fn task_predecessor(&self, id: TaskId) -> Option<TaskId> {
+        self.task(id).and_then(|task| task.predecessor)
+    }
+
     /// Refresh the exact input revision of a running task after it has
     /// recursively materialized its declared dependencies.  A physical
     /// parent normally captures child frontiers before entering the child
@@ -971,6 +985,33 @@ impl TaskRegistry {
         let profile = self.kind_profile_mut(kind);
         profile.started = profile.started.saturating_add(1);
         Ok(())
+    }
+
+    /// Reopen an exact physical evaluation whose cursor was deliberately kept
+    /// incomplete by an incremental readiness pass. Recursive readiness calls
+    /// continue to reuse that prefix; only the explicit full optional pass may
+    /// consume the continuation.
+    pub fn resume_incomplete(&mut self, task: TaskId) -> Result<bool> {
+        let kind = self
+            .task(task)
+            .and_then(|record| self.intent(record.intent))
+            .ok_or_else(|| paro_error::internal("task lost its intent"))?
+            .kind();
+        let incomplete = self
+            .task(task)
+            .is_some_and(|record| record.state == TaskState::Completed)
+            && self
+                .task(task)
+                .and_then(|record| self.cursor(record.cursor))
+                .is_some_and(|cursor| !cursor.complete);
+        if !incomplete {
+            return Ok(false);
+        }
+        let record = self.task_mut(task)?;
+        record.state = TaskState::Runnable;
+        record.outcome = None;
+        self.record_reopened_evaluation(kind);
+        Ok(true)
     }
 
     pub fn advance_cursor(&mut self, task: TaskId, cursor: Cursor) -> Result<CursorId> {
@@ -2110,6 +2151,52 @@ mod tests {
                 .reopened_evaluations,
             1
         );
+    }
+
+    #[test]
+    fn changed_read_evaluation_keeps_an_append_only_predecessor_cursor() {
+        let mut registry = TaskRegistry::default();
+        let intent = TaskIntent::Optimize {
+            group: GroupId::new(1),
+            goal: goal(),
+        };
+        let first = match registry.request(intent.clone(), ReadSet::empty()).unwrap() {
+            TaskRequest::Leader(task) => task,
+            request => panic!("unexpected first request: {request:?}"),
+        };
+        registry.start(first).unwrap();
+        let cursor = registry
+            .advance_cursor(
+                first,
+                Cursor {
+                    position: 17,
+                    complete: false,
+                },
+            )
+            .unwrap();
+        registry
+            .complete(first, TaskOutcome::Progress { cursor })
+            .unwrap();
+
+        let second = match registry
+            .request(
+                intent,
+                ReadSet::new([PatternRead {
+                    group: GroupId::new(1),
+                    logical_frontier_revision: Some(2),
+                    physical_frontier_revision: None,
+                    logical_fact_fingerprint: Fingerprint(3),
+                    statistics_snapshot_fingerprint: Fingerprint(4),
+                }]),
+            )
+            .unwrap()
+        {
+            TaskRequest::Leader(task) => task,
+            request => panic!("unexpected changed-read request: {request:?}"),
+        };
+        assert_ne!(second, first);
+        assert_eq!(registry.task_predecessor(second), Some(first));
+        assert_eq!(registry.cursor(cursor).unwrap().position, 17);
     }
 
     #[test]
