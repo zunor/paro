@@ -3375,160 +3375,175 @@ pub(crate) fn compose_candidate_cost_with_sources_at_ref(
     source_work.reserve(source_work_capacity);
     for (index, child) in child_costs.iter().copied().enumerate() {
         let mut child = child;
+        let mut lanes: Option<Vec<SourceWork>> =
+            sideways_filter.and_then(|(filtered_child, sources)| {
+                (index == filtered_child
+                    && child_source_work[index]
+                        .iter()
+                        .any(|lane| sources.iter().any(|source| source.source == lane.source)))
+                .then(|| child_source_work[index].to_vec())
+            });
         if let Some((filtered_child, sources)) = sideways_filter {
-            let mut lanes = child_source_work[index].to_vec();
-            if index == filtered_child {
-                let matching_lanes = lanes
-                    .iter()
-                    .filter(|lane| sources.iter().any(|source| source.source == lane.source))
-                    .count();
-                if matching_lanes != 0 {
-                    let full_apply_cost = source_filter_apply_cost.ok_or_else(|| {
-                        paro_error::internal(
-                            "sideways-filter composition has no predicate-application cost",
-                        )
-                    })?;
-                    let total_rows = lanes
-                        .iter()
-                        .map(|lane| lane.source_rows)
-                        .fold(0_u64, u64::saturating_add);
-                    let matching_rows = lanes
+            if let Some(lanes) = lanes.as_mut() {
+                if index == filtered_child {
+                    let matching_lanes = lanes
                         .iter()
                         .filter(|lane| sources.iter().any(|source| source.source == lane.source))
-                        .map(|lane| lane.source_rows)
-                        .fold(0_u64, u64::saturating_add);
-                    // Attribute the operator-local full-source term by the
-                    // immutable row domain, not by `lane.cost` (which may
-                    // already be reduced by a filter introduced by another
-                    // join).  If lineage is incomplete, retain the
-                    // unattributed fraction on the parent instead of turning
-                    // a physical-source mismatch into a cost discount.
-                    let matched_share = if total_rows == 0 {
-                        1_000_000_u32
-                    } else {
-                        ((matching_rows as f64 / total_rows as f64 * 1_000_000.0).ceil() as u32)
-                            .min(1_000_000)
-                    };
-                    let unmatched_share = 1_000_000_u32.saturating_sub(matched_share);
-                    cost = cost.replace_work(
-                        full_apply_cost,
-                        full_apply_cost.retain_work(unmatched_share, unmatched_share)?,
-                    )?;
-                    // Predicate evaluation is one operator-local cost before it
-                    // is attributed to source lanes. Allocate every ppm exactly
-                    // once so splitting a UNION into more branches cannot create
-                    // or discard work through independent rounding.
-                    let mut apply_shares = Vec::with_capacity(matching_lanes);
-                    let mut unallocated_ppm = matched_share;
-                    for lane in lanes
-                        .iter()
-                        .filter(|lane| sources.iter().any(|source| source.source == lane.source))
-                    {
-                        let remaining_lanes = matching_lanes - apply_shares.len();
-                        let share = if remaining_lanes == 1 {
-                            unallocated_ppm
-                        } else if matching_rows > 0 {
-                            ((lane.source_rows as f64 / matching_rows as f64 * 1_000_000.0).floor()
-                                as u32)
-                                .min(unallocated_ppm)
+                        .count();
+                    if matching_lanes != 0 {
+                        let full_apply_cost = source_filter_apply_cost.ok_or_else(|| {
+                            paro_error::internal(
+                                "sideways-filter composition has no predicate-application cost",
+                            )
+                        })?;
+                        let total_rows = lanes
+                            .iter()
+                            .map(|lane| lane.source_rows)
+                            .fold(0_u64, u64::saturating_add);
+                        let matching_rows = lanes
+                            .iter()
+                            .filter(|lane| {
+                                sources.iter().any(|source| source.source == lane.source)
+                            })
+                            .map(|lane| lane.source_rows)
+                            .fold(0_u64, u64::saturating_add);
+                        // Attribute the operator-local full-source term by the
+                        // immutable row domain, not by `lane.cost` (which may
+                        // already be reduced by a filter introduced by another
+                        // join).  If lineage is incomplete, retain the
+                        // unattributed fraction on the parent instead of turning
+                        // a physical-source mismatch into a cost discount.
+                        let matched_share = if total_rows == 0 {
+                            1_000_000_u32
                         } else {
-                            unallocated_ppm
-                                / u32::try_from(remaining_lanes).map_err(|_| {
-                                    paro_error::internal(
-                                        "runtime filter has too many source-work lanes",
-                                    )
-                                })?
+                            ((matching_rows as f64 / total_rows as f64 * 1_000_000.0).ceil() as u32)
+                                .min(1_000_000)
                         };
-                        apply_shares.push(share);
-                        unallocated_ppm -= share;
-                    }
-                    debug_assert_eq!(unallocated_ppm, 0);
-                    let mut apply_shares = apply_shares.into_iter();
-                    for lane in &mut lanes {
-                        if let Some(source) =
-                            sources.iter().find(|source| source.source == lane.source)
-                        {
-                            let total_apply_cost = source_filter_apply_cost.expect(
+                        let unmatched_share = 1_000_000_u32.saturating_sub(matched_share);
+                        cost = cost.replace_work(
+                            full_apply_cost,
+                            full_apply_cost.retain_work(unmatched_share, unmatched_share)?,
+                        )?;
+                        // Predicate evaluation is one operator-local cost before it
+                        // is attributed to source lanes. Allocate every ppm exactly
+                        // once so splitting a UNION into more branches cannot create
+                        // or discard work through independent rounding.
+                        let mut apply_shares = Vec::with_capacity(matching_lanes);
+                        let mut unallocated_ppm = matched_share;
+                        for lane in lanes.iter().filter(|lane| {
+                            sources.iter().any(|source| source.source == lane.source)
+                        }) {
+                            let remaining_lanes = matching_lanes - apply_shares.len();
+                            let share = if remaining_lanes == 1 {
+                                unallocated_ppm
+                            } else if matching_rows > 0 {
+                                ((lane.source_rows as f64 / matching_rows as f64 * 1_000_000.0)
+                                    .floor() as u32)
+                                    .min(unallocated_ppm)
+                            } else {
+                                unallocated_ppm
+                                    / u32::try_from(remaining_lanes).map_err(|_| {
+                                        paro_error::internal(
+                                            "runtime filter has too many source-work lanes",
+                                        )
+                                    })?
+                            };
+                            apply_shares.push(share);
+                            unallocated_ppm -= share;
+                        }
+                        debug_assert_eq!(unallocated_ppm, 0);
+                        let mut apply_shares = apply_shares.into_iter();
+                        for lane in lanes.iter_mut() {
+                            if let Some(source) =
+                                sources.iter().find(|source| source.source == lane.source)
+                            {
+                                let total_apply_cost = source_filter_apply_cost.expect(
                                 "matching source-work lane established predicate application cost",
                             );
-                            let share = apply_shares
-                                .next()
-                                .expect("one predicate-cost share per matching source lane");
-                            if lane
-                                .retentions
-                                .iter()
-                                .any(|proof| proof.domain == source.domain)
-                                && lane
-                                    .filters
+                                let share = apply_shares
+                                    .next()
+                                    .expect("one predicate-cost share per matching source lane");
+                                if lane
+                                    .retentions
+                                    .iter()
+                                    .any(|proof| proof.domain == source.domain)
+                                    && lane
+                                        .filters
+                                        .iter()
+                                        .any(|filter| filter.evaluation == source.evaluation)
+                                {
+                                    // The parent term was already attributed above.
+                                    // Re-publishing an existing proof/occurrence does
+                                    // not change the immutable source response.
+                                    continue;
+                                }
+                                let mut updated = lane.snapshot().clone();
+                                let full_apply_cost = total_apply_cost.retain_work(share, share)?;
+                                // Speculative filters retain the complete risk
+                                // ceiling. Exact membership over a declared-unique
+                                // probe carries a proof-backed smaller ceiling.
+                                let mut retentions =
+                                    std::mem::take(&mut updated.retentions).into_vec();
+                                if !retentions
+                                    .iter()
+                                    .any(|retention| retention.domain == source.domain)
+                                {
+                                    retentions.push(SourceRetentionProof {
+                                        domain: source.domain,
+                                        expected_retained_ppm: source.expected_retained_ppm,
+                                        upper_retained_ppm: source.upper_retained_ppm,
+                                    });
+                                }
+                                retentions.sort_by_key(|retention| retention.domain);
+                                let retained = retained_source_cost(lane.base_cost, &retentions)?;
+                                updated.cost = retained;
+                                updated.retentions = retentions.into_boxed_slice();
+                                let mut filters = std::mem::take(&mut updated.filters).into_vec();
+                                if !filters
                                     .iter()
                                     .any(|filter| filter.evaluation == source.evaluation)
-                            {
-                                // The parent term was already attributed above.
-                                // Re-publishing an existing proof/occurrence does
-                                // not change the immutable source response.
-                                continue;
+                                {
+                                    filters.push(SourceFilterWork {
+                                        domain: source.domain,
+                                        evaluation: source.evaluation,
+                                        evaluation_rows: lane.source_rows,
+                                        expected_retained_ppm: source.expected_retained_ppm,
+                                        upper_retained_ppm: source.upper_retained_ppm,
+                                        full_apply_cost: full_apply_cost.work_only(),
+                                    });
+                                }
+                                filters.sort_by_key(|filter| filter.evaluation);
+                                let new_apply_cost = ordered_source_filter_cost(&filters)?;
+                                updated.filters = filters.into_boxed_slice();
+                                updated.filter_apply_cost = new_apply_cost;
+                                let serial_pipeline = retained.sequential(new_apply_cost)?;
+                                let phased_pipeline = calibration.rephase(
+                                    serial_pipeline,
+                                    ParallelWorkProfile::Pipeline,
+                                    lane.phase_tasks,
+                                    lane.phase_tasks,
+                                )?;
+                                child = child.replace_work(lane.phased_cost, phased_pipeline)?;
+                                updated.phased_cost = phased_pipeline;
+                                *lane = updated.into();
                             }
-                            let mut updated = lane.snapshot().clone();
-                            let full_apply_cost = total_apply_cost.retain_work(share, share)?;
-                            // Speculative filters retain the complete risk
-                            // ceiling. Exact membership over a declared-unique
-                            // probe carries a proof-backed smaller ceiling.
-                            let mut retentions = std::mem::take(&mut updated.retentions).into_vec();
-                            if !retentions
-                                .iter()
-                                .any(|retention| retention.domain == source.domain)
-                            {
-                                retentions.push(SourceRetentionProof {
-                                    domain: source.domain,
-                                    expected_retained_ppm: source.expected_retained_ppm,
-                                    upper_retained_ppm: source.upper_retained_ppm,
-                                });
-                            }
-                            retentions.sort_by_key(|retention| retention.domain);
-                            let retained = retained_source_cost(lane.base_cost, &retentions)?;
-                            updated.cost = retained;
-                            updated.retentions = retentions.into_boxed_slice();
-                            let mut filters = std::mem::take(&mut updated.filters).into_vec();
-                            if !filters
-                                .iter()
-                                .any(|filter| filter.evaluation == source.evaluation)
-                            {
-                                filters.push(SourceFilterWork {
-                                    domain: source.domain,
-                                    evaluation: source.evaluation,
-                                    evaluation_rows: lane.source_rows,
-                                    expected_retained_ppm: source.expected_retained_ppm,
-                                    upper_retained_ppm: source.upper_retained_ppm,
-                                    full_apply_cost: full_apply_cost.work_only(),
-                                });
-                            }
-                            filters.sort_by_key(|filter| filter.evaluation);
-                            let new_apply_cost = ordered_source_filter_cost(&filters)?;
-                            updated.filters = filters.into_boxed_slice();
-                            updated.filter_apply_cost = new_apply_cost;
-                            let serial_pipeline = retained.sequential(new_apply_cost)?;
-                            let phased_pipeline = calibration.rephase(
-                                serial_pipeline,
-                                ParallelWorkProfile::Pipeline,
-                                lane.phase_tasks,
-                                lane.phase_tasks,
-                            )?;
-                            child = child.replace_work(lane.phased_cost, phased_pipeline)?;
-                            updated.phased_cost = phased_pipeline;
-                            *lane = updated.into();
                         }
                     }
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        declared_source_count = sources.len(),
+                        matching_lanes,
+                        source_retentions = ?sources,
+                        child_expected_cost = child.score.range.expected,
+                        "composed source-attributed sideways filter"
+                    );
                 }
-                tracing::debug!(
-                    target: "paro::optimizer",
-                    declared_source_count = sources.len(),
-                    matching_lanes,
-                    source_retentions = ?sources,
-                    child_expected_cost = child.score.range.expected,
-                    "composed source-attributed sideways filter"
-                );
             }
-            source_work.extend(lanes);
+            if let Some(lanes) = lanes {
+                source_work.extend(lanes);
+            } else {
+                source_work.extend(child_source_work[index].iter().cloned());
+            }
         } else {
             // SourceWork is an immutable Arc-backed snapshot. When no
             // sideways predicate changes a lane, append shallow handles
