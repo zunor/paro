@@ -5,6 +5,8 @@
 
 use super::*;
 
+use smallvec::SmallVec;
+
 pub(super) struct StagedEquivalent {
     pub(super) key: LogicalExprKey,
     pub(super) payload: LogicalPayloadId,
@@ -76,6 +78,8 @@ impl NativeShell {
         binding: &PatternOperand,
         facts: &boundary::BoundarySnapshot,
     ) -> Result<Option<Self>> {
+        let mut group_names = HashMap::<usize, Arc<[String]>>::new();
+
         struct Built {
             child: NativeChild,
             layout: Arc<paro_planner::operator::LogicalOutputLayout>,
@@ -88,6 +92,7 @@ impl NativeShell {
             facts: &boundary::BoundarySnapshot,
             group: GroupId,
             layout: &PlannerBindingLayout,
+            group_names: &mut HashMap<usize, Arc<[String]>>,
         ) -> Result<Built> {
             if layout.bindings().len() != layout.types().len() {
                 return Err(paro_error::internal(
@@ -108,10 +113,15 @@ impl NativeShell {
             let mut stats = NodeStats::default();
             stats.estimated_cardinality = facts.cardinality(memo, group);
             stats.unique_keys = reference.facts.unique_keys.clone();
-            let names = (0..layout.bindings().len())
-                .map(|index| format!("__bound_reference_{index}"))
-                .collect::<Vec<_>>()
-                .into();
+            let names = group_names
+                .entry(layout.bindings().len())
+                .or_insert_with(|| {
+                    (0..layout.bindings().len())
+                        .map(|index| format!("__bound_reference_{index}"))
+                        .collect::<Vec<_>>()
+                        .into()
+                })
+                .clone();
             Ok(Built {
                 child: NativeChild::MemoGroup {
                     group,
@@ -133,6 +143,7 @@ impl NativeShell {
             operand: &PatternOperand,
             nodes: &mut Vec<NativeNode>,
             expected_layout: Option<&PlannerBindingLayout>,
+            group_names: &mut HashMap<usize, Arc<[String]>>,
         ) -> Result<Option<Built>> {
             match operand {
                 PatternOperand::Group(group_id) => {
@@ -141,7 +152,14 @@ impl NativeShell {
                             "native pattern root cannot be an untyped Memo group",
                         ));
                     };
-                    Ok(Some(group(memo, state, facts, *group_id, layout)?))
+                    Ok(Some(group(
+                        memo,
+                        state,
+                        facts,
+                        *group_id,
+                        layout,
+                        group_names,
+                    )?))
                 }
                 PatternOperand::Expression {
                     group: _group,
@@ -166,10 +184,17 @@ impl NativeShell {
                             "native pattern child arity disagrees with metadata",
                         ));
                     }
-                    let mut built_children = Vec::with_capacity(children.len());
+                    let mut built_children = SmallVec::<[Built; 2]>::with_capacity(children.len());
                     for (child, layout) in children.iter().zip(&metadata.child_layouts) {
-                        let Some(built) =
-                            expression(memo, state, facts, child, nodes, Some(layout))?
+                        let Some(built) = expression(
+                            memo,
+                            state,
+                            facts,
+                            child,
+                            nodes,
+                            Some(layout),
+                            group_names,
+                        )?
                         else {
                             return Ok(None);
                         };
@@ -193,12 +218,12 @@ impl NativeShell {
                     let child_layouts = built_children
                         .iter()
                         .map(|child| child.layout.as_ref())
-                        .collect::<Vec<_>>();
+                        .collect::<SmallVec<[_; 2]>>();
                     let layout = Arc::new(operator.output_layout_from_child_refs(&child_layouts));
                     let child_names = built_children
                         .iter()
                         .map(|child| child.names.as_ref())
-                        .collect::<Vec<_>>();
+                        .collect::<SmallVec<[_; 2]>>();
                     let names: Arc<[String]> =
                         operator.output_names_from_child_refs(&child_names).into();
                     let mut stats = NodeStats::default();
@@ -225,7 +250,16 @@ impl NativeShell {
         }
 
         let mut nodes = Vec::new();
-        let Some(root) = expression(memo, state, facts, binding, &mut nodes, None)? else {
+        let Some(root) = expression(
+            memo,
+            state,
+            facts,
+            binding,
+            &mut nodes,
+            None,
+            &mut group_names,
+        )?
+        else {
             return Ok(None);
         };
         let NativeChild::Node(root) = root.child else {
@@ -248,7 +282,7 @@ impl NativeShell {
             Vec::<paro_planner::operator::LogicalOutputLayout>::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let child_layouts = {
-                let mut children = Vec::new();
+                let mut children = SmallVec::<[&NativeChild; 2]>::new();
                 node.operator
                     .visit_child_links(&mut |child| children.push(child));
                 children

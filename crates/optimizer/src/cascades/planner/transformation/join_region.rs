@@ -293,15 +293,18 @@ pub(super) fn try_native_enumeration(
                 .map(|filter| filter.filter.clone()),
         );
         let projection_map = input.root_projection.clone();
-        let root_layout = NativeShell {
-            nodes: nodes.clone().into_boxed_slice(),
-            root,
-        }
-        .root_layout()?;
+        // INNER/CROSS reconstruction preserves the complete output width: the
+        // native collector rejects every child projection that could drop or
+        // duplicate a column.  The projection guard only needs that width,
+        // not a second layout walk over the freshly rebuilt node graph.
+        let root_width = layouts
+            .get(shell.root)
+            .ok_or_else(|| paro_error::internal("native join shell has no root layout"))?
+            .len();
         let keep_filter = !remaining.is_empty()
             || projection_map
                 .as_ref()
-                .is_some_and(|projection| !projection.is_identity(root_layout.len()));
+                .is_some_and(|projection| !projection.is_identity(root_width));
         if keep_filter {
             let index = nodes.len();
             nodes.push(NativeNode {
