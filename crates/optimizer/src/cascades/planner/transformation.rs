@@ -1004,6 +1004,9 @@ fn try_native_predicate_transfer(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Option<NativeShell>> {
+    if !native_predicate_transfer_may_apply(binding, memo, state)? {
+        return Ok(None);
+    }
     let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
         return Ok(None);
     };
@@ -1168,6 +1171,138 @@ fn try_native_predicate_transfer(
         root,
     })
     .map(Some)
+}
+
+/// Prove that a predicate transfer can possibly be useful before allocating a
+/// native shell.  Matching deliberately returns many filter bindings that are
+/// not side-local (join predicates, constants, or predicates over an opaque
+/// child).  The full native path remains authoritative; this preflight only
+/// rejects cases for which the existing column metadata proves that no
+/// single-side predicate can be moved.
+fn native_predicate_transfer_may_apply(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<bool> {
+    fn operand_tables(
+        operand: &PatternOperand,
+        memo: &Memo,
+        state: &PlannerTransformState,
+    ) -> Result<Option<BTreeSet<usize>>> {
+        let columns = match operand {
+            PatternOperand::Group(group) => {
+                let Some(group) = memo.group(*group) else {
+                    return Ok(None);
+                };
+                group.schema.ids()
+            }
+            PatternOperand::Expression { expression, .. } => {
+                let Some(logical) = memo.logical_expr(*expression) else {
+                    return Ok(None);
+                };
+                let Some(metadata) = state.metadata.get(&logical.payload) else {
+                    return Ok(None);
+                };
+                metadata.output_columns.iter().copied().collect()
+            }
+        };
+        let mut tables = BTreeSet::new();
+        for column in columns {
+            let Some(binding) = state.binding_ids.relation_binding(column) else {
+                return Ok(None);
+            };
+            tables.insert(binding.table_index);
+        }
+        if tables.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(tables))
+        }
+    }
+
+    let PatternOperand::Expression {
+        expression,
+        children,
+        ..
+    } = binding
+    else {
+        return Ok(false);
+    };
+    let logical = memo
+        .logical_expr(*expression)
+        .ok_or_else(|| paro_error::internal("native predicate preflight lost its expression"))?;
+    let operator = &state
+        .payloads
+        .logical
+        .get(logical.payload.index())
+        .ok_or_else(|| paro_error::internal("native predicate preflight lost its operator"))?
+        .semantic_template
+        .operator;
+    let LogicalOperator::Filter(filter) = operator else {
+        return Ok(false);
+    };
+    if filter
+        .expressions
+        .iter()
+        .any(|expression| expression.evaluation_properties().is_reorder_fence())
+    {
+        return Ok(false);
+    }
+    let [join_operand] = children.as_ref() else {
+        return Ok(false);
+    };
+    let PatternOperand::Expression {
+        expression: join_expression,
+        children: join_children,
+        ..
+    } = join_operand
+    else {
+        return Ok(false);
+    };
+    let join_logical = memo
+        .logical_expr(*join_expression)
+        .ok_or_else(|| paro_error::internal("native predicate preflight lost its join"))?;
+    let join_operator = &state
+        .payloads
+        .logical
+        .get(join_logical.payload.index())
+        .ok_or_else(|| paro_error::internal("native predicate preflight lost its join operator"))?
+        .semantic_template
+        .operator;
+    let reorderable = match join_operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            join.join_type == JoinType::Inner
+                && join.duplicate_eliminated_columns.is_empty()
+                && !join.delim_flipped
+                && !crate::expression::comparison_join_has_evaluation_fence(join)
+        }
+        LogicalOperator::Join(Join::Cross(_)) => true,
+        _ => false,
+    };
+    if !reorderable {
+        return Ok(false);
+    }
+    let [left, right] = join_children.as_ref() else {
+        return Ok(false);
+    };
+    let Some(left_tables) = operand_tables(left, memo, state)? else {
+        return Ok(false);
+    };
+    let Some(right_tables) = operand_tables(right, memo, state)? else {
+        return Ok(false);
+    };
+    Ok(filter.expressions.iter().any(|expression| {
+        let mut tables = BTreeSet::new();
+        crate::expression::traversal::visit_expression(expression, &mut |candidate| {
+            if let Expression::ColumnRef(column) = candidate {
+                tables.insert(column.binding.table_index);
+            }
+        });
+        (!tables.is_empty() && tables.is_subset(&left_tables) && tables.is_disjoint(&right_tables))
+            || (!tables.is_empty()
+                && tables.is_subset(&right_tables)
+                && tables.is_disjoint(&left_tables))
+    }))
 }
 
 fn compact_native_shell(shell: NativeShell) -> Result<NativeShell> {
