@@ -2104,6 +2104,9 @@ impl CascadesEngine {
                 "implementation candidate key does not match its registry task",
             ));
         }
+        if let Some(region) = candidate.region.as_mut() {
+            refresh_region_candidate_contract(&self.memo, region)?;
+        }
         let inherited_sources = self
             .memo
             .optimization_context(goal.context)
@@ -2845,6 +2848,20 @@ fn build_joint_cost_proof(
     let Some(region) = &recipe.region else {
         return Ok(None);
     };
+    let mut region_id = None;
+    for facet in region.facets.iter().copied() {
+        let current = memo.regions().region_for_facet(facet).ok_or_else(|| {
+            paro_error::internal("physical candidate references an unowned planning facet")
+        })?;
+        if region_id.is_some_and(|previous| previous != current) {
+            return Err(paro_error::internal(
+                "physical candidate facets do not share a planning region",
+            ));
+        }
+        region_id = Some(current);
+    }
+    let region_id = region_id
+        .ok_or_else(|| paro_error::internal("physical region candidate has no active facet"))?;
     let owner_group = memo.canonical_group(owner_group);
     let boundary_goals = recipe
         .child_goals
@@ -2917,7 +2934,7 @@ fn build_joint_cost_proof(
     }
     dependencies.sort_unstable();
     Ok(Some(JointCostProof {
-        region: region.region,
+        region: region_id,
         facets: region.facets.clone(),
         owner_group,
         boundary_goals,
@@ -2928,6 +2945,27 @@ fn build_joint_cost_proof(
         source_filter_apply_cost: recipe.source_filter_apply_cost,
         cost_composition: recipe.cost_composition.clone(),
     }))
+}
+
+fn refresh_region_candidate_contract(
+    memo: &Memo,
+    region: &mut RegionCandidateContract,
+) -> Result<()> {
+    let mut region_id = None;
+    for facet in region.facets.iter().copied() {
+        let current = memo.regions().region_for_facet(facet).ok_or_else(|| {
+            paro_error::internal("physical candidate references an unowned planning facet")
+        })?;
+        if region_id.is_some_and(|previous| previous != current) {
+            return Err(paro_error::internal(
+                "physical candidate facets do not share a planning region",
+            ));
+        }
+        region_id = Some(current);
+    }
+    region.region = region_id
+        .ok_or_else(|| paro_error::internal("physical region candidate has no active facet"))?;
+    Ok(())
 }
 
 fn resolve_region_boundary_endpoint(

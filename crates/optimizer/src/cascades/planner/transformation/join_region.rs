@@ -203,6 +203,15 @@ pub(super) fn try_native_enumeration(
     let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
         return Ok(Vec::new());
     };
+    // A native join graph does not yet carry the control-region facet closure
+    // through its reordered group holes. Keep CTE/recursive/dependent owners on
+    // the legacy path so a valid physical candidate cannot publish a
+    // JointCostProof whose owner falls outside the region scope. Check the
+    // actual opaque boundary references rather than the root's non-relational
+    // fact observation, which is conservatively marked as control by design.
+    if shell_contains_control_boundary(&shell) {
+        return Ok(Vec::new());
+    }
     let layouts = shell.layouts()?;
     let mut input = NativeJoinInput {
         atoms: Vec::new(),
@@ -312,6 +321,23 @@ pub(super) fn try_native_enumeration(
         })?);
     }
     Ok(shells)
+}
+
+fn shell_contains_control_boundary(shell: &NativeShell) -> bool {
+    shell.nodes.iter().any(|node| {
+        let mut control = false;
+        node.operator.visit_child_links(&mut |child| {
+            if matches!(
+                child,
+                NativeChild::MemoGroup { reference, .. }
+                    | NativeChild::Group { reference, .. }
+                    if reference.facts.contains_control_region
+            ) {
+                control = true;
+            }
+        });
+        control
+    })
 }
 
 fn native_pattern_atom_count(

@@ -25,7 +25,10 @@ use crate::cascades::properties::{
     ProvidedReplayability, ProvidedRepresentation, ReplayabilityRequirement,
     RepresentationRequirement, RequiredProperties, ResultGuarantee,
 };
-use crate::cascades::region::RegionArtifactDependencyContract;
+use crate::cascades::region::{
+    FacetCriticality, RegionArtifactDependencyContract, RegionFacet, RegionFacetKind, RegionForest,
+    RegionScopeContract,
+};
 use crate::cascades::rules::{
     DomainProofId, EquivalentExpression, EvaluationOccurrenceId, GrantDependencyDescriptor,
     PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PhysicalImplementation,
@@ -275,6 +278,21 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
     let canonical_first = memo.merge_groups(first, groups[1]).unwrap();
     let canonical_second = memo.merge_groups(second, groups[2]).unwrap();
     let facet = Fingerprint(90);
+    memo.set_regions(
+        RegionForest::normalize(
+            [RegionFacet {
+                fingerprint: facet,
+                kind: RegionFacetKind::RuntimeFilter,
+                criticality: FacetCriticality::Optional,
+                priority: 1,
+                scope_contract: RegionScopeContract::OwnerWithImmediateInputs,
+                scope: [canonical_owner].into_iter().collect(),
+            }],
+            8,
+            8,
+        )
+        .unwrap(),
+    );
 
     for (producer, consumer, expected_producer, expected_consumer) in [
         (
@@ -300,7 +318,10 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),
             physical_fingerprint: Fingerprint(91),
             region: Some(RegionCandidateContract {
-                region: super::super::ids::RegionId::new(0),
+                // RegionId is an ephemeral forest position. The facet
+                // fingerprint is the stable recipe identity after runtime
+                // facet normalization reassigns positions.
+                region: super::super::ids::RegionId::new(99),
                 facets: Box::new([facet]),
                 artifacts: Box::new([super::super::region::RegionOwnedArtifact {
                     fingerprint: facet,
@@ -318,6 +339,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
         let proof = build_joint_cost_proof(&memo, owner, &recipe, SearchCost::ZERO)
             .unwrap()
             .expect("region recipe must produce a proof");
+        assert_eq!(proof.region, memo.regions().region_for_facet(facet).unwrap());
         assert_eq!(proof.owner_group, canonical_owner);
         assert_eq!(proof.boundary_goals[0].0, canonical_first);
         assert_eq!(proof.boundary_goals[1].0, canonical_second);
