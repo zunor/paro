@@ -3,6 +3,7 @@
 
 //! Cascades engine scheduling, transaction, and costing tests.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -1446,6 +1447,123 @@ fn shared_child_product_is_lazy_and_uses_immutable_candidate_references() {
         1,
         "enumeration cannot allocate Memo nodes"
     );
+}
+
+#[test]
+fn incremental_child_combination_oracle_covers_only_the_frontier_delta() {
+    fn frontiers(values: &[&[u32]]) -> Box<[Box<[CandidateId]>]> {
+        values
+            .iter()
+            .map(|values| {
+                let mut values = values
+                    .iter()
+                    .copied()
+                    .map(|value| CandidateId::new(value as usize))
+                    .collect::<Vec<_>>();
+                values.sort_unstable();
+                values.into_boxed_slice()
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    fn drain(state: &mut ChildCombinationState) -> Vec<Box<[CandidateId]>> {
+        let mut result = Vec::new();
+        while let Some((children, _mandatory)) = state.next_unpriced_domain_tuple() {
+            result.push(children);
+        }
+        result
+    }
+
+    let initial = frontiers(&[&[1, 2], &[10, 11]]);
+    let mut state = ChildCombinationState::default();
+    state.reset_for_context(
+        initial.clone(),
+        Fingerprint(1),
+        0,
+        Some(Box::new([CandidateId::new(2), CandidateId::new(10)])),
+    );
+    let mut seen = BTreeSet::new();
+    for _ in 0..2 {
+        seen.insert(
+            state
+                .next_unpriced_domain_tuple()
+                .expect("the initial cursor has a resumable prefix")
+                .0,
+        );
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "the pause point has a stable two-tuple prefix"
+    );
+
+    // A one-sided addition resumes the two old tuples and adds only the two
+    // products containing the new left candidate. The exact CandidateId
+    // tuple, not its old frontier ordinal, is the coverage oracle.
+    let grown_left = frontiers(&[&[1, 2, 3], &[10, 11]]);
+    state.observe_frontiers(grown_left.clone());
+    let left_delta = drain(&mut state).into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(left_delta.len(), 4, "two old and two new tuples resume");
+    assert_eq!(
+        left_delta
+            .iter()
+            .filter(|children| children[0] == CandidateId::new(3))
+            .count(),
+        2
+    );
+    seen.extend(left_delta);
+    assert_eq!(seen.len(), 6);
+
+    // Adding a candidate on the other side creates the three products in its
+    // new slice, including the cross-product with the earlier addition, but
+    // does not reopen any of the six tuples already covered.
+    let grown = frontiers(&[&[1, 2, 3], &[10, 11, 12]]);
+    state.observe_frontiers(grown.clone());
+    let right_delta = drain(&mut state).into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(right_delta.len(), 3);
+    assert!(right_delta
+        .iter()
+        .all(|children| children[1] == CandidateId::new(12)));
+    assert!(seen.is_disjoint(&right_delta));
+    seen.extend(right_delta);
+    assert_eq!(seen.len(), 9, "the full 3-by-3 product is covered once");
+
+    // A deterministic objective over the exact tuples is an independent
+    // quality oracle: with enough budget the best tuple must remain visible,
+    // regardless of the pause or frontier publication batches.
+    let best = seen
+        .iter()
+        .min_by_key(|children| {
+            (
+                children[0].index() + children[1].index(),
+                children[0],
+                children[1],
+            )
+        })
+        .expect("the product oracle is non-empty");
+    assert_eq!(best.as_ref(), &[CandidateId::new(1), CandidateId::new(10)]);
+
+    // A reorder is represented by the same stable ID set and a crop removes
+    // choices from the active domain; neither operation reopens a priced
+    // product or manufactures a new tuple.
+    state.observe_frontiers(frontiers(&[&[3, 2, 1], &[12, 10, 11]]));
+    assert!(drain(&mut state).is_empty());
+    state.observe_frontiers(frontiers(&[&[2, 3], &[10, 11]]));
+    assert!(drain(&mut state).is_empty());
+
+    // A changed cost/fact context explicitly restarts the cursor. This is the
+    // invalidation boundary; frontier growth alone did not restart it.
+    state.reset_for_context(
+        grown,
+        Fingerprint(2),
+        1,
+        Some(Box::new([CandidateId::new(2), CandidateId::new(10)])),
+    );
+    assert!(state.priced.is_empty());
+    assert!(state.resource_rejected.is_empty());
+    assert!(state.budget_rejected.is_empty());
+    assert!(!drain(&mut state).is_empty());
 }
 
 #[test]

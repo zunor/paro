@@ -1382,6 +1382,10 @@ impl Memo {
         self.cost_epoch
     }
 
+    pub(crate) fn cost_epoch_value(&self) -> u64 {
+        self.cost_epoch.0
+    }
+
     pub fn calibration(&self) -> &MachineCalibrationBundle {
         self.calibration.as_ref()
     }
