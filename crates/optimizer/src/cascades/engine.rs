@@ -2409,6 +2409,7 @@ impl CascadesEngine {
         let mut child_selections = Vec::<ChildWinnerRef>::new();
         let mut child_costs = Vec::<SearchCost>::new();
         let mut child_fingerprints = Vec::<Fingerprint>::new();
+        let mut source_work_scratch = Vec::<SourceWork>::new();
         for (physical, _recipe_fingerprint, recipe) in recipes {
             if !self.memo.control().checkpoint()? {
                 break;
@@ -2572,7 +2573,7 @@ impl CascadesEngine {
                 }
                 child_costs.clear();
                 child_fingerprints.clear();
-                let (local_cost, source_work, mut cost) = {
+                let (local_cost, mut cost) = {
                     // Q11 and the other common plans have only a handful of
                     // child pipelines. Keep the borrowed source-lane list in
                     // inline storage so this per-combination scratch does not
@@ -2621,23 +2622,23 @@ impl CascadesEngine {
                     if let Some(apply) = recipe.source_filter_apply_cost {
                         local_cost = local_cost.replace_work(SearchCost::ZERO, apply)?;
                     }
-                    let composed = compose_candidate_cost_with_sources_at_ref(
+                    let composed_cost = compose_candidate_cost_with_sources_at_ref_scratch(
                         local_cost,
                         recipe.source_filter_apply_cost,
                         &child_costs,
                         &child_source_work_refs,
                         &recipe.cost_composition,
                         self.memo.calibration(),
+                        &mut source_work_scratch,
                     )?;
-                    let source_work = composed.source_work;
                     let Some(cost) = constrain_composed_cost_to_grant(
-                        composed.cost,
+                        composed_cost,
                         recipe.enforcer_cost_input,
                     )?
                     else {
                         continue;
                     };
-                    (local_cost, source_work, cost)
+                    (local_cost, cost)
                 };
                 let Some(constrained_cost) = constrain_composed_cost_to_grant(
                     enforcer_phase.compose_after(cost)?,
@@ -2652,13 +2653,17 @@ impl CascadesEngine {
                     &enforced.steps,
                     child_fingerprints.iter().copied(),
                 );
-                let summary = CandidateSummary {
-                    expression: physical,
-                    cost,
-                    source_work: source_work.as_ref(),
-                    physical_fingerprint: fingerprint,
-                };
-                match self.memo.candidate_preview(group, goal, summary)? {
+                let preview = self.memo.candidate_preview(
+                    group,
+                    goal,
+                    CandidateSummary {
+                        expression: physical,
+                        cost,
+                        source_work: source_work_scratch.as_ref(),
+                        physical_fingerprint: fingerprint,
+                    },
+                )?;
+                match preview {
                     CandidatePreview::Rejected => {
                         self.memo.record_rejected_winner_proposal(
                             group,
@@ -2666,6 +2671,7 @@ impl CascadesEngine {
                             fingerprint,
                             false,
                         )?;
+                        source_work_scratch.clear();
                         continue;
                     }
                     CandidatePreview::Truncated => {
@@ -2675,6 +2681,7 @@ impl CascadesEngine {
                             fingerprint,
                             true,
                         )?;
+                        source_work_scratch.clear();
                         continue;
                     }
                     CandidatePreview::Publish | CandidatePreview::MustMaterialize => {}
@@ -2742,6 +2749,7 @@ impl CascadesEngine {
                 }
                 let joint_cost_proof =
                     build_joint_cost_proof(&self.memo, group, &recipe, local_cost)?;
+                let source_work = std::mem::take(&mut source_work_scratch).into_boxed_slice();
                 let winner = Winner {
                     candidate: super::ids::CandidateId::INVALID,
                     expression: physical,
@@ -3328,6 +3336,35 @@ pub(crate) fn compose_candidate_cost_with_sources_at_ref(
     composition: &CostComposition,
     calibration: &MachineCalibrationBundle,
 ) -> Result<ComposedCost> {
+    let mut source_work = Vec::new();
+    let cost = compose_candidate_cost_with_sources_at_ref_scratch(
+        local_cost,
+        source_filter_apply_cost,
+        child_costs,
+        child_source_work,
+        composition,
+        calibration,
+        &mut source_work,
+    )?;
+    Ok(ComposedCost {
+        cost,
+        source_work: source_work.into_boxed_slice(),
+    })
+}
+
+/// Compose a candidate into caller-owned source-work scratch.  The engine
+/// uses this form while a CandidateSummary is still only a preview: rejected
+/// proposals clear the Vec and pay no owned `Box<[SourceWork]>` allocation.
+fn compose_candidate_cost_with_sources_at_ref_scratch(
+    local_cost: SearchCost,
+    source_filter_apply_cost: Option<SearchCost>,
+    child_costs: &[SearchCost],
+    child_source_work: &[&[SourceWork]],
+    composition: &CostComposition,
+    calibration: &MachineCalibrationBundle,
+    source_work: &mut Vec<SourceWork>,
+) -> Result<SearchCost> {
+    source_work.clear();
     if child_costs.len() != child_source_work.len() {
         return Err(paro_error::internal(
             "cost composition has no source-work evidence for one or more children",
@@ -3336,10 +3373,7 @@ pub(crate) fn compose_candidate_cost_with_sources_at_ref(
     let mut cost = local_cost;
     if matches!(composition, CostComposition::LocalOnly) {
         cost.validate()?;
-        return Ok(ComposedCost {
-            cost,
-            source_work: Box::new([]),
-        });
+        return Ok(cost);
     }
     if let CostComposition::Source {
         source,
@@ -3353,9 +3387,8 @@ pub(crate) fn compose_candidate_cost_with_sources_at_ref(
         }
         cost.validate()?;
         let serial_cost = serial_normalized_work(local_cost);
-        return Ok(ComposedCost {
-            cost,
-            source_work: Box::new([SourceWorkData {
+        source_work.push(
+            SourceWorkData {
                 source: *source,
                 source_rows: *source_rows,
                 base_cost: serial_cost,
@@ -3366,11 +3399,11 @@ pub(crate) fn compose_candidate_cost_with_sources_at_ref(
                 phased_cost: local_cost.work_only(),
                 phase_tasks: local_cost.output_pipeline_tasks,
             }
-            .into()]),
-        });
+            .into(),
+        );
+        return Ok(cost);
     }
     let sideways_filter = composition.sideways_filter();
-    let mut source_work = Vec::new();
     let source_work_capacity = child_source_work.iter().map(|lanes| lanes.len()).sum();
     source_work.reserve(source_work_capacity);
     for (index, child) in child_costs.iter().copied().enumerate() {
@@ -3665,10 +3698,7 @@ pub(crate) fn compose_candidate_cost_with_sources_at_ref(
             .max(cost.preferred_memory_bytes());
     }
     cost.validate()?;
-    Ok(ComposedCost {
-        cost,
-        source_work: source_work.into_boxed_slice(),
-    })
+    Ok(cost)
 }
 
 fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost> {
