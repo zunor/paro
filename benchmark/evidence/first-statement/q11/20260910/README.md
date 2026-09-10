@@ -202,3 +202,42 @@ D1-Q/D1-C, the complete D2/D3/D4 end state, G-Stats/G-Cost admission, and
 formal D6 optimization remain open; M1–M3 remain unpassed. The next round
 should continue from plan-quality attribution and execution-hotspot evidence,
 not from a trace-expansion project.
+
+## Incremental physical readiness scheduling — 2026-09-10
+
+Commit `510489dd` makes the production single-goal and grant-portfolio paths
+share `PhysicalInterleave`. Logical publication wakes only the owning physical
+subproblem and registered physical ancestors. Exact child frontier changes
+mark dependent recipes dirty; owner fact/statistics or dependency-shape changes
+fall back to a full recost. A changed `ReadSet` gets a new task evaluation, but
+the task protocol carries an append-only predecessor cursor without reusing the
+predecessor outcome. Readiness passes preserve a verified executable incumbent
+and leave the final complete-search boundary unchanged.
+
+The primary artifact is `q11-incremental-readiness-v1.json`. It used the binary
+protocol, two fresh process blocks, four execution threads, 2 GiB, private data
+copies, trace-off normal C1, verified cache misses, and complete typed-result
+validation. The release binary SHA-256 is
+`6f47eddc4dcd896af8e3ecbef469895d78d487251a2d29d6ffc0f94e06458fb2`.
+
+The diagnostic 5/10/20/50/100 ms checkpoints had no candidate at 5 ms; the
+first candidates appeared at 10 ms, improved at 20 ms, and the 50/100 ms
+candidate and cost were identical. `search_complete=0`, so these are candidate
+quality observations rather than an early-stop or an independently executed
+50 ms plan.
+
+The normal C1 result was Paro `1530.722438 ms` versus DuckDB `128.400354 ms`,
+ratio `12.034982`, 95% CI `[10.783694, 13.431464]`. Warm ratio was `0.961544`,
+95% CI `[0.917332, 1.033123]`. The diagnostic sample measured optimizer
+`1318.257 ms`, `bind_and_plan` `1.097 ms`, and post-compiler portal execution
+`138.169 ms`. Relative to the preceding ~13.66 s readiness experiment this is
+an approximately 8.9× C1 reduction, but it is not a formal 5-block M1/M2/M3
+campaign and does not pass those milestones.
+
+The effective high-FD SQL regression used `ulimit -n 65536` for both runner and
+server, including runner-controlled restarts. It completed `168 passed, 16
+failed, 0 skipped, 0 new` in `74.07s` with zero `Too many open files` messages
+and a clean server shutdown. The 16 remaining failures are plan/EXPLAIN or
+feature-output mismatches retained for later baseline/semantic follow-up; no
+FD failure was observed. The exact report, error output, runner/server logs and
+regress log use the `*-v4` names in this directory.
