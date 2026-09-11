@@ -493,6 +493,46 @@ fn quality_publication_promotes_only_its_local_followup_lane() {
     assert_eq!(ordinary_rule_stage, u8::MAX);
 }
 
+#[test]
+fn physical_demand_promotes_only_quality_tasks_to_the_demand_lane() {
+    let (mut engine, group, _) = engine_with_budget(super::super::budget::SearchBudget::default());
+    engine
+        .registry
+        .register_transformation(QualityLaneRule)
+        .unwrap();
+    engine.set_quality_policy_handoff_enabled(true);
+    let mut agenda = StableAgenda::default();
+    engine
+        .schedule_transformations_with_lane_and_demand(group, &mut agenda, true, true)
+        .unwrap();
+
+    let quality_key = agenda
+        .tasks
+        .iter()
+        .find_map(|(key, task)| match task {
+            SearchTask::Transform {
+                rule: RuleId(6), ..
+            } => Some(*key),
+            _ => None,
+        })
+        .expect("quality rule must be scheduled");
+    assert_eq!(quality_key.demand_stage, 0);
+    assert_eq!(quality_key.quality_stage, 0);
+
+    let ordinary_key = agenda
+        .tasks
+        .iter()
+        .find_map(|(key, task)| match task {
+            SearchTask::Transform {
+                rule: RuleId(5), ..
+            } => Some(*key),
+            _ => None,
+        })
+        .expect("ordinary rule must be scheduled");
+    assert_eq!(ordinary_key.demand_stage, 1);
+    assert_eq!(ordinary_key.quality_stage, u8::MAX);
+}
+
 struct EnumerateTwoCompositionBindings;
 
 impl TransformationRule for EnumerateTwoCompositionBindings {

@@ -213,6 +213,10 @@ enum TaskKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TaskKey {
+    /// A physical parent demand is an exact causal request for the group's
+    /// quality alternatives. Keep those tasks ahead of the broader quality
+    /// lane without changing the latter's established ordering.
+    demand_stage: u8,
     /// A promoted task is one whose observed dependency was just published.
     /// Keep that readiness lane before the ordinary promise so the direct
     /// successor can run promptly, but enqueue the initial agenda on the
@@ -1061,6 +1065,15 @@ pub struct CascadesEngine {
     /// dependency. A root goal must never be substituted for a child's
     /// required materialization, partitioning, or grant contract.
     physical_goals: BTreeMap<GroupId, BTreeSet<OptimizationGoal>>,
+    /// Physical child groups observed by the mandatory baseline.  The
+    /// optional quality lane may promote only these proven demand edges; it
+    /// must not walk every logical group merely because it is reachable from
+    /// the root. New optional physical requests append to the same set.
+    physical_quality_demanded_groups: BTreeSet<GroupId>,
+    /// Prevent repeated physical drains from rescanning a demanded group's
+    /// existing expressions. New expressions still use the ordinary local
+    /// publication wake-up path.
+    physical_quality_scheduled_groups: BTreeSet<GroupId>,
     /// Physical context work is keyed by the complete OptimizationGoal, not
     /// by group alone.  These counters make context reuse visible without
     /// retaining a second cache or changing the publication protocol.
@@ -1238,6 +1251,8 @@ impl CascadesEngine {
             physical_dirty_recipes: BTreeMap::new(),
             physical_full_recost: BTreeSet::new(),
             physical_goals: BTreeMap::new(),
+            physical_quality_demanded_groups: BTreeSet::new(),
+            physical_quality_scheduled_groups: BTreeSet::new(),
             physical_subproblem_requests: 0,
             physical_subproblem_reuses: 0,
             physical_subproblem_evaluations: 0,
@@ -3317,6 +3332,13 @@ impl CascadesEngine {
         self.physical_completion_proofs.clear();
         self.task_registry.invalidate_physical_tasks()?;
         self.physical_full_recost = self.next_recipe_sequence.keys().copied().collect();
+        self.physical_quality_demanded_groups = self
+            .physical_parents
+            .keys()
+            .copied()
+            .map(|group| self.memo.canonical_group(group))
+            .collect();
+        self.physical_quality_scheduled_groups.clear();
         Ok(())
     }
 
@@ -3877,6 +3899,9 @@ impl CascadesEngine {
             .entry(parent)
             .or_default()
             .insert(parent_goal);
+        if self.quality_handoff_enabled && self.optional_search_started {
+            self.physical_quality_demanded_groups.insert(child);
+        }
         self.physical_parents.entry(child).or_default().insert((
             parent,
             parent_goal,
@@ -4010,6 +4035,7 @@ impl CascadesEngine {
                 self.schedule_quality_bootstrap(interleave.root, &mut agenda)?;
             }
         }
+        self.schedule_demanded_physical_quality_groups(&mut agenda)?;
         'tasks: while let Some(task) = agenda.pop() {
             if self.quality_handoff_reached {
                 break;
@@ -4910,6 +4936,7 @@ impl CascadesEngine {
                             inserted,
                             &mut agenda,
                             promote_quality_followups,
+                            false,
                         )?;
                     }
                     for appended in appended_groups.iter().copied() {
@@ -4945,6 +4972,7 @@ impl CascadesEngine {
                     // The final root pass still owns completion; this queue is
                     // solely the early quality/readiness path.
                     self.drain_physical_interleave(interleave)?;
+                    self.schedule_demanded_physical_quality_groups(&mut agenda)?;
                 }
                 effective_insertions_since_recost = 0;
             }
@@ -4955,6 +4983,7 @@ impl CascadesEngine {
                 // before the final grant extraction. This is an incremental drain,
                 // not another whole-root exploration.
                 self.drain_physical_interleave(interleave)?;
+                self.schedule_demanded_physical_quality_groups(&mut agenda)?;
             }
         }
         self.record_diagnostic_checkpoints();
@@ -5628,6 +5657,33 @@ impl CascadesEngine {
         Ok(())
     }
 
+    /// Promote only the quality rules owned by groups which the physical
+    /// readiness path has actually demanded.  The mandatory dependency index
+    /// supplies the initial set, while optional recursive costing can add a
+    /// newly observed child.  Keeping this handoff local is important: a
+    /// broad second walk of the root's selected tree previously spent most of
+    /// its time on work that never reached a physical parent.
+    fn schedule_demanded_physical_quality_groups(
+        &mut self,
+        agenda: &mut StableAgenda,
+    ) -> Result<()> {
+        if !self.quality_handoff_enabled {
+            return Ok(());
+        }
+        let groups = self
+            .physical_quality_demanded_groups
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for group in groups {
+            let group = self.memo.canonical_group(group);
+            if self.physical_quality_scheduled_groups.insert(group) {
+                self.schedule_transformations_with_lane_and_demand(group, agenda, true, true)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Schedule the transformations owned by one newly visible group. A
     /// quality-producing publication may pass its lane to the exact output
     /// groups it created; this keeps the dependency chain local while making
@@ -5638,6 +5694,16 @@ impl CascadesEngine {
         agenda: &mut StableAgenda,
         promoted: bool,
     ) -> Result<()> {
+        self.schedule_transformations_with_lane_and_demand(group, agenda, promoted, false)
+    }
+
+    fn schedule_transformations_with_lane_and_demand(
+        &mut self,
+        group: GroupId,
+        agenda: &mut StableAgenda,
+        promoted: bool,
+        demanded: bool,
+    ) -> Result<()> {
         let expressions = self
             .memo
             .group(group)
@@ -5645,26 +5711,29 @@ impl CascadesEngine {
             .logical_exprs()
             .to_vec();
         for expression in expressions {
-            self.schedule_transformation_expression(group, expression, agenda, promoted)?;
+            self.schedule_transformation_expression(
+                group, expression, agenda, promoted, demanded,
+            )?;
         }
         Ok(())
     }
 
     /// Return the local quality lane for one transformation task. A task is
     /// promoted only when the publication which woke it is one of its
-    /// observed dependencies. All promoted tasks share one lane: encoding the
-    /// semantic dependency stage in the first agenda key created a global
-    /// barrier, so a late JoinRegion task waited for every unrelated demand,
-    /// domain, and aggregate task in the Memo. The dependency declaration is
-    /// still used to decide which publications may promote a task; it is not a
-    /// cross-group phase barrier. Initial work and unrelated work stay on the
-    /// ordinary lane, and a missing declaration is still searched rather than
-    /// becoming an implicit quality barrier.
-    fn quality_stage_for_rule(&self, rule: &dyn TransformationRule, promoted: bool) -> u8 {
+    /// observed dependencies. A physical demand is a narrower lane than the
+    /// ordinary quality bootstrap, but it still schedules every legal rule
+    /// for the demanded group; it is not a selected-only shortcut or a global
+    /// phase barrier.
+    fn quality_stage_for_rule(
+        &self,
+        rule: &dyn TransformationRule,
+        promoted: bool,
+        demanded: bool,
+    ) -> u8 {
         if !self.quality_handoff_enabled {
             return 0;
         }
-        if promoted && rule.quality_dependency().is_some() {
+        if (demanded || promoted) && rule.quality_dependency().is_some() {
             0
         } else {
             u8::MAX
@@ -5677,6 +5746,7 @@ impl CascadesEngine {
         expression: LogicalExprId,
         agenda: &mut StableAgenda,
         promoted: bool,
+        demanded: bool,
     ) -> Result<()> {
         let expression_ref = self
             .memo
@@ -5722,13 +5792,16 @@ impl CascadesEngine {
             if self.transformation_observation_is_current(task_id)? {
                 continue;
             }
+            let quality_stage = self.quality_stage_for_rule(
+                self.registry
+                    .transformation(rule_id)
+                    .expect("transformation dispatch disappeared"),
+                promoted,
+                demanded,
+            );
             let key = TaskKey {
-                quality_stage: self.quality_stage_for_rule(
-                    self.registry
-                        .transformation(rule_id)
-                        .expect("transformation dispatch disappeared"),
-                    promoted,
-                ),
+                demand_stage: u8::from(!(demanded && quality_stage == 0)),
+                quality_stage,
                 priority: promise.priority,
                 kind: TaskKind::Transform,
                 stable_id: rule_id.0,
@@ -5821,7 +5894,8 @@ impl CascadesEngine {
             let promise = rule.promise(expression_ref, &context);
             agenda.push(
                 TaskKey {
-                    quality_stage: self.quality_stage_for_rule(rule, true),
+                    demand_stage: 1,
+                    quality_stage: self.quality_stage_for_rule(rule, true, false),
                     priority: promise.priority,
                     kind: TaskKind::Transform,
                     stable_id: subscriber.rule.0,
@@ -6026,6 +6100,7 @@ impl CascadesEngine {
                 }
                 let promise = implementation.promise(expression_ref, goal);
                 let key = TaskKey {
+                    demand_stage: 1,
                     quality_stage: if self.quality_handoff_enabled {
                         u8::MAX
                     } else {
