@@ -22,6 +22,7 @@ use paro_planner::operator::{
 use paro_planner::plan::CardinalityEstimate;
 use paro_storage::table::table_factory::TableFactory;
 
+use super::super::memo::LogicalExpr;
 use super::*;
 
 pub(super) fn test_grant_classes() -> [ResourceGrantClass; 1] {
@@ -38,6 +39,42 @@ pub(super) fn test_grant_classes() -> [ResourceGrantClass; 1] {
 fn physical_input(mut plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
     crate::physical::slot_assignment::assign_expression_slots(&mut plan.operator).unwrap();
     plan
+}
+
+#[test]
+fn quality_rule_evidence_comes_from_selected_proofs_not_apply_audit() {
+    let logical = LogicalExpr {
+        id: LogicalExprId::new(0),
+        key: LogicalExprKey {
+            operator: Fingerprint(1),
+            scalars: Box::new([]),
+            children: Box::new([]),
+        },
+        operator_encoding: None,
+        operator_tag: None,
+        payload: LogicalPayloadId::new(0),
+        proofs: [EquivalenceProof::Initial].into_iter().collect(),
+        // This is deliberately populated as if a rule reached the apply gate
+        // but returned empty or was rejected by budget admission.
+        applied_rules: [RuleId(100), RuleId(101)].into_iter().collect(),
+    };
+    assert!(selected_rule_proofs(&logical, None).is_empty());
+
+    let mut transformed = logical.clone();
+    transformed.proofs.insert(EquivalenceProof::Transformation {
+        rule: RuleId(100),
+        source: LogicalExprId::new(0),
+        premise: Fingerprint(2),
+    });
+    assert_eq!(
+        selected_rule_proofs(&transformed, Some(RuleId(100)))
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![RuleId(100)]
+    );
+    // A proof from another expression/branch cannot certify this payload's
+    // origin merely because the rule was applied somewhere in the group.
+    assert!(selected_rule_proofs(&transformed, Some(RuleId(101))).is_empty());
 }
 
 #[test]

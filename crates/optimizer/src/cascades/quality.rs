@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use paro_common::error::{self as paro_error, Result};
 
-use super::ids::{CandidateId, Fingerprint, QualityPolicyId};
+use super::ids::{CandidateId, Fingerprint, QualityPolicyId, RuleId};
 use super::memo::{ChildWinnerRef, FrozenCandidate, Memo, OptimizationGoal};
 use super::tasks::ReadSetId;
 
@@ -117,6 +117,26 @@ pub struct BundleInput {
     /// owned logical tree as a quality result.
     pub choices: Box<[Fingerprint]>,
     pub candidate: Option<CandidateId>,
+    /// Per-region aggregate witnesses. A global AggregateDecomposition fact
+    /// is not sufficient for a shared-aggregate bundle: every relevant
+    /// selected region must be covered by the same candidate and fact
+    /// snapshot.
+    pub aggregate_regions: Box<[AggregateRegionWitness]>,
+}
+
+/// Evidence that one exact aggregate region of a frozen candidate satisfies
+/// the decomposition contract. The fact fingerprint is deliberately carried
+/// by the producer instead of being reconstructed by the quality registry;
+/// changing statistics, logical facts, or the selected region invalidates the
+/// witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateRegionWitness {
+    pub region: Fingerprint,
+    pub candidate: CandidateId,
+    pub anchor: CandidateId,
+    pub fact_fingerprint: Fingerprint,
+    pub choices: Box<[Fingerprint]>,
+    pub covered: bool,
 }
 
 /// Native evidence for one exact frozen candidate. This is a compact
@@ -128,6 +148,26 @@ pub struct NativeQualityEvidence {
     pub region: Fingerprint,
     pub applicability_proof: Fingerprint,
     pub choices: Box<[Fingerprint]>,
+    pub aggregate_regions: Box<[AggregateRegionWitness]>,
+    /// Rule witnesses are extracted from the selected logical expressions'
+    /// equivalence proofs.  They are audit/attribution data only; an applied
+    /// rule set is never accepted as a substitute for this selected-DAG
+    /// witness.
+    pub selected_rules: Box<[RuleId]>,
+    /// Shape facts observed while walking the exact frozen DAG. These are
+    /// diagnostic evidence only; the policy never treats an operator count as
+    /// a substitute for a semantic or physical contract.
+    pub shape: NativeQualityShape,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeQualityShape {
+    pub nodes: u32,
+    pub aggregates: u32,
+    pub joins: u32,
+    pub runtime_filter_joins: u32,
+    pub aggregate_witness_nodes: u32,
+    pub join_region_witness_nodes: u32,
 }
 
 /// Production producers must inspect the exact frozen DAG they are asked to
@@ -151,6 +191,7 @@ pub enum BundleResult {
         region: Fingerprint,
         choices: Box<[Fingerprint]>,
         candidate: Option<CandidateId>,
+        aggregate_regions: Box<[AggregateRegionWitness]>,
     },
     NotApplicable {
         bundle: BundleId,
@@ -222,6 +263,8 @@ pub struct PReadyCertificate {
     pub regions: Box<[Fingerprint]>,
     pub reads: Box<[ReadSetId]>,
     pub candidates: Box<[CandidateId]>,
+    /// The exact per-region witnesses consumed by the certificate.
+    pub aggregate_regions: Box<[AggregateRegionWitness]>,
 }
 
 impl PReadyCertificate {
@@ -239,12 +282,14 @@ impl PReadyCertificate {
                     choices,
                     region,
                     reads,
+                    aggregate_regions,
                     ..
                 }) => {
                     *candidate == Some(self.candidate)
                         && choices.as_ref() == self.choices.as_ref()
                         && self.regions.as_ref() == [*region]
                         && self.reads.as_ref() == [*reads]
+                        && aggregate_regions.as_ref() == self.aggregate_regions.as_ref()
                 }
                 Some(BundleResult::NotApplicable { .. }) => true,
                 _ => false,
@@ -378,6 +423,7 @@ impl QualityBundleRegistry {
             applicability_proof: evidence.applicability_proof,
             choices: evidence.choices.clone(),
             candidate: Some(candidate),
+            aggregate_regions: evidence.aggregate_regions.clone(),
         };
         let ids = self.bundles.keys().copied().collect::<Vec<_>>();
         for id in ids {
@@ -444,6 +490,16 @@ impl QualityBundleRegistry {
             .copied()
             .filter(|fact| !input.facts.contains(fact))
             .collect::<Vec<_>>();
+        let mut missing = missing;
+        if spec
+            .required_facts
+            .contains(&BundleFact::AggregateDecomposition)
+            && !aggregate_coverage_is_complete(input)
+        {
+            if !missing.contains(&BundleFact::AggregateDecomposition) {
+                missing.push(BundleFact::AggregateDecomposition);
+            }
+        }
         if !missing.is_empty() {
             let result = BundleResult::MissingEvidence {
                 bundle: id,
@@ -472,6 +528,7 @@ impl QualityBundleRegistry {
             // never manufactures a digest from a candidate integer.
             choices: input.choices.clone(),
             candidate: input.candidate,
+            aggregate_regions: input.aggregate_regions.clone(),
         };
         self.publish_result(id, result.clone());
         Ok(result)
@@ -503,6 +560,7 @@ impl QualityBundleRegistry {
         let mut candidates = BTreeSet::new();
         let mut certificate_candidate = None;
         let mut certificate_choices: Option<Box<[Fingerprint]>> = None;
+        let mut certificate_aggregate_regions: Option<Box<[AggregateRegionWitness]>> = None;
         for (id, bundle) in &self.bundles {
             bundles.push((*id, bundle.spec.revision));
             if let Some(BundleResult::Completed {
@@ -510,6 +568,7 @@ impl QualityBundleRegistry {
                 reads: read_set,
                 choices,
                 candidate,
+                aggregate_regions,
                 ..
             }) = &bundle.result
             {
@@ -527,6 +586,13 @@ impl QualityBundleRegistry {
                     }
                 } else {
                     certificate_choices = Some(choices.clone());
+                }
+                if let Some(previous) = &certificate_aggregate_regions {
+                    if previous.as_ref() != aggregate_regions.as_ref() {
+                        return None;
+                    }
+                } else {
+                    certificate_aggregate_regions = Some(aggregate_regions.clone());
                 }
                 if regions
                     .iter()
@@ -551,6 +617,7 @@ impl QualityBundleRegistry {
         // handoff. At least one native producer must have completed.
         let candidate = certificate_candidate?;
         let choices = certificate_choices?;
+        let aggregate_regions = certificate_aggregate_regions.unwrap_or_default();
         Some(PReadyCertificate {
             policy,
             bundles: bundles.into_boxed_slice(),
@@ -559,13 +626,42 @@ impl QualityBundleRegistry {
             regions: regions.into_iter().collect(),
             reads: reads.into_iter().collect(),
             candidates: candidates.into_iter().collect(),
+            aggregate_regions,
         })
     }
+}
+
+fn aggregate_coverage_is_complete(input: &BundleInput) -> bool {
+    let Some(candidate) = input.candidate else {
+        return false;
+    };
+    !input.aggregate_regions.is_empty()
+        && input.aggregate_regions.iter().all(|witness| {
+            witness.covered
+                && witness.candidate == candidate
+                && witness.anchor.is_valid()
+                && !witness.choices.is_empty()
+                && witness
+                    .choices
+                    .iter()
+                    .all(|choice| input.choices.contains(choice))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aggregate_region(candidate: CandidateId, choices: &[Fingerprint]) -> AggregateRegionWitness {
+        AggregateRegionWitness {
+            region: Fingerprint(10),
+            candidate,
+            anchor: CandidateId(8),
+            fact_fingerprint: Fingerprint(11),
+            choices: choices.to_vec().into_boxed_slice(),
+            covered: true,
+        }
+    }
 
     fn input(
         capabilities: impl IntoIterator<Item = BundleCapability>,
@@ -579,6 +675,7 @@ mod tests {
             applicability_proof: Fingerprint(3),
             choices: Box::new([Fingerprint(5)]),
             candidate: Some(CandidateId(4)),
+            aggregate_regions: Box::new([aggregate_region(CandidateId(4), &[Fingerprint(5)])]),
         }
     }
 
@@ -723,7 +820,7 @@ mod tests {
     fn native_evaluation_replaces_previous_candidate_evidence() {
         let mut registry = QualityBundleRegistry::default();
         registry.register_builtin_f1_f4().unwrap();
-        let evidence = |choice| NativeQualityEvidence {
+        let evidence = |candidate, choice| NativeQualityEvidence {
             capabilities: [
                 BundleCapability::ScanPredicate,
                 BundleCapability::SmallJoin,
@@ -745,13 +842,16 @@ mod tests {
             region: Fingerprint(2),
             applicability_proof: Fingerprint(3),
             choices: Box::new([Fingerprint(choice)]),
+            aggregate_regions: Box::new([aggregate_region(candidate, &[Fingerprint(choice)])]),
+            selected_rules: Box::new([]),
+            shape: NativeQualityShape::default(),
         };
         let first = registry
             .evaluate_native_candidate(
                 QualityPolicyId(1),
                 CandidateId(4),
                 ReadSetId::new(1),
-                &evidence(5),
+                &evidence(CandidateId(4), 5),
                 1,
             )
             .unwrap()
@@ -762,7 +862,7 @@ mod tests {
                 QualityPolicyId(1),
                 CandidateId(7),
                 ReadSetId::new(2),
-                &evidence(6),
+                &evidence(CandidateId(7), 6),
                 1,
             )
             .unwrap()
@@ -778,6 +878,26 @@ mod tests {
                 ..
             } if choices.as_ref() == [Fingerprint(6)]
         )));
+    }
+
+    #[test]
+    fn partial_shared_aggregate_evidence_cannot_certify_pready() {
+        let mut registry = QualityBundleRegistry::default();
+        registry.register_builtin_f1_f4().unwrap();
+        let value = input(
+            vec![BundleCapability::SharedAggregate],
+            vec![
+                BundleFact::AggregateDecomposition,
+                BundleFact::NullSemantics,
+            ],
+        );
+        registry.evaluate(BundleId(3), &value, 1).unwrap();
+        assert!(matches!(
+            registry.result(BundleId(3)),
+            Some(BundleResult::MissingEvidence { missing, .. })
+                if missing.contains(&BundleFact::CteConsumerDemand)
+        ));
+        assert!(registry.p_ready_certificate(QualityPolicyId(1)).is_none());
     }
 
     #[test]
@@ -849,5 +969,57 @@ mod tests {
             .unwrap();
         assert!(matches!(result, BundleResult::Suspended { cursor: 0, .. }));
         assert!(registry.p_ready_certificate(QualityPolicyId(1)).is_none());
+    }
+
+    #[test]
+    fn aggregate_bundle_requires_every_selected_region() {
+        let mut registry = QualityBundleRegistry::default();
+        registry.register_builtin_f1_f4().unwrap();
+        let mut value = input(
+            [BundleCapability::SharedAggregate],
+            [
+                BundleFact::AggregateDecomposition,
+                BundleFact::CteConsumerDemand,
+                BundleFact::NullSemantics,
+            ],
+        );
+        let mut second = aggregate_region(CandidateId(4), &[Fingerprint(5)]);
+        second.region = Fingerprint(12);
+        second.covered = false;
+        value.aggregate_regions = Box::new([value.aggregate_regions[0].clone(), second]);
+        let result = registry.evaluate(BundleId(3), &value, 1).unwrap();
+        assert!(matches!(
+            result,
+            BundleResult::MissingEvidence { missing, .. }
+                if missing.contains(&BundleFact::AggregateDecomposition)
+        ));
+    }
+
+    #[test]
+    fn aggregate_bundle_rejects_witness_from_another_candidate_or_choice_set() {
+        let mut registry = QualityBundleRegistry::default();
+        registry.register_builtin_f1_f4().unwrap();
+        let mut value = input(
+            [BundleCapability::SharedAggregate],
+            [
+                BundleFact::AggregateDecomposition,
+                BundleFact::CteConsumerDemand,
+                BundleFact::NullSemantics,
+            ],
+        );
+        value.aggregate_regions[0].candidate = CandidateId(99);
+        assert!(matches!(
+            registry.evaluate(BundleId(3), &value, 1).unwrap(),
+            BundleResult::MissingEvidence { missing, .. }
+                if missing.contains(&BundleFact::AggregateDecomposition)
+        ));
+
+        value.aggregate_regions[0].candidate = CandidateId(4);
+        value.aggregate_regions[0].choices = Box::new([Fingerprint(99)]);
+        assert!(matches!(
+            registry.evaluate(BundleId(3), &value, 1).unwrap(),
+            BundleResult::MissingEvidence { missing, .. }
+                if missing.contains(&BundleFact::AggregateDecomposition)
+        ));
     }
 }

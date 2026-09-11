@@ -45,7 +45,10 @@ use super::calibration::{
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility, GroupSchema};
 use super::cost::ResourceDimension;
 use super::cost::{CompactRange, ScoreSummary, SearchCost};
-use super::engine::{CascadesEngine, PricedIncumbent, SearchMode, SearchStopReason, SeedPlan};
+use super::engine::{
+    selected_proof_rule_ids, CascadesEngine, PricedIncumbent, SearchMode, SearchStopReason,
+    SeedPlan,
+};
 use super::ids::{
     AdmissibleGrantSetId, BaseRelationId, CandidateId, ColumnId, Fingerprint, GroupId,
     ImplementationId, LogicalExprId, LogicalPayloadId, OpClassId, OptimizationContextId,
@@ -66,8 +69,8 @@ use super::properties::{
     ResultGuarantee, SortDirection,
 };
 use super::quality::{
-    BundleCapability, BundleFact, NativeQualityEvidence, QualityEvidenceProvider,
-    QualityPolicyStatus,
+    AggregateRegionWitness, BundleCapability, BundleFact, NativeQualityEvidence,
+    NativeQualityShape, QualityEvidenceProvider, QualityPolicyStatus,
 };
 use super::region::{
     FacetCriticality, RegionArtifactDependencyContract, RegionArtifactKind, RegionBoundaryEndpoint,
@@ -77,16 +80,16 @@ use super::region::{
 use super::rules::{
     CostComposition, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
     ImplementationRegistry, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
-    PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, RootDispatch,
-    RuleContext, RulePromise, SidewaysFilterSource, TaskSupplyContract, TransformContext,
-    TransformationBudgetClass, TransformationRule, WorkSourceId, AGGREGATE_DIMENSION_DEFERRAL_RULE,
-    AGGREGATE_DIMENSION_SHARING_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
-    AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
-    AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_DEMAND_PUSHDOWN_RULE,
-    CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE, CTE_PARTITIONED_MATERIALIZATION_RULE,
-    JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE, KEY_DOMAIN_TRANSFER_RULE,
-    LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE, PREDICATE_TRANSFER_RULE,
-    SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
+    PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, QualityDependency,
+    RootDispatch, RuleContext, RulePromise, SidewaysFilterSource, TaskSupplyContract,
+    TransformContext, TransformationBudgetClass, TransformationRule, WorkSourceId,
+    AGGREGATE_DIMENSION_DEFERRAL_RULE, AGGREGATE_DIMENSION_SHARING_RULE,
+    AGGREGATE_INPUT_MATERIALIZATION_RULE, AGGREGATE_JOIN_PREAGGREGATION_RULE,
+    AGGREGATE_JOIN_SUBSUMPTION_RULE, AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE,
+    CTE_DEMAND_PUSHDOWN_RULE, CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE,
+    CTE_PARTITIONED_MATERIALIZATION_RULE, JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE,
+    KEY_DOMAIN_TRANSFER_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
+    PREDICATE_TRANSFER_RULE, SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
@@ -137,6 +140,427 @@ struct PlannerQualityEvidenceProvider {
     state: Arc<RwLock<PlannerTransformState>>,
 }
 
+/// Return only proof-bearing rule identities for the expression selected by a
+/// frozen candidate.  `LogicalExpr::applied_rules` is intentionally absent:
+/// it records that a rule reached the apply gate at some point in the Memo,
+/// not that its output is present in this candidate.
+fn selected_rule_proofs(
+    logical: &crate::cascades::memo::LogicalExpr,
+    origin_rule: Option<RuleId>,
+) -> BTreeSet<RuleId> {
+    selected_proof_rule_ids(logical)
+        .iter()
+        .copied()
+        .filter(|rule| {
+            // A staged payload carries one origin rule.  Requiring its proof
+            // prevents an apply attempt, empty result, or budget-rejected
+            // binding from becoming quality evidence.  Specialized region
+            // roots have no single payload origin, so their explicit Memo
+            // proof is the witness.
+            origin_rule.is_none_or(|origin| origin == *rule)
+        })
+        .collect()
+}
+
+/// Combine proof-bearing identities from the exact Memo expression and the
+/// payload-local lineage retained while a native shell copied an inner Memo
+/// node. Neither source consults `applied_rules`; the latter is only an audit
+/// of work that reached an apply gate.
+fn selected_payload_rule_proofs(
+    logical: &crate::cascades::memo::LogicalExpr,
+    metadata: &PlannerOperatorMetadata,
+) -> BTreeSet<RuleId> {
+    let mut rules = selected_rule_proofs(logical, None);
+    rules.extend(
+        metadata
+            .selected_proofs
+            .iter()
+            .filter_map(|proof| match proof {
+                EquivalenceProof::Transformation { rule, .. }
+                | EquivalenceProof::TransformationDescendant { rule }
+                | EquivalenceProof::SpecializedEnumerator { rule, .. } => Some(*rule),
+                EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => None,
+            }),
+    );
+    rules
+}
+
+fn selected_physical_contract_is_exact(
+    logical: &crate::cascades::memo::LogicalExpr,
+    physical: &crate::cascades::memo::PhysicalExpr,
+    metadata: &PlannerOperatorMetadata,
+    payload: &PlannerPhysicalPayload,
+) -> bool {
+    let Ok(flavor) =
+        selected_implementation_flavor(physical.key.implementation, metadata.implementations)
+    else {
+        return false;
+    };
+    let implementation_supported =
+        flavor == metadata.implementations.baseline || metadata.implementations.supports(flavor);
+    if !implementation_supported || physical.key.children != logical.key.children {
+        return false;
+    }
+    let logical_owner_matches = match &payload.template {
+        PlannerPhysicalTemplate::Logical(owner)
+        | PlannerPhysicalTemplate::OrderedFilter { logical: owner, .. } => {
+            *owner == logical.payload
+        }
+        // An executable template is only produced for the native search
+        // implementation.  Its separate search metadata below binds the
+        // exact payload/fingerprint to this physical choice.
+        PlannerPhysicalTemplate::Executable(_) => {
+            physical.key.implementation == PLANNER_SEARCH_PROVIDER
+        }
+    };
+    if !logical_owner_matches {
+        return false;
+    }
+    if physical.key.implementation == PLANNER_SEARCH_PROVIDER {
+        return metadata.search.as_ref().is_some_and(|search| {
+            search.payload == physical.payload
+                && search.payload_fingerprint == physical.key.payload_fingerprint
+        });
+    }
+    true
+}
+
+fn frozen_choice_fingerprint(frozen: &FrozenCandidate) -> Fingerprint {
+    let mut choice = StableFingerprintBuilder::default();
+    choice.write_bytes(b"paro.quality.frozen-choice.v1");
+    choice.write_u64(frozen.reference.group.0 as u64);
+    choice.write_u64(frozen.reference.candidate.index() as u64);
+    choice.write_u64(frozen.reference.goal.required.0 as u64);
+    choice.write_u64(frozen.reference.goal.grant.stable_tag());
+    choice.write_u64(frozen.reference.goal.row_goal.stable_tag());
+    choice.write_u64(frozen.reference.goal.objective.stable_tag());
+    choice.write_u64(frozen.reference.goal.context.0 as u64);
+    choice.write_fingerprint(frozen.logical.key.stable_fingerprint());
+    choice.write_fingerprint(frozen.physical.key.stable_fingerprint());
+    choice.write_fingerprint(frozen.winner.physical_fingerprint);
+    choice.write_u64(frozen.logical.payload.0 as u64);
+    choice.write_u64(frozen.physical.payload.0 as u64);
+    choice.write_u64(frozen.winner.children.len() as u64);
+    for child in frozen.winner.children.iter() {
+        choice.write_u64(child.group.0 as u64);
+        choice.write_u64(child.candidate.index() as u64);
+        choice.write_u64(child.goal.required.0 as u64);
+        choice.write_u64(child.goal.grant.stable_tag());
+        choice.write_u64(child.goal.context.0 as u64);
+    }
+    choice.finish()
+}
+
+fn collect_frozen_choices(
+    frozen: &FrozenCandidate,
+    choices: &mut Vec<Fingerprint>,
+    visited: &mut BTreeSet<CandidateId>,
+) {
+    if !visited.insert(frozen.reference.candidate) {
+        return;
+    }
+    choices.push(frozen_choice_fingerprint(frozen));
+    for child in frozen.children.iter() {
+        collect_frozen_choices(child, choices, visited);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SelectedAggregateRegionShape {
+    aggregates: u32,
+    joins: u32,
+    decomposed: bool,
+}
+
+fn aggregate_merge_contract_matches<OuterChild, PartialChild>(
+    outer: &paro_planner::operator::Aggregate<OuterChild>,
+    partial: &paro_planner::operator::Aggregate<PartialChild>,
+) -> bool {
+    if outer.post_reduction.is_some()
+        || outer.aggregates.is_empty()
+        || !outer.has_plain_grouping_domain()
+        || partial.post_reduction.is_some()
+        || partial.aggregates.is_empty()
+        || !partial.has_plain_grouping_domain()
+    {
+        return false;
+    }
+    outer.aggregates.iter().all(|expression| {
+        let Expression::Aggregate(merge) = expression else {
+            return false;
+        };
+        if merge.aggr_type != paro_planner::expression::AggregateType::NonDistinct
+            || merge.filter.is_some()
+            || !merge.order_bys.is_empty()
+            || merge.children.len() != 1
+            || merge.function.arguments.len() != 1
+            || merge.function.arguments[0] != merge.children[0].return_type()
+            || merge.function.return_type != merge.return_type
+        {
+            return false;
+        }
+        let Expression::ColumnRef(column) = &merge.children[0] else {
+            return false;
+        };
+        if column.depth != 0
+            || column.binding.table_index != partial.aggregate_index
+            || column.binding.column_index >= partial.aggregates.len()
+        {
+            return false;
+        }
+        let Expression::Aggregate(source) = &partial.aggregates[column.binding.column_index] else {
+            return false;
+        };
+        source
+            .function
+            .partial_merge_function()
+            .is_some_and(|expected| expected.execution_semantics_equal(&merge.function))
+    })
+}
+
+fn selected_aggregate_region_shape(
+    frozen: &FrozenCandidate,
+    state: &PlannerTransformState,
+    visited: &mut BTreeSet<CandidateId>,
+) -> SelectedAggregateRegionShape {
+    if !visited.insert(frozen.reference.candidate) {
+        return SelectedAggregateRegionShape::default();
+    }
+    let operator = state
+        .payloads
+        .logical
+        .get(frozen.logical.payload.index())
+        .map(|payload| &payload.semantic_template.operator);
+    let mut shape = SelectedAggregateRegionShape::default();
+    if matches!(operator, Some(LogicalOperator::Aggregate(_))) {
+        shape.aggregates = 1;
+        if frozen.children.len() == 1 {
+            let join = &frozen.children[0];
+            if let Some(LogicalOperator::Join(Join::Comparison(join_operator))) = state
+                .payloads
+                .logical
+                .get(join.logical.payload.index())
+                .map(|payload| &payload.semantic_template.operator)
+            {
+                if !join_operator.conditions.is_empty() && join.children.len() == 2 {
+                    let outer = match operator {
+                        Some(LogicalOperator::Aggregate(outer)) => outer,
+                        _ => unreachable!("aggregate operator disappeared during inspection"),
+                    };
+                    shape.decomposed = join.children.iter().any(|partial| {
+                        matches!(
+                            state
+                                .payloads
+                                .logical
+                                .get(partial.logical.payload.index())
+                                .map(|payload| &payload.semantic_template.operator),
+                            Some(LogicalOperator::Aggregate(partial))
+                                if aggregate_merge_contract_matches(outer, partial)
+                        )
+                    });
+                }
+            }
+        }
+    }
+    if matches!(operator, Some(LogicalOperator::Join(_))) {
+        shape.joins = 1;
+    }
+    for child in frozen.children.iter() {
+        let child_shape = selected_aggregate_region_shape(child, state, visited);
+        shape.aggregates = shape.aggregates.saturating_add(child_shape.aggregates);
+        shape.joins = shape.joins.saturating_add(child_shape.joins);
+        shape.decomposed |= child_shape.decomposed;
+    }
+    shape
+}
+
+fn collect_region_fact_fingerprint(
+    memo: &Memo,
+    root: &FrozenCandidate,
+    arm: &FrozenCandidate,
+    goal: OptimizationGoal,
+) -> Option<Fingerprint> {
+    let mut facts = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    fn visit(
+        memo: &Memo,
+        frozen: &FrozenCandidate,
+        facts: &mut BTreeMap<GroupId, (Fingerprint, Fingerprint)>,
+        visited: &mut BTreeSet<CandidateId>,
+    ) -> bool {
+        if !visited.insert(frozen.reference.candidate) {
+            return true;
+        }
+        let group = memo.canonical_group(frozen.reference.group);
+        let Some(group_ref) = memo.group(group) else {
+            return false;
+        };
+        facts.insert(
+            group,
+            (
+                group_ref.logical_fact_fingerprint(),
+                group_ref.statistics_snapshot_fingerprint(),
+            ),
+        );
+        frozen
+            .children
+            .iter()
+            .all(|child| visit(memo, child, facts, visited))
+    }
+    if !visit(memo, root, &mut facts, &mut visited) || !visit(memo, arm, &mut facts, &mut visited) {
+        return None;
+    }
+    let mut fingerprint = StableFingerprintBuilder::default();
+    fingerprint.write_bytes(b"paro.quality.aggregate-region-facts.v1");
+    fingerprint.write_u64(goal.required.0 as u64);
+    fingerprint.write_u64(goal.grant.stable_tag());
+    fingerprint.write_u64(goal.row_goal.stable_tag());
+    fingerprint.write_u64(goal.objective.stable_tag());
+    fingerprint.write_u64(goal.context.0 as u64);
+    fingerprint.write_u64(facts.len() as u64);
+    for (group, (logical, statistics)) in facts {
+        fingerprint.write_u64(group.0 as u64);
+        fingerprint.write_fingerprint(logical);
+        fingerprint.write_fingerprint(statistics);
+    }
+    Some(fingerprint.finish())
+}
+
+fn selected_subtree_contains_union(
+    frozen: &FrozenCandidate,
+    state: &PlannerTransformState,
+    visited: &mut BTreeSet<CandidateId>,
+) -> bool {
+    if !visited.insert(frozen.reference.candidate) {
+        return false;
+    }
+    let is_union = state
+        .payloads
+        .logical
+        .get(frozen.logical.payload.index())
+        .is_some_and(|payload| {
+            matches!(
+                &payload.semantic_template.operator,
+                LogicalOperator::SetOperation(setop)
+                    if setop.setop_type == paro_planner::operator::SetOpType::Union
+                        && setop.setop_all
+            )
+        });
+    is_union
+        || frozen
+            .children
+            .iter()
+            .any(|child| selected_subtree_contains_union(child, state, visited))
+}
+
+fn selected_aggregate_region_witnesses(
+    memo: &Memo,
+    state: &PlannerTransformState,
+    root: &FrozenCandidate,
+    goal: OptimizationGoal,
+) -> Option<Vec<AggregateRegionWitness>> {
+    let mut witnesses = Vec::new();
+    let mut path = Vec::new();
+    fn visit_union(
+        memo: &Memo,
+        state: &PlannerTransformState,
+        union: &FrozenCandidate,
+        root_candidate: CandidateId,
+        goal: OptimizationGoal,
+        path: &mut Vec<u32>,
+        witnesses: &mut Vec<AggregateRegionWitness>,
+    ) -> Option<()> {
+        let operator = state
+            .payloads
+            .logical
+            .get(union.logical.payload.index())
+            .map(|payload| &payload.semantic_template.operator);
+        if let Some(LogicalOperator::SetOperation(setop)) = operator {
+            if setop.setop_type == paro_planner::operator::SetOpType::Union && setop.setop_all {
+                for (index, arm) in union.children.iter().enumerate() {
+                    path.push(index as u32);
+                    let mut shape_visited = BTreeSet::new();
+                    let shape = selected_aggregate_region_shape(arm, state, &mut shape_visited);
+                    let mut union_visited = BTreeSet::new();
+                    if shape.aggregates > 0
+                        && shape.joins > 0
+                        && !selected_subtree_contains_union(arm, state, &mut union_visited)
+                    {
+                        let mut choices = Vec::new();
+                        let mut choice_visited = BTreeSet::new();
+                        collect_frozen_choices(arm, &mut choices, &mut choice_visited);
+                        let fact_fingerprint =
+                            collect_region_fact_fingerprint(memo, union, arm, goal)?;
+                        let mut region = StableFingerprintBuilder::default();
+                        region.write_bytes(b"paro.quality.aggregate-region.v2");
+                        region.write_u64(root_candidate.index() as u64);
+                        region.write_u64(arm.reference.candidate.index() as u64);
+                        region.write_fingerprint(frozen_choice_fingerprint(union));
+                        region.write_u64(path.len() as u64);
+                        for component in path.iter().copied() {
+                            region.write_u64(component as u64);
+                        }
+                        region.write_fingerprint(fact_fingerprint);
+                        for choice in choices.iter().copied() {
+                            region.write_fingerprint(choice);
+                        }
+                        witnesses.push(AggregateRegionWitness {
+                            region: region.finish(),
+                            candidate: root_candidate,
+                            anchor: arm.reference.candidate,
+                            fact_fingerprint,
+                            choices: choices.into_boxed_slice(),
+                            covered: shape.decomposed,
+                        });
+                    }
+                    visit_union(memo, state, arm, root_candidate, goal, path, witnesses)?;
+                    path.pop();
+                }
+                return Some(());
+            }
+        }
+        for child in union.children.iter() {
+            visit_union(memo, state, child, root_candidate, goal, path, witnesses)?;
+        }
+        Some(())
+    }
+    visit_union(
+        memo,
+        state,
+        root,
+        root.reference.candidate,
+        goal,
+        &mut path,
+        &mut witnesses,
+    )?;
+    if witnesses.is_empty() {
+        let mut shape_visited = BTreeSet::new();
+        let shape = selected_aggregate_region_shape(root, state, &mut shape_visited);
+        if shape.aggregates > 0 {
+            let mut choices = Vec::new();
+            let mut choice_visited = BTreeSet::new();
+            collect_frozen_choices(root, &mut choices, &mut choice_visited);
+            let fact_fingerprint = collect_region_fact_fingerprint(memo, root, root, goal)?;
+            let mut region = StableFingerprintBuilder::default();
+            region.write_bytes(b"paro.quality.aggregate-region.root.v1");
+            region.write_u64(root.reference.candidate.index() as u64);
+            region.write_fingerprint(fact_fingerprint);
+            for choice in choices.iter().copied() {
+                region.write_fingerprint(choice);
+            }
+            witnesses.push(AggregateRegionWitness {
+                region: region.finish(),
+                candidate: root.reference.candidate,
+                anchor: root.reference.candidate,
+                fact_fingerprint,
+                choices: choices.into_boxed_slice(),
+                covered: shape.decomposed,
+            });
+        }
+    }
+    Some(witnesses)
+}
+
 impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
     fn evidence(
         &self,
@@ -153,6 +577,10 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         let mut facts = BTreeSet::new();
         let mut choices = Vec::new();
         let mut rules = BTreeSet::new();
+        let mut shape = NativeQualityShape::default();
+        let mut cte_producers = BTreeSet::new();
+        let mut cte_consumers = BTreeSet::new();
+        let mut cte_producer_witnesses = BTreeSet::new();
         let mut has_filter = false;
         let mut has_get = false;
         let mut has_join = false;
@@ -171,6 +599,10 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             state: &PlannerTransformState,
             choices: &mut Vec<Fingerprint>,
             rules: &mut BTreeSet<RuleId>,
+            shape: &mut NativeQualityShape,
+            cte_producers: &mut BTreeSet<usize>,
+            cte_consumers: &mut BTreeSet<usize>,
+            cte_producer_witnesses: &mut BTreeSet<usize>,
             has_filter: &mut bool,
             has_get: &mut bool,
             has_join: &mut bool,
@@ -187,8 +619,17 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             if !visited.insert(frozen.reference.candidate) {
                 return Ok(());
             }
+            shape.nodes = shape.nodes.saturating_add(1);
             if frozen.physical.id != frozen.winner.expression
                 || frozen.logical.id != frozen.physical.key.logical
+                || frozen.physical.key.children.len() != frozen.logical.key.children.len()
+                || frozen
+                    .physical
+                    .key
+                    .children
+                    .iter()
+                    .zip(frozen.logical.key.children.iter())
+                    .any(|(physical_child, logical_child)| *physical_child != *logical_child)
                 || frozen.children.len() != frozen.winner.children.len()
                 || frozen
                     .children
@@ -196,45 +637,37 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
                     .zip(frozen.winner.children.iter())
                     .any(|(child, reference)| child.reference != *reference)
             {
+                *exact_contract = false;
                 return Ok(());
             }
             let Some(metadata) = state.metadata.get(&frozen.logical.payload) else {
+                *exact_contract = false;
                 return Ok(());
             };
-            if state
-                .payloads
-                .get_physical(frozen.physical.payload)
-                .is_none()
-            {
+            let Some(physical_payload) = state.payloads.get_physical(frozen.physical.payload)
+            else {
+                *exact_contract = false;
+                return Ok(());
+            };
+            if !selected_physical_contract_is_exact(
+                &frozen.logical,
+                &frozen.physical,
+                metadata,
+                &physical_payload,
+            ) {
+                *exact_contract = false;
                 return Ok(());
             }
-            let mut choice = StableFingerprintBuilder::default();
-            choice.write_bytes(b"paro.quality.frozen-choice.v1");
-            choice.write_u64(frozen.reference.group.0 as u64);
-            choice.write_u64(frozen.reference.candidate.index() as u64);
-            choice.write_u64(frozen.reference.goal.required.0 as u64);
-            choice.write_u64(frozen.reference.goal.grant.stable_tag());
-            choice.write_u64(frozen.reference.goal.row_goal.stable_tag());
-            choice.write_u64(frozen.reference.goal.objective.stable_tag());
-            choice.write_u64(frozen.reference.goal.context.0 as u64);
-            choice.write_fingerprint(frozen.logical.key.stable_fingerprint());
-            choice.write_fingerprint(frozen.physical.key.stable_fingerprint());
-            choice.write_fingerprint(frozen.winner.physical_fingerprint);
-            choice.write_u64(frozen.logical.payload.0 as u64);
-            choice.write_u64(frozen.physical.payload.0 as u64);
-            choice.write_u64(frozen.winner.children.len() as u64);
-            for child in frozen.winner.children.iter() {
-                choice.write_u64(child.group.0 as u64);
-                choice.write_u64(child.candidate.index() as u64);
-                choice.write_u64(child.goal.required.0 as u64);
-                choice.write_u64(child.goal.grant.stable_tag());
-                choice.write_u64(child.goal.context.0 as u64);
+            choices.push(frozen_choice_fingerprint(frozen));
+            let selected_rules = selected_payload_rule_proofs(&frozen.logical, metadata);
+            if metadata.origin_rule.is_some() && selected_rules.is_empty() {
+                // The sidecar says this payload came from a rule, but the
+                // selected Memo expression has no corresponding equivalence
+                // proof.  Fail closed instead of trusting origin metadata.
+                *exact_contract = false;
+                return Ok(());
             }
-            choices.push(choice.finish());
-            rules.extend(frozen.logical.applied_rules.iter().copied());
-            if let Some(rule) = metadata.origin_rule {
-                rules.insert(rule);
-            }
+            rules.extend(selected_rules.iter().copied());
             *exact_contract &= frozen.winner.provided.result_guarantee == ResultGuarantee::Exact
                 && metadata.provided.result_guarantee == ResultGuarantee::Exact;
             match metadata.operator_type {
@@ -249,11 +682,49 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
                 | LogicalOperatorType::CrossProduct => {
                     *has_join = true;
                     *has_join_region |= frozen.winner.joint_cost_proof.is_some();
+                    shape.joins = shape.joins.saturating_add(1);
+                    if frozen.winner.joint_cost_proof.is_some() {
+                        shape.join_region_witness_nodes =
+                            shape.join_region_witness_nodes.saturating_add(1);
+                    }
                 }
-                LogicalOperatorType::Aggregate => *has_aggregate = true,
-                LogicalOperatorType::CTERef => *has_cte_consumer = true,
+                LogicalOperatorType::Aggregate => {
+                    *has_aggregate = true;
+                    shape.aggregates = shape.aggregates.saturating_add(1);
+                }
+                LogicalOperatorType::CTERef => {
+                    *has_cte_consumer = true;
+                    if let LogicalOperator::CTERef(reference) = &state.payloads.logical
+                        [frozen.logical.payload.index()]
+                    .semantic_template
+                    .operator
+                    {
+                        cte_consumers.insert(reference.cte_index);
+                    }
+                }
                 LogicalOperatorType::MaterializedCTE | LogicalOperatorType::RecursiveCTE => {
-                    *has_cte_producer = true
+                    *has_cte_producer = true;
+                    let cte_index = match &state.payloads.logical[frozen.logical.payload.index()]
+                        .semantic_template
+                        .operator
+                    {
+                        LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
+                        LogicalOperator::RecursiveCTE(cte) => Some(cte.cte_index),
+                        _ => None,
+                    };
+                    if let Some(cte_index) = cte_index {
+                        cte_producers.insert(cte_index);
+                        if selected_rules.iter().any(|rule| {
+                            matches!(
+                                *rule,
+                                CTE_DEMAND_PUSHDOWN_RULE
+                                    | CTE_FILTER_PUSHDOWN_RULE
+                                    | CTE_PARTITIONED_MATERIALIZATION_RULE
+                            )
+                        }) {
+                            cte_producer_witnesses.insert(cte_index);
+                        }
+                    }
                 }
                 LogicalOperatorType::Order | LogicalOperatorType::TopN => *has_ordering = true,
                 LogicalOperatorType::DependentJoin => *has_dependent = true,
@@ -263,12 +734,22 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
                 | LogicalOperatorType::CreatePropertyGraph => *has_graph = true,
                 _ => {}
             }
+            if matches!(
+                frozen.physical.key.implementation,
+                PLANNER_HASH_JOIN_RUNTIME_FILTER | PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER
+            ) {
+                shape.runtime_filter_joins = shape.runtime_filter_joins.saturating_add(1);
+            }
             for child in frozen.children.iter() {
                 visit(
                     child,
                     state,
                     choices,
                     rules,
+                    shape,
+                    cte_producers,
+                    cte_consumers,
+                    cte_producer_witnesses,
                     has_filter,
                     has_get,
                     has_join,
@@ -291,6 +772,10 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             &state,
             &mut choices,
             &mut rules,
+            &mut shape,
+            &mut cte_producers,
+            &mut cte_consumers,
+            &mut cte_producer_witnesses,
             &mut has_filter,
             &mut has_get,
             &mut has_join,
@@ -325,25 +810,30 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         if has_join && has_join_region {
             facts.insert(BundleFact::JoinRegion);
         }
+        let Some(aggregate_regions) =
+            selected_aggregate_region_witnesses(memo, &state, frozen, goal)
+        else {
+            return Ok(None);
+        };
+        shape.aggregate_witness_nodes = aggregate_regions
+            .iter()
+            .filter(|witness| witness.covered)
+            .count() as u32;
         if has_aggregate
-            && has_any(&[
-                AGGREGATE_DIMENSION_DEFERRAL_RULE,
-                AGGREGATE_DIMENSION_SHARING_RULE,
-                AGGREGATE_INPUT_MATERIALIZATION_RULE,
-                AGGREGATE_JOIN_PREAGGREGATION_RULE,
-                AGGREGATE_JOIN_SUBSUMPTION_RULE,
-                AGGREGATE_POST_REDUCTION_RULE,
-            ])
+            && !aggregate_regions.is_empty()
+            && aggregate_regions.iter().all(|witness| witness.covered)
         {
             facts.insert(BundleFact::AggregateDecomposition);
         }
+        // A CTE bundle is complete only when every selected producer domain
+        // that has a selected consumer has its own proof-bearing restriction.
+        // This prevents one branch/consumer's transform from certifying a
+        // different branch that merely shares the same CTE index.
         if has_cte_consumer
             && has_cte_producer
-            && has_any(&[
-                CTE_DEMAND_PUSHDOWN_RULE,
-                CTE_FILTER_PUSHDOWN_RULE,
-                CTE_PARTITIONED_MATERIALIZATION_RULE,
-            ])
+            && !cte_consumers.is_empty()
+            && cte_consumers.is_subset(&cte_producers)
+            && cte_producers.is_subset(&cte_producer_witnesses)
         {
             facts.insert(BundleFact::CteConsumerDemand);
         }
@@ -397,12 +887,21 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         }
         proof.write_u64(capabilities.len() as u64);
         proof.write_u64(facts.len() as u64);
+        proof.write_u64(aggregate_regions.len() as u64);
+        for witness in &aggregate_regions {
+            proof.write_fingerprint(witness.region);
+            proof.write_fingerprint(witness.fact_fingerprint);
+            proof.write_u64(u64::from(witness.covered));
+        }
         Ok(Some(NativeQualityEvidence {
             capabilities,
             facts,
             region,
             applicability_proof: proof.finish(),
             choices: choices.into_boxed_slice(),
+            aggregate_regions: aggregate_regions.into_boxed_slice(),
+            selected_rules: rules.into_iter().collect(),
+            shape,
         }))
     }
 }
@@ -410,6 +909,7 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
 fn record_frozen_candidate_trace(
     trace: &paro_context::StatementTrace,
     memo: &Memo,
+    state: &PlannerTransformState,
     prefix: &str,
     frozen: &FrozenCandidate,
 ) -> Result<()> {
@@ -418,6 +918,7 @@ fn record_frozen_candidate_trace(
     let mut visited = BTreeSet::new();
     fn visit(
         memo: &Memo,
+        state: &PlannerTransformState,
         frozen: &FrozenCandidate,
         choices: &mut Vec<(
             ChildWinnerRef,
@@ -426,8 +927,14 @@ fn record_frozen_candidate_trace(
             Fingerprint,
             u32,
             u32,
+            u64,
+            u32,
             Box<[ChildWinnerRef]>,
             Box<[RuleId]>,
+            Box<[RuleId]>,
+            Box<[EquivalenceProof]>,
+            Option<RuleId>,
+            Box<[EquivalenceProof]>,
         )>,
         reads: &mut BTreeSet<PatternRead>,
         visited: &mut BTreeSet<CandidateId>,
@@ -435,6 +942,11 @@ fn record_frozen_candidate_trace(
         if !visited.insert(frozen.reference.candidate) {
             return Ok(());
         }
+        let (origin_rule, payload_selected_proofs) = memo
+            .logical_expr(frozen.logical.id)
+            .and_then(|logical| state.metadata.get(&logical.payload))
+            .map(|metadata| (metadata.origin_rule, metadata.selected_proofs.clone()))
+            .unwrap_or((None, Box::new([])));
         choices.push((
             frozen.reference,
             frozen.logical.id,
@@ -442,16 +954,22 @@ fn record_frozen_candidate_trace(
             frozen.winner.physical_fingerprint,
             frozen.logical.payload.0,
             frozen.physical.payload.0,
+            frozen.logical.operator_tag.unwrap_or(u64::MAX),
+            frozen.physical.key.implementation.0,
             frozen.winner.children.clone(),
             frozen.logical.applied_rules.iter().copied().collect(),
+            selected_proof_rule_ids(&frozen.logical),
+            frozen.logical.proofs.iter().cloned().collect(),
+            origin_rule,
+            payload_selected_proofs,
         ));
         reads.insert(PatternRead::facts_from_group(memo, frozen.reference.group)?);
         for child in frozen.children.iter() {
-            visit(memo, child, choices, reads, visited)?;
+            visit(memo, state, child, choices, reads, visited)?;
         }
         Ok(())
     }
-    visit(memo, frozen, &mut choices, &mut reads, &mut visited)?;
+    visit(memo, state, frozen, &mut choices, &mut reads, &mut visited)?;
     trace.record_value(
         "optimizer",
         &format!("{prefix}.choice_count"),
@@ -466,8 +984,14 @@ fn record_frozen_candidate_trace(
             physical_fingerprint,
             logical_payload,
             physical_payload,
+            operator_tag,
+            physical_implementation,
             children,
             rules,
+            selected_rules,
+            proofs,
+            origin_rule,
+            payload_selected_proofs,
         ),
     ) in choices.iter().enumerate()
     {
@@ -516,6 +1040,16 @@ fn record_frozen_candidate_trace(
             "optimizer",
             &format!("{choice_prefix}.physical_payload"),
             *physical_payload as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.operator_tag"),
+            *operator_tag,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.physical_implementation"),
+            u64::from(*physical_implementation),
         );
         trace.record_value(
             "optimizer",
@@ -571,6 +1105,86 @@ fn record_frozen_candidate_trace(
                 &format!("{choice_prefix}.rule_{rule_index}"),
                 rule.0 as u64,
             );
+        }
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.selected_rule_count"),
+            selected_rules.len() as u64,
+        );
+        for (rule_index, rule) in selected_rules.iter().enumerate() {
+            trace.record_value(
+                "optimizer",
+                &format!("{choice_prefix}.selected_rule_{rule_index}"),
+                rule.0 as u64,
+            );
+        }
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.proof_count"),
+            proofs.len() as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.origin_rule"),
+            origin_rule.map_or(u64::MAX, |rule| rule.0 as u64),
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.payload_selected_proof_count"),
+            payload_selected_proofs.len() as u64,
+        );
+        for (proof_index, proof) in payload_selected_proofs.iter().enumerate() {
+            let rule = match proof {
+                EquivalenceProof::Transformation { rule, .. }
+                | EquivalenceProof::TransformationDescendant { rule }
+                | EquivalenceProof::SpecializedEnumerator { rule, .. }
+                | EquivalenceProof::Normalization { rule } => *rule,
+                EquivalenceProof::Initial => continue,
+            };
+            trace.record_value(
+                "optimizer",
+                &format!("{choice_prefix}.payload_selected_proof_{proof_index}"),
+                rule.0 as u64,
+            );
+        }
+        for (proof_index, proof) in proofs.iter().enumerate() {
+            let proof_prefix = format!("{choice_prefix}.proof_{proof_index}");
+            let (kind, rule, source, premise_or_region) = match proof {
+                EquivalenceProof::Initial => (0_u64, None, None, None),
+                EquivalenceProof::TransformationDescendant { rule } => (1, Some(*rule), None, None),
+                EquivalenceProof::Normalization { rule } => (2, Some(*rule), None, None),
+                EquivalenceProof::Transformation {
+                    rule,
+                    source,
+                    premise,
+                } => (3, Some(*rule), Some(*source), Some(*premise)),
+                EquivalenceProof::SpecializedEnumerator { rule, region } => {
+                    (4, Some(*rule), None, Some(*region))
+                }
+            };
+            trace.record_value("optimizer", &format!("{proof_prefix}.kind"), kind);
+            trace.record_value(
+                "optimizer",
+                &format!("{proof_prefix}.rule"),
+                rule.map_or(u64::MAX, |rule| rule.0 as u64),
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{proof_prefix}.source"),
+                source.map_or(u64::MAX, |source| source.index() as u64),
+            );
+            if let Some(value) = premise_or_region {
+                trace.record_value(
+                    "optimizer",
+                    &format!("{proof_prefix}.fingerprint_lo"),
+                    value.0 as u64,
+                );
+                trace.record_value(
+                    "optimizer",
+                    &format!("{proof_prefix}.fingerprint_hi"),
+                    (value.0 >> 64) as u64,
+                );
+            }
         }
     }
     trace.record_value(
@@ -1051,9 +1665,14 @@ impl OptimizationInput {
                 .as_ref()
                 .and_then(|context| context.statement_trace())
             {
+                let planner_state = self
+                    .planner_state
+                    .read()
+                    .expect("planner transform state poisoned");
                 record_frozen_candidate_trace(
                     &trace,
                     engine.memo(),
+                    &planner_state,
                     &format!("final_winner_{winner_index}"),
                     &grant_winner.frozen,
                 )?;
@@ -1853,6 +2472,7 @@ impl MemoBuilder {
                     }
                     let operator_metadata = PlannerOperatorMetadata {
                         origin_rule: None,
+                        selected_proofs: Box::new([]),
                         operator_type: plan.operator.op_type(),
                         operator_fingerprint,
                         provided: ProvidedProperties {

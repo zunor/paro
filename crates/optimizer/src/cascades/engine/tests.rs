@@ -33,7 +33,8 @@ use crate::cascades::region::{
 use crate::cascades::rules::{
     DomainProofId, EquivalentExpression, EvaluationOccurrenceId, GrantDependencyDescriptor,
     PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PhysicalImplementation,
-    RulePromise, SidewaysFilterSource, TransformationBudgetClass, TransformationRule,
+    QualityDependency, RulePromise, SidewaysFilterSource, TransformationBudgetClass,
+    TransformationRule,
 };
 use crate::cascades::tasks::TaskState;
 use crate::physical::ObjectiveProfile;
@@ -402,6 +403,97 @@ impl TransformationRule for AddEquivalent {
         }]
         .into_boxed_slice())
     }
+}
+
+struct QualityLaneRule;
+
+impl TransformationRule for QualityLaneRule {
+    fn id(&self) -> RuleId {
+        RuleId(6)
+    }
+
+    fn quality_dependency(&self) -> Option<QualityDependency> {
+        Some(QualityDependency::NarrowAggregate)
+    }
+
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
+        expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
+    }
+
+    fn apply(
+        &self,
+        _expr: LogicalExprId,
+        _ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        Ok(Box::new([]))
+    }
+}
+
+#[test]
+fn quality_publication_promotes_only_its_local_followup_lane() {
+    let (mut ordinary_engine, ordinary_group, _) =
+        engine_with_budget(super::super::budget::SearchBudget::default());
+    ordinary_engine
+        .registry
+        .register_transformation(QualityLaneRule)
+        .unwrap();
+    ordinary_engine.set_quality_policy_handoff_enabled(true);
+    let mut ordinary = StableAgenda::default();
+    ordinary_engine
+        .schedule_transformations(ordinary_group, &mut ordinary)
+        .unwrap();
+    let ordinary_quality_stage = ordinary
+        .tasks
+        .iter()
+        .find_map(|(key, task)| match task {
+            SearchTask::Transform {
+                rule: RuleId(6), ..
+            } => Some(key.quality_stage),
+            _ => None,
+        })
+        .expect("quality rule must be scheduled");
+    assert_eq!(ordinary_quality_stage, u8::MAX);
+
+    let (mut promoted_engine, promoted_group, _) =
+        engine_with_budget(super::super::budget::SearchBudget::default());
+    promoted_engine
+        .registry
+        .register_transformation(QualityLaneRule)
+        .unwrap();
+    promoted_engine.set_quality_policy_handoff_enabled(true);
+    let mut promoted = StableAgenda::default();
+    promoted_engine
+        .schedule_transformations_with_lane(promoted_group, &mut promoted, true)
+        .unwrap();
+    let promoted_quality_stage = promoted
+        .tasks
+        .iter()
+        .find_map(|(key, task)| match task {
+            SearchTask::Transform {
+                rule: RuleId(6), ..
+            } => Some(key.quality_stage),
+            _ => None,
+        })
+        .expect("quality rule must be scheduled");
+    assert_eq!(
+        promoted_quality_stage,
+        QualityDependency::NarrowAggregate.stage()
+    );
+    let ordinary_rule_stage = promoted
+        .tasks
+        .iter()
+        .find_map(|(key, task)| match task {
+            SearchTask::Transform {
+                rule: RuleId(5), ..
+            } => Some(key.quality_stage),
+            _ => None,
+        })
+        .expect("ordinary rule must be scheduled");
+    assert_eq!(ordinary_rule_stage, u8::MAX);
 }
 
 struct EnumerateTwoCompositionBindings;

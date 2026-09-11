@@ -64,8 +64,8 @@ pub use planner::{
 };
 pub use properties::{ProvidedProperties, RequiredProperties};
 pub use quality::{
-    BundleCapability, BundleFact, BundleId, BundleInput, BundleResult, BundleState,
-    PReadyCertificate, QualityBundleRegistry, QualityBundleSpec,
+    AggregateRegionWitness, BundleCapability, BundleFact, BundleId, BundleInput, BundleResult,
+    BundleState, PReadyCertificate, QualityBundleRegistry, QualityBundleSpec,
 };
 pub use region::{
     FacetCriticality, JointCostProof, RegionArtifactKind, RegionCandidateContract,

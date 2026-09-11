@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use paro_common::error::{self as paro_error, Result};
+use paro_common::logging::targets;
 use smallvec::SmallVec;
 
 use super::bounds::{CertifiedLocalWorkFloor, ProvenChildLatencyFloor, ProvenRecipeLatencyFloor};
@@ -26,7 +27,7 @@ use super::ids::{
 };
 use super::memo::{
     CandidatePreview, CandidateSummary, ChildWinnerRef, EquivalenceProof, FrozenCandidate,
-    GrantGoalKey, GroupCardinality, LogicalProperties, Memo, OptimizationGoal, Winner,
+    GrantGoalKey, GroupCardinality, LogicalExpr, LogicalProperties, Memo, OptimizationGoal, Winner,
 };
 use super::properties::{
     MaterializationRequirement, MutationSafetyRequirement, OrderingRequirement, OrderingScope,
@@ -46,6 +47,7 @@ use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PatternEnumerationCompletion,
     PatternOperand, PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork,
     SourceRetentionProof, SourceWork, SourceWorkData, TaskSupplyContract, TransformContext,
+    TransformationRule,
 };
 use super::tasks::{
     BoundContext, BoundProofId, BoundProofKind, Cursor, ReadSet, StopReason, TaskId, TaskIntent,
@@ -211,12 +213,35 @@ enum TaskKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TaskKey {
+    /// A promoted task is one whose observed dependency was just published.
+    /// Keep that readiness lane before the ordinary promise so the direct
+    /// successor can run promptly, but enqueue the initial agenda on the
+    /// sentinel lane. This is a local dependency edge, not a global quality
+    /// priority: unrelated groups retain the ordinary scheduler order.
+    quality_stage: u8,
     priority: u16,
     kind: TaskKind,
     stable_id: u32,
     group: GroupId,
     expression: LogicalExprId,
     goal: Option<OptimizationGoal>,
+}
+
+/// Return the transformation proofs carried by one selected logical
+/// expression.  This is deliberately derived from the selected expression's
+/// proof set, not from `LogicalExpr::applied_rules`, which is an audit trail of
+/// attempted work and may include rejected or unused applications.
+pub(crate) fn selected_proof_rule_ids(logical: &LogicalExpr) -> Box<[RuleId]> {
+    logical
+        .proofs
+        .iter()
+        .filter_map(|proof| match proof {
+            EquivalenceProof::Transformation { rule, .. }
+            | EquivalenceProof::TransformationDescendant { rule }
+            | EquivalenceProof::SpecializedEnumerator { rule, .. } => Some(*rule),
+            EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => None,
+        })
+        .collect()
 }
 
 struct TransformationInsertion {
@@ -232,7 +257,7 @@ struct TransformationTaskId {
     rule: RuleId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SearchTask {
     Transform {
         group: GroupId,
@@ -250,15 +275,28 @@ enum SearchTask {
 #[derive(Debug, Default)]
 struct StableAgenda {
     tasks: BTreeMap<TaskKey, SearchTask>,
+    /// One pending key per exact task identity. A child publication may make
+    /// an already queued dependent task ready for the promoted lane; replace
+    /// its old key instead of paying a duplicate discovery visit.
+    keys: BTreeMap<SearchTask, TaskKey>,
 }
 
 impl StableAgenda {
     fn push(&mut self, key: TaskKey, task: SearchTask) {
-        self.tasks.entry(key).or_insert(task);
+        if let Some(previous) = self.keys.get(&task).copied() {
+            if previous <= key {
+                return;
+            }
+            self.tasks.remove(&previous);
+        }
+        self.keys.insert(task, key);
+        self.tasks.insert(key, task);
     }
 
     fn pop(&mut self) -> Option<SearchTask> {
-        self.tasks.pop_first().map(|(_, task)| task)
+        let (_, task) = self.tasks.pop_first()?;
+        self.keys.remove(&task);
+        Some(task)
     }
 }
 
@@ -602,6 +640,13 @@ pub struct RuleWorkProfile {
     /// Valid rule applications which produced no new expression because the
     /// result was already present.
     pub ineffective: u64,
+    /// Diagnostic-only lifecycle offsets for the dependency scheduler.
+    pub first_enqueued_us: Option<u64>,
+    pub first_dependencies_ready_us: Option<u64>,
+    pub first_run_us: Option<u64>,
+    /// Number of times a rule's exact native proof was consumed by a frozen
+    /// root candidate.  `applied_rules` is intentionally not used here.
+    pub root_consumed: u64,
     /// Diagnostic-only elapsed offsets from the start of the optimizer call.
     /// They are optional because the normal trace-off path does not maintain
     /// a timing clock or phase map.
@@ -623,7 +668,14 @@ pub struct FrozenChoice {
     pub physical_payload: u32,
     pub physical_fingerprint: Fingerprint,
     pub children: Box<[ChildWinnerRef]>,
+    /// Audit-only rules which were attempted in the selected expression's
+    /// Memo group.  This field is retained for backwards-compatible trace
+    /// shape; it is never a quality proof.
     pub rules: Box<[RuleId]>,
+    /// Proof-bearing rules attached to this exact selected logical
+    /// expression.  These rules are the only rule attribution eligible for a
+    /// quality certificate.
+    pub selected_rules: Box<[RuleId]>,
 }
 
 const SEARCH_CHECKPOINT_TARGETS_MS: [u64; 5] = [5, 10, 20, 50, 100];
@@ -749,6 +801,9 @@ struct ProtectedIncumbent {
 
 #[derive(Debug, Clone, Copy)]
 enum RuleWorkPhase {
+    Enqueued,
+    DependenciesReady,
+    FirstRun,
     Discovered,
     Matched,
     Applicable,
@@ -939,6 +994,39 @@ pub struct CascadesEngine {
     quality_handoff_reached: bool,
     quality_candidate_evaluation_count: u64,
     quality_candidate_missing_evidence_count: u64,
+    /// Number of root-frontier entries inspected by the quality policy. A
+    /// quality handoff is allowed to select a published, non-leading frontier
+    /// entry when it is the first exact candidate whose native contract is
+    /// complete; the model-cost winner is not automatically a quality winner.
+    quality_frontier_candidate_count: u64,
+    quality_frontier_candidate_skip_count: u64,
+    quality_frontier_certified_count: u64,
+    quality_frontier_policy_rejection_count: u64,
+    quality_frontier_fact_signatures: BTreeMap<u16, u64>,
+    quality_evaluated_candidates:
+        BTreeSet<(OptimizationGoal, CandidateId, super::tasks::ReadSetId)>,
+    quality_frontier_max_aggregates: u32,
+    quality_frontier_max_runtime_filters: u32,
+    quality_frontier_max_aggregate_regions: u32,
+    quality_frontier_max_covered_aggregate_regions: u32,
+    quality_frontier_first_aggregate_region_us: Option<u64>,
+    quality_frontier_first_aggregate_candidate: Option<CandidateId>,
+    quality_frontier_first_incomplete_aggregate_region_us: Option<u64>,
+    quality_frontier_first_incomplete_aggregate_candidate: Option<CandidateId>,
+    quality_frontier_first_incomplete_aggregate_region: Option<Fingerprint>,
+    quality_frontier_first_incomplete_aggregate_anchor: Option<CandidateId>,
+    quality_frontier_first_incomplete_aggregate_covered: u32,
+    quality_frontier_first_incomplete_aggregate_total: u32,
+    quality_frontier_first_complete_aggregate_region_us: Option<u64>,
+    quality_frontier_first_complete_aggregate_candidate: Option<CandidateId>,
+    quality_frontier_max_aggregate_witnesses: u32,
+    quality_frontier_max_join_witnesses: u32,
+    quality_certified_max_aggregates: u32,
+    quality_certified_max_runtime_filters: u32,
+    quality_certified_max_aggregate_regions: u32,
+    quality_certified_max_covered_aggregate_regions: u32,
+    quality_certified_max_aggregate_witnesses: u32,
+    quality_certified_max_join_witnesses: u32,
     quality_last_evaluation: QualityEvaluationSummary,
     /// The candidate/goal associated with the most recent quality attempt.
     /// A bundle summary without this identity cannot explain why a later
@@ -1066,6 +1154,34 @@ impl CascadesEngine {
             quality_handoff_reached: false,
             quality_candidate_evaluation_count: 0,
             quality_candidate_missing_evidence_count: 0,
+            quality_frontier_candidate_count: 0,
+            quality_frontier_candidate_skip_count: 0,
+            quality_frontier_certified_count: 0,
+            quality_frontier_policy_rejection_count: 0,
+            quality_frontier_fact_signatures: BTreeMap::new(),
+            quality_evaluated_candidates: BTreeSet::new(),
+            quality_frontier_max_aggregates: 0,
+            quality_frontier_max_runtime_filters: 0,
+            quality_frontier_max_aggregate_regions: 0,
+            quality_frontier_max_covered_aggregate_regions: 0,
+            quality_frontier_first_aggregate_region_us: None,
+            quality_frontier_first_aggregate_candidate: None,
+            quality_frontier_first_incomplete_aggregate_region_us: None,
+            quality_frontier_first_incomplete_aggregate_candidate: None,
+            quality_frontier_first_incomplete_aggregate_region: None,
+            quality_frontier_first_incomplete_aggregate_anchor: None,
+            quality_frontier_first_incomplete_aggregate_covered: 0,
+            quality_frontier_first_incomplete_aggregate_total: 0,
+            quality_frontier_first_complete_aggregate_region_us: None,
+            quality_frontier_first_complete_aggregate_candidate: None,
+            quality_frontier_max_aggregate_witnesses: 0,
+            quality_frontier_max_join_witnesses: 0,
+            quality_certified_max_aggregates: 0,
+            quality_certified_max_runtime_filters: 0,
+            quality_certified_max_aggregate_regions: 0,
+            quality_certified_max_covered_aggregate_regions: 0,
+            quality_certified_max_aggregate_witnesses: 0,
+            quality_certified_max_join_witnesses: 0,
             quality_last_evaluation: QualityEvaluationSummary::default(),
             quality_last_evaluation_candidate: None,
             quality_last_evaluation_goal: None,
@@ -2068,6 +2184,34 @@ impl CascadesEngine {
         self.quality_handoff_reached = false;
         self.quality_candidate_evaluation_count = 0;
         self.quality_candidate_missing_evidence_count = 0;
+        self.quality_frontier_candidate_count = 0;
+        self.quality_frontier_candidate_skip_count = 0;
+        self.quality_frontier_certified_count = 0;
+        self.quality_frontier_policy_rejection_count = 0;
+        self.quality_frontier_fact_signatures.clear();
+        self.quality_evaluated_candidates.clear();
+        self.quality_frontier_max_aggregates = 0;
+        self.quality_frontier_max_runtime_filters = 0;
+        self.quality_frontier_max_aggregate_regions = 0;
+        self.quality_frontier_max_covered_aggregate_regions = 0;
+        self.quality_frontier_first_aggregate_region_us = None;
+        self.quality_frontier_first_aggregate_candidate = None;
+        self.quality_frontier_first_incomplete_aggregate_region_us = None;
+        self.quality_frontier_first_incomplete_aggregate_candidate = None;
+        self.quality_frontier_first_incomplete_aggregate_region = None;
+        self.quality_frontier_first_incomplete_aggregate_anchor = None;
+        self.quality_frontier_first_incomplete_aggregate_covered = 0;
+        self.quality_frontier_first_incomplete_aggregate_total = 0;
+        self.quality_frontier_first_complete_aggregate_region_us = None;
+        self.quality_frontier_first_complete_aggregate_candidate = None;
+        self.quality_frontier_max_aggregate_witnesses = 0;
+        self.quality_frontier_max_join_witnesses = 0;
+        self.quality_certified_max_aggregates = 0;
+        self.quality_certified_max_runtime_filters = 0;
+        self.quality_certified_max_aggregate_regions = 0;
+        self.quality_certified_max_covered_aggregate_regions = 0;
+        self.quality_certified_max_aggregate_witnesses = 0;
+        self.quality_certified_max_join_witnesses = 0;
         self.quality_last_evaluation = QualityEvaluationSummary::default();
         self.quality_last_evaluation_candidate = None;
         self.quality_last_evaluation_goal = None;
@@ -2284,6 +2428,7 @@ impl CascadesEngine {
                 physical_fingerprint: frozen.winner.physical_fingerprint,
                 children: frozen.winner.children.clone(),
                 rules: frozen.logical.applied_rules.iter().copied().collect(),
+                selected_rules: selected_proof_rule_ids(&frozen.logical),
             });
             for child in frozen.children.iter() {
                 visit(child, choices, visited);
@@ -2330,12 +2475,31 @@ impl CascadesEngine {
         let elapsed = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
         let profile = profiles.entry(rule).or_default();
         let slot = match phase {
+            RuleWorkPhase::Enqueued => &mut profile.first_enqueued_us,
+            RuleWorkPhase::DependenciesReady => &mut profile.first_dependencies_ready_us,
+            RuleWorkPhase::FirstRun => &mut profile.first_run_us,
             RuleWorkPhase::Discovered => &mut profile.first_discovered_us,
             RuleWorkPhase::Matched => &mut profile.first_matched_us,
             RuleWorkPhase::Applicable => &mut profile.first_applicable_us,
             RuleWorkPhase::Published => &mut profile.first_published_us,
         };
         slot.get_or_insert(elapsed);
+    }
+
+    fn note_rule_root_consumed(&mut self, rules: &[RuleId]) {
+        if !self.collect_rule_work_profile {
+            return;
+        }
+        for rule in rules.iter().copied() {
+            let count = self
+                .rule_work_profile
+                .get(&rule)
+                .map_or(1, |profile| profile.root_consumed.saturating_add(1));
+            self.rule_work_profile
+                .entry(rule)
+                .or_default()
+                .root_consumed = count;
+        }
     }
 
     fn note_logical_publication(&mut self) {
@@ -2410,55 +2574,181 @@ impl CascadesEngine {
             return Ok(());
         };
         let root = self.memo.canonical_group(group);
-        let Some(winner) = self
+        let frontier = self
             .memo
             .group(root)
-            .and_then(|group| group.winner(goal))
-            .cloned()
-        else {
+            .and_then(|group| group.winner_frontier(goal))
+            .map(|frontier| frontier.candidates().to_vec())
+            .unwrap_or_default();
+        if frontier.is_empty() {
             return Ok(());
-        };
+        }
+        let leading_candidate = frontier.first().map(|winner| winner.candidate);
         let class = self.quality_class_for_goal(goal);
-        let frozen_winner = self.freeze_grant_winner(root, class, goal, Arc::new(winner))?;
-        let reference = frozen_winner.frozen.reference;
-        self.quality_last_evaluation_candidate = Some(reference.candidate);
-        self.quality_last_evaluation_goal = Some(goal);
-        let Some(evidence) =
-            provider.evidence(&self.memo, reference, &frozen_winner.frozen, goal)?
-        else {
-            self.quality_candidate_missing_evidence_count = self
-                .quality_candidate_missing_evidence_count
-                .saturating_add(1);
-            return Ok(());
-        };
-        let reads = self.winner_fact_reads(root, &frozen_winner.winner)?;
-        let read_id = self.task_registry.intern_read_set(reads);
-        self.quality_candidate_evaluation_count =
-            self.quality_candidate_evaluation_count.saturating_add(1);
-        let Some(certificate) = self.quality_bundles.evaluate_native_candidate(
-            QualityPolicyId::new(1),
-            reference.candidate,
-            read_id,
-            &evidence,
-            1,
-        )?
-        else {
-            self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
-            return Ok(());
-        };
-        self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
-        self.quality_certificates.insert(goal, certificate);
-        self.quality_ready_winners.insert(goal, frozen_winner);
-        if self
-            .quality_required_goals
-            .iter()
-            .all(|required| self.quality_ready_winners.contains_key(required))
-        {
-            self.quality_handoff_reached = true;
-            self.search_milestones.quality_policy_satisfied_us = self
+        for winner in frontier {
+            // The same immutable CandidateId can remain in a frontier while
+            // its group facts advance. Include the exact fact read-set in the
+            // evaluation cursor so a stale quality result cannot suppress a
+            // re-check after a branch/domain/statistics publication.
+            let reads = self.winner_fact_reads(root, &winner)?;
+            let read_id = self.task_registry.intern_read_set(reads);
+            let candidate_key = (goal, winner.candidate, read_id);
+            if !self.quality_evaluated_candidates.insert(candidate_key) {
+                self.quality_frontier_candidate_skip_count =
+                    self.quality_frontier_candidate_skip_count.saturating_add(1);
+                continue;
+            }
+            self.quality_frontier_candidate_count =
+                self.quality_frontier_candidate_count.saturating_add(1);
+            let frozen_winner = self.freeze_grant_winner(root, class, goal, winner)?;
+            let reference = frozen_winner.frozen.reference;
+            self.quality_last_evaluation_candidate = Some(reference.candidate);
+            self.quality_last_evaluation_goal = Some(goal);
+            let Some(evidence) =
+                provider.evidence(&self.memo, reference, &frozen_winner.frozen, goal)?
+            else {
+                self.quality_candidate_missing_evidence_count = self
+                    .quality_candidate_missing_evidence_count
+                    .saturating_add(1);
+                continue;
+            };
+            self.quality_frontier_max_aggregates = self
+                .quality_frontier_max_aggregates
+                .max(evidence.shape.aggregates);
+            self.quality_frontier_max_runtime_filters = self
+                .quality_frontier_max_runtime_filters
+                .max(evidence.shape.runtime_filter_joins);
+            let aggregate_region_count = evidence.aggregate_regions.len() as u32;
+            let covered_aggregate_region_count = evidence
+                .aggregate_regions
+                .iter()
+                .filter(|witness| witness.covered)
+                .count() as u32;
+            let coverage_elapsed_us = self
                 .profile_elapsed_us()
-                .or_else(|| Some(self.memo.control().elapsed_us()));
-            self.search_milestones.quality_policy_candidate = Some(reference.candidate);
+                .unwrap_or_else(|| self.memo.control().elapsed_us());
+            if aggregate_region_count > 0 {
+                self.quality_frontier_first_aggregate_region_us
+                    .get_or_insert(coverage_elapsed_us);
+                self.quality_frontier_first_aggregate_candidate
+                    .get_or_insert(reference.candidate);
+                if covered_aggregate_region_count < aggregate_region_count {
+                    if self
+                        .quality_frontier_first_incomplete_aggregate_region_us
+                        .is_none()
+                    {
+                        let witness = evidence
+                            .aggregate_regions
+                            .iter()
+                            .find(|witness| !witness.covered)
+                            .or_else(|| evidence.aggregate_regions.first());
+                        self.quality_frontier_first_incomplete_aggregate_region_us =
+                            Some(coverage_elapsed_us);
+                        self.quality_frontier_first_incomplete_aggregate_candidate =
+                            Some(reference.candidate);
+                        self.quality_frontier_first_incomplete_aggregate_region =
+                            witness.map(|witness| witness.region);
+                        self.quality_frontier_first_incomplete_aggregate_anchor =
+                            witness.map(|witness| witness.anchor);
+                        self.quality_frontier_first_incomplete_aggregate_covered =
+                            covered_aggregate_region_count;
+                        self.quality_frontier_first_incomplete_aggregate_total =
+                            aggregate_region_count;
+                    }
+                } else {
+                    self.quality_frontier_first_complete_aggregate_region_us
+                        .get_or_insert(coverage_elapsed_us);
+                    self.quality_frontier_first_complete_aggregate_candidate
+                        .get_or_insert(reference.candidate);
+                }
+            }
+            self.quality_frontier_max_aggregate_regions = self
+                .quality_frontier_max_aggregate_regions
+                .max(aggregate_region_count);
+            self.quality_frontier_max_covered_aggregate_regions = self
+                .quality_frontier_max_covered_aggregate_regions
+                .max(covered_aggregate_region_count);
+            self.quality_frontier_max_aggregate_witnesses = self
+                .quality_frontier_max_aggregate_witnesses
+                .max(evidence.shape.aggregate_witness_nodes);
+            self.quality_frontier_max_join_witnesses = self
+                .quality_frontier_max_join_witnesses
+                .max(evidence.shape.join_region_witness_nodes);
+            // This is the first point at which the exact selected proof-bearing
+            // rules are consumed by the root-quality decision.  It is deliberately
+            // fed by the provider's frozen-DAG evidence, never by Memo audit bits.
+            let fact_signature = evidence.facts.iter().fold(0_u16, |signature, fact| {
+                signature | (1_u16 << fact.stable_tag())
+            });
+            *self
+                .quality_frontier_fact_signatures
+                .entry(fact_signature)
+                .or_default() += 1;
+            self.note_rule_root_consumed(&evidence.selected_rules);
+            self.quality_candidate_evaluation_count =
+                self.quality_candidate_evaluation_count.saturating_add(1);
+            let Some(certificate) = self.quality_bundles.evaluate_native_candidate(
+                QualityPolicyId::new(1),
+                reference.candidate,
+                read_id,
+                &evidence,
+                1,
+            )?
+            else {
+                self.quality_frontier_policy_rejection_count = self
+                    .quality_frontier_policy_rejection_count
+                    .saturating_add(1);
+                self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
+                continue;
+            };
+            self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
+            self.quality_frontier_certified_count =
+                self.quality_frontier_certified_count.saturating_add(1);
+            self.quality_certified_max_aggregates = self
+                .quality_certified_max_aggregates
+                .max(evidence.shape.aggregates);
+            self.quality_certified_max_runtime_filters = self
+                .quality_certified_max_runtime_filters
+                .max(evidence.shape.runtime_filter_joins);
+            self.quality_certified_max_aggregate_regions = self
+                .quality_certified_max_aggregate_regions
+                .max(aggregate_region_count);
+            self.quality_certified_max_covered_aggregate_regions = self
+                .quality_certified_max_covered_aggregate_regions
+                .max(covered_aggregate_region_count);
+            self.quality_certified_max_aggregate_witnesses = self
+                .quality_certified_max_aggregate_witnesses
+                .max(evidence.shape.aggregate_witness_nodes);
+            self.quality_certified_max_join_witnesses = self
+                .quality_certified_max_join_witnesses
+                .max(evidence.shape.join_region_witness_nodes);
+            if Some(reference.candidate) != leading_candidate {
+                // This is intentionally observable: selecting a quality-ready
+                // candidate from the Pareto frontier is not the same operation
+                // as claiming that the leading model-cost candidate was ready.
+                tracing::debug!(
+                    target: targets::OPTIMIZER,
+                    leading_candidate =
+                        leading_candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
+                    selected_candidate = reference.candidate.index(),
+                    goal = ?goal,
+                    "quality policy selected a non-leading published root candidate"
+                );
+            }
+            self.quality_certificates.insert(goal, certificate);
+            self.quality_ready_winners.insert(goal, frozen_winner);
+            if self
+                .quality_required_goals
+                .iter()
+                .all(|required| self.quality_ready_winners.contains_key(required))
+            {
+                self.quality_handoff_reached = true;
+                self.search_milestones.quality_policy_satisfied_us = self
+                    .profile_elapsed_us()
+                    .or_else(|| Some(self.memo.control().elapsed_us()));
+                self.search_milestones.quality_policy_candidate = Some(reference.candidate);
+            }
+            break;
         }
         Ok(())
     }
@@ -3187,8 +3477,22 @@ impl CascadesEngine {
         let mut visited = BTreeSet::new();
         for group in changed_groups {
             let group = self.memo.canonical_group(group);
+            // A logical publication can change the local implementation set
+            // without changing an already-indexed child frontier.  Queue the
+            // exact physical goals that have actually been observed for this
+            // group before walking its ancestors.  Relying on the root queue
+            // alone delays a new branch implementation until a later parent
+            // recursion, which is precisely the gap between a published
+            // aggregate choice and a root-consumable quality candidate.
+            if let Some(goals) = self.physical_goals.get(&group).cloned() {
+                for goal in goals {
+                    interleave.pending.insert((group, goal));
+                    self.infeasible_goals.remove(&(group, goal));
+                }
+            }
             if group == interleave.root {
-                for goal in interleave.goals.iter().copied() {
+                let root_goals = interleave.goals.clone();
+                for goal in root_goals {
                     interleave.pending.insert((group, goal));
                     self.infeasible_goals.remove(&(group, goal));
                 }
@@ -3246,6 +3550,61 @@ impl CascadesEngine {
         Ok(())
     }
 
+    /// Promote only the transformation tasks on the exact root candidate that
+    /// the physical interleave just made executable.  This is the narrow
+    /// dependency edge needed by quality-producing rewrites: a candidate's
+    /// selected filter/aggregate shells get a chance to publish their next
+    /// alternative before unrelated Memo expressions continue.  The normal
+    /// agenda still retains every other task, so this changes traversal order
+    /// without shrinking the logical search domain or turning a candidate
+    /// into a completeness proof.
+    fn schedule_selected_quality_followups(
+        &mut self,
+        root: GroupId,
+        goals: &[OptimizationGoal],
+        agenda: &mut StableAgenda,
+    ) -> Result<()> {
+        let mut pending = goals
+            .iter()
+            .copied()
+            .filter_map(|goal| {
+                self.memo
+                    .group(root)
+                    .and_then(|group| group.winner(goal))
+                    .map(|winner| ChildWinnerRef {
+                        group: root,
+                        goal,
+                        candidate: winner.candidate,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(reference) = pending.pop() {
+            if !visited.insert(reference.candidate) {
+                continue;
+            }
+            let Some(winner) = self.memo.resolve_child_winner(reference) else {
+                continue;
+            };
+            let (logical, children) = {
+                let physical = self.memo.physical_expr(winner.expression).ok_or_else(|| {
+                    paro_error::internal(
+                        "selected quality candidate references an unknown physical expression",
+                    )
+                })?;
+                (physical.key.logical, winner.children.clone())
+            };
+            let owner = self.memo.logical_owner(logical).ok_or_else(|| {
+                paro_error::internal(
+                    "selected quality candidate logical expression has no owning group",
+                )
+            })?;
+            self.schedule_transformation_expression(owner, logical, agenda, true)?;
+            pending.extend(children.iter().copied());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn explore_transformations(&mut self) -> Result<()> {
         self.explore_transformations_with_interleave(None)
@@ -3287,6 +3646,7 @@ impl CascadesEngine {
                 expression,
                 rule,
             };
+            self.note_rule_phase(rule, RuleWorkPhase::FirstRun);
             self.note_rule_phase(rule, RuleWorkPhase::Discovered);
             if self.collect_rule_work_profile {
                 let profile = self.rule_work_profile.entry(rule).or_default();
@@ -3383,6 +3743,11 @@ impl CascadesEngine {
             let allocated = paro_common::allocator::allocated_bytes_since(binding_allocated);
             let accumulated = self.rule_allocated_bytes.entry(rule).or_default();
             *accumulated = accumulated.saturating_add(allocated);
+            // Binding construction has now observed the exact child/fact
+            // reads required by this task.  Record this separately from
+            // enqueue and first-run: a queued task can still wait on an
+            // advancing child frontier, and a matcher can discover no binding.
+            self.note_rule_phase(rule, RuleWorkPhase::DependenciesReady);
             if !self.memo.control().checkpoint()? {
                 break;
             }
@@ -4035,10 +4400,15 @@ impl CascadesEngine {
                     inserted_groups.extend(appended_groups.iter().copied());
                     inserted_groups.extend(changed_cte_readers.iter().copied());
                     for (owner, inserted) in newly_inserted_expressions {
-                        self.schedule_transformation_expression(owner, inserted, &mut agenda)?;
+                        self.schedule_transformation_expression(
+                            owner,
+                            inserted,
+                            &mut agenda,
+                            false,
+                        )?;
                     }
                     for appended in appended_groups.iter().copied() {
-                        self.schedule_transformations(appended, &mut agenda)?;
+                        self.schedule_transformations_with_lane(appended, &mut agenda, false)?;
                     }
                 }
                 let mut observed = binding_set.reads.to_vec();
@@ -4066,6 +4436,9 @@ impl CascadesEngine {
                     // The final root pass still owns completion; this queue is
                     // solely the early quality/readiness path.
                     self.drain_physical_interleave(interleave)?;
+                    let root = interleave.root;
+                    let goals = interleave.goals.clone();
+                    self.schedule_selected_quality_followups(root, &goals, &mut agenda)?;
                 }
                 effective_insertions_since_recost = 0;
             }
@@ -4076,6 +4449,9 @@ impl CascadesEngine {
                 // before the final grant extraction. This is an incremental drain,
                 // not another whole-root exploration.
                 self.drain_physical_interleave(interleave)?;
+                let root = interleave.root;
+                let goals = interleave.goals.clone();
+                self.schedule_selected_quality_followups(root, &goals, &mut agenda)?;
             }
         }
         self.record_diagnostic_checkpoints();
@@ -4294,6 +4670,113 @@ impl CascadesEngine {
             (
                 "quality_policy_missing_evidence_count",
                 self.quality_candidate_missing_evidence_count,
+            ),
+            (
+                "quality_policy_frontier_candidate_count",
+                self.quality_frontier_candidate_count,
+            ),
+            (
+                "quality_policy_frontier_candidate_skip_count",
+                self.quality_frontier_candidate_skip_count,
+            ),
+            (
+                "quality_policy_frontier_certified_count",
+                self.quality_frontier_certified_count,
+            ),
+            (
+                "quality_policy_frontier_policy_rejection_count",
+                self.quality_frontier_policy_rejection_count,
+            ),
+            (
+                "quality_policy_frontier_max_aggregates",
+                u64::from(self.quality_frontier_max_aggregates),
+            ),
+            (
+                "quality_policy_frontier_max_runtime_filters",
+                u64::from(self.quality_frontier_max_runtime_filters),
+            ),
+            (
+                "quality_policy_frontier_max_aggregate_regions",
+                u64::from(self.quality_frontier_max_aggregate_regions),
+            ),
+            (
+                "quality_policy_frontier_max_covered_aggregate_regions",
+                u64::from(self.quality_frontier_max_covered_aggregate_regions),
+            ),
+            (
+                "quality_policy_frontier_first_aggregate_region_us",
+                self.quality_frontier_first_aggregate_region_us
+                    .unwrap_or(u64::MAX),
+            ),
+            (
+                "quality_policy_frontier_first_aggregate_candidate",
+                self.quality_frontier_first_aggregate_candidate
+                    .map_or(u64::MAX, |candidate| candidate.index() as u64),
+            ),
+            (
+                "quality_policy_frontier_first_incomplete_aggregate_region_us",
+                self.quality_frontier_first_incomplete_aggregate_region_us
+                    .unwrap_or(u64::MAX),
+            ),
+            (
+                "quality_policy_frontier_first_incomplete_aggregate_candidate",
+                self.quality_frontier_first_incomplete_aggregate_candidate
+                    .map_or(u64::MAX, |candidate| candidate.index() as u64),
+            ),
+            (
+                "quality_policy_frontier_first_incomplete_aggregate_anchor",
+                self.quality_frontier_first_incomplete_aggregate_anchor
+                    .map_or(u64::MAX, |candidate| candidate.index() as u64),
+            ),
+            (
+                "quality_policy_frontier_first_incomplete_aggregate_covered",
+                u64::from(self.quality_frontier_first_incomplete_aggregate_covered),
+            ),
+            (
+                "quality_policy_frontier_first_incomplete_aggregate_total",
+                u64::from(self.quality_frontier_first_incomplete_aggregate_total),
+            ),
+            (
+                "quality_policy_frontier_first_complete_aggregate_region_us",
+                self.quality_frontier_first_complete_aggregate_region_us
+                    .unwrap_or(u64::MAX),
+            ),
+            (
+                "quality_policy_frontier_first_complete_aggregate_candidate",
+                self.quality_frontier_first_complete_aggregate_candidate
+                    .map_or(u64::MAX, |candidate| candidate.index() as u64),
+            ),
+            (
+                "quality_policy_frontier_max_aggregate_witnesses",
+                u64::from(self.quality_frontier_max_aggregate_witnesses),
+            ),
+            (
+                "quality_policy_frontier_max_join_witnesses",
+                u64::from(self.quality_frontier_max_join_witnesses),
+            ),
+            (
+                "quality_policy_certified_max_aggregates",
+                u64::from(self.quality_certified_max_aggregates),
+            ),
+            (
+                "quality_policy_certified_max_runtime_filters",
+                u64::from(self.quality_certified_max_runtime_filters),
+            ),
+            (
+                "quality_policy_certified_max_aggregate_regions",
+                u64::from(self.quality_certified_max_aggregate_regions),
+            ),
+            (
+                "quality_policy_certified_max_covered_aggregate_regions",
+                u64::from(self.quality_certified_max_covered_aggregate_regions),
+            ),
+            (
+                "quality_policy_certified_max_aggregate_witnesses",
+                u64::from(self.quality_certified_max_aggregate_witnesses),
+            ),
+            (
+                "quality_policy_certified_max_join_witnesses",
+                u64::from(self.quality_certified_max_join_witnesses),
             ),
             (
                 "quality_last_evaluation_candidate",
@@ -4541,6 +5024,16 @@ impl CascadesEngine {
         if let Some(timestamp) = self.strong_incumbent_first_invalidation_at_us {
             counters.insert("strong_incumbent_first_invalidation_at_us", timestamp);
         }
+        if let Some(region) = self.quality_frontier_first_incomplete_aggregate_region {
+            counters.insert(
+                "quality_policy_frontier_first_incomplete_aggregate_region_lo",
+                region.0 as u64,
+            );
+            counters.insert(
+                "quality_policy_frontier_first_incomplete_aggregate_region_hi",
+                (region.0 >> 64) as u64,
+            );
+        }
         if let Some(reason) = self.strong_incumbent_first_invalidation_reason {
             counters.insert("strong_incumbent_first_invalidation_reason", reason);
         }
@@ -4554,6 +5047,29 @@ impl CascadesEngine {
                 (fingerprint.0 >> 64) as u64,
             );
         }
+        let fact_bit = |fact: super::quality::BundleFact| 1_u16 << fact.stable_tag();
+        let fact_count = |mask: u16| {
+            self.quality_frontier_fact_signatures
+                .iter()
+                .filter(|(signature, _)| **signature & mask == mask)
+                .map(|(_, count)| *count)
+                .sum()
+        };
+        counters.insert(
+            "quality_frontier_has_join_region_count",
+            fact_count(fact_bit(super::quality::BundleFact::JoinRegion)),
+        );
+        counters.insert(
+            "quality_frontier_has_aggregate_decomposition_count",
+            fact_count(fact_bit(super::quality::BundleFact::AggregateDecomposition)),
+        );
+        counters.insert(
+            "quality_frontier_has_join_and_aggregate_count",
+            fact_count(
+                fact_bit(super::quality::BundleFact::JoinRegion)
+                    | fact_bit(super::quality::BundleFact::AggregateDecomposition),
+            ),
+        );
         // Keep budget evidence in the same diagnostic counter snapshot as
         // physical work.  Aggregate counts alone cannot tell whether a
         // local proof was blocked by logical closure, child products, or a
@@ -4570,6 +5086,19 @@ impl CascadesEngine {
         group: GroupId,
         agenda: &mut StableAgenda,
     ) -> Result<()> {
+        self.schedule_transformations_with_lane(group, agenda, false)
+    }
+
+    /// Schedule the transformations owned by one newly visible group. A
+    /// quality-producing publication may pass its lane to the exact output
+    /// groups it created; this keeps the dependency chain local while making
+    /// the next producer/consumer step run before unrelated initial work.
+    fn schedule_transformations_with_lane(
+        &mut self,
+        group: GroupId,
+        agenda: &mut StableAgenda,
+        promoted: bool,
+    ) -> Result<()> {
         let expressions = self
             .memo
             .group(group)
@@ -4577,9 +5106,26 @@ impl CascadesEngine {
             .logical_exprs()
             .to_vec();
         for expression in expressions {
-            self.schedule_transformation_expression(group, expression, agenda)?;
+            self.schedule_transformation_expression(group, expression, agenda, promoted)?;
         }
         Ok(())
+    }
+
+    /// Return the semantic dependency lane for one transformation task. A
+    /// task is promoted only when the publication which woke it is one of its
+    /// observed dependencies. Initial work and unrelated work stay on the
+    /// ordinary lane; a missing declaration is still searched and never
+    /// becomes an implicit quality barrier.
+    fn quality_stage_for_rule(&self, rule: &dyn TransformationRule, promoted: bool) -> u8 {
+        if !self.quality_handoff_enabled {
+            return 0;
+        }
+        promoted
+            .then(|| {
+                rule.quality_dependency()
+                    .map_or(u8::MAX, |dependency| dependency.stage())
+            })
+            .unwrap_or(u8::MAX)
     }
 
     fn schedule_transformation_expression(
@@ -4587,6 +5133,7 @@ impl CascadesEngine {
         group: GroupId,
         expression: LogicalExprId,
         agenda: &mut StableAgenda,
+        promoted: bool,
     ) -> Result<()> {
         let expression_ref = self
             .memo
@@ -4633,6 +5180,12 @@ impl CascadesEngine {
                 continue;
             }
             let key = TaskKey {
+                quality_stage: self.quality_stage_for_rule(
+                    self.registry
+                        .transformation(rule_id)
+                        .expect("transformation dispatch disappeared"),
+                    promoted,
+                ),
                 priority: promise.priority,
                 kind: TaskKind::Transform,
                 stable_id: rule_id.0,
@@ -4648,6 +5201,7 @@ impl CascadesEngine {
                     rule: rule_id,
                 },
             );
+            self.note_rule_phase(rule_id, RuleWorkPhase::Enqueued);
         }
         Ok(())
     }
@@ -4717,6 +5271,7 @@ impl CascadesEngine {
             let promise = rule.promise(expression_ref, &context);
             agenda.push(
                 TaskKey {
+                    quality_stage: self.quality_stage_for_rule(rule, true),
                     priority: promise.priority,
                     kind: TaskKind::Transform,
                     stable_id: subscriber.rule.0,
@@ -4730,6 +5285,7 @@ impl CascadesEngine {
                     rule: subscriber.rule,
                 },
             );
+            self.note_rule_phase(subscriber.rule, RuleWorkPhase::Enqueued);
         }
         Ok(())
     }
@@ -4913,6 +5469,11 @@ impl CascadesEngine {
                 }
                 let promise = implementation.promise(expression_ref, goal);
                 let key = TaskKey {
+                    quality_stage: if self.quality_handoff_enabled {
+                        u8::MAX
+                    } else {
+                        0
+                    },
                     priority: promise.priority,
                     kind: TaskKind::Implement,
                     stable_id: implementation.id().0,
