@@ -1263,6 +1263,47 @@ fn strong_tree_engine() -> (CascadesEngine, GroupId, OptimizationGoal) {
     (CascadesEngine::new(memo, registry), root, goal)
 }
 
+#[test]
+fn physical_interleave_step_resumes_a_partial_child_recipe() {
+    let (mut engine, root, goal) = strong_tree_engine();
+    let child = engine
+        .memo()
+        .group(root)
+        .and_then(|group| group.logical_exprs().first().copied())
+        .and_then(|logical| engine.memo().logical_expr(logical))
+        .and_then(|logical| logical.key.children.first().copied())
+        .expect("the tree fixture has one physical child");
+
+    // Make the child frontier wide enough that the readiness queue must yield
+    // in the middle of the child's physical recipe stream. Every alternative
+    // is legal and tied on model cost, so the test checks continuation closure
+    // rather than allowing frontier dominance to hide the pause.
+    for offset in 0..40_u32 {
+        engine
+            .registry
+            .register_implementation(TreeImplementation {
+                id: ImplementationId(1_000 + offset),
+                operator: Fingerprint(100),
+                child: None,
+                child_row_goal: None,
+                local_score: 1.0,
+                mandatory: true,
+            })
+            .unwrap();
+    }
+
+    let winner = engine
+        .optimize(root, goal, SearchMode::Memo)
+        .expect("a yielded physical task must resume to a feasible root");
+    assert_eq!(winner.cost.score.range.expected, 1.0);
+    assert!(engine.task_registry().profile().reopened_evaluations > 0);
+    assert!(engine
+        .memo()
+        .group(child)
+        .and_then(|group| group.winner_frontier(winner.children[0].goal))
+        .is_some_and(|frontier| !frontier.candidates().is_empty()));
+}
+
 fn engine(optional_rules: u32) -> (CascadesEngine, GroupId, OptimizationGoal) {
     let mut budget = super::super::budget::SearchBudget::default();
     budget.max_rule_firings_per_group = optional_rules;

@@ -885,6 +885,13 @@ pub struct CascadesEngine {
     engine_created_at: Instant,
     mandatory_only: bool,
     preserve_incomplete_physical: bool,
+    /// The readiness queue may ask a physical task to yield after publishing
+    /// one frontier delta.  This is a continuation mode, not a smaller
+    /// search budget: the exact recipe/child cursor is published back to the
+    /// TaskRegistry and the same task is queued again by the interleave.
+    physical_interleave_step_mode: bool,
+    physical_interleave_step_yielded: bool,
+    physical_interleave_step_publications: u16,
     memo: Memo,
     registry: ImplementationRegistry,
     enforcement: EnforcementPlanner,
@@ -1107,6 +1114,9 @@ impl CascadesEngine {
             engine_created_at: Instant::now(),
             mandatory_only: false,
             preserve_incomplete_physical: false,
+            physical_interleave_step_mode: false,
+            physical_interleave_step_yielded: false,
+            physical_interleave_step_publications: 0,
             memo,
             registry,
             enforcement: EnforcementPlanner::new(
@@ -2719,6 +2729,37 @@ impl CascadesEngine {
         Ok(())
     }
 
+    /// Yield the readiness pass after a bounded batch of newly visible
+    /// physical frontier entries.  The caller keeps the exact
+    /// child-combination state and returns
+    /// the current recipe cursor to the TaskRegistry, so this does not drop
+    /// alternatives or turn a partial domain into a completion claim.
+    fn should_yield_physical_interleave_step(&mut self) -> bool {
+        const PUBLICATIONS_PER_STEP: u16 = 32;
+        if self.physical_interleave_step_mode {
+            self.physical_interleave_step_publications =
+                self.physical_interleave_step_publications.saturating_add(1);
+            if self.physical_interleave_step_publications >= PUBLICATIONS_PER_STEP
+                && !self.physical_interleave_step_yielded
+            {
+                self.physical_interleave_step_yielded = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn note_physical_frontier_change(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        selected_changed: bool,
+    ) -> Result<bool> {
+        self.note_physical_candidate(group, goal, selected_changed)?;
+        self.record_diagnostic_checkpoints();
+        Ok(self.should_yield_physical_interleave_step())
+    }
+
     fn try_quality_handoff_candidate(
         &mut self,
         group: GroupId,
@@ -3726,10 +3767,24 @@ impl CascadesEngine {
             // carry the recovered execution-quality chain.
             self.mandatory_only = previous_mandatory_only;
             self.preserve_incomplete_physical = true;
+            self.physical_interleave_step_mode = true;
+            self.physical_interleave_step_yielded = false;
+            self.physical_interleave_step_publications = 0;
             let result = self.optimize_group(group, goal);
+            let yielded = self.physical_interleave_step_yielded;
+            self.physical_interleave_step_mode = false;
             self.mandatory_only = previous_mandatory_only;
             self.preserve_incomplete_physical = previous_preserve_incomplete;
             result?;
+            if yielded {
+                // A publication inside the task may have made a registered
+                // parent recipe consumable. Requeue the exact task and walk
+                // only its indexed physical ancestors; the next step resumes
+                // from the recipe/combination cursor rather than rescanning
+                // the whole child frontier.
+                interleave.pending.insert((group, goal));
+                self.enqueue_physical_ancestors([group], interleave);
+            }
             self.record_diagnostic_checkpoints();
         }
         Ok(())
@@ -6028,7 +6083,9 @@ impl CascadesEngine {
                 .get(&cache_key)
                 .is_some_and(|entry| {
                     next_recipe_sequence <= entry.recipe_cursor
-                        && (self.preserve_incomplete_physical || entry.complete)
+                        && (entry.complete
+                            || (self.preserve_incomplete_physical
+                                && !self.physical_interleave_step_mode))
                         && entry
                             .reads
                             .is_current(&self.memo)
@@ -6073,7 +6130,10 @@ impl CascadesEngine {
                                 .is_some_and(|cursor| !cursor.complete)
                     )
                 });
-                if !self.mandatory_only && !self.preserve_incomplete_physical && incomplete {
+                if !self.mandatory_only
+                    && (!self.preserve_incomplete_physical || self.physical_interleave_step_mode)
+                    && incomplete
+                {
                     resume_candidate = true;
                     task
                 } else {
@@ -6147,10 +6207,17 @@ impl CascadesEngine {
         // is append-only, so a predecessor cursor is sufficient to visit only
         // newly published expressions. The cursor is task-owned progress;
         // the predecessor result itself is never reused as a winner.
-        let recipe_cursor = predecessor_cursor
-            .or_else(|| (!new_evaluation).then_some(current_cursor))
-            .map(|cursor| cursor.position)
-            .unwrap_or_default();
+        let recipe_cursor = if resume_candidate && self.physical_interleave_step_mode {
+            // Resume the current evaluation. Its predecessor belongs to the
+            // prior read-set epoch and may still point at the beginning of
+            // the recipe stream even when this task yielded mid-recipe.
+            current_cursor.position
+        } else {
+            predecessor_cursor
+                .or_else(|| (!new_evaluation).then_some(current_cursor))
+                .map(|cursor| cursor.position)
+                .unwrap_or_default()
+        };
         let recipe_start = if full_recost { 0 } else { recipe_cursor };
         let local_logical_frontier_changed = physical_local_logical_frontier_changed(
             group,
@@ -6300,7 +6367,8 @@ impl CascadesEngine {
         );
         self.active_goals.remove(&(group, goal));
         match result {
-            Ok(()) => {
+            Ok(resume_recipe_cursor) => {
+                let yielded = resume_recipe_cursor.is_some();
                 let has_winner = self
                     .memo
                     .group(group)
@@ -6316,7 +6384,7 @@ impl CascadesEngine {
                 // reports an incomplete search until the stronger global
                 // obligation predicate succeeds.  A local budget/failure or
                 // deadline remains a hard blocker for this proof.
-                let complete = self.memo.group_physical_obligations_empty(group);
+                let complete = !yielded && self.memo.group_physical_obligations_empty(group);
                 // The recursive pass may have created new recipes and child
                 // frontier dependencies. Rebind the running task to the
                 // exact post-child ReadSet before publication; otherwise a
@@ -6333,10 +6401,11 @@ impl CascadesEngine {
                     .get(&(self.memo.canonical_group(group), goal))
                     .copied()
                     .unwrap_or_default();
+                let cursor_position = resume_recipe_cursor.unwrap_or(recipe_count);
                 let cursor = self.task_registry.advance_cursor(
                     task,
                     Cursor {
-                        position: recipe_count,
+                        position: cursor_position,
                         complete,
                     },
                 )?;
@@ -6381,6 +6450,15 @@ impl CascadesEngine {
                         certificate,
                     },
                     (true, None) => TaskOutcome::Progress { cursor },
+                    // A readiness step is allowed to stop before the first
+                    // feasible response is assembled (for example while a
+                    // child is publishing the first frontier delta).  Keep
+                    // that task resumable; marking it Infeasible would make
+                    // TaskRegistry treat the partial prefix as a proof and
+                    // the final full pass could never reopen it.
+                    (false, _) if self.preserve_incomplete_physical => {
+                        TaskOutcome::Progress { cursor }
+                    }
                     (false, _) => TaskOutcome::Infeasible,
                 };
                 self.task_registry.publish_current_after_local_mutation(
@@ -6394,7 +6472,7 @@ impl CascadesEngine {
                     cache_key,
                     PhysicalTaskCacheEntry {
                         reads: post_child_reads,
-                        recipe_cursor: recipe_count,
+                        recipe_cursor: cursor_position,
                         complete,
                     },
                 );
@@ -7254,7 +7332,7 @@ impl CascadesEngine {
         recipe_cursor: u64,
         enumerate_local_implementations: bool,
         dirty_recipes: Option<&BTreeSet<(PhysicalExprId, Fingerprint)>>,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         if enumerate_local_implementations {
             self.enumerate_implementations(group, goal)?;
         }
@@ -7349,6 +7427,14 @@ impl CascadesEngine {
                 );
                 if optimized_children.insert((child, child_goal)) {
                     self.optimize_group(child, child_goal)?;
+                    if self.physical_interleave_step_mode && self.physical_interleave_step_yielded {
+                        // The child published a frontier delta during this
+                        // readiness step. Do not continue constructing a
+                        // parent response from an arbitrarily large sibling
+                        // domain; the parent task itself will resume from
+                        // this recipe after the child/ancestor wake-up.
+                        return Ok(Some(sequence));
+                    }
                 }
                 let Some(frontier) = self
                     .memo
@@ -7487,6 +7573,7 @@ impl CascadesEngine {
                 .child_combination_states
                 .remove(&recipe_key)
                 .unwrap_or_default();
+            let mut yield_after_publication = false;
             let context_changed = combination_state.cost_context != Some(cost_context);
             if context_changed {
                 self.child_combination_recompute_count =
@@ -7564,10 +7651,17 @@ impl CascadesEngine {
                         );
                     }
                     if frontier_changed {
-                        self.note_physical_candidate(group, goal, selected_changed)?;
-                        self.record_diagnostic_checkpoints();
+                        if self.note_physical_frontier_change(group, goal, selected_changed)? {
+                            yield_after_publication = true;
+                            break;
+                        }
                     }
                 }
+            }
+            if yield_after_publication {
+                self.child_combination_states
+                    .insert(recipe_key, combination_state);
+                return Ok(Some(sequence));
             }
 
             let child_frontier_count = recipe.child_goals.len();
@@ -7638,8 +7732,13 @@ impl CascadesEngine {
                         );
                     }
                     if frontier_changed {
-                        self.note_physical_candidate(group, goal, selected_changed)?;
-                        self.record_diagnostic_checkpoints();
+                        if self.note_physical_frontier_change(group, goal, selected_changed)? {
+                            yield_after_publication = true;
+                            break;
+                        }
+                    }
+                    if yield_after_publication {
+                        break;
                     }
                     continue;
                 }
@@ -7826,8 +7925,10 @@ impl CascadesEngine {
                     );
                 }
                 if frontier_changed {
-                    self.note_physical_candidate(group, goal, selected_changed)?;
-                    self.record_diagnostic_checkpoints();
+                    if self.note_physical_frontier_change(group, goal, selected_changed)? {
+                        yield_after_publication = true;
+                        break;
+                    }
                 }
             }
             if budget_blocked {
@@ -7837,6 +7938,11 @@ impl CascadesEngine {
                     physical_expression = physical.index(),
                     "child combination pricing paused by budget"
                 );
+            }
+            if yield_after_publication {
+                self.child_combination_states
+                    .insert(recipe_key, combination_state);
+                return Ok(Some(sequence));
             }
             let current_parent_frontier_revision = self
                 .memo
@@ -7886,10 +7992,17 @@ impl CascadesEngine {
                         );
                     }
                     if frontier_changed {
-                        self.note_physical_candidate(group, goal, selected_changed)?;
-                        self.record_diagnostic_checkpoints();
+                        if self.note_physical_frontier_change(group, goal, selected_changed)? {
+                            yield_after_publication = true;
+                            break;
+                        }
                     }
                 }
+            }
+            if yield_after_publication {
+                self.child_combination_states
+                    .insert(recipe_key, combination_state);
+                return Ok(Some(sequence));
             }
             combination_state.parent_frontier_revision = self
                 .memo
@@ -7899,7 +8012,7 @@ impl CascadesEngine {
             self.child_combination_states
                 .insert(recipe_key, combination_state);
         }
-        Ok(())
+        Ok(None)
     }
 
     fn infeasible_goal_error(
