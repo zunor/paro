@@ -3791,6 +3791,11 @@ impl CascadesEngine {
                 self.schedule_transformations(group, &mut agenda)?;
             }
         }
+        if self.quality_handoff_enabled {
+            if let Some(interleave) = interleave.as_ref() {
+                self.schedule_quality_bootstrap(interleave.root, &mut agenda)?;
+            }
+        }
         'tasks: while let Some(task) = agenda.pop() {
             if self.quality_handoff_reached {
                 break;
@@ -4595,16 +4600,25 @@ impl CascadesEngine {
                     }
                     inserted_groups.extend(appended_groups.iter().copied());
                     inserted_groups.extend(changed_cte_readers.iter().copied());
+                    let promote_quality_followups = self.quality_handoff_enabled
+                        && self
+                            .registry
+                            .transformation(rule)
+                            .is_some_and(|rule| rule.quality_dependency().is_some());
                     for (owner, inserted) in newly_inserted_expressions {
                         self.schedule_transformation_expression(
                             owner,
                             inserted,
                             &mut agenda,
-                            false,
+                            promote_quality_followups,
                         )?;
                     }
                     for appended in appended_groups.iter().copied() {
-                        self.schedule_transformations_with_lane(appended, &mut agenda, false)?;
+                        self.schedule_transformations_with_lane(
+                            appended,
+                            &mut agenda,
+                            promote_quality_followups,
+                        )?;
                     }
                 }
                 let mut observed = binding_set.reads.to_vec();
@@ -5283,6 +5297,42 @@ impl CascadesEngine {
         agenda: &mut StableAgenda,
     ) -> Result<()> {
         self.schedule_transformations_with_lane(group, agenda, false)
+    }
+
+    /// Seed the quality dependency lane from the root's current Memo
+    /// subgraph. The lane is an ordering request over existing native rule
+    /// tasks, not a second optimizer or a query-specific recipe: every
+    /// logical expression remains scheduled, and undeclared rules stay on
+    /// the ordinary agenda. This makes an already-visible producer/consumer
+    /// chain runnable before unrelated optional exploration consumes the
+    /// first interleave batch.
+    fn schedule_quality_bootstrap(
+        &mut self,
+        root: GroupId,
+        agenda: &mut StableAgenda,
+    ) -> Result<()> {
+        let mut pending = vec![self.memo.canonical_group(root)];
+        let mut visited = BTreeSet::new();
+        while let Some(group) = pending.pop() {
+            let group = self.memo.canonical_group(group);
+            if !visited.insert(group) {
+                continue;
+            }
+            let expressions = self
+                .memo
+                .group(group)
+                .ok_or_else(|| paro_error::internal("quality bootstrap lost Memo group"))?
+                .logical_exprs()
+                .to_vec();
+            self.schedule_transformations_with_lane(group, agenda, true)?;
+            for expression in expressions {
+                let logical = self.memo.logical_expr(expression).ok_or_else(|| {
+                    paro_error::internal("quality bootstrap lost logical expression")
+                })?;
+                pending.extend(logical.key.children.iter().copied());
+            }
+        }
+        Ok(())
     }
 
     /// Schedule the transformations owned by one newly visible group. A
