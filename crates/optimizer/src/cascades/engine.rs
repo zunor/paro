@@ -679,6 +679,8 @@ pub struct FrozenChoice {
 }
 
 const SEARCH_CHECKPOINT_TARGETS_MS: [u64; 5] = [5, 10, 20, 50, 100];
+const MAX_CANDIDATE_LIFECYCLE_EVENTS: usize = 32_768;
+const CANDIDATE_LIFECYCLE_STAGE_LIMITS: [u64; 6] = [4_096, 16_384, 4_096, 8_192, 16_384, 1_024];
 
 /// A diagnostic-only snapshot of the currently selected root candidate at a
 /// fixed search-time checkpoint. The timestamp is the first observation at or
@@ -699,6 +701,43 @@ pub struct SearchCheckpoint {
     pub fact_reads: Box<[PatternRead]>,
     pub frozen: bool,
     pub search_complete: bool,
+}
+
+/// Diagnostic-only identity for one point in the real candidate production
+/// chain.  The event is intentionally attached to the existing search
+/// milestone snapshot instead of a second trace or replay store.  In
+/// particular, a tuple-priced event has no parent CandidateId yet; its exact
+/// child references are the identity that the later Memo admission consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum CandidateLifecycleStage {
+    LogicalPublished = 0,
+    PhysicalRecipePublished = 1,
+    ChildReady = 2,
+    TuplePriced = 3,
+    ParentPublished = 4,
+    RootQualified = 5,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateLifecycleEvent {
+    pub stage: CandidateLifecycleStage,
+    pub elapsed_us: u64,
+    pub group: GroupId,
+    pub goal: Option<OptimizationGoal>,
+    pub candidate: Option<CandidateId>,
+    pub logical: Option<LogicalExprId>,
+    pub physical: Option<PhysicalExprId>,
+    pub recipe: Option<Fingerprint>,
+    pub rule: Option<RuleId>,
+    pub children: Box<[ChildWinnerRef]>,
+    /// Facts are retained only when the producer already has a concrete
+    /// fact-read set (logical publication/root qualification). Physical
+    /// events use the exact child refs and recipe identity; their complete
+    /// fact contract is replayed by the existing FrozenCandidate trace.
+    pub facts: Box<[PatternRead]>,
+    pub expected_cost_bits: Option<u64>,
+    pub upper_cost_bits: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -736,6 +775,15 @@ pub struct SearchMilestones {
     /// still has unexplored obligations. This is separate from ProofComplete.
     pub quality_policy_satisfied_us: Option<u64>,
     pub quality_policy_candidate: Option<CandidateId>,
+    /// Bounded diagnostic timeline for the actual same-Memo production path.
+    /// Normal trace-off searches keep this empty and allocation-free.
+    pub candidate_lifecycle: Vec<CandidateLifecycleEvent>,
+    pub candidate_lifecycle_dropped: u64,
+    /// Per-stage accounting makes a bounded diagnostic cohort auditable: a
+    /// dense child-ready stream must not evict the physical publications
+    /// needed to locate a late producer/parent edge.
+    pub candidate_lifecycle_stage_stored: [u64; 6],
+    pub candidate_lifecycle_stage_dropped: [u64; 6],
 }
 
 /// The last published physical response for one exact `(group, goal)` task.
@@ -2513,6 +2561,103 @@ impl CascadesEngine {
         }
     }
 
+    fn note_candidate_lifecycle(&mut self, event: CandidateLifecycleEvent) {
+        if !self.collect_rule_work_profile {
+            return;
+        }
+        let stage_index = event.stage as usize;
+        if self.search_milestones.candidate_lifecycle_stage_stored[stage_index]
+            >= CANDIDATE_LIFECYCLE_STAGE_LIMITS[stage_index]
+        {
+            self.search_milestones.candidate_lifecycle_stage_dropped[stage_index] =
+                self.search_milestones.candidate_lifecycle_stage_dropped[stage_index]
+                    .saturating_add(1);
+            self.search_milestones.candidate_lifecycle_dropped = self
+                .search_milestones
+                .candidate_lifecycle_dropped
+                .saturating_add(1);
+            return;
+        }
+        self.search_milestones.candidate_lifecycle_stage_stored[stage_index] =
+            self.search_milestones.candidate_lifecycle_stage_stored[stage_index].saturating_add(1);
+        if self.search_milestones.candidate_lifecycle.len() < MAX_CANDIDATE_LIFECYCLE_EVENTS {
+            self.search_milestones.candidate_lifecycle.push(event);
+            return;
+        }
+        // Child-ready and tuple-priced events are useful for locating the
+        // first dependency edge, but they are much denser than publication
+        // events. Preserve a bounded early sample of them while retaining
+        // later parent/root events instead of silently dropping the event
+        // which closes the handoff chain.
+        let replacement = match event.stage {
+            CandidateLifecycleStage::RootQualified => self
+                .search_milestones
+                .candidate_lifecycle
+                .iter()
+                .position(|event| event.stage != CandidateLifecycleStage::RootQualified),
+            CandidateLifecycleStage::ParentPublished => self
+                .search_milestones
+                .candidate_lifecycle
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.stage,
+                        CandidateLifecycleStage::ChildReady | CandidateLifecycleStage::TuplePriced
+                    )
+                }),
+            _ => None,
+        };
+        if let Some(index) = replacement {
+            self.search_milestones.candidate_lifecycle[index] = event;
+        } else {
+            self.search_milestones.candidate_lifecycle_dropped = self
+                .search_milestones
+                .candidate_lifecycle_dropped
+                .saturating_add(1);
+            self.search_milestones.candidate_lifecycle_stage_dropped[stage_index] =
+                self.search_milestones.candidate_lifecycle_stage_dropped[stage_index]
+                    .saturating_add(1);
+        }
+    }
+
+    fn lifecycle_elapsed_us(&self) -> u64 {
+        self.profile_elapsed_us()
+            .unwrap_or_else(|| self.memo.control().elapsed_us())
+    }
+
+    fn note_parent_publication(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        physical: PhysicalExprId,
+        recipe: Fingerprint,
+        candidate: CandidateId,
+        children: Box<[ChildWinnerRef]>,
+        cost: SearchCost,
+    ) {
+        if !self.collect_rule_work_profile {
+            return;
+        }
+        self.note_candidate_lifecycle(CandidateLifecycleEvent {
+            stage: CandidateLifecycleStage::ParentPublished,
+            elapsed_us: self.lifecycle_elapsed_us(),
+            group,
+            goal: Some(goal),
+            candidate: Some(candidate),
+            logical: self
+                .memo
+                .physical_expr(physical)
+                .map(|expression| expression.key.logical),
+            physical: Some(physical),
+            recipe: Some(recipe),
+            rule: None,
+            children,
+            facts: Box::new([]),
+            expected_cost_bits: Some(cost.score.range.expected.to_bits()),
+            upper_cost_bits: Some(cost.score.range.upper.to_bits()),
+        });
+    }
+
     fn note_safe_candidate(&mut self, candidate: CandidateId) {
         if !self.collect_rule_work_profile || self.search_milestones.first_safe_us.is_some() {
             return;
@@ -2591,6 +2736,9 @@ impl CascadesEngine {
             // evaluation cursor so a stale quality result cannot suppress a
             // re-check after a branch/domain/statistics publication.
             let reads = self.winner_fact_reads(root, &winner)?;
+            let diagnostic_facts = self
+                .collect_rule_work_profile
+                .then(|| reads.reads().to_vec().into_boxed_slice());
             let read_id = self.task_registry.intern_read_set(reads);
             let candidate_key = (goal, winner.candidate, read_id);
             if !self.quality_evaluated_candidates.insert(candidate_key) {
@@ -2736,6 +2884,24 @@ impl CascadesEngine {
                 );
             }
             self.quality_certificates.insert(goal, certificate);
+            if self.collect_rule_work_profile {
+                let frozen = &frozen_winner.frozen;
+                self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                    stage: CandidateLifecycleStage::RootQualified,
+                    elapsed_us: self.lifecycle_elapsed_us(),
+                    group: root,
+                    goal: Some(goal),
+                    candidate: Some(reference.candidate),
+                    logical: Some(frozen.logical.id),
+                    physical: Some(frozen.physical.id),
+                    recipe: Some(frozen.winner.physical_fingerprint),
+                    rule: None,
+                    children: frozen.winner.children.clone(),
+                    facts: diagnostic_facts.unwrap_or_default(),
+                    expected_cost_bits: Some(frozen.winner.cost.score.range.expected.to_bits()),
+                    upper_cost_bits: Some(frozen.winner.cost.score.range.upper.to_bits()),
+                });
+            }
             self.quality_ready_winners.insert(goal, frozen_winner);
             if self
                 .quality_required_goals
@@ -4329,6 +4495,36 @@ impl CascadesEngine {
                         .collect::<BTreeSet<_>>();
                     let changed_cte_readers = self.memo.take_changed_cte_readers();
                     self.note_logical_publication();
+                    if self.collect_rule_work_profile {
+                        let facts = ReadSet::new(
+                            binding_set
+                                .reads
+                                .iter()
+                                .copied()
+                                .chain(application_reads.iter().copied()),
+                        )
+                        .reads()
+                        .to_vec()
+                        .into_boxed_slice();
+                        let elapsed_us = self.lifecycle_elapsed_us();
+                        for (target, inserted) in newly_inserted_expressions.iter().copied() {
+                            self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                                stage: CandidateLifecycleStage::LogicalPublished,
+                                elapsed_us,
+                                group: target,
+                                goal: None,
+                                candidate: None,
+                                logical: Some(inserted),
+                                physical: None,
+                                recipe: None,
+                                rule: Some(rule),
+                                children: Box::new([]),
+                                facts: facts.clone(),
+                                expected_cost_bits: None,
+                                upper_cost_bits: None,
+                            });
+                        }
+                    }
                     self.publish_transformation_task(
                         transformation_task,
                         locally_written_groups
@@ -5685,6 +5881,7 @@ impl CascadesEngine {
             candidate.provided,
         )?;
         let recipe_key = (physical, goal, candidate.physical_fingerprint);
+        let recipe_fingerprint = candidate.physical_fingerprint;
         let child_dependencies = candidate
             .child_goals
             .iter()
@@ -5695,7 +5892,9 @@ impl CascadesEngine {
         // boundary.  The previous order left region admission state behind
         // when the physical/group budget rejected the candidate, and built a
         // throwaway `CostRecipe` for duplicate physical keys.
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.recipes.entry(recipe_key) {
+        let recipe_published = if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.recipes.entry(recipe_key)
+        {
             let sequence = self
                 .next_recipe_sequence
                 .entry((self.memo.canonical_group(group), goal))
@@ -5723,6 +5922,32 @@ impl CascadesEngine {
                 region: candidate.region,
                 certified_local_work,
             }));
+            true
+        } else {
+            false
+        };
+        if recipe_published && self.collect_rule_work_profile {
+            let logical = self
+                .memo
+                .physical_expr(physical)
+                .map(|expression| expression.key.logical);
+            let facts =
+                PatternRead::facts_from_group(&self.memo, group).map(|read| Box::new([read]))?;
+            self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                stage: CandidateLifecycleStage::PhysicalRecipePublished,
+                elapsed_us: self.lifecycle_elapsed_us(),
+                group,
+                goal: Some(goal),
+                candidate: None,
+                logical,
+                physical: Some(physical),
+                recipe: Some(recipe_fingerprint),
+                rule: None,
+                children: Box::new([]),
+                facts,
+                expected_cost_bits: None,
+                upper_cost_bits: None,
+            });
         }
         let owner = self.memo.canonical_group(group);
         self.physical_read_dependencies
@@ -6910,14 +7135,14 @@ impl CascadesEngine {
         state: &mut ChildCombinationState,
         children: &[CandidateId],
         count_recheck: bool,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<(bool, bool, Option<CandidateId>)> {
         let Some(cached) = state.priced.get_mut(children) else {
             return Err(paro_error::internal(
                 "priced child combination disappeared before frontier admission",
             ));
         };
         if cached.admission == CombinationAdmission::Published {
-            return Ok((false, false));
+            return Ok((false, false, None));
         }
         if count_recheck {
             self.child_combination_frontier_recheck_count = self
@@ -6943,7 +7168,7 @@ impl CascadesEngine {
                     false,
                 )?;
                 cached.admission = CombinationAdmission::FrontierRejected { dominator };
-                Ok((false, false))
+                Ok((false, false, None))
             }
             CandidatePreview::Truncated => {
                 self.memo.record_rejected_winner_proposal(
@@ -6953,7 +7178,7 @@ impl CascadesEngine {
                     true,
                 )?;
                 cached.admission = CombinationAdmission::FrontierTruncated;
-                Ok((false, false))
+                Ok((false, false, None))
             }
             CandidatePreview::Publish | CandidatePreview::MustMaterialize => {
                 let before = self
@@ -6980,6 +7205,8 @@ impl CascadesEngine {
                 };
                 let published_before = self.memo.published_winner_count();
                 let selected_changed = self.memo.record_winner(group, goal, winner)?;
+                let published_candidate = (self.memo.published_winner_count() > published_before)
+                    .then(|| CandidateId::new(published_before as usize));
                 cached.admission = if self.memo.published_winner_count() > published_before {
                     CombinationAdmission::Published
                 } else {
@@ -6990,7 +7217,7 @@ impl CascadesEngine {
                     .group(group)
                     .map(|group| group.physical_frontier_version())
                     .unwrap_or(before);
-                Ok((after != before, selected_changed))
+                Ok((after != before, selected_changed, published_candidate))
             }
         }
     }
@@ -7126,13 +7353,37 @@ impl CascadesEngine {
                     children_feasible = false;
                     break;
                 }
-                frontier_out.reserve(frontier.candidates().len());
-                frontier_out.extend(frontier.candidates().iter().map(|winner| ChildWinnerRef {
-                    group: child,
-                    goal: child_goal,
-                    candidate: winner.candidate,
-                }));
+                let frontier_candidates = frontier
+                    .candidates()
+                    .iter()
+                    .map(|winner| ChildWinnerRef {
+                        group: child,
+                        goal: child_goal,
+                        candidate: winner.candidate,
+                    })
+                    .collect::<Vec<_>>();
+                frontier_out.reserve(frontier_candidates.len());
+                frontier_out.extend(frontier_candidates.iter().copied());
                 frontier_out.sort_unstable_by_key(|child| child.candidate);
+                if self.collect_rule_work_profile {
+                    for child_reference in frontier_candidates {
+                        self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                            stage: CandidateLifecycleStage::ChildReady,
+                            elapsed_us: self.lifecycle_elapsed_us(),
+                            group: child,
+                            goal: Some(child_goal),
+                            candidate: Some(child_reference.candidate),
+                            logical: None,
+                            physical: Some(physical),
+                            recipe: Some(recipe.physical_fingerprint),
+                            rule: None,
+                            children: Box::new([child_reference]),
+                            facts: Box::new([]),
+                            expected_cost_bits: None,
+                            upper_cost_bits: None,
+                        });
+                    }
+                }
             }
             if !children_feasible {
                 continue;
@@ -7255,7 +7506,7 @@ impl CascadesEngine {
                     .map(|(children, _)| children.clone())
                     .collect::<Vec<_>>();
                 for children in rechecks {
-                    let (frontier_changed, selected_changed) = self
+                    let (frontier_changed, selected_changed, published_candidate) = self
                         .admit_cached_child_combination(
                             group,
                             goal,
@@ -7266,6 +7517,26 @@ impl CascadesEngine {
                             &children,
                             true,
                         )?;
+                    if let Some(candidate) = published_candidate {
+                        let (child_refs, cost) = combination_state
+                            .priced
+                            .get(&children)
+                            .map(|cached| (cached.children.clone(), cached.cost))
+                            .ok_or_else(|| {
+                                paro_error::internal(
+                                    "published child combination disappeared before timeline recording",
+                                )
+                            })?;
+                        self.note_parent_publication(
+                            group,
+                            goal,
+                            physical,
+                            recipe.physical_fingerprint,
+                            candidate,
+                            child_refs,
+                            cost,
+                        );
+                    }
                     if frontier_changed {
                         self.note_physical_candidate(group, goal, selected_changed)?;
                         self.record_diagnostic_checkpoints();
@@ -7309,7 +7580,7 @@ impl CascadesEngine {
                     continue;
                 }
                 if combination_state.priced.contains_key(&child_ids) {
-                    let (frontier_changed, selected_changed) = self
+                    let (frontier_changed, selected_changed, published_candidate) = self
                         .admit_cached_child_combination(
                             group,
                             goal,
@@ -7320,6 +7591,26 @@ impl CascadesEngine {
                             &child_ids,
                             false,
                         )?;
+                    if let Some(candidate) = published_candidate {
+                        let (child_refs, cost) = combination_state
+                            .priced
+                            .get(&child_ids)
+                            .map(|cached| (cached.children.clone(), cached.cost))
+                            .ok_or_else(|| {
+                                paro_error::internal(
+                                    "published child combination disappeared before timeline recording",
+                                )
+                            })?;
+                        self.note_parent_publication(
+                            group,
+                            goal,
+                            physical,
+                            recipe.physical_fingerprint,
+                            candidate,
+                            child_refs,
+                            cost,
+                        );
+                    }
                     if frontier_changed {
                         self.note_physical_candidate(group, goal, selected_changed)?;
                         self.record_diagnostic_checkpoints();
@@ -7440,6 +7731,23 @@ impl CascadesEngine {
                     continue;
                 };
                 cost = constrained_cost;
+                if self.collect_rule_work_profile {
+                    self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                        stage: CandidateLifecycleStage::TuplePriced,
+                        elapsed_us: self.lifecycle_elapsed_us(),
+                        group,
+                        goal: Some(goal),
+                        candidate: None,
+                        logical: None,
+                        physical: Some(physical),
+                        recipe: Some(recipe.physical_fingerprint),
+                        rule: None,
+                        children: children.clone(),
+                        facts: Box::new([]),
+                        expected_cost_bits: Some(cost.score.range.expected.to_bits()),
+                        upper_cost_bits: Some(cost.score.range.upper.to_bits()),
+                    });
+                }
                 let fingerprint = enforced_fingerprint(
                     recipe.physical_fingerprint,
                     &enforced.steps,
@@ -7457,16 +7765,37 @@ impl CascadesEngine {
                         admission: CombinationAdmission::Pending,
                     },
                 );
-                let (frontier_changed, selected_changed) = self.admit_cached_child_combination(
-                    group,
-                    goal,
-                    physical,
-                    &recipe,
-                    &enforced,
-                    &mut combination_state,
-                    &child_ids,
-                    false,
-                )?;
+                let (frontier_changed, selected_changed, published_candidate) = self
+                    .admit_cached_child_combination(
+                        group,
+                        goal,
+                        physical,
+                        &recipe,
+                        &enforced,
+                        &mut combination_state,
+                        &child_ids,
+                        false,
+                    )?;
+                if let Some(candidate) = published_candidate {
+                    let (child_refs, cost) = combination_state
+                        .priced
+                        .get(&child_ids)
+                        .map(|cached| (cached.children.clone(), cached.cost))
+                        .ok_or_else(|| {
+                            paro_error::internal(
+                                "published child combination disappeared before timeline recording",
+                            )
+                        })?;
+                    self.note_parent_publication(
+                        group,
+                        goal,
+                        physical,
+                        recipe.physical_fingerprint,
+                        candidate,
+                        child_refs,
+                        cost,
+                    );
+                }
                 if frontier_changed {
                     self.note_physical_candidate(group, goal, selected_changed)?;
                     self.record_diagnostic_checkpoints();
@@ -7496,7 +7825,7 @@ impl CascadesEngine {
                     .map(|(children, _)| children.clone())
                     .collect::<Vec<_>>();
                 for children in rechecks {
-                    let (frontier_changed, selected_changed) = self
+                    let (frontier_changed, selected_changed, published_candidate) = self
                         .admit_cached_child_combination(
                             group,
                             goal,
@@ -7507,6 +7836,26 @@ impl CascadesEngine {
                             &children,
                             true,
                         )?;
+                    if let Some(candidate) = published_candidate {
+                        let (child_refs, cost) = combination_state
+                            .priced
+                            .get(&children)
+                            .map(|cached| (cached.children.clone(), cached.cost))
+                            .ok_or_else(|| {
+                                paro_error::internal(
+                                    "published child combination disappeared before timeline recording",
+                                )
+                            })?;
+                        self.note_parent_publication(
+                            group,
+                            goal,
+                            physical,
+                            recipe.physical_fingerprint,
+                            candidate,
+                            child_refs,
+                            cost,
+                        );
+                    }
                     if frontier_changed {
                         self.note_physical_candidate(group, goal, selected_changed)?;
                         self.record_diagnostic_checkpoints();

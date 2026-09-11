@@ -1096,11 +1096,18 @@ impl Optimizer {
                     ("published", profile.published),
                     ("rejected", profile.rejected),
                     ("ineffective", profile.ineffective),
+                    ("root_consumed", profile.root_consumed),
                 ] {
                     let event = format!("rule.{rule_name}.{phase}");
                     trace.record_value("optimizer", &event, count);
                 }
                 for (phase, elapsed) in [
+                    ("first_enqueued_us", profile.first_enqueued_us),
+                    (
+                        "first_dependencies_ready_us",
+                        profile.first_dependencies_ready_us,
+                    ),
+                    ("first_run_us", profile.first_run_us),
                     ("first_discovered_us", profile.first_discovered_us),
                     ("first_matched_us", profile.first_matched_us),
                     ("first_applicable_us", profile.first_applicable_us),
@@ -1155,6 +1162,172 @@ impl Optimizer {
             ] {
                 if let Some(candidate) = candidate {
                     trace.record_value("optimizer", name, candidate.index() as u64);
+                }
+            }
+            trace.record_value(
+                "optimizer",
+                "candidate_lifecycle_event_count",
+                extraction.search_milestones.candidate_lifecycle.len() as u64,
+            );
+            trace.record_value(
+                "optimizer",
+                "candidate_lifecycle_event_dropped",
+                extraction.search_milestones.candidate_lifecycle_dropped,
+            );
+            for (stage, (stored, dropped)) in extraction
+                .search_milestones
+                .candidate_lifecycle_stage_stored
+                .iter()
+                .zip(
+                    extraction
+                        .search_milestones
+                        .candidate_lifecycle_stage_dropped
+                        .iter(),
+                )
+                .enumerate()
+            {
+                trace.record_value(
+                    "optimizer",
+                    &format!("candidate_lifecycle_stage_{stage}.stored"),
+                    *stored,
+                );
+                trace.record_value(
+                    "optimizer",
+                    &format!("candidate_lifecycle_stage_{stage}.dropped"),
+                    *dropped,
+                );
+            }
+            for (event_index, event) in extraction
+                .search_milestones
+                .candidate_lifecycle
+                .iter()
+                .enumerate()
+            {
+                let prefix = format!("candidate_lifecycle_{event_index}");
+                trace.record_value("optimizer", &format!("{prefix}.stage"), event.stage as u64);
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.elapsed_us"),
+                    event.elapsed_us,
+                );
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.group"),
+                    event.group.0 as u64,
+                );
+                if let Some(goal) = event.goal {
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{prefix}.goal_required"),
+                        goal.required.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{prefix}.goal_grant"),
+                        goal.grant.stable_tag(),
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{prefix}.goal_context"),
+                        goal.context.0 as u64,
+                    );
+                }
+                for (name, value) in [
+                    (
+                        "candidate",
+                        event.candidate.map(|value| value.index() as u64),
+                    ),
+                    ("logical", event.logical.map(|value| value.index() as u64)),
+                    ("physical", event.physical.map(|value| value.index() as u64)),
+                    ("rule", event.rule.map(|value| value.0 as u64)),
+                ] {
+                    if let Some(value) = value {
+                        trace.record_value("optimizer", &format!("{prefix}.{name}"), value);
+                    }
+                }
+                if let Some(recipe) = event.recipe {
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{prefix}.recipe_lo"),
+                        recipe.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{prefix}.recipe_hi"),
+                        (recipe.0 >> 64) as u64,
+                    );
+                }
+                if let Some(cost) = event.expected_cost_bits {
+                    trace.record_value("optimizer", &format!("{prefix}.expected_cost_bits"), cost);
+                }
+                if let Some(cost) = event.upper_cost_bits {
+                    trace.record_value("optimizer", &format!("{prefix}.upper_cost_bits"), cost);
+                }
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.child_count"),
+                    event.children.len() as u64,
+                );
+                for (child_index, child) in event.children.iter().enumerate() {
+                    let child_prefix = format!("{prefix}.child_{child_index}");
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{child_prefix}.group"),
+                        child.group.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{child_prefix}.candidate"),
+                        child.candidate.index() as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{child_prefix}.goal_required"),
+                        child.goal.required.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{child_prefix}.goal_grant"),
+                        child.goal.grant.stable_tag(),
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{child_prefix}.goal_context"),
+                        child.goal.context.0 as u64,
+                    );
+                }
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.fact_count"),
+                    event.facts.len() as u64,
+                );
+                for (fact_index, fact) in event.facts.iter().enumerate() {
+                    let fact_prefix = format!("{prefix}.fact_{fact_index}");
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{fact_prefix}.group"),
+                        fact.group.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{fact_prefix}.logical_fact_lo"),
+                        fact.logical_fact_fingerprint.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{fact_prefix}.logical_fact_hi"),
+                        (fact.logical_fact_fingerprint.0 >> 64) as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{fact_prefix}.statistics_lo"),
+                        fact.statistics_snapshot_fingerprint.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{fact_prefix}.statistics_hi"),
+                        (fact.statistics_snapshot_fingerprint.0 >> 64) as u64,
+                    );
                 }
             }
             for checkpoint in &extraction.search_milestones.search_checkpoints {
@@ -1312,6 +1485,18 @@ impl Optimizer {
                         trace.record_value(
                             "optimizer",
                             &format!("{choice_prefix}.rule_{rule_index}"),
+                            rule.0 as u64,
+                        );
+                    }
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.selected_rule_count"),
+                        choice.selected_rules.len() as u64,
+                    );
+                    for (rule_index, rule) in choice.selected_rules.iter().enumerate() {
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{choice_prefix}.selected_rule_{rule_index}"),
                             rule.0 as u64,
                         );
                     }
