@@ -479,10 +479,7 @@ fn quality_publication_promotes_only_its_local_followup_lane() {
             _ => None,
         })
         .expect("quality rule must be scheduled");
-    assert_eq!(
-        promoted_quality_stage,
-        QualityDependency::NarrowAggregate.stage()
-    );
+    assert_eq!(promoted_quality_stage, 0);
     let ordinary_rule_stage = promoted
         .tasks
         .iter()

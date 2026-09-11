@@ -726,6 +726,19 @@ pub struct CandidateLifecycleEvent {
     pub group: GroupId,
     pub goal: Option<OptimizationGoal>,
     pub candidate: Option<CandidateId>,
+    /// Source logical expression whose transformation produced `logical`.
+    /// This is only populated for logical-publication events; it lets the
+    /// diagnostic timeline follow the exact same-Memo dependency edge rather
+    /// than attributing a late output to a rule family alone.
+    pub source: Option<LogicalExprId>,
+    /// Stable identity of the exact pattern binding consumed by the rule.
+    /// This distinguishes multiple child-shell matches of one source
+    /// expression without exposing a mutable frontier ordinal.
+    pub binding: Option<Fingerprint>,
+    /// Direct child expression selected by the binding, when the matched
+    /// shell has one.  It is diagnostic provenance only; the Memo remains the
+    /// source of truth for the candidate's actual choices.
+    pub source_child: Option<LogicalExprId>,
     pub logical: Option<LogicalExprId>,
     pub physical: Option<PhysicalExprId>,
     pub recipe: Option<Fingerprint>,
@@ -2644,6 +2657,9 @@ impl CascadesEngine {
             group,
             goal: Some(goal),
             candidate: Some(candidate),
+            source: None,
+            binding: None,
+            source_child: None,
             logical: self
                 .memo
                 .physical_expr(physical)
@@ -2892,6 +2908,9 @@ impl CascadesEngine {
                     group: root,
                     goal: Some(goal),
                     candidate: Some(reference.candidate),
+                    source: None,
+                    binding: None,
+                    source_child: None,
                     logical: Some(frozen.logical.id),
                     physical: Some(frozen.physical.id),
                     recipe: Some(frozen.winner.physical_fingerprint),
@@ -4464,6 +4483,14 @@ impl CascadesEngine {
                                 group: target,
                                 goal: None,
                                 candidate: None,
+                                source: Some(expression),
+                                binding: Some(binding.fingerprint),
+                                source_child: match &binding.root {
+                                    PatternOperand::Expression { children, .. } => {
+                                        children.first().and_then(PatternOperand::expression)
+                                    }
+                                    PatternOperand::Group(_) => None,
+                                },
                                 logical: Some(inserted),
                                 physical: None,
                                 recipe: None,
@@ -5296,21 +5323,25 @@ impl CascadesEngine {
         Ok(())
     }
 
-    /// Return the semantic dependency lane for one transformation task. A
-    /// task is promoted only when the publication which woke it is one of its
-    /// observed dependencies. Initial work and unrelated work stay on the
-    /// ordinary lane; a missing declaration is still searched and never
-    /// becomes an implicit quality barrier.
+    /// Return the local quality lane for one transformation task. A task is
+    /// promoted only when the publication which woke it is one of its
+    /// observed dependencies. All promoted tasks share one lane: encoding the
+    /// semantic dependency stage in the first agenda key created a global
+    /// barrier, so a late JoinRegion task waited for every unrelated demand,
+    /// domain, and aggregate task in the Memo. The dependency declaration is
+    /// still used to decide which publications may promote a task; it is not a
+    /// cross-group phase barrier. Initial work and unrelated work stay on the
+    /// ordinary lane, and a missing declaration is still searched rather than
+    /// becoming an implicit quality barrier.
     fn quality_stage_for_rule(&self, rule: &dyn TransformationRule, promoted: bool) -> u8 {
         if !self.quality_handoff_enabled {
             return 0;
         }
-        promoted
-            .then(|| {
-                rule.quality_dependency()
-                    .map_or(u8::MAX, |dependency| dependency.stage())
-            })
-            .unwrap_or(u8::MAX)
+        if promoted && rule.quality_dependency().is_some() {
+            0
+        } else {
+            u8::MAX
+        }
     }
 
     fn schedule_transformation_expression(
@@ -5928,6 +5959,9 @@ impl CascadesEngine {
                 group,
                 goal: Some(goal),
                 candidate: None,
+                source: None,
+                binding: None,
+                source_child: None,
                 logical,
                 physical: Some(physical),
                 recipe: Some(recipe_fingerprint),
@@ -7362,6 +7396,9 @@ impl CascadesEngine {
                             group: child,
                             goal: Some(child_goal),
                             candidate: Some(child_reference.candidate),
+                            source: None,
+                            binding: None,
+                            source_child: None,
                             logical: None,
                             physical: Some(physical),
                             recipe: Some(recipe.physical_fingerprint),
@@ -7727,6 +7764,9 @@ impl CascadesEngine {
                         group,
                         goal: Some(goal),
                         candidate: None,
+                        source: None,
+                        binding: None,
+                        source_child: None,
                         logical: None,
                         physical: Some(physical),
                         recipe: Some(recipe.physical_fingerprint),

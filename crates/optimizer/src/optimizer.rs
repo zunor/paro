@@ -1118,6 +1118,14 @@ impl Optimizer {
                         trace.record_value("optimizer", &event, elapsed);
                     }
                 }
+                if let Some(elapsed) = extraction.rule_elapsed.get(rule) {
+                    let event = format!("rule.{rule_name}.elapsed_us");
+                    trace.record_value(
+                        "optimizer",
+                        &event,
+                        u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                    );
+                }
             }
             for (name, elapsed) in [
                 ("first_safe_us", extraction.search_milestones.first_safe_us),
@@ -1237,6 +1245,11 @@ impl Optimizer {
                         "candidate",
                         event.candidate.map(|value| value.index() as u64),
                     ),
+                    ("source", event.source.map(|value| value.index() as u64)),
+                    (
+                        "source_child",
+                        event.source_child.map(|value| value.index() as u64),
+                    ),
                     ("logical", event.logical.map(|value| value.index() as u64)),
                     ("physical", event.physical.map(|value| value.index() as u64)),
                     ("rule", event.rule.map(|value| value.0 as u64)),
@@ -1255,6 +1268,18 @@ impl Optimizer {
                         "optimizer",
                         &format!("{prefix}.recipe_hi"),
                         (recipe.0 >> 64) as u64,
+                    );
+                }
+                if let Some(binding) = event.binding {
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{prefix}.binding_lo"),
+                        binding.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{prefix}.binding_hi"),
+                        (binding.0 >> 64) as u64,
                     );
                 }
                 if let Some(cost) = event.expected_cost_bits {
