@@ -47,14 +47,16 @@ use super::cost::ResourceDimension;
 use super::cost::{CompactRange, ScoreSummary, SearchCost};
 use super::engine::{CascadesEngine, PricedIncumbent, SearchMode, SearchStopReason, SeedPlan};
 use super::ids::{
-    AdmissibleGrantSetId, BaseRelationId, ColumnId, Fingerprint, GroupId, ImplementationId,
-    LogicalExprId, LogicalPayloadId, OpClassId, OptimizationContextId, PhysicalPayloadId,
-    PropertySetId, QualityPolicyId, RuleId, ScalarExprId, SnapshotId, StableFingerprintBuilder,
+    AdmissibleGrantSetId, BaseRelationId, CandidateId, ColumnId, Fingerprint, GroupId,
+    ImplementationId, LogicalExprId, LogicalPayloadId, OpClassId, OptimizationContextId,
+    PhysicalExprId, PhysicalPayloadId, PropertySetId, QualityPolicyId, RuleId, ScalarExprId,
+    SnapshotId, StableFingerprintBuilder,
 };
 use super::memo::{
-    CardinalityEnvelope, CardinalityRecipeKind, CteReferenceDomain, EquivalenceProof, GrantGoalKey,
-    GroupCardinality, GroupColumnDomain, LogicalExprKey, LogicalProperties, Memo,
-    OptimizationContext, OptimizationGoal, PhysicalExprKey, RowGoal,
+    CardinalityEnvelope, CardinalityRecipeKind, ChildWinnerRef, CteReferenceDomain,
+    EquivalenceProof, FrozenCandidate, GrantGoalKey, GroupCardinality, GroupColumnDomain,
+    LogicalExprKey, LogicalProperties, Memo, OptimizationContext, OptimizationGoal,
+    PhysicalExprKey, RowGoal,
 };
 use super::properties::{
     MutationSafetyRequirement, NullOrder, OrderingKey, OrderingRequirement, OrderingScope,
@@ -62,6 +64,10 @@ use super::properties::{
     ProvidedPartitioning, ProvidedProperties, ProvidedReplayability, ProvidedRepresentation,
     ReplayabilityRequirement, RepresentationRequirement, RequiredOrdering, RequiredProperties,
     ResultGuarantee, SortDirection,
+};
+use super::quality::{
+    BundleCapability, BundleFact, NativeQualityEvidence, QualityEvidenceProvider,
+    QualityPolicyStatus,
 };
 use super::region::{
     FacetCriticality, RegionArtifactDependencyContract, RegionArtifactKind, RegionBoundaryEndpoint,
@@ -122,6 +128,496 @@ const PLANNER_HASH_JOIN_BUILD_LEFT: ImplementationId = ImplementationId(10);
 pub(super) const PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER: ImplementationId =
     ImplementationId(11);
 const COST_OPTIMIZED_SEARCH_POLICY: QualityPolicyId = QualityPolicyId(1);
+
+/// Planner-owned producer for the same-Memo quality handoff. It inspects the
+/// exact frozen DAG and planner payload arena; it never creates alternatives
+/// or imports an owned logical tree into the search Memo.
+#[derive(Debug)]
+struct PlannerQualityEvidenceProvider {
+    state: Arc<RwLock<PlannerTransformState>>,
+}
+
+impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
+    fn evidence(
+        &self,
+        memo: &Memo,
+        reference: ChildWinnerRef,
+        frozen: &FrozenCandidate,
+        goal: OptimizationGoal,
+    ) -> Result<Option<NativeQualityEvidence>> {
+        let state = self.state.read().expect("planner transform state poisoned");
+        let Some(required) = memo.required(goal.required) else {
+            return Ok(None);
+        };
+        let mut capabilities = BTreeSet::new();
+        let mut facts = BTreeSet::new();
+        let mut choices = Vec::new();
+        let mut rules = BTreeSet::new();
+        let mut has_filter = false;
+        let mut has_get = false;
+        let mut has_join = false;
+        let mut has_join_region = false;
+        let mut has_aggregate = false;
+        let mut has_cte_consumer = false;
+        let mut has_cte_producer = false;
+        let mut has_ordering = false;
+        let mut has_graph = false;
+        let mut has_dependent = false;
+        let mut exact_contract = true;
+        let mut visited = BTreeSet::new();
+
+        fn visit(
+            frozen: &FrozenCandidate,
+            state: &PlannerTransformState,
+            choices: &mut Vec<Fingerprint>,
+            rules: &mut BTreeSet<RuleId>,
+            has_filter: &mut bool,
+            has_get: &mut bool,
+            has_join: &mut bool,
+            has_join_region: &mut bool,
+            has_aggregate: &mut bool,
+            has_cte_consumer: &mut bool,
+            has_cte_producer: &mut bool,
+            has_ordering: &mut bool,
+            has_graph: &mut bool,
+            has_dependent: &mut bool,
+            exact_contract: &mut bool,
+            visited: &mut BTreeSet<CandidateId>,
+        ) -> Result<()> {
+            if !visited.insert(frozen.reference.candidate) {
+                return Ok(());
+            }
+            if frozen.physical.id != frozen.winner.expression
+                || frozen.logical.id != frozen.physical.key.logical
+                || frozen.children.len() != frozen.winner.children.len()
+                || frozen
+                    .children
+                    .iter()
+                    .zip(frozen.winner.children.iter())
+                    .any(|(child, reference)| child.reference != *reference)
+            {
+                return Ok(());
+            }
+            let Some(metadata) = state.metadata.get(&frozen.logical.payload) else {
+                return Ok(());
+            };
+            if state
+                .payloads
+                .get_physical(frozen.physical.payload)
+                .is_none()
+            {
+                return Ok(());
+            }
+            let mut choice = StableFingerprintBuilder::default();
+            choice.write_bytes(b"paro.quality.frozen-choice.v1");
+            choice.write_u64(frozen.reference.group.0 as u64);
+            choice.write_u64(frozen.reference.candidate.index() as u64);
+            choice.write_u64(frozen.reference.goal.required.0 as u64);
+            choice.write_u64(frozen.reference.goal.grant.stable_tag());
+            choice.write_u64(frozen.reference.goal.row_goal.stable_tag());
+            choice.write_u64(frozen.reference.goal.objective.stable_tag());
+            choice.write_u64(frozen.reference.goal.context.0 as u64);
+            choice.write_fingerprint(frozen.logical.key.stable_fingerprint());
+            choice.write_fingerprint(frozen.physical.key.stable_fingerprint());
+            choice.write_fingerprint(frozen.winner.physical_fingerprint);
+            choice.write_u64(frozen.logical.payload.0 as u64);
+            choice.write_u64(frozen.physical.payload.0 as u64);
+            choice.write_u64(frozen.winner.children.len() as u64);
+            for child in frozen.winner.children.iter() {
+                choice.write_u64(child.group.0 as u64);
+                choice.write_u64(child.candidate.index() as u64);
+                choice.write_u64(child.goal.required.0 as u64);
+                choice.write_u64(child.goal.grant.stable_tag());
+                choice.write_u64(child.goal.context.0 as u64);
+            }
+            choices.push(choice.finish());
+            rules.extend(frozen.logical.applied_rules.iter().copied());
+            if let Some(rule) = metadata.origin_rule {
+                rules.insert(rule);
+            }
+            *exact_contract &= frozen.winner.provided.result_guarantee == ResultGuarantee::Exact
+                && metadata.provided.result_guarantee == ResultGuarantee::Exact;
+            match metadata.operator_type {
+                LogicalOperatorType::Filter | LogicalOperatorType::FullTextFilterScan => {
+                    *has_filter = true
+                }
+                LogicalOperatorType::Get
+                | LogicalOperatorType::SearchScan
+                | LogicalOperatorType::TableFunctionGet => *has_get = true,
+                LogicalOperatorType::ComparisonJoin
+                | LogicalOperatorType::AnyJoin
+                | LogicalOperatorType::CrossProduct => {
+                    *has_join = true;
+                    *has_join_region |= frozen.winner.joint_cost_proof.is_some();
+                }
+                LogicalOperatorType::Aggregate => *has_aggregate = true,
+                LogicalOperatorType::CTERef => *has_cte_consumer = true,
+                LogicalOperatorType::MaterializedCTE | LogicalOperatorType::RecursiveCTE => {
+                    *has_cte_producer = true
+                }
+                LogicalOperatorType::Order | LogicalOperatorType::TopN => *has_ordering = true,
+                LogicalOperatorType::DependentJoin => *has_dependent = true,
+                LogicalOperatorType::GraphMatch
+                | LogicalOperatorType::GraphScan
+                | LogicalOperatorType::GraphExpand
+                | LogicalOperatorType::CreatePropertyGraph => *has_graph = true,
+                _ => {}
+            }
+            for child in frozen.children.iter() {
+                visit(
+                    child,
+                    state,
+                    choices,
+                    rules,
+                    has_filter,
+                    has_get,
+                    has_join,
+                    has_join_region,
+                    has_aggregate,
+                    has_cte_consumer,
+                    has_cte_producer,
+                    has_ordering,
+                    has_graph,
+                    has_dependent,
+                    exact_contract,
+                    visited,
+                )?;
+            }
+            Ok(())
+        }
+
+        visit(
+            frozen,
+            &state,
+            &mut choices,
+            &mut rules,
+            &mut has_filter,
+            &mut has_get,
+            &mut has_join,
+            &mut has_join_region,
+            &mut has_aggregate,
+            &mut has_cte_consumer,
+            &mut has_cte_producer,
+            &mut has_ordering,
+            &mut has_graph,
+            &mut has_dependent,
+            &mut exact_contract,
+            &mut visited,
+        )?;
+        if !exact_contract || choices.is_empty() {
+            return Ok(None);
+        }
+
+        let has_any = |candidates: &[RuleId]| candidates.iter().any(|rule| rules.contains(rule));
+        if frozen.winner.provided.satisfies(required) {
+            facts.insert(BundleFact::OutputDemand);
+        }
+        if has_filter
+            && has_get
+            && has_any(&[
+                PREDICATE_TRANSFER_RULE,
+                KEY_DOMAIN_TRANSFER_RULE,
+                CTE_FILTER_PUSHDOWN_RULE,
+            ])
+        {
+            facts.insert(BundleFact::PredicateDomain);
+        }
+        if has_join && has_join_region {
+            facts.insert(BundleFact::JoinRegion);
+        }
+        if has_aggregate
+            && has_any(&[
+                AGGREGATE_DIMENSION_DEFERRAL_RULE,
+                AGGREGATE_DIMENSION_SHARING_RULE,
+                AGGREGATE_INPUT_MATERIALIZATION_RULE,
+                AGGREGATE_JOIN_PREAGGREGATION_RULE,
+                AGGREGATE_JOIN_SUBSUMPTION_RULE,
+                AGGREGATE_POST_REDUCTION_RULE,
+            ])
+        {
+            facts.insert(BundleFact::AggregateDecomposition);
+        }
+        if has_cte_consumer
+            && has_cte_producer
+            && has_any(&[
+                CTE_DEMAND_PUSHDOWN_RULE,
+                CTE_FILTER_PUSHDOWN_RULE,
+                CTE_PARTITIONED_MATERIALIZATION_RULE,
+            ])
+        {
+            facts.insert(BundleFact::CteConsumerDemand);
+        }
+        if exact_contract && (has_aggregate || has_join) {
+            facts.insert(BundleFact::NullSemantics);
+        }
+        if exact_contract {
+            facts.insert(BundleFact::ProviderCapability);
+        }
+        if matches!(
+            frozen.winner.provided.ordering,
+            ProvidedOrdering::Ordered { .. }
+        ) {
+            facts.insert(BundleFact::OrderingDemand);
+        }
+
+        if has_filter && has_get {
+            capabilities.insert(BundleCapability::ScanPredicate);
+        }
+        if has_join {
+            capabilities.insert(BundleCapability::SmallJoin);
+        }
+        if has_aggregate && has_cte_consumer && has_cte_producer {
+            capabilities.insert(BundleCapability::SharedAggregate);
+        }
+        if has_dependent {
+            capabilities.insert(BundleCapability::CorrelatedSubquery);
+        }
+        if has_ordering {
+            capabilities.insert(BundleCapability::Ordering);
+        }
+        if has_graph {
+            capabilities.insert(BundleCapability::GraphProvider);
+        }
+
+        let mut region = StableFingerprintBuilder::default();
+        region.write_bytes(b"paro.quality.native-region.v1");
+        region.write_u64(reference.group.0 as u64);
+        region.write_u64(reference.candidate.index() as u64);
+        region.write_fingerprint(frozen.winner.physical_fingerprint);
+        for choice in &choices {
+            region.write_fingerprint(*choice);
+        }
+        let region = region.finish();
+        let mut proof = StableFingerprintBuilder::default();
+        proof.write_bytes(b"paro.quality.native-evidence.v1");
+        proof.write_fingerprint(region);
+        proof.write_u64(rules.len() as u64);
+        for rule in &rules {
+            proof.write_u64(rule.0 as u64);
+        }
+        proof.write_u64(capabilities.len() as u64);
+        proof.write_u64(facts.len() as u64);
+        Ok(Some(NativeQualityEvidence {
+            capabilities,
+            facts,
+            region,
+            applicability_proof: proof.finish(),
+            choices: choices.into_boxed_slice(),
+        }))
+    }
+}
+
+fn record_frozen_candidate_trace(
+    trace: &paro_context::StatementTrace,
+    memo: &Memo,
+    prefix: &str,
+    frozen: &FrozenCandidate,
+) -> Result<()> {
+    let mut choices = Vec::new();
+    let mut reads = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    fn visit(
+        memo: &Memo,
+        frozen: &FrozenCandidate,
+        choices: &mut Vec<(
+            ChildWinnerRef,
+            LogicalExprId,
+            PhysicalExprId,
+            Fingerprint,
+            u32,
+            u32,
+            Box<[ChildWinnerRef]>,
+            Box<[RuleId]>,
+        )>,
+        reads: &mut BTreeSet<PatternRead>,
+        visited: &mut BTreeSet<CandidateId>,
+    ) -> Result<()> {
+        if !visited.insert(frozen.reference.candidate) {
+            return Ok(());
+        }
+        choices.push((
+            frozen.reference,
+            frozen.logical.id,
+            frozen.physical.id,
+            frozen.winner.physical_fingerprint,
+            frozen.logical.payload.0,
+            frozen.physical.payload.0,
+            frozen.winner.children.clone(),
+            frozen.logical.applied_rules.iter().copied().collect(),
+        ));
+        reads.insert(PatternRead::facts_from_group(memo, frozen.reference.group)?);
+        for child in frozen.children.iter() {
+            visit(memo, child, choices, reads, visited)?;
+        }
+        Ok(())
+    }
+    visit(memo, frozen, &mut choices, &mut reads, &mut visited)?;
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.choice_count"),
+        choices.len() as u64,
+    );
+    for (
+        index,
+        (
+            reference,
+            logical,
+            physical,
+            physical_fingerprint,
+            logical_payload,
+            physical_payload,
+            children,
+            rules,
+        ),
+    ) in choices.iter().enumerate()
+    {
+        let choice_prefix = format!("{prefix}.choice_{index}");
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.group"),
+            reference.group.0 as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.candidate"),
+            reference.candidate.index() as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.goal_required"),
+            reference.goal.required.0 as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.goal_grant"),
+            reference.goal.grant.stable_tag(),
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.goal_context"),
+            reference.goal.context.0 as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.logical"),
+            logical.index() as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.physical"),
+            physical.index() as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.logical_payload"),
+            *logical_payload as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.physical_payload"),
+            *physical_payload as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.physical_fingerprint_lo"),
+            physical_fingerprint.0 as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.physical_fingerprint_hi"),
+            (physical_fingerprint.0 >> 64) as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.child_count"),
+            children.len() as u64,
+        );
+        for (child_index, child) in children.iter().enumerate() {
+            let child_prefix = format!("{choice_prefix}.child_{child_index}");
+            trace.record_value(
+                "optimizer",
+                &format!("{child_prefix}.group"),
+                child.group.0 as u64,
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{child_prefix}.candidate"),
+                child.candidate.index() as u64,
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{child_prefix}.goal_required"),
+                child.goal.required.0 as u64,
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{child_prefix}.goal_grant"),
+                child.goal.grant.stable_tag(),
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{child_prefix}.goal_context"),
+                child.goal.context.0 as u64,
+            );
+        }
+        trace.record_value(
+            "optimizer",
+            &format!("{choice_prefix}.rule_count"),
+            rules.len() as u64,
+        );
+        for (rule_index, rule) in rules.iter().enumerate() {
+            trace.record_value(
+                "optimizer",
+                &format!("{choice_prefix}.rule_{rule_index}"),
+                rule.0 as u64,
+            );
+        }
+    }
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.fact_read_count"),
+        reads.len() as u64,
+    );
+    for (index, read) in reads.iter().enumerate() {
+        let read_prefix = format!("{prefix}.fact_read_{index}");
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.group"),
+            read.group.0 as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.logical_frontier_present"),
+            u64::from(read.logical_frontier_revision.is_some()),
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.physical_frontier_present"),
+            u64::from(read.physical_frontier_revision.is_some()),
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.logical_fact_lo"),
+            read.logical_fact_fingerprint.0 as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.logical_fact_hi"),
+            (read.logical_fact_fingerprint.0 >> 64) as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.statistics_lo"),
+            read.statistics_snapshot_fingerprint.0 as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.statistics_hi"),
+            (read.statistics_snapshot_fingerprint.0 >> 64) as u64,
+        );
+    }
+    Ok(())
+}
 
 struct SearchStagingRequest<'a> {
     plan: OwnedLogicalPlan,
@@ -390,6 +886,14 @@ impl OptimizationInput {
             self.force_spill,
         )?;
         let mut engine = CascadesEngine::new(self.memo, registry);
+        let quality_handoff = std::env::var_os("PARO_QUALITY_POLICY_HANDOFF")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        if quality_handoff {
+            engine.set_quality_policy_handoff_enabled(true);
+            engine.set_quality_evidence_provider(Arc::new(PlannerQualityEvidenceProvider {
+                state: self.planner_state.clone(),
+            }));
+        }
         engine.prime_grant_context(grant_classes.values().copied())?;
         let strong_incumbent_plans = self.strong_incumbent_plans.clone();
         let prepriced_strong_incumbents = std::mem::take(&mut self.prepriced_strong_incumbents);
@@ -539,8 +1043,21 @@ impl OptimizationInput {
         let extraction_started = Instant::now();
         let mut variants = Vec::with_capacity(grant_optimization.winners.len());
         debug!(target: targets::OPTIMIZER, groups = engine.memo().group_count(), attempts = ?engine.rule_attempts(), insertions = ?engine.effective_rule_insertions(), "completed Memo search work");
-        for grant_winner in grant_optimization.winners {
+        for (winner_index, grant_winner) in
+            IntoIterator::into_iter(grant_optimization.winners).enumerate()
+        {
             let winner = &grant_winner.winner;
+            if let Some(trace) = statement_context
+                .as_ref()
+                .and_then(|context| context.statement_trace())
+            {
+                record_frozen_candidate_trace(
+                    &trace,
+                    engine.memo(),
+                    &format!("final_winner_{winner_index}"),
+                    &grant_winner.frozen,
+                )?;
+            }
             if winner.provided.result_guarantee != ResultGuarantee::Exact {
                 let required = engine
                     .memo()
@@ -616,6 +1133,7 @@ impl OptimizationInput {
                 SearchStopReason::Deadline => "search_stop_deadline",
                 SearchStopReason::BudgetLimited => "search_stop_budget_limited",
                 SearchStopReason::RuleFailure => "search_stop_rule_failure",
+                SearchStopReason::QualityPolicySatisfied => "quality_policy_satisfied",
             };
             trace.record_event("optimizer", stop_event);
             if stop.budget_limited {
@@ -648,10 +1166,56 @@ impl OptimizationInput {
                     "search_handoff_extraction_us",
                     search_milestones.handoff_extraction_us,
                 ),
+                (
+                    "quality_policy_satisfied_us",
+                    search_milestones.quality_policy_satisfied_us,
+                ),
             ] {
                 if let Some(value) = value {
                     trace.record_value("optimizer", name, value);
                 }
+            }
+            if let Some(candidate) = search_milestones.quality_policy_candidate {
+                trace.record_value(
+                    "optimizer",
+                    "quality_policy_candidate",
+                    candidate.index() as u64,
+                );
+            }
+            let quality_evaluation = engine.quality_last_evaluation();
+            trace.record_value(
+                "optimizer",
+                "quality_last_completed_bundle_count",
+                quality_evaluation.completed,
+            );
+            trace.record_value(
+                "optimizer",
+                "quality_last_not_applicable_bundle_count",
+                quality_evaluation.not_applicable,
+            );
+            trace.record_value(
+                "optimizer",
+                "quality_last_missing_bundle_count",
+                quality_evaluation.missing_evidence,
+            );
+            trace.record_value(
+                "optimizer",
+                "quality_last_missing_fact_count",
+                quality_evaluation.missing_facts,
+            );
+            for (index, bundle) in quality_evaluation.missing_bundles.iter().enumerate() {
+                trace.record_value(
+                    "optimizer",
+                    &format!("quality_last_missing_bundle_{index}"),
+                    bundle.0 as u64,
+                );
+            }
+            for (index, fact) in quality_evaluation.missing_fact_kinds.iter().enumerate() {
+                trace.record_value(
+                    "optimizer",
+                    &format!("quality_last_missing_fact_{index}"),
+                    fact.stable_tag(),
+                );
             }
         }
         let mut work_counters = engine.search_work_counters();
@@ -726,6 +1290,8 @@ impl OptimizationInput {
             rule_work_profile,
             search_milestones,
             search_summary,
+            search_stop: stop,
+            quality_policy_status: engine.quality_policy_status(),
             strong_incumbent_plans,
             strong_incumbent_logical_plans,
             strong_incumbent_reprice_us: seed_reprice_us,
@@ -753,6 +1319,10 @@ pub struct OptimizationOutput {
     pub rule_work_profile: BTreeMap<RuleId, super::engine::RuleWorkProfile>,
     pub search_milestones: super::engine::SearchMilestones,
     pub search_summary: SearchSummary,
+    /// Search stop is explicit so a policy handoff is not mistaken for
+    /// ProofComplete or a deadline/budget stop.
+    pub search_stop: super::engine::SearchStop,
+    pub quality_policy_status: QualityPolicyStatus,
     /// Exported only when `PARO_EXPORT_STRONG_INCUMBENT=1`; diagnostic/setup
     /// callers can feed these immutable seeds to a fresh Memo.
     pub strong_incumbent_plans: Box<[SeedPlan]>,

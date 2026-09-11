@@ -22,7 +22,7 @@ use super::governor::{Governor, PlanMilestone, PlanningPolicy};
 use super::grant::{derive_grant_sensitivity, verify_grant_sharing, GrantSensitivitySummary};
 use super::ids::{
     AdmissibleGrantSetId, CandidateId, Fingerprint, GroupId, ImplementationId, LogicalExprId,
-    PhysicalExprId, ResourceGrantClassId, RuleId, StableFingerprintBuilder,
+    PhysicalExprId, QualityPolicyId, ResourceGrantClassId, RuleId, StableFingerprintBuilder,
 };
 use super::memo::{
     CandidatePreview, CandidateSummary, ChildWinnerRef, EquivalenceProof, FrozenCandidate,
@@ -32,7 +32,10 @@ use super::properties::{
     MaterializationRequirement, MutationSafetyRequirement, OrderingRequirement, OrderingScope,
     PartitioningRequirement, ReplayabilityRequirement, RepresentationRequirement, ResultGuarantee,
 };
-use super::quality::QualityBundleRegistry;
+use super::quality::{
+    PReadyCertificate, QualityBundleRegistry, QualityEvaluationSummary, QualityEvidenceProvider,
+    QualityPolicyStatus,
+};
 use super::region::{
     JointCostProof, RegionArtifactKind, RegionBoundaryEndpoint, RegionCandidateContract,
     RegionDependencyEdge, RegionDependencyKind,
@@ -65,6 +68,10 @@ pub enum SearchStopReason {
     Deadline,
     BudgetLimited,
     RuleFailure,
+    /// A policy-certified executable candidate was handed to extraction.
+    /// This is intentionally not search completeness: Memo obligations may
+    /// remain and are still reported to the caller.
+    QualityPolicySatisfied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,6 +611,21 @@ pub struct RuleWorkProfile {
     pub first_published_us: Option<u64>,
 }
 
+/// Exact selected-DAG evidence captured at a diagnostic search checkpoint.
+/// Candidate IDs alone are not sufficient because they do not identify the
+/// child choices, payloads, or rule products that made a plan executable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenChoice {
+    pub reference: ChildWinnerRef,
+    pub logical: LogicalExprId,
+    pub physical: PhysicalExprId,
+    pub logical_payload: u32,
+    pub physical_payload: u32,
+    pub physical_fingerprint: Fingerprint,
+    pub children: Box<[ChildWinnerRef]>,
+    pub rules: Box<[RuleId]>,
+}
+
 const SEARCH_CHECKPOINT_TARGETS_MS: [u64; 5] = [5, 10, 20, 50, 100];
 
 /// A diagnostic-only snapshot of the currently selected root candidate at a
@@ -612,7 +634,7 @@ const SEARCH_CHECKPOINT_TARGETS_MS: [u64; 5] = [5, 10, 20, 50, 100];
 /// than being presented as an exact stop point. A candidate is executable at
 /// the Memo boundary, while `search_complete` separately records whether the
 /// overall optional closure has finished.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchCheckpoint {
     pub target_ms: u64,
     pub observed_us: u64,
@@ -621,6 +643,9 @@ pub struct SearchCheckpoint {
     pub expected_cost: Option<f64>,
     pub risk_adjusted_cost: Option<f64>,
     pub upper_cost: Option<f64>,
+    pub choices: Box<[FrozenChoice]>,
+    pub fact_reads: Box<[PatternRead]>,
+    pub frozen: bool,
     pub search_complete: bool,
 }
 
@@ -655,6 +680,10 @@ pub struct SearchMilestones {
     pub search_return_profile_us: Option<u64>,
     pub timeout_tail_profile_us: Option<u64>,
     pub handoff_extraction_us: Option<u64>,
+    /// A quality policy can hand off an executable candidate while the Memo
+    /// still has unexplored obligations. This is separate from ProofComplete.
+    pub quality_policy_satisfied_us: Option<u64>,
+    pub quality_policy_candidate: Option<CandidateId>,
 }
 
 /// The last published physical response for one exact `(group, goal)` task.
@@ -900,6 +929,22 @@ pub struct CascadesEngine {
     task_registry: TaskRegistry,
     governor: Governor,
     quality_bundles: QualityBundleRegistry,
+    /// Opt-in production handoff. The default path never evaluates quality
+    /// packages, so trace-off normal C1 pays no policy-discovery cost.
+    quality_handoff_enabled: bool,
+    quality_evidence_provider: Option<Arc<dyn QualityEvidenceProvider>>,
+    quality_required_goals: BTreeSet<OptimizationGoal>,
+    quality_ready_winners: BTreeMap<OptimizationGoal, GrantWinner>,
+    quality_certificates: BTreeMap<OptimizationGoal, PReadyCertificate>,
+    quality_handoff_reached: bool,
+    quality_candidate_evaluation_count: u64,
+    quality_candidate_missing_evidence_count: u64,
+    quality_last_evaluation: QualityEvaluationSummary,
+    /// The candidate/goal associated with the most recent quality attempt.
+    /// A bundle summary without this identity cannot explain why a later
+    /// frozen frontier entry was or was not PReady.
+    quality_last_evaluation_candidate: Option<CandidateId>,
+    quality_last_evaluation_goal: Option<OptimizationGoal>,
 }
 
 impl CascadesEngine {
@@ -1013,6 +1058,17 @@ impl CascadesEngine {
             governor: Governor::new(PlanningPolicy::default())
                 .expect("default planning policy must be valid"),
             quality_bundles,
+            quality_handoff_enabled: false,
+            quality_evidence_provider: None,
+            quality_required_goals: BTreeSet::new(),
+            quality_ready_winners: BTreeMap::new(),
+            quality_certificates: BTreeMap::new(),
+            quality_handoff_reached: false,
+            quality_candidate_evaluation_count: 0,
+            quality_candidate_missing_evidence_count: 0,
+            quality_last_evaluation: QualityEvaluationSummary::default(),
+            quality_last_evaluation_candidate: None,
+            quality_last_evaluation_goal: None,
         }
     }
 
@@ -1342,6 +1398,40 @@ impl CascadesEngine {
     /// and native choice identities.
     pub fn quality_bundles_mut(&mut self) -> &mut QualityBundleRegistry {
         &mut self.quality_bundles
+    }
+
+    /// Install the planner-owned producer for the optional ready-to-execute
+    /// policy. The producer receives only an exact frozen candidate and may
+    /// return no evidence when a required dependency is not available.
+    pub fn set_quality_evidence_provider(&mut self, provider: Arc<dyn QualityEvidenceProvider>) {
+        self.quality_evidence_provider = Some(provider);
+    }
+
+    /// Enable the same-Memo PReady handoff for an explicitly requested
+    /// diagnostic/experimental cohort. It never changes the default stop
+    /// policy by itself.
+    pub fn set_quality_policy_handoff_enabled(&mut self, enabled: bool) {
+        self.quality_handoff_enabled = enabled;
+    }
+
+    pub fn quality_policy_status(&self) -> QualityPolicyStatus {
+        if !self.quality_handoff_reached {
+            return QualityPolicyStatus::NotSatisfied;
+        }
+        self.quality_certificates.values().next().cloned().map_or(
+            QualityPolicyStatus::NotSatisfied,
+            QualityPolicyStatus::Satisfied,
+        )
+    }
+
+    pub fn quality_policy_certificate(&self) -> Option<&PReadyCertificate> {
+        self.quality_handoff_reached
+            .then(|| self.quality_certificates.values().next())
+            .flatten()
+    }
+
+    pub fn quality_last_evaluation(&self) -> &QualityEvaluationSummary {
+        &self.quality_last_evaluation
     }
 
     pub fn governor_mut(&mut self) -> &mut Governor {
@@ -1965,12 +2055,24 @@ impl CascadesEngine {
         root: GroupId,
         checkpoint_goals: impl IntoIterator<Item = OptimizationGoal>,
     ) {
+        let checkpoint_goals = checkpoint_goals.into_iter().collect::<Vec<_>>();
         self.search_milestones = SearchMilestones::default();
-        self.milestone_root = self
-            .collect_rule_work_profile
+        self.milestone_root = (self.collect_rule_work_profile || self.quality_handoff_enabled)
             .then_some(self.memo.canonical_group(root));
+        self.quality_required_goals = self
+            .quality_handoff_enabled
+            .then(|| checkpoint_goals.iter().copied().collect())
+            .unwrap_or_default();
+        self.quality_ready_winners.clear();
+        self.quality_certificates.clear();
+        self.quality_handoff_reached = false;
+        self.quality_candidate_evaluation_count = 0;
+        self.quality_candidate_missing_evidence_count = 0;
+        self.quality_last_evaluation = QualityEvaluationSummary::default();
+        self.quality_last_evaluation_candidate = None;
+        self.quality_last_evaluation_goal = None;
         if self.collect_rule_work_profile {
-            let mut goals = checkpoint_goals.into_iter().collect::<Vec<_>>();
+            let mut goals = checkpoint_goals;
             goals.sort_unstable();
             goals.dedup();
             self.diagnostic_checkpoint_goals = goals.into_boxed_slice();
@@ -1999,7 +2101,9 @@ impl CascadesEngine {
                 super::budget::SearchIncompleteReason::Budget(_)
             )
         });
-        let reason = if self.memo.control().deadline_reached() {
+        let reason = if self.quality_handoff_reached {
+            SearchStopReason::QualityPolicySatisfied
+        } else if self.memo.control().deadline_reached() {
             SearchStopReason::Deadline
         } else if budget_limited {
             SearchStopReason::BudgetLimited
@@ -2019,7 +2123,9 @@ impl CascadesEngine {
                     .control()
                     .deadline_elapsed_us()
                     .or_else(|| Some(self.memo.control().elapsed_us())),
-                SearchStopReason::BudgetLimited | SearchStopReason::RuleFailure => {
+                SearchStopReason::BudgetLimited
+                | SearchStopReason::RuleFailure
+                | SearchStopReason::QualityPolicySatisfied => {
                     Some(self.memo.control().elapsed_us())
                 }
             },
@@ -2106,15 +2212,37 @@ impl CascadesEngine {
             let search_complete = self.diagnostic_search_complete;
             let mut checkpoints = Vec::with_capacity(self.diagnostic_checkpoint_goals.len());
             for goal in self.diagnostic_checkpoint_goals.iter().copied() {
-                let winner = self.memo.group(root).and_then(|group| group.winner(goal));
+                let winner = self
+                    .memo
+                    .group(root)
+                    .and_then(|group| group.winner(goal))
+                    .cloned();
+                let (choices, fact_reads, frozen) = winner
+                    .as_ref()
+                    .and_then(|winner| self.checkpoint_candidate_evidence(root, goal, winner).ok())
+                    .map_or(
+                        (
+                            Box::<[FrozenChoice]>::default(),
+                            Box::<[PatternRead]>::default(),
+                            false,
+                        ),
+                        |evidence| evidence,
+                    );
                 checkpoints.push(SearchCheckpoint {
                     target_ms,
                     observed_us,
                     goal,
-                    candidate: winner.map(|winner| winner.candidate),
-                    expected_cost: winner.map(|winner| winner.cost.score.range.expected),
-                    risk_adjusted_cost: winner.map(|winner| winner.cost.score.risk_adjusted),
-                    upper_cost: winner.map(|winner| winner.cost.score.range.upper),
+                    candidate: winner.as_ref().map(|winner| winner.candidate),
+                    expected_cost: winner
+                        .as_ref()
+                        .map(|winner| winner.cost.score.range.expected),
+                    risk_adjusted_cost: winner
+                        .as_ref()
+                        .map(|winner| winner.cost.score.risk_adjusted),
+                    upper_cost: winner.as_ref().map(|winner| winner.cost.score.range.upper),
+                    choices,
+                    fact_reads,
+                    frozen,
                     search_complete,
                 });
             }
@@ -2123,6 +2251,51 @@ impl CascadesEngine {
                 .extend(checkpoints);
             self.next_diagnostic_checkpoint += 1;
         }
+    }
+
+    fn checkpoint_candidate_evidence(
+        &self,
+        root: GroupId,
+        goal: OptimizationGoal,
+        winner: &Winner,
+    ) -> Result<(Box<[FrozenChoice]>, Box<[PatternRead]>, bool)> {
+        let reference = ChildWinnerRef {
+            group: self.memo.canonical_group(root),
+            goal,
+            candidate: winner.candidate,
+        };
+        let frozen = self.memo.freeze_candidate_tree(reference)?;
+        let mut choices = Vec::new();
+        let mut visited = BTreeSet::new();
+        fn visit(
+            frozen: &FrozenCandidate,
+            choices: &mut Vec<FrozenChoice>,
+            visited: &mut BTreeSet<CandidateId>,
+        ) {
+            if !visited.insert(frozen.reference.candidate) {
+                return;
+            }
+            choices.push(FrozenChoice {
+                reference: frozen.reference,
+                logical: frozen.logical.id,
+                physical: frozen.physical.id,
+                logical_payload: frozen.logical.payload.0,
+                physical_payload: frozen.physical.payload.0,
+                physical_fingerprint: frozen.winner.physical_fingerprint,
+                children: frozen.winner.children.clone(),
+                rules: frozen.logical.applied_rules.iter().copied().collect(),
+            });
+            for child in frozen.children.iter() {
+                visit(child, choices, visited);
+            }
+        }
+        visit(&frozen, &mut choices, &mut visited);
+        let fact_reads = self.winner_fact_reads(root, winner)?.reads().to_vec();
+        Ok((
+            choices.into_boxed_slice(),
+            fact_reads.into_boxed_slice(),
+            true,
+        ))
     }
 
     fn record_diagnostic_checkpoints(&mut self) {
@@ -2189,12 +2362,13 @@ impl CascadesEngine {
         group: GroupId,
         goal: OptimizationGoal,
         selected_changed: bool,
-    ) {
-        if !self.collect_rule_work_profile
-            || self.optional_search_started
-                && self.milestone_root != Some(self.memo.canonical_group(group))
-        {
-            return;
+    ) -> Result<()> {
+        let is_root = self.milestone_root == Some(self.memo.canonical_group(group));
+        if !self.collect_rule_work_profile || self.optional_search_started && !is_root {
+            if self.quality_handoff_enabled && self.optional_search_started && is_root {
+                return self.try_quality_handoff_candidate(group, goal);
+            }
+            return Ok(());
         }
         let Some(candidate) = self
             .memo
@@ -2202,7 +2376,7 @@ impl CascadesEngine {
             .and_then(|group| group.winner(goal))
             .map(|winner| winner.candidate)
         else {
-            return;
+            return Ok(());
         };
         if self.optional_search_started {
             if self.search_milestones.first_optional_ready_us.is_none() {
@@ -2214,6 +2388,128 @@ impl CascadesEngine {
                 self.search_milestones.optional_selected_candidate = Some(candidate);
             }
         }
+        if self.quality_handoff_enabled && self.optional_search_started {
+            self.try_quality_handoff_candidate(group, goal)?;
+        }
+        Ok(())
+    }
+
+    fn try_quality_handoff_candidate(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> Result<()> {
+        if !self.quality_handoff_enabled
+            || self.quality_handoff_reached
+            || !self.quality_required_goals.contains(&goal)
+            || self.quality_ready_winners.contains_key(&goal)
+        {
+            return Ok(());
+        }
+        let Some(provider) = self.quality_evidence_provider.clone() else {
+            return Ok(());
+        };
+        let root = self.memo.canonical_group(group);
+        let Some(winner) = self
+            .memo
+            .group(root)
+            .and_then(|group| group.winner(goal))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let class = self.quality_class_for_goal(goal);
+        let frozen_winner = self.freeze_grant_winner(root, class, goal, Arc::new(winner))?;
+        let reference = frozen_winner.frozen.reference;
+        self.quality_last_evaluation_candidate = Some(reference.candidate);
+        self.quality_last_evaluation_goal = Some(goal);
+        let Some(evidence) =
+            provider.evidence(&self.memo, reference, &frozen_winner.frozen, goal)?
+        else {
+            self.quality_candidate_missing_evidence_count = self
+                .quality_candidate_missing_evidence_count
+                .saturating_add(1);
+            return Ok(());
+        };
+        let reads = self.winner_fact_reads(root, &frozen_winner.winner)?;
+        let read_id = self.task_registry.intern_read_set(reads);
+        self.quality_candidate_evaluation_count =
+            self.quality_candidate_evaluation_count.saturating_add(1);
+        let Some(certificate) = self.quality_bundles.evaluate_native_candidate(
+            QualityPolicyId::new(1),
+            reference.candidate,
+            read_id,
+            &evidence,
+            1,
+        )?
+        else {
+            self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
+            return Ok(());
+        };
+        self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
+        self.quality_certificates.insert(goal, certificate);
+        self.quality_ready_winners.insert(goal, frozen_winner);
+        if self
+            .quality_required_goals
+            .iter()
+            .all(|required| self.quality_ready_winners.contains_key(required))
+        {
+            self.quality_handoff_reached = true;
+            self.search_milestones.quality_policy_satisfied_us = self
+                .profile_elapsed_us()
+                .or_else(|| Some(self.memo.control().elapsed_us()));
+            self.search_milestones.quality_policy_candidate = Some(reference.candidate);
+        }
+        Ok(())
+    }
+
+    fn quality_class_for_goal(&self, goal: OptimizationGoal) -> ResourceGrantClassId {
+        match goal.grant {
+            GrantGoalKey::Class(class) => class,
+            GrantGoalKey::Parallelism { tasks, .. } => self
+                .grant_classes
+                .values()
+                .find(|class| class.max_parallel_tasks == tasks)
+                .map(|class| class.id)
+                .or_else(|| self.grant_classes.keys().next().copied())
+                .unwrap_or(ResourceGrantClassId(0)),
+            GrantGoalKey::Invariant(_) => self
+                .grant_classes
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or(ResourceGrantClassId(0)),
+        }
+    }
+
+    /// Re-evaluate the candidates that are actually present at the stop
+    /// boundary.  The normal interleave evaluates on root frontier updates,
+    /// but a final child publication can become visible through the frontier
+    /// snapshot without another root callback.  Evaluating here closes the
+    /// PReady -> FrozenCandidate handoff without doing any more search.
+    fn evaluate_current_quality_candidates(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
+    ) -> Result<()> {
+        if !self.quality_handoff_enabled || self.quality_handoff_reached {
+            return Ok(());
+        }
+        let root = self.memo.canonical_group(root);
+        let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
+        for class in classes.values().copied() {
+            let goal = OptimizationGoal {
+                grant: sensitivity.goal_for(admissible_set, class),
+                ..base_goal
+            };
+            self.try_quality_handoff_candidate(root, goal)?;
+            if self.quality_handoff_reached {
+                break;
+            }
+        }
+        Ok(())
     }
 
     pub fn optimize(
@@ -2257,7 +2553,8 @@ impl CascadesEngine {
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
             }
             self.reset_cost_epoch()?;
-            self.optional_search_started = self.collect_rule_work_profile;
+            self.optional_search_started =
+                self.collect_rule_work_profile || self.quality_handoff_enabled;
             // The archived mandatory incumbent remains the safe plan for this
             // new cost epoch.  As soon as optional work publishes enough new
             // logical alternatives, mandatory physical work is re-costed
@@ -2273,6 +2570,13 @@ impl CascadesEngine {
                 std::iter::once(goal),
             )))?;
             self.record_search_checkpoints(root);
+            if self.quality_handoff_reached {
+                if let Some(winner) = self.quality_ready_winners.get(&goal).cloned() {
+                    let stop = self.search_stop();
+                    self.note_search_stop(stop);
+                    return Ok(winner.winner.as_ref().clone());
+                }
+            }
         }
         self.optimize_group(root, goal)?;
         super::verifier::MemoVerifier::verify(&self.memo, None)?;
@@ -2443,6 +2747,7 @@ impl CascadesEngine {
                 "grant portfolio exceeds the bounded class count",
             ));
         }
+        self.grant_classes.clone_from(&classes);
         // Make the actual multi-grant entry point own the same operating
         // context used by SeedPlan re-pricing.  The planner primes this
         // before installation as well, but direct engine callers must not
@@ -2501,7 +2806,8 @@ impl CascadesEngine {
                 });
             }
             self.reset_cost_epoch()?;
-            self.optional_search_started = self.collect_rule_work_profile;
+            self.optional_search_started =
+                self.collect_rule_work_profile || self.quality_handoff_enabled;
             let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
             let goals = classes.values().copied().map(|class| OptimizationGoal {
                 grant: sensitivity.goal_for(admissible_set, class),
@@ -2511,6 +2817,16 @@ impl CascadesEngine {
                 root, goals,
             )))?;
             self.record_search_checkpoints(root);
+            if self.quality_handoff_reached {
+                if let Some(mut snapshot) =
+                    self.quality_grant_snapshot(root, base_goal, admissible_set, &classes)?
+                {
+                    let stop = self.search_stop();
+                    snapshot.stop = stop;
+                    self.note_search_stop(stop);
+                    return Ok(snapshot);
+                }
+            }
             if !self.memo.control().checkpoint()? {
                 self.record_search_checkpoints(root);
                 return self.stop_with_snapshot_or_fallback(
@@ -2547,6 +2863,39 @@ impl CascadesEngine {
         }
         self.record_search_checkpoints(root);
         result
+    }
+
+    fn quality_grant_snapshot(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
+    ) -> Result<Option<GrantOptimization>> {
+        let root = self.memo.canonical_group(root);
+        let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
+        let mut winners = Vec::with_capacity(classes.len());
+        for class in classes.values().copied() {
+            let goal = OptimizationGoal {
+                grant: sensitivity.goal_for(admissible_set, class),
+                ..base_goal
+            };
+            let Some(winner) = self.quality_ready_winners.get(&goal).cloned() else {
+                return Ok(None);
+            };
+            if winner.class != class.id {
+                return Ok(None);
+            }
+            winners.push(winner);
+        }
+        if winners.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(GrantOptimization {
+            sensitivity,
+            winners: winners.into_boxed_slice(),
+            stop: self.search_stop(),
+        }))
     }
 
     fn optimize_grant_classes(
@@ -2680,7 +3029,25 @@ impl CascadesEngine {
         classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
         fallback: Result<GrantOptimization>,
     ) -> Result<GrantOptimization> {
+        self.evaluate_current_quality_candidates(root, base_goal, admissible_set, classes)?;
+        // The stop reason must be sampled after the boundary evaluation. A
+        // frontier publication can make all grants PReady without running
+        // another search task; reporting the earlier Deadline here would
+        // hide a real quality-policy handoff as a timeout.
         let stop = self.search_stop();
+        // If the stop-boundary evaluation certified every required grant,
+        // return those exact frozen winners. Re-freezing the frontier below
+        // would preserve the candidate id in practice, but would weaken the
+        // producer-to-consumer identity guarantee of this handoff.
+        if self.quality_handoff_reached {
+            if let Some(mut snapshot) =
+                self.quality_grant_snapshot(root, base_goal, admissible_set, classes)?
+            {
+                snapshot.stop = stop;
+                self.note_search_stop(stop);
+                return Ok(snapshot);
+            }
+        }
         // A frontier entry that cannot be verified/frozen is not a qualified
         // candidate.  Keep the already verified mandatory result in that
         // case; only return the snapshot when the whole grant portfolio can
@@ -2855,6 +3222,9 @@ impl CascadesEngine {
 
     fn drain_physical_interleave(&mut self, interleave: &mut PhysicalInterleave) -> Result<()> {
         while let Some((group, goal)) = interleave.pending.pop_first() {
+            if self.quality_handoff_reached {
+                break;
+            }
             if !self.memo.control().checkpoint()? {
                 break;
             }
@@ -2897,6 +3267,9 @@ impl CascadesEngine {
             }
         }
         'tasks: while let Some(task) = agenda.pop() {
+            if self.quality_handoff_reached {
+                break;
+            }
             if !self.memo.control().checkpoint()? {
                 break;
             }
@@ -3697,11 +4070,13 @@ impl CascadesEngine {
                 effective_insertions_since_recost = 0;
             }
         }
-        if let Some(interleave) = interleave.as_mut() {
-            // A tail smaller than INTERLEAVE_BATCH must still become visible
-            // before the final grant extraction. This is an incremental drain,
-            // not another whole-root exploration.
-            self.drain_physical_interleave(interleave)?;
+        if !self.quality_handoff_reached {
+            if let Some(interleave) = interleave.as_mut() {
+                // A tail smaller than INTERLEAVE_BATCH must still become visible
+                // before the final grant extraction. This is an incremental drain,
+                // not another whole-root exploration.
+                self.drain_physical_interleave(interleave)?;
+            }
         }
         self.record_diagnostic_checkpoints();
         Ok(())
@@ -3903,6 +4278,66 @@ impl CascadesEngine {
             (
                 "child_combination_budget_rejection_count",
                 self.child_combination_budget_rejection_count,
+            ),
+            (
+                "quality_policy_handoff_enabled",
+                u64::from(self.quality_handoff_enabled),
+            ),
+            (
+                "quality_policy_candidate_evaluation_count",
+                self.quality_candidate_evaluation_count,
+            ),
+            (
+                "quality_policy_ready_goal_count",
+                self.quality_ready_winners.len() as u64,
+            ),
+            (
+                "quality_policy_missing_evidence_count",
+                self.quality_candidate_missing_evidence_count,
+            ),
+            (
+                "quality_last_evaluation_candidate",
+                self.quality_last_evaluation_candidate
+                    .map_or(u64::MAX, |candidate| candidate.index() as u64),
+            ),
+            (
+                "quality_last_evaluation_goal_required",
+                self.quality_last_evaluation_goal
+                    .map_or(u64::MAX, |goal| goal.required.0 as u64),
+            ),
+            (
+                "quality_last_evaluation_goal_grant",
+                self.quality_last_evaluation_goal
+                    .map_or(u64::MAX, |goal| goal.grant.stable_tag()),
+            ),
+            (
+                "quality_last_evaluation_goal_context",
+                self.quality_last_evaluation_goal
+                    .map_or(u64::MAX, |goal| goal.context.0 as u64),
+            ),
+            (
+                "quality_last_completed_bundle_count",
+                self.quality_last_evaluation.completed,
+            ),
+            (
+                "quality_last_not_applicable_bundle_count",
+                self.quality_last_evaluation.not_applicable,
+            ),
+            (
+                "quality_last_missing_bundle_count",
+                self.quality_last_evaluation.missing_evidence,
+            ),
+            (
+                "quality_last_suspended_bundle_count",
+                self.quality_last_evaluation.suspended,
+            ),
+            (
+                "quality_last_missing_fact_count",
+                self.quality_last_evaluation.missing_facts,
+            ),
+            (
+                "quality_policy_satisfied",
+                u64::from(self.quality_handoff_reached),
             ),
             (
                 "certified_bound_check_count",
@@ -6271,7 +6706,7 @@ impl CascadesEngine {
                             true,
                         )?;
                     if frontier_changed {
-                        self.note_physical_candidate(group, goal, selected_changed);
+                        self.note_physical_candidate(group, goal, selected_changed)?;
                         self.record_diagnostic_checkpoints();
                     }
                 }
@@ -6325,7 +6760,7 @@ impl CascadesEngine {
                             false,
                         )?;
                     if frontier_changed {
-                        self.note_physical_candidate(group, goal, selected_changed);
+                        self.note_physical_candidate(group, goal, selected_changed)?;
                         self.record_diagnostic_checkpoints();
                     }
                     continue;
@@ -6472,7 +6907,7 @@ impl CascadesEngine {
                     false,
                 )?;
                 if frontier_changed {
-                    self.note_physical_candidate(group, goal, selected_changed);
+                    self.note_physical_candidate(group, goal, selected_changed)?;
                     self.record_diagnostic_checkpoints();
                 }
             }
@@ -6512,7 +6947,7 @@ impl CascadesEngine {
                             true,
                         )?;
                     if frontier_changed {
-                        self.note_physical_candidate(group, goal, selected_changed);
+                        self.note_physical_candidate(group, goal, selected_changed)?;
                         self.record_diagnostic_checkpoints();
                     }
                 }

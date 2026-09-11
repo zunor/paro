@@ -677,6 +677,9 @@ def main() -> int:
                 "PARO_DIAGNOSTIC_SEARCH_STOP_MS": os.environ.get(
                     "PARO_DIAGNOSTIC_SEARCH_STOP_MS"
                 ),
+                "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
+                    "PARO_QUALITY_POLICY_HANDOFF"
+                ),
                 "PARO_CERTIFIED_GROUP_PRUNING": os.environ.get(
                     "PARO_CERTIFIED_GROUP_PRUNING"
                 ),
@@ -756,6 +759,9 @@ def main() -> int:
                 threads=args.threads,
                 statement_trace=False,
                 optimizer_environment={
+                    "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
+                        "PARO_QUALITY_POLICY_HANDOFF"
+                    ),
                     "PARO_STRONG_INCUMBENT_EXPERIMENT": None,
                     "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": None,
                     "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": None,
@@ -828,6 +834,9 @@ def main() -> int:
                     statement_trace=False,
                     cache_evidence=True,
                     optimizer_environment={
+                        "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
+                            "PARO_QUALITY_POLICY_HANDOFF"
+                        ),
                         "PARO_STRONG_INCUMBENT_EXPERIMENT": (
                             "1" if args.strong_incumbent_c1 else None
                         ),
@@ -956,6 +965,9 @@ def main() -> int:
                     trace_sample_id=diagnostic_sample_id,
                     cache_evidence=True,
                     optimizer_environment={
+                        "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
+                            "PARO_QUALITY_POLICY_HANDOFF"
+                        ),
                         "PARO_STRONG_INCUMBENT_EXPERIMENT": (
                             "1" if args.diagnostic_strong_incumbent else None
                         ),

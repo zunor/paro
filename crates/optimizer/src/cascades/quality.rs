@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use paro_common::error::{self as paro_error, Result};
 
 use super::ids::{CandidateId, Fingerprint, QualityPolicyId};
+use super::memo::{ChildWinnerRef, FrozenCandidate, Memo, OptimizationGoal};
 use super::tasks::ReadSetId;
 
 macro_rules! quality_id_type {
@@ -52,6 +53,21 @@ pub enum BundleFact {
     NullSemantics,
     OrderingDemand,
     ProviderCapability,
+}
+
+impl BundleFact {
+    pub const fn stable_tag(self) -> u64 {
+        match self {
+            Self::OutputDemand => 0,
+            Self::PredicateDomain => 1,
+            Self::JoinRegion => 2,
+            Self::AggregateDecomposition => 3,
+            Self::CteConsumerDemand => 4,
+            Self::NullSemantics => 5,
+            Self::OrderingDemand => 6,
+            Self::ProviderCapability => 7,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +117,29 @@ pub struct BundleInput {
     /// owned logical tree as a quality result.
     pub choices: Box<[Fingerprint]>,
     pub candidate: Option<CandidateId>,
+}
+
+/// Native evidence for one exact frozen candidate. This is a compact
+/// producer result, not a second Memo or an owned logical tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeQualityEvidence {
+    pub capabilities: BTreeSet<BundleCapability>,
+    pub facts: BTreeSet<BundleFact>,
+    pub region: Fingerprint,
+    pub applicability_proof: Fingerprint,
+    pub choices: Box<[Fingerprint]>,
+}
+
+/// Production producers must inspect the exact frozen DAG they are asked to
+/// certify. They may not discover a replacement plan or read a stale frontier.
+pub trait QualityEvidenceProvider: std::fmt::Debug {
+    fn evidence(
+        &self,
+        memo: &Memo,
+        reference: ChildWinnerRef,
+        frozen: &FrozenCandidate,
+        goal: OptimizationGoal,
+    ) -> Result<Option<NativeQualityEvidence>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +193,17 @@ pub enum BundleState {
     Suspended,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QualityEvaluationSummary {
+    pub completed: u64,
+    pub not_applicable: u64,
+    pub missing_evidence: u64,
+    pub suspended: u64,
+    pub missing_facts: u64,
+    pub missing_bundles: Box<[BundleId]>,
+    pub missing_fact_kinds: Box<[BundleFact]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RegisteredBundle {
     spec: QualityBundleSpec,
@@ -165,6 +215,10 @@ struct RegisteredBundle {
 pub struct PReadyCertificate {
     pub policy: QualityPolicyId,
     pub bundles: Box<[(BundleId, u32)]>,
+    /// All completed bundles must identify the same root candidate.
+    pub candidate: CandidateId,
+    /// Exact selected-DAG identities shared by every completed bundle.
+    pub choices: Box<[Fingerprint]>,
     pub regions: Box<[Fingerprint]>,
     pub reads: Box<[ReadSetId]>,
     pub candidates: Box<[CandidateId]>,
@@ -173,10 +227,28 @@ pub struct PReadyCertificate {
 impl PReadyCertificate {
     pub fn is_complete(&self, registry: &QualityBundleRegistry) -> bool {
         self.bundles.iter().all(|(id, revision)| {
-            registry
-                .bundles
-                .get(id)
-                .is_some_and(|bundle| bundle.spec.revision == *revision && bundle.result_is_ready())
+            let Some(bundle) = registry.bundles.get(id) else {
+                return false;
+            };
+            if bundle.spec.revision != *revision || !bundle.result_is_ready() {
+                return false;
+            }
+            match bundle.result.as_ref() {
+                Some(BundleResult::Completed {
+                    candidate,
+                    choices,
+                    region,
+                    reads,
+                    ..
+                }) => {
+                    *candidate == Some(self.candidate)
+                        && choices.as_ref() == self.choices.as_ref()
+                        && self.regions.as_ref() == [*region]
+                        && self.reads.as_ref() == [*reads]
+                }
+                Some(BundleResult::NotApplicable { .. }) => true,
+                _ => false,
+            }
         })
     }
 }
@@ -185,6 +257,12 @@ impl RegisteredBundle {
     fn result_is_ready(&self) -> bool {
         self.result.as_ref().is_some_and(BundleResult::is_ready)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualityPolicyStatus {
+    NotSatisfied,
+    Satisfied(PReadyCertificate),
 }
 
 /// Query-local, capability-driven bundle registry.  There is no benchmark or
@@ -257,6 +335,78 @@ impl QualityBundleRegistry {
         self.bundles
             .get(&id)
             .and_then(|bundle| bundle.result.as_ref())
+    }
+
+    /// Clear all bundle results before evaluating another root candidate. A
+    /// previous candidate's completed package is not valid evidence for a
+    /// later candidate, even when the query facts did not change.
+    pub fn clear_results(&mut self) {
+        for bundle in self.bundles.values_mut() {
+            bundle.result = None;
+            bundle.state = BundleState::Pending;
+        }
+    }
+
+    /// Stable identity used when a caller wants to mirror bundle lifecycle in
+    /// the TaskRegistry/governor. The revision is part of the identity.
+    pub fn bundle_identity(&self, id: BundleId) -> Option<Fingerprint> {
+        let bundle = self.bundles.get(&id)?;
+        let mut fingerprint = super::ids::StableFingerprintBuilder::default();
+        fingerprint.write_bytes(b"paro.quality-bundle.v2");
+        fingerprint.write_u64(bundle.spec.id.0 as u64);
+        fingerprint.write_u64(bundle.spec.revision as u64);
+        Some(fingerprint.finish())
+    }
+
+    /// Evaluate every registered package against one native candidate. The
+    /// exact candidate and choice vector are installed in every input, so
+    /// independently completed packages cannot certify a mixed root.
+    pub fn evaluate_native_candidate(
+        &mut self,
+        policy: QualityPolicyId,
+        candidate: CandidateId,
+        reads: ReadSetId,
+        evidence: &NativeQualityEvidence,
+        budget: u32,
+    ) -> Result<Option<PReadyCertificate>> {
+        self.clear_results();
+        let input = BundleInput {
+            capabilities: evidence.capabilities.clone(),
+            facts: evidence.facts.clone(),
+            reads,
+            region: evidence.region,
+            applicability_proof: evidence.applicability_proof,
+            choices: evidence.choices.clone(),
+            candidate: Some(candidate),
+        };
+        let ids = self.bundles.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            self.evaluate(id, &input, budget)?;
+        }
+        Ok(self.p_ready_certificate(policy))
+    }
+
+    pub fn evaluation_summary(&self) -> QualityEvaluationSummary {
+        let mut summary = QualityEvaluationSummary::default();
+        let mut missing_bundles = Vec::new();
+        let mut missing_fact_kinds = BTreeSet::new();
+        for bundle in self.bundles.values() {
+            match bundle.result.as_ref() {
+                Some(BundleResult::Completed { .. }) => summary.completed += 1,
+                Some(BundleResult::NotApplicable { .. }) => summary.not_applicable += 1,
+                Some(BundleResult::MissingEvidence { missing, .. }) => {
+                    summary.missing_evidence += 1;
+                    summary.missing_facts += missing.len() as u64;
+                    missing_bundles.push(bundle.spec.id);
+                    missing_fact_kinds.extend(missing.iter().copied());
+                }
+                Some(BundleResult::Suspended { .. }) => summary.suspended += 1,
+                None => {}
+            }
+        }
+        summary.missing_bundles = missing_bundles.into_boxed_slice();
+        summary.missing_fact_kinds = missing_fact_kinds.into_iter().collect();
+        summary
     }
 
     pub fn evaluate(
@@ -351,25 +501,61 @@ impl QualityBundleRegistry {
         let mut regions = BTreeSet::new();
         let mut reads = BTreeSet::new();
         let mut candidates = BTreeSet::new();
+        let mut certificate_candidate = None;
+        let mut certificate_choices: Option<Box<[Fingerprint]>> = None;
         for (id, bundle) in &self.bundles {
             bundles.push((*id, bundle.spec.revision));
             if let Some(BundleResult::Completed {
                 region,
                 reads: read_set,
+                choices,
                 candidate,
                 ..
             }) = &bundle.result
             {
+                let candidate = (*candidate)?;
+                if let Some(previous) = certificate_candidate {
+                    if previous != candidate {
+                        return None;
+                    }
+                } else {
+                    certificate_candidate = Some(candidate);
+                }
+                if let Some(previous) = &certificate_choices {
+                    if previous.as_ref() != choices.as_ref() {
+                        return None;
+                    }
+                } else {
+                    certificate_choices = Some(choices.clone());
+                }
+                if regions
+                    .iter()
+                    .next()
+                    .is_some_and(|previous| previous != region)
+                {
+                    return None;
+                }
+                if reads
+                    .iter()
+                    .next()
+                    .is_some_and(|previous| previous != read_set)
+                {
+                    return None;
+                }
                 regions.insert(*region);
                 reads.insert(*read_set);
-                if let Some(candidate) = candidate {
-                    candidates.insert(*candidate);
-                }
+                candidates.insert(candidate);
             }
         }
+        // A policy containing only NotApplicable packages is not a quality
+        // handoff. At least one native producer must have completed.
+        let candidate = certificate_candidate?;
+        let choices = certificate_choices?;
         Some(PReadyCertificate {
             policy,
             bundles: bundles.into_boxed_slice(),
+            candidate,
+            choices,
             regions: regions.into_iter().collect(),
             reads: reads.into_iter().collect(),
             candidates: candidates.into_iter().collect(),
@@ -492,7 +678,154 @@ mod tests {
             .unwrap();
         let certificate = registry.p_ready_certificate(QualityPolicyId(1)).unwrap();
         assert_eq!(certificate.bundles.len(), 4);
+        assert_eq!(certificate.candidate, CandidateId(4));
+        assert_eq!(certificate.choices.as_ref(), &[Fingerprint(5)]);
         assert!(certificate.is_complete(&registry));
+    }
+
+    #[test]
+    fn mixed_candidate_choices_cannot_form_a_certificate() {
+        let mut registry = QualityBundleRegistry::default();
+        registry.register_builtin_f1_f4().unwrap();
+        for id in [BundleId(1), BundleId(2), BundleId(3), BundleId(4)] {
+            let (capabilities, facts) = match id {
+                BundleId(1) => (
+                    vec![BundleCapability::ScanPredicate],
+                    vec![BundleFact::OutputDemand, BundleFact::PredicateDomain],
+                ),
+                BundleId(2) => (
+                    vec![BundleCapability::SmallJoin],
+                    vec![BundleFact::JoinRegion, BundleFact::OutputDemand],
+                ),
+                BundleId(3) => (
+                    vec![BundleCapability::SharedAggregate],
+                    vec![
+                        BundleFact::AggregateDecomposition,
+                        BundleFact::CteConsumerDemand,
+                        BundleFact::NullSemantics,
+                    ],
+                ),
+                _ => (
+                    vec![BundleCapability::CorrelatedSubquery],
+                    vec![BundleFact::PredicateDomain, BundleFact::NullSemantics],
+                ),
+            };
+            let mut value = input(capabilities, facts);
+            if id == BundleId(4) {
+                value.choices = Box::new([Fingerprint(99)]);
+            }
+            registry.evaluate(id, &value, 1).unwrap();
+        }
+        assert!(registry.p_ready_certificate(QualityPolicyId(1)).is_none());
+    }
+
+    #[test]
+    fn native_evaluation_replaces_previous_candidate_evidence() {
+        let mut registry = QualityBundleRegistry::default();
+        registry.register_builtin_f1_f4().unwrap();
+        let evidence = |choice| NativeQualityEvidence {
+            capabilities: [
+                BundleCapability::ScanPredicate,
+                BundleCapability::SmallJoin,
+                BundleCapability::SharedAggregate,
+                BundleCapability::CorrelatedSubquery,
+            ]
+            .into_iter()
+            .collect(),
+            facts: [
+                BundleFact::OutputDemand,
+                BundleFact::PredicateDomain,
+                BundleFact::JoinRegion,
+                BundleFact::AggregateDecomposition,
+                BundleFact::CteConsumerDemand,
+                BundleFact::NullSemantics,
+            ]
+            .into_iter()
+            .collect(),
+            region: Fingerprint(2),
+            applicability_proof: Fingerprint(3),
+            choices: Box::new([Fingerprint(choice)]),
+        };
+        let first = registry
+            .evaluate_native_candidate(
+                QualityPolicyId(1),
+                CandidateId(4),
+                ReadSetId::new(1),
+                &evidence(5),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.candidate, CandidateId(4));
+        let second = registry
+            .evaluate_native_candidate(
+                QualityPolicyId(1),
+                CandidateId(7),
+                ReadSetId::new(2),
+                &evidence(6),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.candidate, CandidateId(7));
+        assert_eq!(second.choices.as_ref(), &[Fingerprint(6)]);
+        assert!(!first.is_complete(&registry));
+        assert!(registry.result(BundleId(1)).is_some_and(|result| matches!(
+            result,
+            BundleResult::Completed {
+                candidate: Some(CandidateId(7)),
+                choices,
+                ..
+            } if choices.as_ref() == [Fingerprint(6)]
+        )));
+    }
+
+    #[test]
+    fn mixed_read_sets_or_regions_cannot_form_a_certificate() {
+        let mut registry = QualityBundleRegistry::default();
+        registry.register_builtin_f1_f4().unwrap();
+        for id in [BundleId(1), BundleId(2), BundleId(3), BundleId(4)] {
+            let (capabilities, facts) = match id {
+                BundleId(1) => (
+                    vec![BundleCapability::ScanPredicate],
+                    vec![BundleFact::OutputDemand, BundleFact::PredicateDomain],
+                ),
+                BundleId(2) => (
+                    vec![BundleCapability::SmallJoin],
+                    vec![BundleFact::JoinRegion, BundleFact::OutputDemand],
+                ),
+                BundleId(3) => (
+                    vec![BundleCapability::SharedAggregate],
+                    vec![
+                        BundleFact::AggregateDecomposition,
+                        BundleFact::CteConsumerDemand,
+                        BundleFact::NullSemantics,
+                    ],
+                ),
+                _ => (
+                    vec![BundleCapability::CorrelatedSubquery],
+                    vec![BundleFact::PredicateDomain, BundleFact::NullSemantics],
+                ),
+            };
+            let mut value = input(capabilities, facts);
+            if id == BundleId(4) {
+                value.reads = ReadSetId::new(2);
+                value.region = Fingerprint(99);
+            }
+            registry.evaluate(id, &value, 1).unwrap();
+        }
+        assert!(registry.p_ready_certificate(QualityPolicyId(1)).is_none());
+    }
+
+    #[test]
+    fn all_not_applicable_packages_do_not_certify_pready() {
+        let mut registry = QualityBundleRegistry::default();
+        registry.register_builtin_f1_f4().unwrap();
+        let value = input(Vec::<BundleCapability>::new(), Vec::<BundleFact>::new());
+        for id in [BundleId(1), BundleId(2), BundleId(3), BundleId(4)] {
+            registry.evaluate(id, &value, 1).unwrap();
+        }
+        assert!(registry.p_ready_certificate(QualityPolicyId(1)).is_none());
     }
 
     #[test]

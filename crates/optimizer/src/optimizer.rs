@@ -1126,6 +1126,10 @@ impl Optimizer {
                     "first_logical_publication_us",
                     extraction.search_milestones.first_logical_publication_us,
                 ),
+                (
+                    "quality_policy_satisfied_us",
+                    extraction.search_milestones.quality_policy_satisfied_us,
+                ),
             ] {
                 if let Some(elapsed) = elapsed {
                     trace.record_value("optimizer", name, elapsed);
@@ -1143,6 +1147,10 @@ impl Optimizer {
                 (
                     "first_optional_selected_candidate",
                     extraction.search_milestones.optional_selected_candidate,
+                ),
+                (
+                    "quality_policy_candidate",
+                    extraction.search_milestones.quality_policy_candidate,
                 ),
             ] {
                 if let Some(candidate) = candidate {
@@ -1195,6 +1203,162 @@ impl Optimizer {
                     &format!("{prefix}.search_complete"),
                     u64::from(checkpoint.search_complete),
                 );
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.frozen"),
+                    u64::from(checkpoint.frozen),
+                );
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.choice_count"),
+                    checkpoint.choices.len() as u64,
+                );
+                for (choice_index, choice) in checkpoint.choices.iter().enumerate() {
+                    let choice_prefix = format!("{prefix}.choice_{choice_index}");
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.group"),
+                        choice.reference.group.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.candidate"),
+                        choice.reference.candidate.index() as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.goal_required"),
+                        choice.reference.goal.required.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.goal_grant"),
+                        choice.reference.goal.grant.stable_tag(),
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.goal_context"),
+                        choice.reference.goal.context.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.logical"),
+                        choice.logical.index() as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.physical"),
+                        choice.physical.index() as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.logical_payload"),
+                        choice.logical_payload as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.physical_payload"),
+                        choice.physical_payload as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.physical_fingerprint_lo"),
+                        choice.physical_fingerprint.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.physical_fingerprint_hi"),
+                        (choice.physical_fingerprint.0 >> 64) as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.child_count"),
+                        choice.children.len() as u64,
+                    );
+                    for (child_index, child) in choice.children.iter().enumerate() {
+                        let child_prefix = format!("{choice_prefix}.child_{child_index}");
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{child_prefix}.group"),
+                            child.group.0 as u64,
+                        );
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{child_prefix}.candidate"),
+                            child.candidate.index() as u64,
+                        );
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{child_prefix}.goal_required"),
+                            child.goal.required.0 as u64,
+                        );
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{child_prefix}.goal_grant"),
+                            child.goal.grant.stable_tag(),
+                        );
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{child_prefix}.goal_context"),
+                            child.goal.context.0 as u64,
+                        );
+                    }
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{choice_prefix}.rule_count"),
+                        choice.rules.len() as u64,
+                    );
+                    for (rule_index, rule) in choice.rules.iter().enumerate() {
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{choice_prefix}.rule_{rule_index}"),
+                            rule.0 as u64,
+                        );
+                    }
+                }
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.fact_read_count"),
+                    checkpoint.fact_reads.len() as u64,
+                );
+                for (read_index, read) in checkpoint.fact_reads.iter().enumerate() {
+                    let read_prefix = format!("{prefix}.fact_read_{read_index}");
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.group"),
+                        read.group.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.logical_frontier_present"),
+                        u64::from(read.logical_frontier_revision.is_some()),
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.physical_frontier_present"),
+                        u64::from(read.physical_frontier_revision.is_some()),
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.logical_fact_lo"),
+                        read.logical_fact_fingerprint.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.logical_fact_hi"),
+                        (read.logical_fact_fingerprint.0 >> 64) as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.statistics_lo"),
+                        read.statistics_snapshot_fingerprint.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.statistics_hi"),
+                        (read.statistics_snapshot_fingerprint.0 >> 64) as u64,
+                    );
+                }
             }
             trace.record_event(
                 "optimizer",
