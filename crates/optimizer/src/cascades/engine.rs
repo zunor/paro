@@ -3716,61 +3716,6 @@ impl CascadesEngine {
         Ok(())
     }
 
-    /// Promote only the transformation tasks on the exact root candidate that
-    /// the physical interleave just made executable.  This is the narrow
-    /// dependency edge needed by quality-producing rewrites: a candidate's
-    /// selected filter/aggregate shells get a chance to publish their next
-    /// alternative before unrelated Memo expressions continue.  The normal
-    /// agenda still retains every other task, so this changes traversal order
-    /// without shrinking the logical search domain or turning a candidate
-    /// into a completeness proof.
-    fn schedule_selected_quality_followups(
-        &mut self,
-        root: GroupId,
-        goals: &[OptimizationGoal],
-        agenda: &mut StableAgenda,
-    ) -> Result<()> {
-        let mut pending = goals
-            .iter()
-            .copied()
-            .filter_map(|goal| {
-                self.memo
-                    .group(root)
-                    .and_then(|group| group.winner(goal))
-                    .map(|winner| ChildWinnerRef {
-                        group: root,
-                        goal,
-                        candidate: winner.candidate,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let mut visited = BTreeSet::new();
-        while let Some(reference) = pending.pop() {
-            if !visited.insert(reference.candidate) {
-                continue;
-            }
-            let Some(winner) = self.memo.resolve_child_winner(reference) else {
-                continue;
-            };
-            let (logical, children) = {
-                let physical = self.memo.physical_expr(winner.expression).ok_or_else(|| {
-                    paro_error::internal(
-                        "selected quality candidate references an unknown physical expression",
-                    )
-                })?;
-                (physical.key.logical, winner.children.clone())
-            };
-            let owner = self.memo.logical_owner(logical).ok_or_else(|| {
-                paro_error::internal(
-                    "selected quality candidate logical expression has no owning group",
-                )
-            })?;
-            self.schedule_transformation_expression(owner, logical, agenda, true)?;
-            pending.extend(children.iter().copied());
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     fn explore_transformations(&mut self) -> Result<()> {
         self.explore_transformations_with_interleave(None)
@@ -4646,9 +4591,6 @@ impl CascadesEngine {
                     // The final root pass still owns completion; this queue is
                     // solely the early quality/readiness path.
                     self.drain_physical_interleave(interleave)?;
-                    let root = interleave.root;
-                    let goals = interleave.goals.clone();
-                    self.schedule_selected_quality_followups(root, &goals, &mut agenda)?;
                 }
                 effective_insertions_since_recost = 0;
             }
@@ -4659,9 +4601,6 @@ impl CascadesEngine {
                 // before the final grant extraction. This is an incremental drain,
                 // not another whole-root exploration.
                 self.drain_physical_interleave(interleave)?;
-                let root = interleave.root;
-                let goals = interleave.goals.clone();
-                self.schedule_selected_quality_followups(root, &goals, &mut agenda)?;
             }
         }
         self.record_diagnostic_checkpoints();
