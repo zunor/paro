@@ -1355,6 +1355,105 @@ impl Optimizer {
                     );
                 }
             }
+            trace.record_value(
+                "optimizer",
+                "transformation_task_lifecycle_count",
+                extraction
+                    .search_milestones
+                    .transformation_task_lifecycle
+                    .len() as u64,
+            );
+            trace.record_value(
+                "optimizer",
+                "transformation_task_lifecycle_dropped",
+                extraction
+                    .search_milestones
+                    .transformation_task_lifecycle_dropped,
+            );
+            for (task_index, task) in extraction
+                .search_milestones
+                .transformation_task_lifecycle
+                .iter()
+                .enumerate()
+            {
+                let prefix = format!("transformation_task_{task_index}");
+                for (name, value) in [
+                    ("group", Some(task.group.index() as u64)),
+                    ("expression", Some(task.expression.index() as u64)),
+                    ("rule", Some(task.rule.0 as u64)),
+                    ("first_enqueued_us", task.first_enqueued_us),
+                    ("first_run_us", task.first_run_us),
+                    (
+                        "first_dependencies_ready_us",
+                        task.first_dependencies_ready_us,
+                    ),
+                    ("first_matched_us", task.first_matched_us),
+                    ("first_no_match_us", task.first_no_match_us),
+                    ("first_applicable_us", task.first_applicable_us),
+                    ("first_published_us", task.first_published_us),
+                    ("first_no_output_us", task.first_no_output_us),
+                    ("first_budget_rejected_us", task.first_budget_rejected_us),
+                    ("first_binding_lo", task.first_binding.map(|value| value.0 as u64)),
+                    (
+                        "first_binding_hi",
+                        task.first_binding.map(|value| (value.0 >> 64) as u64),
+                    ),
+                    ("match_count", Some(task.match_count)),
+                    ("no_match_count", Some(task.no_match_count)),
+                    ("applicable_count", Some(task.applicable_count)),
+                    ("no_output_count", Some(task.no_output_count)),
+                    ("published_count", Some(task.published_count)),
+                    ("budget_rejected_count", Some(task.budget_rejected_count)),
+                ] {
+                    if let Some(value) = value {
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{prefix}.{name}"),
+                            value,
+                        );
+                    }
+                }
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.read_count"),
+                    task.last_reads.len() as u64,
+                );
+                for (read_index, read) in task.last_reads.iter().enumerate() {
+                    let read_prefix = format!("{prefix}.read_{read_index}");
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.group"),
+                        read.group.index() as u64,
+                    );
+                    if let Some(revision) = read.logical_frontier_revision {
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{read_prefix}.logical_frontier_revision"),
+                            revision,
+                        );
+                    }
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.logical_fact_lo"),
+                        read.logical_fact_fingerprint.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.logical_fact_hi"),
+                        (read.logical_fact_fingerprint.0 >> 64) as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.statistics_lo"),
+                        read.statistics_snapshot_fingerprint.0 as u64,
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{read_prefix}.statistics_hi"),
+                        (read.statistics_snapshot_fingerprint.0 >> 64) as u64,
+                    );
+                }
+            }
             for checkpoint in &extraction.search_milestones.search_checkpoints {
                 let goal = checkpoint.goal;
                 let prefix = format!(

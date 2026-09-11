@@ -257,6 +257,75 @@ struct TransformationTaskId {
     rule: RuleId,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TransformationTaskLifecyclePhase {
+    Enqueued,
+    FirstRun,
+    DependenciesReady,
+    Matched,
+    NoMatch,
+    Applicable,
+    Published,
+    NoOutput,
+    BudgetRejected,
+}
+
+/// Diagnostic-only exact lifecycle for one quality-producing transformation
+/// task.  Family-level first-run timestamps cannot tell whether a late
+/// candidate waited in the agenda or waited for a particular observed
+/// frontier.  This record is bounded and emitted only when the diagnostic
+/// rule profile is enabled; normal trace-off searches keep no task entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransformationTaskLifecycle {
+    pub group: GroupId,
+    pub expression: LogicalExprId,
+    pub rule: RuleId,
+    pub first_enqueued_us: Option<u64>,
+    pub first_run_us: Option<u64>,
+    pub first_dependencies_ready_us: Option<u64>,
+    pub first_matched_us: Option<u64>,
+    pub first_no_match_us: Option<u64>,
+    pub first_applicable_us: Option<u64>,
+    pub first_published_us: Option<u64>,
+    pub first_no_output_us: Option<u64>,
+    pub first_budget_rejected_us: Option<u64>,
+    pub first_binding: Option<Fingerprint>,
+    pub match_count: u64,
+    pub no_match_count: u64,
+    pub applicable_count: u64,
+    pub no_output_count: u64,
+    pub published_count: u64,
+    pub budget_rejected_count: u64,
+    pub last_reads: Box<[PatternRead]>,
+}
+
+impl TransformationTaskLifecycle {
+    fn new(task: TransformationTaskId) -> Self {
+        Self {
+            group: task.group,
+            expression: task.expression,
+            rule: task.rule,
+            first_enqueued_us: None,
+            first_run_us: None,
+            first_dependencies_ready_us: None,
+            first_matched_us: None,
+            first_no_match_us: None,
+            first_applicable_us: None,
+            first_published_us: None,
+            first_no_output_us: None,
+            first_budget_rejected_us: None,
+            first_binding: None,
+            match_count: 0,
+            no_match_count: 0,
+            applicable_count: 0,
+            no_output_count: 0,
+            published_count: 0,
+            budget_rejected_count: 0,
+            last_reads: Box::new([]),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SearchTask {
     Transform {
@@ -681,6 +750,7 @@ pub struct FrozenChoice {
 const SEARCH_CHECKPOINT_TARGETS_MS: [u64; 5] = [5, 10, 20, 50, 100];
 const MAX_CANDIDATE_LIFECYCLE_EVENTS: usize = 32_768;
 const CANDIDATE_LIFECYCLE_STAGE_LIMITS: [u64; 6] = [4_096, 16_384, 4_096, 8_192, 16_384, 1_024];
+const MAX_TRANSFORMATION_TASK_LIFECYCLES: usize = 4_096;
 
 /// A diagnostic-only snapshot of the currently selected root candidate at a
 /// fixed search-time checkpoint. The timestamp is the first observation at or
@@ -797,6 +867,12 @@ pub struct SearchMilestones {
     /// needed to locate a late producer/parent edge.
     pub candidate_lifecycle_stage_stored: [u64; 6],
     pub candidate_lifecycle_stage_dropped: [u64; 6],
+    /// Exact quality-rule task lifecycle, bounded separately from the denser
+    /// candidate timeline.  The task identity and reads make a late logical
+    /// publication attributable to queueing versus an advancing child
+    /// frontier without turning normal C1 into a tracing run.
+    pub transformation_task_lifecycle: Vec<TransformationTaskLifecycle>,
+    pub transformation_task_lifecycle_dropped: u64,
 }
 
 /// The last published physical response for one exact `(group, goal)` task.
@@ -2530,6 +2606,119 @@ impl CascadesEngine {
         );
     }
 
+    fn note_transformation_task(
+        &mut self,
+        task: TransformationTaskId,
+        phase: TransformationTaskLifecyclePhase,
+        reads: Option<&[PatternRead]>,
+        binding: Option<Fingerprint>,
+        count: u64,
+    ) {
+        if !self.collect_rule_work_profile
+            || self
+                .registry
+                .transformation(task.rule)
+                .is_none_or(|rule| rule.quality_dependency().is_none())
+        {
+            return;
+        }
+        let elapsed = self.lifecycle_elapsed_us();
+        Self::note_transformation_task_at(
+            &mut self.search_milestones,
+            task,
+            phase,
+            reads,
+            binding,
+            count,
+            elapsed,
+        );
+    }
+
+    fn note_transformation_task_at(
+        milestones: &mut SearchMilestones,
+        task: TransformationTaskId,
+        phase: TransformationTaskLifecyclePhase,
+        reads: Option<&[PatternRead]>,
+        binding: Option<Fingerprint>,
+        count: u64,
+        elapsed: u64,
+    ) {
+        let index = if let Some(index) = milestones
+            .transformation_task_lifecycle
+            .iter()
+            .position(|entry| {
+                entry.group == task.group
+                    && entry.expression == task.expression
+                    && entry.rule == task.rule
+            })
+        {
+            index
+        } else {
+            if milestones.transformation_task_lifecycle.len() >= MAX_TRANSFORMATION_TASK_LIFECYCLES {
+                milestones.transformation_task_lifecycle_dropped = milestones
+                    .transformation_task_lifecycle_dropped
+                    .saturating_add(1);
+                return;
+            }
+            milestones
+                .transformation_task_lifecycle
+                .push(TransformationTaskLifecycle::new(task));
+            milestones
+                .transformation_task_lifecycle
+                .len()
+                .saturating_sub(1)
+        };
+        let entry = &mut milestones.transformation_task_lifecycle[index];
+        if let Some(reads) = reads {
+            let mut reads = reads.to_vec();
+            reads.sort_unstable();
+            reads.dedup();
+            entry.last_reads = reads.into_boxed_slice();
+        }
+        if entry.first_binding.is_none() {
+            entry.first_binding = binding;
+        }
+        let first = match phase {
+            TransformationTaskLifecyclePhase::Enqueued => &mut entry.first_enqueued_us,
+            TransformationTaskLifecyclePhase::FirstRun => &mut entry.first_run_us,
+            TransformationTaskLifecyclePhase::DependenciesReady => {
+                &mut entry.first_dependencies_ready_us
+            }
+            TransformationTaskLifecyclePhase::Matched => &mut entry.first_matched_us,
+            TransformationTaskLifecyclePhase::NoMatch => &mut entry.first_no_match_us,
+            TransformationTaskLifecyclePhase::Applicable => &mut entry.first_applicable_us,
+            TransformationTaskLifecyclePhase::Published => &mut entry.first_published_us,
+            TransformationTaskLifecyclePhase::NoOutput => &mut entry.first_no_output_us,
+            TransformationTaskLifecyclePhase::BudgetRejected => {
+                &mut entry.first_budget_rejected_us
+            }
+        };
+        first.get_or_insert(elapsed);
+        match phase {
+            TransformationTaskLifecyclePhase::Matched => {
+                entry.match_count = entry.match_count.saturating_add(count)
+            }
+            TransformationTaskLifecyclePhase::NoMatch => {
+                entry.no_match_count = entry.no_match_count.saturating_add(count.max(1))
+            }
+            TransformationTaskLifecyclePhase::Applicable => {
+                entry.applicable_count = entry.applicable_count.saturating_add(count.max(1))
+            }
+            TransformationTaskLifecyclePhase::NoOutput => {
+                entry.no_output_count = entry.no_output_count.saturating_add(count.max(1))
+            }
+            TransformationTaskLifecyclePhase::Published => {
+                entry.published_count = entry.published_count.saturating_add(count)
+            }
+            TransformationTaskLifecyclePhase::BudgetRejected => {
+                entry.budget_rejected_count = entry.budget_rejected_count.saturating_add(count.max(1))
+            }
+            TransformationTaskLifecyclePhase::Enqueued
+            | TransformationTaskLifecyclePhase::FirstRun
+            | TransformationTaskLifecyclePhase::DependenciesReady => {}
+        }
+    }
+
     fn note_rule_phase_at(
         profiles: &mut BTreeMap<RuleId, RuleWorkProfile>,
         collect: bool,
@@ -2646,6 +2835,12 @@ impl CascadesEngine {
     fn lifecycle_elapsed_us(&self) -> u64 {
         self.profile_elapsed_us()
             .unwrap_or_else(|| self.memo.control().elapsed_us())
+    }
+
+    fn lifecycle_elapsed_from(started_at: Option<Instant>) -> u64 {
+        started_at
+            .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+            .unwrap_or_default()
     }
 
     fn note_parent_publication(
@@ -3836,6 +4031,13 @@ impl CascadesEngine {
                 expression,
                 rule,
             };
+            self.note_transformation_task(
+                task_id,
+                TransformationTaskLifecyclePhase::FirstRun,
+                None,
+                None,
+                0,
+            );
             self.note_rule_phase(rule, RuleWorkPhase::FirstRun);
             self.note_rule_phase(rule, RuleWorkPhase::Discovered);
             if self.collect_rule_work_profile {
@@ -3880,6 +4082,13 @@ impl CascadesEngine {
                     .group_ledger_mut(group)
                     .ok_or_else(|| paro_error::internal("pattern owner disappeared"))?
                     .record_budget_limited(dimension, witness.finish());
+                self.note_transformation_task(
+                    task_id,
+                    TransformationTaskLifecyclePhase::BudgetRejected,
+                    None,
+                    None,
+                    1,
+                );
                 continue;
             }
             // Rule implementations expose an allocation-free root dispatch
@@ -3938,6 +4147,13 @@ impl CascadesEngine {
             // enqueue and first-run: a queued task can still wait on an
             // advancing child frontier, and a matcher can discover no binding.
             self.note_rule_phase(rule, RuleWorkPhase::DependenciesReady);
+            self.note_transformation_task(
+                task_id,
+                TransformationTaskLifecyclePhase::DependenciesReady,
+                Some(&binding_set.reads),
+                None,
+                0,
+            );
             if !self.memo.control().checkpoint()? {
                 break;
             }
@@ -4000,6 +4216,13 @@ impl CascadesEngine {
                 continue;
             }
             if binding_set.bindings.is_empty() {
+                self.note_transformation_task(
+                    task_id,
+                    TransformationTaskLifecyclePhase::NoMatch,
+                    Some(&binding_set.reads),
+                    None,
+                    1,
+                );
                 continue;
             }
             // A binding set is a snapshot shared by all exact bindings of the
@@ -4020,6 +4243,13 @@ impl CascadesEngine {
             self.transformation_bindings = self
                 .transformation_bindings
                 .saturating_add(binding_set.bindings.len() as u64);
+            self.note_transformation_task(
+                task_id,
+                TransformationTaskLifecyclePhase::Matched,
+                Some(&binding_set.reads),
+                binding_set.bindings.first().map(|binding| binding.fingerprint),
+                binding_set.bindings.len() as u64,
+            );
             for binding in binding_set.bindings.iter() {
                 if !self.memo.control().checkpoint()? {
                     break 'tasks;
@@ -4177,6 +4407,13 @@ impl CascadesEngine {
                     .admit_optional(fire_dimension, event);
                 if admitted == BudgetDecision::Exhausted {
                     *self.rule_budget_exhaustions.entry(rule).or_default() += 1;
+                    self.note_transformation_task(
+                        task_id,
+                        TransformationTaskLifecyclePhase::BudgetRejected,
+                        Some(&application_reads),
+                        Some(binding.fingerprint),
+                        1,
+                    );
                     self.complete_transformation_task(transformation_task)?;
                     continue;
                 }
@@ -4229,6 +4466,12 @@ impl CascadesEngine {
                 // The context owns the complete attempt. Its Memo snapshot is
                 // lazy, and rule-specific side state enlists in the same rollback
                 // domain before its first write.
+                let task_lifecycle_enabled = self.collect_rule_work_profile
+                    && self
+                        .registry
+                        .transformation(rule)
+                        .is_some_and(|rule| rule.quality_dependency().is_some());
+                let task_lifecycle_started_at = self.profile_started_at;
                 let mut context = TransformContext::new(&mut self.memo, group);
                 let apply_started = Instant::now();
                 let apply_allocated = paro_common::allocator::thread_allocated_bytes();
@@ -4326,6 +4569,13 @@ impl CascadesEngine {
                     let mut observed = binding_set.reads.to_vec();
                     observed.extend(application_reads.iter().copied());
                     self.seed_transformation_observation(task_id, &observed)?;
+                    self.note_transformation_task(
+                        task_id,
+                        TransformationTaskLifecyclePhase::NoOutput,
+                        Some(&application_reads),
+                        Some(binding.fingerprint),
+                        1,
+                    );
                     self.transformation_applications
                         .entry(application_key)
                         .or_default()
@@ -4387,6 +4637,17 @@ impl CascadesEngine {
                     let profile = self.rule_work_profile.entry(rule).or_default();
                     profile.applicable = profile.applicable.saturating_add(1);
                     profile.constructed = profile.constructed.saturating_add(outputs.len() as u64);
+                }
+                if task_lifecycle_enabled {
+                    Self::note_transformation_task_at(
+                        &mut self.search_milestones,
+                        task_id,
+                        TransformationTaskLifecyclePhase::Applicable,
+                        Some(&application_reads),
+                        Some(binding.fingerprint),
+                        1,
+                        Self::lifecycle_elapsed_from(task_lifecycle_started_at),
+                    );
                 }
                 let insertion = (|| -> Result<TransformationInsertion> {
                     let mut inserted_groups = BTreeSet::new();
@@ -4512,6 +4773,17 @@ impl CascadesEngine {
                     self.complete_transformation_task(transformation_task)?;
                 } else {
                     let newly_inserted_expressions = inserted_expressions.clone();
+                    if task_lifecycle_enabled {
+                        Self::note_transformation_task_at(
+                            &mut self.search_milestones,
+                            task_id,
+                            TransformationTaskLifecyclePhase::Published,
+                            Some(&application_reads),
+                            Some(binding.fingerprint),
+                            newly_inserted_expressions.len() as u64,
+                            Self::lifecycle_elapsed_from(task_lifecycle_started_at),
+                        );
+                    }
                     let (appended_groups, locally_written_groups) = context.commit()?;
                     let locally_written_groups = locally_written_groups
                         .into_iter()
@@ -5472,6 +5744,13 @@ impl CascadesEngine {
                     rule: rule_id,
                 },
             );
+            self.note_transformation_task(
+                task_id,
+                TransformationTaskLifecyclePhase::Enqueued,
+                None,
+                None,
+                0,
+            );
             self.note_rule_phase(rule_id, RuleWorkPhase::Enqueued);
         }
         Ok(())
@@ -5555,6 +5834,13 @@ impl CascadesEngine {
                     expression: subscriber.expression,
                     rule: subscriber.rule,
                 },
+            );
+            self.note_transformation_task(
+                task_id,
+                TransformationTaskLifecyclePhase::Enqueued,
+                None,
+                None,
+                0,
             );
             self.note_rule_phase(subscriber.rule, RuleWorkPhase::Enqueued);
         }
