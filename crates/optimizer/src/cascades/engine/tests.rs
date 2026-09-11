@@ -13,8 +13,8 @@ use super::*;
 use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::ids::{
-    AdmissibleGrantSetId, CandidateId, ColumnId, LogicalPayloadId, OptimizationContextId,
-    PhysicalExprId, PhysicalPayloadId,
+    AdmissibleGrantSetId, CalibrationRevisionId, CandidateId, ColumnId, LogicalPayloadId,
+    OptimizationContextId, PhysicalExprId, PhysicalPayloadId, ResourceGrantClassId,
 };
 use crate::cascades::memo::{
     GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, OptimizationContext,
@@ -319,6 +319,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),
             physical_fingerprint: Fingerprint(91),
+            certified_local_work: None,
             region: Some(RegionCandidateContract {
                 // RegionId is an ephemeral forest position. The facet
                 // fingerprint is the stable recipe identity after runtime
@@ -911,6 +912,268 @@ impl PhysicalImplementation for LeafImplementation {
     }
 }
 
+struct FixedLeafImplementation {
+    id: ImplementationId,
+    score: f64,
+    mandatory: bool,
+}
+
+impl PhysicalImplementation for FixedLeafImplementation {
+    fn id(&self) -> ImplementationId {
+        self.id
+    }
+
+    fn matches(
+        &self,
+        _: &super::super::memo::LogicalExpr,
+        _: OptimizationGoal,
+        _: &ImplementationContext<'_>,
+    ) -> bool {
+        true
+    }
+
+    fn candidates(
+        &self,
+        expr: LogicalExprId,
+        _: OptimizationGoal,
+        ctx: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let logical = ctx.memo.logical_expr(expr).unwrap();
+        Ok(vec![PhysicalCandidate {
+            key: PhysicalExprKey {
+                implementation: self.id,
+                logical: expr,
+                children: Box::new([]),
+                payload_fingerprint: Fingerprint(self.id.0 as u128),
+            },
+            payload: PhysicalPayloadId(expr.0),
+            provided: provided(),
+            child_goals: Box::new([]),
+            local_cost: cost(self.score),
+            source_filter_apply_cost: None,
+            task_supply: TaskSupplyContract::Serial,
+            cost_composition: CostComposition::Sequential,
+            spillable: false,
+            enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
+            physical_fingerprint: logical.key.operator,
+            region: None,
+            mandatory: self.mandatory,
+        }]
+        .into_boxed_slice())
+    }
+}
+
+fn strong_seed_engine() -> (CascadesEngine, GroupId, OptimizationGoal) {
+    strong_seed_engine_with_prefix(false)
+}
+
+fn strong_seed_engine_with_prefix(
+    prefix_group: bool,
+) -> (CascadesEngine, GroupId, OptimizationGoal) {
+    let mut memo = Memo::new(super::super::budget::SearchBudget::default());
+    if prefix_group {
+        let dummy = memo.create_group(
+            schema(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        memo.insert_logical(
+            dummy,
+            LogicalExprKey {
+                operator: Fingerprint(999),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(999),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+    }
+    let group = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.insert_logical(
+        group,
+        LogicalExprKey {
+            operator: Fingerprint(10),
+            scalars: Box::new([]),
+            children: Box::new([]),
+        },
+        LogicalPayloadId(0),
+        EquivalenceProof::Initial,
+    )
+    .unwrap();
+    let required = memo.intern_required(required()).unwrap();
+    let goal = OptimizationGoal {
+        required,
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    let mut registry = ImplementationRegistry::default();
+    registry
+        .register_implementation(FixedLeafImplementation {
+            id: ImplementationId(40),
+            score: 1.0,
+            mandatory: true,
+        })
+        .unwrap();
+    registry
+        .register_implementation(FixedLeafImplementation {
+            id: ImplementationId(41),
+            score: 100.0,
+            mandatory: false,
+        })
+        .unwrap();
+    (CascadesEngine::new(memo, registry), group, goal)
+}
+
+struct TreeImplementation {
+    id: ImplementationId,
+    operator: Fingerprint,
+    child: Option<GroupId>,
+    child_row_goal: Option<RowGoal>,
+    local_score: f64,
+    mandatory: bool,
+}
+
+impl PhysicalImplementation for TreeImplementation {
+    fn id(&self) -> ImplementationId {
+        self.id
+    }
+
+    fn matches(
+        &self,
+        logical: &super::super::memo::LogicalExpr,
+        _: OptimizationGoal,
+        _: &ImplementationContext<'_>,
+    ) -> bool {
+        logical.key.operator == self.operator
+    }
+
+    fn candidates(
+        &self,
+        expr: LogicalExprId,
+        goal: OptimizationGoal,
+        _: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let local_score =
+            if self.operator == Fingerprint(100) && goal.row_goal == RowGoal::AtMost(1) {
+                10.0
+            } else {
+                self.local_score
+            };
+        let (children, child_goals) = match self.child {
+            Some(child) => {
+                let mut child_goal = goal;
+                child_goal.row_goal = self.child_row_goal.unwrap_or(RowGoal::All);
+                (vec![child], vec![(child, child_goal)])
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        Ok(vec![PhysicalCandidate {
+            key: PhysicalExprKey {
+                implementation: self.id,
+                logical: expr,
+                children: children.into_boxed_slice(),
+                payload_fingerprint: Fingerprint(self.id.0 as u128),
+            },
+            payload: PhysicalPayloadId(expr.0),
+            provided: provided(),
+            child_goals: child_goals.into_boxed_slice(),
+            local_cost: cost(local_score),
+            source_filter_apply_cost: None,
+            task_supply: TaskSupplyContract::Serial,
+            cost_composition: CostComposition::Sequential,
+            spillable: false,
+            enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
+            physical_fingerprint: Fingerprint(self.id.0 as u128),
+            region: None,
+            mandatory: self.mandatory,
+        }]
+        .into_boxed_slice())
+    }
+}
+
+fn strong_tree_engine() -> (CascadesEngine, GroupId, OptimizationGoal) {
+    let mut memo = Memo::new(super::super::budget::SearchBudget::default());
+    let child = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.insert_logical(
+        child,
+        LogicalExprKey {
+            operator: Fingerprint(100),
+            scalars: Box::new([]),
+            children: Box::new([]),
+        },
+        LogicalPayloadId(0),
+        EquivalenceProof::Initial,
+    )
+    .unwrap();
+    let root = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.insert_logical(
+        root,
+        LogicalExprKey {
+            operator: Fingerprint(200),
+            scalars: Box::new([]),
+            children: Box::new([child]),
+        },
+        LogicalPayloadId(1),
+        EquivalenceProof::Initial,
+    )
+    .unwrap();
+    let required = memo.intern_required(required()).unwrap();
+    let goal = OptimizationGoal {
+        required,
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    let mut registry = ImplementationRegistry::default();
+    registry
+        .register_implementation(TreeImplementation {
+            id: ImplementationId(40),
+            operator: Fingerprint(100),
+            child: None,
+            child_row_goal: None,
+            local_score: 1.0,
+            mandatory: true,
+        })
+        .unwrap();
+    registry
+        .register_implementation(TreeImplementation {
+            id: ImplementationId(41),
+            operator: Fingerprint(200),
+            child: Some(child),
+            child_row_goal: Some(RowGoal::All),
+            local_score: 0.0,
+            mandatory: true,
+        })
+        .unwrap();
+    registry
+        .register_implementation(TreeImplementation {
+            id: ImplementationId(42),
+            operator: Fingerprint(200),
+            child: Some(child),
+            child_row_goal: Some(RowGoal::AtMost(1)),
+            local_score: 0.0,
+            mandatory: false,
+        })
+        .unwrap();
+    (CascadesEngine::new(memo, registry), root, goal)
+}
+
 fn engine(optional_rules: u32) -> (CascadesEngine, GroupId, OptimizationGoal) {
     let mut budget = super::super::budget::SearchBudget::default();
     budget.max_rule_firings_per_group = optional_rules;
@@ -1050,6 +1313,315 @@ fn optional_transformation_can_improve_mandatory_baseline() {
     let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
     assert!(winner.cost.score.risk_adjusted < 5.0);
     assert_eq!(winner.physical_fingerprint, Fingerprint(11));
+}
+
+#[test]
+fn certified_group_pruning_is_independent_of_rule_tracing() {
+    let (mut engine, group, goal) = engine(8);
+    engine.set_certified_group_pruning_enabled(true);
+    engine.set_rule_work_profile_enabled(false);
+
+    let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+    assert_eq!(winner.physical_fingerprint, Fingerprint(11));
+
+    let counters = engine.search_work_counters();
+    assert_eq!(counters["certified_group_pruning_enabled"], 1);
+    assert!(counters["certified_bound_compute_us"] > 0);
+    assert!(engine.task_registry().profile().bound_proofs > 0);
+}
+
+#[test]
+fn strong_incumbent_crosses_a_fresh_memo_and_prunes_before_children() {
+    let (mut source, source_group, source_goal) = strong_seed_engine();
+    let source_winner = source
+        .optimize(source_group, source_goal, SearchMode::Memo)
+        .unwrap();
+    assert_eq!(source_winner.cost.score.range.expected, 1.0);
+    let plan = source
+        .export_seed_plan(source_group, source_goal)
+        .unwrap()
+        .expect("the verified source winner is exportable");
+    assert_eq!(plan.candidate(), source_winner.candidate);
+    assert_eq!(plan.frozen().winner.children.len(), 0);
+
+    let (mut target, target_group, target_goal) = strong_seed_engine();
+    let priced = target.reprice_seed_plan(target_group, plan).unwrap();
+    target.install_priced_incumbent(priced).unwrap();
+    target.set_certified_group_pruning_enabled(true);
+    target.set_rule_work_profile_enabled(false);
+    let target_winner = target
+        .optimize(target_group, target_goal, SearchMode::Memo)
+        .unwrap();
+
+    assert_eq!(target_winner.cost.score.range.expected, 1.0);
+    let counters = target.search_work_counters();
+    assert_eq!(counters["strong_incumbent_seed_count"], 1);
+    assert_eq!(counters["strong_incumbent_active_count"], 1);
+    assert!(counters["certified_bound_pruned_before_children_count"] > 0);
+}
+
+#[test]
+fn unrelated_group_merge_does_not_drop_a_current_strong_incumbent() {
+    let (mut source, source_group, source_goal) = strong_seed_engine();
+    source
+        .optimize(source_group, source_goal, SearchMode::Memo)
+        .unwrap();
+    let plan = source
+        .export_seed_plan(source_group, source_goal)
+        .unwrap()
+        .expect("the verified source winner is exportable");
+
+    let (mut target, target_group, target_goal) = strong_seed_engine();
+    let priced = target
+        .reprice_seed_plan(target_group, plan)
+        .expect("the destination must re-price the selected DAG");
+    target.install_priced_incumbent(priced).unwrap();
+    let unrelated_left = target.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let unrelated_right = target.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    target
+        .merge_groups(unrelated_left, unrelated_right)
+        .expect("an unrelated equivalent merge should succeed");
+
+    let counters = target.search_work_counters();
+    assert_eq!(counters["strong_incumbent_seed_count"], 1);
+    assert_eq!(counters["strong_incumbent_active_count"], 1);
+    assert_eq!(counters["strong_incumbent_invalid_lookup_count"], 0);
+    assert_eq!(target_goal, source_goal);
+}
+
+#[test]
+fn completed_child_no_plan_below_prunes_a_parent_before_cost_synthesis() {
+    let (mut source, source_root, source_goal) = strong_tree_engine();
+    let source_winner = source
+        .optimize(source_root, source_goal, SearchMode::Memo)
+        .unwrap();
+    assert_eq!(source_winner.cost.score.range.expected, 1.0);
+    let plan = source
+        .export_seed_plan(source_root, source_goal)
+        .unwrap()
+        .expect("the source tree winner is exportable");
+
+    let (mut target, target_root, target_goal) = strong_tree_engine();
+    let priced = target.reprice_seed_plan(target_root, plan).unwrap();
+    target.install_priced_incumbent(priced).unwrap();
+    target.set_certified_group_pruning_enabled(true);
+    target.set_rule_work_profile_enabled(false);
+    let target_winner = target
+        .optimize(target_root, target_goal, SearchMode::Memo)
+        .unwrap();
+
+    assert_eq!(target_winner.cost.score.range.expected, 1.0);
+    let counters = target.search_work_counters();
+    assert!(counters["certified_bound_pruned_after_children_count"] > 0);
+    assert!(target.task_registry().profile().bound_proofs > 0);
+}
+
+#[test]
+fn priced_seed_is_rejected_after_a_child_fact_change() {
+    let (mut source, source_group, source_goal) = strong_seed_engine();
+    source
+        .optimize(source_group, source_goal, SearchMode::Memo)
+        .unwrap();
+    let plan = source
+        .export_seed_plan(source_group, source_goal)
+        .unwrap()
+        .expect("source winner should produce a seed plan");
+    assert!(source.price_seed_plan(&plan).is_ok());
+    source
+        .memo_mut()
+        .group_mut(source_group)
+        .unwrap()
+        .cardinality = GroupCardinality::new(
+        Fingerprint(992),
+        super::super::memo::CardinalityRecipeKind::Statistics,
+        1,
+        2,
+        4,
+    );
+    assert!(source.price_seed_plan(&plan).is_err());
+
+    let (mut target, target_group, _) = strong_seed_engine();
+    let priced = target.reprice_seed_plan(target_group, plan).unwrap();
+    target
+        .memo_mut()
+        .group_mut(target_group)
+        .unwrap()
+        .cardinality = GroupCardinality::new(
+        Fingerprint(991),
+        super::super::memo::CardinalityRecipeKind::Statistics,
+        1,
+        4,
+        9,
+    );
+    let error = target
+        .install_priced_incumbent(priced)
+        .expect_err("a fact change must invalidate the old price");
+    assert!(error.to_string().contains("read witness is stale"));
+}
+
+#[test]
+fn priced_seed_is_rejected_after_calibration_change() {
+    let (mut source, source_group, source_goal) = strong_seed_engine();
+    source
+        .optimize(source_group, source_goal, SearchMode::Memo)
+        .unwrap();
+    let plan = source
+        .export_seed_plan(source_group, source_goal)
+        .unwrap()
+        .expect("source winner should produce a seed plan");
+
+    let (mut target, target_group, _) = strong_seed_engine();
+    let priced = target.reprice_seed_plan(target_group, plan).unwrap();
+    let mut calibration = MachineCalibrationBundle::default();
+    calibration.revision = CalibrationRevisionId(99);
+    target.memo_mut().set_calibration(Arc::new(calibration));
+    let error = target
+        .install_priced_incumbent(priced)
+        .expect_err("a calibration change must invalidate the old price");
+    assert!(error.to_string().contains("cost context changed"));
+}
+
+#[test]
+fn priced_seed_is_rejected_after_calibration_payload_change_without_revision_bump() {
+    let (mut source, source_group, source_goal) = strong_seed_engine();
+    source
+        .optimize(source_group, source_goal, SearchMode::Memo)
+        .unwrap();
+    let plan = source
+        .export_seed_plan(source_group, source_goal)
+        .unwrap()
+        .expect("source winner should produce a seed plan");
+
+    let (mut target, target_group, _) = strong_seed_engine();
+    let priced = target.reprice_seed_plan(target_group, plan).unwrap();
+    let mut calibration = MachineCalibrationBundle::default();
+    calibration.risk_weight += 0.25;
+    target.memo_mut().set_calibration(Arc::new(calibration));
+    let error = target
+        .install_priced_incumbent(priced)
+        .expect_err("a payload change must invalidate the old price even with the same revision");
+    assert!(error.to_string().contains("cost context changed"));
+}
+
+#[test]
+fn priced_seed_is_rejected_after_grant_operating_point_change() {
+    let class = crate::physical::ResourceGrantClass {
+        id: ResourceGrantClassId(7),
+        hard_memory_bytes: 1024,
+        spill_policy: crate::physical::SpillPolicy::Forbidden,
+        max_parallel_tasks: 1,
+    };
+    let mut source_goal;
+    let (mut source, source_group, base_source_goal) = strong_seed_engine();
+    source_goal = base_source_goal;
+    source_goal.grant = GrantGoalKey::Class(class.id);
+    source.prime_grant_context([class]).unwrap();
+    source
+        .optimize(source_group, source_goal, SearchMode::Memo)
+        .unwrap();
+    let plan = source
+        .export_seed_plan(source_group, source_goal)
+        .unwrap()
+        .expect("source winner should produce a seed plan");
+
+    let (mut target, target_group, base_target_goal) = strong_seed_engine();
+    let mut target_goal = base_target_goal;
+    target_goal.grant = GrantGoalKey::Class(class.id);
+    target.prime_grant_context([class]).unwrap();
+    let priced = target
+        .reprice_seed_plan_for_goal(target_group, target_goal, plan)
+        .unwrap();
+    let changed_class = crate::physical::ResourceGrantClass {
+        hard_memory_bytes: 2048,
+        ..class
+    };
+    target.prime_grant_context([changed_class]).unwrap();
+    let error = target
+        .install_priced_incumbent(priced)
+        .expect_err("a grant operating point change must invalidate the old price");
+    assert!(error.to_string().contains("cost context changed"));
+}
+
+#[test]
+fn seed_plan_repricing_handles_memo_group_id_renaming() {
+    let (mut source, source_group, source_goal) = strong_seed_engine();
+    source
+        .optimize(source_group, source_goal, SearchMode::Memo)
+        .unwrap();
+    let plan = source
+        .export_seed_plan(source_group, source_goal)
+        .unwrap()
+        .expect("source winner should produce a seed plan");
+    let identity = plan.plan_identity();
+
+    let (mut target, target_group, target_goal) = strong_seed_engine_with_prefix(true);
+    let priced = target
+        .reprice_seed_plan_for_goal(target_group, target_goal, plan)
+        .unwrap();
+    assert_eq!(priced.plan().plan_identity(), identity);
+    target.install_priced_incumbent(priced).unwrap();
+    let winner = target
+        .optimize(target_group, target_goal, SearchMode::Memo)
+        .unwrap();
+    assert_eq!(winner.cost.score.range.expected, 1.0);
+}
+
+#[test]
+fn strong_seed_keeps_optimal_result_consistent_through_grant_entry_and_pruning_toggle() {
+    let (mut source, source_group, source_goal) = strong_seed_engine();
+    source
+        .optimize(source_group, source_goal, SearchMode::Memo)
+        .unwrap();
+    let plan = source
+        .export_seed_plan(source_group, source_goal)
+        .unwrap()
+        .expect("source winner should produce a seed plan");
+
+    let class = crate::physical::ResourceGrantClass {
+        id: ResourceGrantClassId(1),
+        hard_memory_bytes: u64::MAX,
+        spill_policy: crate::physical::SpillPolicy::Allowed,
+        max_parallel_tasks: 1,
+    };
+    let mut results = Vec::new();
+    for pruning in [false, true] {
+        let (mut target, target_group, target_goal) = strong_seed_engine();
+        let installed = target
+            .install_strong_incumbent_for_grants(
+                target_group,
+                target_goal,
+                AdmissibleGrantSetId(0),
+                [class],
+                std::slice::from_ref(&plan),
+            )
+            .unwrap();
+        assert_eq!(installed, 1);
+        target.set_certified_group_pruning_enabled(pruning);
+        let optimization = target
+            .optimize_for_grants(
+                target_group,
+                target_goal,
+                AdmissibleGrantSetId(0),
+                [class],
+                SearchMode::Memo,
+            )
+            .unwrap();
+        assert_eq!(optimization.winners.len(), 1);
+        assert_eq!(
+            target.search_work_counters()["strong_incumbent_seed_count"],
+            1
+        );
+        results.push(optimization.winners[0].winner.cost);
+    }
+    assert_eq!(results[0], results[1]);
 }
 
 #[test]

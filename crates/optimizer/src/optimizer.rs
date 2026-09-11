@@ -18,7 +18,7 @@ use crate::physical::{
     StableFingerprintBuilder,
 };
 use paro_catalog::entry::CatalogEntry;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_context::StatementContext;
@@ -26,7 +26,7 @@ use paro_planner::binder::deep_copy::{
     duplicate_plan_preserving_indices, fork_plan_preserving_indices,
 };
 use paro_planner::binder::Binder;
-use paro_planner::operator::{Join, JoinType, LogicalOperator};
+use paro_planner::operator::{Join, JoinType, LogicalOperator, LogicalOperatorType};
 use paro_planner::plan::OwnedLogicalPlan;
 use paro_planner::verify::verify_physical_planner_invariants;
 use paro_storage::statistics::ColumnStatistics;
@@ -36,7 +36,7 @@ use crate::aggregate::common::CommonAggregateOptimizer;
 use crate::aggregate::{distinct_decomposition, late_payload, singleton_groups};
 use crate::cascades::{
     AlternativeOrigin, CompactRange, LocalOperatorWork, LogicalAlternative,
-    MachineCalibrationBundle, MemoBuilder, OpClassId, SearchBudget, SearchCost,
+    MachineCalibrationBundle, MemoBuilder, OpClassId, PricedIncumbent, SearchBudget, SearchCost,
     GRAPH_REGION_ENUMERATOR_RULE,
 };
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
@@ -74,6 +74,7 @@ const DISTINCT_AGGREGATE_FEASIBILITY_RULE: crate::cascades::RuleId =
     crate::cascades::RuleId(10_020);
 const CORRELATED_TOPN_PAYLOAD_REGION_RULE: crate::cascades::RuleId =
     crate::cascades::RuleId(10_022);
+const STRONG_INCUMBENT_SEED_RULE: crate::cascades::RuleId = crate::cascades::RuleId(u32::MAX - 1);
 
 struct CandidatePlan {
     plan: OwnedLogicalPlan,
@@ -88,6 +89,309 @@ impl CandidatePlan {
             column_stats: self.column_stats,
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PlanShapeEvidence {
+    nodes: u64,
+    gets: u64,
+    filters: u64,
+    aggregates: u64,
+    joins: u64,
+    row_fetches: u64,
+    materialized_ctes: u64,
+    recursive_ctes: u64,
+    cte_refs: u64,
+    max_output_width: u64,
+}
+
+fn plan_shape_evidence(plan: &OwnedLogicalPlan) -> PlanShapeEvidence {
+    let mut evidence = PlanShapeEvidence::default();
+    let mut pending = vec![plan];
+    while let Some(node) = pending.pop() {
+        evidence.nodes = evidence.nodes.saturating_add(1);
+        evidence.max_output_width = evidence
+            .max_output_width
+            .max(node.output_layout().len() as u64);
+        match node.operator.op_type() {
+            LogicalOperatorType::Get
+            | LogicalOperatorType::TableFunctionGet
+            | LogicalOperatorType::SearchScan
+            | LogicalOperatorType::FullTextFilterScan
+            | LogicalOperatorType::GraphScan => {
+                evidence.gets = evidence.gets.saturating_add(1);
+            }
+            LogicalOperatorType::Filter => {
+                evidence.filters = evidence.filters.saturating_add(1);
+            }
+            LogicalOperatorType::Aggregate => {
+                evidence.aggregates = evidence.aggregates.saturating_add(1);
+            }
+            LogicalOperatorType::ComparisonJoin
+            | LogicalOperatorType::AnyJoin
+            | LogicalOperatorType::CrossProduct
+            | LogicalOperatorType::DependentJoin => {
+                evidence.joins = evidence.joins.saturating_add(1);
+            }
+            LogicalOperatorType::RowFetch => {
+                evidence.row_fetches = evidence.row_fetches.saturating_add(1);
+            }
+            LogicalOperatorType::MaterializedCTE => {
+                evidence.materialized_ctes = evidence.materialized_ctes.saturating_add(1);
+            }
+            LogicalOperatorType::RecursiveCTE => {
+                evidence.recursive_ctes = evidence.recursive_ctes.saturating_add(1);
+            }
+            LogicalOperatorType::CTERef => {
+                evidence.cte_refs = evidence.cte_refs.saturating_add(1);
+            }
+            _ => {}
+        }
+        pending.extend(node.children());
+    }
+    evidence
+}
+
+fn record_plan_shape(
+    trace: &paro_context::StatementTrace,
+    prefix: &str,
+    evidence: PlanShapeEvidence,
+) {
+    for (name, value) in [
+        ("nodes", evidence.nodes),
+        ("gets", evidence.gets),
+        ("filters", evidence.filters),
+        ("aggregates", evidence.aggregates),
+        ("joins", evidence.joins),
+        ("row_fetches", evidence.row_fetches),
+        ("materialized_ctes", evidence.materialized_ctes),
+        ("recursive_ctes", evidence.recursive_ctes),
+        ("cte_refs", evidence.cte_refs),
+        ("max_output_width", evidence.max_output_width),
+    ] {
+        trace.record_value("optimizer", &format!("{prefix}.shape.{name}"), value);
+    }
+}
+
+fn record_cost_evidence(trace: &paro_context::StatementTrace, prefix: &str, cost: SearchCost) {
+    for (name, value) in [
+        ("score_lower_bits", cost.score.range.lower.to_bits()),
+        ("score_expected_bits", cost.score.range.expected.to_bits()),
+        ("score_upper_bits", cost.score.range.upper.to_bits()),
+        (
+            "score_risk_adjusted_bits",
+            cost.score.risk_adjusted.to_bits(),
+        ),
+        ("work_lower_bits", cost.work_latency.lower.to_bits()),
+        ("work_expected_bits", cost.work_latency.expected.to_bits()),
+        ("work_upper_bits", cost.work_latency.upper.to_bits()),
+        (
+            "critical_path_lower_bits",
+            cost.critical_path.lower.to_bits(),
+        ),
+        (
+            "critical_path_expected_bits",
+            cost.critical_path.expected.to_bits(),
+        ),
+        (
+            "critical_path_upper_bits",
+            cost.critical_path.upper.to_bits(),
+        ),
+        (
+            "non_revocable_memory_upper",
+            cost.non_revocable_memory_upper,
+        ),
+        ("minimum_memory_bytes", cost.minimum_memory_bytes),
+        ("revocable_memory_target", cost.revocable_memory_target),
+        ("peak_memory_upper", cost.peak_memory_upper),
+        ("spill_bytes_expected", cost.spill_bytes_expected),
+        ("max_parallel_tasks", u64::from(cost.max_parallel_tasks)),
+        (
+            "output_pipeline_tasks",
+            u64::from(cost.output_pipeline_tasks),
+        ),
+        ("external_workers", u64::from(cost.external_workers.0)),
+        (
+            "external_worker_slots_upper",
+            u64::from(cost.external_worker_slots_upper),
+        ),
+    ] {
+        trace.record_value("optimizer", &format!("{prefix}.cost.{name}"), value);
+    }
+    for (index, value) in cost.resources_expected.iter().enumerate() {
+        trace.record_value(
+            "optimizer",
+            &format!("{prefix}.cost.resources_expected_{index}_bits"),
+            value.to_bits(),
+        );
+    }
+    for (index, value) in cost.resources_risk_upper.iter().enumerate() {
+        trace.record_value(
+            "optimizer",
+            &format!("{prefix}.cost.resources_risk_upper_{index}_bits"),
+            value.to_bits(),
+        );
+    }
+}
+
+fn record_fingerprint(
+    trace: &paro_context::StatementTrace,
+    prefix: &str,
+    fingerprint: Fingerprint,
+) {
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.fingerprint_lo"),
+        fingerprint.0 as u64,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.fingerprint_hi"),
+        (fingerprint.0 >> 64) as u64,
+    );
+}
+
+fn record_seed_plan_evidence(
+    trace: &paro_context::StatementTrace,
+    prefix: &str,
+    seed: &crate::cascades::SeedPlan,
+    logical: Option<&OwnedLogicalPlan>,
+) {
+    record_fingerprint(trace, &format!("{prefix}.plan"), seed.plan_identity());
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.candidate"),
+        seed.candidate().index() as u64,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.group"),
+        seed.group().0 as u64,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.grant"),
+        seed.goal().grant.stable_tag(),
+    );
+    let frozen = seed.frozen();
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.child_count"),
+        frozen.winner.children.len() as u64,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.source_work_count"),
+        frozen.winner.source_work.len() as u64,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.physical_implementation"),
+        frozen.physical.key.implementation.0 as u64,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.physical_logical_expression"),
+        frozen.physical.key.logical.0 as u64,
+    );
+    record_fingerprint(
+        trace,
+        &format!("{prefix}.physical_payload"),
+        frozen.physical.key.payload_fingerprint,
+    );
+    record_cost_evidence(trace, prefix, frozen.winner.cost);
+    if let Some(logical) = logical {
+        record_plan_shape(trace, prefix, plan_shape_evidence(logical));
+    }
+}
+
+fn record_priced_incumbent_evidence(
+    trace: &paro_context::StatementTrace,
+    prefix: &str,
+    incumbent: &PricedIncumbent,
+) {
+    let seed = incumbent.plan();
+    record_fingerprint(trace, &format!("{prefix}.plan"), seed.plan_identity());
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.candidate"),
+        seed.candidate().index() as u64,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.target_group"),
+        incumbent.target_group().0 as u64,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.grant"),
+        incumbent.goal().grant.stable_tag(),
+    );
+    record_fingerprint(
+        trace,
+        &format!("{prefix}.physical_payload"),
+        seed.frozen().physical.key.payload_fingerprint,
+    );
+    record_cost_evidence(trace, prefix, incumbent.cost());
+    record_fingerprint(
+        trace,
+        &format!("{prefix}.cost_context"),
+        incumbent.context().fingerprint(),
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.read_count"),
+        incumbent.context().reads().reads().len() as u64,
+    );
+}
+
+fn record_variant_evidence(
+    trace: &paro_context::StatementTrace,
+    prefix: &str,
+    variant: &crate::cascades::OptimizedVariant,
+) {
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.grant"),
+        variant.class.0 as u64,
+    );
+    record_fingerprint(
+        trace,
+        &format!("{prefix}.physical"),
+        variant.physical_fingerprint,
+    );
+    record_cost_evidence(trace, prefix, variant.cost);
+    record_plan_shape(trace, prefix, plan_shape_evidence(&variant.plan));
+    let mut runtime_filter_contracts = 0_u64;
+    let mut spill_contracts = 0_u64;
+    for contract in variant.contracts.values() {
+        if matches!(
+            contract.implementation,
+            PhysicalImplementationFlavor::HashJoinRuntimeFilter
+                | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+        ) {
+            runtime_filter_contracts = runtime_filter_contracts.saturating_add(1);
+        }
+        if contract.cost.spill_bytes_expected > 0
+            || matches!(
+                contract.implementation,
+                PhysicalImplementationFlavor::CrossProductExternal
+                    | PhysicalImplementationFlavor::AdaptiveSort
+            )
+        {
+            spill_contracts = spill_contracts.saturating_add(1);
+        }
+    }
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.runtime_filter_contracts"),
+        runtime_filter_contracts,
+    );
+    trace.record_value(
+        "optimizer",
+        &format!("{prefix}.spill_contracts"),
+        spill_contracts,
+    );
 }
 
 pub struct Optimizer {
@@ -333,40 +637,392 @@ impl Optimizer {
             OptimizerComponent::SemanticNormalization,
             paro_common::allocator::allocated_bytes_since(phase_allocated),
         );
-        let phase_started = Instant::now();
-        let phase_allocated = paro_common::allocator::thread_allocated_bytes();
+        let query_ir_phase_started = Instant::now();
+        let query_ir_phase_allocated = paro_common::allocator::thread_allocated_bytes();
         for alternative in &alternatives {
             verify_physical_planner_invariants(&alternative.plan.operator)?;
         }
-        let mut input = MemoBuilder::build_with_search(
-            alternatives,
-            &self.binder,
-            self.budget.clone(),
-            &self.ctx,
-        )?
-        .with_calibration(self.calibration.clone())
-        .with_force_spill(self.ctx.session.limits.force_external);
-        if let Some(write) = statement_layer.write_contract() {
-            if let crate::physical::requirements::MutationSafetyRequirement::StableReadBeforeWrite {
-                targets,
-                snapshot,
-            } = &write.mutation_safety
-            {
-                input = input.require_stable_mutation_input(targets.clone(), *snapshot)?;
-            }
-        }
-        self.ctx.profiler.record(
-            OptimizerComponent::QueryIrConstruction,
-            phase_started.elapsed(),
-        );
-        self.ctx.profiler.record_component_allocation(
-            OptimizerComponent::QueryIrConstruction,
-            paro_common::allocator::allocated_bytes_since(phase_allocated),
-        );
-        let mode = input.mode;
-        let phase_started = Instant::now();
-        let phase_allocated = paro_common::allocator::thread_allocated_bytes();
-        let extraction = input.optimize(&grant_classes)?;
+        let strong_incumbent_experiment = std::env::var_os("PARO_STRONG_INCUMBENT_EXPERIMENT")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let strong_incumbent_provide_bound = strong_incumbent_experiment
+            && std::env::var_os("PARO_STRONG_INCUMBENT_PROVIDE_BOUND")
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let strong_incumbent_inject_logical = strong_incumbent_experiment
+            && std::env::var_os("PARO_STRONG_INCUMBENT_INJECT_LOGICAL")
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let (mode, extraction, search_phase_started, search_phase_allocated) =
+            if strong_incumbent_experiment {
+                // Build two independent Memo instances from the same semantic
+                // alternatives. The first one is used only to produce a verified
+                // immutable upper bound; the second one owns the measured proof
+                // search. No search frontier, task registry, or planner payload
+                // arena crosses this boundary.
+                let mut source_binder = self.binder.clone();
+                source_binder.bind_context = self.binder.bind_context.with_independent_plan_ids();
+                let source_bind_shared = source_binder.bind_context.shared().clone();
+                let mut source_alternatives = Vec::with_capacity(alternatives.len());
+                let mut target_alternatives = Vec::with_capacity(alternatives.len());
+                for alternative in alternatives {
+                    let source = alternative.source;
+                    let column_stats = alternative.column_stats;
+                    // Keep the exact original plan in the measured target
+                    // Memo so the no-seed controls have the same initial
+                    // domain as the ordinary production path. Only the
+                    // source Memo receives a deep duplicate; its fresh
+                    // plan-node IDs must never become a target-search
+                    // variable. Rebuilding both branches here can change
+                    // insertion order and therefore confound the isolation
+                    // experiment even when the trees are semantically equal.
+                    let source_plan = duplicate_plan_preserving_indices(
+                        &alternative.plan,
+                        source_bind_shared.as_ref(),
+                    );
+                    let target_plan = alternative.plan;
+                    source_alternatives.push(LogicalAlternative {
+                        plan: source_plan,
+                        source,
+                        column_stats: column_stats.clone(),
+                    });
+                    target_alternatives.push(LogicalAlternative {
+                        plan: target_plan,
+                        source,
+                        column_stats,
+                    });
+                }
+
+                let source_input = self
+                    .build_search_input_with_binder(
+                        source_alternatives,
+                        &statement_layer,
+                        &source_binder,
+                    )?
+                    .with_strong_incumbent_export(true)
+                    // C/D must use the same known seed.  The pruning switch
+                    // belongs to the independent target proof Memo, not to
+                    // source seed generation.
+                    .with_certified_group_pruning(false);
+                self.ctx.profiler.record(
+                    OptimizerComponent::QueryIrConstruction,
+                    query_ir_phase_started.elapsed(),
+                );
+                self.ctx.profiler.record_component_allocation(
+                    OptimizerComponent::QueryIrConstruction,
+                    paro_common::allocator::allocated_bytes_since(query_ir_phase_allocated),
+                );
+                let search_phase_started = Instant::now();
+                let search_phase_allocated = paro_common::allocator::thread_allocated_bytes();
+                let source_started = Instant::now();
+                let source_output = source_input.optimize(&grant_classes)?;
+                let source_total_us =
+                    u64::try_from(source_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let source_complete = source_output.search_summary.is_complete();
+                let source_obligations = source_output.search_summary.obligations.len() as u64;
+                let source_profile_us = source_output.search_milestones.search_return_profile_us;
+                let source_export_us = source_output.strong_incumbent_export_us;
+                let source_logical_plans = source_output.strong_incumbent_logical_plans.into_vec();
+                let plans = source_output.strong_incumbent_plans.into_vec();
+                let source_seed_count = plans.len();
+                if plans.is_empty() {
+                    return Err(paro_error::internal(
+                        "strong incumbent experiment produced no verified seed plan",
+                    ));
+                }
+                if strong_incumbent_inject_logical && source_logical_plans.len() != plans.len() {
+                    return Err(paro_error::internal(format!(
+                        "strong incumbent logical/physical seed count mismatch: logical={} physical={}",
+                        source_logical_plans.len(),
+                        plans.len()
+                    )));
+                }
+                if let Some(trace) = self.ctx.session.statement_trace() {
+                    for (seed_ordinal, seed) in plans.iter().enumerate() {
+                        record_seed_plan_evidence(
+                            trace.as_ref(),
+                            &format!("strong_incumbent_source_seed_{seed_ordinal}"),
+                            seed,
+                            source_logical_plans.get(seed_ordinal),
+                        );
+                    }
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_provide_bound",
+                        u64::from(strong_incumbent_provide_bound),
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_inject_logical",
+                        u64::from(strong_incumbent_inject_logical),
+                    );
+                    trace.record_event("optimizer", "strong_incumbent_seed_source_complete");
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_seed_source_count",
+                        source_seed_count as u64,
+                    );
+                    if let Some(plan) = plans.first() {
+                        trace.record_value(
+                            "optimizer",
+                            "strong_incumbent_seed_plan_identity_lo",
+                            plan.plan_identity().0 as u64,
+                        );
+                        trace.record_value(
+                            "optimizer",
+                            "strong_incumbent_seed_plan_identity_hi",
+                            (plan.plan_identity().0 >> 64) as u64,
+                        );
+                    }
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_seed_source_total_us",
+                        source_total_us,
+                    );
+                    if let Some(export_us) = source_export_us {
+                        trace.record_value(
+                            "optimizer",
+                            "strong_incumbent_seed_source_export_us",
+                            export_us,
+                        );
+                    }
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_seed_source_search_complete",
+                        u64::from(source_complete),
+                    );
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_seed_source_obligations",
+                        source_obligations,
+                    );
+                    if let Some(profile_us) = source_profile_us {
+                        trace.record_value(
+                            "optimizer",
+                            "strong_incumbent_seed_source_search_us",
+                            profile_us,
+                        );
+                    }
+                }
+
+                let seed_column_stats = target_alternatives
+                    .first()
+                    .map(|alternative| alternative.column_stats.clone())
+                    .unwrap_or_else(|| Arc::new(HashMap::new()));
+                let seed_output_table_index = target_alternatives
+                    .first()
+                    .and_then(|alternative| alternative.plan.get_column_bindings().first().copied())
+                    .map(|binding| binding.table_index);
+                let expected_seed_output_bindings = target_alternatives
+                    .first()
+                    .map(|alternative| alternative.plan.get_column_bindings())
+                    .unwrap_or_default();
+                let mut pricing_alternatives =
+                    if strong_incumbent_provide_bound && !strong_incumbent_inject_logical {
+                        target_alternatives
+                            .iter()
+                            .map(|alternative| LogicalAlternative {
+                                plan: duplicate_plan_preserving_indices(
+                                    &alternative.plan,
+                                    source_bind_shared.as_ref(),
+                                ),
+                                source: alternative.source,
+                                column_stats: alternative.column_stats.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                let mut target_alternatives = target_alternatives;
+                for (seed_ordinal, plan) in source_logical_plans.into_iter().enumerate() {
+                    if !strong_incumbent_inject_logical && !strong_incumbent_provide_bound {
+                        continue;
+                    }
+                    {
+                        let source_bindings = plan.get_column_bindings();
+                        let plan = if strong_incumbent_inject_logical {
+                            duplicate_plan_preserving_indices(
+                                &plan,
+                                self.binder.bind_context.shared().as_ref(),
+                            )
+                        } else {
+                            plan
+                        };
+                        let plan = if let Some(table_index) = seed_output_table_index {
+                            rebase_seed_output_table_index(plan, table_index)?
+                        } else {
+                            plan
+                        };
+                        let rebased_output_bindings = plan.get_column_bindings();
+                        if rebased_output_bindings != expected_seed_output_bindings {
+                            return Err(paro_error::internal(format!(
+                                "strong seed output layout cannot be rebased: expected={expected_seed_output_bindings:?}, actual={rebased_output_bindings:?}"
+                            )));
+                        }
+                        if let Some(trace) = self.ctx.session.statement_trace() {
+                            trace.record_value(
+                                "optimizer",
+                                &format!("strong_incumbent_seed_{seed_ordinal}_target_table_index"),
+                                seed_output_table_index.unwrap_or(usize::MAX) as u64,
+                            );
+                            trace.record_value(
+                                "optimizer",
+                                &format!(
+                                    "strong_incumbent_seed_{seed_ordinal}_source_output_width"
+                                ),
+                                source_bindings.len() as u64,
+                            );
+                            trace.record_value(
+                                "optimizer",
+                                &format!(
+                                    "strong_incumbent_seed_{seed_ordinal}_source_output_table"
+                                ),
+                                source_bindings
+                                    .first()
+                                    .map(|binding| binding.table_index as u64)
+                                    .unwrap_or(u64::MAX),
+                            );
+                            let target_bindings = plan.get_column_bindings();
+                            trace.record_value(
+                                "optimizer",
+                                &format!(
+                                    "strong_incumbent_seed_{seed_ordinal}_rebased_output_table"
+                                ),
+                                target_bindings
+                                    .first()
+                                    .map(|binding| binding.table_index as u64)
+                                    .unwrap_or(u64::MAX),
+                            );
+                        }
+                        let alternative = LogicalAlternative {
+                            plan,
+                            source: AlternativeOrigin::Specialized {
+                                rule: STRONG_INCUMBENT_SEED_RULE,
+                            },
+                            column_stats: seed_column_stats.clone(),
+                        };
+                        if strong_incumbent_inject_logical {
+                            target_alternatives.push(alternative);
+                        } else {
+                            pricing_alternatives.push(alternative);
+                        }
+                    }
+                }
+                // Keep the Memo independent while making a source winner's
+                // transformed logical shell available for re-pricing. The
+                // target registry, facts, grant and costs are rebuilt below;
+                // no source frontier or search cache crosses this boundary.
+                let mut target_input =
+                    self.build_search_input(target_alternatives, &statement_layer)?;
+                let mode = target_input.mode;
+                if strong_incumbent_provide_bound {
+                    if strong_incumbent_inject_logical {
+                        for plan in plans {
+                            target_input = target_input.with_strong_incumbent_plan(plan);
+                        }
+                    } else {
+                        let pricing_input = self.build_search_input_with_binder(
+                            pricing_alternatives,
+                            &statement_layer,
+                            &source_binder,
+                        )?;
+                        let pricing_started = Instant::now();
+                        let repriced = pricing_input
+                            .reprice_seed_plans_in_isolated_memo(&grant_classes, &plans)?;
+                        let pricing_us = u64::try_from(pricing_started.elapsed().as_micros())
+                            .unwrap_or(u64::MAX);
+                        if let Some(trace) = self.ctx.session.statement_trace() {
+                            trace.record_value(
+                                "optimizer",
+                                "strong_incumbent_seed_isolated_reprice_us",
+                                pricing_us,
+                            );
+                            trace.record_value(
+                                "optimizer",
+                                "strong_incumbent_seed_isolated_reprice_count",
+                                repriced.len() as u64,
+                            );
+                            for (incumbent_ordinal, incumbent) in repriced.iter().enumerate() {
+                                record_priced_incumbent_evidence(
+                                    trace.as_ref(),
+                                    &format!("strong_incumbent_target_priced_{incumbent_ordinal}"),
+                                    incumbent,
+                                );
+                            }
+                        }
+                        for incumbent in repriced {
+                            target_input = target_input.with_prepriced_strong_incumbent(incumbent);
+                        }
+                    }
+                }
+                if let Some(trace) = self.ctx.session.statement_trace() {
+                    trace.record_event("optimizer", "strong_incumbent_seed_target_begin");
+                }
+                let target_started = Instant::now();
+                let extraction = target_input.optimize(&grant_classes)?;
+                let target_total_us =
+                    u64::try_from(target_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                if let Some(trace) = self.ctx.session.statement_trace() {
+                    trace.record_event("optimizer", "strong_incumbent_seed_target_complete");
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_seed_target_total_us",
+                        target_total_us,
+                    );
+                    if let Some(reprice_us) = extraction.strong_incumbent_reprice_us {
+                        trace.record_value(
+                            "optimizer",
+                            "strong_incumbent_seed_target_reprice_us",
+                            reprice_us,
+                        );
+                        trace.record_value(
+                            "optimizer",
+                            "strong_incumbent_seed_target_reprice_count",
+                            extraction.strong_incumbent_reprice_count,
+                        );
+                        if let Some(identity) = extraction.strong_incumbent_plan_identity {
+                            trace.record_value(
+                                "optimizer",
+                                "strong_incumbent_seed_target_plan_identity_lo",
+                                identity.0 as u64,
+                            );
+                            trace.record_value(
+                                "optimizer",
+                                "strong_incumbent_seed_target_plan_identity_hi",
+                                (identity.0 >> 64) as u64,
+                            );
+                        }
+                    }
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_seed_target_search_complete",
+                        u64::from(extraction.search_summary.is_complete()),
+                    );
+                }
+                (
+                    mode,
+                    extraction,
+                    search_phase_started,
+                    search_phase_allocated,
+                )
+            } else {
+                let input = self.build_search_input(alternatives, &statement_layer)?;
+                let mode = input.mode;
+                self.ctx.profiler.record(
+                    OptimizerComponent::QueryIrConstruction,
+                    query_ir_phase_started.elapsed(),
+                );
+                self.ctx.profiler.record_component_allocation(
+                    OptimizerComponent::QueryIrConstruction,
+                    paro_common::allocator::allocated_bytes_since(query_ir_phase_allocated),
+                );
+                let search_phase_started = Instant::now();
+                let search_phase_allocated = paro_common::allocator::thread_allocated_bytes();
+                let extraction = input.optimize(&grant_classes)?;
+                (
+                    mode,
+                    extraction,
+                    search_phase_started,
+                    search_phase_allocated,
+                )
+            };
         self.ctx
             .profiler
             .record_rule_attempts(extraction.rule_attempts.clone());
@@ -387,6 +1043,13 @@ impl Optimizer {
             .record_search_summary(&extraction.search_summary);
         if let Some(trace) = self.ctx.session.statement_trace() {
             let summary = &extraction.search_summary;
+            for (variant_ordinal, variant) in extraction.variants.iter().enumerate() {
+                record_variant_evidence(
+                    trace.as_ref(),
+                    &format!("final_winner_{variant_ordinal}"),
+                    variant,
+                );
+            }
             trace.record_value("optimizer", "memo_group_count", summary.groups);
             trace.record_value(
                 "optimizer",
@@ -486,6 +1149,53 @@ impl Optimizer {
                     trace.record_value("optimizer", name, candidate.index() as u64);
                 }
             }
+            for checkpoint in &extraction.search_milestones.search_checkpoints {
+                let goal = checkpoint.goal;
+                let prefix = format!(
+                    "search_checkpoint_{}ms_required{}_grant{}_row{}_objective{}_context{}",
+                    checkpoint.target_ms,
+                    goal.required.0,
+                    goal.grant.stable_tag(),
+                    goal.row_goal.stable_tag(),
+                    goal.objective.stable_tag(),
+                    goal.context.0,
+                );
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.observed_us"),
+                    checkpoint.observed_us,
+                );
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.has_candidate"),
+                    u64::from(checkpoint.candidate.is_some()),
+                );
+                if let Some(candidate) = checkpoint.candidate {
+                    trace.record_value(
+                        "optimizer",
+                        &format!("{prefix}.candidate"),
+                        candidate.index() as u64,
+                    );
+                }
+                for (name, cost) in [
+                    ("expected_cost_bits", checkpoint.expected_cost),
+                    ("risk_adjusted_cost_bits", checkpoint.risk_adjusted_cost),
+                    ("upper_cost_bits", checkpoint.upper_cost),
+                ] {
+                    if let Some(cost) = cost {
+                        trace.record_value(
+                            "optimizer",
+                            &format!("{prefix}.{name}"),
+                            cost.to_bits(),
+                        );
+                    }
+                }
+                trace.record_value(
+                    "optimizer",
+                    &format!("{prefix}.search_complete"),
+                    u64::from(checkpoint.search_complete),
+                );
+            }
             trace.record_event(
                 "optimizer",
                 if summary.is_complete() {
@@ -500,14 +1210,14 @@ impl Optimizer {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
                 crate::cascades::SearchMode::Memo => OptimizerComponent::MemoExploration,
             },
-            phase_started.elapsed(),
+            search_phase_started.elapsed(),
         );
         self.ctx.profiler.record_component_allocation(
             match mode {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
                 crate::cascades::SearchMode::Memo => OptimizerComponent::MemoExploration,
             },
-            paro_common::allocator::allocated_bytes_since(phase_allocated),
+            paro_common::allocator::allocated_bytes_since(search_phase_allocated),
         );
         let phase_started = Instant::now();
         let phase_allocated = paro_common::allocator::thread_allocated_bytes();
@@ -566,6 +1276,36 @@ impl Optimizer {
             "bounded optimizer completed"
         );
         Ok(result)
+    }
+
+    fn build_search_input(
+        &self,
+        alternatives: Vec<LogicalAlternative>,
+        statement_layer: &QueryStatementLayer,
+    ) -> Result<crate::cascades::OptimizationInput> {
+        self.build_search_input_with_binder(alternatives, statement_layer, &self.binder)
+    }
+
+    fn build_search_input_with_binder(
+        &self,
+        alternatives: Vec<LogicalAlternative>,
+        statement_layer: &QueryStatementLayer,
+        binder: &Binder,
+    ) -> Result<crate::cascades::OptimizationInput> {
+        let mut input =
+            MemoBuilder::build_with_search(alternatives, binder, self.budget.clone(), &self.ctx)?
+                .with_calibration(self.calibration.clone())
+                .with_force_spill(self.ctx.session.limits.force_external);
+        if let Some(write) = statement_layer.write_contract() {
+            if let crate::physical::requirements::MutationSafetyRequirement::StableReadBeforeWrite {
+                targets,
+                snapshot,
+            } = &write.mutation_safety
+            {
+                input = input.require_stable_mutation_input(targets.clone(), *snapshot)?;
+            }
+        }
+        Ok(input)
     }
 
     fn attach_statement_layer(
@@ -1102,6 +1842,53 @@ impl Optimizer {
         }
         self.settle_query_candidate(candidate)
     }
+}
+
+/// Transformations may introduce a fresh output table index for a selected
+/// CTE consumer even though its result is the same positional SQL schema as
+/// the original bound root. Rebase only the output-producing Projection on a
+/// pass-through path before staging the immutable seed in the destination
+/// Memo; input bindings and scalar semantics are left untouched.
+fn rebase_seed_output_table_index(
+    plan: OwnedLogicalPlan,
+    table_index: usize,
+) -> Result<OwnedLogicalPlan> {
+    let child_index = match &plan.operator {
+        LogicalOperator::MaterializedCTE(_) => Some(1),
+        LogicalOperator::Filter(_)
+        | LogicalOperator::Order(_)
+        | LogicalOperator::TopN(_)
+        | LogicalOperator::Limit(_)
+        | LogicalOperator::Distinct(_)
+        | LogicalOperator::EmptyResult(_) => Some(0),
+        _ => None,
+    };
+    if let Some(child_index) = child_index {
+        let mut ordinal = 0;
+        return plan.try_map_children(|child| {
+            let current = ordinal;
+            ordinal += 1;
+            if current == child_index {
+                rebase_seed_output_table_index(child, table_index)
+            } else {
+                Ok(child)
+            }
+        });
+    }
+
+    if matches!(plan.operator, LogicalOperator::Projection(_)) {
+        return plan.try_map_operator(|operator| {
+            let LogicalOperator::Projection(mut projection) = operator else {
+                unreachable!("projection output rebasing matched another operator")
+            };
+            projection.table_index = table_index;
+            Ok(LogicalOperator::Projection(projection))
+        });
+    }
+
+    Err(paro_error::internal(
+        "strong seed result layout has no safe output-producing projection",
+    ))
 }
 
 fn observes_optimizer_diagnostics(plan: &OwnedLogicalPlan) -> bool {

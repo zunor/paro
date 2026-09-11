@@ -94,7 +94,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--paro-result-format", choices=("binary", "text"), default="binary"
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--diagnostic-strong-incumbent",
+        action="store_true",
+        help=(
+            "run the diagnostic cohort with an independent seed Memo followed by "
+            "a fresh proof Memo; never affects normal C1 samples"
+        ),
+    )
+    parser.add_argument(
+        "--strong-incumbent-c1",
+        action="store_true",
+        help=(
+            "run normal fresh-process C1 samples through the explicit two-Memo "
+            "SeedPlan experiment; source generation remains included in C1"
+        ),
+    )
+    parser.add_argument(
+        "--strong-incumbent-upper-bound",
+        action="store_true",
+        help=(
+            "when the strong-incumbent experiment is enabled, install the "
+            "re-priced SeedPlan as a destination upper bound"
+        ),
+    )
+    parser.add_argument(
+        "--strong-incumbent-logical-injection",
+        action="store_true",
+        help=(
+            "when the strong-incumbent experiment is enabled, inject the "
+            "source logical shell into the destination Memo"
+        ),
+    )
+    args = parser.parse_args()
+    if (args.strong_incumbent_upper_bound or args.strong_incumbent_logical_injection) and not (
+        args.strong_incumbent_c1 or args.diagnostic_strong_incumbent
+    ):
+        parser.error(
+            "strong-incumbent switches require --strong-incumbent-c1 or "
+            "--diagnostic-strong-incumbent"
+        )
+    return args
 
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
@@ -543,12 +583,30 @@ def main() -> int:
                     "statement_trace": False,
                     "statement_cache_evidence": True,
                     "allocation_profile": False,
+                    "strong_incumbent_experiment": args.strong_incumbent_c1,
+                    "strong_incumbent_provide_bound": (
+                        args.strong_incumbent_c1
+                        and args.strong_incumbent_upper_bound
+                    ),
+                    "strong_incumbent_inject_logical": (
+                        args.strong_incumbent_c1
+                        and args.strong_incumbent_logical_injection
+                    ),
                 },
                 "diagnostic": {
                     "purpose": "same-operation phase attribution",
                     "statement_trace": True,
                     "statement_cache_evidence": True,
                     "excluded_from_c1": True,
+                    "strong_incumbent_experiment": args.diagnostic_strong_incumbent,
+                    "strong_incumbent_provide_bound": (
+                        args.diagnostic_strong_incumbent
+                        and args.strong_incumbent_upper_bound
+                    ),
+                    "strong_incumbent_inject_logical": (
+                        args.diagnostic_strong_incumbent
+                        and args.strong_incumbent_logical_injection
+                    ),
                 },
             },
             "resource_envelope": {
@@ -619,6 +677,24 @@ def main() -> int:
                 "PARO_DIAGNOSTIC_SEARCH_STOP_MS": os.environ.get(
                     "PARO_DIAGNOSTIC_SEARCH_STOP_MS"
                 ),
+                "PARO_CERTIFIED_GROUP_PRUNING": os.environ.get(
+                    "PARO_CERTIFIED_GROUP_PRUNING"
+                ),
+                "PARO_DISABLE_PROTECTED_INCUMBENT": os.environ.get(
+                    "PARO_DISABLE_PROTECTED_INCUMBENT"
+                ),
+                "PARO_EXPORT_STRONG_INCUMBENT": os.environ.get(
+                    "PARO_EXPORT_STRONG_INCUMBENT"
+                ),
+                "PARO_STRONG_INCUMBENT_EXPERIMENT": os.environ.get(
+                    "PARO_STRONG_INCUMBENT_EXPERIMENT"
+                ),
+                "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": os.environ.get(
+                    "PARO_STRONG_INCUMBENT_PROVIDE_BOUND"
+                ),
+                "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": os.environ.get(
+                    "PARO_STRONG_INCUMBENT_INJECT_LOGICAL"
+                ),
             },
         },
         "model_gates": {
@@ -679,6 +755,11 @@ def main() -> int:
                 max_memory=args.memory_limit,
                 threads=args.threads,
                 statement_trace=False,
+                optimizer_environment={
+                    "PARO_STRONG_INCUMBENT_EXPERIMENT": None,
+                    "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": None,
+                    "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": None,
+                },
             )
             with oracle_server_context as oracle_server, DuckDBProcess(
                 args.duckdb_database, args.threads, args.memory_limit
@@ -746,6 +827,23 @@ def main() -> int:
                     threads=args.threads,
                     statement_trace=False,
                     cache_evidence=True,
+                    optimizer_environment={
+                        "PARO_STRONG_INCUMBENT_EXPERIMENT": (
+                            "1" if args.strong_incumbent_c1 else None
+                        ),
+                        "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": (
+                            "1"
+                            if args.strong_incumbent_c1
+                            and args.strong_incumbent_upper_bound
+                            else None
+                        ),
+                        "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": (
+                            "1"
+                            if args.strong_incumbent_c1
+                            and args.strong_incumbent_logical_injection
+                            else None
+                        ),
+                    },
                 )
                 with block_server_context as block_server, DuckDBProcess(
                     args.duckdb_database, args.threads, args.memory_limit
@@ -857,6 +955,23 @@ def main() -> int:
                     statement_trace=True,
                     trace_sample_id=diagnostic_sample_id,
                     cache_evidence=True,
+                    optimizer_environment={
+                        "PARO_STRONG_INCUMBENT_EXPERIMENT": (
+                            "1" if args.diagnostic_strong_incumbent else None
+                        ),
+                        "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": (
+                            "1"
+                            if args.diagnostic_strong_incumbent
+                            and args.strong_incumbent_upper_bound
+                            else None
+                        ),
+                        "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": (
+                            "1"
+                            if args.diagnostic_strong_incumbent
+                            and args.strong_incumbent_logical_injection
+                            else None
+                        ),
+                    },
                 ) as diagnostic_server:
                     diagnostic_server_identity = diagnostic_server.identity()
                     diagnostic_paro = open_paro_connection(args)

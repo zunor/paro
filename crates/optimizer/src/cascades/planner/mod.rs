@@ -45,7 +45,7 @@ use super::calibration::{
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility, GroupSchema};
 use super::cost::ResourceDimension;
 use super::cost::{CompactRange, ScoreSummary, SearchCost};
-use super::engine::{CascadesEngine, SearchMode, SearchStopReason};
+use super::engine::{CascadesEngine, PricedIncumbent, SearchMode, SearchStopReason, SeedPlan};
 use super::ids::{
     AdmissibleGrantSetId, BaseRelationId, ColumnId, Fingerprint, GroupId, ImplementationId,
     LogicalExprId, LogicalPayloadId, OpClassId, OptimizationContextId, PhysicalPayloadId,
@@ -71,8 +71,8 @@ use super::region::{
 use super::rules::{
     CostComposition, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
     ImplementationRegistry, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
-    PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, RuleContext,
-    RulePromise, SidewaysFilterSource, TaskSupplyContract, TransformContext,
+    PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, RootDispatch,
+    RuleContext, RulePromise, SidewaysFilterSource, TaskSupplyContract, TransformContext,
     TransformationBudgetClass, TransformationRule, WorkSourceId, AGGREGATE_DIMENSION_DEFERRAL_RULE,
     AGGREGATE_DIMENSION_SHARING_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
     AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
@@ -243,6 +243,12 @@ pub struct OptimizationInput {
     bind_context: BindContext,
     calibration: Arc<MachineCalibrationBundle>,
     force_spill: bool,
+    /// `None` follows the process experiment setting; `Some(false)` is used
+    /// by the strong-seed source Memo so A/B/C/D compare the same seed.
+    certified_group_pruning: Option<bool>,
+    strong_incumbent_plans: Vec<SeedPlan>,
+    prepriced_strong_incumbents: Vec<PricedIncumbent>,
+    export_strong_incumbent: bool,
 }
 
 impl OptimizationInput {
@@ -254,6 +260,80 @@ impl OptimizationInput {
     pub fn with_force_spill(mut self, force_spill: bool) -> Self {
         self.force_spill = force_spill;
         self
+    }
+
+    /// Enable the proof-backed group-pruning experiment. The flag is kept on
+    /// the input rather than coupled to tracing so normal C1 can remain
+    /// measurement-clean. Benchmark/diagnostic callers may also use the
+    /// `PARO_CERTIFIED_GROUP_PRUNING=1` process setting for an isolated run.
+    pub fn with_certified_group_pruning(mut self, enabled: bool) -> Self {
+        self.certified_group_pruning = Some(enabled);
+        self
+    }
+
+    /// Install an independently exported, immutable plan in the new Memo.
+    /// The plan is re-priced against this input's grant/statistics/calibration
+    /// context before it can become a proof upper bound.
+    pub fn with_strong_incumbent_plan(mut self, plan: SeedPlan) -> Self {
+        self.strong_incumbent_plans.push(plan);
+        self
+    }
+
+    /// Install a SeedPlan that was re-priced in an independent, non-search
+    /// Memo. The destination search receives only the immutable priced
+    /// witness; its source logical shell is never added to this Memo unless
+    /// the caller explicitly requests logical injection.
+    pub(crate) fn with_prepriced_strong_incumbent(mut self, incumbent: PricedIncumbent) -> Self {
+        self.prepriced_strong_incumbents.push(incumbent);
+        self
+    }
+
+    /// Export verified winner DAGs for a diagnostic caller that will install
+    /// them in a separately constructed Memo. This is deliberately opt-in:
+    /// freezing an additional tree is setup work and must never enter normal
+    /// C1 merely because a tracing or pruning switch is present.
+    pub fn with_strong_incumbent_export(mut self, enabled: bool) -> Self {
+        self.export_strong_incumbent = enabled;
+        self
+    }
+
+    /// Re-price fixed seed DAGs in a separate Memo without running logical or
+    /// physical search. This is the isolation path for the strong-incumbent
+    /// experiment: the temporary Memo may contain the source logical shells
+    /// needed to resolve the selected DAG, but no such shell is published to
+    /// the destination search Memo.
+    pub(crate) fn reprice_seed_plans_in_isolated_memo(
+        mut self,
+        grant_classes: &[ResourceGrantClass],
+        plans: &[SeedPlan],
+    ) -> Result<Vec<PricedIncumbent>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.memo.set_calibration(self.calibration.clone());
+        let grant_classes = Arc::new(
+            grant_classes
+                .iter()
+                .map(|class| (class.id, *class))
+                .collect::<BTreeMap<_, _>>(),
+        );
+        let mut registry = ImplementationRegistry::default();
+        implementation::register_implementations(
+            &mut registry,
+            self.planner_state.clone(),
+            grant_classes.clone(),
+            self.calibration.clone(),
+            self.force_spill,
+        )?;
+        let mut engine = CascadesEngine::new(self.memo, registry);
+        engine.prime_grant_context(grant_classes.values().copied())?;
+        engine.reprice_strong_incumbents_for_grants(
+            self.root,
+            self.root_goal,
+            AdmissibleGrantSetId(0),
+            grant_classes.values().copied(),
+            plans,
+        )
     }
 
     /// Strengthen the query root for a self-reading mutation. The mandatory
@@ -310,7 +390,107 @@ impl OptimizationInput {
             self.force_spill,
         )?;
         let mut engine = CascadesEngine::new(self.memo, registry);
+        engine.prime_grant_context(grant_classes.values().copied())?;
+        let strong_incumbent_plans = self.strong_incumbent_plans.clone();
+        let prepriced_strong_incumbents = std::mem::take(&mut self.prepriced_strong_incumbents);
+        let first_seed_identity = prepriced_strong_incumbents
+            .first()
+            .map(|incumbent| incumbent.plan().plan_identity())
+            .or_else(|| {
+                strong_incumbent_plans
+                    .first()
+                    .map(|plan| plan.plan_identity())
+            });
+        if !strong_incumbent_plans.is_empty() || !prepriced_strong_incumbents.is_empty() {
+            let state = self
+                .planner_state
+                .read()
+                .expect("planner transform state poisoned");
+            if let Some(trace) = state
+                .session
+                .as_ref()
+                .and_then(|context| context.statement_trace())
+            {
+                if let Some(root_group) = engine.memo().group(self.root) {
+                    trace.record_value(
+                        "optimizer",
+                        "strong_incumbent_target_root_logical_count",
+                        root_group.logical_exprs().len() as u64,
+                    );
+                    for (ordinal, logical_id) in root_group.logical_exprs().iter().enumerate() {
+                        let Some(logical) = engine.memo().logical_expr(*logical_id) else {
+                            continue;
+                        };
+                        let Some(metadata) = state.metadata.get(&logical.payload) else {
+                            continue;
+                        };
+                        trace.record_value(
+                            "optimizer",
+                            &format!("strong_incumbent_target_root_{ordinal}_logical_id"),
+                            logical_id.index() as u64,
+                        );
+                        trace.record_value(
+                            "optimizer",
+                            &format!("strong_incumbent_target_root_{ordinal}_output_width"),
+                            metadata.output_columns.len() as u64,
+                        );
+                        for (column_ordinal, column) in metadata.output_columns.iter().enumerate() {
+                            trace.record_value(
+                                "optimizer",
+                                &format!(
+                                    "strong_incumbent_target_root_{ordinal}_output_column_{column_ordinal}"
+                                ),
+                                column.0 as u64,
+                            );
+                        }
+                    }
+                }
+                if let Some(required) = engine.memo().required(self.root_goal.required) {
+                    for (ordinal, column) in required.materialization.values.iter().enumerate() {
+                        trace.record_value(
+                            "optimizer",
+                            &format!("strong_incumbent_target_required_column_{ordinal}"),
+                            column.0 as u64,
+                        );
+                    }
+                }
+            }
+        }
+        let seed_reprice_started = Instant::now();
+        let seed_reprice_count = if prepriced_strong_incumbents.is_empty() {
+            engine.install_strong_incumbent_for_grants(
+                self.root,
+                self.root_goal,
+                AdmissibleGrantSetId(0),
+                grant_classes.values().copied(),
+                &strong_incumbent_plans,
+            )?
+        } else {
+            let mut installed = 0_u64;
+            for incumbent in prepriced_strong_incumbents {
+                let target_goal = OptimizationGoal {
+                    grant: incumbent.goal().grant,
+                    ..self.root_goal
+                };
+                let incumbent =
+                    engine.rebind_priced_incumbent_to_current_facts(incumbent, target_goal)?;
+                engine.install_priced_incumbent(incumbent)?;
+                installed = installed.saturating_add(1);
+            }
+            installed
+        };
+        let seed_reprice_us = (seed_reprice_count > 0)
+            .then(|| u64::try_from(seed_reprice_started.elapsed().as_micros()).unwrap_or(u64::MAX));
         engine.set_rule_work_profile_enabled(paro_context::StatementTrace::enabled());
+        let env_certified_group_pruning = std::env::var_os("PARO_CERTIFIED_GROUP_PRUNING")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        engine.set_certified_group_pruning_enabled(
+            self.certified_group_pruning
+                .unwrap_or(env_certified_group_pruning),
+        );
+        let disable_protected_incumbent = std::env::var_os("PARO_DISABLE_PROTECTED_INCUMBENT")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        engine.set_protected_incumbent_enabled(!disable_protected_incumbent);
         let statement_context = self.planner_state.read().unwrap().session.clone();
         if let Some(session) = &statement_context {
             engine
@@ -325,6 +505,36 @@ impl OptimizationInput {
             self.mode,
         )?;
         engine.note_search_return();
+        let export_strong_incumbents = self.export_strong_incumbent
+            || std::env::var_os("PARO_EXPORT_STRONG_INCUMBENT")
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let strong_incumbent_export_started = Instant::now();
+        let strong_incumbent_plans = if export_strong_incumbents {
+            grant_optimization
+                .winners
+                .iter()
+                .filter_map(|winner| engine.export_seed_plan(self.root, winner.goal).transpose())
+                .collect::<Result<Vec<_>>>()?
+                .into_boxed_slice()
+        } else {
+            Box::new([])
+        };
+        let strong_incumbent_export_us = export_strong_incumbents.then(|| {
+            u64::try_from(strong_incumbent_export_started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
+        let strong_incumbent_logical_plans = if export_strong_incumbents {
+            let state = self
+                .planner_state
+                .read()
+                .expect("planner transform state poisoned");
+            strong_incumbent_plans
+                .iter()
+                .map(|seed| materialize_seed_logical_plan(&state, &self.bind_context, seed))
+                .collect::<Result<Vec<_>>>()?
+                .into_boxed_slice()
+        } else {
+            Box::new([])
+        };
         let stop = grant_optimization.stop;
         let extraction_started = Instant::now();
         let mut variants = Vec::with_capacity(grant_optimization.winners.len());
@@ -465,6 +675,29 @@ impl OptimizationInput {
                 state.settlement_cache.invalidation_visits,
             );
             work_counters.extend(state.payloads.schedule_counters());
+            let join_region_cache = state
+                .join_region_cache
+                .lock()
+                .expect("join-region cache poisoned");
+            work_counters.insert("join_region_cache_hits", join_region_cache.hits);
+            work_counters.insert("join_region_cache_builds", join_region_cache.builds);
+            let witness_cache = state
+                .witness_cache
+                .lock()
+                .expect("pattern-witness cache poisoned");
+            work_counters.insert(
+                "pattern_witness_cache_entries",
+                witness_cache.entries.len() as u64,
+            );
+            work_counters.insert("pattern_witness_cache_hits", witness_cache.hits);
+            work_counters.insert(
+                "pattern_witness_cache_invalidations",
+                witness_cache.invalidations,
+            );
+            work_counters.insert(
+                "pattern_witness_root_dispatch_skips",
+                witness_cache.root_dispatch_skips,
+            );
             let (hits, misses) = state.scalars.bound_import_counts();
             work_counters.insert("memo_scalar_import_hits", hits);
             work_counters.insert("memo_scalar_import_misses", misses);
@@ -493,6 +726,12 @@ impl OptimizationInput {
             rule_work_profile,
             search_milestones,
             search_summary,
+            strong_incumbent_plans,
+            strong_incumbent_logical_plans,
+            strong_incumbent_reprice_us: seed_reprice_us,
+            strong_incumbent_reprice_count: seed_reprice_count,
+            strong_incumbent_plan_identity: first_seed_identity,
+            strong_incumbent_export_us,
         })
     }
 }
@@ -514,6 +753,20 @@ pub struct OptimizationOutput {
     pub rule_work_profile: BTreeMap<RuleId, super::engine::RuleWorkProfile>,
     pub search_milestones: super::engine::SearchMilestones,
     pub search_summary: SearchSummary,
+    /// Exported only when `PARO_EXPORT_STRONG_INCUMBENT=1`; diagnostic/setup
+    /// callers can feed these immutable seeds to a fresh Memo.
+    pub strong_incumbent_plans: Box<[SeedPlan]>,
+    /// Logical shells for the selected seed DAGs. These are a transport
+    /// artifact only: the destination builds fresh physical metadata and
+    /// re-prices the immutable SeedPlan against its own context.
+    pub strong_incumbent_logical_plans: Box<[OwnedLogicalPlan]>,
+    /// Destination import/re-pricing time, kept separate from target search
+    /// so diagnostic reports can explain the cost of making a source plan a
+    /// valid upper bound. `None` means no plan was supplied.
+    pub strong_incumbent_reprice_us: Option<u64>,
+    pub strong_incumbent_reprice_count: u64,
+    pub strong_incumbent_plan_identity: Option<Fingerprint>,
+    pub strong_incumbent_export_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -914,7 +1167,7 @@ impl MemoBuilder {
                         &plan.operator,
                         &key.children,
                         &plan.stats,
-                        key.stable_fingerprint(),
+                        stable_cardinality_recipe(operator_fingerprint, &operator_encoding),
                     );
                     let group = memo.create_group(schema, logical_properties, cardinality);
                     let (payload, baseline_payload) =
@@ -931,12 +1184,13 @@ impl MemoBuilder {
                             operator_encoding: operator_encoding.clone(),
                             column_stats: candidate_stats.clone(),
                         });
-                    let logical = memo.insert_logical_with_operator_encoding(
+                    let logical = memo.insert_logical_with_operator_encoding_and_tag(
                         group,
                         key.clone(),
                         payload,
                         EquivalenceProof::Initial,
                         operator_encoding,
+                        operator_tag(plan.operator.op_type()),
                     )?;
                     let search = search_candidate
                         .map(|search_plan| {
@@ -1279,6 +1533,8 @@ impl MemoBuilder {
             expression_group_insertions: Vec::new(),
             metadata_runtime_filter_changes: Vec::new(),
             enumerated_join_regions: BTreeSet::new(),
+            join_region_cache: std::sync::Mutex::new(JoinRegionCache::default()),
+            witness_cache: std::sync::Mutex::new(PatternWitnessCache::default()),
             boundary_cache: std::sync::Mutex::new(boundary::BoundaryFactCache::default()),
             join_region_insertions: Vec::new(),
             cte_restrictions: Vec::new(),
@@ -1310,6 +1566,10 @@ impl MemoBuilder {
             bind_context,
             calibration: Arc::new(MachineCalibrationBundle::default()),
             force_spill: false,
+            certified_group_pruning: None,
+            strong_incumbent_plans: Vec::new(),
+            prepriced_strong_incumbents: Vec::new(),
+            export_strong_incumbent: false,
         })
     }
 }

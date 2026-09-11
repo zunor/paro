@@ -88,6 +88,16 @@ impl BindContext {
         &self.shared
     }
 
+    /// Clone the visible binding state while giving plan-node allocation its
+    /// own namespace. Independent optimizer Memos may reuse the same table
+    /// and CTE indices, but work performed in one Memo must not advance the
+    /// allocator used by another measured search.
+    pub fn with_independent_plan_ids(&self) -> Self {
+        let mut context = self.clone();
+        context.shared = Arc::new(BindShared::new());
+        context
+    }
+
     pub fn generate_table_index(&self) -> usize {
         self.shared.generate_table_index()
     }

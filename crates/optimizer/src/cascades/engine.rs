@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 use paro_common::error::{self as paro_error, Result};
 use smallvec::SmallVec;
 
+use super::bounds::{CertifiedLocalWorkFloor, ProvenChildLatencyFloor, ProvenRecipeLatencyFloor};
 use super::budget::{BudgetDecision, BudgetDimension};
 use super::calibration::{
     LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_ENFORCER_RANDOM_FETCH,
     OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW,
 };
 use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
-use super::enforcer::{EnforcementPlanner, EnforcerStep};
+use super::enforcer::{replay_enforcer_chain, EnforcementPlanner, EnforcerStep};
 use super::governor::{Governor, PlanMilestone, PlanningPolicy};
 use super::grant::{derive_grant_sensitivity, verify_grant_sharing, GrantSensitivitySummary};
 use super::ids::{
@@ -26,6 +27,10 @@ use super::ids::{
 use super::memo::{
     CandidatePreview, CandidateSummary, ChildWinnerRef, EquivalenceProof, FrozenCandidate,
     GrantGoalKey, GroupCardinality, LogicalProperties, Memo, OptimizationGoal, Winner,
+};
+use super::properties::{
+    MaterializationRequirement, MutationSafetyRequirement, OrderingRequirement, OrderingScope,
+    PartitioningRequirement, ReplayabilityRequirement, RepresentationRequirement, ResultGuarantee,
 };
 use super::quality::QualityBundleRegistry;
 use super::region::{
@@ -40,9 +45,10 @@ use super::rules::{
     SourceRetentionProof, SourceWork, SourceWorkData, TaskSupplyContract, TransformContext,
 };
 use super::tasks::{
-    Cursor, ReadSet, StopReason, TaskId, TaskIntent, TaskOutcome, TaskRegistry, TaskRequest,
+    BoundContext, BoundProofId, BoundProofKind, Cursor, ReadSet, StopReason, TaskId, TaskIntent,
+    TaskOutcome, TaskRegistry, TaskRequest, TaskState,
 };
-use crate::physical::{ResourceGrantClass, SpillPolicy};
+use crate::physical::{ObjectiveProfile, ResourceGrantClass, SpillPolicy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -83,6 +89,104 @@ pub struct GrantWinner {
     /// Frozen selected DAG used to prove that extraction does not depend on a
     /// later search pass or a mutable frontier.
     pub frozen: Arc<FrozenCandidate>,
+}
+
+/// An immutable, executable plan snapshot.  This type deliberately contains
+/// no model cost or cost-context fingerprint: a plan exported from one Memo
+/// is only a seed until its selected DAG is priced for the destination
+/// operating point.
+#[derive(Debug, Clone)]
+pub struct SeedPlan {
+    group: GroupId,
+    goal: OptimizationGoal,
+    frozen: Arc<FrozenCandidate>,
+    source_reads: ReadSet,
+    identity: Fingerprint,
+}
+
+impl SeedPlan {
+    pub fn group(&self) -> GroupId {
+        self.group
+    }
+
+    pub fn goal(&self) -> OptimizationGoal {
+        self.goal
+    }
+
+    pub fn frozen(&self) -> &Arc<FrozenCandidate> {
+        &self.frozen
+    }
+
+    pub fn plan_identity(&self) -> Fingerprint {
+        self.identity
+    }
+
+    pub fn candidate(&self) -> CandidateId {
+        self.frozen.reference.candidate
+    }
+}
+
+/// The exact facts and calibration context under which a plan cost was
+/// produced.  ReadSet is the invalidation witness; the fingerprint also
+/// covers the goal contract, calibration and grant operating point.  A
+/// priced incumbent is never valid merely because its frozen plan is still
+/// executable.
+#[derive(Debug, Clone)]
+pub struct CostContext {
+    fingerprint: Fingerprint,
+    reads: ReadSet,
+}
+
+impl CostContext {
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    pub fn reads(&self) -> &ReadSet {
+        &self.reads
+    }
+}
+
+/// A SeedPlan plus a cost re-evaluated in one declared destination context.
+/// The fields are private so callers cannot pair a winner cost with an
+/// unrelated pre-search fingerprint.
+#[derive(Debug, Clone)]
+pub struct PricedIncumbent {
+    target_group: GroupId,
+    goal: OptimizationGoal,
+    plan: Arc<SeedPlan>,
+    cost: SearchCost,
+    context: CostContext,
+}
+
+#[derive(Debug)]
+struct RepricedSeedNode {
+    cost: SearchCost,
+    source_work: Box<[SourceWork]>,
+    physical_fingerprint: Fingerprint,
+    reads: Vec<PatternRead>,
+}
+
+impl PricedIncumbent {
+    pub fn target_group(&self) -> GroupId {
+        self.target_group
+    }
+
+    pub fn goal(&self) -> OptimizationGoal {
+        self.goal
+    }
+
+    pub fn plan(&self) -> &Arc<SeedPlan> {
+        &self.plan
+    }
+
+    pub fn cost(&self) -> SearchCost {
+        self.cost
+    }
+
+    pub fn context(&self) -> &CostContext {
+        &self.context
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +295,10 @@ struct CostRecipe {
     enforcer_cost_input: EnforcerCostInput,
     physical_fingerprint: Fingerprint,
     region: Option<RegionCandidateContract>,
+    /// A proof-backed floor for the recipe's own work. Unknown/statistical
+    /// ranges remain `None`; the floor never stands in for child or logical
+    /// search completeness.
+    certified_local_work: Option<CertifiedLocalWorkFloor>,
 }
 
 /// Exact query-local identity for one child-frontier combination. The budget
@@ -549,6 +657,67 @@ pub struct SearchMilestones {
     pub handoff_extraction_us: Option<u64>,
 }
 
+/// The last published physical response for one exact `(group, goal)` task.
+/// TaskRegistry remains the source of lifecycle/audit truth; this is only a
+/// read-only fast path for the overwhelmingly common recursive request that
+/// arrives before any observed input or local recipe has changed.
+#[derive(Debug, Clone)]
+struct PhysicalTaskCacheEntry {
+    reads: ReadSet,
+    recipe_cursor: u64,
+    /// Readiness passes may cache an incomplete prefix so an unchanged queue
+    /// wake-up does not re-enter TaskRegistry.  A normal completion pass may
+    /// use the same entry only when this bit is set; an incomplete prefix
+    /// must remain resumable by the full search.
+    complete: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PhysicalCompletionProof {
+    proof: BoundProofId,
+    domain: Fingerprint,
+    candidate: CandidateId,
+    threshold: u64,
+}
+
+/// Diagnostic attribution for certified-bound attempts.  These counters are
+/// deliberately separate from candidate/pruning counts: a bound can be
+/// unavailable because its evidence is incomplete, or available but too weak
+/// to exclude a recipe.  Durations are measured on the single search worker;
+/// they are CPU-wall proxies for this diagnostic cohort and are never used as
+/// a correctness condition.
+#[derive(Debug, Default, Clone, Copy)]
+struct CertifiedBoundDiagnostics {
+    no_incumbent: u64,
+    local_interval_uncertain: u64,
+    child_completion_missing: u64,
+    source_response_unsupported: u64,
+    phase_overlap_unsupported: u64,
+    available_not_tight: u64,
+    pruned_before_children: u64,
+    pruned_after_children: u64,
+    compute_us: u64,
+    validation_us: u64,
+    invalidation_count: u64,
+}
+
+impl CertifiedBoundDiagnostics {
+    fn add_elapsed(target: &mut u64, started: Instant) {
+        *target =
+            target.saturating_add(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    }
+}
+
+/// A mandatory winner retained across a cost-epoch reset.  The winner is an
+/// immutable executable upper bound; the fact reads are the validity witness
+/// for the cost context that produced it.  We deliberately retain only the
+/// winner DAG's group facts, not a second Memo or a copied physical frontier.
+#[derive(Debug, Clone)]
+struct ProtectedIncumbent {
+    winner: Arc<Winner>,
+    reads: ReadSet,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RuleWorkPhase {
     Discovered,
@@ -557,11 +726,18 @@ enum RuleWorkPhase {
     Published,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum BoundCheckLocation {
+    BeforeChildren,
+    AfterChildren,
+}
+
 /// The engine is deliberately operator-agnostic. Domain implementations live
 /// in the registry; this type owns stable scheduling, budgets, enforcement,
 /// recursive goal optimization, and winner verification.
 #[derive(Debug)]
 pub struct CascadesEngine {
+    engine_created_at: Instant,
     mandatory_only: bool,
     preserve_incomplete_physical: bool,
     memo: Memo,
@@ -569,6 +745,20 @@ pub struct CascadesEngine {
     enforcement: EnforcementPlanner,
     recipes: BTreeMap<(PhysicalExprId, OptimizationGoal, Fingerprint), Arc<CostRecipe>>,
     infeasible_goals: BTreeSet<(GroupId, OptimizationGoal)>,
+    /// Mandatory winners survive a cost-epoch reset in the immutable winner
+    /// archive, but their frontier is intentionally cleared. Keep this small
+    /// exact map so optional recipe bounds can compare against the protected
+    /// incumbent without copying or rehydrating a Memo frontier.
+    protected_incumbents: BTreeMap<(GroupId, OptimizationGoal), ProtectedIncumbent>,
+    /// Immutable upper bounds supplied by a separate search/Memo.  Unlike
+    /// `protected_incumbents`, these are never produced by the destination
+    /// search epoch and therefore isolate incumbent quality from proof cost.
+    strong_incumbents: BTreeMap<(GroupId, OptimizationGoal), PricedIncumbent>,
+    /// Diagnostic switch used to establish whether certified pruning is
+    /// blocked by the quality of the available incumbent.  The default keeps
+    /// the verified mandatory candidate; disabling it never changes the
+    /// returned fallback, only the optional proof experiment.
+    protected_incumbent_enabled: bool,
     active_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     grant_class_sets: BTreeMap<ResourceGrantClassId, AdmissibleGrantSetId>,
     grant_classes: BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
@@ -612,6 +802,22 @@ pub struct CascadesEngine {
     /// rebuilt lazily as new native/settled recipes are admitted.
     physical_parents:
         BTreeMap<GroupId, BTreeSet<(GroupId, OptimizationGoal, PhysicalExprId, Fingerprint)>>,
+    /// Child groups observed by each physical subproblem.  Recipes are
+    /// published incrementally, so maintaining this small deduplicated index
+    /// at publication avoids rescanning the global recipe table every time a
+    /// recursive task captures its exact child ReadSet.
+    physical_read_dependencies:
+        BTreeMap<(GroupId, OptimizationGoal), BTreeSet<(GroupId, OptimizationGoal)>>,
+    physical_task_cache: BTreeMap<(GroupId, OptimizationGoal), PhysicalTaskCacheEntry>,
+    /// A proof is retained only for the exact current physical domain. The
+    /// TaskRegistry owns its lifecycle; this index avoids scanning all bound
+    /// records when a parent asks whether a child may provide a lower bound.
+    physical_completion_proofs: BTreeMap<(GroupId, OptimizationGoal), PhysicalCompletionProof>,
+    /// Certified pruning is an explicit experimental policy.  The production
+    /// path can execute the same proof protocol without making diagnostic
+    /// tracing part of normal C1; callers opt in only after model/oracle
+    /// admission.
+    certified_group_pruning_enabled: bool,
     /// Recipe identities dirtied by a changed child frontier.  A queued
     /// parent consumes only these old recipes plus any recipes appended after
     /// its cursor; a fact/statistics change still deliberately falls back to
@@ -653,6 +859,40 @@ pub struct CascadesEngine {
     child_combination_cost_synthesis_count: u64,
     child_combination_frontier_recheck_count: u64,
     child_combination_budget_rejection_count: u64,
+    certified_bound_check_count: u64,
+    certified_recipe_prune_count: u64,
+    certified_bound_diagnostics: CertifiedBoundDiagnostics,
+    strong_incumbent_lookup_count: u64,
+    strong_incumbent_bound_request_count: u64,
+    strong_incumbent_valid_lookup_count: u64,
+    strong_incumbent_invalid_lookup_count: u64,
+    strong_incumbent_missing_key_count: u64,
+    strong_incumbent_lookup_group_mismatch_count: u64,
+    strong_incumbent_lookup_goal_mismatch_count: u64,
+    strong_incumbent_lookup_unrelated_key_count: u64,
+    strong_incumbent_fact_invalid_count: u64,
+    strong_incumbent_context_invalid_count: u64,
+    strong_incumbent_source_response_bypass_count: u64,
+    strong_incumbent_phase_overlap_bypass_count: u64,
+    strong_incumbent_selected_for_bound_count: u64,
+    strong_incumbent_install_count: u64,
+    strong_incumbent_installed_read_count: u64,
+    strong_incumbent_installed_cost_expected_bits: Option<u64>,
+    strong_incumbent_installed_cost_upper_bits: Option<u64>,
+    strong_incumbent_merge_invalidation_count: u64,
+    strong_incumbent_goal_mismatch_count: u64,
+    strong_incumbent_reprice_rejection_count: u64,
+    strong_incumbent_reprice_no_destination_recipe_count: u64,
+    strong_incumbent_reprice_child_dag_count: u64,
+    strong_incumbent_reprice_fingerprint_count: u64,
+    strong_incumbent_reprice_property_count: u64,
+    strong_incumbent_reprice_other_count: u64,
+    strong_incumbent_first_reprice_failure_reason: Option<u64>,
+    strong_incumbent_installed_at_us: Option<u64>,
+    strong_incumbent_installed_context_fingerprint: Option<Fingerprint>,
+    strong_incumbent_first_invalidation_at_us: Option<u64>,
+    strong_incumbent_first_invalidation_reason: Option<u64>,
+    strong_incumbent_first_invalidated_context_fingerprint: Option<Fingerprint>,
     next_recipe_sequence: BTreeMap<(GroupId, OptimizationGoal), u64>,
     /// Shared task identity/progress protocol.  Memo remains the owner of
     /// expressions, candidates and facts; this registry only coordinates
@@ -670,6 +910,7 @@ impl CascadesEngine {
             .register_builtin_f1_f4()
             .expect("built-in quality bundles must have unique identities");
         Self {
+            engine_created_at: Instant::now(),
             mandatory_only: false,
             preserve_incomplete_physical: false,
             memo,
@@ -680,6 +921,9 @@ impl CascadesEngine {
             ),
             recipes: BTreeMap::new(),
             infeasible_goals: BTreeSet::new(),
+            protected_incumbents: BTreeMap::new(),
+            strong_incumbents: BTreeMap::new(),
+            protected_incumbent_enabled: true,
             active_goals: BTreeSet::new(),
             grant_class_sets: BTreeMap::new(),
             grant_classes: BTreeMap::new(),
@@ -707,6 +951,10 @@ impl CascadesEngine {
             transformation_subscribers: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
             physical_parents: BTreeMap::new(),
+            physical_read_dependencies: BTreeMap::new(),
+            physical_task_cache: BTreeMap::new(),
+            physical_completion_proofs: BTreeMap::new(),
+            certified_group_pruning_enabled: false,
             physical_dirty_recipes: BTreeMap::new(),
             physical_full_recost: BTreeSet::new(),
             physical_goals: BTreeMap::new(),
@@ -726,6 +974,40 @@ impl CascadesEngine {
             child_combination_cost_synthesis_count: 0,
             child_combination_frontier_recheck_count: 0,
             child_combination_budget_rejection_count: 0,
+            certified_bound_check_count: 0,
+            certified_recipe_prune_count: 0,
+            certified_bound_diagnostics: CertifiedBoundDiagnostics::default(),
+            strong_incumbent_lookup_count: 0,
+            strong_incumbent_bound_request_count: 0,
+            strong_incumbent_valid_lookup_count: 0,
+            strong_incumbent_invalid_lookup_count: 0,
+            strong_incumbent_missing_key_count: 0,
+            strong_incumbent_lookup_group_mismatch_count: 0,
+            strong_incumbent_lookup_goal_mismatch_count: 0,
+            strong_incumbent_lookup_unrelated_key_count: 0,
+            strong_incumbent_fact_invalid_count: 0,
+            strong_incumbent_context_invalid_count: 0,
+            strong_incumbent_source_response_bypass_count: 0,
+            strong_incumbent_phase_overlap_bypass_count: 0,
+            strong_incumbent_selected_for_bound_count: 0,
+            strong_incumbent_install_count: 0,
+            strong_incumbent_installed_read_count: 0,
+            strong_incumbent_installed_cost_expected_bits: None,
+            strong_incumbent_installed_cost_upper_bits: None,
+            strong_incumbent_merge_invalidation_count: 0,
+            strong_incumbent_goal_mismatch_count: 0,
+            strong_incumbent_reprice_rejection_count: 0,
+            strong_incumbent_reprice_no_destination_recipe_count: 0,
+            strong_incumbent_reprice_child_dag_count: 0,
+            strong_incumbent_reprice_fingerprint_count: 0,
+            strong_incumbent_reprice_property_count: 0,
+            strong_incumbent_reprice_other_count: 0,
+            strong_incumbent_first_reprice_failure_reason: None,
+            strong_incumbent_installed_at_us: None,
+            strong_incumbent_installed_context_fingerprint: None,
+            strong_incumbent_first_invalidation_at_us: None,
+            strong_incumbent_first_invalidation_reason: None,
+            strong_incumbent_first_invalidated_context_fingerprint: None,
             next_recipe_sequence: BTreeMap::new(),
             task_registry: TaskRegistry::default(),
             governor: Governor::new(PlanningPolicy::default())
@@ -740,6 +1022,137 @@ impl CascadesEngine {
 
     pub fn memo_mut(&mut self) -> &mut Memo {
         &mut self.memo
+    }
+
+    /// Prime the exact grant operating points before a SeedPlan is re-priced.
+    /// The normal grant-search entry repeats this validation and publication;
+    /// this small pre-search hook only makes the same context available to
+    /// destination seed pricing.
+    pub(crate) fn prime_grant_context(
+        &mut self,
+        classes: impl IntoIterator<Item = ResourceGrantClass>,
+    ) -> Result<()> {
+        let mut class_map = BTreeMap::new();
+        for class in classes {
+            if class.max_parallel_tasks == 0 {
+                return Err(paro_error::internal("grant class has zero worker capacity"));
+            }
+            if class_map
+                .insert(class.id, class)
+                .is_some_and(|prior| prior != class)
+            {
+                return Err(paro_error::internal(
+                    "grant class id has conflicting operating points",
+                ));
+            }
+        }
+        if class_map.is_empty() {
+            return Err(paro_error::internal(
+                "grant portfolio optimization requires at least one class",
+            ));
+        }
+        self.grant_classes = class_map;
+        self.grant_class_sets = self
+            .grant_classes
+            .keys()
+            .copied()
+            .map(|class| (class, AdmissibleGrantSetId(0)))
+            .collect();
+        Ok(())
+    }
+
+    /// Re-price one immutable seed for the exact grant goals that the real
+    /// portfolio entry will request.  A source Memo may classify grants
+    /// differently after the destination has rebuilt its logical shell, so
+    /// reusing the source goal as a map key would silently make the upper
+    /// bound unreachable.  This helper is intentionally on the same engine
+    /// path as `optimize_for_grants`; it does not create a second search or
+    /// grant scheduler.
+    pub(crate) fn reprice_strong_incumbents_for_grants(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: impl IntoIterator<Item = ResourceGrantClass>,
+        plans: &[SeedPlan],
+    ) -> Result<Vec<PricedIncumbent>> {
+        let classes = classes.into_iter().collect::<Vec<_>>();
+        self.prime_grant_context(classes.iter().copied())?;
+        let root = self.memo.canonical_group(root);
+        let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut repriced = Vec::with_capacity(classes.len());
+        for class in classes {
+            let goal = OptimizationGoal {
+                grant: sensitivity.goal_for(admissible_set, class),
+                ..base_goal
+            };
+            // A SeedPlan is an executable shape, not a promise that it is
+            // feasible under every grant operating point. Re-price every
+            // source seed whose grant contract matches this target and keep
+            // the best destination cost. A class-specific target must never
+            // inherit a cost from a different source goal.
+            let matching_plans = plans
+                .iter()
+                .filter(|plan| plan.goal().grant == goal.grant)
+                .collect::<Vec<_>>();
+            if matching_plans.is_empty() {
+                self.strong_incumbent_goal_mismatch_count =
+                    self.strong_incumbent_goal_mismatch_count.saturating_add(1);
+                continue;
+            }
+            let mut best = None;
+            for plan in matching_plans {
+                match self.reprice_seed_plan_for_goal(root, goal, plan.clone()) {
+                    Ok(priced) => {
+                        if best.as_ref().is_none_or(|current: &PricedIncumbent| {
+                            goal.objective.compare(&priced.cost, &current.cost)
+                                == std::cmp::Ordering::Less
+                        }) {
+                            best = Some(priced);
+                        }
+                    }
+                    Err(error) => {
+                        // Re-pricing is the validity check. An executable
+                        // source plan can still be infeasible in a rebuilt
+                        // target Memo; reject it and let target search
+                        // establish its own incumbent.
+                        self.strong_incumbent_reprice_rejection_count = self
+                            .strong_incumbent_reprice_rejection_count
+                            .saturating_add(1);
+                        self.note_strong_incumbent_reprice_failure(&error.to_string());
+                    }
+                }
+            }
+            if let Some(priced) = best {
+                repriced.push(priced);
+            }
+        }
+        Ok(repriced)
+    }
+
+    pub(crate) fn install_strong_incumbent_for_grants(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: impl IntoIterator<Item = ResourceGrantClass>,
+        plans: &[SeedPlan],
+    ) -> Result<u64> {
+        let repriced = self.reprice_strong_incumbents_for_grants(
+            root,
+            base_goal,
+            admissible_set,
+            classes,
+            plans,
+        )?;
+        let installed = repriced.len() as u64;
+        for priced in repriced {
+            self.install_priced_incumbent(priced)?;
+        }
+        Ok(installed)
     }
 
     /// Merge equivalent Memo groups through the same owner/redirect protocol
@@ -771,13 +1184,92 @@ impl CascadesEngine {
         // failed Memo validation cannot invalidate a live task in advance.
         let _ = self.task_registry.redirect_group(secondary, canonical)?;
         self.recanonicalize_physical_parents();
+        self.physical_task_cache.clear();
+        self.revalidate_strong_incumbents_after_merge()?;
         // Logical and physical expression ids from the two pre-merge groups
         // no longer describe an isolated implementation domain.  Revisit the
         // canonical group from its published expressions instead of allowing
         // a pre-merge visit marker to suppress a valid candidate.
         self.physical_implementation_seen.clear();
+        // A group merge changes the declared physical search domain and
+        // invalidates every completion certificate, even when a redirected
+        // task happens to retain the same numeric winner.
+        self.physical_completion_proofs.clear();
         self.discard_merged_transformation_state(secondary, canonical);
         Ok(canonical)
+    }
+
+    /// A group merge changes the identity of an equivalence class, but it is
+    /// not by itself a cost-fact change. Rebuild the exact facts-only witness
+    /// against canonical group IDs and retain the priced seed when its
+    /// context digest is unchanged. If cardinality, logical facts, producer
+    /// facts, statistics, grant, or calibration changed, the digest differs
+    /// and the old upper bound is dropped fail-closed.
+    fn revalidate_strong_incumbents_after_merge(&mut self) -> Result<()> {
+        let incumbents = std::mem::take(&mut self.strong_incumbents);
+        let mut retained = BTreeMap::new();
+        for (_, mut incumbent) in incumbents {
+            let target_group = self.memo.canonical_group(incumbent.target_group);
+            let reads = incumbent
+                .context
+                .reads
+                .reads()
+                .iter()
+                .map(|read| PatternRead::facts_from_group(&self.memo, read.group))
+                .collect::<Result<Vec<_>>>()
+                .map(ReadSet::new);
+            let Ok(reads) = reads else {
+                self.strong_incumbent_merge_invalidation_count = self
+                    .strong_incumbent_merge_invalidation_count
+                    .saturating_add(1);
+                self.note_strong_incumbent_invalidation(4, Some(incumbent.context.fingerprint));
+                continue;
+            };
+            let Ok(context) = self.priced_cost_context(
+                target_group,
+                incumbent.goal,
+                incumbent.plan.identity,
+                &reads,
+            ) else {
+                self.strong_incumbent_merge_invalidation_count = self
+                    .strong_incumbent_merge_invalidation_count
+                    .saturating_add(1);
+                self.note_strong_incumbent_invalidation(4, Some(incumbent.context.fingerprint));
+                continue;
+            };
+            let reads_current = context.reads.is_current(&self.memo)?;
+            if !reads_current || context.fingerprint != incumbent.context.fingerprint {
+                self.strong_incumbent_merge_invalidation_count = self
+                    .strong_incumbent_merge_invalidation_count
+                    .saturating_add(1);
+                self.note_strong_incumbent_invalidation(
+                    if !reads_current { 1 } else { 2 },
+                    Some(incumbent.context.fingerprint),
+                );
+                continue;
+            }
+            incumbent.target_group = target_group;
+            incumbent.context = context;
+            let key = (target_group, incumbent.goal);
+            match retained.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(incumbent);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let current = entry.get();
+                    if incumbent
+                        .goal
+                        .objective
+                        .compare(&incumbent.cost, &current.cost)
+                        == std::cmp::Ordering::Less
+                    {
+                        entry.insert(incumbent);
+                    }
+                }
+            }
+        }
+        self.strong_incumbents = retained;
+        Ok(())
     }
 
     fn recanonicalize_physical_parents(&mut self) {
@@ -799,6 +1291,18 @@ impl CascadesEngine {
                 .entry((self.memo.canonical_group(group), goal))
                 .or_default()
                 .extend(recipes);
+        }
+        let previous = std::mem::take(&mut self.physical_read_dependencies);
+        for ((group, goal), children) in previous {
+            let dependencies = self
+                .physical_read_dependencies
+                .entry((self.memo.canonical_group(group), goal))
+                .or_default();
+            dependencies.extend(
+                children
+                    .into_iter()
+                    .map(|(child, child_goal)| (self.memo.canonical_group(child), child_goal)),
+            );
         }
         let previous = std::mem::take(&mut self.physical_full_recost);
         for (group, goal) in previous {
@@ -849,6 +1353,611 @@ impl CascadesEngine {
     /// with respect to this optional attribution.
     pub fn set_rule_work_profile_enabled(&mut self, enabled: bool) {
         self.collect_rule_work_profile = enabled;
+    }
+
+    /// Enable the sound, proof-backed group/recipe pruning experiment without
+    /// enabling per-rule tracing.  This is intentionally an explicit policy
+    /// knob: the proof path must pass the independent model gate before it is
+    /// made the default production policy.
+    pub fn set_certified_group_pruning_enabled(&mut self, enabled: bool) {
+        self.certified_group_pruning_enabled = enabled;
+    }
+
+    /// Toggle the diagnostic incumbent archive independently from certified
+    /// pruning.  A disabled archive is useful as the no-incumbent control;
+    /// mandatory fallback and result correctness are unchanged.
+    pub fn set_protected_incumbent_enabled(&mut self, enabled: bool) {
+        self.protected_incumbent_enabled = enabled;
+        if !enabled {
+            self.protected_incumbents.clear();
+        }
+    }
+
+    /// Export the selected winner as an immutable executable plan seed for a
+    /// separate Memo.  A SeedPlan intentionally carries no cost: pricing is
+    /// a distinct operation in the destination context.
+    pub fn export_seed_plan(
+        &self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> Result<Option<SeedPlan>> {
+        let group = self.memo.canonical_group(group);
+        let Some(winner) = self
+            .memo
+            .group(group)
+            .and_then(|group| group.winner(goal))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        winner.cost.validate()?;
+        if winner.cost.memory_completion != MemoryCompletion::Guaranteed {
+            return Err(paro_error::internal(
+                "strong incumbent seed requires guaranteed memory completion",
+            ));
+        }
+        let reference = ChildWinnerRef {
+            group,
+            goal,
+            candidate: winner.candidate,
+        };
+        let frozen = self.memo.freeze_candidate_tree(reference)?;
+        validate_frozen_seed_tree(&frozen)?;
+        let source_reads = self.winner_fact_reads(group, &winner)?;
+        let identity = frozen_seed_plan_identity(&frozen);
+        Ok(Some(SeedPlan {
+            group,
+            goal,
+            frozen,
+            source_reads,
+            identity,
+        }))
+    }
+
+    /// Price an exported plan against the exact winner DAG that produced it.
+    /// This is useful for source-side attestation and tests; a plan crossing
+    /// Memo boundaries must use `reprice_seed_plan`, which reconstructs the
+    /// selected physical recipe in the destination Memo.
+    pub fn price_seed_plan(&self, plan: &SeedPlan) -> Result<PricedIncumbent> {
+        self.validate_seed_plan(plan)?;
+        if !plan.source_reads.is_current(&self.memo)? {
+            return Err(paro_error::internal(
+                "seed plan source facts are stale; re-export the executable plan",
+            ));
+        }
+        let winner = self
+            .memo
+            .resolve_child_winner(plan.frozen.reference)
+            .ok_or_else(|| paro_error::internal("seed plan winner disappeared from source Memo"))?;
+        if winner.cost != plan.frozen.winner.cost {
+            return Err(paro_error::internal(
+                "seed plan was paired with a winner from a different cost epoch",
+            ));
+        }
+        let reads = self.winner_fact_reads(plan.group, winner)?;
+        let context = self.priced_cost_context(plan.group, plan.goal, plan.identity, &reads)?;
+        Ok(PricedIncumbent {
+            target_group: plan.group,
+            goal: plan.goal,
+            plan: Arc::new(plan.clone()),
+            cost: winner.cost,
+            context,
+        })
+    }
+
+    /// Re-price the selected physical DAG in this Memo.  The source Winner's
+    /// cost is never read as a destination upper bound; only its immutable
+    /// shape/choices are used to find the corresponding destination recipes.
+    pub fn reprice_seed_plan(
+        &mut self,
+        target_group: GroupId,
+        plan: SeedPlan,
+    ) -> Result<PricedIncumbent> {
+        self.reprice_seed_plan_for_goal(target_group, plan.goal, plan)
+    }
+
+    /// Variant used by independent ID-renaming oracles: the destination may
+    /// have interned the same semantic requirement/context under different
+    /// Memo-local IDs.
+    pub fn reprice_seed_plan_for_goal(
+        &mut self,
+        target_group: GroupId,
+        target_goal: OptimizationGoal,
+        plan: SeedPlan,
+    ) -> Result<PricedIncumbent> {
+        self.validate_seed_plan(&plan)?;
+        let target_group = self.memo.canonical_group(target_group);
+        let repriced = self.reprice_seed_node(target_group, target_goal, &plan.frozen)?;
+        let reads = ReadSet::new(repriced.reads);
+        let context = self.priced_cost_context(target_group, target_goal, plan.identity, &reads)?;
+        repriced.cost.validate()?;
+        if repriced.cost.memory_completion != MemoryCompletion::Guaranteed {
+            return Err(paro_error::internal(
+                "repriced seed requires guaranteed memory completion",
+            ));
+        }
+        Ok(PricedIncumbent {
+            target_group,
+            goal: target_goal,
+            plan: Arc::new(plan),
+            cost: repriced.cost,
+            context,
+        })
+    }
+
+    /// Install only a fully priced incumbent.  The read witness and the
+    /// context digest are checked again at the publication boundary so a
+    /// caller cannot retain an old cost after facts, grant, calibration, or
+    /// the cost epoch changed.
+    pub fn install_priced_incumbent(&mut self, incumbent: PricedIncumbent) -> Result<()> {
+        let group = self.memo.canonical_group(incumbent.target_group);
+        if incumbent.target_group != group {
+            return Err(paro_error::internal(
+                "priced incumbent root does not match its destination contract",
+            ));
+        }
+        // The immutable SeedPlan retains the source Memo's reference goal;
+        // the priced wrapper may carry the semantically equivalent target
+        // goal whose local PropertySet/Context IDs were interned separately.
+        // Validate the source identity here, then validate the destination
+        // goal through the priced context below.
+        self.validate_seed_plan(incumbent.plan.as_ref())?;
+        self.memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("priced incumbent targets an unknown group"))?;
+        incumbent.cost.validate()?;
+        if incumbent.cost.memory_completion != MemoryCompletion::Guaranteed {
+            return Err(paro_error::internal(
+                "priced incumbent requires guaranteed memory completion",
+            ));
+        }
+        validate_frozen_seed_tree(&incumbent.plan.frozen)?;
+        if !incumbent.context.reads.is_current(&self.memo)? {
+            return Err(paro_error::internal(
+                "priced incumbent read witness is stale in the destination Memo",
+            ));
+        }
+        let current_context = self.priced_cost_context(
+            group,
+            incumbent.goal,
+            incumbent.plan.identity,
+            &incumbent.context.reads,
+        )?;
+        if incumbent.context.fingerprint != current_context.fingerprint {
+            return Err(paro_error::internal(
+                "priced incumbent cost context changed before installation",
+            ));
+        }
+        let context_fingerprint = incumbent.context.fingerprint;
+        let read_count = incumbent.context.reads.reads().len() as u64;
+        let cost_expected_bits = incumbent.cost.score.range.expected.to_bits();
+        let cost_upper_bits = incumbent.cost.score.range.upper.to_bits();
+        self.strong_incumbents
+            .insert((group, incumbent.goal), incumbent);
+        self.strong_incumbent_install_count = self.strong_incumbent_install_count.saturating_add(1);
+        if self.strong_incumbent_installed_at_us.is_none() {
+            self.strong_incumbent_installed_at_us = Some(self.engine_elapsed_us());
+            self.strong_incumbent_installed_context_fingerprint = Some(context_fingerprint);
+            self.strong_incumbent_installed_read_count = read_count;
+            self.strong_incumbent_installed_cost_expected_bits = Some(cost_expected_bits);
+            self.strong_incumbent_installed_cost_upper_bits = Some(cost_upper_bits);
+        }
+        Ok(())
+    }
+
+    /// Rebind a priced witness produced by an independent pricing Memo to
+    /// this destination Memo's current facts. The conservative read set is
+    /// all destination groups, so a child fact/statistics change cannot leave
+    /// a detached source-group cursor looking valid. This does not copy or
+    /// publish the pricing Memo and is used only before target search starts.
+    pub(crate) fn rebind_priced_incumbent_to_current_facts(
+        &self,
+        incumbent: PricedIncumbent,
+        target_goal: OptimizationGoal,
+    ) -> Result<PricedIncumbent> {
+        let reads = self
+            .memo
+            .groups()
+            .map(|group| PatternRead::facts_from_group(&self.memo, group.id))
+            .collect::<Result<Vec<_>>>()
+            .map(ReadSet::new)?;
+        let context = self.priced_cost_context(
+            incumbent.target_group,
+            target_goal,
+            incumbent.plan.identity,
+            &reads,
+        )?;
+        Ok(PricedIncumbent {
+            goal: target_goal,
+            context,
+            ..incumbent
+        })
+    }
+
+    fn engine_elapsed_us(&self) -> u64 {
+        u64::try_from(self.engine_created_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    fn note_strong_incumbent_invalidation(
+        &mut self,
+        reason: u64,
+        context_fingerprint: Option<Fingerprint>,
+    ) {
+        if self.strong_incumbent_first_invalidation_at_us.is_none() {
+            self.strong_incumbent_first_invalidation_at_us = Some(self.engine_elapsed_us());
+            self.strong_incumbent_first_invalidation_reason = Some(reason);
+            self.strong_incumbent_first_invalidated_context_fingerprint = context_fingerprint;
+        }
+    }
+
+    fn note_strong_incumbent_reprice_failure(&mut self, error: &str) {
+        let reason = if error.contains("no matching destination recipe") {
+            self.strong_incumbent_reprice_no_destination_recipe_count = self
+                .strong_incumbent_reprice_no_destination_recipe_count
+                .saturating_add(1);
+            1
+        } else if error.contains("selected child DAG") {
+            self.strong_incumbent_reprice_child_dag_count = self
+                .strong_incumbent_reprice_child_dag_count
+                .saturating_add(1);
+            2
+        } else if error.contains("physical fingerprint") {
+            self.strong_incumbent_reprice_fingerprint_count = self
+                .strong_incumbent_reprice_fingerprint_count
+                .saturating_add(1);
+            3
+        } else if error.contains("properties") || error.contains("requirement") {
+            self.strong_incumbent_reprice_property_count = self
+                .strong_incumbent_reprice_property_count
+                .saturating_add(1);
+            4
+        } else {
+            self.strong_incumbent_reprice_other_count =
+                self.strong_incumbent_reprice_other_count.saturating_add(1);
+            255
+        };
+        if self.strong_incumbent_first_reprice_failure_reason.is_none() {
+            self.strong_incumbent_first_reprice_failure_reason = Some(reason);
+        }
+    }
+
+    fn validate_seed_plan(&self, plan: &SeedPlan) -> Result<()> {
+        if plan.frozen.reference.group != plan.group
+            || plan.frozen.reference.goal != plan.goal
+            || plan.frozen.winner.candidate != plan.frozen.reference.candidate
+            || plan.identity != frozen_seed_plan_identity(&plan.frozen)
+        {
+            return Err(paro_error::internal(
+                "seed plan lost its immutable root or stable plan identity",
+            ));
+        }
+        validate_frozen_seed_tree(&plan.frozen)
+    }
+
+    fn reprice_seed_node(
+        &mut self,
+        target_group: GroupId,
+        target_goal: OptimizationGoal,
+        source: &FrozenCandidate,
+    ) -> Result<RepricedSeedNode> {
+        let target_group = self.memo.canonical_group(target_group);
+        let logical_ids = self
+            .memo
+            .group(target_group)
+            .ok_or_else(|| paro_error::internal("seed plan targets an unknown destination group"))?
+            .logical_exprs()
+            .to_vec();
+        let implementation_id = source.physical.key.implementation;
+        let required = self
+            .memo
+            .required(target_goal.required)
+            .cloned()
+            .ok_or_else(|| {
+                paro_error::internal("seed plan target has unknown required properties")
+            })?;
+
+        let mut logical_matches = 0_u64;
+        let mut candidate_count = 0_u64;
+        let mut child_error = None;
+        let mut candidate_summary = Vec::new();
+        let mut rejection_reasons = BTreeMap::<String, u64>::new();
+        let target_logical_summary = logical_ids
+            .iter()
+            .filter_map(|logical_id| self.memo.logical_expr(*logical_id))
+            .map(|logical| {
+                let encoding = logical.operator_encoding.as_ref().map(|encoding| {
+                    let mut builder = StableFingerprintBuilder::default();
+                    builder.write_bytes(encoding);
+                    builder.finish()
+                });
+                format!(
+                    "expr={},op={:?},tag={:?},children={},encoding={encoding:?}",
+                    logical.id.index(),
+                    logical.key.operator,
+                    logical.operator_tag,
+                    logical.key.children.len(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        let source_encoding = source.logical.operator_encoding.as_ref().map(|encoding| {
+            let mut builder = StableFingerprintBuilder::default();
+            builder.write_bytes(encoding);
+            builder.finish()
+        });
+        for logical_id in logical_ids {
+            let Some(logical) = self.memo.logical_expr(logical_id) else {
+                continue;
+            };
+            if !seed_logical_shell_matches(&source.logical, logical) {
+                continue;
+            }
+            logical_matches = logical_matches.saturating_add(1);
+            let candidates = {
+                let implementation = self
+                    .registry
+                    .implementation(implementation_id)
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "seed plan references an implementation absent from destination registry",
+                        )
+                    })?;
+                let context = ImplementationContext {
+                    memo: &self.memo,
+                    group: target_group,
+                };
+                if !implementation.matches(logical, target_goal, &context) {
+                    continue;
+                }
+                implementation
+                    .candidates(logical_id, target_goal, &context)?
+                    .into_vec()
+            };
+            candidate_count = candidate_count.saturating_add(candidates.len() as u64);
+
+            for mut candidate in candidates {
+                candidate_summary.push(format!(
+                    "logical={} impl={} payload={:?} children={:?} provided={:?}",
+                    logical_id.index(),
+                    candidate.key.implementation.0,
+                    candidate.key.payload_fingerprint,
+                    candidate
+                        .key
+                        .children
+                        .iter()
+                        .map(|child| child.index())
+                        .collect::<Vec<_>>(),
+                    &candidate.provided,
+                ));
+                let identity_mismatch = candidate.key.implementation != implementation_id
+                    || candidate.key.logical != logical_id
+                    || candidate.key.payload_fingerprint != source.physical.key.payload_fingerprint
+                    || candidate.key.children.len() != source.children.len();
+                if identity_mismatch || !candidate.provided.satisfies(&required) {
+                    let reason = if identity_mismatch {
+                        format!(
+                            "candidate identity: impl={} payload={:?} arity={}",
+                            candidate.key.implementation.0,
+                            candidate.key.payload_fingerprint,
+                            candidate.key.children.len()
+                        )
+                    } else {
+                        "candidate properties do not satisfy target requirement".to_owned()
+                    };
+                    *rejection_reasons.entry(reason).or_default() += 1;
+                    continue;
+                }
+                if let Some(region) = candidate.region.as_mut() {
+                    refresh_region_candidate_contract(&self.memo, region)?;
+                }
+                if let Some(region) = &candidate.region {
+                    let owner_in_scope = self
+                        .memo
+                        .regions()
+                        .node(region.region)
+                        .is_some_and(|region| region.scope.contains(&target_group));
+                    if !owner_in_scope {
+                        *rejection_reasons
+                            .entry("region owner is outside target scope".to_owned())
+                            .or_default() += 1;
+                        continue;
+                    }
+                }
+                let inherited_sources = self
+                    .memo
+                    .optimization_context(target_goal.context)
+                    .ok_or_else(|| {
+                        paro_error::internal("seed plan target has no source-demand context")
+                    })?
+                    .filterable_sources()
+                    .clone();
+                for (ordinal, (child, child_goal)) in candidate.child_goals.iter_mut().enumerate() {
+                    child_goal.grant = self.normalized_child_grant(
+                        *child,
+                        child_goal.required,
+                        target_goal.grant,
+                    )?;
+                    let mut sources = inherited_sources.clone();
+                    if let Some((filtered_child, filters)) =
+                        candidate.cost_composition.sideways_filter()
+                    {
+                        if ordinal == filtered_child {
+                            sources.extend(filters.iter().map(|filter| filter.source));
+                        }
+                    }
+                    child_goal.context = self
+                        .memo
+                        .intern_source_demand_context(child_goal.context, sources)?;
+                }
+                let canonical_key_children = candidate
+                    .key
+                    .children
+                    .iter()
+                    .map(|child| self.memo.canonical_group(*child))
+                    .collect::<Vec<_>>();
+                let canonical_goal_children = candidate
+                    .child_goals
+                    .iter()
+                    .map(|(child, _)| self.memo.canonical_group(*child))
+                    .collect::<Vec<_>>();
+                if canonical_key_children != canonical_goal_children {
+                    *rejection_reasons
+                        .entry("candidate child keys disagree with child goals".to_owned())
+                        .or_default() += 1;
+                    continue;
+                }
+
+                let mut child_nodes = Vec::with_capacity(candidate.child_goals.len());
+                let mut child_costs = Vec::with_capacity(candidate.child_goals.len());
+                let mut child_fingerprints = Vec::with_capacity(candidate.child_goals.len());
+                let mut reads = vec![PatternRead::facts_from_group(&self.memo, target_group)?];
+                let mut children_match = true;
+                for ((child, child_goal), source_child) in candidate
+                    .child_goals
+                    .iter()
+                    .copied()
+                    .zip(source.children.iter())
+                {
+                    let child = self.memo.canonical_group(child);
+                    let child_node = match self.reprice_seed_node(child, child_goal, source_child) {
+                        Ok(child_node) => child_node,
+                        Err(error) => {
+                            child_error.get_or_insert_with(|| error.to_string());
+                            children_match = false;
+                            break;
+                        }
+                    };
+                    child_costs.push(child_node.cost);
+                    child_fingerprints.push(child_node.physical_fingerprint);
+                    reads.extend(child_node.reads.iter().copied());
+                    child_nodes.push(child_node);
+                }
+                if !children_match || child_nodes.len() != source.children.len() {
+                    *rejection_reasons
+                        .entry("selected child DAG has no destination match".to_owned())
+                        .or_default() += 1;
+                    continue;
+                }
+
+                let enforced = match replay_enforcer_chain(
+                    candidate.provided.clone(),
+                    &required,
+                    &source.winner.enforcers,
+                ) {
+                    Ok(enforced) if enforced.satisfies(&required) => enforced,
+                    _ => {
+                        *rejection_reasons
+                            .entry("enforcer chain cannot be replayed".to_owned())
+                            .or_default() += 1;
+                        continue;
+                    }
+                };
+                drop(enforced);
+                let physical_fingerprint = enforced_fingerprint(
+                    candidate.physical_fingerprint,
+                    &source.winner.enforcers,
+                    child_fingerprints.iter().copied(),
+                );
+                if physical_fingerprint != source.winner.physical_fingerprint {
+                    *rejection_reasons
+                        .entry("physical fingerprint differs after child replay".to_owned())
+                        .or_default() += 1;
+                    continue;
+                }
+                let Some(local_cost) = fit_local_retained_state_to_grant_ref(
+                    candidate.local_cost,
+                    &child_costs,
+                    &candidate.cost_composition,
+                    candidate.spillable,
+                    candidate.enforcer_cost_input,
+                )?
+                else {
+                    *rejection_reasons
+                        .entry("local retained-state cost is infeasible".to_owned())
+                        .or_default() += 1;
+                    continue;
+                };
+                let local_without_source_filter = match candidate.source_filter_apply_cost {
+                    Some(apply) => local_cost.replace_work(apply, SearchCost::ZERO)?,
+                    None => local_cost,
+                };
+                let mut local_cost = resolve_task_supply(
+                    local_without_source_filter,
+                    &child_costs,
+                    &candidate.task_supply,
+                    self.memo.calibration(),
+                )?;
+                if let Some(apply) = candidate.source_filter_apply_cost {
+                    local_cost = local_cost.replace_work(SearchCost::ZERO, apply)?;
+                }
+                let child_source_work_refs = child_nodes
+                    .iter()
+                    .map(|child| child.source_work.as_ref())
+                    .collect::<SmallVec<[&[SourceWork]; 8]>>();
+                let composed = compose_candidate_cost_with_sources_at_ref(
+                    local_cost,
+                    candidate.source_filter_apply_cost,
+                    &child_costs,
+                    &child_source_work_refs,
+                    &candidate.cost_composition,
+                    self.memo.calibration(),
+                )?;
+                let Some(cost) =
+                    constrain_composed_cost_to_grant(composed.cost, candidate.enforcer_cost_input)?
+                else {
+                    *rejection_reasons
+                        .entry("composed cost is infeasible for target grant".to_owned())
+                        .or_default() += 1;
+                    continue;
+                };
+                let Some(enforcer_phase) = enforcer_cost(
+                    &source.winner.enforcers,
+                    candidate.enforcer_cost_input,
+                    self.memo.calibration(),
+                )?
+                else {
+                    *rejection_reasons
+                        .entry("enforcer cost is infeasible for target grant".to_owned())
+                        .or_default() += 1;
+                    continue;
+                };
+                let Some(cost) = constrain_composed_cost_to_grant(
+                    enforcer_phase.compose_after(cost)?,
+                    candidate.enforcer_cost_input,
+                )?
+                else {
+                    *rejection_reasons
+                        .entry("enforcer phase cost is infeasible for target grant".to_owned())
+                        .or_default() += 1;
+                    continue;
+                };
+                return Ok(RepricedSeedNode {
+                    cost,
+                    source_work: composed.source_work,
+                    physical_fingerprint,
+                    reads,
+                });
+            }
+        }
+        Err(paro_error::internal(format!(
+            "seed plan physical DAG has no matching destination recipe: target_group={}, logical_matches={}, candidates={}, implementation={}, payload={:?}, source_op={:?}, source_tag={:?}, source_encoding={source_encoding:?}, target_required={:?}, source_physical={:?}, source_winner_fp={:?}, source_enforcers={:?}, children={}, target_logicals=[{}], candidate_summary=[{}], rejections={:?}, child_error={}",
+            target_group.index(),
+            logical_matches,
+            candidate_count,
+            implementation_id.0,
+            source.physical.key.payload_fingerprint,
+            source.logical.key.operator,
+            source.logical.operator_tag,
+            required,
+            source.physical.provided,
+            source.winner.physical_fingerprint,
+            source.winner.enforcers,
+            source.children.len(),
+            target_logical_summary,
+            candidate_summary.join(";"),
+            rejection_reasons,
+            child_error.as_deref().unwrap_or("none"),
+        )))
     }
 
     fn begin_diagnostic_profile(
@@ -1136,6 +2245,7 @@ impl CascadesEngine {
                 .and_then(|group| group.winner(goal))
                 .cloned();
             if let Some(incumbent) = &incumbent {
+                self.protect_incumbent(root, goal, incumbent.clone())?;
                 self.governor.mark_safe(incumbent.candidate);
                 self.note_safe_candidate(incumbent.candidate);
             }
@@ -1166,8 +2276,7 @@ impl CascadesEngine {
         }
         self.optimize_group(root, goal)?;
         super::verifier::MemoVerifier::verify(&self.memo, None)?;
-        self.diagnostic_search_complete =
-            !self.memo.control().deadline_reached() && self.memo.search_obligations().is_empty();
+        self.diagnostic_search_complete = self.memo.search_obligations_empty();
         self.record_search_checkpoints(root);
         self.memo
             .group(root)
@@ -1178,6 +2287,7 @@ impl CascadesEngine {
     }
 
     fn reset_cost_epoch(&mut self) -> Result<()> {
+        self.protect_current_winners()?;
         self.memo.clear_cost_frontiers()?;
         // Physical recipes are immutable descriptions of already-admitted
         // implementations. Keep them across a fact/cost epoch so only the
@@ -1186,9 +2296,114 @@ impl CascadesEngine {
         // again. New logical expressions still add recipes incrementally.
         self.infeasible_goals.clear();
         self.grant_sensitivity.clear();
+        // The cost epoch is part of every child-combination context. A
+        // completion proof from the previous epoch is therefore never a
+        // valid lower-bound source after frontiers are cleared.
+        self.physical_completion_proofs.clear();
         self.task_registry.invalidate_physical_tasks()?;
         self.physical_full_recost = self.next_recipe_sequence.keys().copied().collect();
         Ok(())
+    }
+
+    /// Save every currently selected winner before clearing the cost
+    /// frontiers.  The physical archive remains the source of exact child
+    /// payloads; this map only retains the immutable roots that can serve as
+    /// conservative upper bounds during the next epoch.
+    fn protect_current_winners(&mut self) -> Result<()> {
+        if !self.protected_incumbent_enabled {
+            return Ok(());
+        }
+        let winners = self
+            .memo
+            .groups()
+            .flat_map(|group| {
+                group
+                    .winners()
+                    .map(move |(goal, winner)| (group.id, *goal, winner.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (group, goal, winner) in winners {
+            self.protect_incumbent(group, goal, winner)?;
+        }
+        Ok(())
+    }
+
+    /// Retain a winner together with the exact group-fact reads that feed its
+    /// local and descendant cost facts.  An old winner is usable only while
+    /// all of those reads remain current; logical alternatives which do not
+    /// change the observed facts therefore keep the incumbent, while a merge
+    /// or statistics refresh invalidates it fail-closed.
+    fn protect_incumbent(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        winner: Winner,
+    ) -> Result<()> {
+        if !self.protected_incumbent_enabled {
+            return Ok(());
+        }
+        let reads = self.winner_fact_reads(group, &winner)?;
+        self.protected_incumbents.insert(
+            (self.memo.canonical_group(group), goal),
+            ProtectedIncumbent {
+                winner: Arc::new(winner),
+                reads,
+            },
+        );
+        Ok(())
+    }
+
+    fn priced_cost_context(
+        &self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        plan_identity: Fingerprint,
+        reads: &ReadSet,
+    ) -> Result<CostContext> {
+        let group = self.memo.canonical_group(group);
+        self.memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("unknown group in priced incumbent context"))?;
+        let mut builder = StableFingerprintBuilder::default();
+        builder.write_bytes(b"paro.priced-incumbent-context.v2");
+        builder.write_fingerprint(plan_identity);
+        write_semantic_goal_fingerprint(&mut builder, &self.memo, goal, &self.grant_classes)?;
+        builder.write_fingerprint(self.memo.calibration().stable_fingerprint());
+        builder.write_u64(reads.reads().len() as u64);
+        for read in reads.reads() {
+            builder.write_u64(u64::from(read.logical_frontier_revision.is_some()));
+            builder.write_u64(u64::from(read.physical_frontier_revision.is_some()));
+            builder.write_fingerprint(read.logical_fact_fingerprint);
+            builder.write_fingerprint(read.statistics_snapshot_fingerprint);
+        }
+        Ok(CostContext {
+            fingerprint: builder.finish(),
+            reads: reads.clone(),
+        })
+    }
+
+    fn winner_fact_reads(&self, group: GroupId, winner: &Winner) -> Result<ReadSet> {
+        let mut pending = vec![(self.memo.canonical_group(group), winner)];
+        let mut visited_candidates = BTreeSet::new();
+        let mut groups = BTreeSet::new();
+        while let Some((owner, winner)) = pending.pop() {
+            if !visited_candidates.insert(winner.candidate) {
+                continue;
+            }
+            groups.insert(self.memo.canonical_group(owner));
+            for child in winner.children.iter().copied() {
+                let child_owner = self.memo.canonical_group(child.group);
+                let child_winner = self.memo.resolve_child_winner(child).ok_or_else(|| {
+                    paro_error::internal("protected incumbent references an unknown child")
+                })?;
+                pending.push((child_owner, child_winner));
+            }
+        }
+        groups
+            .into_iter()
+            .map(|group| PatternRead::facts_from_group(&self.memo, group))
+            .collect::<Result<Vec<_>>>()
+            .map(ReadSet::new)
     }
 
     /// Optimize a bounded set of grant classes while sharing the complete
@@ -1228,6 +2443,11 @@ impl CascadesEngine {
                 "grant portfolio exceeds the bounded class count",
             ));
         }
+        // Make the actual multi-grant entry point own the same operating
+        // context used by SeedPlan re-pricing.  The planner primes this
+        // before installation as well, but direct engine callers must not
+        // receive a different seed-validity contract.
+        self.prime_grant_context(classes.values().copied())?;
         self.memo.freeze_optimization_contexts()?;
         let root = self.memo.canonical_group(root);
         let checkpoint_sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
@@ -1258,13 +2478,14 @@ impl CascadesEngine {
             // that case, but still permit the requested bounded search.
             if incumbent.is_ok() {
                 super::verifier::MemoVerifier::verify(&self.memo, None)?;
-                if let Some(incumbent) = incumbent
-                    .as_ref()
-                    .ok()
-                    .and_then(|optimization| optimization.winners.first())
-                {
-                    self.governor.mark_safe(incumbent.winner.candidate);
-                    self.note_safe_candidate(incumbent.winner.candidate);
+                if let Some(optimization) = incumbent.as_ref().ok() {
+                    for winner in &optimization.winners {
+                        self.protect_incumbent(root, winner.goal, winner.winner.as_ref().clone())?;
+                    }
+                    if let Some(winner) = optimization.winners.first() {
+                        self.governor.mark_safe(winner.winner.candidate);
+                        self.note_safe_candidate(winner.winner.candidate);
+                    }
                 }
             }
             self.memo.control().begin_optional();
@@ -1313,8 +2534,7 @@ impl CascadesEngine {
                 );
             }
             if result.is_ok() {
-                self.diagnostic_search_complete = !self.memo.control().deadline_reached()
-                    && self.memo.search_obligations().is_empty();
+                self.diagnostic_search_complete = self.memo.search_obligations_empty();
                 self.note_search_stop(self.search_stop());
             }
             self.record_search_checkpoints(root);
@@ -1322,8 +2542,7 @@ impl CascadesEngine {
         }
         let result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
         if result.is_ok() {
-            self.diagnostic_search_complete = !self.memo.control().deadline_reached()
-                && self.memo.search_obligations().is_empty();
+            self.diagnostic_search_complete = self.memo.search_obligations_empty();
             self.note_search_stop(self.search_stop());
         }
         self.record_search_checkpoints(root);
@@ -1601,18 +2820,11 @@ impl CascadesEngine {
         let mut visited = BTreeSet::new();
         for group in changed_groups {
             let group = self.memo.canonical_group(group);
-            let goals = if group == interleave.root {
-                interleave.goals.iter().copied().collect::<Vec<_>>()
-            } else {
-                self.physical_goals
-                    .get(&group)
-                    .into_iter()
-                    .flat_map(|goals| goals.iter().copied())
-                    .collect::<Vec<_>>()
-            };
-            for goal in goals {
-                interleave.pending.insert((group, goal));
-                self.infeasible_goals.remove(&(group, goal));
+            if group == interleave.root {
+                for goal in interleave.goals.iter().copied() {
+                    interleave.pending.insert((group, goal));
+                    self.infeasible_goals.remove(&(group, goal));
+                }
             }
             groups.push_back(group);
         }
@@ -1625,6 +2837,11 @@ impl CascadesEngine {
             };
             for &(parent, goal, physical, recipe) in parents {
                 let parent = self.memo.canonical_group(parent);
+                // The parent owns the observable response. Its recursive
+                // physical pass will pull the changed child goal on demand;
+                // queueing both sides made every publication pay a separate
+                // readiness visit for a child that can never be returned by
+                // this interleave. The root remains explicitly queued above.
                 interleave.pending.insert((parent, goal));
                 self.physical_dirty_recipes
                     .entry((parent, goal))
@@ -1740,6 +2957,31 @@ impl CascadesEngine {
                     .group_ledger_mut(group)
                     .ok_or_else(|| paro_error::internal("pattern owner disappeared"))?
                     .record_budget_limited(dimension, witness.finish());
+                continue;
+            }
+            // Rule implementations expose an allocation-free root dispatch
+            // predicate.  Run it before scoped pattern enumeration: the
+            // latter may walk every descendant frontier even when the
+            // immutable root operator can never match.  A false result is a
+            // proof that descendant changes cannot make this exact
+            // expression applicable, so an empty observation is sufficient
+            // and does not subscribe the task to unrelated child groups.
+            let root_dispatch = {
+                let rule_impl = self
+                    .registry
+                    .transformation(rule)
+                    .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
+                let logical = self.memo.logical_expr(expression).ok_or_else(|| {
+                    paro_error::internal("rule task references unknown expression")
+                })?;
+                let context = RuleContext {
+                    memo: &self.memo,
+                    group,
+                };
+                rule_impl.root_dispatch(logical, &context)?
+            };
+            if !root_dispatch.matches {
+                self.seed_transformation_observation(task_id, &root_dispatch.reads)?;
                 continue;
             }
             // A task produced by this same rule inherits the exact read cursor
@@ -2541,9 +3783,39 @@ impl CascadesEngine {
         &self.search_milestones
     }
 
-    pub fn search_work_counters(&self) -> BTreeMap<&'static str, u64> {
+    pub fn search_work_counters(&mut self) -> BTreeMap<&'static str, u64> {
         let task_profile = self.task_registry.profile();
-        BTreeMap::from([
+        let mut strong_incumbent_active_count = 0_u64;
+        let mut first_invalid = None;
+        for ((group, goal), incumbent) in &self.strong_incumbents {
+            let reads_current = incumbent
+                .context
+                .reads
+                .is_current(&self.memo)
+                .is_ok_and(|current| current);
+            let valid = reads_current
+                && self
+                    .priced_cost_context(
+                        *group,
+                        *goal,
+                        incumbent.plan.identity,
+                        &incumbent.context.reads,
+                    )
+                    .ok()
+                    .is_some_and(|context| context.fingerprint == incumbent.context.fingerprint);
+            if valid {
+                strong_incumbent_active_count = strong_incumbent_active_count.saturating_add(1);
+            } else if first_invalid.is_none() {
+                first_invalid = Some((
+                    if reads_current { 2 } else { 1 },
+                    Some(incumbent.context.fingerprint),
+                ));
+            }
+        }
+        if let Some((reason, fingerprint)) = first_invalid {
+            self.note_strong_incumbent_invalidation(reason, fingerprint);
+        }
+        let mut counters = BTreeMap::from([
             ("winner_proposal_count", self.memo.winner_proposal_count()),
             ("published_winner_count", self.memo.published_winner_count()),
             ("transformation_binding_count", self.transformation_bindings),
@@ -2633,6 +3905,166 @@ impl CascadesEngine {
                 self.child_combination_budget_rejection_count,
             ),
             (
+                "certified_bound_check_count",
+                self.certified_bound_check_count,
+            ),
+            (
+                "certified_recipe_prune_count",
+                self.certified_recipe_prune_count,
+            ),
+            (
+                "certified_group_pruning_enabled",
+                u64::from(self.certified_group_pruning_enabled),
+            ),
+            (
+                "protected_incumbent_enabled",
+                u64::from(self.protected_incumbent_enabled),
+            ),
+            (
+                "strong_incumbent_seed_count",
+                self.strong_incumbents.len() as u64,
+            ),
+            (
+                "strong_incumbent_active_count",
+                strong_incumbent_active_count,
+            ),
+            (
+                "certified_bound_no_incumbent_count",
+                self.certified_bound_diagnostics.no_incumbent,
+            ),
+            (
+                "certified_bound_local_interval_uncertain_count",
+                self.certified_bound_diagnostics.local_interval_uncertain,
+            ),
+            (
+                "certified_bound_child_completion_missing_count",
+                self.certified_bound_diagnostics.child_completion_missing,
+            ),
+            (
+                "certified_bound_source_response_unsupported_count",
+                self.certified_bound_diagnostics.source_response_unsupported,
+            ),
+            (
+                "certified_bound_phase_overlap_unsupported_count",
+                self.certified_bound_diagnostics.phase_overlap_unsupported,
+            ),
+            (
+                "certified_bound_available_not_tight_count",
+                self.certified_bound_diagnostics.available_not_tight,
+            ),
+            (
+                "certified_bound_pruned_before_children_count",
+                self.certified_bound_diagnostics.pruned_before_children,
+            ),
+            (
+                "certified_bound_pruned_after_children_count",
+                self.certified_bound_diagnostics.pruned_after_children,
+            ),
+            (
+                "certified_bound_compute_us",
+                self.certified_bound_diagnostics.compute_us,
+            ),
+            (
+                "certified_bound_validation_us",
+                self.certified_bound_diagnostics.validation_us,
+            ),
+            (
+                "certified_bound_invalidation_count",
+                self.certified_bound_diagnostics.invalidation_count,
+            ),
+            (
+                "strong_incumbent_lookup_count",
+                self.strong_incumbent_lookup_count,
+            ),
+            (
+                "strong_incumbent_bound_request_count",
+                self.strong_incumbent_bound_request_count,
+            ),
+            (
+                "strong_incumbent_valid_lookup_count",
+                self.strong_incumbent_valid_lookup_count,
+            ),
+            (
+                "strong_incumbent_invalid_lookup_count",
+                self.strong_incumbent_invalid_lookup_count,
+            ),
+            (
+                "strong_incumbent_missing_key_count",
+                self.strong_incumbent_missing_key_count,
+            ),
+            (
+                "strong_incumbent_lookup_group_mismatch_count",
+                self.strong_incumbent_lookup_group_mismatch_count,
+            ),
+            (
+                "strong_incumbent_lookup_goal_mismatch_count",
+                self.strong_incumbent_lookup_goal_mismatch_count,
+            ),
+            (
+                "strong_incumbent_lookup_unrelated_key_count",
+                self.strong_incumbent_lookup_unrelated_key_count,
+            ),
+            (
+                "strong_incumbent_fact_invalid_count",
+                self.strong_incumbent_fact_invalid_count,
+            ),
+            (
+                "strong_incumbent_context_invalid_count",
+                self.strong_incumbent_context_invalid_count,
+            ),
+            (
+                "strong_incumbent_source_response_bypass_count",
+                self.strong_incumbent_source_response_bypass_count,
+            ),
+            (
+                "strong_incumbent_phase_overlap_bypass_count",
+                self.strong_incumbent_phase_overlap_bypass_count,
+            ),
+            (
+                "strong_incumbent_selected_for_bound_count",
+                self.strong_incumbent_selected_for_bound_count,
+            ),
+            (
+                "strong_incumbent_install_count",
+                self.strong_incumbent_install_count,
+            ),
+            (
+                "strong_incumbent_installed_read_count",
+                self.strong_incumbent_installed_read_count,
+            ),
+            (
+                "strong_incumbent_merge_invalidation_count",
+                self.strong_incumbent_merge_invalidation_count,
+            ),
+            (
+                "strong_incumbent_goal_mismatch_count",
+                self.strong_incumbent_goal_mismatch_count,
+            ),
+            (
+                "strong_incumbent_reprice_rejection_count",
+                self.strong_incumbent_reprice_rejection_count,
+            ),
+            (
+                "strong_incumbent_reprice_no_destination_recipe_count",
+                self.strong_incumbent_reprice_no_destination_recipe_count,
+            ),
+            (
+                "strong_incumbent_reprice_child_dag_count",
+                self.strong_incumbent_reprice_child_dag_count,
+            ),
+            (
+                "strong_incumbent_reprice_fingerprint_count",
+                self.strong_incumbent_reprice_fingerprint_count,
+            ),
+            (
+                "strong_incumbent_reprice_property_count",
+                self.strong_incumbent_reprice_property_count,
+            ),
+            (
+                "strong_incumbent_reprice_other_count",
+                self.strong_incumbent_reprice_other_count,
+            ),
+            (
                 "governor_milestone",
                 match self.governor.milestone() {
                     PlanMilestone::None => 0,
@@ -2648,22 +4080,75 @@ impl CascadesEngine {
                 "governor_calibration_unavailable",
                 u64::from(self.governor.last_calibration_status().is_some()),
             ),
-        ])
+        ]);
+        if let Some(timestamp) = self.strong_incumbent_installed_at_us {
+            counters.insert("strong_incumbent_installed_at_us", timestamp);
+        }
+        if let Some(cost) = self.strong_incumbent_installed_cost_expected_bits {
+            counters.insert("strong_incumbent_installed_cost_expected_bits", cost);
+        }
+        if let Some(cost) = self.strong_incumbent_installed_cost_upper_bits {
+            counters.insert("strong_incumbent_installed_cost_upper_bits", cost);
+        }
+        if let Some(reason) = self.strong_incumbent_first_reprice_failure_reason {
+            counters.insert("strong_incumbent_first_reprice_failure_reason", reason);
+        }
+        if let Some(fingerprint) = self.strong_incumbent_installed_context_fingerprint {
+            counters.insert(
+                "strong_incumbent_installed_context_fingerprint_lo",
+                fingerprint.0 as u64,
+            );
+            counters.insert(
+                "strong_incumbent_installed_context_fingerprint_hi",
+                (fingerprint.0 >> 64) as u64,
+            );
+        }
+        if let Some(timestamp) = self.strong_incumbent_first_invalidation_at_us {
+            counters.insert("strong_incumbent_first_invalidation_at_us", timestamp);
+        }
+        if let Some(reason) = self.strong_incumbent_first_invalidation_reason {
+            counters.insert("strong_incumbent_first_invalidation_reason", reason);
+        }
+        if let Some(fingerprint) = self.strong_incumbent_first_invalidated_context_fingerprint {
+            counters.insert(
+                "strong_incumbent_first_invalidated_context_fingerprint_lo",
+                fingerprint.0 as u64,
+            );
+            counters.insert(
+                "strong_incumbent_first_invalidated_context_fingerprint_hi",
+                (fingerprint.0 >> 64) as u64,
+            );
+        }
+        // Keep budget evidence in the same diagnostic counter snapshot as
+        // physical work.  Aggregate counts alone cannot tell whether a
+        // local proof was blocked by logical closure, child products, or a
+        // global envelope, and guessing that dimension would make any
+        // follow-up pruning change unauditable.
+        for (dimension, count) in self.memo.exhaustion_counts() {
+            counters.insert(budget_exhaustion_counter_name(dimension), count);
+        }
+        counters
     }
 
-    fn schedule_transformations(&self, group: GroupId, agenda: &mut StableAgenda) -> Result<()> {
-        let group_ref = self
+    fn schedule_transformations(
+        &mut self,
+        group: GroupId,
+        agenda: &mut StableAgenda,
+    ) -> Result<()> {
+        let expressions = self
             .memo
             .group(group)
-            .ok_or_else(|| paro_error::internal("cannot schedule an unknown Memo group"))?;
-        for &expression in group_ref.logical_exprs() {
+            .ok_or_else(|| paro_error::internal("cannot schedule an unknown Memo group"))?
+            .logical_exprs()
+            .to_vec();
+        for expression in expressions {
             self.schedule_transformation_expression(group, expression, agenda)?;
         }
         Ok(())
     }
 
     fn schedule_transformation_expression(
-        &self,
+        &mut self,
         group: GroupId,
         expression: LogicalExprId,
         agenda: &mut StableAgenda,
@@ -2676,17 +4161,46 @@ impl CascadesEngine {
             memo: &self.memo,
             group,
         };
-        for rule in self.registry.transformations() {
-            if !self.memo.budget().transformation_enabled(rule.id())
-                || !rule.matches_root(expression_ref)
-            {
+        // Apply the same dispatch used by the task executor before putting a
+        // task on the agenda.  The old scheduler only checked the immutable
+        // shell and then paid one queue/checkpoint/cache visit for every
+        // nested-path rule that was already known not to have a witness.
+        // Negative dispatch is also an observation publication: cached path
+        // reads must wake this exact expression when a child frontier later
+        // acquires a qualifying alternative.
+        let dispatches = self
+            .registry
+            .transformations()
+            .filter(|rule| self.memo.budget().transformation_enabled(rule.id()))
+            .filter(|rule| rule.root_operator_tag_may_match(expression_ref.operator_tag))
+            .map(|rule| {
+                let dispatch = rule.root_dispatch(expression_ref, &context)?;
+                Ok((rule.id(), rule.promise(expression_ref, &context), dispatch))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (rule_id, promise, dispatch) in dispatches {
+            let task_id = TransformationTaskId {
+                group,
+                expression,
+                rule: rule_id,
+            };
+            if !dispatch.matches {
+                if !dispatch.reads.is_empty() {
+                    self.seed_transformation_observation(task_id, &dispatch.reads)?;
+                }
                 continue;
             }
-            let promise = rule.promise(expression_ref, &context);
+            // Scheduling is itself an incremental operation.  Do not create
+            // a duplicate agenda item for an exact task whose observed
+            // frontier and fact reads have not advanced since its last
+            // completed application.
+            if self.transformation_observation_is_current(task_id)? {
+                continue;
+            }
             let key = TaskKey {
                 priority: promise.priority,
                 kind: TaskKind::Transform,
-                stable_id: rule.id().0,
+                stable_id: rule_id.0,
                 group,
                 expression,
                 goal: None,
@@ -2696,7 +4210,7 @@ impl CascadesEngine {
                 SearchTask::Transform {
                     group,
                     expression,
-                    rule: rule.id(),
+                    rule: rule_id,
                 },
             );
         }
@@ -2704,7 +4218,7 @@ impl CascadesEngine {
     }
 
     fn schedule_transformation_dependents(
-        &self,
+        &mut self,
         group: GroupId,
         agenda: &mut StableAgenda,
     ) -> Result<()> {
@@ -2714,6 +4228,7 @@ impl CascadesEngine {
             .get(&group)
             .into_iter()
             .flat_map(|subscribers| subscribers.iter().copied());
+        let subscribers = subscribers.collect::<Vec<_>>();
         for subscriber in subscribers {
             let expression_ref =
                 self.memo
@@ -2737,6 +4252,33 @@ impl CascadesEngine {
                 memo: &self.memo,
                 group: owner,
             };
+            if !rule.root_operator_tag_may_match(expression_ref.operator_tag) {
+                continue;
+            }
+            // A child publication can wake a subscriber whose root operator
+            // is immutable and can never match this rule.  Do the complete
+            // dispatch before putting another task on the agenda, while
+            // preserving the dependency reads of a cached negative path.
+            let dispatch = rule.root_dispatch(expression_ref, &context)?;
+            let task_id = TransformationTaskId {
+                group: owner,
+                expression: subscriber.expression,
+                rule: subscriber.rule,
+            };
+            if !dispatch.matches {
+                if !dispatch.reads.is_empty() {
+                    self.seed_transformation_observation(task_id, &dispatch.reads)?;
+                }
+                continue;
+            }
+            // A subscriber may be notified more than once while a sibling
+            // publication is being committed.  The exact observation is the
+            // wake-up cursor; if every read is still current, putting the
+            // task back on the agenda only pays a discovery visit and then
+            // immediately skips the same binding frontier.
+            if self.transformation_observation_is_current(task_id)? {
+                continue;
+            }
             let promise = rule.promise(expression_ref, &context);
             agenda.push(
                 TaskKey {
@@ -3123,6 +4665,23 @@ impl CascadesEngine {
                 return Ok(());
             }
         }
+        let certified_local_work = if candidate.source_filter_apply_cost.is_none()
+            && !matches!(
+                candidate.cost_composition,
+                CostComposition::SidewaysFilter { .. }
+            )
+            && candidate.cost_composition.overlapping_children() == 0
+            && matches!(
+                candidate.task_supply,
+                TaskSupplyContract::Serial | TaskSupplyContract::Source { .. }
+            ) {
+            CertifiedLocalWorkFloor::from_exact_cost(
+                candidate.local_cost,
+                candidate.stable_event(goal),
+            )
+        } else {
+            None
+        };
         let physical = self.memo.insert_physical(
             group,
             candidate.key,
@@ -3130,6 +4689,11 @@ impl CascadesEngine {
             candidate.provided,
         )?;
         let recipe_key = (physical, goal, candidate.physical_fingerprint);
+        let child_dependencies = candidate
+            .child_goals
+            .iter()
+            .map(|(child, child_goal)| (self.memo.canonical_group(*child), *child_goal))
+            .collect::<BTreeSet<_>>();
         // Do not publish a region fingerprint or allocate a persistent cost
         // recipe until the candidate has crossed the Memo publication
         // boundary.  The previous order left region admission state behind
@@ -3161,8 +4725,14 @@ impl CascadesEngine {
                 enforcer_cost_input: candidate.enforcer_cost_input,
                 physical_fingerprint: candidate.physical_fingerprint,
                 region: candidate.region,
+                certified_local_work,
             }));
         }
+        let owner = self.memo.canonical_group(group);
+        self.physical_read_dependencies
+            .entry((owner, goal))
+            .or_default()
+            .extend(child_dependencies);
         Ok(())
     }
 
@@ -3174,12 +4744,9 @@ impl CascadesEngine {
     /// making every unchanged recursive visit resumable.
     fn physical_read_set(&self, group: GroupId, goal: OptimizationGoal) -> Result<ReadSet> {
         let group = self.memo.canonical_group(group);
-        let physical_exprs = self
-            .memo
+        self.memo
             .group(group)
-            .ok_or_else(|| paro_error::internal("unknown group during physical read capture"))?
-            .physical_exprs()
-            .to_vec();
+            .ok_or_else(|| paro_error::internal("unknown group during physical read capture"))?;
         // The task is allowed to publish into its own group, but subsequent
         // requests still need to observe physical expressions/frontier
         // entries published by another owner.  Publication ignores this
@@ -3191,13 +4758,9 @@ impl CascadesEngine {
         // it. Child physical frontiers remain exact dependencies and are
         // still read with `physical_from_group`.
         let mut reads = vec![PatternRead::from_group(&self.memo, group)?];
-        for physical in physical_exprs {
-            for (_, recipe) in self.recipes.range(
-                (physical, goal, Fingerprint::default())..=(physical, goal, Fingerprint(u128::MAX)),
-            ) {
-                for (child, _) in recipe.child_goals.iter().copied() {
-                    reads.push(PatternRead::physical_from_group(&self.memo, child)?);
-                }
+        if let Some(children) = self.physical_read_dependencies.get(&(group, goal)) {
+            for (child, _) in children.iter().copied() {
+                reads.push(PatternRead::physical_from_group(&self.memo, child)?);
             }
         }
         Ok(ReadSet::new(reads))
@@ -3208,6 +4771,29 @@ impl CascadesEngine {
             return Ok(());
         }
         let group = self.memo.canonical_group(group);
+        let cache_key = (group, goal);
+        let next_recipe_sequence = self
+            .next_recipe_sequence
+            .get(&cache_key)
+            .copied()
+            .unwrap_or_default();
+        let fast_reuse = !self.physical_full_recost.contains(&cache_key)
+            && !self.physical_dirty_recipes.contains_key(&cache_key)
+            && self
+                .physical_task_cache
+                .get(&cache_key)
+                .is_some_and(|entry| {
+                    next_recipe_sequence <= entry.recipe_cursor
+                        && (self.preserve_incomplete_physical || entry.complete)
+                        && entry
+                            .reads
+                            .is_current(&self.memo)
+                            .is_ok_and(|current| current)
+                });
+        if fast_reuse {
+            self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
+            return Ok(());
+        }
         let mut dirty_recipes = self.physical_dirty_recipes.remove(&(group, goal));
         let force_full_recost = self.physical_full_recost.remove(&(group, goal));
         self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
@@ -3378,7 +4964,7 @@ impl CascadesEngine {
                 Cursor {
                     position: recipe_count,
                     complete: !self.preserve_incomplete_physical
-                        && self.memo.search_obligations().is_empty(),
+                        && self.memo.search_obligations_empty(),
                 },
             )?;
             let outcome = if self
@@ -3394,6 +4980,15 @@ impl CascadesEngine {
             };
             self.task_registry
                 .complete_current(task, &self.memo, outcome)?;
+            self.physical_task_cache.insert(
+                cache_key,
+                PhysicalTaskCacheEntry {
+                    reads: requested_read_set.clone(),
+                    recipe_cursor: recipe_count,
+                    complete: !self.preserve_incomplete_physical
+                        && self.memo.search_obligations_empty(),
+                },
+            );
             return Ok(());
         }
         if !new_evaluation
@@ -3432,6 +5027,14 @@ impl CascadesEngine {
             };
             self.task_registry
                 .complete_current(task, &self.memo, outcome)?;
+            self.physical_task_cache.insert(
+                cache_key,
+                PhysicalTaskCacheEntry {
+                    reads: requested_read_set.clone(),
+                    recipe_cursor: recipe_count,
+                    complete: !self.preserve_incomplete_physical,
+                },
+            );
             return Ok(());
         }
         self.physical_subproblem_evaluations =
@@ -3445,6 +5048,7 @@ impl CascadesEngine {
         let result = self.optimize_group_inner(
             group,
             goal,
+            task,
             recipe_start,
             recipe_cursor,
             enumerate_local_implementations,
@@ -3461,23 +5065,25 @@ impl CascadesEngine {
                 if !has_winner && !self.preserve_incomplete_physical {
                     self.infeasible_goals.insert((group, goal));
                 }
-                // A physical task is complete only after its declared search
-                // obligations have been discharged.  This preserves the
-                // quality contract: a budget-limited pass remains resumable
-                // so a later logical publication can re-enter the child
-                // frontier and compete with the incumbent.  The restart
-                // storm seen with this condition is a task lifecycle bug, not
-                // a reason to report an incomplete search as complete.
-                let complete =
-                    self.memo.search_obligations().is_empty() && !self.preserve_incomplete_physical;
+                // A readiness pass may leave the query-wide logical search
+                // open while this exact physical domain is already closed.
+                // Keep that distinction explicit: the local task can publish
+                // a versioned proof for parent bounds, while the root still
+                // reports an incomplete search until the stronger global
+                // obligation predicate succeeds.  A local budget/failure or
+                // deadline remains a hard blocker for this proof.
+                let complete = self.memo.group_physical_obligations_empty(group);
                 // The recursive pass may have created new recipes and child
                 // frontier dependencies. Rebind the running task to the
                 // exact post-child ReadSet before publication; otherwise a
                 // later parent could either miss a child change or retain a
                 // provisional pre-child snapshot.
                 let post_child_reads = self.physical_read_set(group, goal)?;
-                self.task_registry
-                    .replace_current_read_set(task, &self.memo, post_child_reads)?;
+                self.task_registry.replace_current_read_set(
+                    task,
+                    &self.memo,
+                    post_child_reads.clone(),
+                )?;
                 let recipe_count = self
                     .next_recipe_sequence
                     .get(&(self.memo.canonical_group(group), goal))
@@ -3490,10 +5096,48 @@ impl CascadesEngine {
                         complete,
                     },
                 )?;
-                let outcome = if has_winner || self.preserve_incomplete_physical {
-                    TaskOutcome::Progress { cursor }
+                let proof = if complete {
+                    if let Some(candidate) = self
+                        .memo
+                        .group(group)
+                        .and_then(|group| group.winner(goal))
+                        .map(|winner| winner.candidate)
+                    {
+                        self.record_physical_completion_proof(task, group, goal, candidate)?
+                    } else {
+                        None
+                    }
                 } else {
-                    TaskOutcome::Infeasible
+                    None
+                };
+                let outcome = match (has_winner, proof) {
+                    (true, Some(certificate)) if goal.objective == ObjectiveProfile::Latency => {
+                        TaskOutcome::ProvenNoPlanBelow {
+                            threshold: self
+                                .physical_completion_proofs
+                                .get(&cache_key)
+                                .map(|proof| proof.threshold)
+                                .ok_or_else(|| {
+                                    paro_error::internal(
+                                        "latency completion proof lost its threshold",
+                                    )
+                                })?,
+                            certificate,
+                        }
+                    }
+                    (true, Some(certificate)) => TaskOutcome::ProvenOptimal {
+                        candidate: self
+                            .memo
+                            .group(group)
+                            .and_then(|group| group.winner(goal))
+                            .map(|winner| winner.candidate)
+                            .ok_or_else(|| {
+                                paro_error::internal("physical completion proof lost its winner")
+                            })?,
+                        certificate,
+                    },
+                    (true, None) => TaskOutcome::Progress { cursor },
+                    (false, _) => TaskOutcome::Infeasible,
                 };
                 self.task_registry.publish_current_after_local_mutation(
                     task,
@@ -3502,6 +5146,14 @@ impl CascadesEngine {
                     std::iter::empty(),
                     outcome,
                 )?;
+                self.physical_task_cache.insert(
+                    cache_key,
+                    PhysicalTaskCacheEntry {
+                        reads: post_child_reads,
+                        recipe_cursor: recipe_count,
+                        complete,
+                    },
+                );
                 if !has_winner && !self.preserve_incomplete_physical {
                     self.infeasible_goals.insert((group, goal));
                 }
@@ -3537,6 +5189,687 @@ impl CascadesEngine {
             }
             None => next_sequence > recipe_start,
         }
+    }
+
+    fn incumbent_for_goal(&self, group: GroupId, goal: OptimizationGoal) -> Option<&Winner> {
+        if let Some(winner) = self.memo.group(group).and_then(|group| group.winner(goal)) {
+            return Some(winner);
+        }
+        self.protected_incumbents
+            .get(&(self.memo.canonical_group(group), goal))
+            .filter(|incumbent| {
+                incumbent
+                    .reads
+                    .is_current(&self.memo)
+                    .is_ok_and(|current| current)
+            })
+            .map(|incumbent| incumbent.winner.as_ref())
+    }
+
+    fn incumbent_cost_for_goal(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> Option<SearchCost> {
+        let local = self
+            .incumbent_for_goal(group, goal)
+            .map(|winner| winner.cost);
+        let strong = self.strong_incumbent_cost_for_goal(group, goal);
+        match (local, strong) {
+            (Some(local), Some(strong)) => {
+                if goal.objective.compare(&strong, &local) == std::cmp::Ordering::Less {
+                    self.strong_incumbent_selected_for_bound_count = self
+                        .strong_incumbent_selected_for_bound_count
+                        .saturating_add(1);
+                    Some(strong)
+                } else {
+                    Some(local)
+                }
+            }
+            (Some(local), None) => Some(local),
+            (None, Some(strong)) => {
+                self.strong_incumbent_selected_for_bound_count = self
+                    .strong_incumbent_selected_for_bound_count
+                    .saturating_add(1);
+                Some(strong)
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// Return a strong incumbent only when the exact cost dependency witness
+    /// is still current.  The counters intentionally distinguish a missing
+    /// map entry from an entry that was rejected by ReadSet/context
+    /// validation; otherwise a final `active_count` snapshot cannot explain
+    /// whether the seed ever participated in a proof check.
+    fn strong_incumbent_cost_for_goal(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> Option<SearchCost> {
+        if self.strong_incumbents.is_empty() {
+            return None;
+        }
+        self.observe_strong_incumbent_lifecycle();
+        let key = (self.memo.canonical_group(group), goal);
+        self.strong_incumbent_lookup_count = self.strong_incumbent_lookup_count.saturating_add(1);
+        let (identity, cost, context_fingerprint, reads) = {
+            let Some(incumbent) = self.strong_incumbents.get(&key) else {
+                self.strong_incumbent_missing_key_count =
+                    self.strong_incumbent_missing_key_count.saturating_add(1);
+                let has_same_group = self
+                    .strong_incumbents
+                    .keys()
+                    .any(|(candidate_group, _)| *candidate_group == key.0);
+                let has_same_goal = self
+                    .strong_incumbents
+                    .keys()
+                    .any(|(_, candidate_goal)| *candidate_goal == key.1);
+                if has_same_group {
+                    self.strong_incumbent_lookup_goal_mismatch_count = self
+                        .strong_incumbent_lookup_goal_mismatch_count
+                        .saturating_add(1);
+                } else if has_same_goal {
+                    self.strong_incumbent_lookup_group_mismatch_count = self
+                        .strong_incumbent_lookup_group_mismatch_count
+                        .saturating_add(1);
+                } else {
+                    self.strong_incumbent_lookup_unrelated_key_count = self
+                        .strong_incumbent_lookup_unrelated_key_count
+                        .saturating_add(1);
+                }
+                return None;
+            };
+            (
+                incumbent.plan.identity,
+                incumbent.cost,
+                incumbent.context.fingerprint,
+                incumbent.context.reads.clone(),
+            )
+        };
+
+        let reads_current = reads.is_current(&self.memo).is_ok_and(|current| current);
+        if !reads_current {
+            self.strong_incumbent_invalid_lookup_count =
+                self.strong_incumbent_invalid_lookup_count.saturating_add(1);
+            self.strong_incumbent_fact_invalid_count =
+                self.strong_incumbent_fact_invalid_count.saturating_add(1);
+            self.note_strong_incumbent_invalidation(1, Some(context_fingerprint));
+            return None;
+        }
+        let current_context = match self.priced_cost_context(key.0, goal, identity, &reads) {
+            Ok(context) => context,
+            Err(_) => {
+                self.strong_incumbent_invalid_lookup_count =
+                    self.strong_incumbent_invalid_lookup_count.saturating_add(1);
+                self.strong_incumbent_context_invalid_count = self
+                    .strong_incumbent_context_invalid_count
+                    .saturating_add(1);
+                self.note_strong_incumbent_invalidation(2, Some(context_fingerprint));
+                return None;
+            }
+        };
+        if current_context.fingerprint != context_fingerprint {
+            self.strong_incumbent_invalid_lookup_count =
+                self.strong_incumbent_invalid_lookup_count.saturating_add(1);
+            self.strong_incumbent_context_invalid_count = self
+                .strong_incumbent_context_invalid_count
+                .saturating_add(1);
+            self.note_strong_incumbent_invalidation(2, Some(context_fingerprint));
+            return None;
+        }
+        self.strong_incumbent_valid_lookup_count =
+            self.strong_incumbent_valid_lookup_count.saturating_add(1);
+        Some(cost)
+    }
+
+    /// Observe invalidation at the first bound lookup after the Memo's fact
+    /// epoch has changed. A seed can become stale without an exact lookup for
+    /// its root key (for example, when the search only asks child goals), so
+    /// the final counter snapshot is not the first useful observation.
+    fn observe_strong_incumbent_lifecycle(&mut self) {
+        if self.strong_incumbent_first_invalidation_at_us.is_some() {
+            return;
+        }
+        let mut first_invalid = None;
+        for ((group, goal), incumbent) in &self.strong_incumbents {
+            let reads_current = incumbent
+                .context
+                .reads
+                .is_current(&self.memo)
+                .is_ok_and(|current| current);
+            let context_current = reads_current
+                && self
+                    .priced_cost_context(
+                        *group,
+                        *goal,
+                        incumbent.plan.identity,
+                        &incumbent.context.reads,
+                    )
+                    .ok()
+                    .is_some_and(|context| context.fingerprint == incumbent.context.fingerprint);
+            if !context_current {
+                first_invalid = Some((
+                    if reads_current { 2 } else { 1 },
+                    Some(incumbent.context.fingerprint),
+                ));
+                break;
+            }
+        }
+        if let Some((reason, fingerprint)) = first_invalid {
+            self.note_strong_incumbent_invalidation(reason, fingerprint);
+        }
+    }
+
+    fn max_parallel_tasks_for_goal(&self, goal: OptimizationGoal) -> u16 {
+        match goal.grant {
+            GrantGoalKey::Class(class) => self
+                .grant_classes
+                .get(&class)
+                .map_or(1, |class| class.max_parallel_tasks.max(1)),
+            GrantGoalKey::Parallelism { tasks, .. } => tasks.max(1),
+            GrantGoalKey::Invariant(_) => 1,
+        }
+    }
+
+    /// Encode the complete currently published physical domain of one
+    /// subproblem. ReadSet cursors invalidate the proof when facts or logical
+    /// frontiers change; this additional identity covers a recipe appended
+    /// by an already-observed logical expression and makes the proof fail
+    /// closed if the physical registry grows without a frontier mutation.
+    fn physical_search_domain(
+        &self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> Result<Fingerprint> {
+        let group = self.memo.canonical_group(group);
+        let group_ref = self
+            .memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("unknown group in physical search domain"))?;
+        let mut builder = StableFingerprintBuilder::default();
+        builder.write_bytes(b"paro.physical-search-domain.v1");
+        builder.write_u64(group.0 as u64);
+        write_optimization_goal_fingerprint(&mut builder, goal);
+        builder.write_u64(group_ref.logical_expression_version());
+        builder.write_fingerprint(group_ref.logical_fact_fingerprint());
+        builder.write_fingerprint(self.memo.local_statistics_fingerprint(group));
+        for &physical in group_ref.physical_exprs() {
+            builder.write_u64(physical.0 as u64);
+            let Some(expression) = self.memo.physical_expr(physical) else {
+                return Err(paro_error::internal(
+                    "physical search domain references an unknown expression",
+                ));
+            };
+            builder.write_fingerprint(expression.key.stable_fingerprint());
+            for ((recipe_physical, recipe_goal, recipe_fingerprint), recipe) in self.recipes.range(
+                (physical, goal, Fingerprint::default())..=(physical, goal, Fingerprint(u128::MAX)),
+            ) {
+                debug_assert_eq!(*recipe_physical, physical);
+                debug_assert_eq!(*recipe_goal, goal);
+                builder.write_u64(recipe.sequence);
+                builder.write_fingerprint(*recipe_fingerprint);
+                builder.write_fingerprint(recipe.physical_fingerprint);
+                for (child, child_goal) in recipe.child_goals.iter().copied() {
+                    builder.write_u64(self.memo.canonical_group(child).0 as u64);
+                    write_optimization_goal_fingerprint(&mut builder, child_goal);
+                }
+                write_search_cost_fingerprint(&mut builder, recipe.local_cost);
+                write_task_supply_fingerprint(&mut builder, &recipe.task_supply);
+                write_cost_composition_fingerprint(&mut builder, &recipe.cost_composition);
+            }
+        }
+        Ok(builder.finish())
+    }
+
+    /// Return the exact, current frontier of a child only when the child
+    /// task completed with a named upper-bound certificate. A selected winner
+    /// or a non-empty frontier alone is not enough: it may be an anytime
+    /// prefix or may already have been invalidated by a fact change.
+    fn proven_child_latency_floor(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> Result<Option<ProvenChildLatencyFloor>> {
+        let key = (self.memo.canonical_group(group), goal);
+        let Some(record) = self.physical_completion_proofs.get(&key).copied() else {
+            return Ok(None);
+        };
+        let Some(proof) = self.task_registry.bound(record.proof).cloned() else {
+            self.certified_bound_diagnostics.invalidation_count = self
+                .certified_bound_diagnostics
+                .invalidation_count
+                .saturating_add(1);
+            return Ok(None);
+        };
+        // A live upper-bound record is useful to the task owner as a
+        // provisional incumbent, but it is not evidence that every child
+        // alternative has been enumerated.  This caller composes the result
+        // as a *complete* child frontier, so require the named certificate to
+        // have crossed the publication boundary and to be the task outcome.
+        let Some(task) = self.task_registry.task(proof.task) else {
+            self.certified_bound_diagnostics.invalidation_count = self
+                .certified_bound_diagnostics
+                .invalidation_count
+                .saturating_add(1);
+            return Ok(None);
+        };
+        let task_is_completed = task.state == TaskState::Completed;
+        let task_names_proof = matches!(
+            task.outcome,
+            Some(TaskOutcome::ProvenNoPlanBelow { certificate, .. })
+                if certificate == record.proof
+        );
+        if !task_is_completed || !task_names_proof {
+            self.certified_bound_diagnostics.invalidation_count = self
+                .certified_bound_diagnostics
+                .invalidation_count
+                .saturating_add(1);
+            return Ok(None);
+        }
+        if !matches!(
+            proof.kind,
+            BoundProofKind::NoPlanBelow { threshold }
+                if threshold == record.threshold
+                    && self
+                        .memo
+                        .group(key.0)
+                        .and_then(|group| group.winner(goal))
+                        .is_some_and(|winner| winner.candidate == record.candidate)
+        ) {
+            return Ok(None);
+        }
+        let validation_started = Instant::now();
+        let bound_current = self
+            .task_registry
+            .bound_is_current(record.proof, &self.memo)?;
+        let domain_current = record.domain == self.physical_search_domain(key.0, goal)?;
+        CertifiedBoundDiagnostics::add_elapsed(
+            &mut self.certified_bound_diagnostics.validation_us,
+            validation_started,
+        );
+        if !bound_current || !domain_current {
+            self.certified_bound_diagnostics.invalidation_count = self
+                .certified_bound_diagnostics
+                .invalidation_count
+                .saturating_add(1);
+            return Ok(None);
+        }
+        let Some(frontier) = self
+            .memo
+            .group(key.0)
+            .and_then(|group| group.winner_frontier(goal))
+        else {
+            self.certified_bound_diagnostics.invalidation_count = self
+                .certified_bound_diagnostics
+                .invalidation_count
+                .saturating_add(1);
+            return Ok(None);
+        };
+        Ok(ProvenChildLatencyFloor::from_frontier(
+            frontier
+                .candidates()
+                .iter()
+                .map(|winner| winner.cost.work_latency.expected),
+            frontier
+                .candidates()
+                .iter()
+                .map(|winner| winner.cost.critical_path.expected),
+            frontier
+                .candidates()
+                .iter()
+                .map(|winner| winner.cost.max_parallel_tasks),
+        ))
+    }
+
+    /// Publish a completion certificate for one exact physical task. The
+    /// certificate is deliberately created before the task outcome is
+    /// published; `BoundProof::is_current` then requires that outcome to name
+    /// the certificate, preventing a normal progress result from becoming a
+    /// durable pruning proof by accident.
+    fn record_physical_completion_proof(
+        &mut self,
+        task: TaskId,
+        group: GroupId,
+        goal: OptimizationGoal,
+        candidate: CandidateId,
+    ) -> Result<Option<BoundProofId>> {
+        if !self.certified_group_pruning_enabled || self.mandatory_only {
+            return Ok(None);
+        }
+        let reads = self
+            .task_registry
+            .task_read_set(task)
+            .ok_or_else(|| paro_error::internal("physical task lost its completion read set"))?;
+        let domain = self.physical_search_domain(group, goal)?;
+        let winner = self
+            .memo
+            .group(group)
+            .and_then(|group| group.winner(goal))
+            .filter(|winner| winner.candidate == candidate)
+            .ok_or_else(|| paro_error::internal("completion proof lost its selected winner"))?;
+        let threshold = if goal.objective == ObjectiveProfile::Latency {
+            super::bounds::expected_makespan(&winner.cost).to_bits()
+        } else {
+            winner.cost.score.range.expected.to_bits()
+        };
+        let context = BoundContext {
+            group: self.memo.canonical_group(group),
+            goal,
+            reads,
+            search_domain: domain,
+        };
+        // Latency tasks publish the stronger existential certificate.  It is
+        // tied to the same exact selected candidate and domain as the normal
+        // upper bound, so it cannot be consumed as a child result after a
+        // later logical/fact revision. Other objectives retain the existing
+        // verified-upper outcome until their objective-specific lower algebra
+        // is admitted.
+        let proof = if goal.objective == ObjectiveProfile::Latency {
+            self.task_registry
+                .record_no_plan_below(task, context, threshold)?
+        } else {
+            self.task_registry
+                .record_verified_upper(task, context, threshold, candidate)?
+        };
+        self.physical_completion_proofs.insert(
+            (self.memo.canonical_group(group), goal),
+            PhysicalCompletionProof {
+                proof,
+                domain,
+                candidate,
+                threshold,
+            },
+        );
+        Ok(Some(proof))
+    }
+
+    /// Prove a recipe cannot beat the incumbent from complete child
+    /// subproblems. This intentionally covers only the additive, unfiltered
+    /// latency contract. Sideways filters, source response and phase overlap
+    /// remain open and therefore return `false` rather than guessing.
+    fn recipe_is_provably_worse_with_children(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        recipe: &CostRecipe,
+        location: BoundCheckLocation,
+    ) -> Result<Option<bool>> {
+        if self.mandatory_only || !self.certified_group_pruning_enabled {
+            return Ok(None);
+        }
+        self.strong_incumbent_bound_request_count =
+            self.strong_incumbent_bound_request_count.saturating_add(1);
+        let started = Instant::now();
+        if goal.objective != ObjectiveProfile::Latency {
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(None);
+        }
+        if recipe.source_filter_apply_cost.is_some()
+            || recipe.cost_composition.sideways_filter().is_some()
+        {
+            self.strong_incumbent_source_response_bypass_count = self
+                .strong_incumbent_source_response_bypass_count
+                .saturating_add(1);
+            self.certified_bound_diagnostics.source_response_unsupported = self
+                .certified_bound_diagnostics
+                .source_response_unsupported
+                .saturating_add(1);
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(None);
+        }
+        if recipe.cost_composition.overlapping_children() != 0 {
+            self.strong_incumbent_phase_overlap_bypass_count = self
+                .strong_incumbent_phase_overlap_bypass_count
+                .saturating_add(1);
+            self.certified_bound_diagnostics.phase_overlap_unsupported = self
+                .certified_bound_diagnostics
+                .phase_overlap_unsupported
+                .saturating_add(1);
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(None);
+        }
+        let Some(incumbent_cost) = self.incumbent_cost_for_goal(group, goal) else {
+            self.certified_bound_diagnostics.no_incumbent = self
+                .certified_bound_diagnostics
+                .no_incumbent
+                .saturating_add(1);
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(None);
+        };
+        let mut children = Vec::with_capacity(recipe.child_goals.len());
+        for (child, child_goal) in recipe.child_goals.iter().copied() {
+            let Some(floor) = self.proven_child_latency_floor(child, child_goal)? else {
+                // A missing child certificate is an unknown bound, not a
+                // reason to reject the recipe. The caller must continue with
+                // ordinary child-frontier enumeration and may retry this
+                // proof after that child completes.
+                self.certified_bound_diagnostics.child_completion_missing = self
+                    .certified_bound_diagnostics
+                    .child_completion_missing
+                    .saturating_add(1);
+                CertifiedBoundDiagnostics::add_elapsed(
+                    &mut self.certified_bound_diagnostics.compute_us,
+                    started,
+                );
+                return Ok(None);
+            };
+            children.push(floor);
+        }
+        // The requested grant is not the only source of execution capacity.
+        // Source and streaming contracts can expose a larger pipeline, and a
+        // breaker/build-probe can carry that capacity through a phase.  A
+        // floor which divides by the grant alone would be too high and could
+        // incorrectly prune a source-backed plan before it has a winner.
+        let mut max_parallel_tasks = self.max_parallel_tasks_for_goal(goal);
+        for child in &children {
+            max_parallel_tasks = max_parallel_tasks.max(child.max_parallel_tasks);
+        }
+        let child_capacity = |index: u8| {
+            children
+                .get(usize::from(index))
+                .map_or(1, |child| child.max_parallel_tasks.max(1))
+        };
+        match recipe.task_supply {
+            TaskSupplyContract::Serial => {}
+            TaskSupplyContract::Source { tasks } => {
+                max_parallel_tasks = max_parallel_tasks.max(tasks.max(1));
+            }
+            TaskSupplyContract::Streaming { input } => {
+                max_parallel_tasks = max_parallel_tasks.max(child_capacity(input));
+            }
+            TaskSupplyContract::Breaker {
+                input,
+                output_tasks,
+                ..
+            } => {
+                max_parallel_tasks = max_parallel_tasks
+                    .max(child_capacity(input))
+                    .max(output_tasks.max(1));
+            }
+            TaskSupplyContract::BuildProbe { build, probe, .. } => {
+                max_parallel_tasks = max_parallel_tasks
+                    .max(child_capacity(build))
+                    .max(child_capacity(probe));
+            }
+        }
+        let Some(floor) = ProvenRecipeLatencyFloor::from_fixed_recipe(
+            recipe.local_cost,
+            children,
+            max_parallel_tasks,
+            recipe.physical_fingerprint,
+        ) else {
+            self.certified_bound_diagnostics.local_interval_uncertain = self
+                .certified_bound_diagnostics
+                .local_interval_uncertain
+                .saturating_add(1);
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(Some(false));
+        };
+        self.certified_bound_check_count = self.certified_bound_check_count.saturating_add(1);
+        if !floor.proves_no_latency_improvement(&incumbent_cost) {
+            self.certified_bound_diagnostics.available_not_tight = self
+                .certified_bound_diagnostics
+                .available_not_tight
+                .saturating_add(1);
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(Some(false));
+        }
+        self.certified_recipe_prune_count = self.certified_recipe_prune_count.saturating_add(1);
+        match location {
+            BoundCheckLocation::BeforeChildren => {
+                self.certified_bound_diagnostics.pruned_before_children = self
+                    .certified_bound_diagnostics
+                    .pruned_before_children
+                    .saturating_add(1);
+            }
+            BoundCheckLocation::AfterChildren => {
+                self.certified_bound_diagnostics.pruned_after_children = self
+                    .certified_bound_diagnostics
+                    .pruned_after_children
+                    .saturating_add(1);
+            }
+        }
+        CertifiedBoundDiagnostics::add_elapsed(
+            &mut self.certified_bound_diagnostics.compute_us,
+            started,
+        );
+        tracing::debug!(
+            target: "paro::optimizer",
+            memo_group = group.index(),
+            ?goal,
+            witness = floor.witness.0,
+            lower_makespan = floor.makespan(),
+            incumbent_makespan = super::bounds::expected_makespan(&incumbent_cost),
+            "pruned physical recipe by complete child latency bounds"
+        );
+        Ok(Some(true))
+    }
+
+    /// Apply only a recipe-local proof. This deliberately does not infer a
+    /// lower bound from child frontiers, statistical interval endpoints, or
+    /// the set of logical rules not yet applied. Those domains remain open
+    /// until a later bound certificate covers them.
+    fn recipe_is_provably_worse(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        _task: TaskId,
+        recipe: &CostRecipe,
+    ) -> Result<bool> {
+        if self.mandatory_only || !self.certified_group_pruning_enabled {
+            return Ok(false);
+        }
+        self.strong_incumbent_bound_request_count =
+            self.strong_incumbent_bound_request_count.saturating_add(1);
+        let started = Instant::now();
+        if recipe.source_filter_apply_cost.is_some()
+            || recipe.cost_composition.sideways_filter().is_some()
+        {
+            self.strong_incumbent_source_response_bypass_count = self
+                .strong_incumbent_source_response_bypass_count
+                .saturating_add(1);
+            self.certified_bound_diagnostics.source_response_unsupported = self
+                .certified_bound_diagnostics
+                .source_response_unsupported
+                .saturating_add(1);
+        }
+        if recipe.cost_composition.overlapping_children() != 0 {
+            self.strong_incumbent_phase_overlap_bypass_count = self
+                .strong_incumbent_phase_overlap_bypass_count
+                .saturating_add(1);
+            self.certified_bound_diagnostics.phase_overlap_unsupported = self
+                .certified_bound_diagnostics
+                .phase_overlap_unsupported
+                .saturating_add(1);
+        }
+        let Some(floor) = recipe.certified_local_work else {
+            if recipe.source_filter_apply_cost.is_none()
+                && recipe.cost_composition.sideways_filter().is_none()
+                && recipe.cost_composition.overlapping_children() == 0
+            {
+                self.certified_bound_diagnostics.local_interval_uncertain = self
+                    .certified_bound_diagnostics
+                    .local_interval_uncertain
+                    .saturating_add(1);
+            }
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(false);
+        };
+        let Some(incumbent_cost) = self.incumbent_cost_for_goal(group, goal) else {
+            self.certified_bound_diagnostics.no_incumbent = self
+                .certified_bound_diagnostics
+                .no_incumbent
+                .saturating_add(1);
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(false);
+        };
+        self.certified_bound_check_count = self.certified_bound_check_count.saturating_add(1);
+        let max_parallel_tasks =
+            self.max_parallel_tasks_for_goal(goal)
+                .max(match recipe.task_supply {
+                    TaskSupplyContract::Serial => 1,
+                    TaskSupplyContract::Source { tasks } => tasks.max(1),
+                    TaskSupplyContract::Streaming { .. }
+                    | TaskSupplyContract::Breaker { .. }
+                    | TaskSupplyContract::BuildProbe { .. } => 1,
+                });
+        if !floor.proves_no_latency_improvement(goal.objective, &incumbent_cost, max_parallel_tasks)
+        {
+            self.certified_bound_diagnostics.available_not_tight = self
+                .certified_bound_diagnostics
+                .available_not_tight
+                .saturating_add(1);
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(false);
+        }
+        self.certified_recipe_prune_count = self.certified_recipe_prune_count.saturating_add(1);
+        self.certified_bound_diagnostics.pruned_before_children = self
+            .certified_bound_diagnostics
+            .pruned_before_children
+            .saturating_add(1);
+        CertifiedBoundDiagnostics::add_elapsed(
+            &mut self.certified_bound_diagnostics.compute_us,
+            started,
+        );
+        tracing::debug!(
+            target: "paro::optimizer",
+            memo_group = group.index(),
+            ?goal,
+            witness = floor.witness.0,
+            local_work = floor.work_latency,
+            incumbent_makespan = super::bounds::expected_makespan(&incumbent_cost),
+            max_parallel_tasks,
+            "pruned physical recipe by certified local work floor"
+        );
+        Ok(true)
     }
 
     fn intern_child_combination_event(
@@ -3670,6 +6003,7 @@ impl CascadesEngine {
         &mut self,
         group: GroupId,
         goal: OptimizationGoal,
+        task: TaskId,
         recipe_start: u64,
         recipe_cursor: u64,
         enumerate_local_implementations: bool,
@@ -3714,6 +6048,7 @@ impl CascadesEngine {
         let mut child_costs = Vec::<SearchCost>::new();
         let mut child_fingerprints = Vec::<Fingerprint>::new();
         let mut source_work_scratch = Vec::<SourceWork>::new();
+        let mut optimized_children = BTreeSet::<(GroupId, OptimizationGoal)>::new();
 
         for (sequence, physical, recipe_fingerprint, recipe) in recipes {
             let recipe_is_dirty =
@@ -3728,6 +6063,23 @@ impl CascadesEngine {
             if !self.memo.control().checkpoint()? {
                 break;
             }
+            if self.recipe_is_provably_worse(group, goal, task, &recipe)? {
+                continue;
+            }
+            // Once every child has a current completion certificate, the
+            // parent recipe can be rejected before copying any child
+            // frontier or registering another recursive response.  An
+            // unknown child bound deliberately falls through to the normal
+            // path; the post-child check below retries it after optimization.
+            let child_bound = self.recipe_is_provably_worse_with_children(
+                group,
+                goal,
+                &recipe,
+                BoundCheckLocation::BeforeChildren,
+            )?;
+            if child_bound == Some(true) {
+                continue;
+            }
             child_frontiers.resize_with(recipe.child_goals.len(), Vec::new);
             for frontier in child_frontiers.iter_mut() {
                 frontier.clear();
@@ -3740,6 +6092,7 @@ impl CascadesEngine {
                 .copied()
                 .zip(child_frontiers.iter_mut())
             {
+                let child = self.memo.canonical_group(child);
                 self.register_physical_dependency(
                     child,
                     child_goal,
@@ -3748,7 +6101,9 @@ impl CascadesEngine {
                     physical,
                     recipe.physical_fingerprint,
                 );
-                self.optimize_group(child, child_goal)?;
+                if optimized_children.insert((child, child_goal)) {
+                    self.optimize_group(child, child_goal)?;
+                }
                 let Some(frontier) = self
                     .memo
                     .group(child)
@@ -3784,6 +6139,16 @@ impl CascadesEngine {
                 frontier_out.sort_unstable_by_key(|child| child.candidate);
             }
             if !children_feasible {
+                continue;
+            }
+            if child_bound.is_none()
+                && self.recipe_is_provably_worse_with_children(
+                    group,
+                    goal,
+                    &recipe,
+                    BoundCheckLocation::AfterChildren,
+                )? == Some(true)
+            {
                 continue;
             }
             // Enforcement depends only on the physical expression and the
@@ -4441,6 +6806,112 @@ fn build_joint_cost_proof(
     }))
 }
 
+fn validate_frozen_seed_tree(seed: &FrozenCandidate) -> Result<()> {
+    fn visit(
+        node: &FrozenCandidate,
+        active: &mut BTreeSet<CandidateId>,
+        seen: &mut BTreeSet<CandidateId>,
+    ) -> Result<()> {
+        if !active.insert(node.reference.candidate) {
+            return Err(paro_error::internal(
+                "strong incumbent seed contains a candidate cycle",
+            ));
+        }
+        if seen.contains(&node.reference.candidate) {
+            active.remove(&node.reference.candidate);
+            return Ok(());
+        }
+        if node.winner.candidate != node.reference.candidate
+            || node.physical.id != node.winner.expression
+            || node.logical.id != node.physical.key.logical
+            || node.physical.key.children.len() != node.winner.children.len()
+            || node.children.len() != node.winner.children.len()
+            || node
+                .physical
+                .key
+                .children
+                .iter()
+                .zip(node.winner.children.iter())
+                .any(|(group, child)| *group != child.group)
+            || node
+                .children
+                .iter()
+                .zip(node.winner.children.iter())
+                .any(|(child, reference)| child.reference != *reference)
+        {
+            return Err(paro_error::internal(
+                "strong incumbent seed lost an exact physical child or payload identity",
+            ));
+        }
+        node.winner.cost.validate()?;
+        for child in node.children.iter() {
+            visit(child, active, seen)?;
+        }
+        active.remove(&node.reference.candidate);
+        seen.insert(node.reference.candidate);
+        Ok(())
+    }
+
+    visit(seed, &mut BTreeSet::new(), &mut BTreeSet::new())
+}
+
+fn seed_logical_shell_matches(
+    source: &super::memo::LogicalExpr,
+    target: &super::memo::LogicalExpr,
+) -> bool {
+    source.key.operator == target.key.operator
+        && source.operator_tag == target.operator_tag
+        && source.key.children.len() == target.key.children.len()
+        && source.operator_encoding.as_deref() == target.operator_encoding.as_deref()
+        // A core-only expression has no canonical byte encoding.  In that
+        // case scalar IDs are the only exact shell witness and must match;
+        // planner expressions carry operator_encoding and remain independent
+        // of Memo-local scalar numbering.
+        && (source.operator_encoding.is_some() || source.key.scalars == target.key.scalars)
+}
+
+fn frozen_seed_plan_identity(seed: &FrozenCandidate) -> Fingerprint {
+    fn visit(node: &FrozenCandidate, builder: &mut StableFingerprintBuilder) {
+        builder.write_bytes(b"paro.seed-plan-node.v1");
+        builder.write_fingerprint(node.logical.key.operator);
+        builder.write_u64(node.logical.key.children.len() as u64);
+        builder.write_u64(node.logical.key.scalars.len() as u64);
+        if let Some(encoding) = &node.logical.operator_encoding {
+            builder.write_u64(1);
+            builder.write_bytes(encoding);
+        } else {
+            builder.write_u64(0);
+            for scalar in &node.logical.key.scalars {
+                builder.write_u64(scalar.0 as u64);
+            }
+        }
+        match node.logical.operator_tag {
+            Some(tag) => {
+                builder.write_u64(1);
+                builder.write_u64(tag);
+            }
+            None => builder.write_u64(0),
+        }
+        builder.write_u64(node.physical.key.implementation.0 as u64);
+        builder.write_fingerprint(node.physical.key.payload_fingerprint);
+        builder.write_fingerprint(node.winner.physical_fingerprint);
+        builder.write_u64(node.winner.enforcers.len() as u64);
+        for enforcer in &node.winner.enforcers {
+            builder.write_fingerprint(enforcer.stable_fingerprint());
+        }
+        write_cost_composition_fingerprint(builder, &node.winner.cost_composition);
+        builder.write_u64(node.children.len() as u64);
+        for child in &node.children {
+            visit(child, builder);
+        }
+    }
+
+    let mut builder = StableFingerprintBuilder::default();
+    builder.write_bytes(b"paro.seed-plan.v1");
+    visit(seed, &mut builder);
+    builder.finish()
+}
+
 fn stable_region_candidate_key(region: &RegionCandidateContract) -> Box<[Fingerprint]> {
     let mut facets = region.facets.to_vec();
     facets.sort_unstable();
@@ -4680,13 +7151,12 @@ fn child_combination_refs(
         .iter()
         .zip(frontiers)
         .map(|(candidate, frontier)| {
-            frontier
-                .iter()
-                .find(|child| child.candidate == *candidate)
-                .copied()
-                .ok_or_else(|| {
+            let index = frontier
+                .binary_search_by_key(candidate, |child| child.candidate)
+                .map_err(|_| {
                     paro_error::internal("child combination references a stale candidate")
-                })
+                })?;
+            Ok(frontier[index])
         })
         .collect::<Result<Vec<_>>>()
         .map(Vec::into_boxed_slice)
@@ -4694,6 +7164,267 @@ fn child_combination_refs(
 
 fn write_f64_fingerprint(builder: &mut StableFingerprintBuilder, value: f64) {
     builder.write_bytes(&value.to_bits().to_le_bytes());
+}
+
+fn write_optimization_goal_fingerprint(
+    builder: &mut StableFingerprintBuilder,
+    goal: OptimizationGoal,
+) {
+    builder.write_u64(goal.required.0 as u64);
+    builder.write_u64(goal.row_goal.stable_tag());
+    builder.write_u64(goal.objective.stable_tag());
+    builder.write_u64(goal.grant.stable_tag());
+    builder.write_u64(goal.context.0 as u64);
+}
+
+/// Fingerprint a goal without relying on Memo-local property/context IDs.
+/// The exact IDs still select the destination objects during search, while
+/// this digest is the cost-context attestation used across independently
+/// constructed Memos.
+fn write_semantic_goal_fingerprint(
+    builder: &mut StableFingerprintBuilder,
+    memo: &Memo,
+    goal: OptimizationGoal,
+    grant_classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
+) -> Result<()> {
+    builder.write_bytes(b"paro.semantic-goal.v1");
+    builder.write_u64(goal.row_goal.stable_tag());
+    builder.write_u64(goal.objective.stable_tag());
+    match goal.grant {
+        GrantGoalKey::Invariant(set) => {
+            builder.write_u64(0);
+            builder.write_u64(set.0 as u64);
+        }
+        GrantGoalKey::Parallelism { admissible, tasks } => {
+            builder.write_u64(1);
+            builder.write_u64(admissible.0 as u64);
+            builder.write_u64(u64::from(tasks));
+        }
+        GrantGoalKey::Class(class) => {
+            builder.write_u64(2);
+            if let Some(class) = grant_classes.get(&class) {
+                builder.write_u64(class.hard_memory_bytes);
+                builder.write_u64(match class.spill_policy {
+                    SpillPolicy::Forbidden => 0,
+                    SpillPolicy::Allowed => 1,
+                });
+                builder.write_u64(u64::from(class.max_parallel_tasks));
+            } else {
+                // A class not yet primed is not a usable priced context. The
+                // ID is retained only in the error path to make the failure
+                // actionable rather than silently weakening the attestation.
+                return Err(paro_error::internal(format!(
+                    "priced incumbent references an unprimed grant class: {class:?}"
+                )));
+            }
+        }
+    }
+    let required = memo
+        .required(goal.required)
+        .ok_or_else(|| paro_error::internal("priced incumbent has unknown required properties"))?;
+    write_required_properties_fingerprint(builder, required);
+    let context = memo
+        .optimization_context(goal.context)
+        .ok_or_else(|| paro_error::internal("priced incumbent has unknown optimization context"))?;
+    builder.write_bytes(b"paro.optimization-context.v1");
+    builder.write_u64(context.required_region_facets().len() as u64);
+    for facet in context.required_region_facets() {
+        builder.write_fingerprint(*facet);
+    }
+    builder.write_u64(context.filterable_sources().len() as u64);
+    for source in context.filterable_sources() {
+        builder.write_u64(source.0 as u64);
+    }
+    builder.write_u64(match context.phase() {
+        super::memo::OptimizationPhase::Physical => 0,
+        super::memo::OptimizationPhase::Logical => 1,
+        super::memo::OptimizationPhase::Cost => 2,
+        super::memo::OptimizationPhase::Admission => 3,
+        super::memo::OptimizationPhase::Execution => 4,
+    });
+    match context.ownership() {
+        super::memo::SharedOwnership::Private => builder.write_u64(0),
+        super::memo::SharedOwnership::Shared { owner } => {
+            builder.write_u64(1);
+            builder.write_fingerprint(owner);
+        }
+        super::memo::SharedOwnership::Cte { producer } => {
+            builder.write_u64(2);
+            builder.write_fingerprint(producer);
+        }
+    }
+    match context.continuation() {
+        super::memo::ContinuationContract::Complete => builder.write_u64(0),
+        super::memo::ContinuationContract::Prefix { frontier } => {
+            builder.write_u64(1);
+            builder.write_fingerprint(frontier);
+        }
+        super::memo::ContinuationContract::ParentResponse { response } => {
+            builder.write_u64(2);
+            builder.write_fingerprint(response);
+        }
+    }
+    Ok(())
+}
+
+fn write_required_properties_fingerprint(
+    builder: &mut StableFingerprintBuilder,
+    required: &super::properties::RequiredProperties,
+) {
+    builder.write_bytes(b"paro.required-properties.v1");
+    match &required.ordering {
+        OrderingRequirement::Any => builder.write_u64(0),
+        OrderingRequirement::Ordered(ordering) => {
+            builder.write_u64(1);
+            builder.write_u64(match ordering.scope {
+                OrderingScope::PartitionLocal => 0,
+                OrderingScope::Global => 1,
+            });
+            builder.write_u64(ordering.keys.len() as u64);
+            for key in &ordering.keys {
+                builder.write_u64(key.column.0 as u64);
+                builder.write_u64(match key.direction {
+                    super::properties::SortDirection::Asc => 0,
+                    super::properties::SortDirection::Desc => 1,
+                });
+                builder.write_u64(match key.nulls {
+                    super::properties::NullOrder::First => 0,
+                    super::properties::NullOrder::Last => 1,
+                });
+                match key.collation {
+                    Some(collation) => {
+                        builder.write_u64(1);
+                        builder.write_u64(collation.0 as u64);
+                    }
+                    None => builder.write_u64(0),
+                }
+            }
+        }
+    }
+    match &required.partitioning {
+        PartitioningRequirement::Any => builder.write_u64(0),
+        PartitioningRequirement::Singleton => builder.write_u64(1),
+        PartitioningRequirement::Hash { keys, partitions } => {
+            builder.write_u64(2);
+            write_columns_fingerprint(builder, keys);
+            write_optional_u16(builder, *partitions);
+        }
+        PartitioningRequirement::Range { keys, partitions } => {
+            builder.write_u64(3);
+            write_columns_fingerprint(builder, keys);
+            write_optional_u16(builder, *partitions);
+        }
+    }
+    write_materialization_fingerprint(builder, &required.materialization);
+    match &required.mutation_safety {
+        MutationSafetyRequirement::None => builder.write_u64(0),
+        MutationSafetyRequirement::StableReadBeforeWrite { targets, snapshot } => {
+            builder.write_u64(1);
+            builder.write_u64(targets.len() as u64);
+            for target in targets {
+                builder.write_u64(target.0 as u64);
+            }
+            builder.write_u64(snapshot.0 as u64);
+        }
+    }
+    match required.representation {
+        RepresentationRequirement::Any => builder.write_u64(0),
+        RepresentationRequirement::Flat => builder.write_u64(1),
+        RepresentationRequirement::Factorized(spec) => {
+            builder.write_u64(2);
+            builder.write_u64(spec.0 as u64);
+        }
+    }
+    builder.write_u64(match required.replayability {
+        ReplayabilityRequirement::Any => 0,
+        ReplayabilityRequirement::Rewindable => 1,
+    });
+    match required.result_guarantee {
+        ResultGuarantee::Exact => builder.write_u64(0),
+        ResultGuarantee::ApproximateAllowed(policy) => {
+            builder.write_u64(1);
+            builder.write_u64(policy.0 as u64);
+        }
+    }
+}
+
+fn write_columns_fingerprint<'a>(
+    builder: &mut StableFingerprintBuilder,
+    columns: impl IntoIterator<Item = &'a super::ids::ColumnId>,
+) {
+    let columns = columns.into_iter().collect::<Vec<_>>();
+    builder.write_u64(columns.len() as u64);
+    for column in columns {
+        builder.write_u64(column.0 as u64);
+    }
+}
+
+fn write_optional_u16(builder: &mut StableFingerprintBuilder, value: Option<u16>) {
+    match value {
+        Some(value) => {
+            builder.write_u64(1);
+            builder.write_u64(u64::from(value));
+        }
+        None => builder.write_u64(0),
+    }
+}
+
+fn write_materialization_fingerprint(
+    builder: &mut StableFingerprintBuilder,
+    materialization: &MaterializationRequirement,
+) {
+    builder.write_u64(materialization.values.len() as u64);
+    for value in &materialization.values {
+        builder.write_u64(value.0 as u64);
+    }
+    builder.write_u64(materialization.locators.len() as u64);
+    for (relation, requirement) in &materialization.locators {
+        builder.write_u64(relation.0 as u64);
+        match requirement.kind {
+            Some(kind) => {
+                builder.write_u64(1);
+                builder.write_u64(kind.0 as u64);
+            }
+            None => builder.write_u64(0),
+        }
+        builder.write_u64(match requirement.use_kind {
+            super::properties::LocatorUse::ReadStable => 0,
+            super::properties::LocatorUse::WriteTarget => 1,
+        });
+    }
+}
+
+fn budget_exhaustion_counter_name(dimension: BudgetDimension) -> &'static str {
+    match dimension {
+        BudgetDimension::Group => "budget_exhaustion_group",
+        BudgetDimension::CompositionGroup => "budget_exhaustion_composition_group",
+        BudgetDimension::LogicalExprPerGroup => "budget_exhaustion_logical_expr_per_group",
+        BudgetDimension::CompositionLogicalExprPerGroup => {
+            "budget_exhaustion_composition_logical_expr_per_group"
+        }
+        BudgetDimension::PhysicalExprPerGroup => "budget_exhaustion_physical_expr_per_group",
+        BudgetDimension::InterestingGoalPerGroup => "budget_exhaustion_interesting_goal_per_group",
+        BudgetDimension::RuleFirePerGroup => "budget_exhaustion_rule_fire_per_group",
+        BudgetDimension::CompositionRuleFirePerGroup => {
+            "budget_exhaustion_composition_rule_fire_per_group"
+        }
+        BudgetDimension::RuleWorkPerGroup => "budget_exhaustion_rule_work_per_group",
+        BudgetDimension::CompositionRuleWorkPerGroup => {
+            "budget_exhaustion_composition_rule_work_per_group"
+        }
+        BudgetDimension::ChildFrontierCombination => "budget_exhaustion_child_frontier_combination",
+        BudgetDimension::JoinConnectedPair => "budget_exhaustion_join_connected_pair",
+        BudgetDimension::GraphFrontier => "budget_exhaustion_graph_frontier",
+        BudgetDimension::FactorizationVariant => "budget_exhaustion_factorization_variant",
+        BudgetDimension::MultiwayJoinCandidate => "budget_exhaustion_multiway_join_candidate",
+        BudgetDimension::SearchCandidate => "budget_exhaustion_search_candidate",
+        BudgetDimension::SearchFusion => "budget_exhaustion_search_fusion",
+        BudgetDimension::ParameterContext => "budget_exhaustion_parameter_context",
+        BudgetDimension::CompositeRegionCandidate => "budget_exhaustion_composite_region_candidate",
+        BudgetDimension::RecursiveCandidate => "budget_exhaustion_recursive_candidate",
+        BudgetDimension::EnforcerChain => "budget_exhaustion_enforcer_chain",
+        BudgetDimension::WinnerFrontier => "budget_exhaustion_winner_frontier",
+    }
 }
 
 fn write_search_cost_fingerprint(builder: &mut StableFingerprintBuilder, cost: SearchCost) {

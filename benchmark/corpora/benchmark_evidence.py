@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 
 def content_digest(path: Path) -> str:
@@ -295,7 +295,9 @@ def isolated_paro_server(binary: Path, seed: ImmutableDataSeed, listen: str,
                          threads: int,
                          statement_trace: bool = False,
                          trace_sample_id: str | None = None,
-                         cache_evidence: bool = False) -> Iterator["ManagedParoServer"]:
+                         cache_evidence: bool = False,
+                         optimizer_environment: Mapping[str, str | None] | None = None
+                         ) -> Iterator["ManagedParoServer"]:
     """Every oracle and measurement process starts from the same verified input."""
     if log_path.resolve().is_relative_to(seed.path):
         raise ValueError("benchmark logs must not write into the immutable seed")
@@ -305,7 +307,8 @@ def isolated_paro_server(binary: Path, seed: ImmutableDataSeed, listen: str,
                                input_snapshot=snapshot.identity(),
                                statement_trace=statement_trace,
                                trace_sample_id=trace_sample_id,
-                               cache_evidence=cache_evidence) as server:
+                               cache_evidence=cache_evidence,
+                               optimizer_environment=optimizer_environment) as server:
             yield server
 
 
@@ -489,6 +492,7 @@ class ManagedParoServer:
         statement_trace: bool = False,
         trace_sample_id: str | None = None,
         cache_evidence: bool = False,
+        optimizer_environment: Mapping[str, str | None] | None = None,
     ) -> None:
         self.binary = binary.resolve()
         self.data_dir = data_dir.resolve()
@@ -500,6 +504,7 @@ class ManagedParoServer:
         self.statement_trace = statement_trace
         self.trace_sample_id = trace_sample_id
         self.cache_evidence = cache_evidence
+        self.optimizer_environment = dict(optimizer_environment or {})
         self.process: subprocess.Popen[bytes] | None = None
         self._log = None
         self._started_ns: int | None = None
@@ -540,6 +545,11 @@ class ManagedParoServer:
             environment["PARO_STATEMENT_CACHE_EVIDENCE"] = "1"
         else:
             environment.pop("PARO_STATEMENT_CACHE_EVIDENCE", None)
+        for name, value in self.optimizer_environment.items():
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = value
         self._started_ns = time.time_ns()
         self._started_monotonic_ns = time.monotonic_ns()
         self.process = subprocess.Popen(
