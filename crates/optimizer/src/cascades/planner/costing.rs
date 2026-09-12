@@ -68,12 +68,13 @@ pub(super) fn planner_implementation_set(
     planner_implementation_set_for_operator(&plan.operator, capabilities)
 }
 
-/// Native shells can retain all operator-local specialized implementations
-/// whose guards do not inspect an owned child tree. Source-lineage and
-/// inequality gates remain disabled until their boundary fact adapters are
-/// available; they are optional and never alter the structural baseline.
+/// Native shells consume the same RF admission predicates as owned nodes.
+/// Boundary source lineage is complete across the group's legal alternatives;
+/// absent lineage stays unknown. Inequality gates still need their own facts.
 pub(super) fn planner_native_implementation_set<Child>(
     operator: &LogicalOperator<Child>,
+    rowset_scan_pushdown: bool,
+    inputs: &[RuntimeFilterInput<'_>],
 ) -> PlannerImplementationSet {
     let mut capabilities = PlannerImplementationCapabilities::default();
     match operator {
@@ -86,6 +87,14 @@ pub(super) fn planner_native_implementation_set<Child>(
                 )
                 .is_some();
         }
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            if let [left, right] = inputs {
+                capabilities.hash_join_runtime_filter =
+                    supports_runtime_filter_input(join, *left, rowset_scan_pushdown);
+                capabilities.hash_join_build_left_runtime_filter =
+                    supports_build_left_runtime_filter_input(join, *right, rowset_scan_pushdown);
+            }
+        }
         _ => {}
     };
     planner_implementation_set_for_operator(operator, capabilities)
@@ -94,9 +103,8 @@ pub(super) fn planner_native_implementation_set<Child>(
 /// Derive implementation capabilities from an operator shell and immutable
 /// facts. Native transformation staging uses this entry point so it does not
 /// rebuild a shallow `OwnedLogicalPlan` merely to inspect operator-local
-/// capabilities. Runtime-filter source lineage is supplied by the owned
-/// settlement path; a closed native shell leaves those optional capabilities
-/// disabled until its boundary facts provide a native lineage contract.
+/// capabilities. Both inputs use the same RF admission and source-work
+/// routines; only their read-only lineage views differ.
 fn planner_implementation_set_for_operator<Child>(
     operator: &LogicalOperator<Child>,
     capabilities: PlannerImplementationCapabilities,
@@ -226,8 +234,84 @@ fn planner_implementation_set_for_operator<Child>(
     }
 }
 
+/// The same source-work contract can be read from an existing planner tree or
+/// an immutable native boundary. The native view never creates a tree or
+/// chooses a representative expression from a Memo group.
+#[derive(Clone, Copy)]
+pub(super) enum RuntimeFilterInput<'a> {
+    Owned(&'a OwnedLogicalPlan),
+    Boundary {
+        layout: &'a paro_planner::operator::LogicalOutputLayout,
+        facts: &'a paro_planner::operator::bound_reference::BoundRelationFacts,
+    },
+}
+
+impl<'a> RuntimeFilterInput<'a> {
+    fn bindings(self) -> std::borrow::Cow<'a, [ColumnBinding]> {
+        match self {
+            Self::Owned(plan) => plan.get_column_bindings().into(),
+            Self::Boundary { layout, .. } => layout.bindings().into(),
+        }
+    }
+
+    fn lineages(self, output_index: usize) -> Option<RuntimeFilterProbeLineage<'a>> {
+        match self {
+            Self::Owned(plan) => runtime_filter_probe_lineages(plan, output_index),
+            Self::Boundary { layout, facts } => {
+                if layout.types() != facts.types() {
+                    return None;
+                }
+                let columns = facts.source_lineage.get(output_index)?.as_ref()?;
+                Some(RuntimeFilterProbeLineage {
+                    sources: columns
+                        .iter()
+                        .map(|column| RuntimeFilterProbeSource {
+                            plan: None,
+                            output_index: column.column,
+                            boundary: Some(column),
+                        })
+                        .collect(),
+                })
+            }
+        }
+    }
+
+    fn probe_multiplicity(self, expressions: &[&Expression]) -> RuntimeFilterProbeMultiplicity {
+        match self {
+            Self::Owned(plan) => {
+                facts::infer_runtime_filter_probe_multiplicity(plan, expressions.iter().copied())
+            }
+            Self::Boundary { layout, facts } => {
+                if layout.types() == facts.types()
+                    && crate::statistics::unique_keys::expressions_cover_unique_key_from_facts(
+                        layout,
+                        &facts.unique_keys,
+                        expressions,
+                    )
+                {
+                    RuntimeFilterProbeMultiplicity::DeclaredUnique
+                } else {
+                    RuntimeFilterProbeMultiplicity::Unknown
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn supports_runtime_filter_auxiliary(
     join: &paro_planner::operator::ComparisonJoin,
+    rowset_scan_pushdown: bool,
+) -> bool {
+    supports_runtime_filter_input(
+        join,
+        RuntimeFilterInput::Owned(&join.left),
+        rowset_scan_pushdown,
+    )
+}
+
+fn supports_runtime_filter_input<Child>(
+    join: &paro_planner::operator::join::ComparisonJoin<Child>,
+    probe: RuntimeFilterInput<'_>,
     rowset_scan_pushdown: bool,
 ) -> bool {
     if !rowset_scan_pushdown
@@ -239,7 +323,7 @@ pub(super) fn supports_runtime_filter_auxiliary(
         return false;
     }
 
-    let probe_bindings = join.left.get_column_bindings();
+    let probe_bindings = probe.bindings();
     join.conditions.iter().any(|condition| {
         if condition.comparison != JoinComparisonType::Equal {
             return false;
@@ -261,7 +345,8 @@ pub(super) fn supports_runtime_filter_auxiliary(
             _ => None,
         };
         output_index.is_some_and(|index| {
-            runtime_filter_probe_lineages(&join.left, index)
+            probe
+                .lineages(index)
                 .is_some_and(|lineage| !lineage.sources.is_empty())
         })
     })
@@ -269,6 +354,18 @@ pub(super) fn supports_runtime_filter_auxiliary(
 
 pub(super) fn supports_build_left_runtime_filter_auxiliary(
     join: &paro_planner::operator::ComparisonJoin,
+    rowset_scan_pushdown: bool,
+) -> bool {
+    supports_build_left_runtime_filter_input(
+        join,
+        RuntimeFilterInput::Owned(&join.right),
+        rowset_scan_pushdown,
+    )
+}
+
+fn supports_build_left_runtime_filter_input<Child>(
+    join: &paro_planner::operator::join::ComparisonJoin<Child>,
+    probe: RuntimeFilterInput<'_>,
     rowset_scan_pushdown: bool,
 ) -> bool {
     if !rowset_scan_pushdown
@@ -285,7 +382,7 @@ pub(super) fn supports_build_left_runtime_filter_auxiliary(
         return false;
     }
 
-    let probe_bindings = join.right.get_column_bindings();
+    let probe_bindings = probe.bindings();
     join.conditions.iter().any(|condition| {
         if condition.comparison != JoinComparisonType::Equal {
             return false;
@@ -307,7 +404,7 @@ pub(super) fn supports_build_left_runtime_filter_auxiliary(
             _ => None,
         };
         output_index
-            .and_then(|index| runtime_filter_probe_lineages(&join.right, index))
+            .and_then(|index| probe.lineages(index))
             .is_some_and(|lineage| !lineage.sources.is_empty())
     })
 }
@@ -318,7 +415,7 @@ struct RuntimeFilterProbeLineage<'a> {
 
 #[derive(Clone, Copy)]
 struct RuntimeFilterProbeSource<'a> {
-    plan: &'a OwnedLogicalPlan,
+    plan: Option<&'a OwnedLogicalPlan>,
     output_index: usize,
     boundary: Option<&'a paro_planner::operator::bound_reference::BoundSourceColumn>,
 }
@@ -327,7 +424,7 @@ fn runtime_filter_source_id(source: RuntimeFilterProbeSource<'_>) -> Option<Work
     if let Some(boundary) = source.boundary {
         return Some(WorkSourceId(boundary.source));
     }
-    let get = match &source.plan.operator {
+    let get = match &source.plan?.operator {
         LogicalOperator::Get(get) => get,
         LogicalOperator::SearchScan(search) => &search.get,
         LogicalOperator::FullTextFilterScan(search) => &search.get,
@@ -336,11 +433,11 @@ fn runtime_filter_source_id(source: RuntimeFilterProbeSource<'_>) -> Option<Work
     Some(WorkSourceId(get.table_index))
 }
 
-fn runtime_filter_source_facts<'a>(
-    plan: &OwnedLogicalPlan,
+fn runtime_filter_input_source_facts<'a>(
+    input: RuntimeFilterInput<'_>,
     expressions: impl IntoIterator<Item = &'a Expression>,
 ) -> Option<Box<[PlannerRuntimeFilterSource]>> {
-    let bindings = plan.get_column_bindings();
+    let bindings = input.bindings();
     let mut expected_sources = None;
     let mut source_keys = BTreeMap::<
         WorkSourceId,
@@ -359,7 +456,7 @@ fn runtime_filter_source_facts<'a>(
             Expression::Reference(reference) => Some(reference.index),
             _ => None,
         }?;
-        let lineage = runtime_filter_probe_lineages(plan, output_index)?;
+        let lineage = input.lineages(output_index)?;
         let mut current_sources = lineage
             .sources
             .iter()
@@ -386,7 +483,7 @@ fn runtime_filter_source_facts<'a>(
             // merging unrelated statistics under one source-work identity.
             let same_occurrence = match (entry.0.boundary, source.boundary) {
                 (Some(left), Some(right)) => left.occurrence == right.occurrence,
-                (None, None) => std::ptr::eq(entry.0.plan, source.plan),
+                (None, None) => std::ptr::eq(entry.0.plan?, source.plan?),
                 _ => false,
             };
             if !same_occurrence {
@@ -422,7 +519,7 @@ fn runtime_filter_source_facts<'a>(
                     multiplicity,
                 });
             }
-            let plan = first.plan;
+            let plan = first.plan?;
             let types = plan.types();
             let bindings = plan.get_column_bindings();
             let key_expressions = keys
@@ -452,11 +549,12 @@ fn runtime_filter_source_facts<'a>(
         .map(Vec::into_boxed_slice)
 }
 
+#[cfg(test)]
 pub(super) fn runtime_filter_probe_sources(
     join: &paro_planner::operator::ComparisonJoin,
 ) -> Option<Box<[PlannerRuntimeFilterSource]>> {
-    runtime_filter_source_facts(
-        &join.left,
+    runtime_filter_input_source_facts(
+        RuntimeFilterInput::Owned(&join.left),
         join.conditions
             .iter()
             .filter(|condition| condition.comparison == JoinComparisonType::Equal)
@@ -464,13 +562,13 @@ pub(super) fn runtime_filter_probe_sources(
     )
 }
 
+#[cfg(test)]
 pub(super) fn runtime_filter_build_left_probe_sources(
     join: &paro_planner::operator::ComparisonJoin,
 ) -> Option<Box<[PlannerRuntimeFilterSource]>> {
-    runtime_filter_source_facts(
-        &join.right,
-        join.conditions
-            .iter()
+    runtime_filter_input_source_facts(
+        RuntimeFilterInput::Owned(&join.right),
+        join.conditions.iter()
             .filter(|condition| condition.comparison == JoinComparisonType::Equal)
             .map(|condition| &condition.right),
     )
@@ -487,7 +585,7 @@ fn runtime_filter_probe_lineages(
                 sources: columns
                     .iter()
                     .map(|column| RuntimeFilterProbeSource {
-                        plan,
+                        plan: Some(plan),
                         output_index: column.column,
                         boundary: Some(column),
                     })
@@ -499,7 +597,7 @@ fn runtime_filter_probe_lineages(
         {
             Some(RuntimeFilterProbeLineage {
                 sources: vec![RuntimeFilterProbeSource {
-                    plan,
+                    plan: Some(plan),
                     output_index,
                     boundary: None,
                 }],
@@ -518,7 +616,7 @@ fn runtime_filter_probe_lineages(
             search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
                 sources: vec![RuntimeFilterProbeSource {
-                    plan,
+                    plan: Some(plan),
                     output_index,
                     boundary: None,
                 }],
@@ -532,7 +630,7 @@ fn runtime_filter_probe_lineages(
             search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
                 sources: vec![RuntimeFilterProbeSource {
-                    plan,
+                    plan: Some(plan),
                     output_index,
                     boundary: None,
                 }],
@@ -601,11 +699,11 @@ fn runtime_filter_probe_lineages(
     }
 }
 
-fn runtime_filter_source_rows(
-    plan: &OwnedLogicalPlan,
-    expressions: impl IntoIterator<Item = Expression>,
+fn runtime_filter_input_source_rows<'a>(
+    input: RuntimeFilterInput<'_>,
+    expressions: impl IntoIterator<Item = &'a Expression>,
 ) -> Option<paro_planner::plan::CardinalityEstimate> {
-    let probe_bindings = plan.get_column_bindings();
+    let probe_bindings = input.bindings();
     expressions.into_iter().find_map(|expression| {
         let output_index = match expression {
             Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
@@ -614,15 +712,16 @@ fn runtime_filter_source_rows(
             Expression::Reference(reference) => Some(reference.index),
             _ => None,
         }?;
-        let lineage = runtime_filter_probe_lineages(plan, output_index)?;
+        let lineage = input.lineages(output_index)?;
         lineage.sources.into_iter().try_fold(
             paro_planner::plan::CardinalityEstimate::exact(0),
             |sum, source| {
-                let rows = source
-                    .boundary
-                    .map_or(source.plan.stats.estimated_cardinality, |column| {
-                        column.rows
-                    })?;
+                let rows = source.boundary.map_or(
+                    source
+                        .plan
+                        .and_then(|plan| plan.stats.estimated_cardinality),
+                    |column| column.rows,
+                )?;
                 Some(paro_planner::plan::CardinalityEstimate {
                     min: sum.min.saturating_add(rows.min),
                     expected: sum.expected.saturating_add(rows.expected),
@@ -631,30 +730,6 @@ fn runtime_filter_source_rows(
             },
         )
     })
-}
-
-pub(super) fn runtime_filter_probe_source_rows(
-    join: &paro_planner::operator::ComparisonJoin,
-) -> Option<paro_planner::plan::CardinalityEstimate> {
-    runtime_filter_source_rows(
-        &join.left,
-        join.conditions
-            .iter()
-            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-            .map(|condition| condition.left.clone()),
-    )
-}
-
-pub(super) fn runtime_filter_build_left_probe_source_rows(
-    join: &paro_planner::operator::ComparisonJoin,
-) -> Option<paro_planner::plan::CardinalityEstimate> {
-    runtime_filter_source_rows(
-        &join.right,
-        join.conditions
-            .iter()
-            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-            .map(|condition| condition.right.clone()),
-    )
 }
 
 pub(super) fn selected_implementation_flavor(
@@ -787,7 +862,7 @@ pub(super) fn implementation_cost(
     let peak_memory_upper;
     match flavor {
         PhysicalImplementationFlavor::Structural => {
-            return refreshed_structural_cost(metadata, facts, max_concurrent_tasks)
+            return refreshed_structural_cost(metadata, facts, max_concurrent_tasks);
         }
         PhysicalImplementationFlavor::SearchProvider => {
             return Err(paro_error::internal(
@@ -1339,11 +1414,11 @@ fn apply_execution_memory_contract(
     max_concurrent_tasks: u16,
     cost: &mut SearchCost,
 ) -> Result<()> {
+    use crate::physical::MemoryCompletion;
     use crate::physical::resources::{
-        ExecutionMemoryContract, BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES,
+        BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES, ExecutionMemoryContract,
         SPILL_BUFFER_MINIMUM_BYTES,
     };
-    use crate::physical::MemoryCompletion;
 
     let stateful = retained_memory_upper > 0
         || matches!(
@@ -1903,10 +1978,10 @@ pub(super) fn planner_operator_cost(
             return base_table_scan_cost(rows, planner_scan_access_width(get, scan_access_cost));
         }
         LogicalOperator::ExternalProject(project) => {
-            return external_operator_cost(project.cost, plan.stats.estimated_cardinality)
+            return external_operator_cost(project.cost, plan.stats.estimated_cardinality);
         }
         LogicalOperator::ExternalTable(table) => {
-            return external_operator_cost(table.cost, plan.stats.estimated_cardinality)
+            return external_operator_cost(table.cost, plan.stats.estimated_cardinality);
         }
         _ => {}
     }
@@ -2216,8 +2291,8 @@ pub(super) fn external_operator_cost(
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_filtered_probe_work, sort_work, topn_work, CompactRange, RuntimeFilterExactness,
-        RuntimeFilterProbeMultiplicity,
+        CompactRange, RuntimeFilterExactness, RuntimeFilterProbeMultiplicity,
+        runtime_filtered_probe_work, sort_work, topn_work,
     };
 
     #[test]

@@ -182,11 +182,33 @@ fn expressions_cover_key(
     required_provenance: Option<UniqueKeyProvenance>,
 ) -> bool {
     let layout = plan.output_layout();
+    expressions_cover_key_in_layout(
+        &layout,
+        &plan.stats.unique_keys,
+        expressions,
+        required_provenance,
+    )
+}
+
+pub(crate) fn expressions_cover_unique_key_from_facts(
+    layout: &paro_planner::operator::LogicalOutputLayout,
+    keys: &[UniqueKey],
+    expressions: &[&Expression],
+) -> bool {
+    expressions_cover_key_in_layout(layout, keys, expressions, None)
+}
+
+fn expressions_cover_key_in_layout(
+    layout: &paro_planner::operator::LogicalOutputLayout,
+    keys: &[UniqueKey],
+    expressions: &[&Expression],
+    required_provenance: Option<UniqueKeyProvenance>,
+) -> bool {
     !expressions.is_empty()
-        && plan.stats.unique_keys.iter().any(|key| {
+        && keys.iter().any(|key| {
             required_provenance.is_none_or(|required| key.provenance == required)
                 && !key.columns.is_empty()
-                && key_matches_layout(key, &layout)
+                && key_matches_layout(key, layout)
                 && key.columns.iter().all(|column| {
                     expressions.iter().any(|expression| match expression {
                         Expression::Reference(reference) => reference.index == column.output_index,

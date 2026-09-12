@@ -25,6 +25,8 @@ use paro_storage::table::table_factory::TableFactory;
 use super::super::memo::LogicalExpr;
 use super::*;
 
+mod native_runtime_filter;
+
 pub(super) fn test_grant_classes() -> [ResourceGrantClass; 1] {
     [ResourceGrantClass {
         id: super::super::ids::ResourceGrantClassId(0),

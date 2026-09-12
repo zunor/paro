@@ -108,74 +108,6 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         ),
         _ => None,
     };
-    let runtime_filter_probe_multiplicity = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => infer_runtime_filter_probe_multiplicity(
-            &join.left,
-            join.conditions
-                .iter()
-                .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-                .map(|condition| &condition.left),
-        ),
-        _ => RuntimeFilterProbeMultiplicity::Unknown,
-    };
-    let runtime_filter_build_left_probe_multiplicity = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => infer_runtime_filter_probe_multiplicity(
-            &join.right,
-            join.conditions
-                .iter()
-                .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-                .map(|condition| &condition.right),
-        ),
-        _ => RuntimeFilterProbeMultiplicity::Unknown,
-    };
-    let runtime_filter_probe_source_rows = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            super::runtime_filter_probe_source_rows(join)
-        }
-        _ => None,
-    };
-    let runtime_filter_build_left_probe_source_rows = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            super::runtime_filter_build_left_probe_source_rows(join)
-        }
-        _ => None,
-    };
-    let runtime_filter_probe_sources = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            super::runtime_filter_probe_sources(join).unwrap_or_default()
-        }
-        _ => Box::new([]),
-    };
-    let runtime_filter_build_left_probe_sources = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            super::runtime_filter_build_left_probe_sources(join).unwrap_or_default()
-        }
-        _ => Box::new([]),
-    };
-    let runtime_filter_build_distinct_expected = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            join_key_distinct_expected(join, column_stats, JoinKeySide::Right)
-        }
-        _ => None,
-    };
-    let runtime_filter_build_left_distinct_expected = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            join_key_distinct_expected(join, column_stats, JoinKeySide::Left)
-        }
-        _ => None,
-    };
-    let runtime_filter_build_domain_column = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            join_key_domain_column(join, binding_ids, JoinKeySide::Right)
-        }
-        _ => None,
-    };
-    let runtime_filter_build_left_domain_column = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            join_key_domain_column(join, binding_ids, JoinKeySide::Left)
-        }
-        _ => None,
-    };
     let runtime_filter_key_types = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => join
             .conditions
@@ -186,7 +118,7 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
             .into_boxed_slice(),
         _ => Box::new([]),
     };
-    Ok(PlannerCostFacts {
+    let mut result = PlannerCostFacts {
         child_row_widths,
         child_materialization_risk_rows,
         output_row_width,
@@ -196,32 +128,45 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         scan_work_source,
         perfect_hash,
         topn_capacity,
-        runtime_filter_probe_multiplicity,
-        runtime_filter_build_left_probe_multiplicity,
-        runtime_filter_probe_source_rows,
-        runtime_filter_build_left_probe_source_rows,
-        runtime_filter_probe_sources,
-        runtime_filter_build_left_probe_sources,
-        runtime_filter_build_distinct_expected,
-        runtime_filter_build_domain_column,
-        runtime_filter_build_left_distinct_expected,
-        runtime_filter_build_left_domain_column,
+        runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_probe_source_rows: None,
+        runtime_filter_build_left_probe_source_rows: None,
+        runtime_filter_probe_sources: Box::new([]),
+        runtime_filter_build_left_probe_sources: Box::new([]),
+        runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_domain_column: None,
+        runtime_filter_build_left_distinct_expected: None,
+        runtime_filter_build_left_domain_column: None,
         runtime_filter_key_types,
-    })
+    };
+    if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
+        fill_runtime_filter_cost_facts(
+            &mut result,
+            join,
+            RuntimeFilterInput::Owned(&join.left),
+            RuntimeFilterInput::Owned(&join.right),
+            column_stats,
+            binding_ids,
+        );
+    }
+    Ok(result)
 }
 
 /// Build cost facts directly from a closed native operator shell.  The child
 /// tree has already been reduced to immutable `NodeState` facts by staging, so
 /// recreating `BoundReference` plans here would only pay owned-IR allocation
-/// without adding evidence.  Source-lineage fields intentionally remain
-/// unknown: a native shell may use them only after a boundary adapter proves
-/// that its group facts cover the requested source lane.
+/// without adding evidence. RF source work is derived by the same routines as
+/// owned staging, using the boundary's complete source/occurrence coverage.
 pub(in crate::cascades::planner) fn planner_native_cost_facts<Child>(
     operator: &LogicalOperator<Child>,
     child_materialization_risk_rows: &[u64],
     child_row_widths: &[u64],
     output_row_width: u64,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+    inputs: &[RuntimeFilterInput<'_>],
+    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    binding_ids: &BindingCatalog,
 ) -> Result<PlannerCostFacts> {
     let mut operator_child_count = 0;
     operator.visit_child_links(&mut |_| operator_child_count += 1);
@@ -298,7 +243,7 @@ pub(in crate::cascades::planner) fn planner_native_cost_facts<Child>(
             .into_boxed_slice(),
         _ => Box::new([]),
     };
-    Ok(PlannerCostFacts {
+    let mut result = PlannerCostFacts {
         child_row_widths: child_row_widths.iter().copied().collect(),
         child_materialization_risk_rows,
         output_row_width,
@@ -319,7 +264,53 @@ pub(in crate::cascades::planner) fn planner_native_cost_facts<Child>(
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_build_left_domain_column: None,
         runtime_filter_key_types,
-    })
+    };
+    if let (LogicalOperator::Join(Join::Comparison(join)), [left, right]) = (operator, inputs) {
+        fill_runtime_filter_cost_facts(&mut result, join, *left, *right, column_stats, binding_ids);
+    }
+    Ok(result)
+}
+
+fn fill_runtime_filter_cost_facts<Child>(
+    result: &mut PlannerCostFacts,
+    join: &paro_planner::operator::join::ComparisonJoin<Child>,
+    left: RuntimeFilterInput<'_>,
+    right: RuntimeFilterInput<'_>,
+    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    binding_ids: &BindingCatalog,
+) {
+    let left_keys = join
+        .conditions
+        .iter()
+        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+        .map(|condition| &condition.left)
+        .collect::<Vec<_>>();
+    let right_keys = join
+        .conditions
+        .iter()
+        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+        .map(|condition| &condition.right)
+        .collect::<Vec<_>>();
+    result.runtime_filter_probe_multiplicity = left.probe_multiplicity(&left_keys);
+    result.runtime_filter_build_left_probe_multiplicity = right.probe_multiplicity(&right_keys);
+    result.runtime_filter_probe_source_rows =
+        runtime_filter_input_source_rows(left, left_keys.iter().copied());
+    result.runtime_filter_build_left_probe_source_rows =
+        runtime_filter_input_source_rows(right, right_keys.iter().copied());
+    result.runtime_filter_probe_sources =
+        runtime_filter_input_source_facts(left, left_keys.iter().copied()).unwrap_or_default();
+    result.runtime_filter_build_left_probe_sources =
+        runtime_filter_input_source_facts(right, right_keys.iter().copied()).unwrap_or_default();
+    let left_bindings = left.bindings();
+    let right_bindings = right.bindings();
+    result.runtime_filter_build_distinct_expected =
+        join_key_distinct_expected(join, column_stats, JoinKeySide::Right, &right_bindings);
+    result.runtime_filter_build_left_distinct_expected =
+        join_key_distinct_expected(join, column_stats, JoinKeySide::Left, &left_bindings);
+    result.runtime_filter_build_domain_column =
+        join_key_domain_column(join, binding_ids, JoinKeySide::Right, &right_bindings);
+    result.runtime_filter_build_left_domain_column =
+        join_key_domain_column(join, binding_ids, JoinKeySide::Left, &left_bindings);
 }
 
 pub(in crate::cascades::planner) fn planner_row_width_from_layout(
@@ -499,10 +490,11 @@ enum JoinKeySide {
     Right,
 }
 
-fn join_key_distinct_expected(
-    join: &paro_planner::operator::ComparisonJoin,
+fn join_key_distinct_expected<Child>(
+    join: &paro_planner::operator::join::ComparisonJoin<Child>,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     side: JoinKeySide,
+    bindings: &[ColumnBinding],
 ) -> Option<u64> {
     let mut equalities = join
         .conditions
@@ -514,13 +506,13 @@ fn join_key_distinct_expected(
         // build tuples, so a single-column NDV is not its retained domain.
         return None;
     }
-    let (expression, input) = match side {
-        JoinKeySide::Left => (&condition.left, join.left.as_ref()),
-        JoinKeySide::Right => (&condition.right, join.right.as_ref()),
+    let expression = match side {
+        JoinKeySide::Left => &condition.left,
+        JoinKeySide::Right => &condition.right,
     };
     let binding = match expression {
         Expression::ColumnRef(column) if column.depth == 0 => column.binding,
-        Expression::Reference(reference) => *input.get_column_bindings().get(reference.index)?,
+        Expression::Reference(reference) => *bindings.get(reference.index)?,
         _ => return None,
     };
     column_stats
@@ -529,10 +521,11 @@ fn join_key_distinct_expected(
         .filter(|distinct| *distinct > 0)
 }
 
-fn join_key_domain_column(
-    join: &paro_planner::operator::ComparisonJoin,
+fn join_key_domain_column<Child>(
+    join: &paro_planner::operator::join::ComparisonJoin<Child>,
     binding_ids: &BindingCatalog,
     side: JoinKeySide,
+    bindings: &[ColumnBinding],
 ) -> Option<ColumnId> {
     let mut equalities = join
         .conditions
@@ -542,16 +535,16 @@ fn join_key_domain_column(
     if equalities.next().is_some() {
         return None;
     }
-    let (expression, input) = match side {
-        JoinKeySide::Left => (&condition.left, join.left.as_ref()),
-        JoinKeySide::Right => (&condition.right, join.right.as_ref()),
+    let expression = match side {
+        JoinKeySide::Left => &condition.left,
+        JoinKeySide::Right => &condition.right,
     };
     let (binding, logical_type) = match expression {
         Expression::ColumnRef(column) if column.depth == 0 => {
             (column.binding, column.return_type.clone())
         }
         Expression::Reference(reference) => (
-            *input.get_column_bindings().get(reference.index)?,
+            *bindings.get(reference.index)?,
             reference.return_type.clone(),
         ),
         _ => return None,

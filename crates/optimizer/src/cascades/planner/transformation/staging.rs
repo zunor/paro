@@ -1107,8 +1107,28 @@ pub(super) fn stage_transformed_expression(
                 )
             })
             .transpose()?;
+        let native_filter_inputs = if native_direct
+            && matches!(semantic_operator, LogicalOperator::Join(Join::Comparison(_)))
+        {
+            child_states
+                .iter()
+                .map(|child| {
+                    child.boundary_facts.as_deref().map(|facts| RuntimeFilterInput::Boundary {
+                        layout: child.layout.as_ref(),
+                        facts,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let implementations = if native_direct {
-            planner_native_implementation_set(&semantic_operator)
+            planner_native_implementation_set(
+                &semantic_operator,
+                state.rowset_scan_pushdown,
+                &native_filter_inputs,
+            )
         } else {
             planner_implementation_set(
                 cost_plan
@@ -1179,6 +1199,9 @@ pub(super) fn stage_transformed_expression(
                 child_row_widths,
                 *output_row_width,
                 state.scan_access_cost,
+                &native_filter_inputs,
+                column_stats.as_ref(),
+                &state.binding_ids,
             )?
         } else {
             planner_cost_facts(
@@ -1739,6 +1762,8 @@ mod tests {
     use paro_storage::table::table_factory::TableFactory;
 
     use super::*;
+
+    include!("staging/native_runtime_filter_tests.rs");
 
     fn test_base_get(
         table_index: usize,
