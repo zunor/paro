@@ -3,6 +3,7 @@
 
 //! Contextual Memo with expression-local rule history and goal-keyed winners.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use paro_common::error::{self as paro_error, Result};
@@ -24,6 +25,8 @@ use crate::physical::ObjectiveProfile;
 use paro_planner::operator::cte::CteColumnId;
 use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
 use std::sync::{Arc, Mutex, OnceLock};
+
+pub(crate) const UNTYPED_LOGICAL_OPERATOR_TAG: u64 = u64::MAX;
 
 mod profile;
 pub use profile::{PhysicalFrontierProfile, PhysicalGroupProfile, PhysicalSearchProfile};
@@ -392,10 +395,12 @@ impl GroupCardinality {
             fingerprint.write_u64(range.expected_upper);
             fingerprint.write_u64(range.upper);
         }
+        // Input group ordinals are Memo-local and may differ when the same
+        // logical plan is rebuilt in an independent Memo. Their semantic
+        // facts are tracked as explicit PatternRead dependencies by the
+        // callers that resolve inherited cardinality, so only the dependency
+        // arity belongs in this local snapshot witness.
         fingerprint.write_u64(self.inputs.len() as u64);
-        for input in &self.inputs {
-            fingerprint.write_u64(input.0 as u64);
-        }
         fingerprint.finish()
     }
 
@@ -566,6 +571,10 @@ pub struct LogicalExpr {
     /// these bytes establish equivalence inside it. Generic optimizer-core
     /// tests may omit the encoding and then the complete key is authoritative.
     pub operator_encoding: Option<Arc<[u8]>>,
+    /// Planner-provided semantic operator tag. Core-only Memo users may leave
+    /// this absent; the planner uses it only as an exact frontier index key,
+    /// never as an equivalence or completeness decision.
+    pub operator_tag: Option<u64>,
     pub payload: LogicalPayloadId,
     pub proofs: BTreeSet<EquivalenceProof>,
     pub applied_rules: BTreeSet<RuleId>,
@@ -1173,6 +1182,10 @@ pub struct Group {
     /// cursor changes cause revalidation, never a new semantic fingerprint.
     statistics_read_fingerprint: Mutex<Option<(u64, Fingerprint)>>,
     logical_exprs: Vec<LogicalExprId>,
+    /// Exact operator buckets for scoped pattern matching. The bucket is a
+    /// read accelerator only: every expression remains in `logical_exprs`,
+    /// and merges/rollback rebuild both views together.
+    logical_operator_index: BTreeMap<u64, Vec<LogicalExprId>>,
     /// Last Memo-global revision that changed the logical expression set.
     /// Transformation consumers use it to distinguish a completed match from
     /// one whose child frontier has since changed, including through rollback.
@@ -1192,6 +1205,12 @@ pub struct Group {
 impl Group {
     pub fn logical_exprs(&self) -> &[LogicalExprId] {
         &self.logical_exprs
+    }
+
+    pub(crate) fn logical_exprs_of_operator(&self, operator_tag: u64) -> &[LogicalExprId] {
+        self.logical_operator_index
+            .get(&operator_tag)
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn logical_expression_version(&self) -> u64 {
@@ -1266,6 +1285,7 @@ pub struct Memo {
     logical_frontier_revision: u64,
     budget: Arc<SearchBudget>,
     calibration: Arc<MachineCalibrationBundle>,
+    calibration_identity: OnceLock<Fingerprint>,
     regions: Arc<RegionForest>,
     global_ledger: SearchLedger,
     optional_group_budget_sealed: bool,
@@ -1278,6 +1298,10 @@ pub struct Memo {
     cte_type_insertions: Vec<(usize, CteColumnId)>,
     changed_cte_domains: BTreeSet<usize>,
     failed_search_obligations: BTreeSet<super::budget::SearchObligation>,
+    /// Search obligations are absorbing for a query-local Memo. Once the
+    /// first omission witness is observed, completion checks can stay O(1)
+    /// without weakening the detailed ordered report.
+    search_obligations_seen: Cell<bool>,
     /// Existing-group fact mutations made by the active transformation
     /// transaction.  Appended groups are handled by the savepoint lengths;
     /// these snapshots keep a rejected staging attempt from leaking a merged
@@ -1333,6 +1357,7 @@ impl Memo {
             logical_frontier_revision: 0,
             budget,
             calibration: Arc::new(MachineCalibrationBundle::default()),
+            calibration_identity: OnceLock::new(),
             regions: Arc::default(),
             global_ledger,
             optional_group_budget_sealed: false,
@@ -1343,12 +1368,14 @@ impl Memo {
             cte_type_insertions: Vec::new(),
             changed_cte_domains: BTreeSet::new(),
             failed_search_obligations: BTreeSet::new(),
+            search_obligations_seen: Cell::new(false),
             transformation_group_snapshots: None,
         }
     }
 
     pub fn set_calibration(&mut self, calibration: Arc<MachineCalibrationBundle>) {
         self.calibration = calibration;
+        self.calibration_identity = OnceLock::new();
     }
 
     pub fn control(&self) -> &Arc<super::control::SearchControl> {
@@ -1393,6 +1420,14 @@ impl Memo {
 
     pub fn calibration(&self) -> &MachineCalibrationBundle {
         self.calibration.as_ref()
+    }
+
+    /// The calibration revision is a label, not the complete cost dependency.
+    /// The owned bundle is immutable; replacement invalidates this identity.
+    pub(crate) fn calibration_fingerprint(&self) -> Fingerprint {
+        *self
+            .calibration_identity
+            .get_or_init(|| self.calibration.stable_fingerprint())
     }
 
     pub(crate) fn register_cte_producer(
@@ -1512,7 +1547,16 @@ impl Memo {
                 .into_iter()
                 .flatten()
             {
-                fingerprint.write_u64(self.canonical_group(producer.group).0 as u64);
+                // Producer group ordinals are Memo-local.  The producer's
+                // semantic facts/statistics are already explicit cost
+                // dependencies and remain stable when an independent Memo
+                // allocates the same CTE forest in a different order.
+                if let Some(producer_group) = self.group(self.canonical_group(producer.group)) {
+                    fingerprint.write_fingerprint(producer_group.logical_fact_fingerprint());
+                    fingerprint.write_fingerprint(producer_group.statistics_snapshot_fingerprint());
+                } else {
+                    fingerprint.write_bytes(b"missing-cte-producer");
+                }
                 fingerprint.write_u64(producer.columns.len() as u64);
                 for (definition, column) in &producer.columns {
                     fingerprint.write_u64(definition.0 as u64);
@@ -1635,7 +1679,8 @@ impl Memo {
         }))
     }
 
-    pub fn set_regions(&mut self, regions: RegionForest) {
+    pub fn set_regions(&mut self, mut regions: RegionForest) {
+        regions.recanonicalize_groups(|group| self.canonical_group(group));
         self.regions = Arc::new(regions);
     }
 
@@ -1709,6 +1754,30 @@ impl Memo {
                     return Err(paro_error::internal(
                         "transformation rollback found inconsistent group membership",
                     ));
+                }
+                let operator_tag = expression
+                    .operator_tag
+                    .unwrap_or(UNTYPED_LOGICAL_OPERATOR_TAG);
+                let remove_operator_bucket = {
+                    let bucket = group
+                        .logical_operator_index
+                        .get_mut(&operator_tag)
+                        .ok_or_else(|| {
+                            paro_error::internal("transformation rollback lost its operator bucket")
+                        })?;
+                    let position = bucket
+                        .iter()
+                        .position(|candidate| *candidate == id)
+                        .ok_or_else(|| {
+                            paro_error::internal(
+                                "transformation rollback lost its operator identity",
+                            )
+                        })?;
+                    bucket.remove(position);
+                    bucket.is_empty()
+                };
+                if remove_operator_bucket {
+                    group.logical_operator_index.remove(&operator_tag);
                 }
                 let remove_bucket = {
                     let bucket = group
@@ -1824,6 +1893,14 @@ impl Memo {
             .nodes
             .iter()
             .flat_map(|region| region.facets.iter().cloned())
+            .map(|mut facet| {
+                facet.scope = facet
+                    .scope
+                    .iter()
+                    .map(|group| self.canonical_group(*group))
+                    .collect();
+                facet
+            })
             .map(|facet| (facet.fingerprint, facet))
             .collect::<BTreeMap<_, _>>();
         let mut changed = false;
@@ -1902,6 +1979,7 @@ impl Memo {
             statistics_snapshot_fingerprint: OnceLock::new(),
             statistics_read_fingerprint: Mutex::new(None),
             logical_exprs: Vec::new(),
+            logical_operator_index: BTreeMap::new(),
             logical_expression_version: 0,
             physical_frontier_version: 0,
             physical_exprs: Vec::new(),
@@ -2248,6 +2326,79 @@ impl Memo {
         obligations.into_iter().collect()
     }
 
+    /// Allocation-free completion predicate for the recursive search hot
+    /// path. Keep the ordered obligation materialization above as the single
+    /// source of detailed audit evidence, but do not rebuild that evidence
+    /// while each physical child task is being joined.
+    pub(crate) fn search_obligations_empty(&self) -> bool {
+        if self.control.deadline_reached() || self.search_obligations_seen.get() {
+            return false;
+        }
+        let empty = self.failed_search_obligations.is_empty()
+            && self
+                .groups
+                .iter()
+                .all(|group| self.group_search_obligations_empty(group.id));
+        if !empty {
+            self.search_obligations_seen.set(true);
+        }
+        empty
+    }
+
+    /// Check completion for one semantic group without materializing the
+    /// query-wide obligation set. A physical child may have exhausted its
+    /// own logical/physical domain while an unrelated group still has an
+    /// optional rule budget outstanding. Requiring the latter to finish
+    /// before publishing the child's proof prevents safe parent pruning and
+    /// turns every local proof into a query-global barrier.
+    ///
+    /// Global ledger events remain conservative: they can affect any group,
+    /// so no group-local certificate is emitted while one is present. The
+    /// query-wide `search_obligations_empty` predicate remains the only
+    /// criterion for declaring the root search complete.
+    pub(crate) fn group_search_obligations_empty(&self, group: GroupId) -> bool {
+        if self.control.deadline_reached() || self.global_ledger.has_exhaustion_events() {
+            return false;
+        }
+        let group = self.canonical_group(group);
+        if self.failed_search_obligations.iter().any(|obligation| {
+            obligation
+                .group
+                .is_some_and(|owner| self.canonical_group(owner) == group)
+        }) {
+            return false;
+        }
+        self.group(group)
+            .is_some_and(|group| !group.ledger.has_exhaustion_events())
+    }
+
+    /// Check the local physical search contract without importing unrelated
+    /// query-global group reservations.  A physical task has already
+    /// enumerated its current recipes when its own group ledger is clean; a
+    /// global group/composition reservation exhausted in another branch does
+    /// not make that exact, already-published physical domain incomplete.
+    ///
+    /// This is intentionally weaker than [`Self::group_search_obligations_empty`]
+    /// and must only be used for a versioned local physical certificate.  Any
+    /// later logical, fact, statistics, or child-frontier publication changes
+    /// the task ReadSet and invalidates the certificate.  The root's global
+    /// completion predicate continues to use the stronger method above.
+    pub(crate) fn group_physical_obligations_empty(&self, group: GroupId) -> bool {
+        if self.control.deadline_reached() {
+            return false;
+        }
+        let group = self.canonical_group(group);
+        if self.failed_search_obligations.iter().any(|obligation| {
+            obligation
+                .group
+                .is_some_and(|owner| self.canonical_group(owner) == group)
+        }) {
+            return false;
+        }
+        self.group(group)
+            .is_some_and(|group| !group.ledger.has_exhaustion_events())
+    }
+
     pub(crate) fn record_failed_rule(
         &mut self,
         group: GroupId,
@@ -2398,7 +2549,7 @@ impl Memo {
         payload: LogicalPayloadId,
         proof: EquivalenceProof,
     ) -> Result<LogicalExprId> {
-        self.insert_logical_structural(target, key, payload, proof, None)
+        self.insert_logical_structural(target, key, payload, proof, None, None)
     }
 
     pub(crate) fn insert_logical_with_operator_encoding(
@@ -2414,7 +2565,27 @@ impl Memo {
             key,
             payload,
             proof,
+            Some(Arc::from(operator_encoding.clone())),
+            operator_tag_from_recorded_encoding(&operator_encoding),
+        )
+    }
+
+    pub(crate) fn insert_logical_with_operator_encoding_and_tag(
+        &mut self,
+        target: GroupId,
+        key: LogicalExprKey,
+        payload: LogicalPayloadId,
+        proof: EquivalenceProof,
+        operator_encoding: Box<[u8]>,
+        operator_tag: u64,
+    ) -> Result<LogicalExprId> {
+        self.insert_logical_structural(
+            target,
+            key,
+            payload,
+            proof,
             Some(Arc::from(operator_encoding)),
+            Some(operator_tag),
         )
     }
 
@@ -2425,6 +2596,7 @@ impl Memo {
         payload: LogicalPayloadId,
         proof: EquivalenceProof,
         operator_encoding: Option<Arc<[u8]>>,
+        operator_tag: Option<u64>,
     ) -> Result<LogicalExprId> {
         let target = self.canonical_group(target);
         for child in key.children.iter_mut() {
@@ -2468,6 +2640,7 @@ impl Memo {
             id,
             key: key.clone(),
             operator_encoding,
+            operator_tag,
             payload,
             proofs: [proof].into_iter().collect(),
             applied_rules: BTreeSet::new(),
@@ -2480,6 +2653,11 @@ impl Memo {
         let group = &mut self.groups[target.index()];
         group.logical_index.entry(key).or_default().push(id);
         group.logical_exprs.push(id);
+        group
+            .logical_operator_index
+            .entry(operator_tag.unwrap_or(UNTYPED_LOGICAL_OPERATOR_TAG))
+            .or_default()
+            .push(id);
         group.logical_expression_version = self.logical_frontier_revision;
         Ok(id)
     }
@@ -2883,6 +3061,15 @@ impl Memo {
         canonical_group
             .logical_exprs
             .append(&mut secondary_group.logical_exprs);
+        for (operator_tag, expressions) in
+            std::mem::take(&mut secondary_group.logical_operator_index)
+        {
+            canonical_group
+                .logical_operator_index
+                .entry(operator_tag)
+                .or_default()
+                .extend(expressions);
+        }
         canonical_group.logical_expression_version = self.logical_frontier_revision;
         canonical_group
             .physical_exprs
@@ -2908,6 +3095,9 @@ impl Memo {
             }
             id = parent;
         };
+        let mut regions = (*self.regions).clone();
+        regions.recanonicalize_groups(&canonical);
+        self.regions = Arc::new(regions);
         for expression in &mut self.logical_exprs {
             for child in expression.key.children.iter_mut() {
                 *child = canonical(*child);
@@ -2934,6 +3124,7 @@ impl Memo {
         }
         for group in &mut self.groups {
             group.logical_index.clear();
+            group.logical_operator_index.clear();
             group.physical_index.clear();
             group.winner_frontiers.clear();
             group.logical_exprs.sort_unstable();
@@ -2959,6 +3150,15 @@ impl Memo {
                     .entry(self.logical_exprs[expression.index()].key.clone())
                     .or_default()
                     .push(expression);
+                group
+                    .logical_operator_index
+                    .entry(
+                        self.logical_exprs[expression.index()]
+                            .operator_tag
+                            .unwrap_or(UNTYPED_LOGICAL_OPERATOR_TAG),
+                    )
+                    .or_default()
+                    .push(expression);
             }
             group.physical_exprs.sort_unstable();
             group.physical_exprs.dedup_by(|left, right| {
@@ -2972,6 +3172,29 @@ impl Memo {
             }
         }
     }
+}
+
+/// Planner operator identities use the recording form of
+/// `StableFingerprintBuilder`: the first field after the domain prefix is the
+/// tagged operator kind. Keep parsing an optional accelerator here so the
+/// generic Memo API remains source-compatible with core-only callers. A
+/// malformed or foreign encoding simply goes into the untyped bucket and is
+/// still visited by the complete matcher.
+fn operator_tag_from_recorded_encoding(encoding: &[u8]) -> Option<u64> {
+    const PREFIX: &[u8] = b"paro.stable-fingerprint.v3.blake3";
+    let offset = PREFIX.len();
+    (encoding.len() >= offset.saturating_add(1 + std::mem::size_of::<u64>())
+        && &encoding[..offset] == PREFIX
+        && encoding[offset] == 2)
+        .then(|| {
+            let start = offset + 1;
+            let end = start + std::mem::size_of::<u64>();
+            u64::from_le_bytes(
+                encoding[start..end]
+                    .try_into()
+                    .expect("checked operator tag"),
+            )
+        })
 }
 
 fn two_groups_mut(groups: &mut [Group], left: usize, right: usize) -> (&mut Group, &mut Group) {

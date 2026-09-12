@@ -8,6 +8,7 @@
 //! plans into these types, while all equivalence, property, cost, budget and
 //! winner decisions live here.
 
+pub mod bounds;
 pub mod budget;
 pub mod calibration;
 mod catalog_identity;
@@ -45,7 +46,8 @@ pub use column::{
 };
 pub use cost::{CompactRange, SearchCost};
 pub use engine::{
-    CascadesEngine, GrantOptimization, GrantWinner, SearchMode, SearchStop, SearchStopReason,
+    CascadesEngine, CostContext, GrantOptimization, GrantWinner, PricedIncumbent, SearchMode,
+    SearchStop, SearchStopReason, SeedPlan,
 };
 pub use governor::{
     CalibrationScope, EconomicDecision, EconomicSignal, Governor, GovernorSnapshot, GovernorStop,

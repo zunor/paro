@@ -638,6 +638,14 @@ impl SearchLedger {
     pub fn exhaustion_events(&self) -> impl Iterator<Item = &(BudgetDimension, Fingerprint)> {
         self.exhaustion_events.iter()
     }
+
+    /// Fast completion check used by recursive search. Callers that need
+    /// audit details must still consume [`Self::exhaustion_events`]; the
+    /// optimizer hot path only needs to know whether any omission witness
+    /// exists.
+    pub(crate) fn has_exhaustion_events(&self) -> bool {
+        !self.exhaustion_events.is_empty()
+    }
 }
 
 #[cfg(test)]

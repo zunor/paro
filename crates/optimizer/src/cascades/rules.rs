@@ -16,7 +16,8 @@ use super::ids::{
     RuleId, StableFingerprintBuilder,
 };
 use super::memo::{
-    EquivalenceProof, LogicalExpr, LogicalExprKey, Memo, OptimizationGoal, PhysicalExprKey,
+    EquivalenceProof, FrozenCandidate, LogicalExpr, LogicalExprKey, Memo, OptimizationGoal,
+    PhysicalExprKey,
 };
 use super::properties::ProvidedProperties;
 use super::region::RegionCandidateContract;
@@ -113,6 +114,37 @@ pub fn validate_transformation_rule_names(names: &str) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RulePromise {
     pub priority: u16,
+}
+
+/// Semantic dependency lane used by the quality-first scheduler.
+///
+/// This is deliberately separate from `RulePromise::priority`: a promise is
+/// a local rule preference, while this lane describes which producer/consumer
+/// contract must be published before a later quality obligation can be
+/// usefully composed.  The engine only gives these lanes precedence for an
+/// explicitly enabled quality handoff; ordinary searches retain the existing
+/// promise order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QualityDependency {
+    ConsumerDemand,
+    DomainRestriction,
+    ProducerDomain,
+    NarrowAggregate,
+    DimensionMerge,
+    JoinSelection,
+}
+
+impl QualityDependency {
+    pub const fn stage(self) -> u8 {
+        match self {
+            Self::ConsumerDemand => 0,
+            Self::DomainRestriction => 1,
+            Self::ProducerDomain => 2,
+            Self::NarrowAggregate => 3,
+            Self::DimensionMerge => 4,
+            Self::JoinSelection => 5,
+        }
+    }
 }
 
 /// Resource class for optional logical search. A composition rule combines
@@ -347,6 +379,18 @@ pub struct PatternBindingSet {
     pub completion: PatternEnumerationCompletion,
 }
 
+/// Allocation-free root dispatch plus the exact reads which justify a
+/// negative result.  Most rules only need the immutable shell predicate and
+/// therefore return an empty read set.  Planner rules with an existential
+/// path witness may return a completed, dependency-aware negative lookup so
+/// the engine can avoid re-running the full matcher while still waking the
+/// task when a child frontier changes.
+#[derive(Debug, Clone, Default)]
+pub struct RootDispatch {
+    pub matches: bool,
+    pub reads: Box<[PatternRead]>,
+}
+
 type TransformationRollback = Box<dyn FnOnce() -> Result<()> + 'static>;
 
 pub struct TransformContext<'a> {
@@ -534,6 +578,13 @@ impl<'a> TransformContext<'a> {
 pub trait TransformationRule: Send + Sync {
     fn id(&self) -> RuleId;
 
+    /// Declare a semantic producer dependency for the optional quality-first
+    /// lane.  Rules without a declaration remain on the ordinary lane and are
+    /// never treated as evidence that a quality chain is complete.
+    fn quality_dependency(&self) -> Option<QualityDependency> {
+        None
+    }
+
     /// Evidence consumed when applying one exact binding. Discovery reads may
     /// include unrelated alternatives; rules that consume only their bound
     /// operands can narrow this to the operands' facts. The default retains
@@ -560,11 +611,45 @@ pub trait TransformationRule: Send + Sync {
         Ok(None)
     }
 
+    /// Return exact bindings for a quality obligation already observed in one
+    /// frozen candidate.  This is an ordering hint only: the ordinary rule
+    /// matcher still owns the complete legal search space.  The default keeps
+    /// rules which have no native selected-path contract off this lane.
+    fn selected_quality_bindings(
+        &self,
+        _memo: &Memo,
+        _candidate: &FrozenCandidate,
+    ) -> Result<Box<[PatternBinding]>> {
+        Ok(Box::new([]))
+    }
+
     /// Allocation-free dispatch predicate over the immutable expression
     /// shell. Implementations must not inspect child groups here: a false
     /// result means descendant changes can never make this rule applicable,
     /// so the scheduler deliberately records no dependency subscriptions.
     fn matches_root(&self, expr: &LogicalExpr) -> bool;
+
+    /// Allocation-free root capability filter used by the scheduler before
+    /// it constructs a full dispatch/read witness. `true` is the conservative
+    /// default: custom rules which cannot describe their root domain remain
+    /// on the complete path. A planner rule may return `false` only for an
+    /// immutable operator tag that can never satisfy the rule; descendant
+    /// frontiers are not inspected by this accelerator.
+    fn root_operator_tag_may_match(&self, _operator_tag: Option<u64>) -> bool {
+        true
+    }
+
+    /// Dispatch one task using the immutable root shell and, when available,
+    /// a completed dependency-aware negative witness lookup.  The default is
+    /// deliberately equivalent to `matches_root`; custom rules do not need
+    /// to adopt the planner's path-index contract just to participate in the
+    /// engine.
+    fn root_dispatch(&self, expr: &LogicalExpr, _ctx: &RuleContext<'_>) -> Result<RootDispatch> {
+        Ok(RootDispatch {
+            matches: self.matches_root(expr),
+            reads: Box::new([]),
+        })
+    }
 
     /// Maximum number of alternatives one firing may publish. Local rewrite
     /// rules keep the default of one. A bounded whole-region owner may expose
@@ -918,9 +1003,14 @@ impl PhysicalCandidate {
         builder.write_u64(goal.grant.stable_tag());
         builder.write_u64(goal.context.0 as u64);
         if let Some(region) = &self.region {
-            builder.write_u64(region.region.0 as u64);
-            for facet in &region.facets {
-                builder.write_fingerprint(*facet);
+            // RegionId is a normalized-forest position, not a stable
+            // candidate identity. Keep budget events invariant under region
+            // reindexing and use the stable facet declaration instead.
+            let mut facets = region.facets.to_vec();
+            facets.sort_unstable();
+            facets.dedup();
+            for facet in facets {
+                builder.write_fingerprint(facet);
             }
             for artifact in &region.artifacts {
                 builder.write_fingerprint(artifact.fingerprint);

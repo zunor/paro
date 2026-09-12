@@ -326,6 +326,20 @@ impl RegionForest {
             })
             .map(|node| node.id)
     }
+
+    /// Replace group identities after Memo equivalence merges without
+    /// renumbering region nodes. Region and facet scopes are part of the
+    /// ownership contract consumed by winner verification; retaining a
+    /// secondary pre-merge id would make a valid physical owner look like it
+    /// escaped its region.
+    pub(crate) fn recanonicalize_groups(&mut self, mut canonical: impl FnMut(GroupId) -> GroupId) {
+        for node in &mut self.nodes {
+            node.scope = node.scope.iter().map(|group| canonical(*group)).collect();
+            for facet in &mut node.facets {
+                facet.scope = facet.scope.iter().map(|group| canonical(*group)).collect();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

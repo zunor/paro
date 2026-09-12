@@ -149,6 +149,9 @@ pub struct NativeQualityEvidence {
     pub applicability_proof: Fingerprint,
     pub choices: Box<[Fingerprint]>,
     pub aggregate_regions: Box<[AggregateRegionWitness]>,
+    /// Exact selected filter choices with a still-transferable cheap domain.
+    /// Scheduling hints only; they never discharge a quality obligation.
+    pub pending_domain_transfers: Box<[CandidateId]>,
     /// Rule witnesses are extracted from the selected logical expressions'
     /// equivalence proofs.  They are audit/attribution data only; an applied
     /// rule set is never accepted as a substitute for this selected-DAG
@@ -821,6 +824,7 @@ mod tests {
         let mut registry = QualityBundleRegistry::default();
         registry.register_builtin_f1_f4().unwrap();
         let evidence = |candidate, choice| NativeQualityEvidence {
+            pending_domain_transfers: Box::new([]),
             capabilities: [
                 BundleCapability::ScanPredicate,
                 BundleCapability::SmallJoin,

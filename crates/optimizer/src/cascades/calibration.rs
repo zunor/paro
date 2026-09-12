@@ -9,6 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 
 use super::cost::{CompactRange, ResourceDimension, ScoreSummary, SearchCost, RESOURCE_DIMS};
 use super::ids::{CalibrationRevisionId, OpClassId};
+use super::ids::{Fingerprint, StableFingerprintBuilder};
 
 #[path = "calibration/generated.rs"]
 mod generated;
@@ -185,6 +186,34 @@ impl MachineCalibrationBundle {
         Ok(())
     }
 
+    /// Stable identity of every value consumed by costing.  The revision is
+    /// an attestation label, not a substitute for the payload: callers may
+    /// construct a bundle with an unchanged revision while replacing a
+    /// coefficient or a parallelism parameter.  Priced incumbents must be
+    /// invalidated in that case as well.
+    pub fn stable_fingerprint(&self) -> Fingerprint {
+        let mut builder = StableFingerprintBuilder::default();
+        builder.write_bytes(b"paro.machine-calibration.v1");
+        builder.write_u64(self.revision.0 as u64);
+        builder.write_bytes(self.hardware_class.as_bytes());
+        builder.write_bytes(self.corpus_id.as_bytes());
+        builder.write_bytes(self.provenance.as_bytes());
+        builder.write_u64(self.coefficients.len() as u64);
+        for (class, cost) in &self.coefficients {
+            builder.write_u64(class.0 as u64);
+            write_calibration_cost_fingerprint(&mut builder, *cost);
+        }
+        write_calibration_cost_fingerprint(&mut builder, self.conservative_fallback);
+        write_calibration_f64(&mut builder, self.risk_weight);
+        write_calibration_f64(&mut builder, self.expected_worker_efficiency);
+        write_calibration_f64(&mut builder, self.risk_worker_efficiency);
+        write_calibration_f64(&mut builder, self.coordination_latency_expected);
+        write_calibration_f64(&mut builder, self.coordination_latency_upper);
+        write_calibration_f64(&mut builder, self.pipeline_serial_fraction);
+        write_calibration_f64(&mut builder, self.blocking_merge_serial_fraction);
+        builder.finish()
+    }
+
     pub fn fold(&self, work: &LocalOperatorWork) -> Result<SearchCost> {
         let mut resources_expected = [0.0; RESOURCE_DIMS];
         let mut resources_risk_upper = [0.0; RESOURCE_DIMS];
@@ -343,6 +372,25 @@ fn validate_calibrated_cost(cost: CalibratedOpCost) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn write_calibration_cost_fingerprint(
+    builder: &mut StableFingerprintBuilder,
+    cost: CalibratedOpCost,
+) {
+    for value in cost.expected_resources_per_unit {
+        write_calibration_f64(builder, value);
+    }
+    for value in cost.risk_resources_per_unit {
+        write_calibration_f64(builder, value);
+    }
+    write_calibration_f64(builder, cost.latency_per_unit.lower);
+    write_calibration_f64(builder, cost.latency_per_unit.expected);
+    write_calibration_f64(builder, cost.latency_per_unit.upper);
+}
+
+fn write_calibration_f64(builder: &mut StableFingerprintBuilder, value: f64) {
+    builder.write_u64(value.to_bits());
 }
 
 impl Default for MachineCalibrationBundle {

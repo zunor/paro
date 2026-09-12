@@ -1720,6 +1720,46 @@ fn equivalent_region_facets_merge_their_best_scheduling_priority() {
 }
 
 #[test]
+fn merged_region_scopes_follow_the_canonical_group() {
+    use super::super::region::{
+        FacetCriticality, RegionFacet, RegionFacetKind, RegionForest, RegionScopeContract,
+    };
+
+    let mut memo = Memo::new(SearchBudget::default());
+    let left = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let right = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let facet = RegionFacet {
+        fingerprint: Fingerprint(93),
+        kind: RegionFacetKind::Parameterization,
+        criticality: FacetCriticality::Required,
+        priority: 1_003,
+        scope_contract: RegionScopeContract::Exact,
+        scope: std::iter::once(right).collect(),
+    };
+    memo.set_regions(
+        RegionForest::normalize(
+            [facet],
+            usize::from(memo.budget().max_composite_region_groups),
+            memo.budget().max_mandatory_region_groups as usize,
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(memo.merge_groups(left, right).unwrap(), left);
+    let region = memo.regions().nodes.first().unwrap();
+    assert_eq!(region.scope, std::iter::once(left).collect());
+    assert_eq!(region.facets[0].scope, std::iter::once(left).collect());
+}
+
+#[test]
 fn repeated_region_facet_upsert_is_allocation_free() {
     use super::super::region::{FacetCriticality, RegionFacet, RegionFacetKind};
 
@@ -1835,6 +1875,32 @@ fn optional_group_budgets_are_query_global_isolated_and_observable() {
             .get(&BudgetDimension::CompositionGroup),
         Some(&1)
     );
+}
+
+#[test]
+fn local_physical_completion_ignores_unrelated_global_group_exhaustion() {
+    let mut budget = SearchBudget::default();
+    budget.max_optional_groups_per_initial_group = 0;
+    let mut memo = Memo::new(budget);
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.seal_optional_group_budget();
+    assert!(memo
+        .create_optional_group(
+            BudgetDimension::Group,
+            Fingerprint(91),
+            schema(1),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        )
+        .unwrap()
+        .is_none());
+
+    assert!(!memo.group_search_obligations_empty(group));
+    assert!(memo.group_physical_obligations_empty(group));
 }
 
 #[test]
