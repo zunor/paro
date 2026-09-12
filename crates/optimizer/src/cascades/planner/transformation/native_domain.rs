@@ -520,6 +520,38 @@ fn push_domain(
                     .is_identity(native_child_layout(&filter.child, layouts)?.len()) =>
         {
             let original_predicates = predicates.clone();
+            if matches!(filter.child, NativeChild::MemoGroup { .. }) {
+                let layout = native_child_layout(&filter.child, layouts)?;
+                let transfer = domain_transfer::transfer_predicates(
+                    &LogicalOperator::Filter(filter.clone()),
+                    &[&layout],
+                    &predicates,
+                );
+                if transfer.as_ref().is_some_and(|transfer| {
+                    !transfer.unsupported && transfer.remaining.is_empty()
+                }) {
+                    // This is the legal input landing point, not another
+                    // propagation hop. Keep its exact input and namespace;
+                    // combine the new restriction with the existing filter
+                    // before publishing any intermediate stacked filters.
+                    let mut combined = filter.expressions.clone();
+                    combined.extend(predicates);
+                    let Some(combined) = FilterPushdown::normalize_predicates(combined) else {
+                        return Ok(RoutedDomain {
+                            child,
+                            remaining: original_predicates,
+                            moved: false,
+                        });
+                    };
+                    filter.expressions = combined;
+                    nodes[index].operator = LogicalOperator::Filter(filter);
+                    return Ok(RoutedDomain {
+                        child,
+                        remaining: Vec::new(),
+                        moved: true,
+                    });
+                }
+            }
             // The filter already belongs to the selected path.  Route only
             // the new domain request through it; treating its existing
             // predicates as new input would silently relocate or remove a

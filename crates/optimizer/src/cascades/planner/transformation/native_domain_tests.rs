@@ -951,3 +951,210 @@ fn production_selected_binding_derives_mixed_aggregate_domain_through_constant_p
         "aggregate result predicate must remain above aggregation"
     );
 }
+
+#[test]
+fn production_selected_two_domains_publish_one_filter_at_original_hole() {
+    use crate::expression::traversal::associative_terms;
+    use paro_planner::expression::ConjunctionType;
+
+    let value = |value: Option<i32>| {
+        Expression::Constant(
+            ConstantExpression::new(
+                value.map_or(Value::Null(LogicalType::Integer), Value::Integer),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
+    };
+    let source_rows = [
+        (Some(2), Some(2)),
+        (Some(2), Some(2)),
+        (Some(2), Some(3)),
+        (Some(3), Some(2)),
+        (None, Some(2)),
+        (Some(2), None),
+        (None, None),
+    ];
+    let rows = source_rows
+        .into_iter()
+        .map(|(x, y)| vec![value(x), value(y)])
+        .collect();
+    let input = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            rows,
+            vec!["x".into(), "y".into()],
+            vec![LogicalType::Integer; 2],
+        ),
+    ));
+    let aggregate =
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
+            10,
+            11,
+            12,
+            input,
+            vec![column(0, 0), column(0, 1)],
+            vec![],
+            vec![],
+            vec![],
+        ))));
+    let projection = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        20,
+        aggregate,
+        vec![column(10, 0), column(10, 1)],
+    )));
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        projection,
+        vec![equal(20, 0), equal(20, 1)],
+    )));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let original_hole = root.children[0].children[0].children[0].reference.group;
+    let original_aggregate = root.children[0].children[0].reference.group;
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::PredicateTransfer,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .selected_quality_bindings(engine.memo(), &root)
+        .unwrap();
+    assert_eq!(bindings.len(), 1);
+    let mut operand = &bindings[0].root;
+    for selected in [&root, &root.children[0], &root.children[0].children[0]] {
+        let PatternOperand::Expression {
+            expression,
+            children,
+            ..
+        } = operand
+        else {
+            panic!("selected production binding must retain Filter -> Projection -> Aggregate");
+        };
+        assert_eq!(*expression, selected.logical.id);
+        assert_eq!(children.len(), 1);
+        operand = &children[0];
+    }
+    assert_eq!(*operand, PatternOperand::Group(original_hole));
+
+    let arena_before = state.read().unwrap().staging_arena.len();
+    let mut context = TransformContext::new(engine.memo_mut(), bindings[0].root_group());
+    let mut outputs = rule
+        .apply_binding(&bindings[0], &mut context)
+        .unwrap()
+        .into_vec();
+    assert_eq!(
+        outputs.len(),
+        1,
+        "both domains must land in the same publication"
+    );
+    let output = outputs.pop().unwrap();
+    let published = context
+        .memo_mut()
+        .insert_logical_with_operator_encoding(
+            output.target_group,
+            output.key,
+            output.payload,
+            output.proof,
+            output.operator_encoding.unwrap(),
+        )
+        .unwrap();
+    context.commit().unwrap();
+
+    // Follow the returned root's exact edges, not unrelated new payloads or
+    // an independently selected physical winner which could hide an extra hop.
+    let memo = engine.memo();
+    let state = state.read().unwrap();
+    assert_eq!(
+        state.staging_arena.len(),
+        arena_before,
+        "the selected long closure must not fall back to owned settlement"
+    );
+    let projection = memo.logical_expr(published).unwrap();
+    assert!(matches!(
+        state.payloads.logical[projection.payload.index()]
+            .semantic_template
+            .operator,
+        LogicalOperator::Projection(_)
+    ));
+    assert_eq!(
+        state.metadata[&projection.payload].output_columns,
+        state.metadata[&root.logical.payload].output_columns
+    );
+    let aggregate_group = projection.key.children[0];
+    assert_ne!(aggregate_group, original_aggregate);
+    let [aggregate_id] = memo.group(aggregate_group).unwrap().logical_exprs() else {
+        panic!("new aggregate group must identify the published closure unambiguously");
+    };
+    let aggregate = memo.logical_expr(*aggregate_id).unwrap();
+    assert!(matches!(
+        state.payloads.logical[aggregate.payload.index()]
+            .semantic_template
+            .operator,
+        LogicalOperator::Aggregate(_)
+    ));
+    let [filter_id] = memo
+        .group(aggregate.key.children[0])
+        .unwrap()
+        .logical_exprs()
+    else {
+        panic!("aggregate must reference one newly published input filter");
+    };
+    let filter = memo.logical_expr(*filter_id).unwrap();
+    let LogicalOperator::Filter(predicate_filter) = &state.payloads.logical[filter.payload.index()]
+        .semantic_template
+        .operator
+    else {
+        panic!("aggregate input must be a Filter");
+    };
+    assert_eq!(
+        filter.key.children.as_ref(),
+        &[original_hole],
+        "one publication must land both domains directly on the original hole, without Filter -> Filter"
+    );
+    let terms = predicate_filter
+        .expressions
+        .iter()
+        .flat_map(|expression| associative_terms(expression, ConjunctionType::And))
+        .collect::<Vec<_>>();
+    assert_eq!(terms.len(), 2);
+    for ordinal in [0, 1] {
+        assert!(
+            terms.iter().any(|term| term.equals(&equal(0, ordinal))),
+            "published input Filter lost the domain on column {ordinal}"
+        );
+    }
+    // Independently evaluate the actual published predicates on the source
+    // bag. Grouping before output filtering and filtering before grouping
+    // must agree, including duplicate and NULL input keys.
+    let scalar = |expression: &Expression, row: (Option<i32>, Option<i32>)| match expression {
+        Expression::ColumnRef(column) => {
+            assert_eq!(column.binding.table_index, 0);
+            [row.0, row.1][column.binding.column_index]
+        }
+        Expression::Constant(constant) => match constant.value {
+            Value::Integer(value) => Some(value),
+            Value::Null(_) => None,
+            _ => panic!("unexpected fixture literal"),
+        },
+        _ => panic!("unexpected fixture scalar"),
+    };
+    let actual = source_rows
+        .into_iter()
+        .filter(|row| {
+            terms.iter().all(|term| {
+                let Expression::Comparison(comparison) = term else {
+                    panic!("unexpected published predicate");
+                };
+                assert_eq!(comparison.comparison_type, ComparisonType::Equal);
+                scalar(&comparison.left, *row)
+                    .zip(scalar(&comparison.right, *row))
+                    .is_some_and(|(left, right)| left == right)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = source_rows
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|row| *row == (Some(2), Some(2)))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected);
+}
