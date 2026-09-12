@@ -4,6 +4,8 @@
 //! Construction of optimizer Query IR and Memo groups from bound plans.
 
 mod boundary;
+mod domain_transfer;
+mod quality_domain;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
@@ -103,6 +105,9 @@ use crate::physical::{
 
 mod contracts;
 mod costing;
+#[cfg(test)]
+#[path = "domain_oracle_tests.rs"]
+mod domain_oracle_tests;
 mod extraction;
 mod identity;
 mod implementation;
@@ -797,7 +802,12 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         if frozen.winner.provided.satisfies(required) {
             facts.insert(BundleFact::OutputDemand);
         }
-        if has_filter
+        let Some(pending_domain_transfers) = quality_domain::pending_transfers(frozen, &state)
+        else {
+            return Ok(None);
+        };
+        if pending_domain_transfers.is_empty()
+            && has_filter
             && has_get
             && has_any(&[
                 PREDICATE_TRANSFER_RULE,
@@ -894,6 +904,7 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             proof.write_u64(u64::from(witness.covered));
         }
         Ok(Some(NativeQualityEvidence {
+            pending_domain_transfers,
             capabilities,
             facts,
             region,

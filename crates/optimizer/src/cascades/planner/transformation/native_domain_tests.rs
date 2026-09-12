@@ -1,0 +1,826 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+use paro_common::types::LogicalType;
+use paro_planner::expression::{
+    AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType,
+    ConstantExpression, FunctionExpression,
+};
+use paro_planner::operator::bound_reference::{
+    BoundRelationFactValues, BoundRelationFacts, BoundSourceColumn,
+};
+
+fn column(table: usize, ordinal: usize) -> Expression {
+    Expression::ColumnRef(
+        ColumnRefExpression::new(ColumnBinding::new(table, ordinal), LogicalType::Integer).into(),
+    )
+}
+fn equal(table: usize, ordinal: usize) -> Expression {
+    Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::Equal,
+            column(table, ordinal),
+            Expression::Constant(
+                ConstantExpression::new(Value::Integer(2), LogicalType::Integer).into(),
+            ),
+        )
+        .into(),
+    )
+}
+fn boundary(id: u32, table: usize, ordinals: &[usize]) -> OwnedLogicalPlan {
+    let types = vec![LogicalType::Integer; ordinals.len()];
+    let facts = Arc::new(BoundRelationFacts::new(
+        BoundRelationFactValues {
+            cardinality: Some(CardinalityEstimate::exact(10)),
+            contains_control_region: false,
+            source_lineage: ordinals
+                .iter()
+                .map(|ordinal| {
+                    Some(vec![BoundSourceColumn {
+                        source: table,
+                        occurrence: id as usize,
+                        column: *ordinal,
+                        rows: Some(CardinalityEstimate::exact(10)),
+                        distinct: Some(4),
+                        unique: false,
+                    }])
+                })
+                .collect(),
+            ..BoundRelationFactValues::default()
+        },
+        types.clone(),
+    ));
+    let reference = BoundReference::new(
+        BoundReferenceId::group_hole(id),
+        ordinals
+            .iter()
+            .map(|ordinal| ColumnBinding::new(table, *ordinal))
+            .collect(),
+        types,
+    )
+    .with_facts(facts)
+    .unwrap();
+    OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference))
+}
+fn native(plan: OwnedLogicalPlan) -> NativeShell {
+    let mut shell = NativeShell::from_owned(plan, &HashMap::new()).unwrap();
+    for node in &mut shell.nodes {
+        node.operator.visit_child_links_mut(&mut |child| {
+            if let NativeChild::Group { id, stats, layout, names, reference } = child.clone() {
+                *child = NativeChild::MemoGroup {
+                    group: GroupId::new(reference.reference_id.group_hole_value().unwrap() as usize),
+                    id, stats, layout, names, reference,
+                };
+            }
+        });
+    }
+    shell
+}
+fn state() -> Arc<RwLock<PlannerTransformState>> {
+    MemoBuilder::build(
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+        BindContext::new(),
+        SearchBudget::default(),
+    )
+    .unwrap()
+    .planner_state
+}
+
+fn frozen_selected(
+    plan: OwnedLogicalPlan,
+) -> (
+    CascadesEngine,
+    Arc<RwLock<PlannerTransformState>>,
+    Arc<FrozenCandidate>,
+) {
+    let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+    let state = input.planner_state.clone();
+    let grants = super::super::super::tests::test_grant_classes();
+    let classes = Arc::new(grants.into_iter().map(|grant| (grant.id, grant)).collect());
+    let mut registry = ImplementationRegistry::default();
+    implementation::register_implementations(
+        &mut registry,
+        state.clone(),
+        classes,
+        input.calibration,
+        false,
+    )
+    .unwrap();
+    let mut engine = CascadesEngine::new(input.memo, registry);
+    let optimized = engine
+        .optimize_for_grants(
+            input.root,
+            input.root_goal,
+            AdmissibleGrantSetId(0),
+            grants,
+            input.mode,
+        )
+        .unwrap();
+    let winner = optimized.winners.first().unwrap();
+    let root = engine
+        .memo()
+        .freeze_candidate_tree(ChildWinnerRef {
+            group: input.root,
+            goal: winner.goal,
+            candidate: winner.winner.candidate,
+        })
+        .unwrap();
+    state.write().unwrap().session =
+        Some(paro_context::TestStatementContextBuilder::minimal().build());
+    (engine, state, root)
+}
+fn rebound_columns(shell: &NativeShell) -> Vec<Vec<ColumnBinding>> {
+    shell
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let LogicalOperator::Filter(filter) = &node.operator else {
+                return None;
+            };
+            let mut columns = Vec::new();
+            for predicate in &filter.expressions {
+                visit_expression(predicate, &mut |part| {
+                    if let Expression::ColumnRef(column) = part {
+                        columns.push(column.binding);
+                    }
+                });
+            }
+            Some(columns)
+        })
+        .collect()
+}
+
+#[test]
+fn domain_union_routes_each_ordinal_and_preserves_duplicate_null_bags() {
+    let state = state();
+    let state = state.read().unwrap();
+    for base in [0, 100] {
+        let union = SetOperation::union(
+            base + 30,
+            boundary(1, base + 10, &[7, 2]),
+            boundary(2, base + 20, &[9, 4]),
+            true,
+            vec![LogicalType::Integer; 2],
+        );
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(union)),
+            vec![equal(base + 30, 1)],
+        )));
+        let shell = native(plan);
+        let output = shell.root_layout().unwrap();
+        let result = transfer_shell(shell, &state).unwrap().unwrap();
+        assert_eq!(result.root_layout().unwrap(), output);
+        assert!(matches!(
+            result.root_operator(),
+            LogicalOperator::SetOperation(_)
+        ));
+        assert_eq!(
+            rebound_columns(&result),
+            vec![
+                vec![ColumnBinding::new(base + 10, 2)],
+                vec![ColumnBinding::new(base + 20, 4)]
+            ]
+        );
+        // Independent bag-selection oracle, not a cost-composition replay.
+        // The generated predicates above identify slot 1 in each exact input.
+        let left = vec![
+            (Some(1), Some(2)),
+            (Some(1), Some(2)),
+            (None, Some(2)),
+            (Some(-3), None),
+        ];
+        let right = vec![(Some(1), Some(2)), (None, None), (Some(-3), Some(-4))];
+        let original = left
+            .iter()
+            .chain(&right)
+            .filter(|row| row.1 == Some(2))
+            .copied()
+            .collect::<Vec<_>>();
+        let transformed = [left, right]
+            .into_iter()
+            .flat_map(|rows| rows.into_iter().filter(|row| row.1 == Some(2)))
+            .collect::<Vec<_>>();
+        assert_eq!(original, transformed);
+        assert_eq!(transformed.len(), 4);
+    }
+}
+
+#[test]
+fn domain_group_transfer_keeps_aggregate_output_residual_and_original_layout() {
+    let state = state();
+    let state = state.read().unwrap();
+    let mut subtract = paro_function::scalar::ScalarFunctionSet::new("-".into());
+    paro_function::scalar::operators::arithmetic::register_arithmetic_functions(&mut subtract);
+    let (subtract, _) = subtract
+        .bind(&[LogicalType::Integer, LogicalType::Integer])
+        .unwrap();
+    let difference = Expression::Function(
+        FunctionExpression::new(
+            subtract,
+            vec![column(0, 2), column(0, 9)],
+            LogicalType::Integer,
+        )
+        .into(),
+    );
+    let (sum, _) = paro_function::aggregate::distributive::sum::get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .unwrap();
+    let sum = Expression::Aggregate(
+        AggregateExpression::new(sum, vec![difference], LogicalType::BigInt).into(),
+    );
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        boundary(1, 0, &[7, 2, 9]),
+        vec![column(0, 7)],
+        vec![],
+        vec![sum.clone()],
+        vec![],
+    );
+    let positive = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(11, 0), LogicalType::BigInt).into(),
+            ),
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(0), LogicalType::BigInt).into(),
+            ),
+        )
+        .into(),
+    );
+    let mut filter = Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate))),
+        vec![equal(10, 0), positive],
+    );
+    filter.projection_map = paro_planner::operator::ProjectionMap::new(vec![1]);
+    let shell = native(OwnedLogicalPlan::synthetic(LogicalOperator::Filter(filter)));
+    let result = transfer_shell(shell, &state).unwrap().unwrap();
+    let LogicalOperator::Filter(root) = result.root_operator() else {
+        panic!("residual must remain above grouping");
+    };
+    assert_eq!(root.projection_map.to_indices(2), vec![1]);
+    assert_eq!(
+        rebound_columns(&result),
+        vec![
+            vec![ColumnBinding::new(0, 7)],
+            vec![ColumnBinding::new(11, 0)]
+        ]
+    );
+    let NativeChild::Node(aggregate) = root.child else {
+        panic!("aggregate child");
+    };
+    let LogicalOperator::Aggregate(aggregate) = &result.nodes[aggregate].operator else {
+        panic!("aggregate preserved");
+    };
+    assert!(aggregate.aggregates[0].equals(&sum));
+    // Independent grouped SUM(x-y), with duplicate/NULL keys and amounts and
+    // a negative contribution that must not be filtered before accumulation.
+    let rows = [
+        (Some(2), Some(5), Some(1)),
+        (Some(2), Some(-5), Some(2)),
+        (Some(2), None, Some(1)),
+        (None, Some(99), Some(0)),
+        (Some(1), Some(3), Some(1)),
+    ];
+    let group = |rows: Vec<(Option<i32>, Option<i32>, Option<i32>)>| {
+        let mut sums = BTreeMap::<Option<i32>, Option<i32>>::new();
+        for (key, x, y) in rows {
+            let value = sums.entry(key).or_default();
+            if let Some(amount) = x.zip(y).map(|(x, y)| x - y) {
+                *value = Some(value.unwrap_or(0) + amount);
+            }
+        }
+        sums.into_iter()
+            .filter(|(key, sum)| *key == Some(2) && sum.is_some_and(|sum| sum > 0))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        group(rows.to_vec()),
+        group(rows.into_iter().filter(|row| row.0 == Some(2)).collect())
+    );
+    assert!(
+        group(rows.to_vec()).is_empty(),
+        "pushing SUM > 0 to amounts would invent a result"
+    );
+}
+
+#[test]
+fn domain_projection_rebinds_transparent_columns_and_declines_missing_lineage() {
+    let state = state();
+    let state = state.read().unwrap();
+    let fixture = || {
+        OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+                10,
+                boundary(1, 0, &[7, 2]),
+                vec![column(0, 2), column(0, 7)],
+            ))),
+            vec![equal(10, 0)],
+        )))
+    };
+    let result = transfer_shell(native(fixture()), &state).unwrap().unwrap();
+    assert_eq!(
+        rebound_columns(&result),
+        vec![vec![ColumnBinding::new(0, 2)]]
+    );
+    let mut shell = native(fixture());
+    for node in &mut shell.nodes {
+        node.operator.visit_child_links_mut(&mut |child| {
+            if let NativeChild::MemoGroup { reference, .. } = child {
+                let mut values = reference.facts.values().clone();
+                values.source_lineage.clear();
+                reference.facts =
+                    Arc::new(BoundRelationFacts::new(values, reference.types().to_vec()));
+            }
+        });
+    }
+    assert!(transfer_shell(shell, &state).unwrap().is_none());
+
+    let foreign_namespace = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            10,
+            boundary(1, 0, &[7, 2]),
+            vec![column(0, 2), column(0, 7)],
+        ))),
+        vec![equal(99, 0)],
+    )));
+    assert!(
+        transfer_shell(native(foreign_namespace), &state)
+            .unwrap()
+            .is_none(),
+        "a predicate from a foreign output namespace must not be rebound by ordinal"
+    );
+}
+
+#[test]
+fn domain_closure_reaches_an_exact_aggregate_behind_projection() {
+    let state = state();
+    let state = state.read().unwrap();
+    let count = Expression::Aggregate(
+        AggregateExpression::new(
+            paro_function::aggregate::distributive::count::get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        boundary(1, 0, &[7, 2]),
+        vec![column(0, 7)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let projection = Projection::new(
+        20,
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate))),
+        vec![column(10, 0)],
+    );
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(projection)),
+        vec![equal(20, 0)],
+    )));
+    let result = transfer_shell_closure(native(plan), &state)
+        .unwrap()
+        .unwrap();
+    let filters = result
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.operator {
+            LogicalOperator::Filter(filter) => Some(filter),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        filters.len(),
+        1,
+        "one local filter should be inserted at the leaf"
+    );
+    assert_eq!(
+        rebound_columns(&result),
+        vec![vec![ColumnBinding::new(0, 7)]]
+    );
+    assert!(result
+        .nodes
+        .iter()
+        .any(|node| { matches!(node.operator, LogicalOperator::Aggregate(_)) }));
+}
+
+#[test]
+fn production_selected_binding_drives_native_closure_through_projection_and_aggregate() {
+    let count = Expression::Aggregate(
+        AggregateExpression::new(
+            paro_function::aggregate::distributive::count::get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+            paro_planner::operator::ExpressionGet::new(
+                0,
+                vec![],
+                vec!["key0".into(), "key1".into()],
+                vec![LogicalType::Integer; 2],
+            ),
+        )),
+        vec![column(0, 1)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            20,
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate))),
+            vec![column(10, 0)],
+        ))),
+        vec![equal(20, 0)],
+    )));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::PredicateTransfer,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .selected_quality_bindings(engine.memo(), &root)
+        .unwrap();
+    assert_eq!(bindings.len(), 1);
+    let PatternOperand::Expression {
+        children: filter_children,
+        ..
+    } = &bindings[0].root
+    else {
+        panic!("production binding root is not a filter");
+    };
+    let PatternOperand::Expression {
+        children: projection_children,
+        ..
+    } = &filter_children[0]
+    else {
+        panic!("production binding omitted the projection");
+    };
+    assert!(matches!(
+        &projection_children[0],
+        PatternOperand::Expression { .. }
+    ));
+
+    let mut context = TransformContext::new(engine.memo_mut(), bindings[0].root_group());
+    let outputs = rule.apply_binding(&bindings[0], &mut context).unwrap();
+    assert_eq!(outputs.len(), 1, "selected binding did not reach staging");
+    let state = state.read().unwrap();
+    assert_eq!(
+        state.metadata[&outputs[0].payload].output_columns,
+        state.metadata[&root.logical.payload].output_columns,
+        "native closure changed the selected output contract"
+    );
+}
+
+#[test]
+fn production_selected_binding_rebinds_each_union_all_branch_before_staging() {
+    let left = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            vec![],
+            vec!["left_key".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let right = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            30,
+            vec![],
+            vec!["right_key".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let union = SetOperation::union(40, left, right, true, vec![LogicalType::Integer]);
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(union)),
+        vec![equal(40, 0)],
+    )));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::PredicateTransfer,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .selected_quality_bindings(engine.memo(), &root)
+        .unwrap();
+    assert_eq!(bindings.len(), 1);
+    let PatternOperand::Expression {
+        children: filter_children,
+        ..
+    } = &bindings[0].root
+    else {
+        panic!("production binding root is not a filter");
+    };
+    let PatternOperand::Expression {
+        children: union_children,
+        ..
+    } = &filter_children[0]
+    else {
+        panic!("production binding omitted the UNION ALL");
+    };
+    assert_eq!(union_children.len(), 2);
+
+    let mut context = TransformContext::new(engine.memo_mut(), bindings[0].root_group());
+    let outputs = rule.apply_binding(&bindings[0], &mut context).unwrap();
+    assert_eq!(outputs.len(), 1, "UNION ALL binding did not reach staging");
+    let state = state.read().unwrap();
+    assert_eq!(
+        state.metadata[&outputs[0].payload].output_columns,
+        state.metadata[&root.logical.payload].output_columns,
+        "branch rebinding changed the UNION output contract"
+    );
+}
+
+#[test]
+fn production_selected_binding_reaches_aggregate_input_on_a_join_side() {
+    let count = Expression::Aggregate(
+        AggregateExpression::new(
+            paro_function::aggregate::distributive::count::get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+            paro_planner::operator::ExpressionGet::new(
+                0,
+                vec![],
+                vec!["key".into()],
+                vec![LogicalType::Integer],
+            ),
+        )),
+        vec![column(0, 0)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let join = Join::cross(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate))),
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+            paro_planner::operator::ExpressionGet::new(
+                30,
+                vec![],
+                vec!["dimension_key".into()],
+                vec![LogicalType::Integer],
+            ),
+        )),
+    );
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Join(join)),
+        vec![equal(10, 0)],
+    )));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::PredicateTransfer,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .selected_quality_bindings(engine.memo(), &root)
+        .unwrap();
+    assert_eq!(bindings.len(), 1);
+    let PatternOperand::Expression {
+        children: filter_children,
+        ..
+    } = &bindings[0].root
+    else {
+        panic!("production binding root is not a filter");
+    };
+    let PatternOperand::Expression {
+        children: join_children,
+        ..
+    } = &filter_children[0]
+    else {
+        panic!("production binding omitted the join");
+    };
+    assert_eq!(join_children.len(), 2);
+
+    let mut context = TransformContext::new(engine.memo_mut(), bindings[0].root_group());
+    let outputs = rule.apply_binding(&bindings[0], &mut context).unwrap();
+    assert_eq!(outputs.len(), 1, "join-side binding did not reach staging");
+    let state = state.read().unwrap();
+    assert_eq!(
+        state.metadata[&outputs[0].payload].output_columns,
+        state.metadata[&root.logical.payload].output_columns,
+        "join-side aggregate rebinding changed the output contract"
+    );
+}
+
+#[test]
+fn domain_union_declines_distinct_and_incomplete_layouts() {
+    let state = state();
+    let state = state.read().unwrap();
+    for (all, width, predicate) in [
+        (false, 2, equal(30, 1)),
+        (true, 1, equal(30, 1)),
+        (true, 2, equal(30, 3)),
+        (true, 2, equal(99, 0)),
+    ] {
+        let union = SetOperation::union(
+            30,
+            boundary(1, 10, &[7, 2][..width]),
+            boundary(2, 20, &[9, 4]),
+            all,
+            vec![LogicalType::Integer; 2],
+        );
+        let shell = native(OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
+            Filter::new(
+                OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(union)),
+                vec![predicate],
+            ),
+        )));
+        assert!(transfer_shell(shell, &state).unwrap().is_none());
+    }
+}
+
+#[test]
+fn domain_real_rule_preserves_narrow_root_and_does_not_import_into_settlement() {
+    let key = |value| {
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+        )
+    };
+    let input = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            vec![vec![key(1)], vec![key(2)], vec![key(3)]],
+            vec!["key".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(
+            paro_function::aggregate::distributive::count::get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        input,
+        vec![column(0, 0)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let residual = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(11, 0), LogicalType::BigInt).into(),
+            ),
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(0), LogicalType::BigInt).into(),
+            ),
+        )
+        .into(),
+    );
+    let mut filter = Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate))),
+        vec![equal(10, 0), residual],
+    );
+    filter.projection_map = paro_planner::operator::ProjectionMap::new(vec![1]);
+    let mut input = MemoBuilder::build(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Filter(filter)),
+        BindContext::new(),
+        SearchBudget::default(),
+    )
+    .unwrap();
+    let state = input.planner_state.clone();
+    state.write().unwrap().session =
+        Some(paro_context::TestStatementContextBuilder::minimal().build());
+    let root = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let child_group = input.memo.logical_expr(root).unwrap().key.children[0];
+    let child = input.memo.group(child_group).unwrap().logical_exprs()[0];
+    let grandchildren = input
+        .memo
+        .logical_expr(child)
+        .unwrap()
+        .key
+        .children
+        .iter()
+        .copied()
+        .map(PatternOperand::Group)
+        .collect();
+    let binding = PatternBinding {
+        root: PatternOperand::Expression {
+            group: input.root,
+            expression: root,
+            children: Box::new([PatternOperand::Expression {
+                group: child_group,
+                expression: child,
+                children: grandchildren,
+            }]),
+        },
+        fingerprint: Fingerprint(301),
+    };
+    let source_columns = state.read().unwrap().metadata
+        [&input.memo.logical_expr(root).unwrap().payload]
+        .output_columns
+        .clone();
+    let arena_before = state.read().unwrap().staging_arena.len();
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::PredicateTransfer,
+        planner_state: state.clone(),
+    };
+    let mut context = TransformContext::new(&mut input.memo, input.root);
+    let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+    assert_eq!(
+        outputs.len(),
+        1,
+        "native must not suppress a valid semantic alternative"
+    );
+    let state = state.read().unwrap();
+    assert_eq!(
+        state.staging_arena.len(),
+        arena_before,
+        "native binding must not instantiate/settle an owned operand tree"
+    );
+    assert_eq!(
+        state.metadata[&outputs[0].payload].output_columns,
+        source_columns
+    );
+    let LogicalOperator::Filter(residual) = &state.payloads.logical[outputs[0].payload.index()]
+        .semantic_template
+        .operator
+    else {
+        panic!("aggregate output predicate must remain in the returned expression");
+    };
+    assert!(residual.expressions.iter().all(|expression| {
+        let mut group_key = false;
+        visit_expression(expression, &mut |part| {
+            if let Expression::ColumnRef(column) = part {
+                group_key |= column.binding.table_index == 10;
+            }
+        });
+        !group_key
+    }));
+}
+
+#[test]
+fn domain_refresh_prunes_child_filter_to_parent_aggregate_demand() {
+    let state = state();
+    state.write().unwrap().session =
+        Some(paro_context::TestStatementContextBuilder::minimal().build());
+    let state = state.read().unwrap();
+    let memo = MemoBuilder::build(
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+        BindContext::new(),
+        SearchBudget::default(),
+    )
+    .unwrap()
+    .memo;
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        boundary(1, 0, &[7, 2]),
+        vec![column(0, 7)],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let shell = native(OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
+        Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate))),
+            vec![equal(10, 0)],
+        ),
+    )));
+    let shell = transfer_shell(shell, &state).unwrap().unwrap();
+    let (shell, _) = refresh_statistics(shell, &state, &memo).unwrap().unwrap();
+    let LogicalOperator::Aggregate(aggregate) = shell.root_operator() else {
+        panic!("group-only aggregate must remain the root");
+    };
+    let NativeChild::Node(filter) = aggregate.child else {
+        panic!("transferred predicate must have a local child filter");
+    };
+    assert!(matches!(
+        shell.nodes[filter].operator,
+        LogicalOperator::Filter(_)
+    ));
+    assert_eq!(
+        shell.layouts().unwrap()[filter].bindings(),
+        &[ColumnBinding::new(0, 7)],
+        "child filter output must drop 0:2, which its parent aggregate does not read"
+    );
+}
