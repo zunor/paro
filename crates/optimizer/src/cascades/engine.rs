@@ -992,10 +992,6 @@ enum BoundCheckLocation {
 /// recursive goal optimization, and winner verification.
 #[derive(Debug)]
 pub struct CascadesEngine {
-    /// Diagnostic feasibility probe; production admission is not changed.
-    /// Inactive classes retain their exact mandatory frozen DAG.
-    optional_grant_probe: Option<ResourceGrantClass>,
-    lazy_grant_probe_enabled: bool,
     engine_created_at: Instant,
     mandatory_only: bool,
     preserve_incomplete_physical: bool,
@@ -1247,9 +1243,6 @@ impl CascadesEngine {
             .register_builtin_f1_f4()
             .expect("built-in quality bundles must have unique identities");
         Self {
-            optional_grant_probe: None,
-            lazy_grant_probe_enabled: std::env::var_os("PARO_DIAGNOSTIC_LAZY_GRANT")
-                .is_some_and(|value| value == "1"),
             engine_created_at: Instant::now(),
             mandatory_only: false,
             preserve_incomplete_physical: false,
@@ -3596,22 +3589,6 @@ impl CascadesEngine {
                     }
                 }
             }
-            let probe = self.lazy_grant_probe_enabled;
-            let expected = probe.then(|| classes.values().copied().max_by_key(|class|
-                (class.max_parallel_tasks, class.hard_memory_bytes, class.id)).unwrap());
-            let safe = incumbent.as_ref().ok().cloned();
-            if expected.is_some() && safe.as_ref().is_none_or(|safe| safe.winners.len() != classes.len()) {
-                return Err(paro_error::internal("lazy grant probe requires a complete per-class safe portfolio"));
-            }
-            let active_classes = classes.iter().filter(|(id, _)| expected.is_none_or(|class| class.id == **id))
-                .map(|(id, class)| (*id, *class)).collect::<BTreeMap<_, _>>();
-            self.optional_grant_probe = expected;
-            if let Some(class) = expected {
-                let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
-                let goal = OptimizationGoal { grant: sensitivity.goal_for(admissible_set, class), ..base_goal };
-                self.quality_required_goals = [goal].into_iter().collect();
-            }
-            let result = (|| -> Result<GrantOptimization> {
             self.memo.control().begin_optional();
             if !self.memo.control().checkpoint()? {
                 self.governor
@@ -3628,7 +3605,7 @@ impl CascadesEngine {
             self.optional_search_started =
                 self.collect_rule_work_profile || self.quality_handoff_enabled;
             let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
-            let goals = active_classes.values().copied().map(|class| OptimizationGoal {
+            let goals = classes.values().copied().map(|class| OptimizationGoal {
                 grant: sensitivity.goal_for(admissible_set, class),
                 ..base_goal
             });
@@ -3638,7 +3615,7 @@ impl CascadesEngine {
             self.record_search_checkpoints(root);
             if self.quality_handoff_reached {
                 if let Some(mut snapshot) =
-                    self.quality_grant_snapshot(root, base_goal, admissible_set, &active_classes)?
+                    self.quality_grant_snapshot(root, base_goal, admissible_set, &classes)?
                 {
                     let stop = self.search_stop();
                     snapshot.stop = stop;
@@ -3652,11 +3629,11 @@ impl CascadesEngine {
                     root,
                     base_goal,
                     admissible_set,
-                    &active_classes,
+                    &classes,
                     incumbent,
                 );
             }
-            let result = self.optimize_grant_classes(root, base_goal, admissible_set, &active_classes);
+            let result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
             if self.memo.control().deadline_reached() {
                 self.record_search_checkpoints(root);
                 let fallback = result.or_else(|_| incumbent);
@@ -3664,7 +3641,7 @@ impl CascadesEngine {
                     root,
                     base_goal,
                     admissible_set,
-                    &active_classes,
+                    &classes,
                     fallback,
                 );
             }
@@ -3674,21 +3651,6 @@ impl CascadesEngine {
             }
             self.record_search_checkpoints(root);
             return result;
-            })();
-            self.optional_grant_probe = None;
-            return result.map(|mut result| {
-                if expected.is_some() {
-                    let mut winners = result.winners.into_vec();
-                    for winner in safe.unwrap().winners.into_vec() {
-                        if !winners.iter().any(|selected| selected.class == winner.class) {
-                            winners.push(winner);
-                        }
-                    }
-                    winners.sort_by_key(|winner| winner.class);
-                    result.winners = winners.into_boxed_slice();
-                }
-                result
-            });
         }
         let result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
         if result.is_ok() {
@@ -4073,13 +4035,6 @@ impl CascadesEngine {
 
     fn drain_physical_interleave(&mut self, interleave: &mut PhysicalInterleave) -> Result<()> {
         while let Some((group, goal)) = interleave.pending.pop_first() {
-            if self.optional_grant_probe.is_some_and(|class| match goal.grant {
-                GrantGoalKey::Class(id) => id != class.id,
-                GrantGoalKey::Parallelism { tasks, .. } => tasks != class.max_parallel_tasks,
-                GrantGoalKey::Invariant(_) => false,
-            }) {
-                continue;
-            }
             if self.quality_handoff_reached {
                 break;
             }
