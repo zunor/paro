@@ -752,9 +752,11 @@ pub struct FrozenChoice {
 }
 
 const SEARCH_CHECKPOINT_TARGETS_MS: [u64; 5] = [5, 10, 20, 50, 100];
-const MAX_CANDIDATE_LIFECYCLE_EVENTS: usize = 32_768;
-const CANDIDATE_LIFECYCLE_STAGE_LIMITS: [u64; 6] = [4_096, 16_384, 4_096, 8_192, 16_384, 1_024];
-const MAX_TRANSFORMATION_TASK_LIFECYCLES: usize = 4_096;
+const MAX_CANDIDATE_LIFECYCLE_EVENTS: usize = 2_048;
+// Independent bounded prefixes reserve room for late logical/root evidence.
+// A dense publication stage cannot evict another stage's recorded history.
+const CANDIDATE_LIFECYCLE_STAGE_LIMITS: [u64; 6] = [512, 256, 128, 128, 992, 32];
+const MAX_TRANSFORMATION_TASK_LIFECYCLES: usize = 1_024;
 
 /// A diagnostic-only snapshot of the currently selected root candidate at a
 /// fixed search-time checkpoint. The timestamp is the first observation at or
@@ -2795,6 +2797,7 @@ impl CascadesEngine {
         let stage_index = event.stage as usize;
         if self.search_milestones.candidate_lifecycle_stage_stored[stage_index]
             >= CANDIDATE_LIFECYCLE_STAGE_LIMITS[stage_index]
+            || self.search_milestones.candidate_lifecycle.len() >= MAX_CANDIDATE_LIFECYCLE_EVENTS
         {
             self.search_milestones.candidate_lifecycle_stage_dropped[stage_index] =
                 self.search_milestones.candidate_lifecycle_stage_dropped[stage_index]
@@ -2807,44 +2810,7 @@ impl CascadesEngine {
         }
         self.search_milestones.candidate_lifecycle_stage_stored[stage_index] =
             self.search_milestones.candidate_lifecycle_stage_stored[stage_index].saturating_add(1);
-        if self.search_milestones.candidate_lifecycle.len() < MAX_CANDIDATE_LIFECYCLE_EVENTS {
-            self.search_milestones.candidate_lifecycle.push(event);
-            return;
-        }
-        // Child-ready and tuple-priced events are useful for locating the
-        // first dependency edge, but they are much denser than publication
-        // events. Preserve a bounded early sample of them while retaining
-        // later parent/root events instead of silently dropping the event
-        // which closes the handoff chain.
-        let replacement = match event.stage {
-            CandidateLifecycleStage::RootQualified => self
-                .search_milestones
-                .candidate_lifecycle
-                .iter()
-                .position(|event| event.stage != CandidateLifecycleStage::RootQualified),
-            CandidateLifecycleStage::ParentPublished => self
-                .search_milestones
-                .candidate_lifecycle
-                .iter()
-                .position(|event| {
-                    matches!(
-                        event.stage,
-                        CandidateLifecycleStage::ChildReady | CandidateLifecycleStage::TuplePriced
-                    )
-                }),
-            _ => None,
-        };
-        if let Some(index) = replacement {
-            self.search_milestones.candidate_lifecycle[index] = event;
-        } else {
-            self.search_milestones.candidate_lifecycle_dropped = self
-                .search_milestones
-                .candidate_lifecycle_dropped
-                .saturating_add(1);
-            self.search_milestones.candidate_lifecycle_stage_dropped[stage_index] =
-                self.search_milestones.candidate_lifecycle_stage_dropped[stage_index]
-                    .saturating_add(1);
-        }
+        self.search_milestones.candidate_lifecycle.push(event);
     }
 
     fn lifecycle_elapsed_us(&self) -> u64 {
