@@ -6481,12 +6481,14 @@ impl CascadesEngine {
                 task
             }
             TaskRequest::Reused { task, outcome } => {
+                // A dirty notification can be redundant. Reused already
+                // certifies the same child/fact ReadSet; only an extended local
+                // recipe stream (or explicit full recost) reopens that proof.
                 let recipe_domain_advanced = self
                     .physical_task_cache
                     .get(&cache_key)
                     .is_some_and(|cached| next_recipe_sequence > cached.recipe_cursor)
-                    || force_full_recost
-                    || dirty_recipes.as_ref().is_some_and(|dirty| !dirty.is_empty());
+                    || force_full_recost;
                 let incomplete = outcome.as_ref().is_some_and(|outcome| {
                     matches!(
                         outcome,

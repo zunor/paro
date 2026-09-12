@@ -127,6 +127,54 @@ fn response_choices(
 }
 
 #[test]
+fn redundant_dirty_notification_does_not_reopen_a_complete_read_context() {
+    let (mut engine, root, _, goal) = resume_engine(false);
+    engine.optimize_group(root, goal).unwrap();
+    let baseline = engine
+        .memo()
+        .group(root)
+        .unwrap()
+        .winner(goal)
+        .unwrap()
+        .candidate;
+    let reopened = engine.task_registry.profile().reopened_evaluations;
+    let synthesized = engine.child_combination_cost_synthesis_count;
+    let reads = engine.physical_read_set(root, goal).unwrap();
+    let recipes = engine
+        .recipes
+        .keys()
+        .filter(|(physical, recipe_goal, _)| {
+            *recipe_goal == goal
+                && engine
+                    .memo()
+                    .group(root)
+                    .unwrap()
+                    .physical_exprs()
+                    .contains(physical)
+        })
+        .map(|(physical, _, fingerprint)| (*physical, *fingerprint))
+        .collect();
+    engine.physical_dirty_recipes.insert((root, goal), recipes);
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(engine.physical_read_set(root, goal).unwrap(), reads);
+    assert_eq!(
+        engine
+            .memo()
+            .group(root)
+            .unwrap()
+            .winner(goal)
+            .unwrap()
+            .candidate,
+        baseline
+    );
+    assert_eq!(engine.child_combination_cost_synthesis_count, synthesized);
+    assert_eq!(
+        engine.task_registry.profile().reopened_evaluations,
+        reopened
+    );
+}
+
+#[test]
 fn recipe_resume_completed_same_readset_accepts_appended_physical_recipe() {
     let (mut engine, root, child, goal) = resume_engine(false);
     engine.optimize_group(root, goal).unwrap();
