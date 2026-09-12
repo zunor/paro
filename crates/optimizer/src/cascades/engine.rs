@@ -4,7 +4,7 @@
 //! Deterministic mandatory-baseline plus bounded optional Cascades search.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use paro_common::error::{self as paro_error, Result};
@@ -44,16 +44,19 @@ use super::region::{
 #[cfg(test)]
 use super::rules::WorkSourceId;
 use super::rules::{
-    CostComposition, ImplementationContext, ImplementationRegistry, PatternEnumerationCompletion,
-    PatternOperand, PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork,
-    SourceRetentionProof, SourceWork, SourceWorkData, TaskSupplyContract, TransformContext,
-    TransformationRule,
+    CostComposition, ImplementationContext, ImplementationRegistry, PatternBinding,
+    PatternBindingSet, PatternEnumerationCompletion, PatternOperand, PatternRead,
+    PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof, SourceWork,
+    SourceWorkData, TaskSupplyContract, TransformContext, TransformationRule,
 };
 use super::tasks::{
     BoundContext, BoundProofId, BoundProofKind, Cursor, ReadSet, StopReason, TaskId, TaskIntent,
     TaskOutcome, TaskRegistry, TaskRequest, TaskState,
 };
 use crate::physical::{ObjectiveProfile, ResourceGrantClass, SpillPolicy};
+
+mod quality_production;
+use quality_production::QualityProductionRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -259,6 +262,11 @@ struct TransformationTaskId {
     group: GroupId,
     expression: LogicalExprId,
     rule: RuleId,
+    /// `Some` identifies a direct quality-lane binding.  Keeping it outside
+    /// `SearchTask` lets the ordinary task remain queued while one exact
+    /// selected path is run first; the two observations and applications are
+    /// still independent and cannot suppress the complete matcher later.
+    binding: Option<Fingerprint>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -293,6 +301,13 @@ pub struct TransformationTaskLifecycle {
     pub first_published_us: Option<u64>,
     pub first_no_output_us: Option<u64>,
     pub first_budget_rejected_us: Option<u64>,
+    /// The most recent run/publication are needed when one exact task is
+    /// reactivated by a changing Memo fact.  First-* alone would classify a
+    /// late alternative as an early task that happened to publish once.
+    pub last_enqueued_us: Option<u64>,
+    pub last_dependencies_ready_us: Option<u64>,
+    pub last_run_us: Option<u64>,
+    pub last_published_us: Option<u64>,
     pub first_binding: Option<Fingerprint>,
     pub match_count: u64,
     pub no_match_count: u64,
@@ -318,6 +333,10 @@ impl TransformationTaskLifecycle {
             first_published_us: None,
             first_no_output_us: None,
             first_budget_rejected_us: None,
+            last_enqueued_us: None,
+            last_dependencies_ready_us: None,
+            last_run_us: None,
+            last_published_us: None,
             first_binding: None,
             match_count: 0,
             no_match_count: 0,
@@ -355,15 +374,20 @@ struct StableAgenda {
 }
 
 impl StableAgenda {
-    fn push(&mut self, key: TaskKey, task: SearchTask) {
+    /// Insert or promote one exact task.  Returning whether the agenda
+    /// changed lets lifecycle diagnostics distinguish a real queue event from
+    /// a notification which found an already-pending task.  Callers which do
+    /// not need that distinction may continue to ignore the result.
+    fn push(&mut self, key: TaskKey, task: SearchTask) -> bool {
         if let Some(previous) = self.keys.get(&task).copied() {
             if previous <= key {
-                return;
+                return false;
             }
             self.tasks.remove(&previous);
         }
         self.keys.insert(task, key);
         self.tasks.insert(key, task);
+        true
     }
 
     fn pop(&mut self) -> Option<SearchTask> {
@@ -398,7 +422,7 @@ impl PhysicalInterleave {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CostRecipe {
     /// Monotone position within one `(group, goal)` recipe stream.  Physical
     /// expression IDs are not enough here: one expression can acquire a new
@@ -417,6 +441,10 @@ struct CostRecipe {
     /// ranges remain `None`; the floor never stands in for child or logical
     /// search completeness.
     certified_local_work: Option<CertifiedLocalWorkFloor>,
+    /// These fields are immutable after recipe publication. Facts, statistics,
+    /// grant and calibration remain separate live inputs to combination identity;
+    /// resuming a recipe does not hash its unchanged source-work payload again.
+    immutable_cost_identity: OnceLock<Fingerprint>,
 }
 
 /// Exact query-local identity for one child-frontier combination. The budget
@@ -1026,6 +1054,12 @@ pub struct CascadesEngine {
     /// Collision-safe exact bindings already evaluated under these facts.
     /// Discovery can wake a task without invalidating its earlier bindings.
     transformation_applications: BindingApplications,
+    /// Exact selected-path bindings requested by the same-Memo quality lane.
+    /// The goal is part of the key because grants can require different
+    /// quality candidates; no binding is treated as complete search.
+    quality_forced_transform_bindings:
+        BTreeMap<(OptimizationGoal, TransformationTaskId), VecDeque<PatternBinding>>,
+    quality_active_forced_transform_binding: Option<(TransformationTaskId, PatternBinding)>,
     /// Reverse index for incrementally closing transformation dependencies.
     /// Subscribers are woken only after a Memo transaction commits.
     transformation_subscribers: BTreeMap<GroupId, BTreeSet<TransformationTaskId>>,
@@ -1151,6 +1185,13 @@ pub struct CascadesEngine {
     quality_ready_winners: BTreeMap<OptimizationGoal, GrantWinner>,
     quality_certificates: BTreeMap<OptimizationGoal, PReadyCertificate>,
     quality_handoff_reached: bool,
+    quality_production_requests: BTreeMap<OptimizationGoal, QualityProductionRequest>,
+    quality_last_production_obligation: Option<(super::quality::BundleFact, GroupId)>,
+    quality_producer_dispatch_count: u64,
+    quality_direct_binding_dispatch_count: u64,
+    quality_direct_binding_first_us: Option<u64>,
+    quality_direct_binding_last_us: Option<u64>,
+    quality_direct_binding_work_units: u64,
     quality_candidate_evaluation_count: u64,
     quality_candidate_missing_evidence_count: u64,
     /// Number of root-frontier entries inspected by the quality policy. A
@@ -1243,6 +1284,8 @@ impl CascadesEngine {
             transformation_observations: BTreeMap::new(),
             transformation_fact_observations: BTreeMap::new(),
             transformation_applications: BTreeMap::new(),
+            quality_forced_transform_bindings: BTreeMap::new(),
+            quality_active_forced_transform_binding: None,
             transformation_subscribers: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
             physical_parents: BTreeMap::new(),
@@ -1316,6 +1359,13 @@ impl CascadesEngine {
             quality_ready_winners: BTreeMap::new(),
             quality_certificates: BTreeMap::new(),
             quality_handoff_reached: false,
+            quality_production_requests: BTreeMap::new(),
+            quality_last_production_obligation: None,
+            quality_producer_dispatch_count: 0,
+            quality_direct_binding_dispatch_count: 0,
+            quality_direct_binding_first_us: None,
+            quality_direct_binding_last_us: None,
+            quality_direct_binding_work_units: 0,
             quality_candidate_evaluation_count: 0,
             quality_candidate_missing_evidence_count: 0,
             quality_frontier_candidate_count: 0,
@@ -1527,6 +1577,9 @@ impl CascadesEngine {
         // canonical group from its published expressions instead of allowing
         // a pre-merge visit marker to suppress a valid candidate.
         self.physical_implementation_seen.clear();
+        self.quality_production_requests.clear();
+        self.quality_forced_transform_bindings.clear();
+        self.quality_active_forced_transform_binding = None;
         // A group merge changes the declared physical search domain and
         // invalidates every completion certificate, even when a redirected
         // task happens to retain the same numeric winner.
@@ -2346,6 +2399,15 @@ impl CascadesEngine {
         self.quality_ready_winners.clear();
         self.quality_certificates.clear();
         self.quality_handoff_reached = false;
+        self.quality_production_requests.clear();
+        self.quality_forced_transform_bindings.clear();
+        self.quality_active_forced_transform_binding = None;
+        self.quality_last_production_obligation = None;
+        self.quality_producer_dispatch_count = 0;
+        self.quality_direct_binding_dispatch_count = 0;
+        self.quality_direct_binding_first_us = None;
+        self.quality_direct_binding_last_us = None;
+        self.quality_direct_binding_work_units = 0;
         self.quality_candidate_evaluation_count = 0;
         self.quality_candidate_missing_evidence_count = 0;
         self.quality_frontier_candidate_count = 0;
@@ -2660,18 +2722,19 @@ impl CascadesEngine {
         count: u64,
         elapsed: u64,
     ) {
-        let index = if let Some(index) = milestones
-            .transformation_task_lifecycle
-            .iter()
-            .position(|entry| {
-                entry.group == task.group
-                    && entry.expression == task.expression
-                    && entry.rule == task.rule
-            })
-        {
+        let index = if let Some(index) =
+            milestones
+                .transformation_task_lifecycle
+                .iter()
+                .position(|entry| {
+                    entry.group == task.group
+                        && entry.expression == task.expression
+                        && entry.rule == task.rule
+                }) {
             index
         } else {
-            if milestones.transformation_task_lifecycle.len() >= MAX_TRANSFORMATION_TASK_LIFECYCLES {
+            if milestones.transformation_task_lifecycle.len() >= MAX_TRANSFORMATION_TASK_LIFECYCLES
+            {
                 milestones.transformation_task_lifecycle_dropped = milestones
                     .transformation_task_lifecycle_dropped
                     .saturating_add(1);
@@ -2695,6 +2758,19 @@ impl CascadesEngine {
         if entry.first_binding.is_none() {
             entry.first_binding = binding;
         }
+        match phase {
+            TransformationTaskLifecyclePhase::Enqueued => entry.last_enqueued_us = Some(elapsed),
+            TransformationTaskLifecyclePhase::DependenciesReady => {
+                entry.last_dependencies_ready_us = Some(elapsed)
+            }
+            TransformationTaskLifecyclePhase::FirstRun => entry.last_run_us = Some(elapsed),
+            TransformationTaskLifecyclePhase::Published => entry.last_published_us = Some(elapsed),
+            TransformationTaskLifecyclePhase::Matched
+            | TransformationTaskLifecyclePhase::NoMatch
+            | TransformationTaskLifecyclePhase::Applicable
+            | TransformationTaskLifecyclePhase::NoOutput
+            | TransformationTaskLifecyclePhase::BudgetRejected => {}
+        }
         let first = match phase {
             TransformationTaskLifecyclePhase::Enqueued => &mut entry.first_enqueued_us,
             TransformationTaskLifecyclePhase::FirstRun => &mut entry.first_run_us,
@@ -2706,9 +2782,7 @@ impl CascadesEngine {
             TransformationTaskLifecyclePhase::Applicable => &mut entry.first_applicable_us,
             TransformationTaskLifecyclePhase::Published => &mut entry.first_published_us,
             TransformationTaskLifecyclePhase::NoOutput => &mut entry.first_no_output_us,
-            TransformationTaskLifecyclePhase::BudgetRejected => {
-                &mut entry.first_budget_rejected_us
-            }
+            TransformationTaskLifecyclePhase::BudgetRejected => &mut entry.first_budget_rejected_us,
         };
         first.get_or_insert(elapsed);
         match phase {
@@ -2728,7 +2802,8 @@ impl CascadesEngine {
                 entry.published_count = entry.published_count.saturating_add(count)
             }
             TransformationTaskLifecyclePhase::BudgetRejected => {
-                entry.budget_rejected_count = entry.budget_rejected_count.saturating_add(count.max(1))
+                entry.budget_rejected_count =
+                    entry.budget_rejected_count.saturating_add(count.max(1))
             }
             TransformationTaskLifecyclePhase::Enqueued
             | TransformationTaskLifecyclePhase::FirstRun
@@ -2991,6 +3066,19 @@ impl CascadesEngine {
                     .saturating_add(1);
                 continue;
             };
+            tracing::debug!(
+                target: "paro::optimizer::quality_handoff",
+                candidate = reference.candidate.index(),
+                logical_payload = frozen_winner.frozen.logical.payload.0,
+                physical_payload = frozen_winner.frozen.physical.payload.0,
+                operator_tag = frozen_winner.frozen.logical.operator_tag,
+                child_count = frozen_winner.frozen.children.len(),
+                shape = ?evidence.shape,
+                facts = ?evidence.facts,
+                capabilities = ?evidence.capabilities,
+                aggregate_regions = ?evidence.aggregate_regions,
+                "evaluating exact quality handoff candidate"
+            );
             self.quality_frontier_max_aggregates = self
                 .quality_frontier_max_aggregates
                 .max(evidence.shape.aggregates);
@@ -3078,6 +3166,14 @@ impl CascadesEngine {
                     .quality_frontier_policy_rejection_count
                     .saturating_add(1);
                 self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
+                let missing = self.quality_last_evaluation.missing_fact_kinds.clone();
+                self.record_quality_production_request(
+                    goal,
+                    &frozen_winner.frozen,
+                    read_id,
+                    &evidence,
+                    &missing,
+                )?;
                 continue;
             };
             self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
@@ -3281,6 +3377,9 @@ impl CascadesEngine {
     }
 
     fn reset_cost_epoch(&mut self) -> Result<()> {
+        self.quality_production_requests.clear();
+        self.quality_forced_transform_bindings.clear();
+        self.quality_active_forced_transform_binding = None;
         self.protect_current_winners()?;
         self.memo.clear_cost_frontiers()?;
         // Physical recipes are immutable descriptions of already-admitted
@@ -4000,7 +4099,7 @@ impl CascadesEngine {
             }
         }
         self.schedule_demanded_physical_quality_groups(&mut agenda)?;
-        'tasks: while let Some(task) = agenda.pop() {
+        'tasks: while let Some(task) = self.pop_transformation_task(&mut agenda)? {
             if self.quality_handoff_reached {
                 break;
             }
@@ -4016,11 +4115,23 @@ impl CascadesEngine {
             else {
                 unreachable!("transformation agenda contains implementation task")
             };
-            let task_id = TransformationTaskId {
+            let normal_task_id = TransformationTaskId {
                 group,
                 expression,
                 rule,
+                binding: None,
             };
+            let forced_binding = self
+                .quality_active_forced_transform_binding
+                .take()
+                .map(|(_, binding)| binding);
+            let task_id = forced_binding
+                .as_ref()
+                .map(|binding| TransformationTaskId {
+                    binding: Some(binding.fingerprint),
+                    ..normal_task_id
+                })
+                .unwrap_or(normal_task_id);
             self.note_transformation_task(
                 task_id,
                 TransformationTaskLifecyclePhase::FirstRun,
@@ -4112,12 +4223,24 @@ impl CascadesEngine {
             // incremental-work cursor, not a provenance match guard: any
             // relevant child/fact revision invalidates it and makes the new
             // expression eligible for ordinary matching.
-            if self.transformation_observation_is_current(task_id)? {
+            if forced_binding.is_none() && self.transformation_observation_is_current(task_id)? {
                 continue;
             }
             let binding_started = Instant::now();
             let binding_allocated = paro_common::allocator::thread_allocated_bytes();
-            let mut binding_set = {
+            let mut binding_set = if let Some(binding) = forced_binding {
+                let reads = pattern_binding_fact_reads(&self.memo, &binding)?;
+                self.quality_direct_binding_work_units = self
+                    .quality_direct_binding_work_units
+                    .saturating_add(pattern_operand_work_units(&binding.root) as u64);
+                PatternBindingSet {
+                    bindings: Box::new([binding.clone()]),
+                    reads,
+                    work_units: pattern_operand_work_units(&binding.root),
+                    work_dimension,
+                    completion: PatternEnumerationCompletion::Complete,
+                }
+            } else {
                 let rule_impl = self
                     .registry
                     .transformation(rule)
@@ -4237,7 +4360,10 @@ impl CascadesEngine {
                 task_id,
                 TransformationTaskLifecyclePhase::Matched,
                 Some(&binding_set.reads),
-                binding_set.bindings.first().map(|binding| binding.fingerprint),
+                binding_set
+                    .bindings
+                    .first()
+                    .map(|binding| binding.fingerprint),
                 binding_set.bindings.len() as u64,
             );
             for binding in binding_set.bindings.iter() {
@@ -4512,6 +4638,21 @@ impl CascadesEngine {
                 let fact_reads = context.take_fact_reads();
                 application_reads.extend(fact_reads.iter().copied());
                 let application_reads = application_reads.into_boxed_slice();
+                // Lifecycle diagnostics must retain the discovery frontier as
+                // well as application facts.  The frontier is the cursor
+                // which explains a later reactivation; recording only the
+                // narrower binding facts makes an early subscriber look like
+                // an unrelated late task.  This allocation is diagnostic
+                // only, just like the surrounding task profile.
+                let lifecycle_reads = task_lifecycle_enabled.then(|| {
+                    ReadSet::new(
+                        binding_set
+                            .reads
+                            .iter()
+                            .copied()
+                            .chain(application_reads.iter().copied()),
+                    )
+                });
                 Self::merge_transformation_fact_reads(
                     context.memo(),
                     &mut self.transformation_fact_observations,
@@ -4562,7 +4703,7 @@ impl CascadesEngine {
                     self.note_transformation_task(
                         task_id,
                         TransformationTaskLifecyclePhase::NoOutput,
-                        Some(&application_reads),
+                        lifecycle_reads.as_ref().map(ReadSet::reads),
                         Some(binding.fingerprint),
                         1,
                     );
@@ -4633,7 +4774,7 @@ impl CascadesEngine {
                         &mut self.search_milestones,
                         task_id,
                         TransformationTaskLifecyclePhase::Applicable,
-                        Some(&application_reads),
+                        lifecycle_reads.as_ref().map(ReadSet::reads),
                         Some(binding.fingerprint),
                         1,
                         Self::lifecycle_elapsed_from(task_lifecycle_started_at),
@@ -4768,7 +4909,7 @@ impl CascadesEngine {
                             &mut self.search_milestones,
                             task_id,
                             TransformationTaskLifecyclePhase::Published,
-                            Some(&application_reads),
+                            lifecycle_reads.as_ref().map(ReadSet::reads),
                             Some(binding.fingerprint),
                             newly_inserted_expressions.len() as u64,
                             Self::lifecycle_elapsed_from(task_lifecycle_started_at),
@@ -4882,6 +5023,7 @@ impl CascadesEngine {
                                     group: owner,
                                     expression: inserted,
                                     rule,
+                                    binding: None,
                                 },
                                 &inherited_reads,
                             )?;
@@ -5154,6 +5296,26 @@ impl CascadesEngine {
             (
                 "quality_policy_handoff_enabled",
                 u64::from(self.quality_handoff_enabled),
+            ),
+            (
+                "quality_producer_dispatch_count",
+                self.quality_producer_dispatch_count,
+            ),
+            (
+                "quality_direct_binding_dispatch_count",
+                self.quality_direct_binding_dispatch_count,
+            ),
+            (
+                "quality_direct_binding_first_us",
+                self.quality_direct_binding_first_us.unwrap_or_default(),
+            ),
+            (
+                "quality_direct_binding_last_us",
+                self.quality_direct_binding_last_us.unwrap_or_default(),
+            ),
+            (
+                "quality_direct_binding_work_units",
+                self.quality_direct_binding_work_units,
             ),
             (
                 "quality_policy_candidate_evaluation_count",
@@ -5675,9 +5837,7 @@ impl CascadesEngine {
             .logical_exprs()
             .to_vec();
         for expression in expressions {
-            self.schedule_transformation_expression(
-                group, expression, agenda, promoted, demanded,
-            )?;
+            self.schedule_transformation_expression(group, expression, agenda, promoted, demanded)?;
         }
         Ok(())
     }
@@ -5742,6 +5902,7 @@ impl CascadesEngine {
                 group,
                 expression,
                 rule: rule_id,
+                binding: None,
             };
             if !dispatch.matches {
                 if !dispatch.reads.is_empty() {
@@ -5773,7 +5934,7 @@ impl CascadesEngine {
                 expression,
                 goal: None,
             };
-            agenda.push(
+            let queued = agenda.push(
                 key,
                 SearchTask::Transform {
                     group,
@@ -5781,14 +5942,16 @@ impl CascadesEngine {
                     rule: rule_id,
                 },
             );
-            self.note_transformation_task(
-                task_id,
-                TransformationTaskLifecyclePhase::Enqueued,
-                None,
-                None,
-                0,
-            );
-            self.note_rule_phase(rule_id, RuleWorkPhase::Enqueued);
+            if queued {
+                self.note_transformation_task(
+                    task_id,
+                    TransformationTaskLifecyclePhase::Enqueued,
+                    None,
+                    None,
+                    0,
+                );
+                self.note_rule_phase(rule_id, RuleWorkPhase::Enqueued);
+            }
         }
         Ok(())
     }
@@ -5840,6 +6003,7 @@ impl CascadesEngine {
                 group: owner,
                 expression: subscriber.expression,
                 rule: subscriber.rule,
+                binding: None,
             };
             if !dispatch.matches {
                 if !dispatch.reads.is_empty() {
@@ -5856,7 +6020,7 @@ impl CascadesEngine {
                 continue;
             }
             let promise = rule.promise(expression_ref, &context);
-            agenda.push(
+            let queued = agenda.push(
                 TaskKey {
                     demand_stage: 1,
                     quality_stage: self.quality_stage_for_rule(rule, true, false),
@@ -5873,14 +6037,16 @@ impl CascadesEngine {
                     rule: subscriber.rule,
                 },
             );
-            self.note_transformation_task(
-                task_id,
-                TransformationTaskLifecyclePhase::Enqueued,
-                None,
-                None,
-                0,
-            );
-            self.note_rule_phase(subscriber.rule, RuleWorkPhase::Enqueued);
+            if queued {
+                self.note_transformation_task(
+                    task_id,
+                    TransformationTaskLifecyclePhase::Enqueued,
+                    None,
+                    None,
+                    0,
+                );
+                self.note_rule_phase(subscriber.rule, RuleWorkPhase::Enqueued);
+            }
         }
         Ok(())
     }
@@ -6321,6 +6487,7 @@ impl CascadesEngine {
                 physical_fingerprint: candidate.physical_fingerprint,
                 region: candidate.region,
                 certified_local_work,
+                immutable_cost_identity: OnceLock::new(),
             }));
             true
         } else {
@@ -6356,7 +6523,24 @@ impl CascadesEngine {
         self.physical_read_dependencies
             .entry((owner, goal))
             .or_default()
-            .extend(child_dependencies);
+            .extend(child_dependencies.iter().copied());
+        // Publish the reverse edge together with the recipe.  Registering it
+        // only when a parent later recurses into the child leaves a window in
+        // which a newly published child frontier has no parent to wake.  The
+        // edge is exact (child goal, parent goal, physical expression and
+        // recipe identity), so an early wakeup still follows the normal
+        // continuation/read-set invalidation path and cannot turn a partial
+        // child frontier into a completion certificate.
+        for &(child, child_goal) in &child_dependencies {
+            self.register_physical_dependency(
+                child,
+                child_goal,
+                owner,
+                goal,
+                physical,
+                recipe_fingerprint,
+            );
+        }
         Ok(())
     }
 
@@ -6474,7 +6658,10 @@ impl CascadesEngine {
                         .unwrap_or_default();
                     self.task_registry.advance_cursor(
                         task,
-                        Cursor { complete: false, ..cursor },
+                        Cursor {
+                            complete: false,
+                            ..cursor
+                        },
                     )?;
                     self.physical_completion_proofs.remove(&cache_key);
                     resume_candidate = true;
@@ -7780,11 +7967,14 @@ impl CascadesEngine {
                     // its entire domain to finish before a parent can respond.
                     // Once one child yields, consume only already-published
                     // siblings; do not start another recursive search here.
-                    if !(self.physical_interleave_step_mode && self.physical_interleave_step_yielded) {
+                    if !(self.physical_interleave_step_mode
+                        && self.physical_interleave_step_yielded)
+                    {
                         self.optimize_group(child, child_goal)?;
                     }
                 }
-                child_yielded |= self.physical_interleave_step_mode && self.physical_interleave_step_yielded;
+                child_yielded |=
+                    self.physical_interleave_step_mode && self.physical_interleave_step_yielded;
                 let Some(frontier) = self
                     .memo
                     .group(child)
@@ -9419,14 +9609,42 @@ fn child_combination_cost_context_fingerprint(
     recipe: &CostRecipe,
 ) -> Result<Fingerprint> {
     let mut builder = StableFingerprintBuilder::default();
-    builder.write_bytes(b"paro.child-combination-cost-context.v1");
+    builder.write_bytes(b"paro.child-combination-cost-context.v2");
     builder.write_u64(memo.cost_epoch_value());
     builder.write_u64(goal.required.0 as u64);
     builder.write_u64(goal.row_goal.stable_tag());
     builder.write_u64(goal.objective.stable_tag());
     builder.write_u64(goal.grant.stable_tag());
     builder.write_u64(goal.context.0 as u64);
-    builder.write_u64(memo.calibration().revision.0 as u64);
+    builder.write_fingerprint(memo.calibration_fingerprint());
+    builder.write_fingerprint(
+        *recipe
+            .immutable_cost_identity
+            .get_or_init(|| immutable_recipe_cost_identity(recipe)),
+    );
+
+    let mut groups = BTreeSet::from([memo.canonical_group(owner)]);
+    groups.extend(
+        recipe
+            .child_goals
+            .iter()
+            .map(|(group, _)| memo.canonical_group(*group)),
+    );
+    builder.write_u64(groups.len() as u64);
+    for group in groups {
+        let group_ref = memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("cost context references an unknown group"))?;
+        builder.write_u64(group.0 as u64);
+        builder.write_fingerprint(group_ref.logical_fact_fingerprint());
+        builder.write_fingerprint(memo.local_statistics_fingerprint(group));
+    }
+    Ok(builder.finish())
+}
+
+fn immutable_recipe_cost_identity(recipe: &CostRecipe) -> Fingerprint {
+    let mut builder = StableFingerprintBuilder::default();
+    builder.write_bytes(b"paro.immutable-recipe-cost.v1");
     builder.write_fingerprint(recipe.physical_fingerprint);
     write_search_cost_fingerprint(&mut builder, recipe.local_cost);
     if let Some(cost) = recipe.source_filter_apply_cost {
@@ -9449,23 +9667,7 @@ fn child_combination_cost_context_fingerprint(
     });
     builder.write_u64(u64::from(recipe.enforcer_cost_input.max_parallel_tasks));
 
-    let mut groups = BTreeSet::from([memo.canonical_group(owner)]);
-    groups.extend(
-        recipe
-            .child_goals
-            .iter()
-            .map(|(group, _)| memo.canonical_group(*group)),
-    );
-    builder.write_u64(groups.len() as u64);
-    for group in groups {
-        let group_ref = memo
-            .group(group)
-            .ok_or_else(|| paro_error::internal("cost context references an unknown group"))?;
-        builder.write_u64(group.0 as u64);
-        builder.write_fingerprint(group_ref.logical_fact_fingerprint());
-        builder.write_fingerprint(memo.local_statistics_fingerprint(group));
-    }
-    Ok(builder.finish())
+    builder.finish()
 }
 
 #[cfg(test)]
@@ -10148,6 +10350,48 @@ fn transformation_dependency_fingerprint(dependencies: &[PatternRead]) -> Finger
         builder.write_fingerprint(read.statistics_snapshot_fingerprint);
     }
     builder.finish()
+}
+
+/// A selected-path binding observes facts/statistics of its exact operands,
+/// not the complete logical frontiers below them.  The normal matcher keeps
+/// its frontier reads separately, so this direct quality task cannot suppress
+/// later peer exploration or be invalidated by an unrelated child alternative.
+fn pattern_binding_fact_reads(memo: &Memo, binding: &PatternBinding) -> Result<Box<[PatternRead]>> {
+    fn collect(operand: &PatternOperand, memo: &Memo, groups: &mut BTreeSet<GroupId>) {
+        match operand {
+            PatternOperand::Group(group) => {
+                groups.insert(memo.canonical_group(*group));
+            }
+            PatternOperand::Expression {
+                group, children, ..
+            } => {
+                groups.insert(memo.canonical_group(*group));
+                for child in children {
+                    collect(child, memo, groups);
+                }
+            }
+        }
+    }
+
+    let mut groups = BTreeSet::new();
+    collect(&binding.root, memo, &mut groups);
+    groups
+        .into_iter()
+        .map(|group| PatternRead::facts_from_group(memo, group))
+        .collect::<Result<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn pattern_operand_work_units(operand: &PatternOperand) -> usize {
+    match operand {
+        PatternOperand::Group(_) => 1,
+        PatternOperand::Expression { children, .. } => {
+            1 + children
+                .iter()
+                .map(pattern_operand_work_units)
+                .sum::<usize>()
+        }
+    }
 }
 
 fn transformation_binding_fingerprint(

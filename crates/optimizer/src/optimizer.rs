@@ -1393,7 +1393,17 @@ impl Optimizer {
                     ("first_published_us", task.first_published_us),
                     ("first_no_output_us", task.first_no_output_us),
                     ("first_budget_rejected_us", task.first_budget_rejected_us),
-                    ("first_binding_lo", task.first_binding.map(|value| value.0 as u64)),
+                    ("last_enqueued_us", task.last_enqueued_us),
+                    (
+                        "last_dependencies_ready_us",
+                        task.last_dependencies_ready_us,
+                    ),
+                    ("last_run_us", task.last_run_us),
+                    ("last_published_us", task.last_published_us),
+                    (
+                        "first_binding_lo",
+                        task.first_binding.map(|value| value.0 as u64),
+                    ),
                     (
                         "first_binding_hi",
                         task.first_binding.map(|value| (value.0 >> 64) as u64),
@@ -1406,11 +1416,7 @@ impl Optimizer {
                     ("budget_rejected_count", Some(task.budget_rejected_count)),
                 ] {
                     if let Some(value) = value {
-                        trace.record_value(
-                            "optimizer",
-                            &format!("{prefix}.{name}"),
-                            value,
-                        );
+                        trace.record_value("optimizer", &format!("{prefix}.{name}"), value);
                     }
                 }
                 trace.record_value(

@@ -51,6 +51,12 @@ mod parent_response;
 #[path = "tests/lifecycle_retention.rs"]
 mod lifecycle_retention;
 
+#[path = "tests/quality_production.rs"]
+mod quality_production;
+
+#[path = "tests/cost_identity.rs"]
+mod cost_identity;
+
 #[path = "tests/grant_capacity.rs"]
 mod grant_capacity;
 
@@ -330,6 +336,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),
             physical_fingerprint: Fingerprint(91),
             certified_local_work: None,
+            immutable_cost_identity: OnceLock::new(),
             region: Some(RegionCandidateContract {
                 // RegionId is an ephemeral forest position. The facet
                 // fingerprint is the stable recipe identity after runtime
@@ -1353,6 +1360,57 @@ fn physical_interleave_step_resumes_a_partial_child_recipe() {
         .is_some_and(|frontier| !frontier.candidates().is_empty()));
 }
 
+#[test]
+fn physical_recipe_publication_registers_exact_parent_before_child_is_optimized() {
+    let (mut engine, root, goal) = strong_tree_engine();
+    let root_expression = engine
+        .memo()
+        .group(root)
+        .and_then(|group| group.logical_exprs().first().copied())
+        .expect("the tree fixture has a root expression");
+    let child = engine
+        .memo()
+        .logical_expr(root_expression)
+        .and_then(|expression| expression.key.children.first().copied())
+        .expect("the tree fixture has one physical child");
+    let implementation = TreeImplementation {
+        id: ImplementationId(41),
+        operator: Fingerprint(200),
+        child: Some(child),
+        child_row_goal: Some(RowGoal::All),
+        local_score: 0.0,
+        mandatory: true,
+    };
+    let candidate = implementation
+        .candidates(
+            root_expression,
+            goal,
+            &ImplementationContext {
+                memo: engine.memo(),
+                group: root,
+            },
+        )
+        .unwrap()
+        .into_vec()
+        .pop()
+        .expect("the parent implementation has one candidate");
+
+    // Admit only the parent recipe.  In particular, do not run
+    // optimize_group(child, ...) first: the reverse index must be ready at
+    // publication time, not lazily after the first recursive observation.
+    let recipe_fingerprint = candidate.physical_fingerprint;
+    engine
+        .admit_candidate(root, root_expression, ImplementationId(41), goal, candidate)
+        .unwrap();
+
+    let child_goal = goal;
+    let parents = engine
+        .physical_parents
+        .get(&child)
+        .expect("publishing a recipe must install its reverse child edge");
+    assert!(parents.contains(&(root, child_goal, PhysicalExprId(0), recipe_fingerprint)));
+}
+
 fn engine(optional_rules: u32) -> (CascadesEngine, GroupId, OptimizationGoal) {
     let mut budget = super::super::budget::SearchBudget::default();
     budget.max_rule_firings_per_group = optional_rules;
@@ -1423,6 +1481,7 @@ fn engine_group_merge_redirects_tasks_and_discards_stale_transform_state() {
         group: secondary,
         expression: LogicalExprId::new(0),
         rule: RuleId::new(77),
+        binding: None,
     };
     engine
         .transformation_subscribers
@@ -1505,7 +1564,9 @@ fn certified_group_pruning_is_independent_of_rule_tracing() {
 
     let counters = engine.search_work_counters();
     assert_eq!(counters["certified_group_pruning_enabled"], 1);
-    assert!(counters["certified_bound_compute_us"] > 0);
+    // Sub-microsecond checks can legitimately round to zero in the timing
+    // ledger. Assert actual work, not clock resolution.
+    assert!(counters["strong_incumbent_bound_request_count"] > 0);
     assert!(engine.task_registry().profile().bound_proofs > 0);
 }
 
@@ -2447,6 +2508,7 @@ fn saturated_transformation_cursor_invalidates_when_an_observed_frontier_advance
         group: owner,
         expression,
         rule: RuleId(5),
+        binding: None,
     };
     let read = PatternRead::from_group(engine.memo(), observed).unwrap();
 
@@ -2859,6 +2921,7 @@ fn later_binding_observations_keep_all_application_fact_subscriptions() {
         group: root,
         expression: engine.memo().group(root).unwrap().logical_exprs()[0],
         rule: RuleId(904),
+        binding: None,
     };
     let root_read = PatternRead::from_group(engine.memo(), root).unwrap();
     let fact_read = PatternRead::from_group(engine.memo(), evidence).unwrap();
@@ -2983,6 +3046,7 @@ fn repeated_fact_cursors_update_in_place_without_downgrading_frontier_reads() {
         group: root,
         expression: engine.memo().group(root).unwrap().logical_exprs()[0],
         rule: RuleId(904),
+        binding: None,
     };
     let frontier = PatternRead::from_group(engine.memo(), root).unwrap();
     let mut observations = BTreeMap::new();

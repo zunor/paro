@@ -34,6 +34,137 @@ pub struct BudgetedOracleResult {
     pub omitted: bool,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CertifiedOracleCandidate {
+    id: u8,
+    local_work: u64,
+    child_work: u64,
+    runtime_filter_work: u64,
+    shared_cte_work: u64,
+    required_source: u8,
+    required_grant: u8,
+    shared_owner: u8,
+    stats_revision: u8,
+    child_complete: bool,
+    source_response_supported: bool,
+    phase_overlap_supported: bool,
+    logical_domain_complete: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CertifiedOracleContext {
+    source_demand: u8,
+    grant: u8,
+    shared_owner: u8,
+    stats_revision: u8,
+}
+
+#[cfg(test)]
+fn certified_oracle_cost(candidate: CertifiedOracleCandidate, shared_cte_charge: u64) -> u64 {
+    candidate
+        .local_work
+        .saturating_add(candidate.child_work)
+        .saturating_add(candidate.runtime_filter_work)
+        .saturating_add(candidate.shared_cte_work)
+        .saturating_add(shared_cte_charge)
+}
+
+#[cfg(test)]
+fn certified_oracle_admissible(
+    candidate: CertifiedOracleCandidate,
+    context: CertifiedOracleContext,
+) -> bool {
+    candidate.required_source & !context.source_demand == 0
+        && candidate.required_grant <= context.grant
+        && candidate.shared_owner == context.shared_owner
+}
+
+/// Independent finite reference for the exact cases where the production
+/// proof is allowed to prune.  It intentionally does not call `SearchCost`,
+/// Memo or TaskRegistry: a lower bound is usable only when all declared
+/// completion/context facts are present and its exact operating-point cost is
+/// above the current incumbent.
+#[cfg(test)]
+fn certified_oracle_winner(
+    candidates: impl IntoIterator<Item = CertifiedOracleCandidate>,
+    context: CertifiedOracleContext,
+    incumbent: CertifiedOracleCandidate,
+    shared_cte_charge: u64,
+) -> (CertifiedOracleCandidate, BTreeSet<u8>) {
+    candidates.into_iter().fold(
+        (incumbent, BTreeSet::new()),
+        |(winner, mut pruned), candidate| {
+            if !certified_oracle_admissible(candidate, context) {
+                return (winner, pruned);
+            }
+            let cost = certified_oracle_cost(candidate, shared_cte_charge);
+            let proof_available = candidate.stats_revision == context.stats_revision
+                && candidate.child_complete
+                && candidate.source_response_supported
+                && candidate.phase_overlap_supported
+                && candidate.logical_domain_complete;
+            if proof_available && cost > certified_oracle_cost(winner, shared_cte_charge) {
+                pruned.insert(candidate.id);
+                return (winner, pruned);
+            }
+            if (cost, candidate.id) < (certified_oracle_cost(winner, shared_cte_charge), winner.id)
+            {
+                (candidate, pruned)
+            } else {
+                (winner, pruned)
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeedCostContext {
+    source_stats: u8,
+    child_stats: u8,
+    grant_memory: u64,
+    calibration: u8,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeedPlanAttestation {
+    /// Semantic plan identity; Memo allocation IDs are intentionally absent.
+    plan: u8,
+    source_stats: u8,
+    child_stats: u8,
+    grant_memory: u64,
+    calibration: u8,
+    cost: u64,
+}
+
+#[cfg(test)]
+fn seed_oracle_price(plan: u8, context: SeedCostContext) -> SeedPlanAttestation {
+    SeedPlanAttestation {
+        plan,
+        source_stats: context.source_stats,
+        child_stats: context.child_stats,
+        grant_memory: context.grant_memory,
+        calibration: context.calibration,
+        cost: 10 + u64::from(context.source_stats) + u64::from(context.child_stats),
+    }
+}
+
+#[cfg(test)]
+fn seed_oracle_is_current(
+    attestation: SeedPlanAttestation,
+    plan: u8,
+    context: SeedCostContext,
+) -> bool {
+    attestation.plan == plan
+        && attestation.source_stats == context.source_stats
+        && attestation.child_stats == context.child_stats
+        && attestation.grant_memory == context.grant_memory
+        && attestation.calibration == context.calibration
+}
+
 fn admissible(candidate: OracleCandidate, context: OracleContext) -> bool {
     candidate.required_source & !context.source_demand == 0
         && candidate.required_grant <= context.grant
@@ -436,5 +567,300 @@ mod tests {
         let redirected_object = production.allocate_object(redirected).unwrap();
         production.invalidate(redirected).unwrap();
         assert!(!production.is_published(redirected_object));
+    }
+
+    #[test]
+    fn certified_pruning_oracle_preserves_optimum_across_order_and_context_changes() {
+        let context = CertifiedOracleContext {
+            source_demand: 0b11,
+            grant: 4,
+            shared_owner: 7,
+            stats_revision: 1,
+        };
+        let incumbent = CertifiedOracleCandidate {
+            id: 0,
+            local_work: 1,
+            child_work: 1,
+            runtime_filter_work: 0,
+            shared_cte_work: 0,
+            required_source: 0,
+            required_grant: 1,
+            shared_owner: 7,
+            stats_revision: 1,
+            child_complete: true,
+            source_response_supported: true,
+            phase_overlap_supported: true,
+            logical_domain_complete: true,
+        };
+        let candidates = vec![
+            // Equal cost is retained so the declared tie-break remains the
+            // oracle's responsibility rather than a pruning side effect.
+            CertifiedOracleCandidate {
+                id: 1,
+                local_work: 2,
+                child_work: 0,
+                runtime_filter_work: 0,
+                shared_cte_work: 0,
+                required_source: 0,
+                required_grant: 1,
+                shared_owner: 7,
+                stats_revision: 1,
+                child_complete: true,
+                source_response_supported: true,
+                phase_overlap_supported: true,
+                logical_domain_complete: true,
+            },
+            // This is the non-selected child case: a child frontier that is
+            // not complete cannot be used as a proof, even though its current
+            // estimate is worse than the incumbent.
+            CertifiedOracleCandidate {
+                id: 2,
+                local_work: 20,
+                child_work: 0,
+                runtime_filter_work: 0,
+                shared_cte_work: 0,
+                required_source: 0,
+                required_grant: 1,
+                shared_owner: 7,
+                stats_revision: 1,
+                child_complete: false,
+                source_response_supported: true,
+                phase_overlap_supported: true,
+                logical_domain_complete: true,
+            },
+            // A valid RF/source response is part of the exact cost and can be
+            // pruned only after that source work is included.
+            CertifiedOracleCandidate {
+                id: 3,
+                local_work: 4,
+                child_work: 0,
+                runtime_filter_work: 5,
+                shared_cte_work: 0,
+                required_source: 0b10,
+                required_grant: 2,
+                shared_owner: 7,
+                stats_revision: 1,
+                child_complete: true,
+                source_response_supported: true,
+                phase_overlap_supported: true,
+                logical_domain_complete: true,
+            },
+            // An unsupported phase overlap is fail-closed rather than
+            // guessed into a pruning proof.
+            CertifiedOracleCandidate {
+                id: 4,
+                local_work: 30,
+                child_work: 0,
+                runtime_filter_work: 0,
+                shared_cte_work: 0,
+                required_source: 0,
+                required_grant: 1,
+                shared_owner: 7,
+                stats_revision: 1,
+                child_complete: true,
+                source_response_supported: true,
+                phase_overlap_supported: false,
+                logical_domain_complete: true,
+            },
+            // An unperformed logical rewrite keeps the domain open.
+            CertifiedOracleCandidate {
+                id: 5,
+                local_work: 40,
+                child_work: 0,
+                runtime_filter_work: 0,
+                shared_cte_work: 0,
+                required_source: 0,
+                required_grant: 1,
+                shared_owner: 7,
+                stats_revision: 1,
+                child_complete: true,
+                source_response_supported: true,
+                phase_overlap_supported: true,
+                logical_domain_complete: false,
+            },
+            // A shared CTE producer is charged once outside the child choice;
+            // inline work remains visible in the candidate itself.
+            CertifiedOracleCandidate {
+                id: 6,
+                local_work: 10,
+                child_work: 0,
+                runtime_filter_work: 0,
+                shared_cte_work: 2,
+                required_source: 0,
+                required_grant: 1,
+                shared_owner: 7,
+                stats_revision: 1,
+                child_complete: true,
+                source_response_supported: true,
+                phase_overlap_supported: true,
+                logical_domain_complete: true,
+            },
+            // A changed statistics revision invalidates the old proof.
+            CertifiedOracleCandidate {
+                id: 7,
+                local_work: 25,
+                child_work: 0,
+                runtime_filter_work: 0,
+                shared_cte_work: 0,
+                required_source: 0,
+                required_grant: 1,
+                shared_owner: 7,
+                stats_revision: 1,
+                child_complete: true,
+                source_response_supported: true,
+                phase_overlap_supported: true,
+                logical_domain_complete: true,
+            },
+        ];
+        let expected = candidates
+            .iter()
+            .copied()
+            .chain([incumbent])
+            .filter(|candidate| certified_oracle_admissible(*candidate, context))
+            .min_by_key(|candidate| (certified_oracle_cost(*candidate, 3), candidate.id))
+            .unwrap();
+
+        let (winner, pruned) = certified_oracle_winner(candidates.clone(), context, incumbent, 3);
+        assert_eq!(winner, expected);
+        assert!(pruned.contains(&3));
+        assert!(pruned.contains(&6));
+        assert!(!pruned.contains(&2));
+        assert!(!pruned.contains(&4));
+        assert!(!pruned.contains(&5));
+
+        for permutation in permutations(&candidates) {
+            let (permuted_winner, _) = certified_oracle_winner(permutation, context, incumbent, 3);
+            assert_eq!(permuted_winner, expected);
+        }
+
+        let changed_context = CertifiedOracleContext {
+            stats_revision: 2,
+            ..context
+        };
+        let (_, changed_pruned) =
+            certified_oracle_winner(candidates, changed_context, incumbent, 3);
+        assert!(!changed_pruned.contains(&3));
+        assert!(!changed_pruned.contains(&6));
+    }
+
+    #[test]
+    fn seed_cost_oracle_rejects_stale_source_and_child_facts() {
+        let source = SeedCostContext {
+            source_stats: 1,
+            child_stats: 2,
+            grant_memory: 1024,
+            calibration: 3,
+        };
+        let attestation = seed_oracle_price(7, source);
+        assert!(seed_oracle_is_current(attestation, 7, source));
+
+        let refined_source = SeedCostContext {
+            source_stats: 4,
+            ..source
+        };
+        let refined_child = SeedCostContext {
+            child_stats: 8,
+            ..source
+        };
+        assert!(!seed_oracle_is_current(attestation, 7, refined_source));
+        assert!(!seed_oracle_is_current(attestation, 7, refined_child));
+        assert!(seed_oracle_is_current(
+            seed_oracle_price(7, refined_source),
+            7,
+            refined_source
+        ));
+        assert!(seed_oracle_is_current(
+            seed_oracle_price(7, refined_child),
+            7,
+            refined_child
+        ));
+    }
+
+    #[test]
+    fn seed_cost_oracle_reprices_grant_and_calibration_changes_but_ignores_memo_ids() {
+        let context = SeedCostContext {
+            source_stats: 1,
+            child_stats: 1,
+            grant_memory: 1024,
+            calibration: 1,
+        };
+        let attestation = seed_oracle_price(9, context);
+        assert!(!seed_oracle_is_current(
+            attestation,
+            9,
+            SeedCostContext {
+                grant_memory: 2048,
+                ..context
+            }
+        ));
+        assert!(!seed_oracle_is_current(
+            attestation,
+            9,
+            SeedCostContext {
+                calibration: 2,
+                ..context
+            }
+        ));
+
+        // Memo/group/property allocation is not a cost dependency. A
+        // differently numbered destination can reuse the same semantic plan
+        // after it is priced against its own facts and operating point.
+        let renamed_memo_context = context;
+        assert!(seed_oracle_is_current(
+            seed_oracle_price(9, renamed_memo_context),
+            9,
+            renamed_memo_context
+        ));
+    }
+
+    #[test]
+    fn pruning_on_and_off_have_the_same_optimum_when_the_bound_is_certified() {
+        let context = CertifiedOracleContext {
+            source_demand: 0b11,
+            grant: 4,
+            shared_owner: 7,
+            stats_revision: 1,
+        };
+        let incumbent = CertifiedOracleCandidate {
+            id: 0,
+            local_work: 8,
+            child_work: 0,
+            runtime_filter_work: 0,
+            shared_cte_work: 0,
+            required_source: 0,
+            required_grant: 1,
+            shared_owner: 7,
+            stats_revision: 1,
+            child_complete: true,
+            source_response_supported: true,
+            phase_overlap_supported: true,
+            logical_domain_complete: true,
+        };
+        let candidates = [
+            incumbent,
+            CertifiedOracleCandidate {
+                id: 1,
+                local_work: 12,
+                child_work: 2,
+                runtime_filter_work: 0,
+                shared_cte_work: 0,
+                required_source: 0,
+                required_grant: 1,
+                shared_owner: 7,
+                stats_revision: 1,
+                child_complete: true,
+                source_response_supported: true,
+                phase_overlap_supported: true,
+                logical_domain_complete: true,
+            },
+        ];
+        let without_pruning = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| certified_oracle_admissible(*candidate, context))
+            .min_by_key(|candidate| (certified_oracle_cost(*candidate, 0), candidate.id));
+        let (with_pruning, pruned) = certified_oracle_winner(candidates, context, incumbent, 0);
+        assert_eq!(without_pruning, Some(with_pruning));
+        assert!(pruned.contains(&1));
     }
 }

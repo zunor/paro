@@ -1,0 +1,372 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Requests owned by the missing obligations of one executable candidate.
+//!
+//! This orders existing tasks; it does not discharge an obligation, remove a
+//! legal alternative, or replace the model-cost frontier or quality policy.
+
+use super::*;
+use crate::cascades::quality::{BundleFact, NativeQualityEvidence};
+use crate::cascades::rules::QualityDependency;
+use crate::cascades::tasks::ReadSetId;
+
+type ProductionObligation = (BundleFact, GroupId);
+type SelectedLogicalChoice = (GroupId, LogicalExprId);
+
+#[derive(Debug)]
+pub(super) struct QualityProductionRequest {
+    candidate: CandidateId,
+    reads: ReadSetId,
+    obligations: BTreeMap<ProductionObligation, BTreeSet<SelectedLogicalChoice>>,
+    /// Exact selected-path bindings which can run in this Memo before the
+    /// broad PredicateTransfer matcher. The ordinary task remains queued and
+    /// still covers every other legal alternative.
+    domain_bindings: Box<[PatternBinding]>,
+    deficit: usize,
+    cost: f64,
+}
+
+impl QualityProductionRequest {
+    fn from_candidate(
+        memo: &Memo,
+        frozen: &Arc<FrozenCandidate>,
+        reads: ReadSetId,
+        evidence: &NativeQualityEvidence,
+        missing: &[BundleFact],
+    ) -> Option<Self> {
+        let candidate = frozen.reference.candidate;
+        if evidence
+            .aggregate_regions
+            .iter()
+            .any(|region| region.candidate != candidate)
+        {
+            return None;
+        }
+        let mut nodes = BTreeMap::new();
+        let mut pending = vec![frozen];
+        while let Some(node) = pending.pop() {
+            if nodes.insert(node.reference.candidate, node).is_none() {
+                pending.extend(node.children.iter());
+            }
+        }
+        // Even a covered witness must belong to this exact frozen DAG.
+        if evidence
+            .aggregate_regions
+            .iter()
+            .any(|region| !nodes.contains_key(&region.anchor))
+            || evidence
+                .pending_domain_transfers
+                .iter()
+                .any(|choice| !nodes.contains_key(choice))
+        {
+            return None;
+        }
+        let mut obligations = BTreeMap::new();
+        let mut uncovered = 0_usize;
+        for &fact in missing {
+            if fact == BundleFact::AggregateDecomposition {
+                for region in evidence
+                    .aggregate_regions
+                    .iter()
+                    .filter(|region| !region.covered)
+                {
+                    let arm = *nodes.get(&region.anchor)?;
+                    let mut choices = BTreeSet::new();
+                    let mut visited = BTreeSet::new();
+                    let mut pending = vec![arm];
+                    while let Some(node) = pending.pop() {
+                        if visited.insert(node.reference.candidate) {
+                            choices.insert((
+                                memo.canonical_group(node.reference.group),
+                                node.logical.id,
+                            ));
+                            pending.extend(node.children.iter());
+                        }
+                    }
+                    uncovered += 1;
+                    obligations.insert((fact, memo.canonical_group(arm.reference.group)), choices);
+                }
+            } else if fact == BundleFact::PredicateDomain
+                && !evidence.pending_domain_transfers.is_empty()
+            {
+                for choice in &evidence.pending_domain_transfers {
+                    let node = *nodes.get(choice)?;
+                    let group = memo.canonical_group(node.reference.group);
+                    obligations
+                        .entry((fact, group))
+                        .or_insert_with(BTreeSet::new)
+                        .insert((group, node.logical.id));
+                }
+            } else if matches!(
+                fact,
+                BundleFact::PredicateDomain
+                    | BundleFact::CteConsumerDemand
+                    | BundleFact::JoinRegion
+            ) {
+                // Producers are exact selected logical choices, not every
+                // alternative in those groups. Rule dispatch supplies the
+                // operator applicability and exact binding/fact subscriptions.
+                obligations.insert(
+                    (fact, memo.canonical_group(frozen.reference.group)),
+                    nodes
+                        .values()
+                        .map(|node| (memo.canonical_group(node.reference.group), node.logical.id))
+                        .collect(),
+                );
+            }
+        }
+        Some(Self {
+            candidate,
+            reads,
+            obligations,
+            domain_bindings: Box::new([]),
+            // Count the policy's real missing facts, including unsupported
+            // ones. Two missing aggregate regions cannot count as one done
+            // region, and aggregate coverage alone cannot hide missing domains.
+            deficit: missing.len().saturating_add(uncovered.saturating_sub(1)),
+            cost: frozen.winner.cost.score.range.expected,
+        })
+    }
+
+    fn prefers(&self, other: &Self) -> bool {
+        self.deficit
+            .cmp(&other.deficit)
+            .then_with(|| self.cost.total_cmp(&other.cost))
+            .then_with(|| self.candidate.cmp(&other.candidate))
+            .is_lt()
+    }
+}
+
+fn produces(fact: BundleFact, dependency: Option<QualityDependency>) -> bool {
+    // Join choices consume restricted input domains as well as join-order
+    // alternatives. A producer-level filter can satisfy the coarse domain
+    // bundle while its safe propagation into this selected join's inputs is
+    // still pending. Keep those exact domain producers eligible for an
+    // outstanding join request; this is not additional completion evidence.
+    matches!(
+        (fact, dependency),
+        (
+            BundleFact::AggregateDecomposition,
+            Some(QualityDependency::NarrowAggregate)
+        ) | (
+            BundleFact::PredicateDomain,
+            Some(QualityDependency::DomainRestriction)
+        ) | (
+            BundleFact::CteConsumerDemand,
+            Some(QualityDependency::ConsumerDemand | QualityDependency::DomainRestriction)
+        ) | (
+            BundleFact::JoinRegion,
+            Some(QualityDependency::DomainRestriction | QualityDependency::JoinSelection)
+        )
+    )
+}
+
+impl StableAgenda {
+    fn matching_choice_key(
+        &self,
+        (group, expression): SelectedLogicalChoice,
+        mut relevant: impl FnMut(RuleId) -> bool,
+    ) -> Option<TaskKey> {
+        let start = SearchTask::Transform {
+            group,
+            expression,
+            rule: RuleId(0),
+        };
+        self.keys.range(start..)
+            .take_while(|(task, _)| matches!(task, SearchTask::Transform { group: owner, expression: selected, .. } if *owner == group && *selected == expression))
+            .filter(|(task, _)| matches!(task, SearchTask::Transform { rule, .. } if relevant(*rule)))
+            .map(|(_, key)| *key)
+            .min()
+    }
+}
+
+impl CascadesEngine {
+    pub(super) fn record_quality_production_request(
+        &mut self,
+        goal: OptimizationGoal,
+        frozen: &Arc<FrozenCandidate>,
+        reads: ReadSetId,
+        evidence: &NativeQualityEvidence,
+        missing: &[BundleFact],
+    ) -> Result<()> {
+        let Some(mut request) =
+            QualityProductionRequest::from_candidate(&self.memo, frozen, reads, evidence, missing)
+        else {
+            return Ok(());
+        };
+        if missing.contains(&BundleFact::PredicateDomain)
+            && self
+                .memo
+                .budget()
+                .transformation_enabled(crate::cascades::rules::PREDICATE_TRANSFER_RULE)
+        {
+            request.domain_bindings = self
+                .registry
+                .transformations()
+                .find(|rule| rule.id() == crate::cascades::rules::PREDICATE_TRANSFER_RULE)
+                .map(|rule| rule.selected_quality_bindings(&self.memo, frozen))
+                .transpose()?
+                .unwrap_or_default();
+        }
+        if let Some(previous) = self.quality_production_requests.get(&goal) {
+            let current = self
+                .task_registry
+                .read_set(previous.reads)
+                .is_some_and(|reads| reads.is_current(&self.memo).is_ok_and(|current| current));
+            if current && !request.prefers(previous) {
+                return Ok(());
+            }
+        }
+        self.quality_forced_transform_bindings
+            .retain(|(entry_goal, _), _| *entry_goal != goal);
+        self.quality_production_requests.insert(goal, request);
+        if let Some(request) = self.quality_production_requests.get(&goal) {
+            for binding in request.domain_bindings.iter().cloned() {
+                let task = TransformationTaskId {
+                    group: self.memo.canonical_group(binding.root_group()),
+                    expression: binding.root_expression(),
+                    rule: crate::cascades::rules::PREDICATE_TRANSFER_RULE,
+                    binding: Some(binding.fingerprint),
+                };
+                self.quality_forced_transform_bindings
+                    .entry((goal, task))
+                    .or_default()
+                    .push_back(binding);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn pop_transformation_task(
+        &mut self,
+        agenda: &mut StableAgenda,
+    ) -> Result<Option<SearchTask>> {
+        if !self.quality_handoff_enabled {
+            return Ok(agenda.pop());
+        }
+        let mut stale = Vec::new();
+        let mut obligations =
+            BTreeMap::<ProductionObligation, BTreeSet<SelectedLogicalChoice>>::new();
+        for (&goal, request) in &self.quality_production_requests {
+            let current = match self.task_registry.read_set(request.reads) {
+                Some(reads) => reads.is_current(&self.memo)?,
+                None => false,
+            };
+            if !current || self.quality_ready_winners.contains_key(&goal) {
+                stale.push(goal);
+                continue;
+            }
+            for (&obligation, choices) in &request.obligations {
+                obligations
+                    .entry(obligation)
+                    .or_default()
+                    .extend(choices.iter().copied());
+            }
+        }
+        for goal in stale {
+            self.quality_production_requests.remove(&goal);
+            self.quality_forced_transform_bindings
+                .retain(|(entry_goal, _), _| *entry_goal != goal);
+        }
+        // Execute one exact selected path before taking a general quality
+        // task. The ordinary task is left queued (or inserted if it was
+        // already consumed), so this accelerator cannot narrow the legal
+        // search domain or make the direct binding stand in for closure.
+        if let Some((goal, task, _binding)) = self
+            .quality_forced_transform_bindings
+            .iter()
+            .filter_map(|((goal, task), bindings)| {
+                bindings
+                    .front()
+                    .cloned()
+                    .map(|binding| (*goal, *task, binding))
+            })
+            .min_by_key(|(goal, task, binding)| (*goal, *task, binding.fingerprint))
+        {
+            let ordinary_task = SearchTask::Transform {
+                group: task.group,
+                expression: task.expression,
+                rule: task.rule,
+            };
+            if !agenda.keys.contains_key(&ordinary_task) {
+                let expression = self
+                    .memo
+                    .logical_expr(task.expression)
+                    .ok_or_else(|| paro_error::internal("quality binding lost its expression"))?;
+                let rule = self
+                    .registry
+                    .transformation(task.rule)
+                    .ok_or_else(|| paro_error::internal("quality binding lost its rule"))?;
+                let context = RuleContext {
+                    memo: &self.memo,
+                    group: task.group,
+                };
+                let quality_stage = self.quality_stage_for_rule(rule, false, false);
+                agenda.push(
+                    TaskKey {
+                        demand_stage: 1,
+                        quality_stage,
+                        priority: rule.promise(expression, &context).priority,
+                        kind: TaskKind::Transform,
+                        stable_id: task.rule.0,
+                        group: task.group,
+                        expression: task.expression,
+                        goal: None,
+                    },
+                    ordinary_task,
+                );
+            }
+            let forced_key = (goal, task);
+            let binding = self
+                .quality_forced_transform_bindings
+                .get_mut(&forced_key)
+                .and_then(|bindings| bindings.pop_front())
+                .ok_or_else(|| paro_error::internal("quality binding queue disappeared"))?;
+            if self
+                .quality_forced_transform_bindings
+                .get(&forced_key)
+                .is_some_and(|bindings| bindings.is_empty())
+            {
+                self.quality_forced_transform_bindings.remove(&forced_key);
+            }
+            self.quality_active_forced_transform_binding = Some((task, binding));
+            self.quality_producer_dispatch_count += 1;
+            self.quality_direct_binding_dispatch_count += 1;
+            let elapsed = self
+                .profile_elapsed_us()
+                .unwrap_or_else(|| self.memo.control().elapsed_us());
+            self.quality_direct_binding_first_us.get_or_insert(elapsed);
+            self.quality_direct_binding_last_us = Some(elapsed);
+            return Ok(Some(ordinary_task));
+        }
+        let mut obligations = obligations.into_iter().collect::<Vec<_>>();
+        if let Some(previous) = self.quality_last_production_obligation {
+            let start = obligations.partition_point(|(obligation, _)| *obligation <= previous);
+            obligations.rotate_left(start);
+        }
+        for (obligation, choices) in obligations {
+            let key = choices
+                .into_iter()
+                .filter_map(|choice| {
+                    agenda.matching_choice_key(choice, |id| {
+                        self.registry
+                            .transformation(id)
+                            .is_some_and(|rule| produces(obligation.0, rule.quality_dependency()))
+                    })
+                })
+                .min();
+            if let Some(key) = key {
+                let task = agenda
+                    .tasks
+                    .remove(&key)
+                    .expect("indexed producer disappeared");
+                agenda.keys.remove(&task);
+                self.quality_last_production_obligation = Some(obligation);
+                self.quality_producer_dispatch_count += 1;
+                return Ok(Some(task));
+            }
+        }
+        Ok(agenda.pop())
+    }
+}
