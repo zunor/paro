@@ -251,6 +251,12 @@ impl<P> PhysicalPlanPortfolio<P> {
         let selected = variants
             .get(selected_index)
             .expect("selected portfolio index must remain valid");
+        if paro_context::StatementTrace::enabled() {
+            tracing::info!(target: "paro::optimizer::admission_identity",
+                class = selected_class.id.0,
+                physical_fingerprint = ?selected.physical_fingerprint,
+                "diagnostic portfolio admission choice");
+        }
         Ok(AdmittedPlan {
             resources: ExecutionResourceContract {
                 class: selected_class.id,
