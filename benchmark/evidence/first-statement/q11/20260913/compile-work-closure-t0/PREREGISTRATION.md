@@ -7,7 +7,7 @@ The source for every performance run is an unchanged clean detached worktree.
 The withdrawn allocation repair and the leftover executor/debug modifications
 are excluded. Old dirty-worktree timings are context only.
 
-Normal: original archived Q11 at /private/tmp/paro-q11-query-s0bTho/11.sql,
+Normal: original archived Q11 at benchmark/evidence/first-statement/q11/20260910/early-stop-v1/11.sql,
 SF1 data at /Users/linjunhong/workspace/tpcds-sf1/csv, DuckDB tpcds-sf1.duckdb,
 immutable Paro seed /private/tmp/paro-necessary-domain-seed-direct-v1. Harness
 records hashes; if corpus/seed differs from the preceding report, stop and
