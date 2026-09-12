@@ -399,6 +399,7 @@ pub struct Optimizer {
     ctx: OptimizationContext,
     budget: SearchBudget,
     calibration: Arc<MachineCalibrationBundle>,
+    compile_work: paro_context::CompileWork,
 }
 
 /// Complete optimizer output.  Execution receives no logical tree and makes
@@ -419,12 +420,17 @@ impl Optimizer {
             binder,
             budget: SearchBudget::default(),
             calibration: Arc::new(MachineCalibrationBundle::builtin_production()),
+            compile_work: Default::default(),
         }
     }
 
     pub fn with_budget(mut self, budget: SearchBudget) -> Self {
         self.budget = budget;
         self
+    }
+
+    pub fn compile_work(&self) -> paro_context::CompileWork {
+        self.compile_work
     }
 
     pub fn with_calibration(mut self, calibration: Arc<MachineCalibrationBundle>) -> Self {
@@ -1023,6 +1029,13 @@ impl Optimizer {
                     search_phase_allocated,
                 )
             };
+        if paro_context::compile_work_evidence_enabled() {
+            self.compile_work.rule_elapsed_us = extraction.rule_elapsed.values()
+                .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+                .fold(0u64, u64::saturating_add);
+            self.compile_work.child_combination_cost_synthesis_count = extraction.search_summary
+                .work_counters.get("child_combination_cost_synthesis_count").copied().unwrap_or(0);
+        }
         self.ctx
             .profiler
             .record_rule_attempts(extraction.rule_attempts.clone());

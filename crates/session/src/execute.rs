@@ -447,12 +447,12 @@ impl Session {
         let cached_plan = shared_plan_cache_eligible
             .then(|| self.reusable_instance_query_plan(&stmt, &[], ctx.as_ref()))
             .flatten();
-        if shared_plan_cache_eligible {
+        let cache_occurrence = if shared_plan_cache_eligible {
             self.record_statement_cache_decision(
                 statement_fingerprint(&stmt.to_string()),
                 cached_plan.is_some(),
-            );
-        }
+            )
+        } else { None };
         if let Some(trace) = ctx.statement_trace() {
             trace.record_event(
                 "compile",
@@ -508,6 +508,9 @@ impl Session {
             }
         };
         if shared_plan_cache_eligible && cached_plan.is_none() {
+            if let (Some(occurrence), Some(work)) = (cache_occurrence, compiled.compile_work()) {
+                ctx.diagnostics.publish_compile_work(statement_fingerprint(&stmt.to_string()), occurrence, work);
+            }
             self.publish_instance_query_plan(
                 stmt.clone(),
                 Vec::new(),

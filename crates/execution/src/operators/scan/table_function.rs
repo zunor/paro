@@ -1076,6 +1076,24 @@ fn populate_paro_optimizers(
                     invocation_count: 1,
                 }),
         );
+        for decision in ctx.diagnostics.statement_cache_snapshot() {
+            let Some(work) = decision.compile_work else { continue };
+            for (name, value, unit) in [
+                ("compiler_elapsed_us", work.compiler_elapsed_us, "microseconds"),
+                ("optimizer_elapsed_us", work.optimizer_elapsed_us, "microseconds"),
+                ("rule_elapsed_us", work.rule_elapsed_us, "microseconds"),
+                ("child_combination_cost_synthesis_count", work.child_combination_cost_synthesis_count, "count"),
+            ] {
+                entries.push(OptimizerData {
+                    name: format!("statement_compile_work/{:016x}/{}/{}", decision.query_fingerprint, decision.occurrence, name),
+                    kind: "evidence".into(),
+                    last_elapsed_us: 0,
+                    metric_value: i64::try_from(value).unwrap_or(i64::MAX),
+                    metric_unit: unit.into(),
+                    invocation_count: 1,
+                });
+            }
+        }
         populate_optimizer_data(state, entries);
     }
 }

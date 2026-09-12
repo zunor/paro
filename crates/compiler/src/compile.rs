@@ -89,6 +89,11 @@ pub fn compile_statement_with_parameter_types(
             return Err(error);
         }
     };
+    let compile_work = paro_context::compile_work_evidence_enabled().then(|| {
+        let mut work = optimizer.compile_work();
+        work.optimizer_elapsed_us = u64::try_from(optimizer_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        work
+    });
     if let Some(trace) = &statement_trace {
         trace.record_span("compile", "optimizer", optimizer_started);
     }
@@ -172,5 +177,11 @@ pub fn compile_statement_with_parameter_types(
         trace.record_event("compile", "compiler_return");
     }
 
-    Ok(compiled)
+    Ok(match compile_work {
+        Some(mut work) => {
+            work.compiler_elapsed_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+            compiled.with_compile_work(work)
+        }
+        None => compiled,
+    })
 }

@@ -381,11 +381,19 @@ def collect_statement_cache_evidence(
         name = str(matches[0][name_index])
         occurrence = int(name.rsplit("/", 1)[1])
         cache_hit = int(matches[0][value_index]) == 1
+        work_prefix = f"statement_compile_work/{fingerprint:016x}/{occurrence}/"
+        compile_work = {
+            str(row[name_index])[len(work_prefix):]: int(row[value_index])
+            for row in rows
+            if str(row[kind_index]) == "evidence"
+            and str(row[name_index]).startswith(work_prefix)
+        }
         return {
             "status": "verified",
             "query_fingerprint": fingerprint,
             "occurrence": occurrence,
             "cache_hit": cache_hit,
+            "compile_work": compile_work,
             "source": "paro_optimizers_post_timer_side_channel",
         }
     except (IndexError, KeyError, TypeError, ValueError, psycopg.Error) as error:

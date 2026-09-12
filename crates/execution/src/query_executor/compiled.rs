@@ -39,6 +39,7 @@ impl ResultColumnDesc {
 #[derive(Debug, Clone)]
 pub struct CompiledStatement {
     image: Arc<CompiledStatementImage>,
+    compile_work: Option<paro_context::CompileWork>,
 }
 
 #[derive(Debug)]
@@ -57,6 +58,7 @@ impl CompiledStatement {
         compile_environment: CompileEnvironmentKey,
     ) -> Self {
         Self {
+            compile_work: None,
             image: Arc::new(CompiledStatementImage {
                 program,
                 result_schema: result_schema.into_boxed_slice(),
@@ -64,6 +66,15 @@ impl CompiledStatement {
                 compile_environment,
             }),
         }
+    }
+
+    pub fn with_compile_work(mut self, work: paro_context::CompileWork) -> Self {
+        self.compile_work = Some(work);
+        self
+    }
+
+    pub fn compile_work(&self) -> Option<paro_context::CompileWork> {
+        self.compile_work
     }
 
     #[inline]

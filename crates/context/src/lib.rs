@@ -54,7 +54,7 @@ pub use query_resources::{
 };
 pub use runtime_limits::RuntimeLimits;
 pub use session_diagnostics::{
-    OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics, StatementCacheDecision,
+    compile_work_evidence_enabled, CompileWork, OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics, StatementCacheDecision,
 };
 pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,

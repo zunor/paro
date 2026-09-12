@@ -768,9 +768,8 @@ fn build_query_plan(
             return Ok(plan);
         }
     }
-    if share_across_sessions {
-        session.record_statement_cache_decision(cache_query_fingerprint, false);
-    }
+    let cache_occurrence = share_across_sessions.then(||
+        session.record_statement_cache_decision(cache_query_fingerprint, false)).flatten();
     if let Some(trace) = &statement_trace {
         trace.record_event("compile", "plan_cache_miss");
         trace.record_event("compile", "compiler_call_entry");
@@ -781,6 +780,9 @@ fn build_query_plan(
         trace.record_event("compile", "compiler_call_return");
     }
     let plan = compiled?;
+    if let (Some(occurrence), Some(work)) = (cache_occurrence, plan.compile_work()) {
+        snapshot.diagnostics.publish_compile_work(cache_query_fingerprint, occurrence, work);
+    }
     if share_across_sessions {
         session.publish_instance_query_plan(
             stmt,

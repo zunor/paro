@@ -1084,7 +1084,7 @@ impl Session {
     /// trace-off cold-miss side channel. The decision is read after the timed
     /// statement and therefore does not serialize a per-event trace to the
     /// normal C1 log.
-    pub(crate) fn record_statement_cache_decision(&self, query_fingerprint: u64, cache_hit: bool) {
+    pub(crate) fn record_statement_cache_decision(&self, query_fingerprint: u64, cache_hit: bool) -> Option<u64> {
         let enabled = std::env::var("PARO_STATEMENT_CACHE_EVIDENCE")
             .map(|value| {
                 !matches!(
@@ -1094,8 +1094,10 @@ impl Session {
             })
             .unwrap_or(false);
         if enabled {
-            self.diagnostics
-                .publish_statement_cache_decision(query_fingerprint, cache_hit);
+            Some(self.diagnostics
+                .publish_statement_cache_decision(query_fingerprint, cache_hit))
+        } else {
+            None
         }
     }
 
