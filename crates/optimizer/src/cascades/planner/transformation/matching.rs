@@ -958,6 +958,10 @@ fn enumerate_pattern_bindings(
         work_units: usize,
         reads: BTreeMap<GroupId, PatternRead>,
         witness_groups: BTreeMap<(GroupId, PatternWitness), bool>,
+        // Invocation-local negative DAG results. No Memo mutation can occur
+        // during enumeration; reads from the first traversal remain subscribed.
+        empty_non_null_inputs: BTreeSet<GroupId>,
+        recursion_cuts: usize,
         limited: bool,
         cancellation: Option<&'a paro_context::StatementCancellation>,
     }
@@ -1112,6 +1116,9 @@ fn enumerate_pattern_bindings(
             if let Some(cancellation) = self.cancellation {
                 cancellation.check()?;
             }
+            if matches!(scope, PatternScope::NonNullInput) && !self.admit_work(1)? {
+                return Ok(Vec::new());
+            }
             let group = self.memo.canonical_group(group);
             let group_ref = self.memo.group(group).ok_or_else(|| {
                 paro_error::internal("pattern matcher references an unknown Memo group")
@@ -1139,6 +1146,7 @@ fn enumerate_pattern_bindings(
                 return Ok(Vec::new());
             }
             if !active.insert(group) {
+                self.recursion_cuts = self.recursion_cuts.saturating_add(1);
                 // A CTE ownership proof must enumerate every occurrence in
                 // its consumer scope. A recursion cut is not evidence that a
                 // subtree contains no reference; decline this cyclic binding
@@ -1157,6 +1165,13 @@ fn enumerate_pattern_bindings(
                 fingerprint.write_u64(group.0 as u64);
                 return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
             }
+            if matches!(scope, PatternScope::NonNullInput)
+                && self.empty_non_null_inputs.contains(&group)
+            {
+                active.remove(&group);
+                return Ok(Vec::new());
+            }
+            let recursion_cuts = self.recursion_cuts;
             let mut expressions = group_ref.logical_exprs().to_vec();
             expressions.sort_by_key(|expression| {
                 self.memo
@@ -1180,6 +1195,16 @@ fn enumerate_pattern_bindings(
             active.remove(&group);
             result.sort_by_key(|(_, fingerprint)| *fingerprint);
             result.dedup_by_key(|(_, fingerprint)| *fingerprint);
+            // NonNullInput follows only unary transparent shells to Get.
+            // A fully inspected failure is independent of the caller's path.
+            // Never reuse truncation or a recursion-cut result as absence.
+            if matches!(scope, PatternScope::NonNullInput)
+                && result.is_empty()
+                && !self.limited
+                && recursion_cuts == self.recursion_cuts
+            {
+                self.empty_non_null_inputs.insert(group);
+            }
             Ok(result)
         }
 
@@ -1192,6 +1217,9 @@ fn enumerate_pattern_bindings(
         ) -> Result<Vec<(PatternOperand, Fingerprint)>> {
             if let Some(cancellation) = self.cancellation {
                 cancellation.check()?;
+            }
+            if matches!(scope, PatternScope::NonNullInput) && !self.admit_work(1)? {
+                return Ok(Vec::new());
             }
             if self.work_units >= self.limit {
                 self.limited = true;
@@ -1392,6 +1420,8 @@ fn enumerate_pattern_bindings(
         work_units: 0,
         reads: BTreeMap::new(),
         witness_groups: BTreeMap::new(),
+        empty_non_null_inputs: BTreeSet::new(),
+        recursion_cuts: 0,
         limited: false,
         cancellation,
     };
@@ -1578,6 +1608,10 @@ fn transformation_root_operator_matches(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "matching_failure_tests.rs"]
+mod failure_tests;
 
 #[cfg(test)]
 mod tests {
