@@ -6481,6 +6481,12 @@ impl CascadesEngine {
                 task
             }
             TaskRequest::Reused { task, outcome } => {
+                let recipe_domain_advanced = self
+                    .physical_task_cache
+                    .get(&cache_key)
+                    .is_some_and(|cached| next_recipe_sequence > cached.recipe_cursor)
+                    || force_full_recost
+                    || dirty_recipes.as_ref().is_some_and(|dirty| !dirty.is_empty());
                 let incomplete = outcome.as_ref().is_some_and(|outcome| {
                     matches!(
                         outcome,
@@ -6491,7 +6497,23 @@ impl CascadesEngine {
                                 .is_some_and(|cursor| !cursor.complete)
                     )
                 });
-                if !self.mandatory_only
+                if !incomplete && recipe_domain_advanced {
+                    // Own physical writes are deliberately absent from the
+                    // task ReadSet. A completed prefix cannot certify recipes
+                    // appended later under that same read context.
+                    let cursor = self
+                        .task_registry
+                        .task(task)
+                        .and_then(|record| self.task_registry.cursor(record.cursor))
+                        .unwrap_or_default();
+                    self.task_registry.advance_cursor(
+                        task,
+                        Cursor { complete: false, ..cursor },
+                    )?;
+                    self.physical_completion_proofs.remove(&cache_key);
+                    resume_candidate = true;
+                    task
+                } else if !self.mandatory_only
                     && (!self.preserve_incomplete_physical || self.physical_interleave_step_mode)
                     && incomplete
                 {
@@ -6568,7 +6590,7 @@ impl CascadesEngine {
         // is append-only, so a predecessor cursor is sufficient to visit only
         // newly published expressions. The cursor is task-owned progress;
         // the predecessor result itself is never reused as a winner.
-        let recipe_cursor = if resume_candidate && self.physical_interleave_step_mode {
+        let recipe_cursor = if resume_candidate {
             // Resume the current evaluation. Its predecessor belongs to the
             // prior read-set epoch and may still point at the beginning of
             // the recipe stream even when this task yielded mid-recipe.
@@ -8103,7 +8125,7 @@ impl CascadesEngine {
                     }
                     continue;
                 }
-                if combination_state.budget_rejected.contains(&child_ids) {
+                if !pending_retry && combination_state.budget_rejected.contains(&child_ids) {
                     continue;
                 }
                 if !pending_retry {

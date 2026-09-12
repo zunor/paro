@@ -42,6 +42,9 @@ use crate::physical::ObjectiveProfile;
 #[path = "tests/closure.rs"]
 mod closure;
 
+#[path = "tests/recipe_resume.rs"]
+mod recipe_resume;
+
 #[path = "tests/grant_capacity.rs"]
 mod grant_capacity;
 
