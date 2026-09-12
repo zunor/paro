@@ -2949,9 +2949,7 @@ impl CascadesEngine {
         if self.physical_interleave_step_mode {
             self.physical_interleave_step_publications =
                 self.physical_interleave_step_publications.saturating_add(1);
-            if self.physical_interleave_step_publications >= PUBLICATIONS_PER_STEP
-                && !self.physical_interleave_step_yielded
-            {
+            if self.physical_interleave_step_publications >= PUBLICATIONS_PER_STEP {
                 self.physical_interleave_step_yielded = true;
                 return true;
             }
@@ -7795,6 +7793,7 @@ impl CascadesEngine {
             }
             let mut baseline_child_selections = Vec::with_capacity(recipe.child_goals.len());
             let mut children_feasible = true;
+            let mut child_yielded = false;
             for ((child, child_goal), frontier_out) in recipe
                 .child_goals
                 .iter()
@@ -7811,21 +7810,23 @@ impl CascadesEngine {
                     recipe.physical_fingerprint,
                 );
                 if optimized_children.insert((child, child_goal)) {
-                    self.optimize_group(child, child_goal)?;
-                    if self.physical_interleave_step_mode && self.physical_interleave_step_yielded {
-                        // The child published a frontier delta during this
-                        // readiness step. Do not continue constructing a
-                        // parent response from an arbitrarily large sibling
-                        // domain; the parent task itself will resume from
-                        // this recipe after the child/ancestor wake-up.
-                        return Ok(Some(sequence));
+                    // A child yields a usable prefix, not a barrier requiring
+                    // its entire domain to finish before a parent can respond.
+                    // Once one child yields, consume only already-published
+                    // siblings; do not start another recursive search here.
+                    if !(self.physical_interleave_step_mode && self.physical_interleave_step_yielded) {
+                        self.optimize_group(child, child_goal)?;
                     }
                 }
+                child_yielded |= self.physical_interleave_step_mode && self.physical_interleave_step_yielded;
                 let Some(frontier) = self
                     .memo
                     .group(child)
                     .and_then(|group| group.winner_frontier(child_goal))
                 else {
+                    if child_yielded {
+                        return Ok(Some(sequence));
+                    }
                     tracing::debug!(
                         target: "paro::optimizer",
                         parent_group = group.index(),
@@ -7883,6 +7884,9 @@ impl CascadesEngine {
                 }
             }
             if !children_feasible {
+                if child_yielded {
+                    return Ok(Some(sequence));
+                }
                 continue;
             }
             if child_bound.is_none()
@@ -7893,6 +7897,9 @@ impl CascadesEngine {
                     BoundCheckLocation::AfterChildren,
                 )? == Some(true)
             {
+                if child_yielded {
+                    return Ok(Some(sequence));
+                }
                 continue;
             }
             // Enforcement depends only on the physical expression and the
@@ -7918,6 +7925,9 @@ impl CascadesEngine {
                     physical_expression = physical.index(),
                     "physical recipe rejected because its required enforcer is absent from the execution ABI"
                 );
+                if child_yielded {
+                    return Ok(Some(sequence));
+                }
                 continue;
             };
             let Some(enforcer_phase) = enforcer_cost(
@@ -7933,6 +7943,9 @@ impl CascadesEngine {
                     ?enforced.steps,
                     "physical recipe rejected because its enforcer chain is infeasible"
                 );
+                if child_yielded {
+                    return Ok(Some(sequence));
+                }
                 continue;
             };
             let current_frontier_ids = child_frontiers
@@ -7959,6 +7972,12 @@ impl CascadesEngine {
                 .remove(&recipe_key)
                 .unwrap_or_default();
             let mut yield_after_publication = false;
+            // At most one ordinary admission/composition attempt per waiting
+            // parent frame after a child yield. The attempt uses the same
+            // budget ledger and CandidateId cursor, including rejection. This
+            // is an explicit response opportunity, not a free full Cartesian
+            // product or a claim that the whole coordinator turn is bounded.
+            let mut yielded_response_attempted = false;
             let context_changed = combination_state.cost_context != Some(cost_context);
             if context_changed {
                 self.child_combination_recompute_count =
@@ -8002,8 +8021,10 @@ impl CascadesEngine {
                             && combination_state.active(&cached.children)
                     })
                     .map(|(children, _)| children.clone())
+                    .take(if child_yielded { 1 } else { usize::MAX })
                     .collect::<Vec<_>>();
                 for children in rechecks {
+                    yielded_response_attempted = true;
                     let (frontier_changed, selected_changed, published_candidate) = self
                         .admit_cached_child_combination(
                             group,
@@ -8043,7 +8064,7 @@ impl CascadesEngine {
                     }
                 }
             }
-            if yield_after_publication {
+            if yield_after_publication || (child_yielded && yielded_response_attempted) {
                 self.child_combination_states
                     .insert(recipe_key, combination_state);
                 return Ok(Some(sequence));
@@ -8058,6 +8079,9 @@ impl CascadesEngine {
             child_fingerprints.reserve(child_frontier_count);
             let mut budget_blocked = false;
             while self.memo.control().checkpoint()? {
+                if child_yielded && yielded_response_attempted {
+                    break;
+                }
                 let pending = combination_state
                     .budget_rejected
                     .iter()
@@ -8075,6 +8099,7 @@ impl CascadesEngine {
                 } else {
                     break;
                 };
+                yielded_response_attempted = true;
                 let Ok(children) = child_combination_refs(&child_ids, &child_frontiers) else {
                     continue;
                 };
@@ -8324,7 +8349,7 @@ impl CascadesEngine {
                     "child combination pricing paused by budget"
                 );
             }
-            if yield_after_publication {
+            if yield_after_publication || child_yielded {
                 self.child_combination_states
                     .insert(recipe_key, combination_state);
                 return Ok(Some(sequence));

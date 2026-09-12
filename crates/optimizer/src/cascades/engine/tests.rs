@@ -45,6 +45,9 @@ mod closure;
 #[path = "tests/recipe_resume.rs"]
 mod recipe_resume;
 
+#[path = "tests/parent_response.rs"]
+mod parent_response;
+
 #[path = "tests/grant_capacity.rs"]
 mod grant_capacity;
 
