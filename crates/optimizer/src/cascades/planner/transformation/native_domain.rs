@@ -199,8 +199,11 @@ pub(super) fn transfer_shell(
             };
             let mut moved = Vec::new();
             for predicate in predicates {
-                if let Some(predicate) = aggregate_domain(&predicate, aggregate, layout) {
-                    moved.push(predicate);
+                if let Some((necessary, retain)) = aggregate_domain(&predicate, aggregate, layout) {
+                    moved.push(necessary);
+                    if retain {
+                        remaining.push(predicate);
+                    }
                 } else {
                     remaining.push(predicate);
                 }
@@ -440,14 +443,14 @@ fn aggregate_domain(
     predicate: &Expression,
     aggregate: &Aggregate<NativeChild>,
     child_layout: &LogicalOutputLayout,
-) -> Option<Expression> {
+) -> Option<(Expression, bool)> {
     let operator = LogicalOperator::Aggregate(Box::new(aggregate.clone()));
     let routed =
         domain_transfer::transfer_predicates(&operator, &[child_layout], &[predicate.clone()])?;
-    if !routed.remaining.is_empty() {
-        return None;
-    }
-    routed.child_predicates.first()?.first().cloned()
+    Some((
+        routed.child_predicates.first()?.first()?.clone(),
+        !routed.remaining.is_empty(),
+    ))
 }
 
 fn union_domain(
@@ -606,7 +609,7 @@ fn push_domain(
             let mut moved = false;
             for original_predicate in predicates {
                 let child_layout = native_child_layout(&aggregate.child, layouts)?;
-                let Some(predicate) =
+                let Some((predicate, retain)) =
                     aggregate_domain(&original_predicate, &aggregate, &child_layout)
                 else {
                     remaining.push(original_predicate);
@@ -624,6 +627,9 @@ fn push_domain(
                 if routed.moved && routed.remaining.is_empty() {
                     aggregate.child = routed.child;
                     moved = true;
+                    if retain {
+                        remaining.push(original_predicate);
+                    }
                 } else {
                     *nodes = snapshot_nodes;
                     *layouts = snapshot_layouts;
@@ -632,6 +638,25 @@ fn push_domain(
             }
             if moved {
                 nodes[index].operator = LogicalOperator::Aggregate(aggregate);
+            }
+            // A necessary input condition does not discharge the original
+            // aggregate-output predicate. Materialize that residual here, in
+            // its original namespace, so enclosing projections can accept the
+            // completed route without dropping or rebinding the residual.
+            if moved && !remaining.is_empty() {
+                let child = add_native_filter(
+                    nodes,
+                    layouts,
+                    NativeChild::Node(index),
+                    remaining,
+                    paro_planner::operator::ProjectionMap::all(),
+                    state,
+                )?;
+                return Ok(RoutedDomain {
+                    child,
+                    remaining: Vec::new(),
+                    moved,
+                });
             }
             Ok(RoutedDomain {
                 child: NativeChild::Node(index),

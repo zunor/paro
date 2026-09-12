@@ -13,6 +13,10 @@
 use super::*;
 use crate::expression::traversal::visit_expression;
 use crate::filter::pushdown::FilterPushdown;
+use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
+#[cfg(test)]
+#[path = "domain_transfer_tests.rs"]
+mod tests;
 use paro_planner::operator::{
     Aggregate, Join, JoinType, LogicalOutputLayout, Projection, SetOpType, SetOperation,
 };
@@ -28,6 +32,9 @@ use paro_planner::operator::{
 pub(super) struct OperatorDomainTransfer {
     pub(super) child_predicates: Box<[Box<[Expression]>]>,
     pub(super) remaining: Box<[Expression]>,
+    /// Residuals whose necessary-domain coverage is not established. They
+    /// must not be certified as a legal barrier merely because routing stops.
+    pub(super) unsupported: bool,
 }
 
 impl OperatorDomainTransfer {
@@ -139,7 +146,7 @@ fn projection_predicate<Child>(
                     Expression::ColumnRef(projected) => {
                         projected.depth == 0 && child_layout.bindings().contains(&projected.binding)
                     }
-                    Expression::Constant(_) => false,
+                    Expression::Constant(_) => true,
                     _ => false,
                 });
         }
@@ -147,12 +154,51 @@ fn projection_predicate<Child>(
     if !mapped {
         return None;
     }
-    Some(predicate.clone().replace_column_ref(&|column| {
+    let mut mapped = predicate.clone().replace_column_ref(&|column| {
         projection
             .expressions
             .get(column.binding.column_index)
             .cloned()
-    }))
+    });
+    crate::expression::scalar_normalizer()
+        .rewrite_expression(&mut mapped, &LogicalOperator::DummyScan);
+    Some(mapped)
+}
+
+/// Abstract a predicate to a necessary condition in the grouping-key domain.
+/// An unavailable atom denotes TRUE (no restriction), never an empty domain.
+/// AND may retain supported conjuncts; OR needs a condition from every arm.
+/// This is linear in the expression tree and never distributes into DNF.
+fn aggregate_necessary_predicate<Child>(
+    predicate: &Expression,
+    aggregate: &Aggregate<Child>,
+    child_layout: &LogicalOutputLayout,
+    depth: usize,
+) -> Option<Expression> {
+    if depth == 128 || !aggregate.has_plain_grouping_domain() || !is_local_domain(predicate) {
+        return None;
+    }
+    if let Some(mapped) = aggregate_predicate(predicate, aggregate, child_layout) {
+        return Some(mapped);
+    }
+    let Expression::Conjunction(conjunction) = predicate else {
+        return None;
+    };
+    let mut children = Vec::new();
+    for child in &conjunction.children {
+        match aggregate_necessary_predicate(child, aggregate, child_layout, depth + 1) {
+            Some(mapped) => children.push(mapped),
+            None if conjunction.conjunction_type == ConjunctionType::And => {}
+            None => return None,
+        }
+    }
+    match children.len() {
+        0 => None,
+        1 => children.pop(),
+        _ => Some(Expression::Conjunction(
+            ConjunctionExpression::new(conjunction.conjunction_type, children).into(),
+        )),
+    }
 }
 
 fn aggregate_predicate<Child>(
@@ -264,7 +310,12 @@ pub(super) fn transfer_predicates<Child>(
 
     let mut child_predicates = vec![Vec::new(); child_count];
     let mut remaining = Vec::new();
+    let mut unsupported = false;
     for predicate in predicates {
+        if predicate.evaluation_properties().is_reorder_fence() {
+            remaining.push(predicate.clone());
+            continue;
+        }
         match operator {
             LogicalOperator::Filter(_) => {
                 let LogicalOperator::Filter(filter) = operator else {
@@ -282,6 +333,10 @@ pub(super) fn transfer_predicates<Child>(
                 {
                     child_predicates[0].push(predicate.clone());
                 } else {
+                    unsupported |= !filter
+                        .expressions
+                        .iter()
+                        .any(|expression| expression.evaluation_properties().is_reorder_fence());
                     remaining.push(predicate.clone());
                 }
             }
@@ -297,6 +352,10 @@ pub(super) fn transfer_predicates<Child>(
                 {
                     child_predicates[0].push(mapped);
                 } else {
+                    unsupported |= !projection
+                        .expressions
+                        .iter()
+                        .any(|expression| expression.evaluation_properties().is_reorder_fence());
                     remaining.push(predicate.clone());
                 }
             }
@@ -307,6 +366,38 @@ pub(super) fn transfer_predicates<Child>(
                 if let Some(mapped) = aggregate_predicate(predicate, aggregate, child_layouts[0]) {
                     child_predicates[0].push(mapped);
                 } else {
+                    if aggregate.has_plain_grouping_domain() {
+                        unsupported |= !is_local_domain(predicate);
+                        visit_expression(predicate, &mut |part| {
+                            if let Expression::ColumnRef(column) = part {
+                                if column.binding.table_index == aggregate.group_index {
+                                    unsupported |= !aggregate
+                                        .groups
+                                        .get(column.binding.column_index)
+                                        .is_some_and(|group| {
+                                            predicate_is_local_to_layout(group, child_layouts[0])
+                                        });
+                                }
+                            }
+                        });
+                        let mut depth_stack = vec![(predicate, 0usize)];
+                        while let Some((part, depth)) = depth_stack.pop() {
+                            if depth >= 128 {
+                                unsupported = true;
+                                break;
+                            }
+                            if let Expression::Conjunction(conjunction) = part {
+                                depth_stack.extend(
+                                    conjunction.children.iter().map(|child| (child, depth + 1)),
+                                );
+                            }
+                        }
+                    }
+                    if let Some(necessary) =
+                        aggregate_necessary_predicate(predicate, aggregate, child_layouts[0], 0)
+                    {
+                        child_predicates[0].push(necessary);
+                    }
                     remaining.push(predicate.clone());
                 }
             }
@@ -327,6 +418,7 @@ pub(super) fn transfer_predicates<Child>(
                     child_predicates[0].push(left);
                     child_predicates[1].push(right);
                 } else {
+                    unsupported |= !matches!(predicate, Expression::Constant(_));
                     remaining.push(predicate.clone());
                 }
             }
@@ -353,5 +445,6 @@ pub(super) fn transfer_predicates<Child>(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         remaining: remaining.into_boxed_slice(),
+        unsupported,
     })
 }

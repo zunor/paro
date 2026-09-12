@@ -824,3 +824,130 @@ fn domain_refresh_prunes_child_filter_to_parent_aggregate_demand() {
         "child filter output must drop 0:2, which its parent aggregate does not read"
     );
 }
+
+#[test]
+fn production_selected_binding_derives_mixed_aggregate_domain_through_constant_projection() {
+    use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
+    let constant = |v| {
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(v), LogicalType::Integer).into(),
+        )
+    };
+    let compare = |left, right| {
+        Expression::Comparison(ComparisonExpression::new(ComparisonType::Equal, left, right).into())
+    };
+    let and = |children| {
+        Expression::Conjunction(ConjunctionExpression::new(ConjunctionType::And, children).into())
+    };
+    let input = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            vec![vec![constant(1)], vec![constant(2)], vec![constant(3)]],
+            vec!["key".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(
+            paro_function::aggregate::distributive::count::get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
+    let aggregate =
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
+            10,
+            11,
+            12,
+            input,
+            vec![column(0, 0)],
+            vec![],
+            vec![count],
+            vec![],
+        ))));
+    let aggregate_column = Expression::ColumnRef(
+        ColumnRefExpression::new(ColumnBinding::new(11, 0), LogicalType::BigInt).into(),
+    );
+    let projection = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        20,
+        aggregate,
+        vec![constant(7), column(10, 0), aggregate_column],
+    )));
+    let total = Expression::ColumnRef(
+        ColumnRefExpression::new(ColumnBinding::new(20, 2), LogicalType::BigInt).into(),
+    );
+    let positive = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            total,
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(0), LogicalType::BigInt).into(),
+            ),
+        )
+        .into(),
+    );
+    let predicate = and(vec![
+        compare(column(20, 0), constant(7)),
+        Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![
+                    compare(column(20, 1), constant(2)),
+                    and(vec![compare(column(20, 1), constant(1)), positive]),
+                ],
+            )
+            .into(),
+        ),
+    ]);
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        projection,
+        vec![predicate],
+    )));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::PredicateTransfer,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .selected_quality_bindings(engine.memo(), &root)
+        .unwrap();
+    assert_eq!(
+        bindings.len(),
+        1,
+        "constant output must not block the selected route"
+    );
+    let before = state.read().unwrap().payloads.logical.len();
+    let mut context = TransformContext::new(engine.memo_mut(), bindings[0].root_group());
+    let outputs = rule.apply_binding(&bindings[0], &mut context).unwrap();
+    assert_eq!(
+        outputs.len(),
+        1,
+        "mixed predicate must produce a staged input restriction"
+    );
+    let state = state.read().unwrap();
+    let mut input_domain = false;
+    let mut output_residual = false;
+    for payload in &state.payloads.logical[before..] {
+        if let LogicalOperator::Filter(filter) = &payload.semantic_template.operator {
+            for predicate in &filter.expressions {
+                let mut tables = BTreeSet::new();
+                visit_expression(predicate, &mut |part| {
+                    if let Expression::ColumnRef(column) = part {
+                        tables.insert(column.binding.table_index);
+                    }
+                });
+                input_domain |= tables == BTreeSet::from([0]);
+                output_residual |= tables.contains(&11);
+            }
+        }
+    }
+    assert!(
+        input_domain,
+        "native publication omitted the necessary source-key restriction"
+    );
+    assert!(
+        output_residual,
+        "aggregate result predicate must remain above aggregation"
+    );
+}

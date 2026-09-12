@@ -53,23 +53,166 @@ fn can_advance(
         .collect::<Vec<_>>();
     match domain_transfer::transfer_predicates(operator, &layouts, std::slice::from_ref(predicate))
     {
+        Some(routed) if routed.unsupported => None,
         Some(routed) => Some(routed.has_moved()),
         // A known leaf/control boundary is a semantic no-op for this local
         // transfer. Missing layouts or malformed supported operators remain
         // unavailable evidence and must not look like a completed barrier.
-        None if !matches!(
-            operator,
-            LogicalOperator::Filter(_)
-                | LogicalOperator::Projection(_)
-                | LogicalOperator::Aggregate(_)
-                | LogicalOperator::SetOperation(_)
-                | LogicalOperator::Join(_)
-        ) =>
+        None if child_layouts.is_empty()
+            && matches!(
+                operator,
+                LogicalOperator::Get(_)
+                    | LogicalOperator::ExpressionGet(_)
+                    | LogicalOperator::DummyScan
+                    | LogicalOperator::GraphScan(_)
+                    | LogicalOperator::TableFunctionGet(_)
+                    | LogicalOperator::SearchScan(_)
+                    | LogicalOperator::FullTextFilterScan(_)
+                    | LogicalOperator::CTERef(_)
+                    | LogicalOperator::DelimGet(_)
+            ) =>
+        {
+            Some(false)
+        }
+        None if child_layouts.len() == 1
+            && matches!(
+                operator,
+                LogicalOperator::Limit(_)
+                    | LogicalOperator::TopN(_)
+                    | LogicalOperator::EmptyResult(_)
+            ) =>
         {
             Some(false)
         }
         None => None,
     }
+}
+
+/// Prove consumption on every routed, selected child. The residual at this
+/// boundary belongs to the native rewrite; it is not another child request.
+fn selected_routes_consumed(
+    node: &FrozenCandidate,
+    routed: &domain_transfer::OperatorDomainTransfer,
+    state: &PlannerTransformState,
+) -> bool {
+    !routed.unsupported
+        && routed.has_moved()
+        && node.logical.key.children.len() == node.children.len()
+        && routed.child_predicates.len() == node.children.len()
+        && routed
+            .child_predicates
+            .iter()
+            .zip(node.children.iter())
+            .all(|(predicates, child)| {
+                predicates.is_empty() || selected_consumes(child, predicates, state)
+            })
+}
+
+/// Only an actual Filter is evidence. AND terms may be covered separately;
+/// OR branches and unrelated selected siblings cannot discharge each other.
+fn selected_consumes(
+    node: &FrozenCandidate,
+    predicates: &[Expression],
+    state: &PlannerTransformState,
+) -> bool {
+    use crate::expression::traversal::into_associative_terms;
+    use paro_planner::expression::ConjunctionType;
+
+    let normalized_terms = |expression: &Expression| {
+        let mut expression = expression.clone();
+        crate::expression::scalar_normalizer()
+            .rewrite_expression(&mut expression, &LogicalOperator::DummyScan);
+        into_associative_terms(expression, ConjunctionType::And)
+    };
+    let Some(payload) = state.payloads.logical.get(node.logical.payload.index()) else {
+        return false;
+    };
+    let Some(metadata) = state.metadata.get(&node.logical.payload) else {
+        return false;
+    };
+    if metadata.child_layouts.len() != node.children.len()
+        || node.logical.key.children.len() != node.children.len()
+    {
+        return false;
+    }
+    let operator = &payload.semantic_template.operator;
+    let layouts = metadata
+        .child_layouts
+        .iter()
+        .map(|layout| layout.as_ref())
+        .collect::<Vec<_>>();
+    let mut uncovered = predicates
+        .iter()
+        .flat_map(&normalized_terms)
+        .collect::<Vec<_>>();
+    if let LogicalOperator::Filter(filter) = operator {
+        let [layout] = layouts.as_slice() else {
+            return false;
+        };
+        if !filter.projection_map.is_identity(layout.len())
+            || filter
+                .expressions
+                .iter()
+                .any(|expression| expression.evaluation_properties().is_reorder_fence())
+        {
+            return false;
+        }
+        let enforced = filter
+            .expressions
+            .iter()
+            .filter(|expression| domain_transfer::predicate_is_local_to_layout(expression, layout))
+            .flat_map(&normalized_terms)
+            .collect::<Vec<_>>();
+        uncovered.retain(|predicate| {
+            !enforced
+                .iter()
+                .any(|expression| expression.equals(predicate))
+        });
+        if uncovered.is_empty() {
+            return true;
+        }
+    }
+    if matches!(operator, LogicalOperator::Projection(_)) {
+        let [child] = node.children.as_ref() else {
+            return false;
+        };
+        if selected_is_graph_chain(child, state) != Some(false) {
+            return false;
+        }
+    }
+    let Some(routed) = domain_transfer::transfer_predicates(operator, &layouts, &uncovered) else {
+        return false;
+    };
+    // A weaker necessary condition deeper in the tree does not prove that
+    // the domain requested here was consumed in full.
+    routed.remaining.is_empty() && selected_routes_consumed(node, &routed, state)
+}
+
+fn selected_transfer_consumed(
+    node: &FrozenCandidate,
+    predicate: &Expression,
+    state: &PlannerTransformState,
+) -> bool {
+    let Some(payload) = state.payloads.logical.get(node.logical.payload.index()) else {
+        return false;
+    };
+    let Some(metadata) = state.metadata.get(&node.logical.payload) else {
+        return false;
+    };
+    if metadata.child_layouts.len() != node.children.len() {
+        return false;
+    }
+    let layouts = metadata
+        .child_layouts
+        .iter()
+        .map(|layout| layout.as_ref())
+        .collect::<Vec<_>>();
+    domain_transfer::transfer_predicates(
+        &payload.semantic_template.operator,
+        &layouts,
+        std::slice::from_ref(predicate),
+    )
+    .is_some_and(|routed| selected_routes_consumed(node, &routed, state))
 }
 
 pub(super) fn pending_transfers(
@@ -124,7 +267,9 @@ pub(super) fn pending_transfers(
                     &metadata.child_layouts,
                     projection_is_graph_chain,
                 )?;
-                advances |= !owner_fenced && transferable;
+                advances |= !owner_fenced
+                    && transferable
+                    && !selected_transfer_consumed(child, predicate, state);
             }
             if advances {
                 pending.push(node.reference.candidate);
@@ -237,6 +382,7 @@ fn selected_transfer_path_operand(
                 &metadata.child_layouts,
                 projection_is_graph_chain,
             ) == Some(true)
+                && !selected_transfer_consumed(node, predicate, state)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -253,13 +399,8 @@ fn selected_transfer_path_operand(
         &layouts,
         &movable,
     )?;
-    // A selected binding may only claim the exact path when every selected
-    // predicate crossed this operator.  Keeping the child routes while
-    // silently dropping `remaining` would make discovery and native rewrite
-    // disagree about which namespace still owns the residual predicate.
-    if !routed.remaining.is_empty() {
-        return None;
-    }
+    // Child routes include necessary domains. Native transfer retains the
+    // original residual at this boundary; the binding only selects its path.
     let children = node
         .logical
         .key
@@ -331,7 +472,7 @@ mod tests {
     use paro_function::scalar::{FunctionStability, ScalarFunction};
     use paro_planner::expression::{
         AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType,
-        ConstantExpression, FunctionExpression,
+        ConjunctionExpression, ConjunctionType, ConstantExpression, FunctionExpression,
     };
     use paro_planner::operator::{
         Aggregate, EmptyResult, ExpandDirection, ExpressionGet, Filter, GraphExpand, GraphScan,
@@ -345,12 +486,16 @@ mod tests {
     }
 
     fn equal(table: usize, index: usize) -> Expression {
+        equal_value(table, index, 2)
+    }
+
+    fn equal_value(table: usize, index: usize, value: i32) -> Expression {
         Expression::Comparison(
             ComparisonExpression::new(
                 ComparisonType::Equal,
                 column(table, index),
                 Expression::Constant(
-                    ConstantExpression::new(Value::Integer(2), LogicalType::Integer).into(),
+                    ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
                 ),
             )
             .into(),
@@ -623,7 +768,10 @@ mod tests {
         // graph execution is needed to test the selected-chain walk.
         let plan = filtered(
             projected(
-                filtered(filtered(input(0, 1), vec![equal(0, 0)]), vec![equal(0, 0)]),
+                filtered(
+                    filtered(input(0, 1), vec![equal_value(0, 0, 3)]),
+                    vec![equal_value(0, 0, 3)],
+                ),
                 10,
                 column(0, 0),
             ),
@@ -740,6 +888,52 @@ mod tests {
         assert_eq!(
             can_advance(&equal(10, 0), &fenced, &layouts, false),
             Some(false)
+        );
+        let computed = detached(projected(input(0, 1), 10, equal(0, 0)));
+        assert_eq!(
+            can_advance(&equal(10, 0), &computed, &layouts, false),
+            None,
+            "an unsupported computed projection is not a proven barrier"
+        );
+    }
+
+    #[test]
+    fn unsupported_mapping_keeps_quality_evidence_unavailable() {
+        let (engine, state, root) = frozen(filtered(
+            projected(input(0, 1), 10, column(0, 0)),
+            vec![equal(10, 0)],
+        ));
+        let mut state = state.write().unwrap();
+        state.payloads.logical[root.children[0].logical.payload.index()]
+            .semantic_template
+            .operator = detached(projected(input(0, 1), 10, equal(0, 0)));
+        assert!(pending_transfers(&root, &state).is_none());
+        assert!(selected_transfer_binding(engine.memo(), &root, &state).is_none());
+
+        let LogicalOperator::Filter(residual) = branch(0, true, true).into_operator() else {
+            unreachable!()
+        };
+        let aggregate = detached(*residual.child);
+        assert_eq!(
+            can_advance(
+                &residual.expressions[0],
+                &aggregate,
+                &[layout(&[(0, 0)])],
+                false
+            ),
+            Some(false)
+        );
+        let mut unsupported = equal(1, 0);
+        for _ in 0..130 {
+            unsupported = conjunction(
+                ConjunctionType::And,
+                vec![unsupported, residual.expressions[0].clone()],
+            );
+        }
+        assert_eq!(
+            can_advance(&unsupported, &aggregate, &[layout(&[(0, 0)])], false),
+            None,
+            "an exhausted abstraction must not certify a barrier"
         );
     }
 
@@ -879,5 +1073,163 @@ mod tests {
             matches!(&projection_children[0], PatternOperand::Expression { .. }),
             "the production binding stopped before the selected aggregate"
         );
+    }
+
+    fn conjunction(kind: ConjunctionType, expressions: Vec<Expression>) -> Expression {
+        Expression::Conjunction(ConjunctionExpression::new(kind, expressions).into())
+    }
+
+    #[test]
+    fn necessary_domain_residual_is_pending_only_until_selected_input_consumes_it() {
+        for kind in [ConjunctionType::And, ConjunctionType::Or] {
+            for consumed in [false, true] {
+                let LogicalOperator::Filter(residual) = branch(0, true, true).into_operator()
+                else {
+                    unreachable!()
+                };
+                let mixed = conjunction(
+                    ConjunctionType::And,
+                    vec![equal(1, 0), residual.expressions[0].clone()],
+                );
+                let predicate = if kind == ConjunctionType::Or {
+                    conjunction(kind, vec![mixed, equal(1, 0)])
+                } else {
+                    mixed
+                };
+                let aggregate = if consumed {
+                    branch(0, true, false)
+                } else {
+                    let LogicalOperator::Filter(filter) = branch(0, false, false).into_operator()
+                    else {
+                        unreachable!()
+                    };
+                    *filter.child
+                };
+                let (engine, state, root) = frozen(filtered(aggregate, vec![predicate]));
+                let state = state.read().unwrap();
+                assert_eq!(
+                    pending_transfers(&root, &state)
+                        .unwrap()
+                        .contains(&root.reference.candidate),
+                    !consumed
+                );
+                assert_eq!(
+                    selected_transfer_binding(engine.memo(), &root, &state).is_some(),
+                    !consumed
+                );
+                if consumed && kind == ConjunctionType::And {
+                    let LogicalOperator::Filter(filter) = &state.payloads.logical
+                        [root.logical.payload.index()]
+                    .semantic_template
+                    .operator
+                    else {
+                        unreachable!()
+                    };
+                    assert!(
+                        !selected_consumes(&root.children[0], &filter.expressions, &state),
+                        "consuming a necessary domain does not consume the aggregate residual"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consumption_follows_projection_and_requires_every_union_branch() {
+        for consumed in [[false, false], [true, false], [false, true], [true, true]] {
+            let child = |table, consumed| {
+                let input = if consumed {
+                    filtered(input(table, 1), vec![equal(table, 0)])
+                } else {
+                    filtered(input(table, 1), vec![equal_value(table, 0, 3)])
+                };
+                projected(input, table + 1, column(table, 0))
+            };
+            let union =
+                OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
+                    30,
+                    child(0, consumed[0]),
+                    child(10, consumed[1]),
+                    true,
+                    vec![LogicalType::Integer],
+                )));
+            let (engine, state, root) = frozen(filtered(union, vec![equal(30, 0)]));
+            let mut state = state.write().unwrap();
+            let expected = !consumed.into_iter().all(|value| value);
+            assert_eq!(
+                pending_transfers(&root, &state)
+                    .unwrap()
+                    .contains(&root.reference.candidate),
+                expected
+            );
+            assert_eq!(
+                selected_transfer_binding(engine.memo(), &root, &state).is_some(),
+                expected
+            );
+            if !expected {
+                let input_filter = &root.children[0].children[1].children[0];
+                state.metadata.remove(&input_filter.logical.payload);
+                assert!(!selected_transfer_consumed(
+                    &root.children[0],
+                    &equal(30, 0),
+                    &state
+                ));
+                assert!(selected_transfer_binding(engine.memo(), &root, &state).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn consumption_accepts_safe_and_coverage_but_not_or_or_weaker_domains() {
+        let and = conjunction(ConjunctionType::And, vec![equal(0, 0), equal(0, 1)]);
+        let or = conjunction(ConjunctionType::Or, vec![equal(0, 0), equal(0, 1)]);
+        for (enforced, requested, expected) in [
+            (vec![and.clone()], vec![equal(0, 0)], true),
+            (vec![equal(0, 0), equal(0, 1)], vec![and.clone()], true),
+            (vec![or.clone()], vec![equal(0, 0)], false),
+            (vec![equal(0, 0)], vec![and], false),
+            (vec![or.clone()], vec![or], true),
+        ] {
+            let (_, state, root) = frozen(filtered(input(0, 2), enforced));
+            assert_eq!(
+                selected_consumes(&root, &requested, &state.read().unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn consumption_uses_shared_projection_constant_folding() {
+        for consumed in [false, true] {
+            let child = if consumed {
+                filtered(input(0, 1), vec![equal(0, 0)])
+            } else {
+                input(0, 1)
+            };
+            let projection =
+                OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+                    10,
+                    child,
+                    vec![
+                        column(0, 0),
+                        Expression::Constant(
+                            ConstantExpression::new(Value::Integer(2), LogicalType::Integer).into(),
+                        ),
+                    ],
+                )));
+            let predicate = conjunction(ConjunctionType::And, vec![equal(10, 0), equal(10, 1)]);
+            let (engine, state, root) = frozen(filtered(projection, vec![predicate]));
+            let state = state.read().unwrap();
+            assert_eq!(
+                pending_transfers(&root, &state)
+                    .unwrap()
+                    .contains(&root.reference.candidate),
+                !consumed
+            );
+            assert_eq!(
+                selected_transfer_binding(engine.memo(), &root, &state).is_some(),
+                !consumed
+            );
+        }
     }
 }
