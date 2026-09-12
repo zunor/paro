@@ -148,6 +148,125 @@ pub(crate) fn intern_operator_scalars<Child>(
         // Logical identity has no preferred evaluation order within a pure,
         // total segment. Preserve fence positions and occurrence arity; the
         // physical Filter contract chooses execution order after search.
+        let semantic_roots = semantic_operand_fingerprints(operator)?;
+        sort_filter_scalar_roots(&mut roots, &semantic_roots, arena);
+    }
+    Ok(roots.into_boxed_slice())
+}
+
+/// Return a stable identity for the scalar operands of one logical shell.
+///
+/// `ScalarExprId` and the `ColumnId` embedded in a lowered scalar are local to
+/// one Memo construction.  They are useful for arena lookup, but cannot be a
+/// cross-Memo identity for a SeedPlan.  The bound expression/operand itself is
+/// the semantic source of truth; references are positional or binding-based,
+/// and therefore remain stable when a destination allocates a different
+/// scalar/column numbering.
+fn semantic_operand_fingerprints<Child>(
+    operator: &LogicalOperator<Child>,
+) -> Result<Vec<Fingerprint>> {
+    use fields::{OperandRef, ReferenceScope};
+
+    let mut fingerprints = Vec::new();
+    fields::visit_fields(operator, |operand| {
+        let mut builder = StableFingerprintBuilder::default();
+        match operand {
+            OperandRef::Expression(expression, scope) => {
+                builder.write_u64(0);
+                builder.write_u64(match scope {
+                    ReferenceScope::Input => 0,
+                    ReferenceScope::Output => 1,
+                    ReferenceScope::Left => 2,
+                    ReferenceScope::None => 3,
+                    ReferenceScope::Reducers => 4,
+                });
+                builder.write_fingerprint(expression_fingerprint(expression));
+            }
+            OperandRef::Comparison(condition) => {
+                builder.write_u64(1);
+                builder.write_u64(match condition.comparison {
+                    JoinComparisonType::Equal => 0,
+                    JoinComparisonType::NotEqual => 1,
+                    JoinComparisonType::LessThan => 2,
+                    JoinComparisonType::LessThanOrEqual => 3,
+                    JoinComparisonType::GreaterThan => 4,
+                    JoinComparisonType::GreaterThanOrEqual => 5,
+                    JoinComparisonType::DistinctFrom => 6,
+                    JoinComparisonType::NotDistinctFrom => 7,
+                });
+                builder.write_fingerprint(expression_fingerprint(&condition.left));
+                builder.write_fingerprint(expression_fingerprint(&condition.right));
+            }
+            OperandRef::Window(window) => {
+                builder.write_u64(2);
+                builder.write_fingerprint(window_fingerprint(window));
+                builder.write_u64(window.partitions.len() as u64);
+                for partition in &window.partitions {
+                    builder.write_fingerprint(expression_fingerprint(partition));
+                }
+                builder.write_u64(window.orders.len() as u64);
+                for order in &window.orders {
+                    builder.write_u64(order.ascending as u64);
+                    builder.write_u64(order.nulls_first as u64);
+                    builder.write_fingerprint(expression_fingerprint(&order.expression));
+                }
+                builder.write_bytes(format!("{:?}", window.frame).as_bytes());
+                builder.write_u64(window.ignore_nulls as u64);
+            }
+        }
+        fingerprints.push(builder.finish());
+        Ok(())
+    })?;
+    Ok(fingerprints)
+}
+
+/// Sort only reorderable Filter segments using semantic identities.  Fence
+/// positions are taken from the lowered arena because they include execution
+/// properties (volatility/error/side effects) that are not part of the
+/// binding-level expression fingerprint.
+fn sort_filter_scalar_roots(
+    roots: &mut [ScalarExprId],
+    semantic_roots: &[Fingerprint],
+    arena: &ScalarArena,
+) {
+    debug_assert_eq!(roots.len(), semantic_roots.len());
+    let mut start = 0;
+    for end in 0..=roots.len() {
+        if end == roots.len()
+            || arena
+                .get(roots[end])
+                .is_none_or(|node| node.properties.is_evaluation_fence())
+        {
+            let mut segment = (start..end)
+                .map(|index| (semantic_roots[index], roots[index]))
+                .collect::<Vec<_>>();
+            segment.sort_by_key(|(fingerprint, _)| *fingerprint);
+            for (index, (_, root)) in (start..end).zip(segment) {
+                roots[index] = root;
+            }
+            start = end + 1;
+        }
+    }
+}
+
+/// Stable scalar identities in the same canonical order used by the Memo
+/// shell identity.  The arena is consulted only for the fence boundaries;
+/// no arena-local fingerprint or ordinal escapes into the result.
+pub(crate) fn semantic_scalar_root_fingerprints<Child>(
+    operator: &LogicalOperator<Child>,
+    roots: &[ScalarExprId],
+    arena: &ScalarArena,
+) -> Result<Box<[Fingerprint]>> {
+    let mut fingerprints = semantic_operand_fingerprints(operator)?;
+    if fingerprints.len() != roots.len() {
+        return Err(paro_error::internal(
+            "semantic scalar identity arity disagrees with lowered operator roots",
+        ));
+    }
+    if matches!(operator, LogicalOperator::Filter(_)) {
+        // The scalar arena keeps fence positions fixed while the Memo sorts
+        // each reorderable segment. Apply that same segment normalization to
+        // the semantic identities without exposing scalar IDs.
         let mut start = 0;
         for end in 0..=roots.len() {
             if end == roots.len()
@@ -155,13 +274,12 @@ pub(crate) fn intern_operator_scalars<Child>(
                     .get(roots[end])
                     .is_none_or(|node| node.properties.is_evaluation_fence())
             {
-                roots[start..end]
-                    .sort_by_key(|id| (arena.get(*id).map(|node| node.fingerprint), *id));
+                fingerprints[start..end].sort_unstable();
                 start = end + 1;
             }
         }
     }
-    Ok(roots.into_boxed_slice())
+    Ok(fingerprints.into_boxed_slice())
 }
 
 fn get_reference_columns(

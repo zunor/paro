@@ -682,7 +682,30 @@ fn apply(
     let mut final_groups = left_outer
         .groups
         .into_iter()
-        .map(|expression| replace_known_bindings(expression, &partial_to_union))
+        .map(|expression| {
+            // A branch discriminator can be present as a literal in the
+            // outer grouping list even when the projection exposes it as a
+            // constant output.  After the branches are shared, the literal
+            // from the first arm would collapse every arm into that value.
+            // Carry the discriminator from the compact UNION instead.
+            if let Some(constant_ordinal) = witness
+                .constant_outputs
+                .iter()
+                .position(|ordinal| left_projection_expressions[*ordinal].equals(&expression))
+            {
+                let input_ordinal =
+                    partial_group_count + partial_aggregate_count + constant_ordinal;
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(union_index, input_ordinal),
+                        union_types[input_ordinal].clone(),
+                    )
+                    .into(),
+                )
+            } else {
+                replace_known_bindings(expression, &partial_to_union)
+            }
+        })
         .collect::<Vec<_>>();
     final_groups.extend(witness.constant_outputs.iter().enumerate().map(
         |(constant_ordinal, _)| {

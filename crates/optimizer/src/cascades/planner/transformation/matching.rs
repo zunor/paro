@@ -69,6 +69,24 @@ pub(super) fn dimension_sharing_pattern_bindings(
         cancellation: Option<&'a paro_context::StatementCancellation>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NativeOutputSlot {
+        Group(usize),
+        Aggregate(usize),
+        Constant,
+    }
+
+    #[derive(Debug, Clone)]
+    struct NativeBranch<'a> {
+        projection: &'a paro_planner::operator::Projection<()>,
+        filter: Option<&'a paro_planner::operator::Filter<()>>,
+        outer: &'a paro_planner::operator::Aggregate<()>,
+        join: &'a paro_planner::operator::join::ComparisonJoin<()>,
+        dimension: &'a paro_planner::operator::Get,
+        partial: &'a paro_planner::operator::Aggregate<()>,
+        output_slots: Vec<NativeOutputSlot>,
+    }
+
     impl LocalMatcher<'_> {
         fn admit_work(&mut self, units: usize) -> Result<bool> {
             if !self.memo.control().checkpoint()? {
@@ -141,6 +159,272 @@ pub(super) fn dimension_sharing_pattern_bindings(
             Some(get)
         }
 
+        /// Read only the immutable operator shells needed by dimension
+        /// sharing.  The semantic template has no owned child tree; all
+        /// descendants are represented by the exact Memo expression ids in
+        /// the skeleton.  Keeping this check here avoids constructing an
+        /// OwnedLogicalPlan for every frontier pair merely to call the
+        /// legacy recognizer.
+        fn semantic_operator(
+            &self,
+            expression: LogicalExprId,
+        ) -> Option<&paro_planner::operator::LogicalOperator<()>> {
+            let logical = self.memo.logical_expr(expression)?;
+            self.state
+                .payloads
+                .logical
+                .get(logical.payload.index())
+                .map(|payload| &payload.semantic_template.operator)
+        }
+
+        fn native_branch(&self, skeleton: BranchSkeleton) -> Option<NativeBranch<'_>> {
+            let projection = match self.semantic_operator(skeleton.projection)? {
+                LogicalOperator::Projection(projection) => projection,
+                _ => return None,
+            };
+            let filter = skeleton.filter.and_then(|expression| {
+                match self.semantic_operator(expression)? {
+                    LogicalOperator::Filter(filter) => Some(filter),
+                    _ => None,
+                }
+            });
+            if skeleton.filter.is_some() && filter.is_none() {
+                return None;
+            }
+            let outer = match self.semantic_operator(skeleton.outer_aggregate)? {
+                LogicalOperator::Aggregate(aggregate) => aggregate.as_ref(),
+                _ => return None,
+            };
+            let join = match self.semantic_operator(skeleton.join)? {
+                LogicalOperator::Join(Join::Comparison(join)) => join,
+                _ => return None,
+            };
+            let dimension = match self.semantic_operator(skeleton.dimension)? {
+                LogicalOperator::Get(dimension) => dimension,
+                _ => return None,
+            };
+            let partial = match self.semantic_operator(skeleton.partial_aggregate)? {
+                LogicalOperator::Aggregate(aggregate) => aggregate.as_ref(),
+                _ => return None,
+            };
+            if outer.post_reduction.is_some()
+                || outer.aggregates.is_empty()
+                || !outer.has_plain_grouping_domain()
+                || join.join_type != JoinType::Inner
+                || join.conditions.is_empty()
+                || join.mark_index.is_some()
+                || !join.duplicate_eliminated_columns.is_empty()
+                || join.delim_flipped
+                || join.build_side_constraint
+                    != paro_planner::operator::JoinBuildSideConstraint::Either
+                || join
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.comparison != JoinComparisonType::Equal)
+                || partial.post_reduction.is_some()
+                || partial.aggregates.is_empty()
+                || !partial.has_plain_grouping_domain()
+                || dimension.table.is_none()
+            {
+                return None;
+            }
+            let dimension_bindings = (0..dimension.returned_types.len())
+                .map(|ordinal| ColumnBinding::new(dimension.table_index, ordinal))
+                .collect::<std::collections::HashSet<_>>();
+            if !join.conditions.iter().all(|condition| {
+                expression_reads_only(&condition.left, &dimension_bindings)
+                    && matches!(
+                        &condition.right,
+                        Expression::ColumnRef(column)
+                            if column.depth == 0
+                                && column.binding.table_index == partial.group_index
+                                && column.binding.column_index < partial.groups.len()
+                    )
+            }) || !merge_contract_matches_partial(outer, partial)
+            {
+                return None;
+            }
+            let output_slots = projection
+                .expressions
+                .iter()
+                .map(|expression| output_slot(expression, outer))
+                .collect::<Option<Vec<_>>>()?;
+            Some(NativeBranch {
+                projection,
+                filter,
+                outer,
+                join,
+                dimension,
+                partial,
+                output_slots,
+            })
+        }
+
+        fn union_operator_is_valid(&self, expression: LogicalExprId) -> bool {
+            let Some(LogicalOperator::SetOperation(setop)) = self.semantic_operator(expression)
+            else {
+                return false;
+            };
+            setop.setop_type == paro_planner::operator::SetOpType::Union
+                && setop.setop_all
+                && setop.column_count == setop.types.len()
+        }
+
+        fn branches_compatible(&self, left: &NativeBranch<'_>, right: &NativeBranch<'_>) -> bool {
+            if left.projection.expressions.len() != right.projection.expressions.len()
+                || left.outer.groups.len() != right.outer.groups.len()
+                || left.outer.aggregates.len() != right.outer.aggregates.len()
+                || left.partial.groups.len() != right.partial.groups.len()
+                || left.partial.aggregates.len() != right.partial.aggregates.len()
+                || left.join.conditions.len() != right.join.conditions.len()
+                || left
+                    .partial
+                    .groups
+                    .iter()
+                    .map(Expression::return_type)
+                    .ne(right.partial.groups.iter().map(Expression::return_type))
+                || left
+                    .partial
+                    .aggregates
+                    .iter()
+                    .map(Expression::return_type)
+                    .ne(right.partial.aggregates.iter().map(Expression::return_type))
+                || left.output_slots != right.output_slots
+            {
+                return false;
+            }
+            if !crate::aggregate::dimension_sharing::equivalent_dimension_gets(
+                left.dimension,
+                right.dimension,
+            ) {
+                return false;
+            }
+            let mut bindings = HashMap::new();
+            extend_positional_bindings(
+                &mut bindings,
+                right.dimension.table_index,
+                left.dimension.table_index,
+                left.dimension.returned_types.len(),
+            );
+            extend_positional_bindings(
+                &mut bindings,
+                right.partial.group_index,
+                left.partial.group_index,
+                left.partial.groups.len(),
+            );
+            extend_positional_bindings(
+                &mut bindings,
+                right.partial.aggregate_index,
+                left.partial.aggregate_index,
+                left.partial.aggregates.len(),
+            );
+            extend_positional_bindings(
+                &mut bindings,
+                right.outer.group_index,
+                left.outer.group_index,
+                left.outer.groups.len(),
+            );
+            extend_positional_bindings(
+                &mut bindings,
+                right.outer.aggregate_index,
+                left.outer.aggregate_index,
+                left.outer.aggregates.len(),
+            );
+            let filters_match = match (left.filter, right.filter) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    let right = right
+                        .expressions
+                        .iter()
+                        .map(|expression| remap_expression(expression, &bindings))
+                        .collect::<Option<Vec<_>>>();
+                    right.is_some_and(|right| expression_multisets_equal(&left.expressions, &right))
+                }
+                _ => false,
+            };
+            filters_match
+                && left
+                    .outer
+                    .groups
+                    .iter()
+                    .zip(&right.outer.groups)
+                    .all(|(left, right)| {
+                        remap_expression(right, &bindings).is_some_and(|right| left.equals(&right))
+                    })
+                && left
+                    .outer
+                    .aggregates
+                    .iter()
+                    .zip(&right.outer.aggregates)
+                    .all(|(left, right)| {
+                        remap_expression(right, &bindings).is_some_and(|right| left.equals(&right))
+                    })
+                && left
+                    .join
+                    .conditions
+                    .iter()
+                    .zip(&right.join.conditions)
+                    .all(|(left, right)| {
+                        left.comparison == right.comparison
+                            && remap_expression(&right.left, &bindings)
+                                .is_some_and(|right| left.left.equals(&right))
+                            && remap_expression(&right.right, &bindings)
+                                .is_some_and(|right| left.right.equals(&right))
+                    })
+                && left
+                    .projection
+                    .expressions
+                    .iter()
+                    .zip(&right.projection.expressions)
+                    .zip(&left.output_slots)
+                    .all(|((left, right), slot)| match slot {
+                        NativeOutputSlot::Constant => left.return_type() == right.return_type(),
+                        _ => remap_expression(right, &bindings)
+                            .is_some_and(|right| left.equals(&right)),
+                    })
+        }
+
+        fn union_contract_matches(&self, skeleton: &UnionSkeleton) -> bool {
+            let mut branches = Vec::new();
+            skeleton.branches(&mut branches);
+            if let UnionSkeleton::SetOperation { expression, .. } = skeleton {
+                if !self.union_operator_is_valid(*expression) {
+                    return false;
+                }
+            }
+            let Some(first) = branches.first().copied() else {
+                return false;
+            };
+            let Some(first) = self.native_branch(first) else {
+                return false;
+            };
+            let output_types = first.projection.returned_types.as_slice();
+            let root_types_match = match skeleton {
+                UnionSkeleton::SetOperation { expression, .. } => {
+                    self.semantic_operator(*expression).is_some_and(|operator| {
+                        matches!(operator, LogicalOperator::SetOperation(setop)
+                            if setop.types.as_slice() == output_types
+                                && setop.column_count == output_types.len())
+                    })
+                }
+                UnionSkeleton::Branch { .. } => false,
+            };
+            if output_types.len() != first.projection.expressions.len() || !root_types_match {
+                return false;
+            }
+            for branch in branches.iter().skip(1).copied() {
+                let Some(branch) = self.native_branch(branch) else {
+                    return false;
+                };
+                if branch.projection.returned_types != output_types
+                    || !self.branches_compatible(&first, &branch)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+
         fn dimensions_can_share(&self, left: BranchSkeleton, right: BranchSkeleton) -> bool {
             self.dimension_get(left.dimension)
                 .zip(self.dimension_get(right.dimension))
@@ -162,32 +446,6 @@ pub(super) fn dimension_sharing_pattern_bindings(
                 .all(|branch| self.dimensions_can_share(first, branch))
         }
 
-        fn expressions(&mut self, group: GroupId) -> Result<Vec<LogicalExprId>> {
-            let group = self.memo.canonical_group(group);
-            if !self.observe(group)? {
-                return Ok(Vec::new());
-            }
-            let mut expressions = self
-                .memo
-                .group(group)
-                .ok_or_else(|| {
-                    paro_error::internal("local pattern matcher references an unknown group")
-                })?
-                .logical_exprs()
-                .to_vec();
-            expressions.sort_by_key(|expression| {
-                self.memo
-                    .logical_expr(*expression)
-                    // Child group ids are allocation artifacts. The immutable
-                    // operator shell contains the scalar fingerprints needed
-                    // for semantic ordering; exact child choices are bound and
-                    // fingerprinted separately below.
-                    .map(|logical| logical.key.operator)
-                    .unwrap_or_default()
-            });
-            Ok(expressions)
-        }
-
         fn operator_fingerprint(&self, expression: LogicalExprId) -> Fingerprint {
             self.memo
                 .logical_expr(expression)
@@ -200,11 +458,29 @@ pub(super) fn dimension_sharing_pattern_bindings(
             group: GroupId,
             operator_type: LogicalOperatorType,
         ) -> Result<Vec<LogicalExprId>> {
-            Ok(self
-                .expressions(group)?
-                .into_iter()
+            let group = self.memo.canonical_group(group);
+            if !self.observe(group)? {
+                return Ok(Vec::new());
+            }
+            let group_ref = self.memo.group(group).ok_or_else(|| {
+                paro_error::internal("local pattern matcher references an unknown group")
+            })?;
+            let mut expressions = group_ref
+                .logical_exprs_of_operator(super::super::identity::operator_tag(operator_type))
+                .iter()
+                .copied()
+                .chain(
+                    group_ref
+                        .logical_exprs_of_operator(
+                            crate::cascades::memo::UNTYPED_LOGICAL_OPERATOR_TAG,
+                        )
+                        .iter()
+                        .copied(),
+                )
                 .filter(|expression| self.operator_type(*expression) == Some(operator_type))
-                .collect())
+                .collect::<Vec<_>>();
+            expressions.sort_by_key(|expression| self.operator_fingerprint(*expression));
+            Ok(expressions)
         }
 
         fn branch_skeletons(&mut self, group: GroupId) -> Result<Vec<BranchSkeleton>> {
@@ -428,9 +704,18 @@ pub(super) fn dimension_sharing_pattern_bindings(
             let mut skeletons = self
                 .branch_skeletons(group)?
                 .into_iter()
+                // The legacy recognizer rejects a malformed branch before
+                // pairing it with any other arm. Keep that same early
+                // rejection here; otherwise the native Cartesian product
+                // can grow from every projection/aggregate shell in the
+                // child frontier and only be discarded at the root.
+                .filter(|branch| self.native_branch(*branch).is_some())
                 .map(|branch| UnionSkeleton::Branch { group, branch })
                 .collect::<Vec<_>>();
             for expression in self.expressions_of_type(group, LogicalOperatorType::LogicalUnion)? {
+                if !self.union_operator_is_valid(expression) {
+                    continue;
+                }
                 let (left_group, right_group) = {
                     let logical = self.logical(expression)?;
                     let [left_group, right_group] = logical.key.children.as_ref() else {
@@ -522,6 +807,156 @@ pub(super) fn dimension_sharing_pattern_bindings(
                 ),
             }
         }
+    }
+
+    fn expression_reads_only(
+        expression: &Expression,
+        allowed: &std::collections::HashSet<ColumnBinding>,
+    ) -> bool {
+        let mut valid = true;
+        let mut read = false;
+        crate::expression::traversal::visit_expression(expression, &mut |expression| {
+            if let Expression::ColumnRef(column) = expression {
+                read = true;
+                valid &= column.depth == 0 && allowed.contains(&column.binding);
+            }
+        });
+        valid && read
+    }
+
+    fn merge_contract_matches_partial(
+        outer: &paro_planner::operator::Aggregate<()>,
+        partial: &paro_planner::operator::Aggregate<()>,
+    ) -> bool {
+        outer.aggregates.iter().all(|expression| {
+            let Expression::Aggregate(merge) = expression else {
+                return false;
+            };
+            if merge.children.len() != 1 || merge.filter.is_some() || !merge.order_bys.is_empty() {
+                return false;
+            }
+            let Expression::ColumnRef(column) = &merge.children[0] else {
+                return false;
+            };
+            if column.depth != 0
+                || column.binding.table_index != partial.aggregate_index
+                || column.binding.column_index >= partial.aggregates.len()
+            {
+                return false;
+            }
+            let Expression::Aggregate(source) = &partial.aggregates[column.binding.column_index]
+            else {
+                return false;
+            };
+            source
+                .function
+                .partial_merge_function()
+                .is_some_and(|expected| expected.execution_semantics_equal(&merge.function))
+        })
+    }
+
+    fn output_slot(
+        expression: &Expression,
+        aggregate: &paro_planner::operator::Aggregate<()>,
+    ) -> Option<NativeOutputSlot> {
+        match expression {
+            Expression::ColumnRef(column) if column.depth == 0 => {
+                if column.binding.table_index == aggregate.group_index
+                    && column.binding.column_index < aggregate.groups.len()
+                {
+                    Some(NativeOutputSlot::Group(column.binding.column_index))
+                } else if column.binding.table_index == aggregate.aggregate_index
+                    && column.binding.column_index < aggregate.aggregates.len()
+                {
+                    Some(NativeOutputSlot::Aggregate(column.binding.column_index))
+                } else {
+                    None
+                }
+            }
+            Expression::Constant(_) => Some(NativeOutputSlot::Constant),
+            _ => None,
+        }
+    }
+
+    fn extend_positional_bindings(
+        bindings: &mut HashMap<ColumnBinding, ColumnBinding>,
+        from_table: usize,
+        to_table: usize,
+        count: usize,
+    ) {
+        bindings.extend((0..count).map(|ordinal| {
+            (
+                ColumnBinding::new(from_table, ordinal),
+                ColumnBinding::new(to_table, ordinal),
+            )
+        }));
+    }
+
+    fn remap_expression(
+        expression: &Expression,
+        bindings: &HashMap<ColumnBinding, ColumnBinding>,
+    ) -> Option<Expression> {
+        let valid = std::cell::Cell::new(true);
+        let expression = expression.clone().replace_column_ref(&|column| {
+            if column.depth != 0 {
+                valid.set(false);
+                return None;
+            }
+            match bindings.get(&column.binding) {
+                Some(binding) => Some(Expression::ColumnRef(
+                    paro_planner::expression::ColumnRefExpression::new(
+                        *binding,
+                        column.return_type.clone(),
+                    )
+                    .into(),
+                )),
+                None => {
+                    valid.set(false);
+                    None
+                }
+            }
+        });
+        valid.get().then_some(expression)
+    }
+
+    fn expressions_equivalent(left: &Expression, right: &Expression) -> bool {
+        let (Expression::Conjunction(left), Expression::Conjunction(right)) = (left, right) else {
+            return left.equals(right);
+        };
+        if left.conjunction_type != right.conjunction_type
+            || left.children.len() != right.children.len()
+        {
+            return false;
+        }
+        let mut matched = vec![false; right.children.len()];
+        left.children.iter().all(|left_child| {
+            right
+                .children
+                .iter()
+                .enumerate()
+                .find(|(ordinal, right_child)| {
+                    !matched[*ordinal] && expressions_equivalent(left_child, right_child)
+                })
+                .map(|(ordinal, _)| matched[ordinal] = true)
+                .is_some()
+        })
+    }
+
+    fn expression_multisets_equal(left: &[Expression], right: &[Expression]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+        let mut matched = vec![false; right.len()];
+        left.iter().all(|left_expression| {
+            right
+                .iter()
+                .enumerate()
+                .find(|(ordinal, right_expression)| {
+                    !matched[*ordinal] && expressions_equivalent(left_expression, right_expression)
+                })
+                .map(|(ordinal, _)| matched[ordinal] = true)
+                .is_some()
+        })
     }
 
     let work_dimension = BudgetDimension::CompositionRuleWorkPerGroup;
@@ -618,7 +1053,9 @@ pub(super) fn dimension_sharing_pattern_bindings(
                 left: Box::new(left_skeleton.clone()),
                 right: Box::new(right_skeleton.clone()),
             };
-            if !matcher.union_dimensions_can_share(&combined) {
+            if !matcher.union_dimensions_can_share(&combined)
+                || !matcher.union_contract_matches(&combined)
+            {
                 continue;
             }
             let root = match matcher.union_operand(&combined)? {
@@ -628,23 +1065,12 @@ pub(super) fn dimension_sharing_pattern_bindings(
             };
             let (root, fingerprint) = root;
             // The output frontier counts semantic matches, not raw shell
-            // pairs. Pre-admit the exact tree-clone work, instantiate the
-            // bound candidate, and run the same proof recognizer used by
-            // apply. Otherwise a finite frontier can be filled entirely by
-            // structurally plausible pairs that the rule must reject.
+            // pairs. Pre-admit the exact native shell work. The contract
+            // check above has already compared the immutable Memo operator
+            // payloads; do not materialize an OwnedLogicalPlan just to run a
+            // duplicate recognizer for every pair.
             if !matcher.admit_work(LocalMatcher::operand_nodes(&root))? {
                 break 'frontiers;
-            }
-            let Some(candidate) =
-                super::super::semantic_plan::instantiate_bound_plan_with_group_holes(
-                    memo, state, &root, None,
-                )?
-            else {
-                matcher.limited = true;
-                break 'frontiers;
-            };
-            if !crate::aggregate::dimension_sharing::recognizes_plan(&candidate.plan) {
-                continue;
             }
             if bindings.len() == variant_limit {
                 matcher.limited = true;
@@ -696,7 +1122,7 @@ pub(super) fn pattern_bindings(
     work_dimension: BudgetDimension,
     cancellation: Option<&paro_context::StatementCancellation>,
 ) -> Result<PatternBindingSet> {
-    enumerate_pattern_bindings(
+    let bindings = enumerate_pattern_bindings(
         root_group,
         root_expression,
         memo,
@@ -708,7 +1134,8 @@ pub(super) fn pattern_bindings(
             scope: PatternScope::TestSubtree,
             witness: None,
         },
-    )
+    )?;
+    Ok(bindings)
 }
 
 /// A pattern owns only the operators whose semantics the rule reads. Opaque
@@ -753,6 +1180,59 @@ enum PatternScope {
 }
 
 impl PatternScope {
+    /// Return the exact operator types that can produce a non-hole node at
+    /// this scope. `None` means that this scope intentionally accepts an
+    /// opaque atom for all operators, so the complete frontier is required.
+    /// The index is only a read accelerator; callers still run the original
+    /// structural matcher for every returned expression.
+    fn candidate_operator_types(self) -> Option<&'static [LogicalOperatorType]> {
+        use LogicalOperatorType as Op;
+        match self {
+            Self::PredicateTransfer | Self::MarkFilter => Some(&[Op::Filter]),
+            Self::KeyDomainTransfer | Self::MarkJoin => Some(&[Op::ComparisonJoin]),
+            Self::CteInlineOwner | Self::CteDemandOwner => Some(&[Op::MaterializedCTE]),
+            Self::AggregateRegion
+            | Self::Preaggregate
+            | Self::NonNullAggregate
+            | Self::SubsumptionAggregate => Some(&[Op::Aggregate]),
+            Self::LimitProjection | Self::TopN => Some(&[Op::Limit]),
+            Self::LateProjection | Self::Projection => Some(&[Op::Projection]),
+            Self::NonNullInput => Some(&[Op::Filter, Op::Order, Op::TopN, Op::Limit, Op::Get]),
+            Self::Order => Some(&[Op::Projection, Op::Order]),
+            Self::MarkConsumer => Some(&[Op::Projection, Op::Filter]),
+            Self::LatePayload => Some(&[Op::Projection, Op::TopN]),
+            Self::RowIdPath => Some(&[
+                Op::Get,
+                Op::Filter,
+                Op::Window,
+                Op::Order,
+                Op::Limit,
+                Op::TopN,
+                Op::EmptyResult,
+                Op::ComparisonJoin,
+                Op::AnyJoin,
+                Op::CrossProduct,
+            ]),
+            // These scopes either treat every unknown operator as an opaque
+            // atom or inspect a path witness before choosing child scopes.
+            Self::Hole
+            | Self::Shell
+            | Self::JoinRegion
+            | Self::DimensionRegion
+            | Self::SearchInput
+            | Self::LeftJoin
+            | Self::SubsumptionInput
+            | Self::LateAggregate
+            | Self::ScalarAggregatePath
+            | Self::OuterJoinPath
+            | Self::CteDemandReferencePath
+            | Self::CteDemandInput
+            | Self::CteReferencePath => None,
+            #[cfg(test)]
+            Self::TestSubtree => None,
+        }
+    }
+
     fn children(self, operator: &LogicalOperator<()>) -> Option<Vec<Self>> {
         let mut arity = 0;
         operator.visit_child_links(&mut |_| arity += 1);
@@ -894,7 +1374,7 @@ pub(super) fn scoped_pattern_bindings(
         PlannerTransformation::JoinElimination => Some(PatternWitness::OuterJoin),
         _ => None,
     };
-    enumerate_pattern_bindings(
+    let mut bindings = enumerate_pattern_bindings(
         root_group,
         root_expression,
         memo,
@@ -906,7 +1386,40 @@ pub(super) fn scoped_pattern_bindings(
             scope,
             witness,
         },
-    )
+    )?;
+
+    if matches!(
+        transformation,
+        PlannerTransformation::AggregateDimensionDeferral
+    ) {
+        // The aggregate-region matcher deliberately treats a non-dimension
+        // shell as an opaque hole.  For deferral, however, the aggregate's
+        // direct input is the boundary at which a newly published logical
+        // alternative can expose the deferred dimension shape.  Subscribe to
+        // that input frontier during discovery, before the first binding is
+        // applied; application-only reads are too late to wake this task for
+        // an alternative published in the same early planning wave.
+        let mut reads = bindings.reads.into_vec();
+        for child in memo
+            .logical_expr(root_expression)
+            .ok_or_else(|| paro_error::internal("aggregate deferral lost root expression"))?
+            .key
+            .children
+            .iter()
+            .copied()
+        {
+            let child = memo.canonical_group(child);
+            let frontier = PatternRead::from_group(memo, child)?;
+            if let Some(read) = reads.iter_mut().find(|read| read.group == child) {
+                *read = frontier;
+            } else {
+                reads.push(frontier);
+            }
+        }
+        bindings.reads = reads.into_boxed_slice();
+    }
+
+    Ok(bindings)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -917,6 +1430,14 @@ enum PatternWitness {
 }
 
 impl PatternWitness {
+    fn stable_tag(self) -> u8 {
+        match self {
+            Self::ScalarAggregate => 0,
+            Self::OuterJoin => 1,
+            Self::CteReference => 2,
+        }
+    }
+
     fn matches<Child>(self, operator: &LogicalOperator<Child>) -> bool {
         match (self, operator) {
             (Self::ScalarAggregate, LogicalOperator::Aggregate(aggregate)) => {
@@ -929,6 +1450,67 @@ impl PatternWitness {
             _ => false,
         }
     }
+}
+
+fn transformation_root_witness(transformation: PlannerTransformation) -> Option<PatternWitness> {
+    match transformation {
+        PlannerTransformation::AggregatePostReduction
+        | PlannerTransformation::ScalarAggregateWindow => Some(PatternWitness::ScalarAggregate),
+        PlannerTransformation::JoinElimination => Some(PatternWitness::OuterJoin),
+        _ => None,
+    }
+}
+
+/// Return an exact negative root dispatch when every child path has a
+/// completed, still-current witness lookup.  A positive lookup is not enough
+/// to dispatch the rule: the full matcher still has to check the operator
+/// path and construct its exact binding.  Missing or stale entries likewise
+/// fall back to ordinary matching, so a newly published alternative cannot
+/// be hidden by this fast path.
+pub(super) fn cached_negative_root_reads(
+    transformation: PlannerTransformation,
+    root_group: GroupId,
+    root_expression: LogicalExprId,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<Option<Box<[PatternRead]>>> {
+    let Some(witness) = transformation_root_witness(transformation) else {
+        return Ok(None);
+    };
+    let logical = memo
+        .logical_expr(root_expression)
+        .ok_or_else(|| paro_error::internal("root dispatch lost logical expression"))?;
+    let mut reads = BTreeSet::from([PatternRead::facts_from_group(memo, root_group)?]);
+    let mut cache = state.witness_cache.lock().expect("witness cache poisoned");
+    for child in logical.key.children.iter().copied() {
+        let child = memo.canonical_group(child);
+        let key = (child, witness.stable_tag());
+        let Some(entry) = cache.entries.get(&key).cloned() else {
+            return Ok(None);
+        };
+        let current = entry
+            .reads
+            .iter()
+            .try_fold(true, |current, read| -> Result<bool> {
+                Ok(current && read.is_current(memo)?)
+            })?;
+        if !current {
+            cache.entries.remove(&key);
+            cache.invalidations = cache.invalidations.saturating_add(1);
+            return Ok(None);
+        }
+        cache.hits = cache.hits.saturating_add(1);
+        if entry.matches {
+            // A positive child witness only proves that this root may match;
+            // it does not prove that the complete scoped binding is valid.
+            return Ok(None);
+        }
+        reads.extend(entry.reads.iter().copied());
+    }
+    cache.root_dispatch_skips = cache.root_dispatch_skips.saturating_add(1);
+    Ok(Some(
+        reads.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+    ))
 }
 
 struct PatternSpec<'a> {
@@ -957,6 +1539,7 @@ fn enumerate_pattern_bindings(
         limit: usize,
         work_units: usize,
         reads: BTreeMap<GroupId, PatternRead>,
+        read_log: Vec<GroupId>,
         witness_groups: BTreeMap<(GroupId, PatternWitness), bool>,
         // Invocation-local negative DAG results. No Memo mutation can occur
         // during enumeration; reads from the first traversal remain subscribed.
@@ -1029,6 +1612,25 @@ fn enumerate_pattern_bindings(
             if let Some(matches) = self.witness_groups.get(&(group, witness)) {
                 return Ok(*matches);
             }
+            let read_start = self.read_log.len();
+            let work_start = self.work_units;
+
+            // Nested-path rules repeatedly ask whether the same child group
+            // contains an existential witness. Reuse only a completed result
+            // whose full dependency transcript is still current. Applying the
+            // transcript to this enumerator is necessary for task wakeups;
+            // validating a cache entry without registering those reads would
+            // make a later witness insertion invisible to the task.
+            if let Some(entry) = self.cached_witness(group, witness)? {
+                if !self.admit_work(entry.work_units)? {
+                    return Ok(false);
+                }
+                for read in entry.reads.iter().copied() {
+                    self.register_cached_read(read)?;
+                }
+                self.witness_groups.insert((group, witness), entry.matches);
+                return Ok(entry.matches);
+            }
             if !self.observe(group)? {
                 return Ok(false);
             }
@@ -1045,13 +1647,96 @@ fn enumerate_pattern_bindings(
             for expression in expressions {
                 if self.contains_witness(expression, witness)? {
                     self.witness_groups.insert((group, witness), true);
+                    self.store_witness(group, witness, true, read_start, work_start);
                     return Ok(true);
                 }
             }
             if !self.limited {
                 self.witness_groups.insert((group, witness), false);
+                self.store_witness(group, witness, false, read_start, work_start);
             }
             Ok(false)
+        }
+
+        fn cached_witness(
+            &mut self,
+            group: GroupId,
+            witness: PatternWitness,
+        ) -> Result<Option<CachedPatternWitness>> {
+            let Some(state) = self.state else {
+                return Ok(None);
+            };
+            let mut cache = state.witness_cache.lock().expect("witness cache poisoned");
+            let key = (group, witness.stable_tag());
+            let Some(entry) = cache.entries.get(&key).cloned() else {
+                return Ok(None);
+            };
+            let current = entry
+                .reads
+                .iter()
+                .try_fold(true, |current, read| -> Result<bool> {
+                    Ok(current && read.is_current(self.memo)?)
+                })?;
+            if current {
+                cache.hits = cache.hits.saturating_add(1);
+                Ok(Some(entry))
+            } else {
+                cache.entries.remove(&key);
+                cache.invalidations = cache.invalidations.saturating_add(1);
+                Ok(None)
+            }
+        }
+
+        fn store_witness(
+            &self,
+            group: GroupId,
+            witness: PatternWitness,
+            matches: bool,
+            read_start: usize,
+            work_start: usize,
+        ) {
+            let Some(state) = self.state else {
+                return;
+            };
+            let mut read_groups = BTreeSet::from([group]);
+            read_groups.extend(self.read_log[read_start..].iter().copied());
+            let reads = read_groups
+                .into_iter()
+                .filter_map(|group| self.reads.get(&group).copied())
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let mut cache = state.witness_cache.lock().expect("witness cache poisoned");
+            cache.entries.insert(
+                (group, witness.stable_tag()),
+                CachedPatternWitness {
+                    matches,
+                    work_units: self.work_units.saturating_sub(work_start),
+                    reads,
+                },
+            );
+        }
+
+        fn register_cached_read(&mut self, read: PatternRead) -> Result<()> {
+            let group = self.memo.canonical_group(read.group);
+            if let Some(current) = self.reads.get_mut(&group) {
+                if current.logical_frontier_revision.is_none()
+                    && read.logical_frontier_revision.is_some()
+                {
+                    *current = PatternRead::from_group(self.memo, group)?;
+                    self.read_log.push(group);
+                }
+            } else {
+                self.reads.insert(
+                    group,
+                    if read.logical_frontier_revision.is_some() {
+                        PatternRead::from_group(self.memo, group)?
+                    } else {
+                        PatternRead::facts_from_group(self.memo, group)?
+                    },
+                );
+                self.read_log.push(group);
+            }
+            Ok(())
         }
         fn operand_work(operand: &PatternOperand) -> usize {
             match operand {
@@ -1083,6 +1768,7 @@ fn enumerate_pattern_bindings(
             if let Some(read) = self.reads.get_mut(&group) {
                 if read.logical_frontier_revision.is_none() {
                     *read = PatternRead::from_group(self.memo, group)?;
+                    self.read_log.push(group);
                 }
                 return Ok(true);
             }
@@ -1091,6 +1777,7 @@ fn enumerate_pattern_bindings(
             }
             self.reads
                 .insert(group, PatternRead::from_group(self.memo, group)?);
+            self.read_log.push(group);
             Ok(true)
         }
 
@@ -1104,6 +1791,7 @@ fn enumerate_pattern_bindings(
             }
             self.reads
                 .insert(group, PatternRead::facts_from_group(self.memo, group)?);
+            self.read_log.push(group);
             Ok(true)
         }
 
@@ -1172,7 +1860,39 @@ fn enumerate_pattern_bindings(
                 return Ok(Vec::new());
             }
             let recursion_cuts = self.recursion_cuts;
-            let mut expressions = group_ref.logical_exprs().to_vec();
+            let mut expressions = if let (Some(state), Some(operator_types)) =
+                (self.state, scope.candidate_operator_types())
+            {
+                let mut indexed = BTreeSet::new();
+                let mut expressions = Vec::new();
+                for operator_type in operator_types {
+                    for expression in group_ref
+                        .logical_exprs_of_operator(super::super::identity::operator_tag(
+                            *operator_type,
+                        ))
+                        .iter()
+                        .copied()
+                    {
+                        indexed.insert(expression);
+                        expressions.push(expression);
+                    }
+                }
+                // Core-only callers and hand-built planner tests may insert
+                // an expression without a semantic tag. Keep that bucket in
+                // the indexed path and let the original operator check below
+                // reject it when its type is not allowed.
+                expressions.extend(
+                    group_ref
+                        .logical_exprs_of_operator(
+                            crate::cascades::memo::UNTYPED_LOGICAL_OPERATOR_TAG,
+                        )
+                        .iter()
+                        .copied(),
+                );
+                expressions
+            } else {
+                group_ref.logical_exprs().to_vec()
+            };
             expressions.sort_by_key(|expression| {
                 self.memo
                     .logical_expr(*expression)
@@ -1419,6 +2139,7 @@ fn enumerate_pattern_bindings(
         limit,
         work_units: 0,
         reads: BTreeMap::new(),
+        read_log: Vec::new(),
         witness_groups: BTreeMap::new(),
         empty_non_null_inputs: BTreeSet::new(),
         recursion_cuts: 0,
@@ -1483,6 +2204,191 @@ fn enumerate_pattern_bindings(
             }
         } else {
             PatternEnumerationCompletion::Complete
+        },
+    })
+}
+
+/// Cheap root dispatch for dimension sharing.
+///
+/// The full matcher deliberately checks every exact child choice, but the
+/// initial quality lane must not run that Cartesian walk for every UNION shell
+/// in a Memo.  This probe only answers whether the two root arms can contain
+/// the immutable branch skeleton at all.  A negative answer carries every
+/// group frontier read by the probe, so a later publication invalidates the
+/// answer and re-enqueues the exact task.  A positive answer is advisory and
+/// still goes through `dimension_sharing_pattern_bindings`.
+pub(super) fn dimension_sharing_root_dispatch(
+    root_group: GroupId,
+    root_expression: LogicalExprId,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<RootDispatch> {
+    struct Probe<'a> {
+        memo: &'a Memo,
+        state: &'a PlannerTransformState,
+        reads: BTreeMap<GroupId, PatternRead>,
+        visiting: BTreeSet<GroupId>,
+    }
+
+    impl Probe<'_> {
+        fn observe(&mut self, group: GroupId) -> Result<()> {
+            let group = self.memo.canonical_group(group);
+            self.reads
+                .entry(group)
+                .or_insert(PatternRead::from_group(self.memo, group)?);
+            Ok(())
+        }
+
+        fn operator_type(&self, expression: LogicalExprId) -> Option<LogicalOperatorType> {
+            let logical = self.memo.logical_expr(expression)?;
+            self.state
+                .metadata
+                .get(&logical.payload)
+                .map(|metadata| metadata.operator_type)
+        }
+
+        fn expressions_of_type(
+            &mut self,
+            group: GroupId,
+            operator_type: LogicalOperatorType,
+        ) -> Result<Vec<LogicalExprId>> {
+            let group = self.memo.canonical_group(group);
+            self.observe(group)?;
+            Ok(self
+                .memo
+                .group(group)
+                .ok_or_else(|| paro_error::internal("dimension-sharing probe lost group"))?
+                .logical_exprs()
+                .iter()
+                .copied()
+                .filter(|expression| self.operator_type(*expression) == Some(operator_type))
+                .collect())
+        }
+
+        fn has_operator(
+            &mut self,
+            group: GroupId,
+            operator_type: LogicalOperatorType,
+        ) -> Result<bool> {
+            Ok(!self.expressions_of_type(group, operator_type)?.is_empty())
+        }
+
+        fn branch_possible(&mut self, group: GroupId) -> Result<bool> {
+            for projection in self.expressions_of_type(group, LogicalOperatorType::Projection)? {
+                let Some(projection_logical) = self.memo.logical_expr(projection) else {
+                    continue;
+                };
+                let [projection_child] = projection_logical.key.children.as_ref() else {
+                    continue;
+                };
+                let mut aggregate_groups = vec![*projection_child];
+                for filter in
+                    self.expressions_of_type(*projection_child, LogicalOperatorType::Filter)?
+                {
+                    let Some(filter_logical) = self.memo.logical_expr(filter) else {
+                        continue;
+                    };
+                    if let [aggregate_group] = filter_logical.key.children.as_ref() {
+                        aggregate_groups.push(*aggregate_group);
+                    }
+                }
+                for aggregate_group in aggregate_groups {
+                    for outer in
+                        self.expressions_of_type(aggregate_group, LogicalOperatorType::Aggregate)?
+                    {
+                        let Some(outer_logical) = self.memo.logical_expr(outer) else {
+                            continue;
+                        };
+                        let [join_group] = outer_logical.key.children.as_ref() else {
+                            continue;
+                        };
+                        for join in self
+                            .expressions_of_type(*join_group, LogicalOperatorType::ComparisonJoin)?
+                        {
+                            let Some(join_logical) = self.memo.logical_expr(join) else {
+                                continue;
+                            };
+                            let [dimension_group, partial_group] =
+                                join_logical.key.children.as_ref()
+                            else {
+                                continue;
+                            };
+                            if self.has_operator(*dimension_group, LogicalOperatorType::Get)?
+                                && self
+                                    .has_operator(*partial_group, LogicalOperatorType::Aggregate)?
+                            {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(false)
+        }
+
+        fn union_group_possible(&mut self, group: GroupId) -> Result<bool> {
+            let group = self.memo.canonical_group(group);
+            self.observe(group)?;
+            if !self.visiting.insert(group) {
+                return Ok(false);
+            }
+            let expressions = self
+                .memo
+                .group(group)
+                .ok_or_else(|| paro_error::internal("dimension-sharing probe lost group"))?
+                .logical_exprs()
+                .to_vec();
+            for expression in expressions {
+                match self.operator_type(expression) {
+                    Some(LogicalOperatorType::LogicalUnion) => {
+                        let Some(logical) = self.memo.logical_expr(expression) else {
+                            continue;
+                        };
+                        let [left, right] = logical.key.children.as_ref() else {
+                            continue;
+                        };
+                        if self.union_group_possible(*left)? && self.union_group_possible(*right)? {
+                            self.visiting.remove(&group);
+                            return Ok(true);
+                        }
+                    }
+                    Some(LogicalOperatorType::Projection) if self.branch_possible(group)? => {
+                        self.visiting.remove(&group);
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
+            self.visiting.remove(&group);
+            Ok(false)
+        }
+    }
+
+    let root_group = memo.canonical_group(root_group);
+    let root = memo
+        .logical_expr(root_expression)
+        .ok_or_else(|| paro_error::internal("dimension-sharing probe lost root expression"))?;
+    let [left, right] = root.key.children.as_ref() else {
+        return Ok(RootDispatch::default());
+    };
+    let mut probe = Probe {
+        memo,
+        state,
+        reads: BTreeMap::new(),
+        visiting: BTreeSet::new(),
+    };
+    probe.observe(root_group)?;
+    let matches = probe.union_group_possible(*left)? && probe.union_group_possible(*right)?;
+    Ok(RootDispatch {
+        matches,
+        reads: if matches {
+            Box::new([])
+        } else {
+            probe
+                .reads
+                .into_values()
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
         },
     })
 }

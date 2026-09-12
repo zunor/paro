@@ -41,12 +41,14 @@ pub(super) fn query_operator_identity<Child>(
 ) -> Result<(Fingerprint, Box<[u8]>)> {
     let mut fingerprint = StableFingerprintBuilder::recording();
     fingerprint.write_u64(operator_tag(operator.op_type()));
-    fingerprint.write_u64(scalar_roots.len() as u64);
-    for root in scalar_roots {
-        let scalar = scalars
-            .get(*root)
-            .ok_or_else(|| paro_error::internal("operator references an unknown scalar root"))?;
-        fingerprint.write_fingerprint(scalar.fingerprint);
+    let semantic_roots = crate::cascades::scalar_lowering::semantic_scalar_root_fingerprints(
+        operator,
+        scalar_roots,
+        scalars,
+    )?;
+    fingerprint.write_u64(semantic_roots.len() as u64);
+    for root in semantic_roots {
+        fingerprint.write_fingerprint(root);
     }
     match operator {
         LogicalOperator::Get(get) => encode_get(&mut fingerprint, get),

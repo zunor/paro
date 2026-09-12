@@ -5,6 +5,80 @@
 
 use super::*;
 
+fn current_region_for_proof<'a>(
+    memo: &'a Memo,
+    proof: &crate::cascades::region::JointCostProof,
+) -> Result<&'a crate::cascades::region::RegionNode> {
+    let facet = proof
+        .facets
+        .first()
+        .copied()
+        .ok_or_else(|| paro_error::internal("winner extraction lost its region facet"))?;
+    let region = memo
+        .regions()
+        .region_for_facet(facet)
+        .ok_or_else(|| paro_error::internal("winner extraction lost its region facet owner"))?;
+    memo.regions()
+        .node(region)
+        .ok_or_else(|| paro_error::internal("winner extraction lost its planning region"))
+}
+
+/// Rebuild only the logical shell represented by a frozen seed.  A selected
+/// winner can refer to a transformed logical descendant that is not present
+/// in a newly constructed destination Memo yet; importing the source's
+/// executable plan would lose that distinction for search-provider payloads.
+/// Re-instantiating the canonical semantic templates keeps the destination
+/// Memo independent while making every selected logical node available for
+/// normal destination implementation construction and re-pricing.
+pub(super) fn materialize_seed_logical_plan(
+    state: &PlannerTransformState,
+    bind_context: &BindContext,
+    seed: &crate::cascades::engine::SeedPlan,
+) -> Result<OwnedLogicalPlan> {
+    fn visit(
+        state: &PlannerTransformState,
+        bind_context: &BindContext,
+        frozen: &crate::cascades::memo::FrozenCandidate,
+    ) -> Result<OwnedLogicalPlan> {
+        let payload = state
+            .payloads
+            .logical
+            .get(frozen.logical.payload.index())
+            .ok_or_else(|| {
+                paro_error::internal("strong seed lost its source logical payload template")
+            })?;
+        let metadata = state
+            .metadata
+            .get(&frozen.logical.payload)
+            .ok_or_else(|| paro_error::internal("strong seed lost its source logical metadata"))?;
+        let children = frozen
+            .children
+            .iter()
+            .map(|child| visit(state, bind_context, child))
+            .collect::<Result<Vec<_>>>()?;
+        let plan = payload
+            .semantic_template
+            .instantiate(bind_context.next_plan_id(), children)?;
+        let plan = semantic_plan::freeze_output_layout(plan, &metadata.output_columns, state)?;
+        let (operator_fingerprint, operator_encoding) =
+            query_operator_identity(&plan.operator, &frozen.logical.key.scalars, &state.scalars)?;
+        if operator_fingerprint != frozen.logical.key.operator
+            || Some(operator_encoding.as_ref()) != frozen.logical.operator_encoding.as_deref()
+        {
+            return Err(paro_error::internal(format!(
+                "strong seed logical template changed identity: source={:?}/{:?}, materialized={:?}/{:?}",
+                frozen.logical.key.operator,
+                frozen.logical.operator_encoding.as_deref().map(|bytes| bytes.len()),
+                operator_fingerprint,
+                operator_encoding.len(),
+            )));
+        }
+        Ok(plan)
+    }
+
+    visit(state, bind_context, seed.frozen())
+}
+
 /// Replay the planner-specific semantic contract in addition to the generic
 /// WinnerVerifier's exact candidate/cost tree. Statistics may rank schedules,
 /// but are neither a proof of safe reordering nor an extraction-time choice.
@@ -281,9 +355,7 @@ pub(super) fn extract_frozen_planner_tree(
                     winner.enforcer_cost_input.max_parallel_tasks,
                 )?;
                 let origin = if let Some(proof) = &winner.joint_cost_proof {
-                    let region = memo.regions().node(proof.region).ok_or_else(|| {
-                        paro_error::internal("winner extraction lost its planning region")
-                    })?;
+                    let region = current_region_for_proof(memo, proof)?;
                     crate::physical::properties::PlanOrigin::SpecializedRegion(
                         region.stable_fingerprint(),
                     )
@@ -396,6 +468,7 @@ pub(super) fn extract_frozen_planner_tree(
                     ));
                 }
                 let children = plans.split_off(plans.len() - child_count);
+                let physical_payload_id = payload;
                 let payload = state
                     .payloads
                     .get_physical(payload)
@@ -456,6 +529,17 @@ pub(super) fn extract_frozen_planner_tree(
                         },
                     )?;
                     plan = semantic_plan::freeze_output_layout(plan, &output_columns, state)?;
+                }
+                if let LogicalOperator::Aggregate(aggregate) = &plan.operator {
+                    if aggregate.groups.len() >= 9 {
+                        tracing::debug!(
+                            target: "paro::optimizer::extraction_debug",
+                            physical_payload = physical_payload_id.0,
+                            logical_payload = logical.payload.0,
+                            groups = ?aggregate.groups,
+                            "extracted aggregate grouping"
+                        );
+                    }
                 }
                 anchor_output_cardinality(&mut plan, output_estimate);
                 contracts.insert(plan.id, base_contract.clone());
@@ -687,10 +771,7 @@ pub(super) fn extracted_region_ownership(
     let Some(proof) = &winner.joint_cost_proof else {
         return Ok((None, Box::new([])));
     };
-    let region = memo
-        .regions()
-        .node(proof.region)
-        .ok_or_else(|| paro_error::internal("winner region ownership disappeared"))?;
+    let region = current_region_for_proof(memo, proof)?;
     let artifacts = proof
         .owned_artifacts
         .iter()

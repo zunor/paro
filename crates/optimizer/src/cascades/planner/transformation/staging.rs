@@ -36,6 +36,11 @@ pub(super) struct NativeNode {
     pub(super) id: paro_planner::plan::PlanNodeId,
     pub(super) stats: NodeStats,
     pub(super) operator: LogicalOperator<NativeChild>,
+    /// Proof lineage for a Memo expression copied into this shell. Fresh
+    /// nodes emitted by a native rewrite leave this empty; copied nodes keep
+    /// their selected transformation proofs so an outer rewrite cannot turn
+    /// an adopted inner aggregate/domain choice into audit-only metadata.
+    pub(super) source_proofs: Box<[EquivalenceProof]>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +244,7 @@ impl NativeShell {
                         id: state.bind_context.next_plan_id(),
                         stats,
                         operator,
+                        source_proofs: logical.proofs.iter().cloned().collect(),
                     });
                     Ok(Some(Built {
                         child: NativeChild::Node(node_index),
@@ -314,7 +320,10 @@ impl NativeShell {
     /// Lower an already-validated closed owned shell exactly once. The output
     /// is a compact post-order node list; real descendants become node
     /// indices and Memo holes keep their immutable BoundReference facts.
-    pub(super) fn from_owned(root: OwnedLogicalPlan) -> Result<Self> {
+    pub(super) fn from_owned(
+        root: OwnedLogicalPlan,
+        selected_proofs: &HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
+    ) -> Result<Self> {
         enum Frame {
             Enter(OwnedLogicalPlan),
             Exit {
@@ -372,6 +381,10 @@ impl NativeShell {
                         id: skeleton.id,
                         stats: skeleton.stats,
                         operator,
+                        source_proofs: selected_proofs
+                            .get(&skeleton.id)
+                            .cloned()
+                            .unwrap_or_default(),
                     });
                     completed.push(NativeChild::Node(id));
                 }
@@ -408,6 +421,10 @@ pub(super) struct StagingRequest {
     /// legitimately discarded by a relational rewrite are removed before
     /// staging; every surviving transport node is consumed exactly once.
     pub(super) nested_group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
+    /// Selected proof lineage keyed by stable occurrence node id. New rewrite
+    /// nodes do not inherit this map and receive only their own transformation
+    /// proof when published.
+    pub(super) selected_proofs: HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
 }
 
 pub(super) struct StagingTarget {
@@ -451,6 +468,7 @@ pub(super) fn stage_transformed_expression(
                 inherited_runtime_filter_facet,
             },
         nested_group_holes,
+        selected_proofs,
     } = request;
 
     #[derive(Clone)]
@@ -484,6 +502,7 @@ pub(super) fn stage_transformed_expression(
         nested_group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         facts: boundary::BoundarySnapshot,
         search_candidates: HashMap<paro_planner::plan::PlanNodeId, OwnedLogicalPlan>,
+        selected_proofs: HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
     }
 
     enum NodeStagingInput {
@@ -492,6 +511,7 @@ pub(super) fn stage_transformed_expression(
             id: paro_planner::plan::PlanNodeId,
             stats: NodeStats,
             operator: LogicalOperator<GroupId>,
+            source_proofs: Box<[EquivalenceProof]>,
         },
     }
 
@@ -616,57 +636,80 @@ pub(super) fn stage_transformed_expression(
             target_child_context,
             refined_cardinality_kind,
         } = request;
-        let (id, stats, semantic_operator, semantic_template, cost_plan) = match input {
-            NodeStagingInput::Owned(plan) => {
-                if let LogicalOperator::BoundReference(reference) = &plan.operator {
-                    if target.is_some()
-                        || !session
-                            .nested_group_holes
-                            .contains_key(&reference.reference_id)
-                    {
-                        return Err(paro_error::internal(
-                            "staging reached an unregistered or root Memo group hole",
-                        ));
+        let (id, stats, semantic_operator, semantic_template, cost_plan, source_proofs) =
+            match input {
+                NodeStagingInput::Owned(plan) => {
+                    if let LogicalOperator::BoundReference(reference) = &plan.operator {
+                        if target.is_some()
+                            || !session
+                                .nested_group_holes
+                                .contains_key(&reference.reference_id)
+                        {
+                            return Err(paro_error::internal(
+                                "staging reached an unregistered or root Memo group hole",
+                            ));
+                        }
+                        let node = resolve_group_hole(session, plan)?;
+                        return Ok(Some((node, None)));
                     }
-                    let node = resolve_group_hole(session, plan)?;
-                    return Ok(Some((node, None)));
+                    let (skeleton, children) =
+                        paro_planner::plan::arena::LogicalPlanNode::detach(plan);
+                    let skeleton_id = skeleton.id;
+                    let source_proofs = session
+                        .selected_proofs
+                        .get(&skeleton_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let semantic_template = semantic_plan::canonical_template(skeleton.clone());
+                    let semantic_operator = skeleton.operator.clone();
+                    (
+                        skeleton.id,
+                        skeleton.stats.clone(),
+                        semantic_operator,
+                        semantic_template,
+                        Some(skeleton.assemble(children)?),
+                        source_proofs,
+                    )
                 }
-                let (skeleton, children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
-                let semantic_template = semantic_plan::canonical_template(skeleton.clone());
-                let semantic_operator = skeleton.operator.clone();
-                (
-                    skeleton.id,
-                    skeleton.stats.clone(),
-                    semantic_operator,
-                    semantic_template,
-                    Some(skeleton.assemble(children)?),
-                )
-            }
-            NodeStagingInput::Native {
-                id,
-                stats,
-                operator,
-            } => {
-                let semantic_operator = operator
-                    .clone()
-                    .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
-                    .expect("mapping native group references to a semantic shell cannot fail");
-                let semantic_template =
-                    semantic_plan::canonical_template(paro_planner::plan::arena::LogicalPlanNode {
-                        id,
-                        stats: NodeStats::default(),
-                        operator: semantic_operator.clone(),
-                    });
-                (
+                NodeStagingInput::Native {
                     id,
-                    stats.clone(),
-                    semantic_operator,
-                    semantic_template,
-                    None,
-                )
-            }
-        };
+                    stats,
+                    operator,
+                    source_proofs,
+                } => {
+                    let semantic_operator = operator
+                        .clone()
+                        .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
+                        .expect("mapping native group references to a semantic shell cannot fail");
+                    let semantic_template = semantic_plan::canonical_template(
+                        paro_planner::plan::arena::LogicalPlanNode {
+                            id,
+                            stats: NodeStats::default(),
+                            operator: semantic_operator.clone(),
+                        },
+                    );
+                    (
+                        id,
+                        stats.clone(),
+                        semantic_operator,
+                        semantic_template,
+                        None,
+                        source_proofs,
+                    )
+                }
+            };
         let native_direct = cost_plan.is_none();
+        if native_direct {
+            if let LogicalOperator::Aggregate(aggregate) = &semantic_operator {
+                if aggregate.groups.len() >= 9 {
+                    tracing::debug!(
+                        target: "paro::optimizer::native_staging",
+                        groups = ?aggregate.groups,
+                        "staged native aggregate grouping"
+                    );
+                }
+            }
+        }
         // The canonical extraction template deliberately has no output demand
         // or occurrence statistics. Derive the published schema/facts from the
         // settled occurrence, before erasing those annotations for storage.
@@ -850,7 +893,7 @@ pub(super) fn stage_transformed_expression(
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         };
-        let logical_identity = key.stable_fingerprint();
+        let logical_identity = stable_cardinality_recipe(operator_fingerprint, &operator_encoding);
         let mut cardinality =
             derive_group_cardinality(&semantic_operator, &key.children, &stats, logical_identity);
         if let Some(target) = target {
@@ -1108,15 +1151,20 @@ pub(super) fn stage_transformed_expression(
             })
             .transpose()?;
         let native_filter_inputs = if native_direct
-            && matches!(semantic_operator, LogicalOperator::Join(Join::Comparison(_)))
-        {
+            && matches!(
+                semantic_operator,
+                LogicalOperator::Join(Join::Comparison(_))
+            ) {
             child_states
                 .iter()
                 .map(|child| {
-                    child.boundary_facts.as_deref().map(|facts| RuntimeFilterInput::Boundary {
-                        layout: child.layout.as_ref(),
-                        facts,
-                    })
+                    child
+                        .boundary_facts
+                        .as_deref()
+                        .map(|facts| RuntimeFilterInput::Boundary {
+                            layout: child.layout.as_ref(),
+                            facts,
+                        })
                 })
                 .collect::<Option<Vec<_>>>()
                 .unwrap_or_default()
@@ -1215,6 +1263,7 @@ pub(super) fn stage_transformed_expression(
         };
         let metadata = PlannerOperatorMetadata {
             origin_rule: Some(options.rule),
+            selected_proofs: source_proofs,
             operator_type: semantic_operator.op_type(),
             operator_fingerprint,
             provided: ProvidedProperties {
@@ -1310,12 +1359,13 @@ pub(super) fn stage_transformed_expression(
                 cardinality,
             })
         } else {
-            let logical = memo.insert_logical_with_operator_encoding(
+            let logical = memo.insert_logical_with_operator_encoding_and_tag(
                 group,
                 key.clone(),
                 payload,
                 EquivalenceProof::TransformationDescendant { rule: options.rule },
                 operator_encoding,
+                operator_tag(semantic_operator.op_type()),
             )?;
             state.record_expression_group(key, group, logical);
             if runtime_filter_candidate {
@@ -1428,6 +1478,7 @@ pub(super) fn stage_transformed_expression(
             nested_group_holes,
             facts: input_facts,
             search_candidates,
+            selected_proofs,
         };
         let (root, staged) = match input {
             StagingInput::Arena(root_index) => {
@@ -1618,6 +1669,7 @@ pub(super) fn stage_transformed_expression(
                                 id: native_node.id,
                                 stats: native_node.stats,
                                 operator,
+                                source_proofs: native_node.source_proofs,
                             },
                             target: is_root.then_some(target),
                             required_region_facet: is_root
@@ -1870,6 +1922,7 @@ mod tests {
                     inherited_runtime_filter_facet: None,
                 },
                 nested_group_holes: BTreeMap::new(),
+                selected_proofs: HashMap::new(),
             },
             &mut input.memo,
             &mut state,
@@ -1923,6 +1976,7 @@ mod tests {
                     inherited_runtime_filter_facet: None,
                 },
                 nested_group_holes: BTreeMap::new(),
+                selected_proofs: HashMap::new(),
             },
             &mut input.memo,
             &mut state,
@@ -1975,7 +2029,7 @@ mod tests {
         let mut state = input.planner_state.write().unwrap();
         state.session = Some(TestStatementContextBuilder::minimal().build());
         let arena_len = state.staging_arena.len();
-        let native = NativeShell::from_owned(native).unwrap();
+        let native = NativeShell::from_owned(native, &HashMap::new()).unwrap();
         let staged = stage_transformed_expression(
             StagingRequest {
                 input: StagingInput::Native(native),
@@ -1996,6 +2050,7 @@ mod tests {
                     inherited_runtime_filter_facet: None,
                 },
                 nested_group_holes: BTreeMap::from([(reference_id, source)]),
+                selected_proofs: HashMap::new(),
             },
             &mut input.memo,
             &mut state,
@@ -2048,6 +2103,7 @@ mod tests {
                     },
                     projection_map: ProjectionMap::all(),
                 }),
+                source_proofs: Box::new([]),
             }]),
             root: 0,
         };
@@ -2073,6 +2129,7 @@ mod tests {
                     inherited_runtime_filter_facet: None,
                 },
                 nested_group_holes: BTreeMap::new(),
+                selected_proofs: HashMap::new(),
             },
             &mut input.memo,
             &mut state,
@@ -2142,6 +2199,7 @@ mod tests {
                                 inherited_runtime_filter_facet: None,
                             },
                             nested_group_holes: BTreeMap::new(),
+                            selected_proofs: HashMap::new(),
                         },
                         memo,
                         state,
@@ -2214,6 +2272,7 @@ mod tests {
                                 inherited_runtime_filter_facet: None,
                             },
                             nested_group_holes: BTreeMap::new(),
+                            selected_proofs: HashMap::new(),
                         },
                         memo,
                         state,

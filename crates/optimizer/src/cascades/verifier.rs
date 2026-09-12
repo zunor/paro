@@ -359,29 +359,37 @@ fn verify_joint_cost_proof(
             "region JointCostProof boundary goals disagree with its canonical winner boundary",
         ));
     }
+    // RegionId is an index into the normalized forest and can be renumbered
+    // when a later logical publication changes the forest. The facet
+    // fingerprints are the stable proof identity; resolve the current node
+    // from them before checking scope and artifact ownership.
+    let Some(first_facet) = proof.facets.first().copied() else {
+        return Err(paro_error::internal(
+            "region-owned winner has no active facet",
+        ));
+    };
+    let current_region_id = memo
+        .regions()
+        .region_for_facet(first_facet)
+        .ok_or_else(|| paro_error::internal("JointCostProof facet is no longer active"))?;
     let region = memo
         .regions()
-        .node(proof.region)
+        .node(current_region_id)
         .ok_or_else(|| paro_error::internal("JointCostProof references an unknown region"))?;
     if !region.scope.contains(&owner_group) {
         return Err(paro_error::internal(
-            "JointCostProof owner is outside its region scope",
+            "JointCostProof owner is outside its current facet region scope",
         ));
     }
     let mut proof_facets = BTreeSet::new();
     for facet in proof.facets.iter().copied() {
         if !proof_facets.insert(facet)
-            || memo.regions().region_for_facet(facet) != Some(proof.region)
+            || memo.regions().region_for_facet(facet) != Some(current_region_id)
         {
             return Err(paro_error::internal(
                 "JointCostProof facet is duplicated or owned by another region",
             ));
         }
-    }
-    if proof_facets.is_empty() {
-        return Err(paro_error::internal(
-            "region-owned winner has no active facet",
-        ));
     }
     let runtime_filter_facets = region
         .facets
@@ -671,7 +679,7 @@ mod tests {
     use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
     use crate::cascades::cost::{CompactRange, SearchCost};
     use crate::cascades::ids::{
-        AdmissibleGrantSetId, ColumnId, LogicalPayloadId, PhysicalPayloadId,
+        AdmissibleGrantSetId, ColumnId, LogicalPayloadId, PhysicalPayloadId, RegionId,
     };
     use crate::cascades::memo::{
         GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, PhysicalExprKey,
@@ -745,6 +753,24 @@ mod tests {
         declared_consumer: RegionBoundaryEndpoint,
         proof_producer_ordinal: usize,
         proof_consumer_ordinal: usize,
+    ) -> Result<()> {
+        verify_runtime_filter_boundary_with_recorded_region(
+            implementation,
+            declared_producer,
+            declared_consumer,
+            proof_producer_ordinal,
+            proof_consumer_ordinal,
+            None,
+        )
+    }
+
+    fn verify_runtime_filter_boundary_with_recorded_region(
+        implementation: crate::cascades::ids::ImplementationId,
+        declared_producer: RegionBoundaryEndpoint,
+        declared_consumer: RegionBoundaryEndpoint,
+        proof_producer_ordinal: usize,
+        proof_consumer_ordinal: usize,
+        recorded_region: Option<RegionId>,
     ) -> Result<()> {
         let mut memo = Memo::new(Default::default());
         let (first, _) = add_logical_group(&mut memo, 10, []);
@@ -832,7 +858,8 @@ mod tests {
             source_work: Box::new([]),
             physical_fingerprint: Fingerprint(212),
             joint_cost_proof: Some(crate::cascades::region::JointCostProof {
-                region: memo.regions().region_for_facet(facet).unwrap(),
+                region: recorded_region
+                    .unwrap_or_else(|| memo.regions().region_for_facet(facet).unwrap()),
                 facets: Box::new([facet]),
                 owner_group: owner,
                 boundary_goals: child_goals,
@@ -870,6 +897,19 @@ mod tests {
             RegionBoundaryEndpoint::Input(0),
             1,
             0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn joint_cost_proof_rebinds_after_region_forest_renumbering() {
+        verify_runtime_filter_boundary_with_recorded_region(
+            super::super::planner::PLANNER_HASH_JOIN_RUNTIME_FILTER,
+            RegionBoundaryEndpoint::Input(1),
+            RegionBoundaryEndpoint::Input(0),
+            1,
+            0,
+            Some(RegionId::new(99)),
         )
         .unwrap();
     }

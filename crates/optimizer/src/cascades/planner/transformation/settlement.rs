@@ -15,7 +15,7 @@ use paro_planner::plan::arena::{LogicalPlanArena, LogicalPlanNode, PlanIndex};
 use paro_planner::plan::{NodeStats, PlanNodeId};
 use std::hash::{Hash, Hasher};
 
-mod demand;
+pub(super) mod demand;
 
 type FactId = usize;
 type CteEnvironment = Arc<BTreeMap<usize, FactId>>;
@@ -589,18 +589,12 @@ impl SettlementCache {
         // in which the last visited branch overwrote the first.
         if let LogicalOperator::SetOperation(_) = &plan.operator {
             if inputs.len() == 2 {
-                for (ordinal, binding) in output.bindings().iter().enumerate() {
-                    if let (Some(left), Some(right)) = (
-                        self.facts[inputs[0]].columns.get(ordinal),
-                        self.facts[inputs[1]].columns.get(ordinal),
-                    ) {
-                        let mut merged = left.as_ref().copy();
-                        merged.merge(right.as_ref());
-                        context
-                            .column_stats_mut()
-                            .insert(*binding, Arc::new(merged));
-                    }
-                }
+                crate::statistics::gathering::merge_set_operation_column_statistics(
+                    &output,
+                    &self.facts[inputs[0]].columns,
+                    &self.facts[inputs[1]].columns,
+                    &mut context,
+                );
             }
         }
         let facts = self.intern_fact(RelationFacts {

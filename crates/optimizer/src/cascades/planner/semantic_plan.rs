@@ -24,6 +24,10 @@ pub(super) struct InstantiatedPlanWithGroupHoles {
     /// entry and substitutes the named Memo group before publishing a logical
     /// expression, so the representative subtree can never become semantics.
     pub(super) group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
+    /// Proof lineage for the exact Memo expressions copied into the owned
+    /// occurrence. Rebuilding the occurrence must not turn selected Memo
+    /// proofs into `applied_rules` audit data when it is staged again.
+    pub(super) selected_proofs: HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
 }
 
 /// Instantiate the operator shells explicitly consumed by a pattern while
@@ -82,6 +86,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
     }
 
     let mut group_holes = BTreeMap::new();
+    let mut selected_proofs = HashMap::new();
     let mut pending = vec![(binding, None, false)];
     let mut completed = Vec::new();
     while let Some((binding, expected_layout, finish)) = pending.pop() {
@@ -169,6 +174,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                     &layout,
                     &child_layouts,
                 );
+                selected_proofs.insert(plan.id, logical.proofs.iter().cloned().collect());
                 completed.push(plan);
             }
         }
@@ -180,7 +186,11 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
         ));
     }
     let plan = completed.pop().unwrap();
-    Ok(Some(InstantiatedPlanWithGroupHoles { plan, group_holes }))
+    Ok(Some(InstantiatedPlanWithGroupHoles {
+        plan,
+        group_holes,
+        selected_proofs,
+    }))
 }
 
 /// Restore the occurrence's output column set after materializing a canonical
@@ -414,7 +424,7 @@ fn projection_for_columns(
     )
 }
 
-fn projection_for_bindings(
+pub(super) fn projection_for_bindings(
     input_bindings: &[ColumnBinding],
     input_types: &[paro_common::types::LogicalType],
     output_columns: &[ColumnId],

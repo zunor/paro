@@ -143,6 +143,27 @@ impl FilterPushdown {
         into_associative_terms(expr, ConjunctionType::And)
     }
 
+    /// The same local predicate normalization used by tree and Memo producers.
+    /// `None` leaves contradiction/empty-output settlement to its owner.
+    pub(crate) fn normalize_predicates(
+        predicates: impl IntoIterator<Item = Expression>,
+    ) -> Option<Vec<Expression>> {
+        let mut pushdown = Self::new();
+        for predicate in predicates {
+            if pushdown.add_filter(predicate) == FilterResult::Unsatisfiable {
+                return None;
+            }
+        }
+        pushdown.generate_filters();
+        Some(
+            pushdown
+                .filters
+                .into_iter()
+                .map(|filter| filter.filter)
+                .collect(),
+        )
+    }
+
     /// Push current filters into the combiner.
     fn push_filters(&mut self) -> FilterResult {
         for filter in self.filters.drain(..) {
@@ -293,7 +314,10 @@ impl FilterPushdown {
 
     /// Check whether moving a predicate below a projection could duplicate, eliminate, or reorder
     /// an observable evaluation.
-    fn has_evaluation_fence_through_projection(proj: &Projection, expr: &Expression) -> bool {
+    pub(crate) fn has_evaluation_fence_through_projection<Child>(
+        proj: &Projection<Child>,
+        expr: &Expression,
+    ) -> bool {
         if expr.evaluation_properties().is_reorder_fence() {
             return true;
         }
@@ -911,24 +935,7 @@ impl FilterPushdown {
                 // Group columns are outputs owned by `group_index`, not
                 // pass-through child bindings. Substitute the defining GROUP
                 // BY expression before crossing the aggregate boundary.
-                let mut pushable = !filter.filter.evaluation_properties().is_reorder_fence();
-                visit_expression(&filter.filter, &mut |expression| {
-                    let Expression::ColumnRef(column) = expression else {
-                        return;
-                    };
-                    if column.depth != 0
-                        || column.binding.table_index != agg.group_index
-                        || agg
-                            .groups
-                            .get(column.binding.column_index)
-                            .is_none_or(|group| {
-                                !group.evaluation_properties().can_share_evaluation()
-                            })
-                    {
-                        pushable = false;
-                    }
-                });
-                if !pushable {
+                if !Self::group_filter_can_move(&agg, &filter.filter) {
                     remaining_filters.push(filter.filter);
                     continue;
                 }
@@ -955,6 +962,30 @@ impl FilterPushdown {
                 remaining_filters,
             ))
         }
+    }
+
+    /// The expression contract for crossing an aggregate output boundary.
+    /// Callers that require an ordinary grouping domain check that separately.
+    pub(crate) fn group_filter_can_move<Child>(
+        agg: &paro_planner::operator::Aggregate<Child>,
+        predicate: &Expression,
+    ) -> bool {
+        let mut pushable = !predicate.evaluation_properties().is_reorder_fence();
+        visit_expression(predicate, &mut |expression| {
+            let Expression::ColumnRef(column) = expression else {
+                return;
+            };
+            if column.depth != 0
+                || column.binding.table_index != agg.group_index
+                || agg
+                    .groups
+                    .get(column.binding.column_index)
+                    .is_none_or(|group| !group.evaluation_properties().can_share_evaluation())
+            {
+                pushable = false;
+            }
+        });
+        pushable
     }
 
     /// Push down through a Distinct operator.
@@ -1117,7 +1148,10 @@ impl FilterPushdown {
     }
 }
 
-fn projection_reference_crosses_execution_boundary(proj: &Projection, expr: &Expression) -> bool {
+fn projection_reference_crosses_execution_boundary<Child>(
+    proj: &Projection<Child>,
+    expr: &Expression,
+) -> bool {
     let mut crosses_boundary = false;
     visit_expression(expr, &mut |expression| {
         if crosses_boundary {

@@ -1580,13 +1580,14 @@ fn left_outer_nullable_build_output_stops_runtime_filter_lineage() {
     assert!(!supports_runtime_filter_auxiliary(&join, true));
 }
 
-#[test]
-fn nested_filters_share_one_ordered_source_work_lane() {
+fn nested_runtime_filter_input(
+    build_side: paro_planner::operator::join::JoinBuildSideConstraint,
+) -> OptimizationInput {
     let mut fact = test_base_get(0, 20_041, "fact_probe", 20_000);
     fact.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
     let mut first_build = test_base_get(1, 20_042, "first_build", 20);
     first_build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
-    let first_join = ComparisonJoin::new(
+    let mut first_join = ComparisonJoin::new(
         JoinType::Inner,
         fact,
         first_build,
@@ -1595,16 +1596,15 @@ fn nested_filters_share_one_ordered_source_work_lane() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
+    first_join.build_side_constraint = build_side;
     let mut probe =
         OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
     probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(200));
-    // The second build is selective at the 20,000-row source and its lineage
-    // crosses the first join. Source-work composition owns one lane and
-    // jointly prices both predicates in selectivity order, so both physical
-    // filters are admissible without independently discounting the scan.
+    // With right builds, both RFs reach source 0 through the first join.
+    // Without that constraint the outer join may instead filter source 2.
     let mut second_build = test_base_get(2, 20_043, "second_build", 500);
     second_build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(500));
-    let second_join = ComparisonJoin::new(
+    let mut second_join = ComparisonJoin::new(
         JoinType::Inner,
         probe,
         second_build,
@@ -1613,22 +1613,296 @@ fn nested_filters_share_one_ordered_source_work_lane() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
+    second_join.build_side_constraint = build_side;
     let mut plan =
         OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(second_join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
 
-    let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
-        .expect("build nested runtime-filter memo");
-    let optimized = input.optimize(&test_grant_classes()).expect("optimize");
-    let runtime_filters = optimized.variants[0]
-        .contracts
-        .values()
-        .filter(|contract| {
-            contract.implementation == PhysicalImplementationFlavor::HashJoinRuntimeFilter
-        })
-        .count();
+    MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
+        .expect("build nested runtime-filter memo")
+        .with_strong_incumbent_export(true)
+}
 
-    assert_eq!(runtime_filters, 2);
+/// Return (source identity, physical occurrence), after checking executable
+/// contracts. Equal source IDs alone must not hide two separate scan nodes.
+fn nested_runtime_filter_consumers(
+    plan: OwnedLogicalPlan,
+    contracts: WinnerPhysicalContracts,
+    enforcers: ExtractedEnforcerContracts,
+) -> Vec<(usize, usize)> {
+    let physical =
+        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+            .with_winner_contracts(contracts)
+            .with_enforcer_contracts(enforcers)
+            .requiring_winner_contracts()
+            .extract(&physical_input(plan))
+            .unwrap();
+    crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
+    let mut consumers = physical
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.kind,
+                crate::physical::PhysicalEdgeKind::RuntimeFilter(_)
+            )
+        })
+        .map(|edge| {
+            let crate::physical::PhysicalNodeKind::RowsetScan(scan) =
+                &physical.node(edge.consumer).kind
+            else {
+                panic!("nested runtime filter must reach a rowset scan");
+            };
+            (scan.table_index, edge.consumer.index())
+        })
+        .collect::<Vec<_>>();
+    consumers.sort_unstable();
+    consumers
+}
+
+#[test]
+fn nested_filters_share_one_ordered_source_work_lane() {
+    // Price one fixed legal witness: baseline scans and two right-build RFs.
+    // All candidate data/costs still come from the production providers. The
+    // unrestricted companion test below retains the normal choice domain.
+    struct FixedRfWitness {
+        providers: Arc<ImplementationRegistry>,
+        id: ImplementationId,
+    }
+    impl PhysicalImplementation for FixedRfWitness {
+        fn id(&self) -> ImplementationId {
+            self.id
+        }
+
+        fn grant_dependency(&self) -> GrantDependencyDescriptor {
+            self.providers
+                .implementation(self.id)
+                .unwrap()
+                .grant_dependency()
+        }
+
+        fn grant_dependency_for(
+            &self,
+            expr: &LogicalExpr,
+            ctx: &ImplementationContext<'_>,
+        ) -> GrantDependencyDescriptor {
+            self.providers
+                .implementation(self.id)
+                .unwrap()
+                .grant_dependency_for(expr, ctx)
+        }
+
+        fn matches(
+            &self,
+            expr: &LogicalExpr,
+            goal: OptimizationGoal,
+            ctx: &ImplementationContext<'_>,
+        ) -> bool {
+            (expr.key.children.is_empty() == (self.id == PLANNER_BASELINE_IMPLEMENTATION))
+                && self
+                    .providers
+                    .implementation(self.id)
+                    .unwrap()
+                    .matches(expr, goal, ctx)
+        }
+
+        fn candidates(
+            &self,
+            expr: LogicalExprId,
+            goal: OptimizationGoal,
+            ctx: &ImplementationContext<'_>,
+        ) -> Result<Box<[PhysicalCandidate]>> {
+            self.providers
+                .implementation(self.id)
+                .unwrap()
+                .candidates(expr, goal, ctx)
+        }
+    }
+
+    let mut input =
+        nested_runtime_filter_input(paro_planner::operator::join::JoinBuildSideConstraint::Right);
+    input.mode = SearchMode::Direct; // Fixed physical witness, no mandatory baseline join phase.
+    input.root_goal.grant = GrantGoalKey::Class(test_grant_classes()[0].id);
+    let mut registry = ImplementationRegistry::default();
+    implementation::register_implementations(
+        &mut registry,
+        input.planner_state.clone(),
+        Arc::new(
+            test_grant_classes()
+                .into_iter()
+                .map(|class| (class.id, class))
+                .collect(),
+        ),
+        input.calibration.clone(),
+        input.force_spill,
+    )
+    .unwrap();
+    let providers = Arc::new(registry);
+    let mut registry = ImplementationRegistry::default();
+    for id in [
+        PLANNER_BASELINE_IMPLEMENTATION,
+        PLANNER_HASH_JOIN_RUNTIME_FILTER,
+    ] {
+        registry
+            .register_implementation(FixedRfWitness {
+                providers: providers.clone(),
+                id,
+            })
+            .unwrap();
+    }
+    input.memo.set_calibration(input.calibration.clone());
+    let mut engine = CascadesEngine::new(input.memo, registry);
+    engine.prime_grant_context(test_grant_classes()).unwrap();
+    let candidate = engine
+        .optimize(input.root, input.root_goal, input.mode)
+        .unwrap();
+    let root = engine
+        .memo()
+        .freeze_candidate_tree(ChildWinnerRef {
+            group: input.root,
+            goal: input.root_goal,
+            candidate: candidate.candidate,
+        })
+        .unwrap();
+    let extracted = extract_frozen_planner_tree(
+        engine.memo(),
+        &input.planner_state.read().unwrap(),
+        &input.bind_context,
+        input.root,
+        input.root_goal,
+        root.clone(),
+        input.mode,
+    )
+    .unwrap();
+    let presented = enforce_result_presentation(
+        extracted,
+        &input.presentation,
+        &input.bind_context,
+        input.calibration.as_ref(),
+        root.winner.physical_fingerprint,
+        root.winner.cost,
+    )
+    .unwrap();
+    let consumers = nested_runtime_filter_consumers(
+        presented.plan,
+        Arc::new(presented.contracts),
+        Arc::new(presented.enforcers),
+    );
+    assert_eq!(consumers.len(), 2);
+    assert_eq!(consumers[0].0, 0);
+    assert_eq!(
+        consumers[0], consumers[1],
+        "both RF edges must reach the same scan"
+    );
+    let inner = &root.children[0];
+    for node in [&root, inner] {
+        assert_eq!(
+            node.physical.key.implementation,
+            PLANNER_HASH_JOIN_RUNTIME_FILTER
+        );
+        let CostComposition::SidewaysFilter {
+            filtered_child,
+            sources,
+            ..
+        } = &node.winner.cost_composition
+        else {
+            panic!("selected RF must retain its source-work composition");
+        };
+        assert_eq!(*filtered_child, 0);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source, WorkSourceId(0));
+    }
+    let lanes = &root.winner.source_work;
+    assert_eq!(
+        lanes
+            .iter()
+            .filter(|lane| lane.source == WorkSourceId(0))
+            .count(),
+        1
+    );
+    let lane = lanes
+        .iter()
+        .find(|lane| lane.source == WorkSourceId(0))
+        .unwrap();
+    assert_eq!(lane.source_rows, 20_000);
+    assert_eq!(lane.retentions.len(), 2);
+    assert_eq!(lane.filters.len(), 2);
+    assert!(lanes
+        .iter()
+        .filter(|lane| lane.source != WorkSourceId(0))
+        .all(|lane| lane.filters.is_empty()));
+    let inner_lane = inner
+        .winner
+        .source_work
+        .iter()
+        .find(|lane| lane.source == WorkSourceId(0))
+        .unwrap();
+    assert_eq!(inner_lane.filters.len(), 1);
+    assert!(lane.filters.contains(&inner_lane.filters[0]));
+    let [a, b] = lane.filters.as_ref() else {
+        unreachable!()
+    };
+    assert_ne!(a.domain, b.domain);
+    assert_ne!(a.evaluation, b.evaluation);
+    assert_eq!((a.evaluation_rows, b.evaluation_rows), (20_000, 20_000));
+
+    // Independently price the specified selectivity-first order from each
+    // evaluation's immutable full-source work, not from an already reduced
+    // lane. Different RF representations need not have equal apply costs.
+    let a_work = a.full_apply_cost.score.range.expected;
+    let b_work = b.full_apply_cost.score.range.expected;
+    assert!(a_work > 0.0 && b_work > 0.0);
+    assert_ne!(a.expected_retained_ppm, b.expected_retained_ppm);
+    let expected_apply = if a.expected_retained_ppm < b.expected_retained_ppm {
+        a_work + f64::from(a.expected_retained_ppm) / 1_000_000.0 * b_work
+    } else {
+        b_work + f64::from(b.expected_retained_ppm) / 1_000_000.0 * a_work
+    };
+    assert!((lane.filter_apply_cost.score.range.expected - expected_apply).abs() < 1e-9);
+    assert!(expected_apply < a_work + b_work);
+}
+
+#[test]
+fn nested_filters_allow_build_left_on_a_different_source() {
+    let optimized =
+        nested_runtime_filter_input(paro_planner::operator::join::JoinBuildSideConstraint::Either)
+            .optimize(&test_grant_classes())
+            .expect("optimize unconstrained nested filters");
+    let root = optimized.strong_incumbent_plans[0].frozen();
+    assert_eq!(
+        root.physical.key.implementation,
+        PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER
+    );
+    assert_eq!(
+        root.children[0].physical.key.implementation,
+        PLANNER_HASH_JOIN_RUNTIME_FILTER
+    );
+    let CostComposition::SidewaysFilter {
+        filtered_child,
+        sources,
+        ..
+    } = &root.winner.cost_composition
+    else {
+        panic!("build-left RF must retain its source-work composition");
+    };
+    assert_eq!(*filtered_child, 1);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].source, WorkSourceId(2));
+    let mut lanes = root
+        .winner
+        .source_work
+        .iter()
+        .map(|lane| (lane.source.0, lane.source_rows, lane.filters.len()))
+        .collect::<Vec<_>>();
+    lanes.sort_unstable();
+    assert_eq!(lanes, vec![(0, 20_000, 1), (1, 20, 0), (2, 500, 1)]);
+
+    let variant = optimized.variants.into_vec().remove(0);
+    let consumers =
+        nested_runtime_filter_consumers(variant.plan, variant.contracts, variant.enforcers);
+    assert_eq!(consumers.len(), 2);
+    assert_eq!((consumers[0].0, consumers[1].0), (0, 2));
+    assert_ne!(consumers[0].1, consumers[1].1);
 }
 
 #[test]

@@ -8,8 +8,8 @@ use super::*;
 use paro_planner::expression::ExpressionIterator;
 use paro_planner::operator::ProjectionMap;
 
-pub(super) type BindingMap = BTreeMap<ColumnBinding, ColumnBinding>;
-pub(super) type ScanBindings = HashMap<
+pub(in super::super) type BindingMap = BTreeMap<ColumnBinding, ColumnBinding>;
+pub(in super::super) type ScanBindings = HashMap<
     (
         usize,
         Vec<paro_planner::operator::get::GetColumnSource>,
@@ -71,42 +71,12 @@ pub(super) fn derive(
         }
         let node = arena.get(index)?;
         let wanted = outputs[&index].clone();
-        let mut execution = wanted.clone();
-        let mut positional = false;
-        paro_planner::visitor::enumerate_expression_refs(&node.operator, |expression| {
-            crate::expression::traversal::visit_expression(expression, &mut |expression| {
-                if let Expression::ColumnRef(column) = expression {
-                    if column.depth == 0 {
-                        execution.insert(column.binding);
-                    }
-                }
-                positional |= matches!(expression, Expression::Reference(_));
-            });
-        });
+        let (execution, positional) = execution_demand(&node.operator, &wanted);
         let mut children = Vec::new();
         node.operator
             .visit_child_links(&mut |child| children.push(*child));
         for (ordinal, child) in children.into_iter().enumerate() {
-            let all = positional
-                || match &node.operator {
-                    // These operators observe the complete row/positional schema,
-                    // even if their parent returns only a subset.
-                    LogicalOperator::SetOperation(_)
-                    | LogicalOperator::Distinct(_)
-                    | LogicalOperator::RecursiveCTE(_)
-                    | LogicalOperator::EmptyResult(_) => true,
-                    LogicalOperator::MaterializedCTE(_) => ordinal == 0,
-                    LogicalOperator::Projection(_)
-                    | LogicalOperator::Aggregate(_)
-                    | LogicalOperator::Filter(_)
-                    | LogicalOperator::Order(_)
-                    | LogicalOperator::TopN(_)
-                    | LogicalOperator::Limit(_)
-                    | LogicalOperator::RowFetch(_)
-                    | LogicalOperator::Window(_)
-                    | LogicalOperator::Join(_) => false,
-                    _ => true,
-                };
+            let all = child_needs_full_row(&node.operator, ordinal, positional);
             let layout = if all {
                 &layouts[&child]
             } else {
@@ -132,6 +102,52 @@ pub(super) fn derive(
         carriers,
         outputs,
     }))
+}
+
+pub(in super::super) fn execution_demand<Child>(
+    operator: &LogicalOperator<Child>,
+    wanted: &BTreeSet<ColumnBinding>,
+) -> (BTreeSet<ColumnBinding>, bool) {
+    let mut execution = wanted.clone();
+    let mut positional = false;
+    paro_planner::visitor::enumerate_expression_refs(operator, |expression| {
+        crate::expression::traversal::visit_expression(expression, &mut |expression| {
+            if let Expression::ColumnRef(column) = expression {
+                if column.depth == 0 {
+                    execution.insert(column.binding);
+                }
+            }
+            positional |= matches!(expression, Expression::Reference(_));
+        });
+    });
+    (execution, positional)
+}
+
+pub(in super::super) fn child_needs_full_row<Child>(
+    operator: &LogicalOperator<Child>,
+    ordinal: usize,
+    positional: bool,
+) -> bool {
+    positional
+        || match operator {
+            // The row/positional schema is observable even when the parent uses
+            // fewer columns. Native shells and arena settlement share this gate.
+            LogicalOperator::SetOperation(_)
+            | LogicalOperator::Distinct(_)
+            | LogicalOperator::RecursiveCTE(_)
+            | LogicalOperator::EmptyResult(_) => true,
+            LogicalOperator::MaterializedCTE(_) => ordinal == 0,
+            LogicalOperator::Projection(_)
+            | LogicalOperator::Aggregate(_)
+            | LogicalOperator::Filter(_)
+            | LogicalOperator::Order(_)
+            | LogicalOperator::TopN(_)
+            | LogicalOperator::Limit(_)
+            | LogicalOperator::RowFetch(_)
+            | LogicalOperator::Window(_)
+            | LogicalOperator::Join(_) => false,
+            _ => true,
+        }
 }
 
 fn remap_expression(expression: &Expression, bindings: &BindingMap) -> Result<Expression> {
@@ -208,14 +224,14 @@ fn project(
     Ok(())
 }
 
-pub(super) struct Inputs<'a> {
-    pub(super) old_carriers: &'a LogicalOutputLayout,
-    pub(super) before: &'a [LogicalOutputLayout],
-    pub(super) after: &'a [LogicalOutputLayout],
-    pub(super) children: &'a [BindingMap],
+pub(in super::super) struct Inputs<'a> {
+    pub(in super::super) old_carriers: &'a LogicalOutputLayout,
+    pub(in super::super) before: &'a [LogicalOutputLayout],
+    pub(in super::super) after: &'a [LogicalOutputLayout],
+    pub(in super::super) children: &'a [BindingMap],
 }
 
-pub(super) fn apply(
+pub(in super::super) fn apply(
     mut shell: LogicalPlanNode<()>,
     inputs: Inputs<'_>,
     wanted: &BTreeSet<ColumnBinding>,

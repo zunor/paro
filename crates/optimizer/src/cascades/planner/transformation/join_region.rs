@@ -228,6 +228,24 @@ pub(super) fn try_native_enumeration(
         return Ok(Vec::new());
     }
 
+    // Relation ids are local to one DP invocation. Canonicalize atom order
+    // before either building or reading the cache so an equivalent
+    // associative tree cannot map a cached relation-set id onto a different
+    // native child. The uniqueness check below still rejects repeated table
+    // bindings; table-index order is therefore a total order here.
+    input
+        .atoms
+        .sort_unstable_by(|left, right| left.tables.cmp(&right.tables));
+
+    let cache_key = identity_with_facts(binding, memo, state, Some(facts))?.map(|identity| {
+        (
+            memo.canonical_group(match binding {
+                PatternOperand::Group(group) | PatternOperand::Expression { group, .. } => *group,
+            }),
+            identity,
+        )
+    });
+
     let mut relation_manager = RelationManager::new();
     let mut column_stats = HashMap::new();
     let mut seen_tables = BTreeSet::new();
@@ -257,20 +275,63 @@ pub(super) fn try_native_enumeration(
                 .cloned(),
         )
         .collect::<HashMap<_, _>>();
-    let mut optimizer = JoinOrderOptimizer::new(state.cost_model.defaults.clone());
-    optimizer = optimizer.with_search_budget(memo.budget());
-    let Some(graph) = optimizer.enumerate_relation_graph(
-        input.filters,
-        region_outputs,
-        relation_manager,
-        column_stats,
-    )?
-    else {
-        return Ok(Vec::new());
+    let graph = if let Some(key) = cache_key.as_ref() {
+        let cached = {
+            let mut cache = state
+                .join_region_cache
+                .lock()
+                .expect("join-region cache poisoned");
+            let cached = cache.entries.get(key).cloned();
+            if cached.is_some() {
+                cache.hits = cache.hits.saturating_add(1);
+            }
+            cached
+        };
+        if let Some(graph) = cached {
+            graph
+        } else {
+            let mut optimizer = JoinOrderOptimizer::new(state.cost_model.defaults.clone());
+            optimizer = optimizer.with_search_budget(memo.budget());
+            let Some(graph) = optimizer.enumerate_relation_graph(
+                input.filters,
+                region_outputs,
+                relation_manager,
+                column_stats,
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let graph = Arc::new(graph);
+            let mut cache = state
+                .join_region_cache
+                .lock()
+                .expect("join-region cache poisoned");
+            if let Some(existing) = cache.entries.get(key).cloned() {
+                cache.hits = cache.hits.saturating_add(1);
+                existing
+            } else {
+                cache.entries.insert(key.clone(), Arc::clone(&graph));
+                cache.builds = cache.builds.saturating_add(1);
+                graph
+            }
+        }
+    } else {
+        let mut optimizer = JoinOrderOptimizer::new(state.cost_model.defaults.clone());
+        optimizer = optimizer.with_search_budget(memo.budget());
+        let Some(graph) = optimizer.enumerate_relation_graph(
+            input.filters,
+            region_outputs,
+            relation_manager,
+            column_stats,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        Arc::new(graph)
     };
 
     let mut shells = Vec::with_capacity(graph.final_plans.len());
-    for plan in graph.final_plans {
+    for plan in &graph.final_plans {
         let mut nodes = shell.nodes.to_vec();
         let mut used_filters = HashSet::new();
         let root_child =
@@ -315,6 +376,7 @@ pub(super) fn try_native_enumeration(
                     child: NativeChild::Node(root),
                     projection_map: projection_map.unwrap_or_else(ProjectionMap::all),
                 }),
+                source_proofs: Box::new([]),
             });
             root = index;
         }
@@ -751,6 +813,7 @@ fn rebuild_native_join(
         id: state.bind_context.next_plan_id(),
         stats,
         operator,
+        source_proofs: Box::new([]),
     });
     Ok(NativeChild::Node(index))
 }
@@ -1001,5 +1064,14 @@ mod tests {
             ));
             assert_eq!(shell.root_layout().unwrap().len(), 3);
         }
+
+        // The DP result, rather than the reconstructed shell, is the shared
+        // value. A second request must reuse that immutable graph while still
+        // allocating fresh native node identities for the caller.
+        let second = try_native_enumeration(&binding.root, context.memo(), &state, &facts).unwrap();
+        assert_eq!(second.len(), 1);
+        let cache = state.join_region_cache.lock().unwrap();
+        assert_eq!(cache.builds, 1);
+        assert_eq!(cache.hits, 1);
     }
 }

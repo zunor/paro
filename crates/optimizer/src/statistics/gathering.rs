@@ -68,6 +68,25 @@ pub struct StatisticsGathering {
     delim_output_stats: HashMap<usize, Vec<Arc<ColumnStatistics>>>,
 }
 
+/// Set-operation inputs are positional domains, even when both branches use
+/// identical bindings. A shared binding map cannot represent both snapshots.
+pub(crate) fn merge_set_operation_column_statistics(
+    output: &LogicalOutputLayout,
+    left: &[Arc<ColumnStatistics>],
+    right: &[Arc<ColumnStatistics>],
+    context: &mut OptimizationContext,
+) {
+    for (ordinal, binding) in output.bindings().iter().enumerate() {
+        if let (Some(left), Some(right)) = (left.get(ordinal), right.get(ordinal)) {
+            let mut merged = left.as_ref().copy();
+            merged.merge(right.as_ref());
+            context
+                .column_stats_mut()
+                .insert(*binding, Arc::new(merged));
+        }
+    }
+}
+
 struct StatisticsGatherFolder<'a> {
     gathering: &'a mut StatisticsGathering,
     context: &'a mut OptimizationContext,

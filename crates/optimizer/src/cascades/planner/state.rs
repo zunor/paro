@@ -136,6 +136,43 @@ struct PhysicalPayloadStorage {
     rollback_removals: u64,
 }
 
+/// Exact join-graph DP results retained for the duration of one planning
+/// session. The key is supplied by the same boundary/fact identity used by
+/// the transformation rule; it is not a cost-only or frontier-ordinal cache.
+/// Keeping this behind a mutex lets the native rule use an immutable planner
+/// state view and gives a future worker pool one publication point.
+#[derive(Debug, Default)]
+pub(super) struct JoinRegionCache {
+    pub(super) entries:
+        BTreeMap<(GroupId, Box<[u8]>), Arc<crate::join_order::optimizer::JoinGraphEnumeration>>,
+    pub(super) hits: u64,
+    pub(super) builds: u64,
+}
+
+/// A completed existential pattern lookup and the exact Memo reads that made
+/// it true or false. The read set is part of the value: a negative result is
+/// only reusable while every inspected logical frontier and fact snapshot is
+/// still current. This keeps the cache a dependency-aware memoization layer,
+/// rather than a semantic shortcut which could miss a newly inserted witness.
+#[derive(Debug, Clone)]
+pub(super) struct CachedPatternWitness {
+    pub(super) matches: bool,
+    /// Preserve the logical-work budget charge of the original lookup even
+    /// when the physical traversal is reused. Otherwise a cache hit would
+    /// silently create extra search capacity and could turn a bounded search
+    /// into an unbounded exploration of newly exposed alternatives.
+    pub(super) work_units: usize,
+    pub(super) reads: Box<[PatternRead]>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct PatternWitnessCache {
+    pub(super) entries: BTreeMap<(GroupId, u8), CachedPatternWitness>,
+    pub(super) hits: u64,
+    pub(super) invalidations: u64,
+    pub(super) root_dispatch_skips: u64,
+}
+
 impl PhysicalPayloadStorage {
     fn push(&mut self, template: PlannerPhysicalTemplate) -> PhysicalPayloadId {
         let id = PhysicalPayloadId::new(self.payloads.len());
@@ -296,6 +333,14 @@ pub(super) struct PlannerTransformState {
     pub(super) expression_group_insertions: Vec<(LogicalExprKey, (GroupId, LogicalExprId))>,
     pub(super) metadata_runtime_filter_changes: Vec<MetadataRuntimeFilterChange>,
     pub(super) enumerated_join_regions: BTreeSet<(GroupId, Box<[u8]>)>,
+    /// Immutable DP results are reusable only when the semantic graph and
+    /// all consumed boundary facts have the same identity. This is separate
+    /// from `enumerated_join_regions`: that set is a publication guard,
+    /// whereas this cache is a pure result-reuse path.
+    pub(super) join_region_cache: std::sync::Mutex<JoinRegionCache>,
+    /// Cross-task existential lookahead reuse. Entries carry their complete
+    /// dependency transcript and are revalidated before use.
+    pub(super) witness_cache: std::sync::Mutex<PatternWitnessCache>,
     /// Immutable value facts may survive a failed publication. Their local
     /// revision and exact child fact identities validate every cache read.
     pub(super) boundary_cache: std::sync::Mutex<super::boundary::BoundaryFactCache>,
@@ -505,6 +550,11 @@ impl std::fmt::Debug for PlannerTransformState {
 #[derive(Debug, Clone)]
 pub(super) struct PlannerOperatorMetadata {
     pub(super) origin_rule: Option<RuleId>,
+    /// Selected proof lineage copied from an existing Memo expression while
+    /// a native shell is rebuilt. This is payload-local evidence and must not
+    /// be confused with `origin_rule` (which only identifies the producer of
+    /// the shell) or the Memo expression's apply audit.
+    pub(super) selected_proofs: Box<[EquivalenceProof]>,
     pub(super) operator_type: LogicalOperatorType,
     pub(super) operator_fingerprint: Fingerprint,
     pub(super) provided: ProvidedProperties,

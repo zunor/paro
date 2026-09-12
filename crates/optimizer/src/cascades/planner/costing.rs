@@ -568,7 +568,8 @@ pub(super) fn runtime_filter_build_left_probe_sources(
 ) -> Option<Box<[PlannerRuntimeFilterSource]>> {
     runtime_filter_input_source_facts(
         RuntimeFilterInput::Owned(&join.right),
-        join.conditions.iter()
+        join.conditions
+            .iter()
             .filter(|condition| condition.comparison == JoinComparisonType::Equal)
             .map(|condition| &condition.right),
     )
@@ -1414,11 +1415,11 @@ fn apply_execution_memory_contract(
     max_concurrent_tasks: u16,
     cost: &mut SearchCost,
 ) -> Result<()> {
-    use crate::physical::MemoryCompletion;
     use crate::physical::resources::{
-        BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES, ExecutionMemoryContract,
+        ExecutionMemoryContract, BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES,
         SPILL_BUFFER_MINIMUM_BYTES,
     };
+    use crate::physical::MemoryCompletion;
 
     let stateful = retained_memory_upper > 0
         || matches!(
@@ -2291,8 +2292,8 @@ pub(super) fn external_operator_cost(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompactRange, RuntimeFilterExactness, RuntimeFilterProbeMultiplicity,
-        runtime_filtered_probe_work, sort_work, topn_work,
+        runtime_filtered_probe_work, sort_work, topn_work, CompactRange, RuntimeFilterExactness,
+        RuntimeFilterProbeMultiplicity,
     };
 
     #[test]

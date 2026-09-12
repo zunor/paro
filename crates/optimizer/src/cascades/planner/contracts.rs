@@ -141,6 +141,21 @@ pub(super) fn derive_group_cardinality<Child>(
         })
 }
 
+/// Build a cardinality-recipe witness from semantic operator bytes rather
+/// than Memo-local scalar/expression ordinals. A frozen incumbent may be
+/// checked against a separately constructed Memo; numeric arena ids are
+/// intentionally allowed to differ across that boundary.
+pub(super) fn stable_cardinality_recipe(
+    operator_fingerprint: Fingerprint,
+    operator_encoding: &[u8],
+) -> Fingerprint {
+    let mut fingerprint = StableFingerprintBuilder::default();
+    fingerprint.write_bytes(b"paro.cardinality-recipe.v2");
+    fingerprint.write_fingerprint(operator_fingerprint);
+    fingerprint.write_bytes(operator_encoding);
+    fingerprint.finish()
+}
+
 pub(super) fn planner_grant_dependency<Child>(
     operator: &LogicalOperator<Child>,
 ) -> GrantDependencyDescriptor {
