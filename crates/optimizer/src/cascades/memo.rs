@@ -2988,3 +2988,7 @@ fn two_groups_mut(groups: &mut [Group], left: usize, right: usize) -> (&mut Grou
 #[cfg(test)]
 #[path = "memo/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "memo/region_delta_tests.rs"]
+mod region_delta_tests;
