@@ -678,6 +678,8 @@ def main() -> int:
             "runtime_environment": {
                 "RUST_LOG": os.environ.get("RUST_LOG"),
                 "PARO_STATEMENT_CACHE_EVIDENCE": "1",
+                "PARO_COMPILE_WORK_EVIDENCE": os.environ.get("PARO_COMPILE_WORK_EVIDENCE"),
+                "PARO_DIAGNOSTIC_LAZY_GRANT": os.environ.get("PARO_DIAGNOSTIC_LAZY_GRANT"),
                 # Explicit diagnostic-only search deadline.  An absent value
                 # means the production/default policy was used; keep this in
                 # the report so a checkpoint run cannot be mistaken for a
