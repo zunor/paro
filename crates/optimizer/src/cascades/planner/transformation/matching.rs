@@ -2403,6 +2403,21 @@ pub(super) fn matches_transformation_root(
     };
     if matches!(
         transformation,
+        PlannerTransformation::AggregateDimensionDeferral
+    ) {
+        let Some(payload) = state.payloads.logical.get(expr.payload.index()) else {
+            return false;
+        };
+        let LogicalOperator::Aggregate(aggregate) = &payload.semantic_template.operator else {
+            return false;
+        };
+        // Only immutable root shape is negative here. Do not consult a child
+        // representative or cache a failed native direct-child proof: scoped
+        // matching still subscribes to the direct input frontier below.
+        return crate::aggregate::dimension_deferral::root_eligible(aggregate);
+    }
+    if matches!(
+        transformation,
         PlannerTransformation::CtePartitionedMaterialization
             | PlannerTransformation::CteInline
             | PlannerTransformation::CteDemandPushdown
@@ -2522,6 +2537,175 @@ mod failure_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deferral_dispatch_input() -> OptimizationInput {
+        use paro_common::types::LogicalType;
+        use paro_function::aggregate::distributive::sum::get_sum_function;
+        use paro_planner::expression::{AggregateExpression, ColumnRefExpression};
+        use paro_planner::operator::{Aggregate, Get};
+        let column = || {
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::BigInt).into(),
+            )
+        };
+        let (function, _) = get_sum_function().bind(&[LogicalType::BigInt]).unwrap();
+        let ty = function.return_type.clone();
+        let sum =
+            Expression::Aggregate(AggregateExpression::new(function, vec![column()], ty).into());
+        let plan =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
+                1,
+                2,
+                3,
+                OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                    Get::new_without_table(0, vec!["k".into()], vec![LogicalType::BigInt]),
+                ))),
+                vec![column()],
+                vec![],
+                vec![sum],
+                vec![],
+            ))));
+        MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap()
+    }
+
+    #[test]
+    fn deferral_root_dispatch_shares_only_immutable_aggregate_guards() {
+        use paro_common::runtime_value::Value;
+        use paro_common::types::LogicalType;
+        use paro_planner::binder::ir::GroupingSet;
+        use paro_planner::expression::ConstantExpression;
+        use paro_planner::operator::aggregate::PostAggregateReduction;
+
+        // Mutate only the imported shell for each guard fixture: no child
+        // witness or executable expression recognition is involved here.
+        for (case, expected) in [
+            ("plain", true),
+            ("explicit_full_grouping_set", true),
+            ("empty_aggregates", false),
+            ("post_reduction", false),
+            ("scalar_aggregate", false),
+            ("empty_grouping_set", false),
+            ("multiple_grouping_sets", false),
+            ("duplicate_grouping_indices", false),
+            ("out_of_range_grouping_index", false),
+            ("grouping_function", false),
+        ] {
+            let input = deferral_dispatch_input();
+            let expression = input
+                .memo
+                .logical_expr(input.memo.group(input.root).unwrap().logical_exprs()[0])
+                .unwrap();
+            let mut state = input.planner_state.write().unwrap();
+            let LogicalOperator::Aggregate(aggregate) = &mut state.payloads.logical
+                [expression.payload.index()]
+            .semantic_template
+            .operator
+            else {
+                unreachable!()
+            };
+            match case {
+                "empty_aggregates" => aggregate.aggregates.clear(),
+                "post_reduction" => {
+                    aggregate.post_reduction = Some(PostAggregateReduction {
+                        reduction_index: 4,
+                        reducers: vec![],
+                        scalar_expressions: vec![],
+                        predicate: Expression::Constant(
+                            ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean)
+                                .into(),
+                        ),
+                    });
+                }
+                "scalar_aggregate" => aggregate.groups.clear(),
+                "empty_grouping_set" => aggregate.grouping_sets = vec![GroupingSet::default()],
+                "multiple_grouping_sets" => {
+                    aggregate.grouping_sets = vec![
+                        GroupingSet {
+                            expressions: vec![0],
+                        },
+                        GroupingSet::default(),
+                    ]
+                }
+                "grouping_function" => aggregate.grouping_functions = vec![vec![0]],
+                "duplicate_grouping_indices" => {
+                    aggregate.groups.push(aggregate.groups[0].clone());
+                    aggregate.grouping_sets = vec![GroupingSet {
+                        expressions: vec![0, 0],
+                    }];
+                }
+                "out_of_range_grouping_index" => {
+                    aggregate.grouping_sets = vec![GroupingSet {
+                        expressions: vec![1],
+                    }];
+                }
+                "explicit_full_grouping_set" => {
+                    aggregate.grouping_sets = vec![GroupingSet {
+                        expressions: vec![0],
+                    }];
+                }
+                "plain" => {}
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                crate::aggregate::dimension_deferral::root_eligible(aggregate),
+                expected,
+                "{case}"
+            );
+            assert_eq!(
+                matches_transformation_root(
+                    PlannerTransformation::AggregateDimensionDeferral,
+                    expression,
+                    &state,
+                ),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferral_non_join_child_is_not_a_permanent_negative_root() {
+        let input = deferral_dispatch_input();
+        let expression = input
+            .memo
+            .logical_expr(input.memo.group(input.root).unwrap().logical_exprs()[0])
+            .unwrap();
+        let child = input.memo.canonical_group(expression.key.children[0]);
+        let state = input.planner_state.read().unwrap();
+        // The input is a Get, not a join. Root eligibility must nevertheless
+        // allow discovery of later alternatives in this same input group.
+        assert!(matches_transformation_root(
+            PlannerTransformation::AggregateDimensionDeferral,
+            expression,
+            &state,
+        ));
+        assert!(cached_negative_root_reads(
+            PlannerTransformation::AggregateDimensionDeferral,
+            input.root,
+            expression.id,
+            &input.memo,
+            &state,
+        )
+        .unwrap()
+        .is_none());
+        let bindings = scoped_pattern_bindings(
+            PlannerTransformation::AggregateDimensionDeferral,
+            input.root,
+            expression.id,
+            &input.memo,
+            &state,
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap();
+        assert!(
+            bindings
+                .reads
+                .iter()
+                .any(|read| { read.group == child && read.logical_frontier_revision.is_some() }),
+            "later child publications must still invalidate discovery"
+        );
+    }
 
     #[test]
     fn aggregate_root_dispatch_uses_published_native_evidence_not_executable_payloads() {

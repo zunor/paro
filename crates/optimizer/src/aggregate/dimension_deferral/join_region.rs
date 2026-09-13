@@ -50,10 +50,7 @@ fn widest_dimension_candidate(plan: &OwnedLogicalPlan) -> Option<(usize, usize)>
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
     };
-    if aggregate.post_reduction.is_some()
-        || aggregate.aggregates.is_empty()
-        || !aggregate.has_plain_grouping_domain()
-    {
+    if !super::root_eligible(aggregate) {
         return None;
     }
     let mut projections = Vec::new();

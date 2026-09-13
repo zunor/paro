@@ -1508,10 +1508,7 @@ fn try_native_dimension_deferral(
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
         return Ok(None);
     };
-    if aggregate.post_reduction.is_some()
-        || aggregate.aggregates.is_empty()
-        || !aggregate.has_plain_grouping_domain()
-    {
+    if !dimension_deferral::root_eligible(&aggregate) {
         return Ok(None);
     }
     let NativeChild::Node(join_index) = aggregate.child.clone() else {

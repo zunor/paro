@@ -28,6 +28,16 @@ use crate::expression::traversal::visit_expression;
 
 mod join_region;
 
+/// Necessary root-only eligibility shared by dispatch and both rewrite paths.
+/// These fields belong to the immutable aggregate shell. In particular this
+/// must not inspect the child: a later child alternative can expose a dimension
+/// join even when the current input cannot be deferred.
+pub(crate) fn root_eligible<Child>(aggregate: &Aggregate<Child>) -> bool {
+    aggregate.post_reduction.is_none()
+        && !aggregate.aggregates.is_empty()
+        && aggregate.has_plain_grouping_domain()
+}
+
 /// Produce one root-local aggregate alternative. Memo owns traversal and rule
 /// scheduling; recursively rewriting descendants here would duplicate work
 /// and make one firing consume unrelated equivalence groups.
@@ -96,10 +106,7 @@ fn recognize(plan: &OwnedLogicalPlan) -> Option<DimensionDeferral> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
     };
-    if aggregate.post_reduction.is_some()
-        || aggregate.aggregates.is_empty()
-        || !aggregate.has_plain_grouping_domain()
-    {
+    if !root_eligible(aggregate) {
         return None;
     }
     let mut projections = Vec::new();
