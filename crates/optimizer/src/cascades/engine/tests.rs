@@ -2443,6 +2443,27 @@ fn incremental_child_combination_oracle_covers_only_the_frontier_delta() {
 }
 
 #[test]
+fn visit_positions_preserve_exact_choices_and_reject_stale_ids() {
+    let (_, group, goal) = engine(0);
+    let reference = |id| ChildWinnerRef { group, goal, candidate: CandidateId::new(id) };
+    let frontiers = vec![vec![reference(2), reference(9)], vec![reference(4), reference(17)]];
+    // Independent nested enumeration, not the Cartesian cursor under test.
+    for (left_index, left) in frontiers[0].iter().enumerate() {
+        for (right_index, right) in frontiers[1].iter().enumerate() {
+            let ids = [left.candidate, right.candidate];
+            assert_eq!(child_combination_positions(&ids, &frontiers).unwrap().as_slice(), &[left_index, right_index]);
+            assert_eq!(child_combination_refs(&ids, &frontiers).unwrap().as_ref(), &[*left, *right]);
+        }
+    }
+    assert!(child_combination_positions(&[CandidateId::new(3), CandidateId::new(4)], &frontiers).is_err());
+    assert!(child_combination_positions(&[CandidateId::new(2)], &frontiers).is_err());
+    let pruned = vec![vec![reference(9)], frontiers[1].clone()];
+    assert!(child_combination_positions(&[CandidateId::new(2), CandidateId::new(4)], &pruned).is_err());
+    assert_eq!(child_combination_positions(&[CandidateId::new(9), CandidateId::new(17)], &pruned).unwrap().as_slice(), &[0, 1]);
+    assert!(child_combination_positions(&[], &[]).unwrap().is_empty());
+}
+
+#[test]
 fn child_combination_event_interning_is_exact() {
     let (mut engine, group, goal) = engine(0);
     let left = ChildWinnerRef {
