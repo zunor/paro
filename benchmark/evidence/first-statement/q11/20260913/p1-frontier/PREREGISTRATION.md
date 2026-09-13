@@ -46,3 +46,17 @@ attribution rather than fitting a causal decomposition to correlated counts.
 Before any measured query: the harness rejected process-blocks=1 at argument
 validation. Its minimum is two; amended to two per arm, not a lowered validation
 gate. The rejected command log is retained; it contains no observations.
+
+## P2 independent slice, before P2 measured queries
+
+Probe 2deb6450 shares the immutable deferral root eligibility guard with native
+and owned rewriting, and rejects an ineligible shell before scoped matching.
+It does not reject a root because its current child is not a join; input
+frontier subscriptions remain. Seven targeted tests passed on the mixed tree;
+repeat on the committed clean tree before measuring. Existing failures remain.
+Run probe two fresh blocks, then control a476731b two fresh blocks, snapshot OFF,
+same handoff/budgets/seed and normal trace-off with separate diagnostic. Compare
+per-rule published counts, exact final choices/fingerprints, N and final admitted
+fingerprint first. A timing difference in this small sequential pilot cannot
+certify W NI. If Q11 rejection counts are unchanged, report no demonstrated
+benefit on the requested path, not sixty avoided bindings.
