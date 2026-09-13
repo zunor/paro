@@ -10,6 +10,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::Instant;
 
 pub const MAX_OPERATORS: usize = 1024;
@@ -25,6 +26,37 @@ static NANOS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 static OP_NANOS: [AtomicU64; MAX_OPERATORS] = [const { AtomicU64::new(0) }; MAX_OPERATORS];
 static OP_COUNTS: [AtomicU64; MAX_OPERATORS] = [const { AtomicU64::new(0) }; MAX_OPERATORS];
 thread_local! { static ACCOUNTED_NS: Cell<u64> = const { Cell::new(0) }; }
+thread_local! { static CURRENT_KIND: Cell<Option<usize>> = const { Cell::new(None) }; }
+// Fixed scalar occupancy histogram, not an event trace. Bin0 is uninstrumented
+// wall; other bins identify simultaneous activity, counted once regardless of DOP.
+struct Occupancy {
+    active: [u32; KINDS],
+    nanos: [u64; 1 << KINDS],
+    last: Instant,
+}
+impl Occupancy {
+    fn new() -> Self { Self { active:[0; KINDS], nanos:[0; 1 << KINDS], last:Instant::now() } }
+    fn settle(&mut self) {
+        self.settle_at(Instant::now());
+    }
+    fn settle_at(&mut self, now: Instant) {
+        let mask = self.active.iter().enumerate().fold(0, |mask,(i,n)| mask | (usize::from(*n > 0) << i));
+        self.nanos[mask] = self.nanos[mask].saturating_add(now.duration_since(self.last).as_nanos() as u64);
+        self.last = now;
+    }
+    fn transition(&mut self, from: Option<usize>, to: Option<usize>) {
+        self.transition_at(from, to, Instant::now());
+    }
+    fn transition_at(&mut self, from: Option<usize>, to: Option<usize>, now: Instant) {
+        self.settle_at(now);
+        if let Some(i) = from { self.active[i] = self.active[i].saturating_sub(1); }
+        if let Some(i) = to { self.active[i] += 1; }
+    }
+}
+fn occupancy() -> &'static Mutex<Occupancy> {
+    static CLOCK: OnceLock<Mutex<Occupancy>> = OnceLock::new();
+    CLOCK.get_or_init(|| Mutex::new(Occupancy::new()))
+}
 
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -42,14 +74,19 @@ pub struct WorkScope {
     bytes: u64,
     operator: Option<usize>,
     epoch: u64,
+    parent: Option<usize>,
+    occupancy_entered: bool,
     // A synchronous scope must not migrate between worker-local nesting clocks.
     _not_send: PhantomData<Rc<()>>,
 }
 impl WorkScope {
     pub fn new(kind: Kind, bytes: usize) -> Option<Self> {
         if !enabled() || !ACTIVE.load(Relaxed) { return None; }
+        let parent = CURRENT_KIND.with(|current| current.replace(Some(kind as usize)));
+        occupancy().lock().unwrap().transition(parent, Some(kind as usize));
         Some(Self { started: Instant::now(), accounted: ACCOUNTED_NS.with(Cell::get),
-            kind: kind as usize, bytes: bytes as u64, operator: None, epoch: EPOCH.load(Relaxed), _not_send: PhantomData })
+            kind: kind as usize, bytes: bytes as u64, operator: None, epoch: EPOCH.load(Relaxed),
+            parent, occupancy_entered:true, _not_send: PhantomData })
     }
     pub fn operator(kind: Kind, id: usize) -> Option<Self> {
         let mut scope = Self::new(kind, 0)?;
@@ -59,7 +96,9 @@ impl WorkScope {
 }
 impl Drop for WorkScope {
     fn drop(&mut self) {
+        if self.occupancy_entered { CURRENT_KIND.with(|current| current.set(self.parent)); }
         if !ACTIVE.load(Relaxed) || self.epoch != EPOCH.load(Relaxed) { return; }
+        if self.occupancy_entered { occupancy().lock().unwrap().transition(Some(self.kind), self.parent); }
         let total = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let own = ACCOUNTED_NS.with(|clock| {
             let nested = clock.get().saturating_sub(self.accounted);
@@ -108,6 +147,7 @@ pub struct Snapshot {
     pub overflow: u64,
     pub metrics: [[u64; 3]; KINDS],
     pub operators: Vec<(usize, u64, u64)>,
+    pub occupancy_nanos: [u64; 1 << KINDS],
 }
 impl Snapshot {
     /// Naming/serialization happens only when the post-timer side channel is read.
@@ -129,6 +169,9 @@ impl Snapshot {
             rows.push((format!("operator_{id}_init_count"), count));
             rows.push((format!("operator_{id}_init_exclusive_worker_ns"), nanos));
         }
+        for (mask, nanos) in self.occupancy_nanos.iter().enumerate() {
+            rows.push((format!("activity_mask_{mask}_wall_ns"), *nanos));
+        }
         rows
     }
 }
@@ -148,10 +191,14 @@ impl Window {
             }
             OVERFLOW.store(0, Relaxed);
         }
-        Self { before: usage(), overlaps: OVERLAPS.load(Relaxed), started: Instant::now(), owner }
+        let before = usage();
+        let started = Instant::now();
+        if owner { *occupancy().lock().unwrap() = Occupancy { active:[0; KINDS], nanos:[0; 1 << KINDS], last:started }; }
+        Self { before, overlaps: OVERLAPS.load(Relaxed), started, owner }
     }
     pub fn finish(self) -> Snapshot {
         let after = usage();
+        let occupancy_nanos = { let mut clock = occupancy().lock().unwrap(); clock.settle(); clock.nanos };
         let valid = self.owner && self.overlaps == OVERLAPS.load(Relaxed) && self.before.valid && after.valid && OVERFLOW.load(Relaxed) == 0;
         let mut operators = Vec::new();
         for id in 0..MAX_OPERATORS {
@@ -163,7 +210,7 @@ impl Window {
         Snapshot { valid, elapsed_us:self.started.elapsed().as_micros() as u64,
             minor:after.minor.saturating_sub(self.before.minor), major:after.major.saturating_sub(self.before.major),
             rss_before:self.before.max_rss, rss_after:after.max_rss, overflow:OVERFLOW.load(Relaxed),
-            metrics:std::array::from_fn(|i| [COUNTS[i].load(Relaxed), BYTES[i].load(Relaxed), NANOS[i].load(Relaxed)]), operators }
+            metrics:std::array::from_fn(|i| [COUNTS[i].load(Relaxed), BYTES[i].load(Relaxed), NANOS[i].load(Relaxed)]), operators, occupancy_nanos }
     }
 }
 impl Drop for Window { fn drop(&mut self) {
@@ -176,14 +223,31 @@ mod tests {
     use super::*;
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
+    fn occupancy_oracle_counts_parallel_overlap_once_and_preserves_uncovered_time() {
+        let mut clock = Occupancy::new();
+        let zero = clock.last;
+        let t = |n| zero + std::time::Duration::from_nanos(n);
+        clock.transition_at(None, Some(0), t(10));
+        clock.transition_at(None, Some(1), t(20));
+        clock.transition_at(Some(0), None, t(40));
+        clock.transition_at(Some(1), None, t(50));
+        clock.settle_at(t(70));
+        assert_eq!(clock.nanos[0], 30);
+        assert_eq!(clock.nanos[1], 10);
+        assert_eq!(clock.nanos[2], 10);
+        assert_eq!(clock.nanos[3], 20);
+        assert_eq!(clock.nanos.iter().sum::<u64>(), 70);
+        assert_eq!(clock.nanos.iter().skip(1).sum::<u64>(), 40);
+    }
+    #[test]
     fn worker_nesting_excludes_children_without_changing_wall_semantics() {
         let _serial = SERIAL.lock().unwrap();
         let window = Window::begin_enabled();
         ACCOUNTED_NS.with(|v| v.set(0));
         let outer = WorkScope { started: Instant::now(), accounted: 0, kind: 4, bytes:0,
-            operator: None, epoch:EPOCH.load(Relaxed), _not_send: PhantomData };
+            operator: None, epoch:EPOCH.load(Relaxed), parent:None, occupancy_entered:false, _not_send: PhantomData };
         let inner = WorkScope { started: Instant::now(), accounted: 0, kind: 1, bytes:17,
-            operator: None, epoch:EPOCH.load(Relaxed), _not_send: PhantomData };
+            operator: None, epoch:EPOCH.load(Relaxed), parent:None, occupancy_entered:false, _not_send: PhantomData };
         drop(inner);
         drop(outer);
         assert_eq!(BYTES[1].load(Relaxed), 17);
@@ -201,7 +265,7 @@ mod tests {
         assert!(!second.finish().valid);
         let aborted = Window::begin_enabled();
         let old = WorkScope { started: Instant::now(), accounted: ACCOUNTED_NS.with(Cell::get),
-            kind:0, bytes:99, operator:None, epoch:EPOCH.load(Relaxed), _not_send:PhantomData };
+            kind:0, bytes:99, operator:None, epoch:EPOCH.load(Relaxed), parent:None, occupancy_entered:false, _not_send:PhantomData };
         drop(aborted);
         let fresh = Window::begin_enabled();
         drop(old);
