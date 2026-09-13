@@ -502,6 +502,26 @@ impl TransformationRule for PlannerTransformationRule {
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Apply);
+        // Pattern enumeration intentionally leaves unrelated Memo groups as
+        // opaque holes.  A legacy owned rewrite cannot discover a rule
+        // witness behind such a hole, so reject only bindings which are
+        // missing a necessary node in their *selected* shell.  This is a
+        // fail-closed preflight: it does not inspect estimates, choose a
+        // winner, or replace the rule's semantic recognizer.  Its purpose is
+        // to avoid importing/settling an owned tree which is guaranteed to
+        // return no output.
+        if binding_is_structurally_impossible(
+            self.transformation,
+            binding,
+            ctx.memo(),
+            &self.planner_state,
+        )? {
+            crate::transformation_rejection::reject::<()>(
+                &mut ctx.rejection_reasons,
+                crate::transformation_rejection::TransformationRejectionGuard::NoOutput,
+            );
+            return Ok(Box::new([]));
+        }
         let expr = binding.root_expression();
         let target_group = ctx.group();
         let facts = {
@@ -1167,6 +1187,350 @@ impl TransformationRule for PlannerTransformationRule {
             })
             .collect())
     }
+
+}
+
+/// Return whether this exact binding cannot produce an output without
+/// traversing any opaque group child.  The check deliberately covers only
+/// necessary structural conditions, so an uncertain or richer shape goes
+/// through the authoritative owned rewrite unchanged.
+fn binding_is_structurally_impossible(
+    transformation: PlannerTransformation,
+    binding: &PatternBinding,
+    memo: &Memo,
+    planner_state: &Arc<RwLock<PlannerTransformState>>,
+) -> Result<bool> {
+    match transformation {
+        PlannerTransformation::AggregateJoinSubsumption => {
+            binding_is_structurally_impossible_for_subsumption(binding, memo, planner_state)
+        }
+        PlannerTransformation::AggregateDimensionDeferral => {
+            let state = planner_state
+                .read()
+                .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+            Ok(!binding_has_dimension_deferral_shape(binding, memo, &state)?)
+        }
+        PlannerTransformation::AggregateInputMaterialization => {
+            let state = planner_state
+                .read()
+                .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+            Ok(!binding_has_input_materialization_shape(binding, memo, &state)?)
+        }
+        PlannerTransformation::PredicateTransfer => {
+            let state = planner_state
+                .read()
+                .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+            Ok(binding_has_only_opaque_filter_input(binding, memo, &state)?)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn binding_is_structurally_impossible_for_subsumption(
+    binding: &PatternBinding,
+    memo: &Memo,
+    planner_state: &Arc<RwLock<PlannerTransformState>>,
+) -> Result<bool> {
+    let state = planner_state
+        .read()
+        .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+
+    let PatternOperand::Expression { expression, .. } = &binding.root else {
+        return Ok(false);
+    };
+    let root = memo
+        .logical_expr(*expression)
+        .ok_or_else(|| paro_error::internal("preflight lost aggregate root"))?;
+    let root_payload = state
+        .payloads
+        .logical
+        .get(root.payload.index())
+        .ok_or_else(|| paro_error::internal("preflight lost aggregate root payload"))?;
+    if !matches!(
+        root_payload.semantic_template.operator,
+        LogicalOperator::Aggregate(_)
+    ) {
+        return Ok(false);
+    }
+
+    // Every successful detail-subsumption rewrite has both a clean inner
+    // detail edge and a semi reduction edge.  It also needs a second
+    // aggregate carrying the partial SUM and a direct detail Get whose
+    // table binding is the value being replaced.  These are necessary
+    // for both the direct-join and reduction-join forms in
+    // aggregate/join_subsumption.rs.
+    let mut aggregate_count = 0usize;
+    let mut detail_table = None;
+    if let LogicalOperator::Aggregate(aggregate) = &root_payload.semantic_template.operator {
+        if let Some(Expression::Aggregate(sum)) = aggregate.aggregates.first() {
+            if let Some(Expression::ColumnRef(input)) = sum.children.first() {
+                detail_table = Some(input.binding.table_index);
+            }
+        }
+    }
+    let mut has_clean_inner = false;
+    let mut has_reduction = false;
+    let mut has_detail_get = false;
+    fn visit(
+        operand: &PatternOperand,
+        memo: &Memo,
+        state: &PlannerTransformState,
+        detail_table: Option<usize>,
+        aggregate_count: &mut usize,
+        has_clean_inner: &mut bool,
+        has_reduction: &mut bool,
+        has_detail_get: &mut bool,
+    ) -> Result<()> {
+        let PatternOperand::Expression {
+            expression,
+            children,
+            ..
+        } = operand
+        else {
+            return Ok(());
+        };
+        let logical = memo
+            .logical_expr(*expression)
+            .ok_or_else(|| paro_error::internal("preflight lost logical expression"))?;
+        let payload = state
+            .payloads
+            .logical
+            .get(logical.payload.index())
+            .ok_or_else(|| paro_error::internal("preflight lost logical payload"))?;
+        match &payload.semantic_template.operator {
+            LogicalOperator::Aggregate(_) => *aggregate_count += 1,
+            LogicalOperator::Get(get)
+                if detail_table == Some(get.table_index)
+                    && get.table.is_some()
+                    && get.runtime_filter_expressions.is_empty() =>
+            {
+                *has_detail_get = true;
+            }
+            LogicalOperator::Join(Join::Comparison(join)) => {
+                let clean = join.join_type == JoinType::Inner
+                    && join.mark_index.is_none()
+                    && join.duplicate_eliminated_columns.is_empty()
+                    && !join.delim_flipped
+                    && join.left_projection_map.is_all()
+                    && join.right_projection_map.is_all();
+                *has_clean_inner |= clean;
+                *has_reduction |=
+                    matches!(join.join_type, JoinType::Semi | JoinType::RightSemi);
+            }
+            _ => {}
+        }
+        for child in children {
+            visit(
+                child,
+                memo,
+                state,
+                detail_table,
+                aggregate_count,
+                has_clean_inner,
+                has_reduction,
+                has_detail_get,
+            )?;
+        }
+        Ok(())
+    }
+    visit(
+        &binding.root,
+        memo,
+        &state,
+        detail_table,
+        &mut aggregate_count,
+        &mut has_clean_inner,
+        &mut has_reduction,
+        &mut has_detail_get,
+    )?;
+
+    Ok(aggregate_count < 2 || !has_clean_inner || !has_reduction || !has_detail_get)
+}
+
+/// The owned dimension-deferral recognizer can only see a projection spine
+/// over a plain inner equi-join region. A group hole is an opaque bound
+/// reference after instantiation and therefore cannot hide a relation that
+/// the recognizer could discover later. This helper checks only that
+/// necessary shape; all expression-domain, liveness, and cost checks remain
+/// in the authoritative rule.
+fn binding_has_dimension_deferral_shape(
+    binding: &PatternBinding,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<bool> {
+    let PatternOperand::Expression {
+        expression,
+        children,
+        ..
+    } = &binding.root
+    else {
+        return Ok(false);
+    };
+    let root = memo
+        .logical_expr(*expression)
+        .ok_or_else(|| paro_error::internal("deferral preflight lost aggregate root"))?;
+    let root_payload = state
+        .payloads
+        .logical
+        .get(root.payload.index())
+        .ok_or_else(|| paro_error::internal("deferral preflight lost aggregate payload"))?;
+    if !matches!(
+        root_payload.semantic_template.operator,
+        LogicalOperator::Aggregate(_)
+    ) || children.len() != 1
+    {
+        return Ok(false);
+    }
+
+    fn region_shape(
+        operand: &PatternOperand,
+        memo: &Memo,
+        state: &PlannerTransformState,
+    ) -> Result<(usize, usize)> {
+        let PatternOperand::Expression {
+            expression,
+            children,
+            ..
+        } = operand
+        else {
+            // A group hole becomes a BoundReference, which is not a
+            // dimension relation accepted by the owned recognizer.
+            return Ok((1, 0));
+        };
+        let logical = memo
+            .logical_expr(*expression)
+            .ok_or_else(|| paro_error::internal("deferral preflight lost region expression"))?;
+        let payload = state
+            .payloads
+            .logical
+            .get(logical.payload.index())
+            .ok_or_else(|| paro_error::internal("deferral preflight lost region payload"))?;
+        match &payload.semantic_template.operator {
+            LogicalOperator::Projection(_) if children.len() == 1 => {
+                region_shape(&children[0], memo, state)
+            }
+            LogicalOperator::Join(Join::Comparison(join))
+                if join.join_type == JoinType::Inner
+                    && !join.conditions.is_empty()
+                    && join.mark_index.is_none()
+                    && join.duplicate_eliminated_columns.is_empty()
+                    && !join.delim_flipped
+                    && join.conditions.iter().all(|condition| {
+                        condition.comparison == JoinComparisonType::Equal
+                    })
+                    && children.len() == 2 =>
+            {
+                let left = region_shape(&children[0], memo, state)?;
+                let right = region_shape(&children[1], memo, state)?;
+                Ok((
+                    left.0.saturating_add(right.0),
+                    left.1.saturating_add(right.1),
+                ))
+            }
+            LogicalOperator::Get(_) | LogicalOperator::CTERef(_) if children.is_empty() => {
+                Ok((1, 1))
+            }
+            _ => Ok((1, 0)),
+        }
+    }
+
+    let (relations, dimensions) = region_shape(&children[0], memo, state)?;
+    Ok(relations >= 2 && dimensions >= 1)
+}
+
+/// Aggregate input materialization starts at the aggregate's direct child
+/// and descends only through plain inner joins. A projection, an opaque
+/// child, or a non-inner join makes the owned rule a guaranteed no-op; a
+/// visible join remains authoritative because candidate liveness and side
+/// ownership still require its full implementation.
+fn binding_has_input_materialization_shape(
+    binding: &PatternBinding,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<bool> {
+    let PatternOperand::Expression {
+        expression,
+        children,
+        ..
+    } = &binding.root
+    else {
+        return Ok(false);
+    };
+    let root = memo
+        .logical_expr(*expression)
+        .ok_or_else(|| paro_error::internal("materialization preflight lost aggregate root"))?;
+    let root_payload = state
+        .payloads
+        .logical
+        .get(root.payload.index())
+        .ok_or_else(|| paro_error::internal("materialization preflight lost aggregate payload"))?;
+    if !matches!(
+        root_payload.semantic_template.operator,
+        LogicalOperator::Aggregate(_)
+    ) || children.len() != 1
+    {
+        return Ok(false);
+    }
+    let PatternOperand::Expression {
+        expression: child_expression,
+        children: join_children,
+        ..
+    } = &children[0]
+    else {
+        return Ok(false);
+    };
+    let child = memo
+        .logical_expr(*child_expression)
+        .ok_or_else(|| paro_error::internal("materialization preflight lost child"))?;
+    let payload = state
+        .payloads
+        .logical
+        .get(child.payload.index())
+        .ok_or_else(|| paro_error::internal("materialization preflight lost child payload"))?;
+    Ok(matches!(
+        (&payload.semantic_template.operator, join_children.as_ref()),
+        (
+            LogicalOperator::Join(Join::Comparison(join)),
+            [_, _]
+        ) if join.join_type == JoinType::Inner
+            && join.mark_index.is_none()
+            && join.duplicate_eliminated_columns.is_empty()
+            && !join.delim_flipped
+    ))
+}
+
+/// A PredicateTransfer binding whose input is still an opaque group cannot
+/// move the incoming filter: FilterPushdown stops at BoundReference. Do not
+/// infer the same result for any visible child, because nested filters,
+/// projections, joins, aggregates, and control operators retain legitimate
+/// pushdown paths with different contracts.
+fn binding_has_only_opaque_filter_input(
+    binding: &PatternBinding,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<bool> {
+    let PatternOperand::Expression {
+        expression,
+        children,
+        ..
+    } = &binding.root
+    else {
+        return Ok(false);
+    };
+    let root = memo
+        .logical_expr(*expression)
+        .ok_or_else(|| paro_error::internal("predicate preflight lost filter root"))?;
+    let payload = state
+        .payloads
+        .logical
+        .get(root.payload.index())
+        .ok_or_else(|| paro_error::internal("predicate preflight lost filter payload"))?;
+    let LogicalOperator::Filter(filter) = &payload.semantic_template.operator else {
+        return Ok(false);
+    };
+    Ok(!filter.expressions.is_empty()
+        && children.len() == 1
+        && matches!(children[0], PatternOperand::Group(_)))
 }
 
 /// A bounded region enumerator already emits its complete candidate frontier
@@ -4808,6 +5172,11 @@ impl GroupHoleTransportGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::{
+        ColumnRefExpression, ConstantExpression,
+    };
+    use paro_planner::operator::{ExpressionGet, Get, Join, JoinCondition};
 
     #[test]
     fn enumerator_outputs_do_not_feed_the_same_enumerator() {
@@ -4872,5 +5241,184 @@ mod tests {
         assert!(native_shell_staging_allowed(
             PlannerTransformation::JoinRegionEnumeration
         ));
+    }
+
+    #[test]
+    fn structural_preflight_stops_only_opaque_no_output_shapes() {
+        let base = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+            ExpressionGet::new(
+                7,
+                Vec::new(),
+                vec!["key".to_string()],
+                vec![LogicalType::BigInt],
+            ),
+        ));
+        let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(
+            Aggregate::new(8, 9, 10, base, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        )));
+        let mut input = MemoBuilder::build(
+            aggregate,
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let aggregate_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let aggregate_logical = input
+            .memo
+            .logical_expr(aggregate_expression)
+            .unwrap()
+            .clone();
+        let aggregate_binding = PatternBinding::root_only(
+            input.root,
+            aggregate_expression,
+            &aggregate_logical,
+        );
+        let state = input.planner_state.clone();
+        assert!(binding_is_structurally_impossible(
+            PlannerTransformation::AggregateJoinSubsumption,
+            &aggregate_binding,
+            &input.memo,
+            &state,
+        )
+        .unwrap());
+        assert!(binding_is_structurally_impossible(
+            PlannerTransformation::AggregateDimensionDeferral,
+            &aggregate_binding,
+            &input.memo,
+            &state,
+        )
+        .unwrap());
+        assert!(binding_is_structurally_impossible(
+            PlannerTransformation::AggregateInputMaterialization,
+            &aggregate_binding,
+            &input.memo,
+            &state,
+        )
+        .unwrap());
+
+        let filter = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+                ExpressionGet::new(
+                    11,
+                    Vec::new(),
+                    vec!["key".to_string()],
+                    vec![LogicalType::BigInt],
+                ),
+            )),
+            vec![Expression::Constant(
+                ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+            )],
+        )));
+        input = MemoBuilder::build(filter, BindContext::new(), SearchBudget::default()).unwrap();
+        let filter_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let filter_logical = input.memo.logical_expr(filter_expression).unwrap().clone();
+        let filter_binding = PatternBinding::root_only(input.root, filter_expression, &filter_logical);
+        let state = input.planner_state.clone();
+        assert!(binding_is_structurally_impossible(
+            PlannerTransformation::PredicateTransfer,
+            &filter_binding,
+            &input.memo,
+            &state,
+        )
+        .unwrap());
+
+        let join = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                12,
+                Vec::new(),
+                vec!["key".to_string()],
+                vec![LogicalType::BigInt],
+            ))),
+            OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                Get::new_without_table(
+                    13,
+                    vec!["key".to_string()],
+                    vec![LogicalType::BigInt],
+                ),
+            ))),
+            vec![JoinCondition::equality(
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(12, 0),
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(13, 0),
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                ),
+            )],
+        )));
+        let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(
+            Aggregate::new(14, 15, 16, join, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        )));
+        input = MemoBuilder::build(aggregate, BindContext::new(), SearchBudget::default()).unwrap();
+        let aggregate_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let aggregate_logical = input
+            .memo
+            .logical_expr(aggregate_expression)
+            .unwrap()
+            .clone();
+        let child_group = aggregate_logical.key.children[0];
+        let join_expression = input.memo.group(child_group).unwrap().logical_exprs()[0];
+        let join_logical = input.memo.logical_expr(join_expression).unwrap().clone();
+        let aggregate_binding = PatternBinding::root_only(
+            input.root,
+            aggregate_expression,
+            &aggregate_logical,
+        );
+        let aggregate_binding = PatternBinding {
+            root: PatternOperand::Expression {
+                group: input.root,
+                expression: aggregate_expression,
+                children: Box::new([PatternOperand::Expression {
+                    group: child_group,
+                    expression: join_expression,
+                    children: join_logical
+                        .key
+                        .children
+                        .iter()
+                        .copied()
+                        .map(|group| {
+                            let expression = input.memo.group(group).unwrap().logical_exprs()[0];
+                            let logical = input.memo.logical_expr(expression).unwrap();
+                            PatternOperand::Expression {
+                                group,
+                                expression,
+                                children: logical
+                                    .key
+                                    .children
+                                    .iter()
+                                    .copied()
+                                    .map(PatternOperand::Group)
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                }]),
+            },
+            fingerprint: aggregate_binding.fingerprint,
+        };
+        let state = input.planner_state.clone();
+        assert!(!binding_is_structurally_impossible(
+            PlannerTransformation::AggregateDimensionDeferral,
+            &aggregate_binding,
+            &input.memo,
+            &state,
+        )
+        .unwrap());
+        assert!(!binding_is_structurally_impossible(
+            PlannerTransformation::AggregateInputMaterialization,
+            &aggregate_binding,
+            &input.memo,
+            &state,
+        )
+        .unwrap());
+
     }
 }
