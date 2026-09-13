@@ -200,7 +200,9 @@ pub(super) fn try_native_enumeration(
     if native_pattern_atom_count(binding, memo, state)? < 3 {
         return Ok(Vec::new());
     }
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(Vec::new());
     };
     // A native join graph does not yet carry the control-region facet closure
@@ -212,7 +214,6 @@ pub(super) fn try_native_enumeration(
     if shell_contains_control_boundary(&shell) {
         return Ok(Vec::new());
     }
-    let layouts = shell.layouts()?;
     let mut input = NativeJoinInput {
         atoms: Vec::new(),
         filters: Vec::new(),

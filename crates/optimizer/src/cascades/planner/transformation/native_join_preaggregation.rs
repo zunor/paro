@@ -36,20 +36,40 @@ pub(super) fn try_native_aggregate_join_preaggregation(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> paro_common::error::Result<Option<NativeShell>> {
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(None);
     };
     if super::native_shell_contains_control_boundary(&shell) {
         return Ok(None);
     }
-    try_native_shell(shell, state)
+    let original_root_layout = layouts
+        .get(shell.root)
+        .cloned()
+        .ok_or_else(|| paro_error::internal("native preaggregation has no root layout"))?;
+    try_native_shell_with_layout(shell, state, original_root_layout, layouts)
 }
 
+#[cfg(test)]
 fn try_native_shell(
     shell: NativeShell,
     state: &PlannerTransformState,
 ) -> paro_common::error::Result<Option<NativeShell>> {
-    let original_root_layout = shell.root_layout()?;
+    let layouts = shell.layouts()?;
+    let original_root_layout = layouts
+        .get(shell.root)
+        .cloned()
+        .ok_or_else(|| paro_error::internal("native preaggregation has no root layout"))?;
+    try_native_shell_with_layout(shell, state, original_root_layout, layouts)
+}
+
+fn try_native_shell_with_layout(
+    shell: NativeShell,
+    state: &PlannerTransformState,
+    original_root_layout: paro_planner::operator::LogicalOutputLayout,
+    layouts: Vec<paro_planner::operator::LogicalOutputLayout>,
+) -> paro_common::error::Result<Option<NativeShell>> {
     let root = shell.root;
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
         return Ok(None);
@@ -76,8 +96,8 @@ fn try_native_shell(
     if condition.comparison != JoinComparisonType::Equal {
         return Ok(None);
     }
-    let left_layout = child_layout(&shell, &join.left)?;
-    let right_layout = child_layout(&shell, &join.right)?;
+    let left_layout = child_layout(&layouts, &join.left)?;
+    let right_layout = child_layout(&layouts, &join.right)?;
     let Some(condition_left) = column_binding(&condition.left) else {
         return Ok(None);
     };
@@ -283,12 +303,11 @@ fn column_binding(expression: &Expression) -> Option<ColumnBinding> {
 }
 
 fn child_layout(
-    shell: &NativeShell,
+    layouts: &[paro_planner::operator::LogicalOutputLayout],
     child: &NativeChild,
 ) -> paro_common::error::Result<paro_planner::operator::LogicalOutputLayout> {
     match child {
-        NativeChild::Node(index) => shell
-            .layouts()?
+        NativeChild::Node(index) => layouts
             .get(*index)
             .cloned()
             .ok_or_else(|| paro_error::internal("native preaggregation child has no layout")),

@@ -65,17 +65,31 @@ pub(super) fn try_native_aggregate_join_subsumption(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> paro_common::error::Result<Option<NativeShell>> {
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(None);
     };
     if super::native_shell_contains_control_boundary(&shell) {
         return Ok(None);
     }
-    try_native_shell(shell)
+    let original_root_layout = layouts
+        .get(shell.root)
+        .cloned()
+        .ok_or_else(|| paro_error::internal("native subsumption has no root layout"))?;
+    try_native_shell_with_layout(shell, original_root_layout)
 }
 
+#[cfg(test)]
 fn try_native_shell(shell: NativeShell) -> paro_common::error::Result<Option<NativeShell>> {
     let original_root_layout = shell.root_layout()?;
+    try_native_shell_with_layout(shell, original_root_layout)
+}
+
+fn try_native_shell_with_layout(
+    shell: NativeShell,
+    original_root_layout: paro_planner::operator::LogicalOutputLayout,
+) -> paro_common::error::Result<Option<NativeShell>> {
     let root = shell.root;
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
         return Ok(None);

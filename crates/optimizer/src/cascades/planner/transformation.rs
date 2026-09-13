@@ -1686,7 +1686,9 @@ fn try_native_predicate_transfer(
     if !native_predicate_transfer_may_apply(binding, memo, state)? {
         return Ok(None);
     }
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(None);
     };
     // CTE references carry producer/consumer ownership and demand domains
@@ -1734,7 +1736,6 @@ fn try_native_predicate_transfer(
         return Ok(None);
     }
 
-    let layouts = shell.layouts()?;
     let child_layout =
         |child: &NativeChild| -> Result<paro_planner::operator::LogicalOutputLayout> {
             match child {
@@ -2236,14 +2237,19 @@ fn try_native_input_materialization(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Option<NativeShell>> {
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(None);
     };
     if native_shell_contains_control_boundary(&shell) {
         return Ok(None);
     }
-    let original_root_layout = shell.root_layout()?;
     let root = shell.root;
+    let original_root_layout = layouts
+        .get(root)
+        .cloned()
+        .ok_or_else(|| paro_error::internal("native materialization has no root layout"))?;
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
         return Ok(None);
     };
@@ -2271,7 +2277,6 @@ fn try_native_input_materialization(
     {
         return Ok(None);
     }
-    let layouts = shell.layouts()?;
     let left_layout = native_shell_child_layout(&join.left, &layouts)?;
     let right_layout = native_shell_child_layout(&join.right, &layouts)?;
     let mut candidates = Vec::new();
@@ -2395,7 +2400,9 @@ fn try_native_key_domain_transfer(
     let PatternOperand::Expression { .. } = binding else {
         return Ok(None);
     };
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(None);
     };
     if native_shell_contains_control_boundary(&shell) {
@@ -2418,7 +2425,6 @@ fn try_native_key_domain_transfer(
         return Ok(None);
     }
 
-    let layouts = shell.layouts()?;
     let mut nodes = shell.nodes.into_vec();
     let NativeChild::Node(probe_index) = domain.left.clone() else {
         return Ok(None);
@@ -2865,14 +2871,18 @@ fn try_native_dimension_deferral(
     if !native_dimension_direct_shape(binding, memo, state)? {
         return Ok(None);
     }
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(None);
     };
     if native_shell_contains_control_boundary(&shell) {
         return Ok(None);
     }
-    let layouts = shell.layouts()?;
-    let original_root_layout = shell.root_layout()?;
+    let original_root_layout = layouts
+        .get(shell.root)
+        .cloned()
+        .ok_or_else(|| paro_error::internal("native dimension shell has no root layout"))?;
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
         return Ok(None);
     };
@@ -3568,7 +3578,9 @@ fn try_native_dimension_sharing(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Option<NativeShell>> {
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(None);
     };
     let (output_types, allow_out_of_order, root_table_index, root_stats) =
@@ -3593,7 +3605,6 @@ fn try_native_dimension_sharing(
     {
         return Ok(None);
     }
-    let layouts = shell.layouts()?;
     let branches = arm_indices
         .into_iter()
         .map(|index| native_sharing_branch_view(&shell, &layouts, index))

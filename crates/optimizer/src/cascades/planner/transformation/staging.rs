@@ -83,6 +83,36 @@ impl NativeShell {
         binding: &PatternOperand,
         facts: &boundary::BoundarySnapshot,
     ) -> Result<Option<Self>> {
+        Self::from_pattern_impl(memo, state, binding, facts, false)
+            .map(|result| result.map(|(shell, _)| shell))
+    }
+
+    /// Build a native shell and retain the layouts calculated while the
+    /// pattern is lowered.  `from_pattern` intentionally keeps its old
+    /// allocation profile for callers that do not inspect layouts; native
+    /// rules which need layouts should use this entry point instead of
+    /// walking the immutable shell a second time.
+    pub(super) fn from_pattern_with_layouts(
+        memo: &Memo,
+        state: &PlannerTransformState,
+        binding: &PatternOperand,
+        facts: &boundary::BoundarySnapshot,
+    ) -> Result<Option<(Self, Vec<paro_planner::operator::LogicalOutputLayout>)>> {
+        let Some((shell, Some(layouts))) =
+            Self::from_pattern_impl(memo, state, binding, facts, true)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((shell, layouts)))
+    }
+
+    fn from_pattern_impl(
+        memo: &Memo,
+        state: &PlannerTransformState,
+        binding: &PatternOperand,
+        facts: &boundary::BoundarySnapshot,
+        collect_layouts: bool,
+    ) -> Result<Option<(Self, Option<Vec<paro_planner::operator::LogicalOutputLayout>>)>> {
         let mut group_names = HashMap::<usize, Arc<[String]>>::new();
 
         struct Built {
@@ -147,6 +177,7 @@ impl NativeShell {
             facts: &boundary::BoundarySnapshot,
             operand: &PatternOperand,
             nodes: &mut Vec<NativeNode>,
+            layouts: &mut Option<Vec<paro_planner::operator::LogicalOutputLayout>>,
             expected_layout: Option<&PlannerBindingLayout>,
             group_names: &mut HashMap<usize, Arc<[String]>>,
         ) -> Result<Option<Built>> {
@@ -197,6 +228,7 @@ impl NativeShell {
                             facts,
                             child,
                             nodes,
+                            layouts,
                             Some(layout),
                             group_names,
                         )?
@@ -246,6 +278,10 @@ impl NativeShell {
                         operator,
                         source_proofs: logical.proofs.iter().cloned().collect(),
                     });
+                    if let Some(layouts) = layouts.as_mut() {
+                        debug_assert_eq!(layouts.len(), node_index);
+                        layouts.push(layout.as_ref().clone());
+                    }
                     Ok(Some(Built {
                         child: NativeChild::Node(node_index),
                         layout,
@@ -256,12 +292,14 @@ impl NativeShell {
         }
 
         let mut nodes = Vec::new();
+        let mut layouts = collect_layouts.then(Vec::new);
         let Some(root) = expression(
             memo,
             state,
             facts,
             binding,
             &mut nodes,
+            &mut layouts,
             None,
             &mut group_names,
         )?
@@ -273,10 +311,13 @@ impl NativeShell {
                 "native pattern root must be an expression",
             ));
         };
-        Ok(Some(Self {
-            nodes: nodes.into_boxed_slice(),
-            root,
-        }))
+        Ok(Some((
+            Self {
+                nodes: nodes.into_boxed_slice(),
+                root,
+            },
+            layouts,
+        )))
     }
 
     pub(super) fn root_operator(&self) -> &LogicalOperator<NativeChild> {
