@@ -20,6 +20,7 @@ pub struct MemoVerifier;
 
 impl MemoVerifier {
     pub fn verify(memo: &Memo, columns: Option<&ColumnCatalog>) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         verify_region_forest(memo)?;
         for group in memo.groups() {
             if let Some(columns) = columns {
@@ -98,6 +99,7 @@ pub struct WinnerVerifier;
 
 impl WinnerVerifier {
     pub fn verify(memo: &Memo) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         for group in memo.groups() {
             for (goal, frontier) in group.winner_frontiers() {
                 if frontier.candidates().is_empty() {
@@ -114,6 +116,7 @@ impl WinnerVerifier {
     /// Replay the precise immutable DAG selected for extraction, including
     /// archived incumbent children no longer retained by a cost frontier.
     pub fn verify_candidate_tree(memo: &Memo, root: super::memo::ChildWinnerRef) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
         let mut pending = vec![root];
         let mut seen = std::collections::BTreeSet::new();
         while let Some(reference) = pending.pop() {

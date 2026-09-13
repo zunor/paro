@@ -466,6 +466,7 @@ impl Optimizer {
     }
 
     pub fn optimize(&mut self, plan: OwnedLogicalPlan) -> Result<OptimizedStatement> {
+        let pre_partition = crate::work_partition::enter(crate::work_partition::Bucket::Pre);
         // Allocation attribution is a planning concern. The global allocator
         // remains installed for observation, while counter updates are scoped
         // to this synchronous compiler operation so execution pays no tax.
@@ -1021,6 +1022,7 @@ impl Optimizer {
                 );
                 let search_phase_started = Instant::now();
                 let search_phase_allocated = paro_common::allocator::thread_allocated_bytes();
+                drop(pre_partition);
                 let extraction = input.optimize(&grant_classes)?;
                 (
                     mode,
@@ -1029,6 +1031,7 @@ impl Optimizer {
                     search_phase_allocated,
                 )
             };
+        let _finish_partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         if paro_context::compile_work_evidence_enabled() {
             self.compile_work.rule_elapsed_us = extraction.rule_elapsed.values()
                 .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))

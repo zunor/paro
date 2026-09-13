@@ -12,6 +12,7 @@ pub mod profiler;
 pub mod statement;
 pub mod transformation_rejection;
 pub(crate) mod verify;
+pub mod work_partition;
 
 pub mod aggregate;
 pub mod column;

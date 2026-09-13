@@ -546,6 +546,7 @@ impl<'a> TransformContext<'a> {
     }
 
     pub(crate) fn rollback(mut self) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Apply);
         let mut failures = Vec::new();
         while let Some(rollback) = self.sidecar_rollbacks.pop() {
             if let Err(error) = rollback() {
@@ -568,6 +569,7 @@ impl<'a> TransformContext<'a> {
     }
 
     pub(crate) fn commit(mut self) -> Result<(Box<[GroupId]>, BTreeSet<GroupId>)> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Insert);
         let Some(savepoint) = self.memo_savepoint.take() else {
             return Ok((Box::new([]), BTreeSet::new()));
         };

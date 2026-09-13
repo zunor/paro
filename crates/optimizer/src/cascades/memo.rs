@@ -2820,6 +2820,7 @@ impl Memo {
                 .get_mut()
                 .insert_with_limit(goal, winner, frontier_limit),
         };
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
         let frontier_changed =
             insertion.selected_changed || insertion.truncated || insertion.published.is_some();
         if insertion.truncated {
@@ -2936,6 +2937,7 @@ impl Memo {
     /// is rejected at the handoff boundary instead of being repaired by a
     /// later search pass.
     pub fn freeze_candidate_tree(&self, root: ChildWinnerRef) -> Result<Arc<FrozenCandidate>> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
         fn visit(
             memo: &Memo,
             reference: ChildWinnerRef,

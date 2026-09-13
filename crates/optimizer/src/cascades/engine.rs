@@ -2582,6 +2582,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         winner: Arc<Winner>,
     ) -> Result<GrantWinner> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
         let started = Instant::now();
         let reference = ChildWinnerRef {
             group: self.memo.canonical_group(root),
@@ -2614,6 +2615,7 @@ impl CascadesEngine {
     }
 
     fn record_search_checkpoints(&mut self, root: GroupId) {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         if !self.collect_rule_work_profile
             || self.diagnostic_checkpoint_goals.is_empty()
             || self.next_diagnostic_checkpoint >= SEARCH_CHECKPOINT_TARGETS_MS.len()
@@ -2678,6 +2680,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         winner: &Winner,
     ) -> Result<(Box<[FrozenChoice]>, Box<[PatternRead]>, bool)> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         let reference = ChildWinnerRef {
             group: self.memo.canonical_group(root),
             goal,
@@ -2719,6 +2722,7 @@ impl CascadesEngine {
     }
 
     fn record_diagnostic_checkpoints(&mut self) {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         if let Some(root) = self.milestone_root {
             self.record_search_checkpoints(root);
         }
@@ -2958,6 +2962,7 @@ impl CascadesEngine {
         children: Box<[ChildWinnerRef]>,
         cost: SearchCost,
     ) {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
         if !self.collect_rule_work_profile {
             return;
         }
@@ -3053,6 +3058,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         selected_changed: bool,
     ) -> Result<bool> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
         self.note_physical_candidate(group, goal, selected_changed)?;
         self.record_diagnostic_checkpoints();
         Ok(self.should_yield_physical_interleave_step())
@@ -3063,6 +3069,7 @@ impl CascadesEngine {
         group: GroupId,
         goal: OptimizationGoal,
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
         if !self.quality_handoff_enabled
             || self.quality_handoff_reached
             || !self.quality_required_goals.contains(&goal)
@@ -3341,6 +3348,7 @@ impl CascadesEngine {
         admissible_set: AdmissibleGrantSetId,
         classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
         if !self.quality_handoff_enabled || self.quality_handoff_reached {
             return Ok(());
         }
@@ -4195,6 +4203,7 @@ impl CascadesEngine {
         physical: PhysicalExprId,
         recipe: Fingerprint,
     ) {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
         let child = self.memo.canonical_group(child);
         let parent = self.memo.canonical_group(parent);
         self.physical_goals
@@ -4225,6 +4234,7 @@ impl CascadesEngine {
         changed_groups: impl IntoIterator<Item = GroupId>,
         interleave: &mut PhysicalInterleave,
     ) {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
         let mut groups = VecDeque::new();
         let mut visited = BTreeSet::new();
         for group in changed_groups {
@@ -4277,6 +4287,7 @@ impl CascadesEngine {
     }
 
     fn drain_physical_interleave(&mut self, interleave: &mut PhysicalInterleave) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Subproblem);
         while let Some((group, goal)) = interleave.pending.pop_first() {
             if self
                 .active_optional_grant
@@ -4335,6 +4346,7 @@ impl CascadesEngine {
         &mut self,
         mut interleave: Option<PhysicalInterleave>,
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Agenda);
         self.memo.control().begin_optional();
         self.memo.seal_optional_group_budget();
         let mut agenda = StableAgenda::default();
@@ -5061,6 +5073,7 @@ impl CascadesEngine {
                     );
                 }
                 let insertion = (|| -> Result<TransformationInsertion> {
+                    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Insert);
                     let mut inserted_groups = BTreeSet::new();
                     let mut inserted_properties = Vec::new();
                     let mut inserted_expressions = Vec::new();
@@ -6120,6 +6133,7 @@ impl CascadesEngine {
         promoted: bool,
         demanded: bool,
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
         let expressions = self
             .memo
             .group(group)
@@ -6162,6 +6176,7 @@ impl CascadesEngine {
         promoted: bool,
         demanded: bool,
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
         let expression_ref = self
             .memo
             .logical_expr(expression)
@@ -6251,6 +6266,7 @@ impl CascadesEngine {
         group: GroupId,
         agenda: &mut StableAgenda,
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
         let group = self.memo.canonical_group(group);
         let subscribers = self
             .transformation_subscribers
@@ -6382,6 +6398,7 @@ impl CascadesEngine {
         task: TransformationTaskId,
         reads: &[PatternRead],
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
         let mut dependencies = reads.to_vec();
         // Discovery is shared by all bindings of a task. Application-only
         // evidence remains subscribed even when a later binding reads a
@@ -6485,6 +6502,7 @@ impl CascadesEngine {
     }
 
     fn enumerate_implementations(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Recipe);
         let group = self.memo.canonical_group(group);
         self.physical_implementation_requests =
             self.physical_implementation_requests.saturating_add(1);
@@ -6599,6 +6617,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         mut candidate: PhysicalCandidate,
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Recipe);
         candidate.local_cost.validate()?;
         candidate.provided.validate()?;
         if candidate.key.implementation != implementation || candidate.key.logical != expression {
@@ -6865,6 +6884,7 @@ impl CascadesEngine {
     }
 
     fn optimize_group(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Subproblem);
         if !self.memo.control().checkpoint()? {
             return Ok(());
         }
@@ -8063,6 +8083,7 @@ impl CascadesEngine {
         children: &[CandidateId],
         count_recheck: bool,
     ) -> Result<(bool, bool, Option<CandidateId>)> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Admission);
         let _admission_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 1);
         let Some(cached) = state.priced.get_mut(children) else {
             return Err(paro_error::internal(
@@ -8631,6 +8652,7 @@ impl CascadesEngine {
                     combination_state.budget_rejected.remove(&child_ids);
                 }
                 child_selections.clear();
+                let kernel_partition = crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
                 let kernel_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 0);
                 child_selections.extend(children.iter().copied());
                 child_costs.clear();
@@ -8715,6 +8737,7 @@ impl CascadesEngine {
                 };
                 cost = constrained_cost;
                 drop(kernel_timer);
+                drop(kernel_partition);
                 if self.collect_rule_work_profile {
                     self.note_candidate_lifecycle(CandidateLifecycleEvent {
                         stage: CandidateLifecycleStage::TuplePriced,

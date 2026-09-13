@@ -1480,6 +1480,7 @@ impl OptimizationInput {
     }
 
     pub fn optimize(mut self, grant_classes: &[ResourceGrantClass]) -> Result<OptimizationOutput> {
+        let preparation_partition = crate::work_partition::enter(crate::work_partition::Bucket::Pre);
         if grant_classes.is_empty() {
             return Err(paro_error::internal(
                 "planner optimization requires at least one resource grant class",
@@ -1638,6 +1639,7 @@ impl OptimizationInput {
                 )
                 .map(|class| ResourceGrantClassId::new(class.index))
         });
+        drop(preparation_partition);
         let grant_optimization = if statement_context.is_some() {
             engine.optimize_for_expected_grant(
                 self.root,
@@ -1658,6 +1660,7 @@ impl OptimizationInput {
                 self.mode,
             )?
         };
+        let _finish_partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         engine.note_search_return();
         let export_strong_incumbents = self.export_strong_incumbent
             || std::env::var_os("PARO_EXPORT_STRONG_INCUMBENT")

@@ -71,11 +71,15 @@ pub fn compile_statement_with_parameter_types(
     );
 
     let optimizer_started = Instant::now();
+    let partition = paro_optimizer::work_partition::begin(optimizer_started);
     paro_optimizer::cascades::memo::diagnostic_snapshot::clear();
     let mut optimizer = paro_optimizer::Optimizer::new(planner.binder, ctx.clone());
     let optimized = match optimizer.optimize(logical_plan) {
         Ok(plan) => plan,
         Err(error) => {
+            if let Some(report) = partition.finish(Instant::now()) {
+                let _ = report.write(&statement_tag, false);
+            }
             if let Some(trace) = &statement_trace {
                 trace.record_span("compile", "optimizer", optimizer_started);
                 trace.record_event("compile", "optimizer_error");
@@ -90,9 +94,11 @@ pub fn compile_statement_with_parameter_types(
             return Err(error);
         }
     };
+    let optimizer_finished = Instant::now();
+    let partition_report = partition.finish(optimizer_finished);
     let compile_work = paro_context::compile_work_evidence_enabled().then(|| {
         let mut work = optimizer.compile_work();
-        work.optimizer_elapsed_us = u64::try_from(optimizer_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        work.optimizer_elapsed_us = u64::try_from(optimizer_finished.duration_since(optimizer_started).as_micros()).unwrap_or(u64::MAX);
         work
     });
     if let Some(trace) = &statement_trace {
@@ -100,6 +106,11 @@ pub fn compile_statement_with_parameter_types(
     }
     if let Err(error) = paro_optimizer::cascades::memo::diagnostic_snapshot::flush(&statement_tag) {
         tracing::warn!(%error, "frontier diagnostic snapshot write failed");
+    }
+    if let Some(report) = partition_report {
+        if let Err(error) = report.write(&statement_tag, true) {
+            tracing::warn!(%error, "optimizer work partition write failed");
+        }
     }
     debug!(
         target: targets::OPTIMIZER,

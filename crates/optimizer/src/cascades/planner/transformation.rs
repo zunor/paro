@@ -357,6 +357,7 @@ impl TransformationRule for PlannerTransformationRule {
         expr: &crate::cascades::memo::LogicalExpr,
         ctx: &RuleContext<'_>,
     ) -> Result<RootDispatch> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Match);
         let state = self
             .planner_state
             .read()
@@ -433,6 +434,7 @@ impl TransformationRule for PlannerTransformationRule {
     }
 
     fn bindings(&self, expr: LogicalExprId, ctx: &RuleContext<'_>) -> Result<PatternBindingSet> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Match);
         let state = self
             .planner_state
             .read()
@@ -499,6 +501,7 @@ impl TransformationRule for PlannerTransformationRule {
         binding: &PatternBinding,
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Apply);
         let expr = binding.root_expression();
         let target_group = ctx.group();
         let facts = {
