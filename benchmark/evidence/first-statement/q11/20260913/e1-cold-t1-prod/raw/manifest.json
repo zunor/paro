@@ -1,0 +1,394 @@
+{
+  "paro-e1-cold-analysis.json": {
+    "archive": "paro-e1-cold-analysis.json.gz",
+    "archive_bytes": 13744,
+    "archive_sha256": "ec574ea5aa71fa94a85267ce2e0539b7a2580d5f959f493616c7bb24f725f504",
+    "bytes": 141961,
+    "sha256": "206c5a85bdb71e255e15e4a7dbf679e90de6f4090aedb68f4a059e4a28f201d6",
+    "source_path": "/private/tmp/paro-e1-cold-analysis.json"
+  },
+  "paro-e1-cold-baseline-handoff-run-v2.log": {
+    "archive": "paro-e1-cold-baseline-handoff-run-v2.log.gz",
+    "archive_bytes": 557,
+    "archive_sha256": "66db2f6d6b275733636872d4924cd583ea619c384dfb1e9c6ef17b82ea5ac706",
+    "bytes": 1011,
+    "sha256": "c21dd7f4da9625658693606b136e9c91d8e0a4b7e737c304aa1b9005a6b43896",
+    "source_path": "/private/tmp/paro-e1-cold-baseline-handoff-run-v2.log"
+  },
+  "paro-e1-cold-baseline-handoff-run.log": {
+    "archive": "paro-e1-cold-baseline-handoff-run.log.gz",
+    "archive_bytes": 149,
+    "archive_sha256": "b3bcac34b5b7bddaaed152ef4ecb869df466b7725dcbeee729b16efd4b58502a",
+    "bytes": 246,
+    "sha256": "2aea551d7ca8d3070989357bd5d962feeaeed03e01a39996ba83c95ff7bf8bc8",
+    "source_path": "/private/tmp/paro-e1-cold-baseline-handoff-run.log"
+  },
+  "paro-e1-cold-check.log": {
+    "archive": "paro-e1-cold-check.log.gz",
+    "archive_bytes": 728,
+    "archive_sha256": "969876ed123cb19b787a8349960b2a007e7f8088c924fe81528b90e847a092a2",
+    "bytes": 2309,
+    "sha256": "8e83830f0888599c44e4eb9d306e0d5b1257c27020209d764ee988c0b61a7bb2",
+    "source_path": "/private/tmp/paro-e1-cold-check.log"
+  },
+  "paro-e1-cold-harness-tests.log": {
+    "archive": "paro-e1-cold-harness-tests.log.gz",
+    "archive_bytes": 51,
+    "archive_sha256": "e7dc5a12e527db3b221c713cd8260fe89b32f6812a1df33092b6739dd0e984fa",
+    "bytes": 98,
+    "sha256": "fb184ea57734512b1f088f9181209901b9cd46df3eb7eaa2500ea9e48dde20b5",
+    "source_path": "/private/tmp/paro-e1-cold-harness-tests.log"
+  },
+  "paro-e1-cold-off-handoff-run.log": {
+    "archive": "paro-e1-cold-off-handoff-run.log.gz",
+    "archive_bytes": 556,
+    "archive_sha256": "c2a87dcfca8e395b2af7575b301ed61f7b2a432adb21fbd18212a7eed25f8626",
+    "bytes": 1011,
+    "sha256": "3ef68d09e227f2394524bcf8dd020a88d4f3aca3485e9d30ded32ced5ce5f215",
+    "source_path": "/private/tmp/paro-e1-cold-off-handoff-run.log"
+  },
+  "paro-e1-cold-on-handoff-run.log": {
+    "archive": "paro-e1-cold-on-handoff-run.log.gz",
+    "archive_bytes": 556,
+    "archive_sha256": "bd7c5121c6fc66518640f658e424f46756da377316aa8e11e49a7f6774ed37f6",
+    "bytes": 1011,
+    "sha256": "a4254d5ef10fa75f2a7dc95c79942ac34474852f69829bcea0e57671e02ed0bc",
+    "source_path": "/private/tmp/paro-e1-cold-on-handoff-run.log"
+  },
+  "paro-e1-cold-release.log": {
+    "archive": "paro-e1-cold-release.log.gz",
+    "archive_bytes": 686,
+    "archive_sha256": "9b9bf8bcdd3e9b7dd700d198bde94270d23a78ea3c13f2884b1e0db7352dfd94",
+    "bytes": 2447,
+    "sha256": "29c5049118da02fc7521d14f905f10ceee7257c307e866cb0fcbc7d75d2b92e9",
+    "source_path": "/private/tmp/paro-e1-cold-release.log"
+  },
+  "paro-e1-cold-unit-tests.log": {
+    "archive": "paro-e1-cold-unit-tests.log.gz",
+    "archive_bytes": 718,
+    "archive_sha256": "cc69688149c751c8efe62e1dcc61b3f3bfd9adb9d3a7b346e2ec840b8e0674a5",
+    "bytes": 1613,
+    "sha256": "04e89f889276613a67775da8eb37b59a94d8b7c1a5724e400b706d598ac97f0e",
+    "source_path": "/private/tmp/paro-e1-cold-unit-tests.log"
+  },
+  "paro-e1-cold-v2-analysis.json": {
+    "archive": "paro-e1-cold-v2-analysis.json.gz",
+    "archive_bytes": 18669,
+    "archive_sha256": "174f5e7babd8beb174934ca86c26a43a6994d7bf0c53b723a3c357f730907ce2",
+    "bytes": 188961,
+    "sha256": "4858249974a8dc01a1803ff47e350c41d3001555ded30a84b2b243a9aa830d40",
+    "source_path": "/private/tmp/paro-e1-cold-v2-analysis.json"
+  },
+  "paro-e1-cold-v2-off-run.log": {
+    "archive": "paro-e1-cold-v2-off-run.log.gz",
+    "archive_bytes": 557,
+    "archive_sha256": "5e8abc56faca029e00b3e0aa3d60e9e7373ecc18d1af2ead3ea7accee73e9738",
+    "bytes": 1011,
+    "sha256": "deab7e3c227e21e076be80524a29347a98eadc7407e316f105089f1861897626",
+    "source_path": "/private/tmp/paro-e1-cold-v2-off-run.log"
+  },
+  "paro-e1-cold-v2-on-run.log": {
+    "archive": "paro-e1-cold-v2-on-run.log.gz",
+    "archive_bytes": 555,
+    "archive_sha256": "7415070112954f516a66711a21ef032aae47f821be5483ff2f3a0e1101291472",
+    "bytes": 1011,
+    "sha256": "335431de9613fb31141583193a295bb8c0bfb0692a678a05dce5dc1b01bc3be9",
+    "source_path": "/private/tmp/paro-e1-cold-v2-on-run.log"
+  },
+  "paro-e1-cold-v2-release.log": {
+    "archive": "paro-e1-cold-v2-release.log.gz",
+    "archive_bytes": 688,
+    "archive_sha256": "ed53ea5fee5e4f8c05d0d5ed60bfefbbe42e45e80744c23204201188129d6401",
+    "bytes": 2447,
+    "sha256": "005a34dafc77a7eea931659a517faa6e10c3c4fbbe8ffd87794d6085b01c0988",
+    "source_path": "/private/tmp/paro-e1-cold-v2-release.log"
+  },
+  "paro-e1-cold-v2-unit-tests.log": {
+    "archive": "paro-e1-cold-v2-unit-tests.log.gz",
+    "archive_bytes": 438,
+    "archive_sha256": "fa02ee0fe1860ea829131c87ab80b9d35932fb9d388e72199a68639dd53e2a78",
+    "bytes": 692,
+    "sha256": "d2406c6a3314ed2b1c774187a4e83e07dbde39a679ad08e369de720a21ac9ea6",
+    "source_path": "/private/tmp/paro-e1-cold-v2-unit-tests.log"
+  },
+  "paro-tcwc-e1-cold-baseline-handoff.json": {
+    "archive": "paro-tcwc-e1-cold-baseline-handoff.json.gz",
+    "archive_bytes": 1895640,
+    "archive_sha256": "7b6deb3fb042af18239ca4a0ae36f02abd36f4ff835512d122bdc8b9ec1dd716",
+    "bytes": 50017743,
+    "sha256": "dd5cfc99337d9c2e4be7a1a53dbf8502d393234d40796d51e1bff986e0ca8774",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-baseline-handoff.json"
+  },
+  "paro-tcwc-e1-cold-baseline-handoff.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-baseline-handoff.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-baseline-handoff.q11.block000.parod.log"
+  },
+  "paro-tcwc-e1-cold-baseline-handoff.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e1-cold-baseline-handoff.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-baseline-handoff.q11.block001.parod.log"
+  },
+  "paro-tcwc-e1-cold-baseline-handoff.q11.block002.parod.log": {
+    "archive": "paro-tcwc-e1-cold-baseline-handoff.q11.block002.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-baseline-handoff.q11.block002.parod.log"
+  },
+  "paro-tcwc-e1-cold-baseline-handoff.q11.block003.parod.log": {
+    "archive": "paro-tcwc-e1-cold-baseline-handoff.q11.block003.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-baseline-handoff.q11.block003.parod.log"
+  },
+  "paro-tcwc-e1-cold-baseline-handoff.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-baseline-handoff.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1569694,
+    "archive_sha256": "58bf5055f50f01813c09ef5ce59137453e8ec17a7eb1de3b908bd00aa13a4f77",
+    "bytes": 65685418,
+    "sha256": "636b10084ef94a177abe583617e91d63b0d07b3ac2f8cb1cc64208928534880d",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-baseline-handoff.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e1-cold-baseline-handoff.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e1-cold-baseline-handoff.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-baseline-handoff.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e1-cold-off-handoff.json": {
+    "archive": "paro-tcwc-e1-cold-off-handoff.json.gz",
+    "archive_bytes": 1874649,
+    "archive_sha256": "96a359e33b5d7f83f09cdfb90474b4bc20e746ae758ab948c835d20629c27146",
+    "bytes": 49357125,
+    "sha256": "7f1a8fd42b371b1603b3f678d08142993bd3ed99e3fab4f2f7ebc6adfb97fa3f",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-off-handoff.json"
+  },
+  "paro-tcwc-e1-cold-off-handoff.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-off-handoff.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-off-handoff.q11.block000.parod.log"
+  },
+  "paro-tcwc-e1-cold-off-handoff.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e1-cold-off-handoff.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-off-handoff.q11.block001.parod.log"
+  },
+  "paro-tcwc-e1-cold-off-handoff.q11.block002.parod.log": {
+    "archive": "paro-tcwc-e1-cold-off-handoff.q11.block002.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-off-handoff.q11.block002.parod.log"
+  },
+  "paro-tcwc-e1-cold-off-handoff.q11.block003.parod.log": {
+    "archive": "paro-tcwc-e1-cold-off-handoff.q11.block003.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-off-handoff.q11.block003.parod.log"
+  },
+  "paro-tcwc-e1-cold-off-handoff.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-off-handoff.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1551023,
+    "archive_sha256": "ac5db61dc2607959a1c40327d530a3419cfad015abdbbc83d817d4874b4a9968",
+    "bytes": 64747347,
+    "sha256": "c46ba173053a422057e95e77b618ae04e2cc0f8eefa72cd690001c0f8ab83986",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-off-handoff.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e1-cold-off-handoff.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e1-cold-off-handoff.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-off-handoff.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e1-cold-on-handoff.json": {
+    "archive": "paro-tcwc-e1-cold-on-handoff.json.gz",
+    "archive_bytes": 1885242,
+    "archive_sha256": "856c8cec307d5e74abeefd6ba6419041255c16f4dabe27c1f623de1a4f87d67f",
+    "bytes": 49499174,
+    "sha256": "ec786c9d37f677d19e304ea3cfbbea4ac77bbba08f8c968fad3357c261ba4166",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-on-handoff.json"
+  },
+  "paro-tcwc-e1-cold-on-handoff.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-on-handoff.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-on-handoff.q11.block000.parod.log"
+  },
+  "paro-tcwc-e1-cold-on-handoff.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e1-cold-on-handoff.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-on-handoff.q11.block001.parod.log"
+  },
+  "paro-tcwc-e1-cold-on-handoff.q11.block002.parod.log": {
+    "archive": "paro-tcwc-e1-cold-on-handoff.q11.block002.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-on-handoff.q11.block002.parod.log"
+  },
+  "paro-tcwc-e1-cold-on-handoff.q11.block003.parod.log": {
+    "archive": "paro-tcwc-e1-cold-on-handoff.q11.block003.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-on-handoff.q11.block003.parod.log"
+  },
+  "paro-tcwc-e1-cold-on-handoff.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-on-handoff.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1549662,
+    "archive_sha256": "b904e71169b0e951ee2a5fd90bded27b2f525c5c4dc82bf5d634c5837ebd71df",
+    "bytes": 64739441,
+    "sha256": "80fc52f3f54ac47a1aa3a75fdce40274fa891681c641996a01778c5e6cf46b54",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-on-handoff.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e1-cold-on-handoff.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e1-cold-on-handoff.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-on-handoff.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-off-handoff.json": {
+    "archive": "paro-tcwc-e1-cold-v2-off-handoff.json.gz",
+    "archive_bytes": 1852626,
+    "archive_sha256": "7819fd77351d1aa12bfcb4ff8ea47139674b2e5e08787013bb888c67252fb9f7",
+    "bytes": 48689017,
+    "sha256": "e5213683bb895cf5bbe7b678b5a90c4686dfd406ab3f0909aa74ee7b503c3a7f",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-off-handoff.json"
+  },
+  "paro-tcwc-e1-cold-v2-off-handoff.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-off-handoff.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-off-handoff.q11.block000.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-off-handoff.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-off-handoff.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-off-handoff.q11.block001.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-off-handoff.q11.block002.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-off-handoff.q11.block002.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-off-handoff.q11.block002.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-off-handoff.q11.block003.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-off-handoff.q11.block003.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-off-handoff.q11.block003.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-off-handoff.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-off-handoff.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1532719,
+    "archive_sha256": "944cabae7fd5a3a071575e0def5800c7f5eddfe29d27bdf659110adf6cb44109",
+    "bytes": 64029969,
+    "sha256": "b629cc0e0e01158f92d519411028ccb7f3108dc9f319452bebc98096cf7334d9",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-off-handoff.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-off-handoff.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-off-handoff.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-off-handoff.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-on-handoff.json": {
+    "archive": "paro-tcwc-e1-cold-v2-on-handoff.json.gz",
+    "archive_bytes": 1868143,
+    "archive_sha256": "dcb5a05ee17d34b0a39106b504b59110527dc6f30e1915c7f213f84146885073",
+    "bytes": 48886567,
+    "sha256": "d296e6e780708c70c93f67998c40d3599d009bd2d1f6fe354e13194b6dd1ef6e",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-on-handoff.json"
+  },
+  "paro-tcwc-e1-cold-v2-on-handoff.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-on-handoff.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-on-handoff.q11.block000.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-on-handoff.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-on-handoff.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-on-handoff.q11.block001.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-on-handoff.q11.block002.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-on-handoff.q11.block002.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-on-handoff.q11.block002.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-on-handoff.q11.block003.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-on-handoff.q11.block003.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-on-handoff.q11.block003.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-on-handoff.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-on-handoff.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1530948,
+    "archive_sha256": "e17cab2d813a7ee6696fdb65b43e186de8448a5baf2b321e8f5ab57e845edfd3",
+    "bytes": 64029954,
+    "sha256": "531268db096ed0c60f1b83258c7e9f71198d2ee1560c9e339200e7c9c31a87f0",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-on-handoff.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e1-cold-v2-on-handoff.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e1-cold-v2-on-handoff.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e1-cold-v2-on-handoff.q11.oracle.parod.log"
+  }
+}
