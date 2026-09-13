@@ -2106,7 +2106,7 @@ fn native_materialize_candidate(
     join_index: usize,
     left_side: bool,
     candidate: &Expression,
-    layouts: &[paro_planner::operator::LogicalOutputLayout],
+    layouts: &mut Vec<paro_planner::operator::LogicalOutputLayout>,
     state: &PlannerTransformState,
 ) -> Result<bool> {
     let join = match nodes
@@ -2161,6 +2161,8 @@ fn native_materialize_candidate(
         child,
         returned_types,
     };
+    let projection_layout = LogicalOperator::Projection(projection.clone())
+        .output_layout_from_child_refs(&[&child_layout]);
     let materialized_binding = ColumnBinding::new(projection_index, old_width);
     let projection_index_in_shell = nodes.len();
     nodes.push(NativeNode {
@@ -2169,6 +2171,8 @@ fn native_materialize_candidate(
         operator: LogicalOperator::Projection(projection),
         source_proofs: Box::new([]),
     });
+    debug_assert_eq!(layouts.len(), projection_index_in_shell);
+    layouts.push(projection_layout);
 
     let binding_map = child_layout
         .bindings()
@@ -2198,8 +2202,20 @@ fn native_materialize_candidate(
     for expression in &mut rewritten_join.duplicate_eliminated_columns {
         *expression = native_replace_known_bindings(expression, &binding_map);
     }
-    nodes[join_index].operator = LogicalOperator::Join(Join::Comparison(rewritten_join));
+    let rewritten_join = LogicalOperator::Join(Join::Comparison(rewritten_join));
+    let rewritten_join_layout = {
+        let mut children = SmallVec::<[&NativeChild; 2]>::new();
+        rewritten_join.visit_child_links(&mut |child| children.push(child));
+        let child_layouts = children
+            .iter()
+            .map(|child| native_shell_child_layout(child, layouts))
+            .collect::<Result<SmallVec<[paro_planner::operator::LogicalOutputLayout; 2]>>>()?;
+        let child_layouts = child_layouts.iter().collect::<SmallVec<[_; 2]>>();
+        rewritten_join.output_layout_from_child_refs(&child_layouts)
+    };
+    nodes[join_index].operator = rewritten_join;
     nodes[join_index].source_proofs = Box::new([]);
+    layouts[join_index] = rewritten_join_layout.clone();
 
     let LogicalOperator::Aggregate(aggregate) = nodes
         .get(root_index)
@@ -2226,8 +2242,11 @@ fn native_materialize_candidate(
         *expression = native_replace_known_bindings(expression, &binding_map);
     }
     reset_native_aggregate_output(&mut rewritten_aggregate);
-    nodes[root_index].operator = LogicalOperator::Aggregate(Box::new(rewritten_aggregate));
+    let rewritten_aggregate = LogicalOperator::Aggregate(Box::new(rewritten_aggregate));
+    let root_layout = rewritten_aggregate.output_layout_from_child_refs(&[&rewritten_join_layout]);
+    nodes[root_index].operator = rewritten_aggregate;
     nodes[root_index].source_proofs = Box::new([]);
+    layouts[root_index] = root_layout;
     Ok(true)
 }
 
@@ -2243,7 +2262,7 @@ fn try_native_input_materialization(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Option<NativeShell>> {
-    let Some((shell, layouts)) =
+    let Some((shell, mut layouts)) =
         NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
     else {
         return Ok(None);
@@ -2327,7 +2346,6 @@ fn try_native_input_materialization(
     let mut rejected = Vec::<Expression>::new();
     let mut changed = false;
     loop {
-        let layouts = native_shell_layouts_for_nodes(&nodes)?;
         let LogicalOperator::Aggregate(current) = nodes[root].operator.clone() else {
             return Ok(None);
         };
@@ -2370,7 +2388,7 @@ fn try_native_input_materialization(
             join_index,
             left_side,
             &candidate,
-            &layouts,
+            &mut layouts,
             state,
         )? {
             changed = true;
