@@ -22,6 +22,9 @@ use paro_planner::plan::OwnedLogicalPlan;
 use crate::aggregate::semantic_kernels::scalar_kernels_equal;
 use crate::cost_model::CostModel;
 use crate::expression::traversal::visit_expression;
+use crate::transformation_rejection::{
+    reject, RejectionReasons, TransformationRejectionGuard as Guard,
+};
 
 /// Rewrite every eligible subtree while preserving an ordinary narrow plan as
 /// the fallback for shapes whose dependency or expression domain is unclear.
@@ -44,15 +47,24 @@ pub(crate) fn rewrite_node(
     bind_context: &BindContext,
     cost_model: &CostModel,
 ) -> Result<(OwnedLogicalPlan, bool)> {
-    if let Some(proof) = prove_selective_projection_candidate(&plan, cost_model) {
+    rewrite_node_profiled(plan, bind_context, cost_model, &mut None)
+}
+
+pub(crate) fn rewrite_node_profiled(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+    cost_model: &CostModel,
+    reasons: &mut Option<RejectionReasons>,
+) -> Result<(OwnedLogicalPlan, bool)> {
+    if let Some(proof) = prove_selective_projection_candidate_profiled(&plan, cost_model, reasons) {
         return Ok((
             apply_selective_projection_rewrite(plan, proof, bind_context)?,
             true,
         ));
     }
-    match prove_candidate(&plan, cost_model) {
+    match prove_candidate_profiled(&plan, cost_model, reasons) {
         Some(proof) => Ok((apply_rewrite(plan, proof, bind_context)?, true)),
-        None => match prove_row_preserving_candidate(&plan, cost_model) {
+        None => match prove_row_preserving_candidate_profiled(&plan, cost_model, reasons) {
             Some(proof) => Ok((
                 apply_row_preserving_rewrite(plan, proof, bind_context)?,
                 true,
@@ -515,12 +527,13 @@ struct Candidate {
 /// is especially useful across blocking operators: a stable rowid and narrow
 /// predicate inputs cross the blocker, while wide output-only columns are
 /// gathered for the surviving rows immediately below their final projection.
-fn prove_selective_projection_candidate(
+fn prove_selective_projection_candidate_profiled(
     plan: &OwnedLogicalPlan,
     cost_model: &CostModel,
+    reasons: &mut Option<RejectionReasons>,
 ) -> Option<SelectiveProjectionCandidate> {
     let LogicalOperator::Projection(output) = &plan.operator else {
-        return None;
+        return reject(reasons, Guard::SelectiveShape);
     };
     if matches!(output.child.operator, LogicalOperator::RowFetch(_))
         || output
@@ -528,7 +541,7 @@ fn prove_selective_projection_candidate(
             .iter()
             .any(|expression| !expression.evaluation_properties().can_share_evaluation())
     {
-        return None;
+        return reject(reasons, Guard::SelectiveUnsafeOutput);
     }
     // A late fetch is paid after the whole rowid path, where join fanout and
     // correlated selectivity errors have already accumulated. Planning it
@@ -536,7 +549,12 @@ fn prove_selective_projection_candidate(
     // irreversible: an underestimated join creates one random lookup per
     // actual row. Charge the interval's upper bound for that lookup frontier,
     // while the eager side below remains based on observed source work.
-    let fetched_rows = output.child.stats.estimated_cardinality?.max;
+    let fetched_rows = output
+        .child
+        .stats
+        .estimated_cardinality
+        .or_else(|| reject(reasons, Guard::SelectiveMissingCardinality))?
+        .max;
     let mut by_source = HashMap::<usize, SelectiveProjectionSource>::new();
     for expression in &output.expressions {
         let mut valid = true;
@@ -583,10 +601,13 @@ fn prove_selective_projection_candidate(
                 .insert(column.binding, catalog_column);
         });
         if !valid {
-            return None;
+            return reject(reasons, Guard::SelectiveInvalidColumn);
         }
     }
 
+    if by_source.is_empty() {
+        return reject(reasons, Guard::SelectiveNoBaseSource);
+    }
     let sources = by_source
         .into_values()
         .filter_map(|mut source| {
@@ -594,7 +615,8 @@ fn prove_selective_projection_candidate(
                 output.child.as_ref(),
                 source.source_table_index,
                 RowIdPathPolicy::RowPreserving,
-            )?;
+            )
+            .or_else(|| reject(reasons, Guard::SelectiveRowIdPath))?;
             // The current sparse fetch frontier has a direct-scan locality
             // model. Once a rowid crosses a join, physical lookups are paid
             // after fanout, while join cardinality intervals do not yet carry
@@ -603,25 +625,28 @@ fn prove_selective_projection_candidate(
             // eligibility, but require a cost proof before enabling post-join
             // fetch rather than treating an optimistic estimate as exact.
             if rowid_path.crosses_join() {
-                return None;
+                return reject(reasons, Guard::SelectiveJoinLocality);
             }
             let carrier_rows =
-                source_estimated_rows(output.child.as_ref(), source.source_table_index)?;
+                source_estimated_rows(output.child.as_ref(), source.source_table_index)
+                    .or_else(|| reject(reasons, Guard::SelectiveMissingSourceRows))?;
             if fetched_rows >= carrier_rows {
-                return None;
+                return reject(reasons, Guard::SelectiveNoReduction);
             }
-            cost_model.late_row_fetch_benefit(
-                carrier_rows,
-                fetched_rows,
-                source.delayed_bindings.values().filter_map(|&column| {
-                    source
-                        .table
-                        .columns
-                        .get(column)
-                        .map(|definition| definition.logical_type.clone())
-                }),
-                rowid_path.stages(),
-            )?;
+            cost_model
+                .late_row_fetch_benefit(
+                    carrier_rows,
+                    fetched_rows,
+                    source.delayed_bindings.values().filter_map(|&column| {
+                        source
+                            .table
+                            .columns
+                            .get(column)
+                            .map(|definition| definition.logical_type.clone())
+                    }),
+                    rowid_path.stages(),
+                )
+                .or_else(|| reject(reasons, Guard::SelectiveNoBenefit))?;
             source.rowid_path = rowid_path;
             Some(source)
         })
@@ -706,15 +731,19 @@ impl RowIdPath {
     }
 }
 
-fn prove_candidate(plan: &OwnedLogicalPlan, cost_model: &CostModel) -> Option<Candidate> {
+fn prove_candidate_profiled(
+    plan: &OwnedLogicalPlan,
+    cost_model: &CostModel,
+    reasons: &mut Option<RejectionReasons>,
+) -> Option<Candidate> {
     let LogicalOperator::TopN(topn) = &plan.operator else {
-        return None;
+        return reject(reasons, Guard::AggregateShape);
     };
     if topn.total_rows() == 0 {
-        return None;
+        return reject(reasons, Guard::AggregateZeroLimit);
     }
     let LogicalOperator::Projection(output) = &topn.child.operator else {
-        return None;
+        return reject(reasons, Guard::AggregateProjectionShape);
     };
     if matches!(output.child.operator, LogicalOperator::RowFetch(_))
         || output
@@ -722,23 +751,23 @@ fn prove_candidate(plan: &OwnedLogicalPlan, cost_model: &CostModel) -> Option<Ca
             .iter()
             .any(|expression| !expression.evaluation_properties().can_share_evaluation())
     {
-        return None;
+        return reject(reasons, Guard::AggregateUnsafeOutput);
     }
     if output
         .expressions
         .iter()
         .any(|expression| !matches!(expression, Expression::ColumnRef(column) if column.depth == 0))
     {
-        return None;
+        return reject(reasons, Guard::AggregateOutputExpression);
     }
     let LogicalOperator::Aggregate(aggregate) = &output.child.operator else {
-        return None;
+        return reject(reasons, Guard::AggregateInputShape);
     };
     // Scalar aggregates produce at most one row, so a TopN cannot amortize a
     // late payload frontier. The shared plain-domain predicate intentionally
     // excludes that shape rather than treating it as a grouping-set detail.
     if aggregate.post_reduction.is_some() || !aggregate.has_plain_grouping_domain() {
-        return None;
+        return reject(reasons, Guard::AggregateGroupingDomain);
     }
 
     if output
@@ -758,64 +787,85 @@ fn prove_candidate(plan: &OwnedLogicalPlan, cost_model: &CostModel) -> Option<Ca
             _ => true,
         })
     {
-        return None;
+        return reject(reasons, Guard::AggregateOutputBinding);
     }
     for order in &topn.orders {
         let Expression::ColumnRef(column) = &order.expression else {
-            return None;
+            return reject(reasons, Guard::AggregateOrderBinding);
         };
         if column.depth != 0
             || column.binding.table_index != output.table_index
             || column.binding.column_index >= output.expressions.len()
         {
-            return None;
+            return reject(reasons, Guard::AggregateOrderBinding);
         }
     }
 
+    if aggregate.group_dependencies.is_empty() {
+        return reject(reasons, Guard::AggregateNoDependency);
+    }
     aggregate
         .group_dependencies
         .iter()
         .enumerate()
         .filter_map(|(dependency, proof)| {
             if !proof.is_valid_for(aggregate.groups.len()) {
-                return None;
+                return reject(reasons, Guard::AggregateDependencyInvalid);
             }
-            let first = *proof.dependents.first()?;
+            let first = *proof
+                .dependents
+                .first()
+                .or_else(|| reject(reasons, Guard::AggregateDependentColumn))?;
             let Expression::ColumnRef(first_column) = &aggregate.groups[first] else {
-                return None;
+                return reject(reasons, Guard::AggregateDependentColumn);
             };
             if first_column.depth != 0 {
-                return None;
+                return reject(reasons, Guard::AggregateDependentColumn);
             }
             let source_table_index = first_column.binding.table_index;
             let rowid_path = prove_rowid_path(
                 aggregate.child.as_ref(),
                 source_table_index,
                 RowIdPathPolicy::NonNull,
-            )?;
-            let get = unique_get(aggregate.child.as_ref(), source_table_index)?;
-            let table = get.table.as_ref()?.clone();
+            )
+            .or_else(|| reject(reasons, Guard::AggregateRowIdPath))?;
+            let get = unique_get(aggregate.child.as_ref(), source_table_index)
+                .or_else(|| reject(reasons, Guard::AggregateSource))?;
+            let table = get
+                .table
+                .as_ref()
+                .or_else(|| reject(reasons, Guard::AggregateStorage))?
+                .clone();
             if table.get_storage().is_none() {
-                return None;
+                return reject(reasons, Guard::AggregateStorage);
             }
             let mut dependent_catalog_columns = HashMap::new();
             let mut payload_types = Vec::with_capacity(proof.dependents.len());
             for &group_index in proof.dependents.iter() {
                 let Expression::ColumnRef(column) = &aggregate.groups[group_index] else {
-                    return None;
+                    return reject(reasons, Guard::AggregateDependentColumn);
                 };
                 if column.depth != 0 || column.binding.table_index != source_table_index {
-                    return None;
+                    return reject(reasons, Guard::AggregateDependentColumn);
                 }
-                let catalog_column = get.stored_column(column.binding.column_index)?;
+                let catalog_column = get
+                    .stored_column(column.binding.column_index)
+                    .or_else(|| reject(reasons, Guard::AggregateDependentColumn))?;
                 if catalog_column >= table.columns.len() {
-                    return None;
+                    return reject(reasons, Guard::AggregateDependentColumn);
                 }
                 payload_types.push(column.return_type.clone());
                 dependent_catalog_columns.insert(group_index, catalog_column);
             }
-            let carrier_rows = aggregate.child.stats.estimated_cardinality?.expected;
-            let topn_rows = u64::try_from(topn.total_rows()).ok()?;
+            let carrier_rows = aggregate
+                .child
+                .stats
+                .estimated_cardinality
+                .or_else(|| reject(reasons, Guard::AggregateMissingCardinality))?
+                .expected;
+            let topn_rows = u64::try_from(topn.total_rows())
+                .ok()
+                .or_else(|| reject(reasons, Guard::AggregateMissingCardinality))?;
             let fetched_rows = topn_rows.min(
                 output
                     .child
@@ -823,23 +873,23 @@ fn prove_candidate(plan: &OwnedLogicalPlan, cost_model: &CostModel) -> Option<Ca
                     .estimated_cardinality
                     .map_or(carrier_rows, |estimate| estimate.expected),
             );
-            let benefit = cost_model.late_row_fetch_benefit(
-                carrier_rows,
-                fetched_rows,
-                payload_types,
-                rowid_path.stages(),
-            )?;
-            Some(Candidate {
+            let benefit = cost_model
+                .late_row_fetch_benefit(
+                    carrier_rows,
+                    fetched_rows,
+                    payload_types,
+                    rowid_path.stages(),
+                )
+                .or_else(|| reject(reasons, Guard::AggregateNoBenefit))?;
+            let candidate = Candidate {
                 dependency,
                 source_table_index,
                 table,
                 dependent_catalog_columns,
                 benefit,
                 rowid_path,
-            })
-        })
-        .filter(|candidate| {
-            topn.orders.iter().all(|order| {
+            };
+            let allowed = topn.orders.iter().all(|order| {
                 let Expression::ColumnRef(column) = &order.expression else {
                     return false;
                 };
@@ -852,23 +902,28 @@ fn prove_candidate(plan: &OwnedLogicalPlan, cost_model: &CostModel) -> Option<Ca
                     || !candidate
                         .dependent_catalog_columns
                         .contains_key(&output_column.binding.column_index)
-            })
+            });
+            if !allowed {
+                reject::<()>(reasons, Guard::AggregateOrderUsesPayload);
+            }
+            allowed.then_some(candidate)
         })
         .max_by(|left, right| left.benefit.total_cmp(&right.benefit))
 }
 
-fn prove_row_preserving_candidate(
+fn prove_row_preserving_candidate_profiled(
     plan: &OwnedLogicalPlan,
     cost_model: &CostModel,
+    reasons: &mut Option<RejectionReasons>,
 ) -> Option<RowPreservingCandidate> {
     let LogicalOperator::TopN(topn) = &plan.operator else {
-        return None;
+        return reject(reasons, Guard::TopNShape);
     };
     if topn.total_rows() == 0 {
-        return None;
+        return reject(reasons, Guard::TopNZeroLimit);
     }
     let LogicalOperator::Projection(output) = &topn.child.operator else {
-        return None;
+        return reject(reasons, Guard::TopNProjectionShape);
     };
     if matches!(output.child.operator, LogicalOperator::RowFetch(_))
         || output
@@ -876,30 +931,32 @@ fn prove_row_preserving_candidate(
             .iter()
             .any(|expression| !expression.evaluation_properties().can_share_evaluation())
     {
-        return None;
+        return reject(reasons, Guard::TopNUnsafeOutput);
     }
     if output
         .expressions
         .iter()
         .any(|expression| !matches!(expression, Expression::ColumnRef(column) if column.depth == 0))
     {
-        return None;
+        return reject(reasons, Guard::TopNOutputExpression);
     }
     let ordered_outputs = topn
         .orders
         .iter()
         .map(|order| {
             let Expression::ColumnRef(column) = &order.expression else {
-                return None;
+                return reject(reasons, Guard::TopNOrderBinding);
             };
             (column.depth == 0
                 && column.binding.table_index == output.table_index
                 && column.binding.column_index < output.expressions.len())
             .then_some(column.binding.column_index)
         })
-        .collect::<Option<HashSet<_>>>()?;
+        .collect::<Option<HashSet<_>>>()
+        .or_else(|| reject(reasons, Guard::TopNOrderBinding))?;
     let projected_outputs =
-        checked_projection_indices(&topn.projection_map, output.expressions.len())?
+        checked_projection_indices(&topn.projection_map, output.expressions.len())
+            .or_else(|| reject(reasons, Guard::TopNProjectionMap))?
             .into_iter()
             .collect::<HashSet<_>>();
 
@@ -911,13 +968,17 @@ fn prove_row_preserving_candidate(
             continue;
         }
         let Expression::ColumnRef(column) = expression else {
-            return None;
+            return reject(reasons, Guard::TopNOutputExpression);
         };
         if column.depth != 0 {
             continue;
         }
-        let get = unique_get(output.child.as_ref(), column.binding.table_index)?;
-        let table = get.table.as_ref()?;
+        let get = unique_get(output.child.as_ref(), column.binding.table_index)
+            .or_else(|| reject(reasons, Guard::TopNSource))?;
+        let table = get
+            .table
+            .as_ref()
+            .or_else(|| reject(reasons, Guard::TopNSource))?;
         if table.get_storage().is_none() {
             continue;
         }
@@ -931,7 +992,7 @@ fn prove_row_preserving_candidate(
         if catalog_column >= table.columns.len()
             || table.columns[catalog_column].logical_type != column.return_type
         {
-            return None;
+            return reject(reasons, Guard::TopNColumnType);
         }
         let source = by_source
             .entry(column.binding.table_index)
@@ -954,8 +1015,19 @@ fn prove_row_preserving_candidate(
         }
     }
 
-    let output_rows = output.child.stats.estimated_cardinality?.expected;
-    let topn_rows = u64::try_from(topn.total_rows()).ok()?.min(output_rows);
+    let output_rows = output
+        .child
+        .stats
+        .estimated_cardinality
+        .or_else(|| reject(reasons, Guard::TopNMissingCardinality))?
+        .expected;
+    let topn_rows = u64::try_from(topn.total_rows())
+        .ok()
+        .or_else(|| reject(reasons, Guard::TopNMissingCardinality))?
+        .min(output_rows);
+    if by_source.is_empty() {
+        return reject(reasons, Guard::TopNNoPayload);
+    }
     let sources = by_source
         .into_values()
         .filter_map(|mut source| {
@@ -963,7 +1035,8 @@ fn prove_row_preserving_candidate(
                 output.child.as_ref(),
                 source.source_table_index,
                 RowIdPathPolicy::RowPreserving,
-            )?;
+            )
+            .or_else(|| reject(reasons, Guard::TopNRowIdPath))?;
             let carrier_stages = rowid_path.stages();
             // Eager materialization starts at the source scan, not at the
             // final relational frontier. A selective join can reduce a large
@@ -972,7 +1045,8 @@ fn prove_row_preserving_candidate(
             // Conversely, a fanout may make the frontier larger than the
             // source, so retain the larger expected work domain.
             let carrier_rows =
-                source_estimated_rows(output.child.as_ref(), source.source_table_index)?
+                source_estimated_rows(output.child.as_ref(), source.source_table_index)
+                    .or_else(|| reject(reasons, Guard::TopNMissingSourceRows))?
                     .max(output_rows);
             let ordered_benefit = cost_model.late_row_fetch_benefit(
                 carrier_rows,
@@ -998,6 +1072,10 @@ fn prove_row_preserving_candidate(
             }
             if output_benefit.is_none() {
                 source.output_catalog_columns.clear();
+            }
+            if source.ordered_catalog_columns.is_empty() && source.output_catalog_columns.is_empty()
+            {
+                reject::<()>(reasons, Guard::TopNNoBenefit);
             }
             source.benefit =
                 ordered_benefit.unwrap_or_default() + output_benefit.unwrap_or_default();

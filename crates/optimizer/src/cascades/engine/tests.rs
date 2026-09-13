@@ -1954,6 +1954,67 @@ fn rule_work_profile_is_opt_in_for_diagnostic_cohorts() {
 }
 
 #[test]
+fn rejection_guards_are_diagnostic_only_and_exclude_successful_proof_branches() {
+    use crate::transformation_rejection::{reject, TransformationRejectionGuard as Guard};
+    struct WitnessRule {
+        emit: bool,
+    }
+    impl TransformationRule for WitnessRule {
+        fn id(&self) -> RuleId {
+            RuleId(8)
+        }
+        fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
+            expr.key.operator == Fingerprint(10)
+        }
+        fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+            self.matches_root(expr)
+        }
+        fn apply(
+            &self,
+            expr: LogicalExprId,
+            ctx: &mut TransformContext<'_>,
+        ) -> Result<Box<[EquivalentExpression]>> {
+            reject::<()>(&mut ctx.rejection_reasons, Guard::SelectiveRowIdPath);
+            reject::<()>(&mut ctx.rejection_reasons, Guard::SelectiveRowIdPath);
+            if self.emit {
+                DuplicateEquivalent.apply(expr, ctx)
+            } else {
+                Ok(Box::new([]))
+            }
+        }
+    }
+    for diagnostic in [false, true] {
+        for emit in [false, true] {
+            let mut budget = super::super::budget::SearchBudget::default();
+            budget.disable_transformation(RuleId(5));
+            let (mut engine, group, goal) = engine_with_budget(budget);
+            engine.set_rule_work_profile_enabled(diagnostic);
+            engine
+                .registry
+                .register_transformation(WitnessRule { emit })
+                .unwrap();
+            let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+            assert_eq!(winner.physical_fingerprint, Fingerprint(10));
+            if !diagnostic {
+                assert!(engine.rule_work_profile().is_empty());
+                continue;
+            }
+            let profile = &engine.rule_work_profile()[&RuleId(8)];
+            let count = |reason| {
+                profile
+                    .rejection_guards
+                    .iter()
+                    .find(|(guard, _)| *guard == reason)
+                    .unwrap()
+                    .1
+            };
+            assert_eq!(count(Guard::SelectiveRowIdPath), u64::from(!emit));
+            assert_eq!(count(Guard::NoOutput), u64::from(!emit));
+        }
+    }
+}
+
+#[test]
 fn diagnostic_search_checkpoints_keep_exact_goal_and_candidate_quality() {
     let (mut engine, group, goal) = engine(8);
     engine.set_rule_work_profile_enabled(true);

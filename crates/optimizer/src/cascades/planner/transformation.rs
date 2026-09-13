@@ -513,6 +513,7 @@ impl TransformationRule for PlannerTransformationRule {
                 self.budget_class().work_dimension(),
             )?
             else {
+                crate::transformation_rejection::reject::<()>(&mut ctx.rejection_reasons, crate::transformation_rejection::TransformationRejectionGuard::BoundaryUnavailable);
                 return Ok(Box::new([]));
             };
             facts
@@ -776,6 +777,7 @@ impl TransformationRule for PlannerTransformationRule {
                     plan,
                     source_stats.as_ref(),
                     &environment,
+                    &mut ctx.rejection_reasons,
                 )?
             }
         } else {
@@ -3449,6 +3451,7 @@ fn rewrite_planner_expressions(
     plan: OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     environment: &PlannerRuleEnvironment,
+    rejection_reasons: &mut Option<crate::transformation_rejection::RejectionReasons>,
 ) -> Result<Vec<OwnedLogicalPlan>> {
     if matches!(transformation, PlannerTransformation::JoinRegionEnumeration) {
         return crate::join_order::optimizer::JoinOrderOptimizer::new(
@@ -3462,11 +3465,15 @@ fn rewrite_planner_expressions(
             &environment.bind_context,
         );
     }
-    Ok(
-        rewrite_planner_expression(transformation, plan, column_stats, environment)?
-            .into_iter()
-            .collect(),
-    )
+    Ok(rewrite_planner_expression(
+        transformation,
+        plan,
+        column_stats,
+        environment,
+        rejection_reasons,
+    )?
+    .into_iter()
+    .collect())
 }
 
 fn rewrite_planner_expression(
@@ -3474,6 +3481,7 @@ fn rewrite_planner_expression(
     plan: OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     environment: &PlannerRuleEnvironment,
+    rejection_reasons: &mut Option<crate::transformation_rejection::RejectionReasons>,
 ) -> Result<Option<OwnedLogicalPlan>> {
     let rewritten = match transformation {
         PlannerTransformation::PredicateTransfer => FilterPushdown::new().rewrite_plan(plan),
@@ -3583,10 +3591,17 @@ fn rewrite_planner_expression(
         }
         PlannerTransformation::LatePayloadFetch => {
             let (plan, prefix_changed) = late_payload::rewrite_matched_prefix_node(plan)?;
-            let (plan, payload_changed) = late_payload::rewrite_node(
+            if !prefix_changed {
+                crate::transformation_rejection::reject::<()>(
+                    rejection_reasons,
+                    crate::transformation_rejection::TransformationRejectionGuard::PrefixNoWitness,
+                );
+            }
+            let (plan, payload_changed) = late_payload::rewrite_node_profiled(
                 plan,
                 &environment.bind_context,
                 &environment.cost_model,
+                rejection_reasons,
             )?;
             if !prefix_changed && !payload_changed {
                 return Ok(None);

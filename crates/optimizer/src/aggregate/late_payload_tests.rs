@@ -26,6 +26,61 @@ const AGGREGATE: usize = 21;
 const GROUPINGS: usize = 22;
 const OUTPUT: usize = 30;
 
+#[test]
+fn rejection_guards_observe_actual_late_payload_proofs_without_changing_results() {
+    use crate::transformation_rejection::{
+        RejectionReasons, TransformationRejectionCounts, TransformationRejectionGuard as Guard,
+    };
+    let mut no_reduction = selective_projection_candidate(GetColumnSource::Stored { column_id: 1 });
+    let LogicalOperator::Projection(output) = &mut no_reduction.operator else {
+        unreachable!()
+    };
+    output.child.stats.estimated_cardinality =
+        Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    let cases = [
+        (
+            selective_join_projection_candidate(JoinType::Inner, true),
+            Guard::SelectiveJoinLocality,
+        ),
+        (no_reduction, Guard::SelectiveNoReduction),
+        (
+            selective_projection_candidate(GetColumnSource::MatchedUtf8Prefix {
+                source_column: 1,
+                byte_width: 2,
+            }),
+            Guard::SelectiveInvalidColumn,
+        ),
+    ];
+    for (plan, expected) in cases {
+        let original = format!("{plan:?}");
+        let mut reasons = Some(RejectionReasons::default());
+        let (observed, changed) = super::late_payload::rewrite_node_profiled(
+            plan,
+            &BindContext::new(),
+            &CostModel::default(),
+            &mut reasons,
+        )
+        .unwrap();
+        assert_eq!(format!("{observed:?}"), original);
+        let (normal, normal_changed) =
+            super::late_payload::rewrite_node(observed, &BindContext::new(), &CostModel::default())
+                .unwrap();
+        assert!(!changed);
+        assert_eq!(changed, normal_changed);
+        assert_eq!(original, format!("{normal:?}"));
+        let mut counts = TransformationRejectionCounts::default();
+        counts.record(reasons.unwrap());
+        assert_eq!(
+            counts
+                .iter()
+                .find(|(guard, _)| *guard == expected)
+                .unwrap()
+                .1,
+            1
+        );
+    }
+}
+
 fn column(table: usize, index: usize, ty: LogicalType) -> Expression {
     Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(table, index), ty).into())
 }

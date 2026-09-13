@@ -730,6 +730,8 @@ type BindingApplications = BTreeMap<(TransformationTaskId, Fingerprint), Vec<Bin
 /// not imply parallel width or a completed search frontier.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuleWorkProfile {
+    /// Guard witnesses for rejected bindings; not mutually exclusive.
+    pub rejection_guards: crate::transformation_rejection::TransformationRejectionCounts,
     /// Transformation tasks that reached the matcher.
     pub discovered: u64,
     /// Exact bindings returned by the matcher.
@@ -4809,6 +4811,9 @@ impl CascadesEngine {
                         .is_some_and(|rule| rule.quality_dependency().is_some());
                 let task_lifecycle_started_at = self.profile_started_at;
                 let mut context = TransformContext::new(&mut self.memo, group);
+                context.rejection_reasons = self
+                    .collect_rule_work_profile
+                    .then(crate::transformation_rejection::RejectionReasons::default);
                 let apply_started = Instant::now();
                 let apply_allocated = paro_common::allocator::thread_allocated_bytes();
                 let outputs_result = {
@@ -4883,6 +4888,13 @@ impl CascadesEngine {
                     Ok(outputs) => outputs,
                     Err(error) => {
                         if self.collect_rule_work_profile {
+                            let mut reasons = context.rejection_reasons.unwrap_or_default();
+                            reasons.record(crate::transformation_rejection::TransformationRejectionGuard::ApplicationError);
+                            self.rule_work_profile
+                                .entry(rule)
+                                .or_default()
+                                .rejection_guards
+                                .record(reasons);
                             self.rule_work_profile.entry(rule).or_default().rejected = self
                                 .rule_work_profile
                                 .get(&rule)
@@ -4911,6 +4923,15 @@ impl CascadesEngine {
                 };
                 if outputs.is_empty() {
                     if self.collect_rule_work_profile {
+                        let mut reasons = context.rejection_reasons.unwrap_or_default();
+                        reasons.record(
+                            crate::transformation_rejection::TransformationRejectionGuard::NoOutput,
+                        );
+                        self.rule_work_profile
+                            .entry(rule)
+                            .or_default()
+                            .rejection_guards
+                            .record(reasons);
                         self.rule_work_profile.entry(rule).or_default().rejected = self
                             .rule_work_profile
                             .get(&rule)
@@ -4946,6 +4967,14 @@ impl CascadesEngine {
                 }
                 if outputs.len() > output_events.len() {
                     if self.collect_rule_work_profile {
+                        let mut reasons =
+                            crate::transformation_rejection::RejectionReasons::default();
+                        reasons.record(crate::transformation_rejection::TransformationRejectionGuard::OutputContract);
+                        self.rule_work_profile
+                            .entry(rule)
+                            .or_default()
+                            .rejection_guards
+                            .record(reasons);
                         self.rule_work_profile.entry(rule).or_default().rejected = self
                             .rule_work_profile
                             .get(&rule)
@@ -5080,6 +5109,14 @@ impl CascadesEngine {
                     Ok(result) => result,
                     Err(error) => {
                         if self.collect_rule_work_profile {
+                            let mut reasons =
+                                crate::transformation_rejection::RejectionReasons::default();
+                            reasons.record(crate::transformation_rejection::TransformationRejectionGuard::PublicationError);
+                            self.rule_work_profile
+                                .entry(rule)
+                                .or_default()
+                                .rejection_guards
+                                .record(reasons);
                             self.rule_work_profile.entry(rule).or_default().rejected = self
                                 .rule_work_profile
                                 .get(&rule)

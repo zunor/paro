@@ -10,6 +10,7 @@ pub mod optimizer;
 pub mod physical;
 pub mod profiler;
 pub mod statement;
+pub mod transformation_rejection;
 pub(crate) mod verify;
 
 pub mod aggregate;

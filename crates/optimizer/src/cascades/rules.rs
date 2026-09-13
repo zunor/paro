@@ -400,6 +400,7 @@ pub struct TransformContext<'a> {
     sidecar_rollbacks: Vec<TransformationRollback>,
     fact_reads: BTreeMap<GroupId, PatternRead>,
     fact_value_fingerprint: Option<Fingerprint>,
+    pub(crate) rejection_reasons: Option<crate::transformation_rejection::RejectionReasons>,
 }
 
 impl<'a> TransformContext<'a> {
@@ -411,6 +412,7 @@ impl<'a> TransformContext<'a> {
             sidecar_rollbacks: Vec::new(),
             fact_reads: BTreeMap::new(),
             fact_value_fingerprint: None,
+            rejection_reasons: None,
         }
     }
 

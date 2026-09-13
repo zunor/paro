@@ -1101,6 +1101,12 @@ impl Optimizer {
                 let rule_name = crate::cascades::rules::transformation_rule_name(*rule)
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("unknown_rule_{}", rule.0));
+                for (guard, count) in profile.rejection_guards.iter() {
+                    if count != 0 {
+                        let event = format!("rule.{rule_name}.rejection_guard.{}", guard.name());
+                        trace.record_value("optimizer", &event, count);
+                    }
+                }
                 for (phase, count) in [
                     ("discovered", profile.discovered),
                     ("matched", profile.matched),
