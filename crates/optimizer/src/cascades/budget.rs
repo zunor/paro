@@ -730,6 +730,32 @@ mod tests {
     }
 
     #[test]
+    fn optional_combination_prefix_is_not_whole_expression_atomic_admission() {
+        // Mandatory baseline work is outside this optional credit. Replacing
+        // two tuple events with one expression event cannot preserve admission
+        // at the budget boundary, even when both tuples have frozen inputs.
+        let mut budget = SearchBudget::default();
+        budget.max_child_frontier_combinations_per_group = 1;
+        let mut tuples = SearchLedger::new(budget.clone());
+        let mut batch = SearchLedger::new(budget);
+        let dimension = BudgetDimension::ChildFrontierCombination;
+        assert_eq!(
+            tuples.admit_optional(dimension, Fingerprint(1)),
+            BudgetDecision::Allowed
+        );
+        assert_eq!(
+            tuples.admit_optional(dimension, Fingerprint(2)),
+            BudgetDecision::Exhausted
+        );
+        assert_eq!(
+            batch.admit_optional_units(dimension, Fingerprint(3), 2),
+            BudgetDecision::Exhausted
+        );
+        assert_eq!(tuples.consumed(dimension), 1);
+        assert_eq!(batch.consumed(dimension), 0);
+    }
+
+    #[test]
     fn batch_admission_is_atomic_and_idempotent() {
         let mut budget = SearchBudget::default();
         budget.max_rule_work_units_per_group = 4;
