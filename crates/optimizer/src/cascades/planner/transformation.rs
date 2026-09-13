@@ -2400,13 +2400,20 @@ fn try_native_input_materialization(
     if !changed || !rejected.is_empty() {
         return Ok(None);
     }
+    // The incremental layout vector is the authoritative layout for the
+    // rewritten root.  Check the unchanged output contract before compaction;
+    // calling `NativeShell::root_layout` here would walk the whole shell a
+    // second time solely to rediscover the value we already maintained.
+    if layouts
+        .get(root)
+        .is_none_or(|layout| *layout != original_root_layout)
+    {
+        return Ok(None);
+    }
     let shell = compact_native_shell(NativeShell {
         nodes: nodes.into_boxed_slice(),
         root,
     })?;
-    if shell.root_layout()? != original_root_layout {
-        return Ok(None);
-    }
     Ok(Some(shell))
 }
 
