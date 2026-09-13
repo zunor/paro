@@ -1,0 +1,170 @@
+[
+  {
+    "source": "/private/tmp/paro-ub-prefix-c0-run.log",
+    "archive": "paro-ub-prefix-c0-run.log.gz",
+    "sha256": "98a6f53ad9d2806a2134029b136924277dfa00ca719cb53c0eef3e1baab814fb",
+    "gzip_sha256": "aac6e53a5ed50a1a921a3ad0a99ff179f28c2eac0eb5dc74b39f54601e5c8d12"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c0.json",
+    "archive": "paro-ub-prefix-c0.json.gz",
+    "sha256": "07e40e10d95ee0a8e930213743e11c154414427f52732bd64f545541b89ea1ff",
+    "gzip_sha256": "685047ac9c317fd135c02d74e000a29627324f1eaf320629d7c7e43a3f5ddb11"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c0.q11.block000.parod.log",
+    "archive": "paro-ub-prefix-c0.q11.block000.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c0.q11.block001.parod.log",
+    "archive": "paro-ub-prefix-c0.q11.block001.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c0.q11.diagnostic000.parod.log",
+    "archive": "paro-ub-prefix-c0.q11.diagnostic000.parod.log.gz",
+    "sha256": "214634d5d244992f801ebe9938584140e26066ad3d8b9e1d074d3ada8dbd38c2",
+    "gzip_sha256": "eacb574dc2962a4fcba55475859941073aae7c7327109cd3ad81c7771fd69d02"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c0.q11.oracle.parod.log",
+    "archive": "paro-ub-prefix-c0.q11.oracle.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c1-run.log",
+    "archive": "paro-ub-prefix-c1-run.log.gz",
+    "sha256": "6b5ec0afea0adb506f75ab7c564bfaf36bb330417d1a1706144fa3466d32e816",
+    "gzip_sha256": "85165d86fdd5c6560201a2623c57afbb36a14664832bcc1d09fc771c8f36e0ca"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c1.json",
+    "archive": "paro-ub-prefix-c1.json.gz",
+    "sha256": "461c567c9c3a338cc776fd73d83dda210a56197fa0efe77e15bce908341f1483",
+    "gzip_sha256": "028223d6efda84a42554b786e6ab8d966b70e4ceb5ff4ecf90fed3e52f21f171"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c1.q11.block000.parod.log",
+    "archive": "paro-ub-prefix-c1.q11.block000.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c1.q11.block001.parod.log",
+    "archive": "paro-ub-prefix-c1.q11.block001.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c1.q11.diagnostic000.parod.log",
+    "archive": "paro-ub-prefix-c1.q11.diagnostic000.parod.log.gz",
+    "sha256": "de7c2c25077b78f936b352702b6c402d35b6966b5ca2c60a660a4422f118e8a5",
+    "gzip_sha256": "4e7b4892c9317b9cfe4d8c6184c856d57f5e6f5346b7f929ef703fed408b765f"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-c1.q11.oracle.parod.log",
+    "archive": "paro-ub-prefix-c1.q11.oracle.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-clean-tests.log",
+    "archive": "paro-ub-prefix-clean-tests.log.gz",
+    "sha256": "7cf92e766ebc89a859ebaa5d36dc2cb33bf28b429ccac8c97208d38981427000",
+    "gzip_sha256": "2c8c9a623eefef3fd9e9f564a0cb0e24a8208c73ed781290ecb877cc5fc00ddc"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p0-run.log",
+    "archive": "paro-ub-prefix-p0-run.log.gz",
+    "sha256": "04602d5e22658c1e8677152ea579333a3e04fb630d06c81da3f92a18bb987ad4",
+    "gzip_sha256": "01ee78b1e66c2ac9c990df17e96a9c746bc9b788b4c776bde28a97a2d1c93856"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p0.json",
+    "archive": "paro-ub-prefix-p0.json.gz",
+    "sha256": "3f039ac7dce7d48cf74093b48215ce52c9ebace9e18105b2fe84e5ead6b6d2e7",
+    "gzip_sha256": "c0fb95ff668fffc854702b572c2091d06dd242cea1b87570366df0b829719189"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p0.q11.block000.parod.log",
+    "archive": "paro-ub-prefix-p0.q11.block000.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p0.q11.block001.parod.log",
+    "archive": "paro-ub-prefix-p0.q11.block001.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p0.q11.diagnostic000.parod.log",
+    "archive": "paro-ub-prefix-p0.q11.diagnostic000.parod.log.gz",
+    "sha256": "66ac05b969ba95420b0bb54948d0844e58c064e01bfb5fcf893b17142b02c5a4",
+    "gzip_sha256": "3531922c4b353318d15b54076bbe40253ef9d43deb8c7a724ff9a56ed9551654"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p0.q11.oracle.parod.log",
+    "archive": "paro-ub-prefix-p0.q11.oracle.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p1-run.log",
+    "archive": "paro-ub-prefix-p1-run.log.gz",
+    "sha256": "07fa1f6d979c2139be6fdbcd55a9469a877a37f38c2fad96f83500d41a482950",
+    "gzip_sha256": "66eeaf7bc840e85e500789978068d8bd3f1afb2b22d7b1ceac0d3444bce09405"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p1.json",
+    "archive": "paro-ub-prefix-p1.json.gz",
+    "sha256": "2eee8cca5e79a3a98f6f3beca40e7697f78a44e4802b07c9cc940619dc6bb62c",
+    "gzip_sha256": "f65a4c209837bc55a7c590608b3bb10f9eb4629330d8edacdc6de965590a933d"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p1.q11.block000.parod.log",
+    "archive": "paro-ub-prefix-p1.q11.block000.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p1.q11.block001.parod.log",
+    "archive": "paro-ub-prefix-p1.q11.block001.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p1.q11.diagnostic000.parod.log",
+    "archive": "paro-ub-prefix-p1.q11.diagnostic000.parod.log.gz",
+    "sha256": "061820b6f09bf83acce6fd4136f5d20e56579173351ff9a8f95dddf7030e72a6",
+    "gzip_sha256": "61fac447345a2b4abc275b2996f50355e33054e054fff3ce3c8a4669f94542c8"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-p1.q11.oracle.parod.log",
+    "archive": "paro-ub-prefix-p1.q11.oracle.parod.log.gz",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-positions.log",
+    "archive": "paro-ub-prefix-positions.log.gz",
+    "sha256": "ba695bec34db72d35ed22c141078b42ca58c36c8c6e4f642212949fc63db1a2b",
+    "gzip_sha256": "57246e7ad5852e11c985e89ea24948c61a93d16a1e11993faf9206844d24593d"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-result.json",
+    "archive": "paro-ub-prefix-result.json.gz",
+    "sha256": "9841dd25aad3fd3cd0cceddb822b6c73969f1326660e8372f027383494b1be9c",
+    "gzip_sha256": "5306793639069834b5bb38b9f776fce525ec5170cbb266fe888e62c29592d5e3"
+  },
+  {
+    "source": "/private/tmp/paro-ub-prefix-tests.log",
+    "archive": "paro-ub-prefix-tests.log.gz",
+    "sha256": "593ba6c5bb848e22abed3450c8b31511cf242c7865a1ce2c9c9838a351875f48",
+    "gzip_sha256": "46d0ac4f49be834b78751d8d6def99c9e465ad07a30d53381f0c3f11a9e7f987"
+  }
+]
