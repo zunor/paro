@@ -78,3 +78,16 @@ one separate diagnostic. Compare exact N/choices/fingerprints and optimizer
 overhead; >10% repeatable perturbation invalidates attribution. No production
 policy/budget/model changes. If neither measured bucket dominates, do not start
 P3-A/B simply because one was proposed. Report residual as unattributed.
+
+## SQL identity correction before acceptance
+
+The initial off0/on0/off1/w1/w2/w4/w8/winf and p2probe commands used the upstream
+DuckDB 3008-byte SQL (aliases and `2001+1` spelling), not the exact historical
+2418-byte archive. Results and complete-width fingerprints matched, but corpus
+hash differed. Retain all these reports as exploratory, NOT acceptance data.
+Repeat with `20260911/incremental-pricing-v1/11.sql`, already committed in this
+repository; require historical corpus hash
+`a1f151c2d5617427a9394f1353d47478682e4d0b79bc16cddcd8be4de438d503`.
+Corrected arm names have suffix `-exact`. Same sample counts, envelope, timing
+boundaries and all other gates. This corrects the input identity, not results
+or stopping rules. No valid slow sample is removed.
