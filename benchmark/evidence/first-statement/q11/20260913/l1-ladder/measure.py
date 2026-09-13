@@ -322,7 +322,7 @@ def main():
     args = arguments()
     args.runtime_repo, args.output_dir = args.runtime_repo.resolve(), args.output_dir.resolve()
     rt = runtime(args)
-    for protected in (args.runtime_repo, Path(__file__).resolve().parents[7],
+    for protected in (args.runtime_repo, Path(__file__).resolve().parents[6],
                       args.server_data_dir.resolve(), args.dataset_source_dir.resolve()):
         require(not args.output_dir.is_relative_to(protected), "Output must be outside repos and input directories")
     require(not args.output_dir.exists(), "Refuse to overwrite or resume a campaign directory")
