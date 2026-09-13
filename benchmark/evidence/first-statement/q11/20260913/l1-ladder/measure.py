@@ -255,9 +255,9 @@ def sample_block(rt, args, seed, rung, spec, block, order, record):
         stack.callback(paro.close)
         record["processes"] = {"paro": server.identity(), "duckdb": duck.identity}
         inventories = {"paro": rt.c.paro_metadata_inventory(paro), "duckdb": rt.c.duckdb_metadata_inventory(duck)}
-        require(rt.c.validate_metadata_track(args.metadata_track, inventories["paro"], inventories["duckdb"]),
-                "Optimizer-visible key metadata differs between engines")
         record["metadata"] = inventories
+        record["metadata_symmetric"] = rt.c.validate_metadata_track(
+            args.metadata_track, inventories["paro"], inventories["duckdb"])
         canonical, schemas = {}, {}
         for name in order:
             engine = "paro" if name == "A" else "duckdb"

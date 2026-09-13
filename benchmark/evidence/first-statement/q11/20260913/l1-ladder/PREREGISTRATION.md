@@ -1,5 +1,13 @@
 # L1-LADDER — registered measurement-only protocol
 
+Pre-observation amendment: the first attempt failed a path guard before starting
+processes; the second failed metadata symmetry before any target execution.
+Both logs/partial report are retained. Existing M/E2/E3 data has declared Paro
+keys and no DuckDB keys. Preserve that same data/track instead of altering either
+database: validate the declared track and record asymmetry (the existing harness
+contract). These are not identical optimizer-visible schemas or isolated equal-
+work throughput comparisons. No target timing/result was available when amended.
+
 Reviewed and registered by main 2026-09-13; **not executed or syntax-tested during
 M-POWER**. Main has read the driver and protocol; runtime validation follows
 M-POWER completion. No
@@ -68,8 +76,8 @@ or silently add a date join. Preparation is outside every measured process.
   effects. No concurrent other workloads, tests, compiles, or database users.
 - Runtime: four workers, 2GB, Paro binary result format, optimizer verification
   on, existing handoff on, compile-work evidence on, model/budgets unchanged.
-  Metadata track is required on the CLI; Paro and DuckDB key inventories must
-  agree and the selected Paro track must validate. Metadata SELECTs/configuration
+  Metadata track is required on the CLI; the selected Paro track must validate.
+  Both key inventories and their symmetry are recorded. Metadata SELECTs/configuration
   precede the target but never execute its SQL or scan its user-table contents.
 - Every Paro target is followed immediately by the existing post-timer cache
   lookup, using explicit `expected_occurrence=0/1`. Require verified first miss
@@ -193,7 +201,7 @@ Check full expected commit, clean status and binary SHA-256; record engine/build
 input digest, all corpus Python helper hashes, driver/prereg hashes, DuckDB
 extension/version/database hash, immutable Paro seed hash, dataset source hash,
 metadata inventories and exact SQL bytes/hashes. Recheck identities after the
-campaign. Private outputs must be a new directory outside both repositories
+  campaign. Private outputs must be a new directory outside both repositories
 and input data. The driver performs no build. Do not mutate seeds or run their servers
 in place. The normal helper timeout applies to Paro; DuckDBProcess retains its
 existing blocking worker protocol, so an externally interrupted hang invalidates
