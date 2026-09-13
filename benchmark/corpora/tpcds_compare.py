@@ -73,6 +73,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-source-dir", type=Path, required=True)
     parser.add_argument("--query-dir", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--pre-touch-sql", type=Path, help=(
+        "One read-only SELECT executed and fully drained before the target in each "
+        "engine process. Diagnostic only: target timing is not normal C1."
+    ))
     parser.add_argument("--start", type=int, default=1)
     parser.add_argument("--end", type=int, default=99)
     parser.add_argument("--warmups-per-process", type=int, default=1)
@@ -142,6 +146,54 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def read_pre_touch(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    query = path.read_text(encoding="utf-8")
+    statements = duckdb.extract_statements(query)
+    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+        raise ValueError("pre-touch requires exactly one read-only SELECT")
+    return {"path": str(path.resolve()), "sha256": content_digest(path),
+            "sql": query, "query_fingerprint": statement_fingerprint(query)}
+
+
+def require_first_target_miss(evidence: dict[str, Any], query: str) -> None:
+    if (evidence.get("status") != "verified"
+            or evidence.get("cache_hit") is not False
+            or evidence.get("occurrence") != 0
+            or evidence.get("query_fingerprint") != statement_fingerprint(query)):
+        raise AssertionError("pre-touch invalidated target first-occurrence cache miss")
+
+
+def collect_pre_touch(paro: Any, duck: Any, spec: dict[str, Any] | None,
+                      target: str, binary: bool) -> dict[str, Any] | None:
+    if spec is None:
+        return None
+    if spec["query_fingerprint"] == statement_fingerprint(target):
+        raise ValueError("pre-touch must not share the target fingerprint")
+    started = time.perf_counter_ns()
+    records = {}
+    schemas = {}
+    normalized = {}
+    for engine in ("paro", "duckdb") if duck is not None else ("paro",):
+        rows, schema, elapsed = (timed_run_paro(paro, spec["sql"], binary)
+                                 if engine == "paro" else duck.execute(spec["sql"]))
+        schemas[engine] = schema
+        normalized[engine] = canonicalize_rows(rows, schema)
+        records[engine] = {"execute_fetch_ms": elapsed, "rows": len(rows),
+                           "schema": schema_report(schema),
+                           "result_sha256": multiset_digest(normalized[engine])}
+        if engine == "paro":
+            records[engine]["cache_evidence"] = collect_statement_cache_evidence(paro, spec["sql"])
+    if duck is not None:
+        assert_compatible_schema(schemas["paro"], schemas["duckdb"])
+        assert_same_multiset(normalized["paro"], normalized["duckdb"])
+    return {"query_fingerprint": spec["query_fingerprint"], "engines": records,
+            "preparation_wall_ms": (time.perf_counter_ns()-started)/1e6,
+            "includes_evidence_and_validation": True, "excluded_from_target_timer": True,
+            "target_is_normal_c1": False}
 
 
 def extension_digest(module: Any) -> dict[str, str | None]:
@@ -535,6 +587,9 @@ def verify_measurement_inputs(repo_root: Path, binary: Path,
         "Paro seed": tree_digest(args.server_data_dir) == report["dataset"]["paro_data_sha256"],
         "DuckDB data": content_digest(args.duckdb_database) == report["dataset"]["duckdb_sha256"],
     }
+    if report.get("pre_touch"):
+        spec = report["pre_touch"]
+        checks["pre-touch SQL"] = content_digest(Path(spec["path"])) == spec["sha256"]
     changed = [name for name, current in checks.items() if not current]
     if changed:
         raise RuntimeError(f"measurement inputs changed: {', '.join(changed)}")
@@ -560,6 +615,7 @@ def main() -> int:
         raise SystemExit("bootstrap-samples must be at least 100")
 
     repo_root = Path(__file__).resolve().parents[2]
+    pre_touch = read_pre_touch(args.pre_touch_sql)
     server_binary, build = build_benchmark_server(repo_root, args.build_jobs)
     seed = ImmutableDataSeed.capture(args.server_data_dir)
     harness_files = [
@@ -570,6 +626,7 @@ def main() -> int:
     ]
     report: dict[str, Any] = {
         "schema_version": 8,
+        "pre_touch": pre_touch,
         "corpus": "TPC-DS",
         "scale_factor": 1,
         "query_range": [args.start, args.end],
@@ -610,7 +667,7 @@ def main() -> int:
             "execution_dop": args.threads,
             "cohorts": {
                 "normal": {
-                    "purpose": "primary C1/W",
+                    "purpose": "diagnostic pre-touched target/W" if pre_touch else "primary C1/W",
                     "statement_trace": False,
                     "statement_cache_evidence": True,
                     "allocation_profile": False,
@@ -655,8 +712,8 @@ def main() -> int:
                 "C1": {
                     "name": "cold_first_statement",
                     "timer": "client perf_counter_ns around execute/fetch/native result metadata",
-                    "cohort": "normal_trace_off",
-                    "primary_gate": True,
+                    "cohort": "pre_touch_diagnostic_trace_off" if pre_touch else "normal_trace_off",
+                    "primary_gate": pre_touch is None,
                 },
                 "C2": {
                     "name": "first_noncompile_path",
@@ -897,6 +954,8 @@ def main() -> int:
                         if duckdb_metadata_inventory(duck_process) != duckdb_inventory:
                             raise AssertionError("DuckDB metadata changed between process blocks")
 
+                        preparation = collect_pre_touch(paro, duck_process, pre_touch, query, binary_result)
+
                         cold_order = ["paro", "duckdb"]
                         if rng.getrandbits(1):
                             cold_order.reverse()
@@ -919,6 +978,8 @@ def main() -> int:
                                 cold_cache_evidence = collect_statement_cache_evidence(
                                     paro, query
                                 )
+                                if pre_touch:
+                                    require_first_target_miss(cold_cache_evidence, query)
 
                         # The measured cold statement is also the first warmup.
                         # Additional warmups are deliberately outside both timed scopes.
@@ -941,7 +1002,8 @@ def main() -> int:
                                 )
                         block = {
                             "block": block_number,
-                            "cohort": "normal",
+                            "cohort": "pre_touch_diagnostic" if pre_touch else "normal",
+                            "pre_touch": preparation,
                             "cold_order": cold_order,
                             "cold_statement_ms": cold_statement_ms,
                             "cold_miss_evidence": cold_cache_evidence,
@@ -1024,12 +1086,17 @@ def main() -> int:
                     diagnostic_server_identity = diagnostic_server.identity()
                     diagnostic_paro = open_paro_connection(args)
                     try:
+                        diagnostic_preparation = collect_pre_touch(
+                            diagnostic_paro, None, pre_touch, query, binary_result)
                         diagnostic_rows, diagnostic_schema, diagnostic_ms = timed_run_paro(
                             diagnostic_paro, query, binary_result
                         )
                         validate_sample(
                             "diagnostic Paro", diagnostic_rows, diagnostic_schema
                         )
+                        if pre_touch:
+                            require_first_target_miss(
+                                collect_statement_cache_evidence(diagnostic_paro, query), query)
                     finally:
                         diagnostic_paro.close()
                 diagnostic_traces = parse_statement_trace_log(diagnostic_log)
@@ -1051,6 +1118,7 @@ def main() -> int:
                 diagnostic_blocks.append({
                     "block": diagnostic_block_number,
                     "cohort": "diagnostic",
+                    "pre_touch": diagnostic_preparation,
                     "client_ms": round(diagnostic_ms, 6),
                     "paro_server": diagnostic_server_identity,
                     "statement_traces": diagnostic_traces,
@@ -1089,7 +1157,8 @@ def main() -> int:
                 <= statistics.median(cold_samples["duckdb"])
             )
             evidence_qualifies = (
-                metadata_symmetric
+                pre_touch is None
+                and metadata_symmetric
                 and cold_confidence_high <= 1
                 and c1_p50_not_slower
                 and trace_off_verified
@@ -1130,7 +1199,8 @@ def main() -> int:
                     "paro": timing_summary(cold_samples["paro"]),
                     "duckdb": timing_summary(cold_samples["duckdb"]),
                     "crossover": cold_crossover,
-                    "cohort": "normal_trace_off",
+                    "cohort": "pre_touch_diagnostic_trace_off" if pre_touch else "normal_trace_off",
+                    "primary_gate_eligible": pre_touch is None,
                     "trace_enabled": False,
                     "trace_off_verified": trace_off_verified,
                     "trace_query_fingerprint": statement_fingerprint(query),
@@ -1149,12 +1219,13 @@ def main() -> int:
                 warm_paro_over_duckdb=round(warm_ratio, 6),
                 faster_than_duckdb=evidence_qualifies,
                 evidence_qualification=(
-                    "qualified"
+                    "diagnostic pre-touch target is ineligible for C1/parity"
+                    if pre_touch else "qualified"
                     if evidence_qualifies
                     else "requires verified cold miss, C1 p50 non-regression and C1 CI upper bound at most one"
                 ),
                 evidence_status=("EvidenceValid" if cold_miss_verified else "EvidenceUncovered"),
-                regression_status="RegressionCompared",
+                regression_status="DiagnosticOnly" if pre_touch else "RegressionCompared",
                 milestone_status="MilestoneNotPassed",
                 model_status="ModelNotAdmitted",
             )
@@ -1173,7 +1244,7 @@ def main() -> int:
                 "hierarchical_confidence_interval_95"
             ]
             print(
-                f"TPC-DS {query_id}: C1 Paro {result['cold_statement']['paro']['median_ms']:.3f} ms, "
+                f"TPC-DS {query_id}: {'pre-touched target (NOT C1)' if pre_touch else 'C1'} Paro {result['cold_statement']['paro']['median_ms']:.3f} ms, "
                 f"DuckDB {result['cold_statement']['duckdb']['median_ms']:.3f} ms, "
                 f"ratio {result['paro_over_duckdb']:.3f}, "
                 f"95% CI [{c1_confidence[0]:.3f}, {c1_confidence[1]:.3f}]; "
