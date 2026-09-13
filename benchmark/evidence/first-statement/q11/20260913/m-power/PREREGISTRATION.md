@@ -27,13 +27,21 @@ Versions: clean6fce0fc0 control and clean c23ae52a T1 production; corpus harness
 files identical (`git diff 6fce0fc0 c23ae52a -- benchmark/corpora` empty).
 Original Q11, same seed/4 workers/2GB/model/budgets, handoff enabled, compile
 scalars on, E1 scalar and statement trace off in normal, separate diagnostic1
-and oracle each report.36 blocks/version in fixed chronological sequence:
-control9 → T1-9 → T1-9 → control9 → T1-9 → control9 → control9 → T1-9.
-This yields four matched adjacent nine-block batches with version order balanced.
+and oracle each report. Before sampling, independent review corrected odd report
+sizes:36 blocks/version in12 six-block reports, fixed chronological sequence
+C6 → T6 → T6 → C6 → C6 → T6 → T6 → C6 → C6 → T6 → T6 → C6.
+This yields six matched adjacent batches with version order balanced, and even
+report sizes also balance the C1 engine-first schedule.
 Warmup1/ABBA round1 within every block balances engine execution order; all slow
 samples retained. No stopping on significance or extra samples after the result.
 Pair corresponding block offsets within adjacent batches; use log(T1 W/control W)
 with one-sided t upper and lower, and whole-pair bootstrap sensitivity (10000).
+Report a second t interval on the six batch-mean contrasts to expose sensitivity
+to temporal clustering; NI is certified only if both upper bounds≤1.00. The
+block test assumes residual drift negligible within matched batches; this is
+not random allocation of72 independent treatments. N36 power is conditional P/D
+power only. The primary block-median statistic is recomputed from raw samples,
+not substituted by the harness's differently aggregated ratio field.
 Also report P/D W and C1 separately, p95 and all per-block observations. Building
 occurs outside sampling, no tests/builds/other benchmarks during measured blocks.
 
