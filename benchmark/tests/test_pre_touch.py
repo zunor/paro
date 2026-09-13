@@ -6,10 +6,34 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'corpora'))
 from benchmark_evidence import statement_fingerprint
-from tpcds_compare import read_pre_touch, require_first_target_miss, collect_pre_touch
+from tpcds_compare import (read_pre_touch, require_first_target_miss, collect_pre_touch,
+                           collect_statement_cache_evidence)
 
 
 class PreTouchTests(unittest.TestCase):
+    def test_explicit_second_occurrence_does_not_relax_first_miss_gate(self):
+        fp = statement_fingerprint('SELECT 1')
+        prefix = f'statement_plan_cache/{fp:016x}/'
+        cursor = Mock()
+        cursor.description = []
+        for name in ('name', 'kind', 'metric_value', 'metric_unit'):
+            col = Mock()
+            col.name = name
+            cursor.description.append(col)
+        cursor.fetchall.return_value = [(prefix+'0', 'evidence', 0, 'count'),
+                                       (prefix+'1', 'evidence', 1, 'count')]
+        connection = Mock()
+        connection.cursor.return_value.__enter__ = Mock(return_value=cursor)
+        connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        self.assertEqual(collect_statement_cache_evidence(connection, 'SELECT 1')['status'], 'uncovered')
+        evidence = collect_statement_cache_evidence(connection, 'SELECT 1', expected_occurrence=1)
+        self.assertEqual(evidence['occurrence'], 1)
+        self.assertTrue(evidence['cache_hit'])
+        with self.assertRaises(AssertionError):
+            require_first_target_miss(evidence, 'SELECT 1')
+        cursor.fetchall.return_value.append((prefix+'1', 'evidence', 1, 'count'))
+        self.assertEqual(collect_statement_cache_evidence(connection, 'SELECT 1', expected_occurrence=1)['status'], 'uncovered')
+
     def test_second_pre_touch_is_separate_and_validated(self):
         spec = dict(sql='SELECT 1', query_fingerprint=statement_fingerprint('SELECT 1'),
                     repetitions=2)

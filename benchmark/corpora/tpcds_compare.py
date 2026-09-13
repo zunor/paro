@@ -205,7 +205,7 @@ def collect_pre_touch(paro: Any, duck: Any, spec: dict[str, Any] | None,
                 "result_sha256": multiset_digest(warm_normalized)}
             if engine == "paro":
                 records[engine]["second_execution"]["cache_evidence"] = (
-                    collect_statement_cache_evidence(paro, spec["sql"]))
+                    collect_statement_cache_evidence(paro, spec["sql"], expected_occurrence=1))
     if duck is not None:
         assert_compatible_schema(schemas["paro"], schemas["duckdb"])
         assert_same_multiset(normalized["paro"], normalized["duckdb"])
@@ -417,7 +417,7 @@ def run_paro_raw(
 
 
 def collect_statement_cache_evidence(
-    connection: psycopg.Connection[Any], query: str
+    connection: psycopg.Connection[Any], query: str, *, expected_occurrence: int | None = None
 ) -> dict[str, Any]:
     """Read the lightweight miss side-channel after, never before, C1."""
     fingerprint = statement_fingerprint(query)
@@ -441,6 +441,8 @@ def collect_statement_cache_evidence(
             if str(row[kind_index]) == "evidence"
             and str(row[unit_index]) == "count"
             and str(row[name_index]).startswith(prefix)
+            and (expected_occurrence is None
+                 or str(row[name_index]) == f"{prefix}{expected_occurrence}")
         ]
         if len(matches) != 1:
             return {
