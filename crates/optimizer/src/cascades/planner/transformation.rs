@@ -547,14 +547,6 @@ impl TransformationRule for PlannerTransformationRule {
         // for their conservative native subsets. Keep the legacy owned-plan
         // path available for every shape that needs richer semantic handling.
         let mut native_domain_scopes = None;
-        // A single simple side-local comparison over two base relations is
-        // exactly the subset implemented by `try_native_predicate_transfer`.
-        // Unlike the broader native domain producer, this subset has no
-        // derived OR-domain, aggregate residual, or ownership alternative
-        // that the owned FilterPushdown path can discover from this binding.
-        // Keep the flag separate so a partial domain shell still retains its
-        // semantic peer below.
-        let mut native_predicate_direct_only = false;
         let direct_native = if matches!(
             self.transformation,
             PlannerTransformation::PredicateTransfer
@@ -588,14 +580,9 @@ impl TransformationRule for PlannerTransformationRule {
                         native_domain_scopes = Some(scopes);
                         vec![shell]
                     } else {
-                        let native = try_native_predicate_transfer(
-                            &binding.root,
-                            ctx.memo(),
-                            &state,
-                            &facts,
-                        )?;
-                        native_predicate_direct_only = native.is_some();
-                        native.into_iter().collect()
+                        try_native_predicate_transfer(&binding.root, ctx.memo(), &state, &facts)?
+                            .into_iter()
+                            .collect()
                     }
                 }
                 PlannerTransformation::JoinRegionEnumeration => {
@@ -668,11 +655,10 @@ impl TransformationRule for PlannerTransformationRule {
             // reorderable graph and emitted every bounded final plan.  Do not
             // first materialize the same binding as an OwnedLogicalPlan just
             // to convert it back into group references below.  The broad
-            // PredicateTransfer path may still be only a partial semantic
-            // subset; only its separately proven simple-comparison tranche
-            // suppresses the owned peer.
+            // Other native paths (notably PredicateTransfer) may be only a
+            // partial semantic subset, so they deliberately keep their owned
+            // peer.
             let native_direct_only = (native_domain_scopes.is_some()
-                || native_predicate_direct_only
                 || matches!(
                     self.transformation,
                     PlannerTransformation::JoinRegionEnumeration
@@ -4059,16 +4045,6 @@ fn native_predicate_transfer_may_apply(
     let LogicalOperator::Filter(filter) = operator else {
         return Ok(false);
     };
-    // `FilterPushdown` also derives additional OR-domain predicates and can
-    // normalize a compound filter. The native side-local producer is kept
-    // authoritative only for the one-comparison case where its output is the
-    // complete rewrite of this exact binding, so selecting it cannot discard
-    // a distinct semantic peer.
-    if filter.expressions.len() != 1
-        || !matches!(filter.expressions.first(), Some(Expression::Comparison(_)))
-    {
-        return Ok(false);
-    }
     if filter
         .expressions
         .iter()
