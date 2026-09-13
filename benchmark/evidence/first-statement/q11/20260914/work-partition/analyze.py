@@ -27,7 +27,8 @@ def analyze(report_path, ledger_path=None):
                     c1=b['cold_statement_ms'], warm=b['paro_ms'])
         if ledger_path:
             # Identical optimizer end/start Instants, integer microsecond sidecar.
-            matches = [r for r in ledger if r['total_ns'] // 1000 == work['optimizer_elapsed_us']]
+            matches = [r for r in ledger if r['pid'] == b['paro_server']['pid']
+                       and r['total_ns'] // 1000 == work['optimizer_elapsed_us']]
             assert len(matches) == 1, (work, len(matches))
             r = matches[0]
             assert r['success'] and r['total_ns'] == r['sum_ns'] == sum(x['exclusive_ns'] for x in r['buckets'])
@@ -39,6 +40,8 @@ def analyze(report_path, ledger_path=None):
     events = q['diagnostic_cohort']['process_blocks'][0]['target_statement_traces'][0]['events']
     values = {e['event']: e['value'] for e in events if e['value'] is not None}
     result = dict(source=d['source'], attestation=d['build_attestation'], blocks=blocks,
+                  cohort='diagnostic_partition_trace_off' if ledger_path else 'normal_trace_off',
+                  primary_c1_eligible=ledger_path is None,
                   optimizer_median_us=statistics.median(b['work']['optimizer_elapsed_us'] for b in blocks),
                   c1=q['cold_statement'], warm=q['paro'], warm_ratio=q['warm_paro_over_duckdb'],
                   diagnostic_counters={k: v for k, v in values.items() if 'count' in k or k.startswith('rule.')},
