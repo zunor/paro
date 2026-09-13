@@ -748,7 +748,10 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         expected_num_elements: u32,
         page_pointer: crate::rowset::page::PagePointer,
     ) -> Result<PageDecoderImpl> {
-        let _cold_work = paro_common::cold_work::WorkScope::new(paro_common::cold_work::Kind::Decoder, data.len());
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::Decoder,
+            data.len(),
+        );
         let mut decoder = match self.meta.encoding {
             EncodingType::Plain => {
                 if self.meta.field_type == crate::rowset::encoding::FieldType::Vector {
@@ -1094,6 +1097,10 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 access,
                 decoder.count() as usize,
             ) {
+                if matches!(access, DecodedPageAccess::Sequential) {
+                    decoder.stream_sequential();
+                    null_decoder.stream_sequential();
+                }
                 return Ok(());
             }
             let data_size = decoder.decoded_size()?;
@@ -1134,6 +1141,9 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             access,
             decoder.count() as usize,
         ) {
+            if matches!(access, DecodedPageAccess::Sequential) {
+                decoder.stream_sequential();
+            }
             return Ok(());
         }
         let decoded_size = decoder.decoded_size()?;
@@ -2356,6 +2366,95 @@ mod tests {
         assert!(batch_sizes.len() > 1);
         assert_eq!(batch_sizes.iter().sum::<usize>(), 100);
         assert_eq!(observed, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sequential_streaming_does_not_materialize_even_without_cache_admission() {
+        for nullable in [false, true] {
+            for cache_enabled in [false, true] {
+                let opts = ColumnWriterOptions::new(FieldType::Int, 0)
+                    .with_nullable(nullable)
+                    .with_encoding(EncodingType::BitShuffle)
+                    .with_compression(CompressionType::None);
+                let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+                let values: Vec<i32> = (0..257).map(|i| i - 128).collect();
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let mut null_bits = vec![0u8; values.len().div_ceil(8)];
+                for i in (0..values.len()).step_by(7) {
+                    null_bits[i / 8] |= 1 << (i % 8);
+                }
+                writer
+                    .append(&bytes, nullable.then_some(null_bits.as_slice()), 257)
+                    .unwrap();
+                let meta = writer.finish().unwrap();
+                let physical = writer.into_inner().into_inner();
+                let index = Arc::new(OrdinalIndexReader::new(
+                    vec![OrdinalIndexEntry {
+                        first_ordinal: 0,
+                        page_pointer: meta.data_page_pointer,
+                    }],
+                    257,
+                ));
+                let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+                let mut options = PageReaderOptions::default();
+                options.cache_decoded = cache_enabled;
+                options.decoded_admission_policy.sequential_materialization = false;
+                let reader = PageReader::new(
+                    PageReaderContext::new(1, 2, 3, 4),
+                    cache_enabled.then_some(cache.clone()),
+                    options,
+                );
+                // Two independent iterators verify cold and repeated sequential reads.
+                for _ in 0..2 {
+                    let mut iterator = ScalarColumnIterator::new(
+                        ColumnReaderMeta::from_writer_meta(&meta, FieldType::Int),
+                        Cursor::new(physical.clone()),
+                        ColumnReaderOptions::default().with_compression(CompressionType::None),
+                        reader.clone(),
+                        None,
+                        None,
+                        index.clone(),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    let mut offset = 0;
+                    loop {
+                        let (count, batch) = iterator.next_batch(31).unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        for row in 0..count {
+                            let is_null = nullable && (offset + row) % 7 == 0;
+                            assert_eq!(batch.nulls.as_ref().is_some_and(|n| n[row] != 0), is_null);
+                            if !is_null {
+                                assert_eq!(
+                                    i32::from_le_bytes(
+                                        batch.data[row * 4..row * 4 + 4].try_into().unwrap()
+                                    ),
+                                    values[offset + row]
+                                );
+                            }
+                        }
+                        assert!(!iterator
+                            .current_decoder
+                            .as_mut()
+                            .unwrap()
+                            .decoded_cache_decoder_mut()
+                            .unwrap()
+                            .is_materialized());
+                        if let Some(PageDecoderImpl::BitShuffle(nulls)) =
+                            iterator.current_null_decoder.as_ref()
+                        {
+                            assert!(!nulls.is_materialized());
+                        }
+                        offset += count;
+                    }
+                    assert_eq!(offset, 257);
+                    assert_eq!(cache.stats().decoded_entries, 0);
+                }
+            }
+        }
     }
 
     #[test]

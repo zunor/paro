@@ -7,7 +7,7 @@
 //! provides cache-aware page loading with optional decompressed caching.
 
 use std::io::{Read, Seek};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -49,6 +49,9 @@ const DEFAULT_DECODER_SEEK_WORK_UNITS: usize = 1024;
 /// `BITSHUFFLE_DECODE_GROUP_ROWS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedPageAdmissionPolicy {
+    /// Diagnostic intervention only. Sparse-gather admission and cache hits
+    /// remain unchanged; sequential reads use the codec's streaming path.
+    pub sequential_materialization: bool,
     min_analytical_selected_rows: usize,
     full_decode_rows_per_work_unit: usize,
     decoder_seek_work_units: usize,
@@ -69,6 +72,7 @@ impl DecodedPageAdmissionPolicy {
             ));
         }
         Ok(Self {
+            sequential_materialization: true,
             min_analytical_selected_rows,
             full_decode_rows_per_work_unit,
             decoder_seek_work_units,
@@ -79,6 +83,7 @@ impl DecodedPageAdmissionPolicy {
 impl Default for DecodedPageAdmissionPolicy {
     fn default() -> Self {
         Self {
+            sequential_materialization: true,
             min_analytical_selected_rows: 16,
             full_decode_rows_per_work_unit: DEFAULT_FULL_DECODE_ROWS_PER_WORK_UNIT,
             decoder_seek_work_units: DEFAULT_DECODER_SEEK_WORK_UNITS,
@@ -172,8 +177,14 @@ impl PageReader {
     pub fn new(
         context: PageReaderContext,
         cache: Option<Arc<PageCache>>,
-        options: PageReaderOptions,
+        mut options: PageReaderOptions,
     ) -> Self {
+        static STREAM_SEQUENTIAL: OnceLock<bool> = OnceLock::new();
+        if *STREAM_SEQUENTIAL.get_or_init(|| {
+            std::env::var("PARO_DIAGNOSTIC_STREAM_SEQUENTIAL").as_deref() == Ok("1")
+        }) {
+            options.decoded_admission_policy.sequential_materialization = false;
+        }
         Self {
             cache,
             context,
@@ -325,7 +336,7 @@ impl PageReader {
             .transpose()
     }
 
-    /// Sequential consumers necessarily materialize a logical page. A sparse
+    /// Sequential consumers normally materialize a logical page. A sparse
     /// gather is admitted immediately only when its page-local access shape is
     /// analytical and the full decode has bounded work amplification. Smaller
     /// point lookups must demonstrate reuse through the page-local probation
@@ -337,7 +348,11 @@ impl PageReader {
         decoded_rows: usize,
     ) -> bool {
         match access {
-            DecodedPageAccess::Sequential => true,
+            DecodedPageAccess::Sequential => {
+                self.options
+                    .decoded_admission_policy
+                    .sequential_materialization
+            }
             DecodedPageAccess::SparseGather {
                 selected_rows,
                 decoded_groups,

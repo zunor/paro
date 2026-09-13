@@ -251,6 +251,7 @@ pub struct BitShufflePageDecoder {
     cur_index: u32,
     /// Whether init() has been called
     parsed: bool,
+    stream_sequential: bool,
 }
 
 impl BitShufflePageDecoder {
@@ -269,6 +270,7 @@ impl BitShufflePageDecoder {
             block_elements: 0,
             cur_index: 0,
             parsed: false,
+            stream_sequential: false,
         }
     }
 
@@ -333,6 +335,7 @@ impl BitShufflePageDecoder {
             block_elements: BITSHUFFLE_BLOCK_ELEMENTS,
             cur_index: 0,
             parsed: true,
+            stream_sequential: false,
         })
     }
 
@@ -482,6 +485,19 @@ impl BitShufflePageDecoder {
             return Ok((0, Bytes::new()));
         }
 
+        if self.stream_sequential && self.decoded_data.is_none() {
+            let mut output = vec![0; to_read * self.type_size];
+            // Reuse the existing sparse codec primitive. Source and destination
+            // bounds follow from to_read <= remaining; no full-page allocation.
+            unsafe {
+                self.gather_values_at_validated(
+                    (0..to_read).map(|i| (self.cur_index + i as u32, i)),
+                    &mut output,
+                )?;
+            }
+            self.cur_index += to_read as u32;
+            return Ok((to_read, Bytes::from(output)));
+        }
         self.ensure_materialized()?;
         let decoded = self
             .decoded_data
@@ -738,6 +754,10 @@ impl BitShufflePageDecoder {
     #[inline]
     pub fn is_materialized(&self) -> bool {
         self.decoded_data.is_some()
+    }
+
+    pub(crate) fn stream_sequential(&mut self) {
+        self.stream_sequential = true;
     }
 
     /// Return the logical page only when an operation has already required
