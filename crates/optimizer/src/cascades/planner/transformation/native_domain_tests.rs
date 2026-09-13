@@ -1158,3 +1158,299 @@ fn production_selected_two_domains_publish_one_filter_at_original_hole() {
         .collect::<BTreeSet<_>>();
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn production_limit_binding_uses_native_shell_without_owned_settlement() {
+    let input = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            vec![vec![Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            )]],
+            vec!["value".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let projection = Projection::new(10, input, vec![column(0, 0)]);
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Box::new(
+        paro_planner::operator::Limit::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Projection(projection)),
+            Some(Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            )),
+            None,
+        ),
+    )));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::LimitPushdown,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .bindings(
+            root.logical.id,
+            &RuleContext {
+                memo: engine.memo(),
+                group: root.reference.group,
+            },
+        )
+        .unwrap();
+    assert_eq!(bindings.bindings.len(), 1);
+    let arena_before = state.read().unwrap().staging_arena.len();
+    let mut context = TransformContext::new(engine.memo_mut(), root.reference.group);
+    let outputs = rule
+        .apply_binding(&bindings.bindings[0], &mut context)
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        state.read().unwrap().staging_arena.len(),
+        arena_before,
+        "native limit pushdown must not round-trip through the owned arena"
+    );
+    let state = state.read().unwrap();
+    assert!(matches!(
+        state.payloads.logical[outputs[0].payload.index()]
+            .semantic_template
+            .operator,
+        LogicalOperator::Projection(_)
+    ));
+}
+
+#[test]
+fn production_topn_binding_uses_native_shell_without_owned_settlement() {
+    let input = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            vec![vec![Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            )]],
+            vec!["value".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let order = paro_planner::operator::Order::new(
+        input,
+        vec![paro_planner::binder::ir::OrderByNode {
+            expression: column(0, 0),
+            ascending: true,
+            nulls_first: false,
+        }],
+    );
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Box::new(
+        paro_planner::operator::Limit::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Order(order)),
+            Some(Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            )),
+            None,
+        ),
+    )));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let root_expr = {
+        let candidates = engine
+            .memo()
+            .group(root.reference.group)
+            .unwrap()
+            .logical_exprs()
+            .to_vec();
+        let state = state.read().unwrap();
+        candidates
+            .into_iter()
+            .find(|expression| {
+                let logical = engine.memo().logical_expr(*expression).unwrap();
+                matches!(
+                    state.payloads.logical[logical.payload.index()]
+                        .semantic_template
+                        .operator,
+                    LogicalOperator::Limit(_)
+                )
+            })
+            .expect("the source LIMIT must remain in the Memo")
+    };
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::TopNIntroduction,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .bindings(
+            root_expr,
+            &RuleContext {
+                memo: engine.memo(),
+                group: root.reference.group,
+            },
+        )
+        .unwrap();
+    assert_eq!(bindings.bindings.len(), 1);
+    let arena_before = state.read().unwrap().staging_arena.len();
+    let mut context = TransformContext::new(engine.memo_mut(), root.reference.group);
+    let outputs = rule
+        .apply_binding(&bindings.bindings[0], &mut context)
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        state.read().unwrap().staging_arena.len(),
+        arena_before,
+        "native TopN introduction must not round-trip through the owned arena"
+    );
+    let state = state.read().unwrap();
+    assert!(matches!(
+        state.payloads.logical[outputs[0].payload.index()]
+            .semantic_template
+            .operator,
+        LogicalOperator::TopN(_)
+    ));
+}
+
+#[test]
+fn production_key_domain_binding_rewrites_the_exact_probe_edge_natively() {
+    let probe = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            vec![vec![
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(2), LogicalType::Integer).into(),
+                ),
+            ]],
+            vec!["key".into(), "payload".into()],
+            vec![LogicalType::Integer; 2],
+        ),
+    ));
+    let projection = Projection::new(10, probe, vec![column(0, 0), column(0, 1)]);
+    let reduction = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            20,
+            vec![vec![Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            )]],
+            vec!["key".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let semi = Join::comparison(
+        JoinType::Semi,
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(projection)),
+        reduction,
+        vec![paro_planner::operator::JoinCondition::equality(
+            column(10, 0),
+            column(20, 0),
+        )],
+    );
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(semi));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::KeyDomainTransfer,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .bindings(
+            root.logical.id,
+            &RuleContext {
+                memo: engine.memo(),
+                group: root.reference.group,
+            },
+        )
+        .unwrap();
+    assert_eq!(bindings.bindings.len(), 1);
+    let arena_before = state.read().unwrap().staging_arena.len();
+    let mut context = TransformContext::new(engine.memo_mut(), root.reference.group);
+    let outputs = rule
+        .apply_binding(&bindings.bindings[0], &mut context)
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        state.read().unwrap().staging_arena.len(),
+        arena_before,
+        "native key-domain transfer must not round-trip through the owned arena"
+    );
+    let state = state.read().unwrap();
+    assert!(matches!(
+        state.payloads.logical[outputs[0].payload.index()]
+            .semantic_template
+            .operator,
+        LogicalOperator::Projection(_)
+    ));
+}
+
+#[test]
+fn production_mark_filter_binding_rewrites_without_owned_settlement() {
+    let left = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            vec![vec![Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            )]],
+            vec!["left_key".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let right = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            1,
+            vec![vec![Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            )]],
+            vec!["right_key".into()],
+            vec![LogicalType::Integer],
+        ),
+    ));
+    let mut mark_join = Join::comparison(
+        JoinType::Mark,
+        left,
+        right,
+        vec![paro_planner::operator::JoinCondition::equality(
+            column(0, 0),
+            column(1, 0),
+        )],
+    );
+    let Join::Comparison(mark) = &mut mark_join else {
+        panic!("comparison MARK join");
+    };
+    mark.mark_index = Some(30);
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Join(mark_join)),
+        vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(30, 0), LogicalType::Boolean).into(),
+        )],
+    )));
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        40,
+        plan,
+        vec![column(0, 0)],
+    )));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::MarkJoinToSemi,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .bindings(
+            root.logical.id,
+            &RuleContext {
+                memo: engine.memo(),
+                group: root.reference.group,
+            },
+        )
+        .unwrap();
+    assert_eq!(bindings.bindings.len(), 1);
+    let arena_before = state.read().unwrap().staging_arena.len();
+    let mut context = TransformContext::new(engine.memo_mut(), root.reference.group);
+    let outputs = rule
+        .apply_binding(&bindings.bindings[0], &mut context)
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        state.read().unwrap().staging_arena.len(),
+        arena_before,
+        "native MARK rewrite must not round-trip through the owned arena"
+    );
+    let state = state.read().unwrap();
+    assert!(matches!(
+        state.payloads.logical[outputs[0].payload.index()]
+            .semantic_template
+            .operator,
+        LogicalOperator::Projection(_)
+    ));
+}

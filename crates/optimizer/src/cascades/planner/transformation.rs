@@ -18,8 +18,8 @@ pub(super) mod settlement;
 mod staging;
 
 use staging::{
-    stage_transformed_expression, NativeChild, NativeNode, NativeShell, StagingInput,
-    StagingRegionRequirements, StagingRequest, StagingTarget,
+    NativeChild, NativeNode, NativeShell, StagingInput, StagingRegionRequirements, StagingRequest,
+    StagingTarget, stage_transformed_expression,
 };
 
 fn settle_with_session_arena(
@@ -550,6 +550,10 @@ impl TransformationRule for PlannerTransformationRule {
         let direct_native = if matches!(
             self.transformation,
             PlannerTransformation::PredicateTransfer
+                | PlannerTransformation::KeyDomainTransfer
+                | PlannerTransformation::MarkJoinToSemi
+                | PlannerTransformation::LimitPushdown
+                | PlannerTransformation::TopNIntroduction
                 | PlannerTransformation::JoinRegionEnumeration
                 | PlannerTransformation::AggregateDimensionDeferral
                 | PlannerTransformation::AggregateDimensionSharing
@@ -582,6 +586,26 @@ impl TransformationRule for PlannerTransformationRule {
                 }
                 PlannerTransformation::JoinRegionEnumeration => {
                     join_region::try_native_enumeration(&binding.root, ctx.memo(), &state, &facts)?
+                }
+                PlannerTransformation::KeyDomainTransfer => {
+                    try_native_key_domain_transfer(&binding.root, ctx.memo(), &state, &facts)?
+                        .into_iter()
+                        .collect()
+                }
+                PlannerTransformation::MarkJoinToSemi => {
+                    try_native_mark_join_to_semi(&binding.root, ctx.memo(), &state, &facts)?
+                        .into_iter()
+                        .collect()
+                }
+                PlannerTransformation::LimitPushdown => {
+                    try_native_limit_pushdown(&binding.root, ctx.memo(), &state, &facts)?
+                        .into_iter()
+                        .collect()
+                }
+                PlannerTransformation::TopNIntroduction => {
+                    try_native_topn_introduction(&binding.root, ctx.memo(), &state, &facts)?
+                        .into_iter()
+                        .collect()
                 }
                 PlannerTransformation::AggregateDimensionDeferral => {
                     try_native_dimension_deferral(&binding.root, ctx.memo(), &state, &facts)?
@@ -631,6 +655,10 @@ impl TransformationRule for PlannerTransformationRule {
                 || matches!(
                     self.transformation,
                     PlannerTransformation::JoinRegionEnumeration
+                        | PlannerTransformation::KeyDomainTransfer
+                        | PlannerTransformation::MarkJoinToSemi
+                        | PlannerTransformation::LimitPushdown
+                        | PlannerTransformation::TopNIntroduction
                         | PlannerTransformation::AggregateDimensionDeferral
                         | PlannerTransformation::AggregateDimensionSharing
                 ))
@@ -1453,6 +1481,506 @@ fn try_native_predicate_transfer(
     compact_native_shell(NativeShell {
         nodes: nodes.into_boxed_slice(),
         root,
+    })
+    .map(Some)
+}
+
+/// Compare two native child edges as edges, not as semantic group contracts.
+/// A group may occur more than once in a shell; replacing a different
+/// occurrence merely because it has the same group would change the rewrite.
+fn native_child_edge_is(left: &NativeChild, right: &NativeChild) -> bool {
+    match (left, right) {
+        (NativeChild::Node(left), NativeChild::Node(right)) => left == right,
+        (
+            NativeChild::MemoGroup {
+                group: left_group,
+                id: left_id,
+                ..
+            },
+            NativeChild::MemoGroup {
+                group: right_group,
+                id: right_id,
+                ..
+            },
+        ) => left_group == right_group && left_id == right_id,
+        (
+            NativeChild::Group {
+                id: left_id,
+                reference: left_reference,
+                ..
+            },
+            NativeChild::Group {
+                id: right_id,
+                reference: right_reference,
+                ..
+            },
+        ) => left_id == right_id && left_reference.reference_id == right_reference.reference_id,
+        _ => false,
+    }
+}
+
+fn native_shell_child_layout(
+    child: &NativeChild,
+    layouts: &[paro_planner::operator::LogicalOutputLayout],
+) -> Result<paro_planner::operator::LogicalOutputLayout> {
+    match child {
+        NativeChild::Node(index) => layouts
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("native rewrite references an unknown node")),
+        NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
+            Ok(layout.clone())
+        }
+    }
+}
+
+fn native_shell_child_stats(nodes: &[NativeNode], child: &NativeChild) -> NodeStats {
+    match child {
+        NativeChild::Node(index) => nodes
+            .get(*index)
+            .map(|node| node.stats.clone())
+            .unwrap_or_default(),
+        NativeChild::MemoGroup { stats, .. } | NativeChild::Group { stats, .. } => stats.clone(),
+    }
+}
+
+/// The key-domain rule is a shell rewrite: it moves the semi join below the
+/// smallest probe operator that owns all key columns.  The old implementation
+/// detached an owned probe tree, inserted a synthetic semi join and assembled
+/// it again.  All of the decisions here use the exact native child edge and
+/// layout, so the rewrite never needs to materialize a representative child.
+fn try_native_key_domain_transfer(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: &boundary::BoundarySnapshot,
+) -> Result<Option<NativeShell>> {
+    let PatternOperand::Expression { .. } = binding else {
+        return Ok(None);
+    };
+    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+        return Ok(None);
+    };
+    if native_shell_contains_control_boundary(&shell) {
+        return Ok(None);
+    }
+    let root = shell.root;
+    let LogicalOperator::Join(Join::Comparison(domain)) = shell.nodes[root].operator.clone() else {
+        return Ok(None);
+    };
+    if domain.join_type != JoinType::Semi
+        || domain.conditions.is_empty()
+        || !domain.duplicate_eliminated_columns.is_empty()
+        || domain.delim_flipped
+        || domain.conditions.iter().any(|condition| {
+            condition.comparison != JoinComparisonType::Equal
+                || condition.left.evaluation_properties().is_reorder_fence()
+                || condition.right.evaluation_properties().is_reorder_fence()
+        })
+    {
+        return Ok(None);
+    }
+
+    let layouts = shell.layouts()?;
+    let mut nodes = shell.nodes.into_vec();
+    let NativeChild::Node(probe_index) = domain.left.clone() else {
+        return Ok(None);
+    };
+    let probe_operator = nodes
+        .get(probe_index)
+        .ok_or_else(|| paro_error::internal("native key-domain shell lost its probe"))?
+        .operator
+        .clone();
+    let mut conditions = domain.conditions.clone();
+    let (mut probe_operator, target_child) = match probe_operator {
+        LogicalOperator::Projection(projection) => {
+            for condition in &mut conditions {
+                let Expression::ColumnRef(column) = &condition.left else {
+                    return Ok(None);
+                };
+                if column.depth != 0 || column.binding.table_index != projection.table_index {
+                    return Ok(None);
+                }
+                let Some(expression) = projection.expressions.get(column.binding.column_index)
+                else {
+                    return Ok(None);
+                };
+                if expression.return_type() != column.return_type {
+                    return Ok(None);
+                }
+                condition.left = expression.clone();
+            }
+            let target = projection.child.clone();
+            (LogicalOperator::Projection(projection), target)
+        }
+        LogicalOperator::Aggregate(aggregate)
+            if aggregate.has_plain_grouping_domain()
+                && !aggregate.groups.is_empty()
+                && aggregate.post_reduction.is_none() =>
+        {
+            for condition in &mut conditions {
+                let Expression::ColumnRef(column) = &condition.left else {
+                    return Ok(None);
+                };
+                if column.depth != 0 || column.binding.table_index != aggregate.group_index {
+                    return Ok(None);
+                }
+                let Some(expression) = aggregate.groups.get(column.binding.column_index) else {
+                    return Ok(None);
+                };
+                if expression.return_type() != column.return_type {
+                    return Ok(None);
+                }
+                condition.left = expression.clone();
+            }
+            let target = aggregate.child.clone();
+            (LogicalOperator::Aggregate(aggregate), target)
+        }
+        LogicalOperator::Filter(filter) => {
+            if filter
+                .expressions
+                .iter()
+                .any(|expression| expression.evaluation_properties().is_reorder_fence())
+            {
+                return Ok(None);
+            }
+            let target = filter.child.clone();
+            (LogicalOperator::Filter(filter), target)
+        }
+        LogicalOperator::Order(order) => {
+            if order
+                .orders
+                .iter()
+                .any(|order| order.expression.evaluation_properties().is_reorder_fence())
+            {
+                return Ok(None);
+            }
+            let target = order.child.clone();
+            (LogicalOperator::Order(order), target)
+        }
+        LogicalOperator::Join(Join::Comparison(join))
+            if join.join_type == JoinType::Inner
+                && join.duplicate_eliminated_columns.is_empty()
+                && !join.delim_flipped =>
+        {
+            let mut keys = Vec::new();
+            for condition in &conditions {
+                crate::column::lifetime::ColumnLifetimeAnalyzer::extract_column_bindings(
+                    &condition.left,
+                    &mut keys,
+                );
+            }
+            if keys.is_empty() {
+                return Ok(None);
+            }
+            let left_bindings = native_shell_child_layout(&join.left, &layouts)?
+                .bindings()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let right_bindings = native_shell_child_layout(&join.right, &layouts)?
+                .bindings()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let owned = [
+                keys.iter().all(|key| left_bindings.contains(key)),
+                keys.iter().all(|key| right_bindings.contains(key)),
+            ];
+            let target = match owned {
+                [true, false] => join.left.clone(),
+                [false, true] => join.right.clone(),
+                _ => return Ok(None),
+            };
+            (LogicalOperator::Join(Join::Comparison(join)), target)
+        }
+        _ => return Ok(None),
+    };
+
+    let restricted_index = nodes.len();
+    let mut restricted = domain;
+    restricted.left = target_child.clone();
+    restricted.conditions = conditions;
+    nodes.push(NativeNode {
+        id: state.bind_context.next_plan_id(),
+        stats: native_shell_child_stats(&nodes, &target_child),
+        operator: LogicalOperator::Join(Join::Comparison(restricted)),
+        source_proofs: Box::new([]),
+    });
+
+    let mut replaced = false;
+    probe_operator = probe_operator.try_map_child_links(&mut |child| {
+        if !replaced && native_child_edge_is(&child, &target_child) {
+            replaced = true;
+            Ok::<_, paro_error::ParoError>(NativeChild::Node(restricted_index))
+        } else {
+            Ok::<_, paro_error::ParoError>(child.clone())
+        }
+    })?;
+    if !replaced {
+        return Ok(None);
+    }
+    nodes[root].operator = probe_operator;
+    nodes[root].source_proofs = Box::new([]);
+    compact_native_shell(NativeShell {
+        nodes: nodes.into_boxed_slice(),
+        root,
+    })
+    .map(Some)
+}
+
+/// Convert the positive MARK-filter pattern to a SEMI join in-place.  The
+/// output node keeps the root occurrence identity while its child edges stay
+/// native, matching the old rewrite's exact projection contract.
+fn try_native_mark_join_to_semi(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: &boundary::BoundarySnapshot,
+) -> Result<Option<NativeShell>> {
+    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+        return Ok(None);
+    };
+    if native_shell_contains_control_boundary(&shell) {
+        return Ok(None);
+    }
+    let mut nodes = shell.nodes.into_vec();
+    let mut rewritten = false;
+    for index in 0..nodes.len() {
+        let LogicalOperator::Filter(filter) = nodes[index].operator.clone() else {
+            continue;
+        };
+        let [Expression::ColumnRef(marker)] = filter.expressions.as_slice() else {
+            continue;
+        };
+        if marker.depth != 0 {
+            continue;
+        }
+        let NativeChild::Node(join_index) = filter.child else {
+            continue;
+        };
+        let LogicalOperator::Join(Join::Comparison(mut join)) = nodes
+            .get(join_index)
+            .ok_or_else(|| paro_error::internal("native MARK rewrite lost its join"))?
+            .operator
+            .clone()
+        else {
+            continue;
+        };
+        if join.join_type != JoinType::Mark
+            || join.mark_index != Some(marker.binding.table_index)
+            || marker.binding.column_index != 0
+        {
+            continue;
+        }
+        join.join_type = JoinType::Semi;
+        join.mark_index = None;
+        join.mark_semantics = paro_planner::operator::MarkJoinSemantics::NotMark;
+        join.left_projection_map = paro_planner::operator::ProjectionMap::all();
+        join.right_projection_map = paro_planner::operator::ProjectionMap::none();
+        nodes[index].operator = LogicalOperator::Join(Join::Comparison(join));
+        nodes[index].source_proofs = Box::new([]);
+        rewritten = true;
+        break;
+    }
+    if !rewritten {
+        return Ok(None);
+    }
+    compact_native_shell(NativeShell {
+        nodes: nodes.into_boxed_slice(),
+        root: shell.root,
+    })
+    .map(Some)
+}
+
+fn native_constant_value(expression: &Expression) -> Option<usize> {
+    let Expression::Constant(constant) = expression else {
+        return None;
+    };
+    match &constant.value {
+        Value::TinyInt(value) => usize::try_from(*value).ok(),
+        Value::SmallInt(value) => usize::try_from(*value).ok(),
+        Value::Integer(value) => usize::try_from(*value).ok(),
+        Value::BigInt(value) => usize::try_from(*value).ok(),
+        Value::UTinyInt(value) => Some(*value as usize),
+        Value::USmallInt(value) => Some(*value as usize),
+        Value::UInteger(value) => Some(*value as usize),
+        Value::UBigInt(value) => usize::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+/// Push a constant LIMIT below one projection without detaching either node.
+fn try_native_limit_pushdown(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: &boundary::BoundarySnapshot,
+) -> Result<Option<NativeShell>> {
+    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+        return Ok(None);
+    };
+    if native_shell_contains_control_boundary(&shell) {
+        return Ok(None);
+    }
+    let root = shell.root;
+    let LogicalOperator::Limit(limit) = shell.nodes[root].operator.clone() else {
+        return Ok(None);
+    };
+    let Some(limit_value) = limit.limit.as_ref().and_then(native_constant_value) else {
+        return Ok(None);
+    };
+    if limit_value >= 8192
+        || limit
+            .offset
+            .as_ref()
+            .is_some_and(|offset| native_constant_value(offset).is_none())
+    {
+        return Ok(None);
+    }
+    let NativeChild::Node(projection_index) = limit.child.clone() else {
+        return Ok(None);
+    };
+    let LogicalOperator::Projection(mut projection) =
+        shell.nodes[projection_index].operator.clone()
+    else {
+        return Ok(None);
+    };
+    if projection
+        .expressions
+        .iter()
+        .any(|expression| !expression.evaluation_properties().can_share_evaluation())
+    {
+        return Ok(None);
+    }
+    let mut nodes = shell.nodes.into_vec();
+    let inner_child = projection.child.clone();
+    let limit_index = nodes.len();
+    let mut pushed_limit = limit;
+    pushed_limit.child = inner_child;
+    nodes.push(NativeNode {
+        id: state.bind_context.next_plan_id(),
+        stats: NodeStats::default(),
+        operator: LogicalOperator::Limit(pushed_limit),
+        source_proofs: Box::new([]),
+    });
+    projection.child = NativeChild::Node(limit_index);
+    nodes.push(NativeNode {
+        id: nodes[root].id,
+        stats: nodes[root].stats.clone(),
+        operator: LogicalOperator::Projection(projection),
+        source_proofs: Box::new([]),
+    });
+    let new_root = nodes.len() - 1;
+    compact_native_shell(NativeShell {
+        nodes: nodes.into_boxed_slice(),
+        root: new_root,
+    })
+    .map(Some)
+}
+
+/// Fuse an ORDER + constant LIMIT chain into TopN while retaining every
+/// transparent projection layer.  Only the shell and its exact native child
+/// edges are copied; the rule never constructs an owned descendant.
+fn try_native_topn_introduction(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: &boundary::BoundarySnapshot,
+) -> Result<Option<NativeShell>> {
+    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+        return Ok(None);
+    };
+    if native_shell_contains_control_boundary(&shell) {
+        return Ok(None);
+    }
+    let root = shell.root;
+    let LogicalOperator::Limit(limit) = shell.nodes[root].operator.clone() else {
+        return Ok(None);
+    };
+    let Some(limit_value) = limit.limit.as_ref().and_then(native_constant_value) else {
+        return Ok(None);
+    };
+    let offset_value = limit
+        .offset
+        .as_ref()
+        .and_then(native_constant_value)
+        .unwrap_or(0);
+    if limit
+        .offset
+        .as_ref()
+        .is_some_and(|offset| native_constant_value(offset).is_none())
+    {
+        return Ok(None);
+    }
+
+    let mut nodes = shell.nodes.into_vec();
+    let mut projections = Vec::<(
+        paro_planner::plan::PlanNodeId,
+        NodeStats,
+        Projection<NativeChild>,
+    )>::new();
+    let mut child = limit.child.clone();
+    let order =
+        loop {
+            let NativeChild::Node(index) = child.clone() else {
+                return Ok(None);
+            };
+            match nodes[index].operator.clone() {
+                LogicalOperator::Projection(projection) => {
+                    if projection.expressions.iter().any(|expression| {
+                        !expression.evaluation_properties().can_share_evaluation()
+                    }) {
+                        return Ok(None);
+                    }
+                    child = projection.child.clone();
+                    projections.push((nodes[index].id, nodes[index].stats.clone(), projection));
+                }
+                LogicalOperator::Order(order) => break (index, order),
+                _ => return Ok(None),
+            }
+        };
+
+    let (order_index, order) = order;
+    let topn_index = nodes.len();
+    nodes.push(NativeNode {
+        id: state.bind_context.next_plan_id(),
+        stats: nodes[order_index].stats.clone(),
+        operator: LogicalOperator::TopN(paro_planner::operator::TopN {
+            orders: order.orders,
+            limit: limit_value,
+            offset: offset_value,
+            hnsw_options: limit.hnsw_options,
+            projection_map: order.projection_map,
+            child: order.child,
+        }),
+        source_proofs: Box::new([]),
+    });
+    let mut current = NativeChild::Node(topn_index);
+    while let Some((id, stats, mut projection)) = projections.pop() {
+        projection.child = current;
+        let index = nodes.len();
+        nodes.push(NativeNode {
+            id,
+            stats,
+            operator: LogicalOperator::Projection(projection),
+            source_proofs: Box::new([]),
+        });
+        current = NativeChild::Node(index);
+    }
+    let NativeChild::Node(new_root) = current else {
+        return Err(paro_error::internal("native TopN rewrite lost its root"));
+    };
+    // TopNOptimizer returns the original LIMIT occurrence as the root
+    // identity, even when projection layers were rebuilt around it.
+    if new_root != root {
+        let root_node = nodes[root].clone();
+        nodes[new_root].id = root_node.id;
+        nodes[new_root].stats = root_node.stats;
+    }
+    compact_native_shell(NativeShell {
+        nodes: nodes.into_boxed_slice(),
+        root: new_root,
     })
     .map(Some)
 }
@@ -3486,7 +4014,7 @@ fn rewrite_planner_expression(
     let rewritten = match transformation {
         PlannerTransformation::PredicateTransfer => FilterPushdown::new().rewrite_plan(plan),
         PlannerTransformation::KeyDomainTransfer => {
-            return crate::filter::domain_transfer::transfer(plan)
+            return crate::filter::domain_transfer::transfer(plan);
         }
         PlannerTransformation::CtePartitionedMaterialization => {
             unreachable!("CTE partitioning consumes a native occurrence requirement")
