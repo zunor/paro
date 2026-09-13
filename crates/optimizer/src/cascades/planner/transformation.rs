@@ -547,7 +547,6 @@ impl TransformationRule for PlannerTransformationRule {
         // for their conservative native subsets. Keep the legacy owned-plan
         // path available for every shape that needs richer semantic handling.
         let mut native_domain_scopes = None;
-        let mut predicate_transfer_native_complete = false;
         let direct_native = if matches!(
             self.transformation,
             PlannerTransformation::PredicateTransfer
@@ -581,14 +580,9 @@ impl TransformationRule for PlannerTransformationRule {
                         native_domain_scopes = Some(scopes);
                         vec![shell]
                     } else {
-                        let native = try_native_predicate_transfer(
-                            &binding.root,
-                            ctx.memo(),
-                            &state,
-                            &facts,
-                        )?;
-                        predicate_transfer_native_complete = native.is_some();
-                        native.into_iter().collect()
+                        try_native_predicate_transfer(&binding.root, ctx.memo(), &state, &facts)?
+                            .into_iter()
+                            .collect()
                     }
                 }
                 PlannerTransformation::JoinRegionEnumeration => {
@@ -861,8 +855,7 @@ impl TransformationRule for PlannerTransformationRule {
             nested_group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         }
 
-        let use_native_shell = native_shell_staging_allowed(self.transformation)
-            || predicate_transfer_native_complete;
+        let use_native_shell = native_shell_staging_allowed(self.transformation);
         enum PlanCandidate {
             Native(NativeShell),
             Owned {
