@@ -1,0 +1,387 @@
+[
+  {
+    "source": "/private/tmp/paro-l1-L0-diagnostic-run-v3.log",
+    "archive": "paro-l1-L0-diagnostic-run-v3.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-diagnostic-v3/L0.diagnostic.block000.parod.log",
+    "archive": "paro-l1-L0-diagnostic-v3/L0.diagnostic.block000.parod.log.gz",
+    "bytes": 8319152,
+    "sha256": "4d34423d6a39f4f2c0e1d88246f665303604674bc2dc0122b924d7ebdd635367",
+    "gzip_sha256": "7836803ac643be51ed515010c9e34ae47ca0b1abf536c1743615cd53a6d76a5a"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-diagnostic-v3/L0.sql",
+    "archive": "paro-l1-L0-diagnostic-v3/L0.sql.gz",
+    "bytes": 43,
+    "sha256": "40d7a57f48b66deeae4e5100657a356b0e938dd49ebb1a8be2e2e2b1a8a40dd7",
+    "gzip_sha256": "29e36b001b66f59650c9295a828f06e731233ed057d9c7bbf05d77b5b32fff9a"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-diagnostic-v3/report.json",
+    "archive": "paro-l1-L0-diagnostic-v3/report.json.gz",
+    "bytes": 551591,
+    "sha256": "828a6c813b2dfbd0b92f262b781caea9064e402f81eca6146345db2af1afc9c7",
+    "gzip_sha256": "78c8d81abdc9bf93b2bb257917bc67d8d56d87ad40d90c787d40652db1b8f52d"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-run-v2.log",
+    "archive": "paro-l1-L0-run-v2.log.gz",
+    "bytes": 1204,
+    "sha256": "d4cb9914740f86161a311b58d366a5763fd59807092c35e4a6601e407eb670e8",
+    "gzip_sha256": "fcd72432989148d3619c54084e06f568785bc05352bf678d9f9e250854aa7a22"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-run-v3.log",
+    "archive": "paro-l1-L0-run-v3.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-run.log",
+    "archive": "paro-l1-L0-run.log.gz",
+    "bytes": 794,
+    "sha256": "08acad32bd410dde53efed9c76fd4178c4f4e1c02a14c44718ffcb9e2a74cb63",
+    "gzip_sha256": "f5cd95b315ca3cdfebbfb9aa907769b60cbc51ee3bdda2c6993b39d870c78678"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36/L0.ladder.block000.parod.log",
+    "archive": "paro-l1-L0-scalar36/L0.ladder.block000.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36/L0.sql",
+    "archive": "paro-l1-L0-scalar36/L0.sql.gz",
+    "bytes": 43,
+    "sha256": "40d7a57f48b66deeae4e5100657a356b0e938dd49ebb1a8be2e2e2b1a8a40dd7",
+    "gzip_sha256": "29e36b001b66f59650c9295a828f06e731233ed057d9c7bbf05d77b5b32fff9a"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36/report.json",
+    "archive": "paro-l1-L0-scalar36/report.json.gz",
+    "bytes": 8490,
+    "sha256": "90a91cbd510c9b3360f5b38a7ac0c17f6ad88906f5ff1e48248d716986b2b422",
+    "gzip_sha256": "0d071b5e31601eed4dcb16cd92ce2290bd07af91118eafec2febf141018b8adc"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block000.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block000.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block001.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block001.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block002.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block002.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block003.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block003.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block004.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block004.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block005.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block005.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block006.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block006.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block007.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block007.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block008.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block008.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block009.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block009.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block010.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block010.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block011.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block011.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block012.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block012.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block013.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block013.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block014.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block014.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block015.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block015.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block016.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block016.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block017.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block017.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block018.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block018.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block019.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block019.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block020.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block020.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block021.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block021.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block022.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block022.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block023.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block023.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block024.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block024.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block025.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block025.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block026.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block026.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block027.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block027.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block028.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block028.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block029.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block029.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block030.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block030.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block031.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block031.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block032.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block032.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block033.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block033.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block034.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block034.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.ladder.block035.parod.log",
+    "archive": "paro-l1-L0-scalar36-v3/L0.ladder.block035.parod.log.gz",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/L0.sql",
+    "archive": "paro-l1-L0-scalar36-v3/L0.sql.gz",
+    "bytes": 43,
+    "sha256": "40d7a57f48b66deeae4e5100657a356b0e938dd49ebb1a8be2e2e2b1a8a40dd7",
+    "gzip_sha256": "29e36b001b66f59650c9295a828f06e731233ed057d9c7bbf05d77b5b32fff9a"
+  },
+  {
+    "source": "/private/tmp/paro-l1-L0-scalar36-v3/report.json",
+    "archive": "paro-l1-L0-scalar36-v3/report.json.gz",
+    "bytes": 791068,
+    "sha256": "101045f9918e7308b7405297ee97a23f1cf6d7b4b348c1958d395a23ce22e5d4",
+    "gzip_sha256": "5f50e517d35c9d8d08b8b6136e817c7aba986da232f78bb2318e656f747dbab6"
+  },
+  {
+    "source": "/private/tmp/paro-l1-build-v2.json",
+    "archive": "paro-l1-build-v2.json.gz",
+    "bytes": 564,
+    "sha256": "0a397324db6585c2db5f9cb13ee8837d108bff106cbe8aeba3fa8bf91708c0b2",
+    "gzip_sha256": "d09aa0499266ef33b1f743582a126fdba04123e7e05ca2ef85156ec6461c35b8"
+  },
+  {
+    "source": "/private/tmp/paro-l1-build-v2.log",
+    "archive": "paro-l1-build-v2.log.gz",
+    "bytes": 911,
+    "sha256": "5e3198a18307cfbbd54b04a1eb58eeaa81b41d302850146640de4f730c78c037",
+    "gzip_sha256": "00943593532430c87fc5a61af933bc15a59f58fce902bb51aa6889f95c43cf0b"
+  },
+  {
+    "source": "/private/tmp/paro-l1-build-v3.json",
+    "archive": "paro-l1-build-v3.json.gz",
+    "bytes": 564,
+    "sha256": "7fb540e5a983e6b7f30ce065c441d0007f64689e685934f1437344a6562fe6aa",
+    "gzip_sha256": "c1e334d883b394489b5be2cc0147fef91a62cafa0039d17a8fa34079f9ffa7a3"
+  },
+  {
+    "source": "/private/tmp/paro-l1-build-v3.log",
+    "archive": "paro-l1-build-v3.log.gz",
+    "bytes": 911,
+    "sha256": "4fd06779c0e16e961544b863aa3183c749bea98d2ce2a337e3c8141df89bd5ec",
+    "gzip_sha256": "ee552dffa0a6e2907e8b5b0270f014a9475835884d94c1948b7ad47b02be8fd3"
+  },
+  {
+    "source": "/private/tmp/paro-l1-build.json",
+    "archive": "paro-l1-build.json.gz",
+    "bytes": 567,
+    "sha256": "fd6e6e42c12334beae63bf3b54e9e6c292b6855a69a8c8195d008f263b0d5fe4",
+    "gzip_sha256": "bf333084d3b020f7f3a3a1467c6fda60b6325f44e618294738e55742a4dd6689"
+  },
+  {
+    "source": "/private/tmp/paro-l1-build.log",
+    "archive": "paro-l1-build.log.gz",
+    "bytes": 1903,
+    "sha256": "a57d2343361ecfd86cfc500bf31e84bfd6d6cbf785ff82031dda234333630a77",
+    "gzip_sha256": "f03abea721a88888a99adfd4e805ea01be9fdff031ecb42059bd2b015db358c5"
+  },
+  {
+    "source": "/private/tmp/paro-l1-help.log",
+    "archive": "paro-l1-help.log.gz",
+    "bytes": 2310,
+    "sha256": "edbf8a674a994f61b20db56153a647171817ccb4e8a59f3d96ae9ecc3104fc8f",
+    "gzip_sha256": "70d602b96c87e9e2ddba0a036c29b657f85b65fff3caa3516b319259f2e5b195"
+  }
+]
