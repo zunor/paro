@@ -6,6 +6,7 @@
 use super::*;
 use crate::cascades::scalar::ScalarKind;
 use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
 use paro_planner::operator::bound_reference::{
     BoundRelationFactValues, BoundRelationFacts, BoundSourceColumn,
 };
@@ -799,6 +800,31 @@ impl BoundarySnapshot {
                 .saturating_add((range.expected_upper - range.expected_lower) / 2),
             max: range.upper,
         })
+    }
+
+    /// Prove NULLability for one exact Memo-boundary column.  Native rules do
+    /// not have an owned settlement tree to borrow a statistics map from, so
+    /// they use the same canonical group and interned-column identity as
+    /// `transport`. Missing value evidence is unknown and fails closed.
+    pub(super) fn binding_is_non_null(
+        &self,
+        memo: &Memo,
+        state: &PlannerTransformState,
+        group: GroupId,
+        binding: ColumnBinding,
+        ty: &LogicalType,
+    ) -> bool {
+        let Some(column) = state
+            .binding_ids
+            .get(binding.table_index, binding.column_index, ty)
+            .copied()
+        else {
+            return false;
+        };
+        self.groups
+            .get(&memo.canonical_group(group))
+            .and_then(|facts| facts.column_values.get(&column))
+            .is_some_and(|value| !value.statistics().can_have_null())
     }
 
     pub(super) fn transport(

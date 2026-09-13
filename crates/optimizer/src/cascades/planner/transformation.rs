@@ -16,6 +16,7 @@ mod matching;
 mod native_domain;
 mod native_join_preaggregation;
 mod native_join_subsumption;
+mod native_non_null_inputs;
 pub(super) mod settlement;
 mod staging;
 
@@ -680,6 +681,7 @@ impl TransformationRule for PlannerTransformationRule {
                 | PlannerTransformation::JoinRegionEnumeration
                 | PlannerTransformation::AggregateJoinPreaggregation
                 | PlannerTransformation::AggregateJoinSubsumption
+                | PlannerTransformation::AggregateNonNullInput
                 | PlannerTransformation::AggregateDimensionDeferral
                 | PlannerTransformation::AggregateInputMaterialization
                 | PlannerTransformation::AggregateDimensionSharing
@@ -731,6 +733,16 @@ impl TransformationRule for PlannerTransformationRule {
                 }
                 PlannerTransformation::AggregateJoinSubsumption => {
                     native_join_subsumption::try_native_aggregate_join_subsumption(
+                        &binding.root,
+                        ctx.memo(),
+                        &state,
+                        &facts,
+                    )?
+                    .into_iter()
+                    .collect()
+                }
+                PlannerTransformation::AggregateNonNullInput => {
+                    native_non_null_inputs::try_native_aggregate_non_null_input(
                         &binding.root,
                         ctx.memo(),
                         &state,
@@ -823,6 +835,7 @@ impl TransformationRule for PlannerTransformationRule {
                     PlannerTransformation::JoinRegionEnumeration
                         | PlannerTransformation::AggregateJoinPreaggregation
                         | PlannerTransformation::AggregateJoinSubsumption
+                        | PlannerTransformation::AggregateNonNullInput
                         | PlannerTransformation::KeyDomainTransfer
                         | PlannerTransformation::MarkJoinToSemi
                         | PlannerTransformation::LimitPushdown
@@ -1703,6 +1716,7 @@ fn native_shell_staging_allowed(transformation: PlannerTransformation) -> bool {
         PlannerTransformation::JoinRegionEnumeration
             | PlannerTransformation::AggregateDimensionDeferral
             | PlannerTransformation::AggregateJoinSubsumption
+            | PlannerTransformation::AggregateNonNullInput
             | PlannerTransformation::AggregateDimensionSharing
             | PlannerTransformation::CteInline
             | PlannerTransformation::CtePartitionedMaterialization
