@@ -1,0 +1,346 @@
+{
+  "paro-e2-analysis.json": {
+    "archive": "paro-e2-analysis.json.gz",
+    "archive_bytes": 1485,
+    "archive_sha256": "3002fe1518b05c9a22bd348cb32dc18c1911836d4e3e21bf964059b53ee9bd87",
+    "bytes": 6754,
+    "sha256": "720e142959beffdd3387c41e0e74e6c0ad9fa380dc056fb3b680c8b711443e30",
+    "source_path": "/private/tmp/paro-e2-analysis.json"
+  },
+  "paro-e2-clean-tests.log": {
+    "archive": "paro-e2-clean-tests.log.gz",
+    "archive_bytes": 54,
+    "archive_sha256": "33492925794019a50d23c2446defe2ffeb63561dbb458de8d6b1009776dc0b11",
+    "bytes": 101,
+    "sha256": "921b60a7fd52e978fbb551cacd29df2d6708879400278e1fcc70fceeb0c6f8e0",
+    "source_path": "/private/tmp/paro-e2-clean-tests.log"
+  },
+  "paro-e2-contract-tests.log": {
+    "archive": "paro-e2-contract-tests.log.gz",
+    "archive_bytes": 55,
+    "archive_sha256": "17079953dc6491b43a8107d914d290e09a9d5ac679ad9378a07f6d6034886e62",
+    "bytes": 113,
+    "sha256": "d41f3c846ddc49b0edee5f0cc7d1f92afb009ffd88a2bdac06fe9b8c1e024766",
+    "source_path": "/private/tmp/paro-e2-contract-tests.log"
+  },
+  "paro-e2-control-a-run.log": {
+    "archive": "paro-e2-control-a-run.log.gz",
+    "archive_bytes": 556,
+    "archive_sha256": "47fbadefb67ca4b6f595667f163cce8150fd9ed383a68f1d9af023f4267aee68",
+    "bytes": 1011,
+    "sha256": "ec9bccf601117fb5a385a6929a3bdcf8e796f9d44b0470a7125015ae23a1cf96",
+    "source_path": "/private/tmp/paro-e2-control-a-run.log"
+  },
+  "paro-e2-control-b-run.log": {
+    "archive": "paro-e2-control-b-run.log.gz",
+    "archive_bytes": 555,
+    "archive_sha256": "6986332d6d2176a4cdb680f364dffe69fa9908b3fe5ed0960b2af8e5aefd7007",
+    "bytes": 1011,
+    "sha256": "11c5e168645528d06e9a4d725140bf9fec4eb17fc32c469833f8a4e69829dda0",
+    "source_path": "/private/tmp/paro-e2-control-b-run.log"
+  },
+  "paro-e2-duckdb-inspection.json": {
+    "archive": "paro-e2-duckdb-inspection.json.gz",
+    "archive_bytes": 6880,
+    "archive_sha256": "3915b02d0fe99d63ed1239909511b39dccadb01a3e61d08cca44b94fd180141c",
+    "bytes": 178760,
+    "sha256": "a5fed7ac33a3aacfc423877c5a04219707c5a1c703eae9e28ee083b1fbe3a9b6",
+    "source_path": "/private/tmp/paro-e2-duckdb-inspection.json"
+  },
+  "paro-e2-harness-tests.log": {
+    "archive": "paro-e2-harness-tests.log.gz",
+    "archive_bytes": 54,
+    "archive_sha256": "33492925794019a50d23c2446defe2ffeb63561dbb458de8d6b1009776dc0b11",
+    "bytes": 101,
+    "sha256": "921b60a7fd52e978fbb551cacd29df2d6708879400278e1fcc70fceeb0c6f8e0",
+    "source_path": "/private/tmp/paro-e2-harness-tests.log"
+  },
+  "paro-e2-identity-verification.json": {
+    "archive": "paro-e2-identity-verification.json.gz",
+    "archive_bytes": 1058,
+    "archive_sha256": "7e2e101fab1f0dc458056c86bae38746bf45db663d9c2bf58dcafce3520ed93b",
+    "bytes": 2213,
+    "sha256": "d48600c127938468f04b3a6dec5277a4e16213725ff344e6fde48bfebfb20652",
+    "source_path": "/private/tmp/paro-e2-identity-verification.json"
+  },
+  "paro-e2-scalar-control-run.log": {
+    "archive": "paro-e2-scalar-control-run.log.gz",
+    "archive_bytes": 555,
+    "archive_sha256": "640ebce6800e4a7793ff2a34af8a83cd76e65320e58a4a1c3dce1161c810fec7",
+    "bytes": 1011,
+    "sha256": "849b526f948809d16651c8c1af89006d3f8b0e2392576e9b6bb2dcb98af9e3f1",
+    "source_path": "/private/tmp/paro-e2-scalar-control-run.log"
+  },
+  "paro-e2-scalar-summary.json": {
+    "archive": "paro-e2-scalar-summary.json.gz",
+    "archive_bytes": 13024,
+    "archive_sha256": "0d20ffa6b6a0fbb35e8e0b8c2fae3bed94ae4bdaa5691cf51c192df6cf279276",
+    "bytes": 153626,
+    "sha256": "b0255a5a98003292c1151a59fb43b7cd4f019e0c229c9910070fb2879b6a690b",
+    "source_path": "/private/tmp/paro-e2-scalar-summary.json"
+  },
+  "paro-e2-scalar-touch-run.log": {
+    "archive": "paro-e2-scalar-touch-run.log.gz",
+    "archive_bytes": 569,
+    "archive_sha256": "fd258a3f25822327974d354a31325d103bd32937ec41bb3b28ee4a09edc79a28",
+    "bytes": 1036,
+    "sha256": "22ddd3302660e748762072db32351ecc1962af8df6436018e8624a6f044d3497",
+    "source_path": "/private/tmp/paro-e2-scalar-touch-run.log"
+  },
+  "paro-e2-touch-a-run.log": {
+    "archive": "paro-e2-touch-a-run.log.gz",
+    "archive_bytes": 570,
+    "archive_sha256": "b3dd15ba7df83a6767bfffc4ef4a209ec133979253788b3a5b602e1b5ded17d0",
+    "bytes": 1036,
+    "sha256": "a8952a6d65ed66757e811abfff61f2bb9a2c0e71ed8faff019a523d6f218a85a",
+    "source_path": "/private/tmp/paro-e2-touch-a-run.log"
+  },
+  "paro-e2-touch-b-run.log": {
+    "archive": "paro-e2-touch-b-run.log.gz",
+    "archive_bytes": 570,
+    "archive_sha256": "94a9cec79a45b53935789b269a2b9eb2c5ef4a9c16e797892f9a79cae308a818",
+    "bytes": 1036,
+    "sha256": "336abef029bd538e07f1a93da997effba4a6a47234e9e46b0675cb57e6e8a83a",
+    "source_path": "/private/tmp/paro-e2-touch-b-run.log"
+  },
+  "paro-tcwc-e2-control-a.json": {
+    "archive": "paro-tcwc-e2-control-a.json.gz",
+    "archive_bytes": 1630140,
+    "archive_sha256": "97abcaa56c8d013d619f9e0bd5b6e5e151ec2446dc9dc8e361065acc80e1ec36",
+    "bytes": 42045974,
+    "sha256": "80f4d1c1c7e6d26148d2544f7ce5c3459cfed99e397c892ef47de145cd6176b4",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-a.json"
+  },
+  "paro-tcwc-e2-control-a.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e2-control-a.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-a.q11.block000.parod.log"
+  },
+  "paro-tcwc-e2-control-a.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e2-control-a.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-a.q11.block001.parod.log"
+  },
+  "paro-tcwc-e2-control-a.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e2-control-a.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1348576,
+    "archive_sha256": "42136bc411c744d0c03f491e488d53d7dc4c68c5c897e2c0680ced7b33cadc70",
+    "bytes": 55921757,
+    "sha256": "d9be512c90c1c9a4758400e77cc9fc2ec7281e59427d2a7722969cff10991c20",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-a.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e2-control-a.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e2-control-a.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-a.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e2-control-b.json": {
+    "archive": "paro-tcwc-e2-control-b.json.gz",
+    "archive_bytes": 1629133,
+    "archive_sha256": "373afa324869dffe925d16aea7f6ddcbf83feea582b1ca441b58506279993c76",
+    "bytes": 42023978,
+    "sha256": "f287ba250c76260990871675d96bec212c99a95f4f2317a8b2a9be822966a97a",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-b.json"
+  },
+  "paro-tcwc-e2-control-b.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e2-control-b.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-b.q11.block000.parod.log"
+  },
+  "paro-tcwc-e2-control-b.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e2-control-b.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-b.q11.block001.parod.log"
+  },
+  "paro-tcwc-e2-control-b.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e2-control-b.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1344623,
+    "archive_sha256": "b0335b5913adc221364e4b73eca0160a6c1d321b42b349446437afbea2dd4673",
+    "bytes": 55895464,
+    "sha256": "b18689a1b125135f32e9d4161bcc52003cb5e604b8c3c16d976275559f4a759a",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-b.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e2-control-b.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e2-control-b.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-control-b.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e2-scalar-control.json": {
+    "archive": "paro-tcwc-e2-scalar-control.json.gz",
+    "archive_bytes": 1641636,
+    "archive_sha256": "19c849ac411c18c54f3b0e99cd3baf2fb29ca66581c03ffa41421d256d74ede9",
+    "bytes": 42185108,
+    "sha256": "10b71ba985a34873160cb09ba414ebfd9927a19c3dbf0c75102e92d71ac28ef1",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-control.json"
+  },
+  "paro-tcwc-e2-scalar-control.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e2-scalar-control.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-control.q11.block000.parod.log"
+  },
+  "paro-tcwc-e2-scalar-control.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e2-scalar-control.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-control.q11.block001.parod.log"
+  },
+  "paro-tcwc-e2-scalar-control.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e2-scalar-control.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1352095,
+    "archive_sha256": "7b97e263e7b68da243ba7fc5aa0d202f0569e89de19f09dd90933de3d0387951",
+    "bytes": 55969899,
+    "sha256": "24e2142d04466401abada0c097d871c0e44740bb30e2cb8323b804b6ba756e82",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-control.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e2-scalar-control.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e2-scalar-control.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-control.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e2-scalar-touch.json": {
+    "archive": "paro-tcwc-e2-scalar-touch.json.gz",
+    "archive_bytes": 1756371,
+    "archive_sha256": "e416b1a8698c1277227dbef527a8217a3aa4c229ed2d3211ceccad0f14555578",
+    "bytes": 45115705,
+    "sha256": "dc53031a8e223118942b51703f7cfbf066e972f749dba1b9d4536d8bca1f5c1c",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-touch.json"
+  },
+  "paro-tcwc-e2-scalar-touch.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e2-scalar-touch.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-touch.q11.block000.parod.log"
+  },
+  "paro-tcwc-e2-scalar-touch.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e2-scalar-touch.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-touch.q11.block001.parod.log"
+  },
+  "paro-tcwc-e2-scalar-touch.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e2-scalar-touch.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1532421,
+    "archive_sha256": "52f05b55795d2336fa96e48ead6b06067cea863f2501dec33d3182b2a6bea8b2",
+    "bytes": 63780283,
+    "sha256": "a4e123302ef48f5bf48f58e907d91a639188655a64e614dd55ea426c016fb78b",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-touch.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e2-scalar-touch.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e2-scalar-touch.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-scalar-touch.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e2-touch-a.json": {
+    "archive": "paro-tcwc-e2-touch-a.json.gz",
+    "archive_bytes": 1743721,
+    "archive_sha256": "c1d50dd1be8e5bf82bdc79edc3803f96b15dca55f2f0ca2cfd8875c431d1f488",
+    "bytes": 44962180,
+    "sha256": "99e39dd957fd20bd66e1bf2ee28979cc2e8edb6fc0b6c8a0516160bd59eb4694",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-a.json"
+  },
+  "paro-tcwc-e2-touch-a.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e2-touch-a.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-a.q11.block000.parod.log"
+  },
+  "paro-tcwc-e2-touch-a.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e2-touch-a.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-a.q11.block001.parod.log"
+  },
+  "paro-tcwc-e2-touch-a.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e2-touch-a.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1532725,
+    "archive_sha256": "f3e2d3ba7722636e701f1780b5c0fbbc7fc7dfe95ff3347eceb24838c20a7c51",
+    "bytes": 63743954,
+    "sha256": "09a637cd5d2ddbeabef87190bd9515700060185e60e77d22e701fbe4bb98917a",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-a.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e2-touch-a.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e2-touch-a.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-a.q11.oracle.parod.log"
+  },
+  "paro-tcwc-e2-touch-b.json": {
+    "archive": "paro-tcwc-e2-touch-b.json.gz",
+    "archive_bytes": 1743663,
+    "archive_sha256": "32dddcb3038508f54e896405a534fb2b50198c0b496cdab1ce0fff932e162a6c",
+    "bytes": 44962175,
+    "sha256": "c2c5001b9d1348e14f2889485f9a909b130985b3013004c516904a41bd06b6d1",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-b.json"
+  },
+  "paro-tcwc-e2-touch-b.q11.block000.parod.log": {
+    "archive": "paro-tcwc-e2-touch-b.q11.block000.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-b.q11.block000.parod.log"
+  },
+  "paro-tcwc-e2-touch-b.q11.block001.parod.log": {
+    "archive": "paro-tcwc-e2-touch-b.q11.block001.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-b.q11.block001.parod.log"
+  },
+  "paro-tcwc-e2-touch-b.q11.diagnostic000.parod.log": {
+    "archive": "paro-tcwc-e2-touch-b.q11.diagnostic000.parod.log.gz",
+    "archive_bytes": 1530306,
+    "archive_sha256": "588a6d92bb5957d10f0ed53af2d16393acb13ebb997233efc28bc6da09089b92",
+    "bytes": 63743950,
+    "sha256": "3552495621e7ba321f4c4c70fcb7e4e009266f3172d275173b40aee03f896a1b",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-b.q11.diagnostic000.parod.log"
+  },
+  "paro-tcwc-e2-touch-b.q11.oracle.parod.log": {
+    "archive": "paro-tcwc-e2-touch-b.q11.oracle.parod.log.gz",
+    "archive_bytes": 20,
+    "archive_sha256": "ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_path": "/private/tmp/paro-tcwc-e2-touch-b.q11.oracle.parod.log"
+  }
+}
