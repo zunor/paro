@@ -60,3 +60,21 @@ per-rule published counts, exact final choices/fingerprints, N and final admitte
 fingerprint first. A timing difference in this small sequential pilot cannot
 certify W NI. If Q11 rejection counts are unchanged, report no demonstrated
 benefit on the requested path, not sixty avoided bindings.
+
+## P1 additional bounded attribution, before its measured queries
+
+Width1/2 changed logical work and admitted plans; width4/8 changed combination
+history even when the final fingerprint matched. These points cannot uniquely
+identify fixed kernel versus per-frontier cost. Add two opt-in cumulative
+monotonic wall timers, no per-tuple events: (1) child summary reads, local fit,
+task supply, source composition and both grant constraints; (2) cached candidate
+admission including preview, witness construction and Memo insertion. Timers are
+disjoint, include rejected/error/continue paths, and exclude subsequent parent
+wakeups. Their sum is NOT total physical search. Remaining time is not assigned
+to hypothetical cache misses or scheduling without evidence.
+
+Run same binary, snapshot OFF, timing OFF/ON/OFF, two fresh blocks/report plus
+one separate diagnostic. Compare exact N/choices/fingerprints and optimizer
+overhead; >10% repeatable perturbation invalidates attribution. No production
+policy/budget/model changes. If neither measured bucket dominates, do not start
+P3-A/B simply because one was proposed. Report residual as unattributed.

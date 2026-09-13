@@ -7,6 +7,33 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+// P1-only bounded timing. Owned guards survive error/continue paths without
+// borrowing the engine; no per-candidate events or heap allocations.
+#[derive(Default)]
+struct CostPhaseTimes([std::sync::atomic::AtomicU64; 2]);
+struct CostPhaseTimer {
+    times: Arc<CostPhaseTimes>,
+    phase: usize,
+    started: Instant,
+}
+impl CostPhaseTimer {
+    fn start(times: &Option<Arc<CostPhaseTimes>>, phase: usize) -> Option<Self> {
+        times.as_ref().map(|times| Self {
+            times: Arc::clone(times),
+            phase,
+            started: Instant::now(),
+        })
+    }
+}
+impl Drop for CostPhaseTimer {
+    fn drop(&mut self) {
+        self.times.0[self.phase].fetch_add(
+            self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
 use smallvec::SmallVec;
@@ -1143,6 +1170,7 @@ pub struct CascadesEngine {
     child_combination_new_count: u64,
     child_combination_recompute_count: u64,
     child_combination_cost_synthesis_count: u64,
+    diagnostic_cost_phase_times: Option<Arc<CostPhaseTimes>>,
     child_combination_frontier_recheck_count: u64,
     child_combination_budget_rejection_count: u64,
     certified_bound_check_count: u64,
@@ -1322,6 +1350,9 @@ impl CascadesEngine {
             child_combination_new_count: 0,
             child_combination_recompute_count: 0,
             child_combination_cost_synthesis_count: 0,
+            diagnostic_cost_phase_times: (std::env::var_os("PARO_DIAGNOSTIC_COST_PHASE_TIMES")
+                .as_deref() == Some(std::ffi::OsStr::new("1")))
+            .then(|| Arc::new(CostPhaseTimes::default())),
             child_combination_frontier_recheck_count: 0,
             child_combination_budget_rejection_count: 0,
             certified_bound_check_count: 0,
@@ -5542,6 +5573,8 @@ impl CascadesEngine {
                 "child_combination_cost_synthesis_count",
                 self.child_combination_cost_synthesis_count,
             ),
+            ("diagnostic_cost_kernel_ns", self.diagnostic_cost_phase_times.as_ref().map_or(0, |t| t.0[0].load(std::sync::atomic::Ordering::Relaxed))),
+            ("diagnostic_candidate_admission_ns", self.diagnostic_cost_phase_times.as_ref().map_or(0, |t| t.0[1].load(std::sync::atomic::Ordering::Relaxed))),
             (
                 "child_combination_frontier_recheck_count",
                 self.child_combination_frontier_recheck_count,
@@ -8030,6 +8063,7 @@ impl CascadesEngine {
         children: &[CandidateId],
         count_recheck: bool,
     ) -> Result<(bool, bool, Option<CandidateId>)> {
+        let _admission_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 1);
         let Some(cached) = state.priced.get_mut(children) else {
             return Err(paro_error::internal(
                 "priced child combination disappeared before frontier admission",
@@ -8597,6 +8631,7 @@ impl CascadesEngine {
                     combination_state.budget_rejected.remove(&child_ids);
                 }
                 child_selections.clear();
+                let kernel_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 0);
                 child_selections.extend(children.iter().copied());
                 child_costs.clear();
                 child_fingerprints.clear();
@@ -8679,6 +8714,7 @@ impl CascadesEngine {
                     continue;
                 };
                 cost = constrained_cost;
+                drop(kernel_timer);
                 if self.collect_rule_work_profile {
                     self.note_candidate_lifecycle(CandidateLifecycleEvent {
                         stage: CandidateLifecycleStage::TuplePriced,

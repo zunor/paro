@@ -4671,8 +4671,11 @@ fn parent_costs_every_source_sensitive_child_frontier_candidate() {
         .register_implementation(SourceSensitiveAlternativeImplementation)
         .unwrap();
     let mut engine = CascadesEngine::new(memo, registry);
+    let phase_times = Arc::new(CostPhaseTimes::default());
+    engine.diagnostic_cost_phase_times = Some(Arc::clone(&phase_times));
 
     let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
+    assert!(phase_times.0.iter().all(|n| n.load(std::sync::atomic::Ordering::Relaxed) > 0));
 
     // Independent exhaustive oracle: remove each candidate's source phase
     // from its complete cost, apply the proven absolute survivor ratio once,
