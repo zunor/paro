@@ -1611,6 +1611,7 @@ dependencies = [
  "dirs",
  "figment",
  "humantime-serde",
+ "libc",
  "memchr",
  "parking_lot",
  "serde",

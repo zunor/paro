@@ -19,6 +19,7 @@ test-support = []
 [dependencies]
 thiserror = { workspace = true }
 bytes = { workspace = true }
+libc = "0.2"
 
 # Configuration system
 serde = { workspace = true }

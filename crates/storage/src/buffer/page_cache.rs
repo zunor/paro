@@ -723,6 +723,8 @@ impl PageCache {
                 return Ok(None);
             };
 
+            let _cold_work = paro_common::cold_work::WorkScope::new(paro_common::cold_work::Kind::BufferFill, size);
+
             // SAFETY: this newly allocated buffer is pinned by `buffer` and
             // is not reachable from the cache until initialization succeeds.
             let initialize_result = unsafe {
@@ -1027,6 +1029,7 @@ impl PageCache {
         kind: PageContentKind,
         data: &[u8],
     ) -> Result<(BufferHandle, SharedBlockHandle)> {
+        let _cold_work = paro_common::cold_work::WorkScope::new(paro_common::cold_work::Kind::BufferFill, data.len());
         if data.is_empty() {
             return Err(paro_error::invalid_input("page data is empty"));
         }

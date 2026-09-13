@@ -394,6 +394,7 @@ def collect_statement_cache_evidence(
             "occurrence": occurrence,
             "cache_hit": cache_hit,
             "compile_work": compile_work,
+            "execution_work": execution_work_from_rows(rows, indexes, fingerprint),
             "source": "paro_optimizers_post_timer_side_channel",
         }
     except (IndexError, KeyError, TypeError, ValueError, psycopg.Error) as error:
@@ -402,6 +403,28 @@ def collect_statement_cache_evidence(
             "query_fingerprint": fingerprint,
             "reason": f"post-timer cache decision could not be read: {error}",
         }
+
+
+def execution_work_from_rows(rows: list[Any], indexes: dict[str, int], fingerprint: int) -> dict[str, Any]:
+    prefix = f"statement_execution_work/{fingerprint:016x}/"
+    records: dict[int, dict[str, int]] = {}
+    for row in rows:
+        name = str(row[indexes["name"]])
+        if str(row[indexes["kind"]]) != "evidence" or not name.startswith(prefix):
+            continue
+        identity, metric = name[len(prefix):].split("/", 1)
+        records.setdefault(int(identity), {})[metric] = int(row[indexes["metric_value"]])
+    if not records:
+        return {}
+    latest = max(records)
+    return {"query_fingerprint": fingerprint, "execution_id": latest, "metrics": records[latest]}
+
+
+def collect_execution_work(connection: psycopg.Connection[Any], query: str) -> dict[str, Any]:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM paro_optimizers()")
+        indexes = {column.name.rsplit(".", 1)[-1]: i for i, column in enumerate(cursor.description or ())}
+        return execution_work_from_rows(cursor.fetchall(), indexes, statement_fingerprint(query))
 
 
 def run_paro(
@@ -679,6 +702,7 @@ def main() -> int:
                 "RUST_LOG": os.environ.get("RUST_LOG"),
                 "PARO_STATEMENT_CACHE_EVIDENCE": "1",
                 "PARO_COMPILE_WORK_EVIDENCE": os.environ.get("PARO_COMPILE_WORK_EVIDENCE"),
+                "PARO_COLD_WORK_EVIDENCE": os.environ.get("PARO_COLD_WORK_EVIDENCE"),
                 # Explicit diagnostic-only search deadline.  An absent value
                 # means the production/default policy was used; keep this in
                 # the report so a checkpoint run cannot be mistaken for a
@@ -923,6 +947,7 @@ def main() -> int:
                             "cold_miss_evidence": cold_cache_evidence,
                             "measurement_round_orders": round_orders,
                             "paro_ms": [],
+                            "paro_execution_work": [],
                             "duckdb_ms": [],
                             "paro_server": block_server.identity(),
                             "duckdb_process": duck_process.identity,
@@ -941,6 +966,8 @@ def main() -> int:
                                 samples[engine].append(elapsed_ms)
                                 sample_digests[engine].append(digest)
                                 block[f"{engine}_ms"].append(round(elapsed_ms, 6))
+                                if engine == "paro" and os.environ.get("PARO_COLD_WORK_EVIDENCE") == "1":
+                                    block["paro_execution_work"].append(collect_execution_work(paro, query))
                     finally:
                         paro.close()
                 trace_events = parse_statement_trace_log(block_log)

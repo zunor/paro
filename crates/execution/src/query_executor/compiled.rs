@@ -136,6 +136,12 @@ impl CompiledStatement {
     pub fn shares_image_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.image, &other.image)
     }
+
+    /// Process-local identity only, for exact cold/warm image correlation.
+    /// Not a stable physical fingerprint or proof of plan quality.
+    pub fn diagnostic_image_identity(&self) -> u64 {
+        Arc::as_ptr(&self.image) as usize as u64
+    }
 }
 
 fn statement_program_dependencies_available(

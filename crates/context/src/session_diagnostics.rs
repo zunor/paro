@@ -77,9 +77,30 @@ pub struct SessionDiagnostics {
     optimizer: RwLock<Vec<OptimizerDiagnostic>>,
     statement_trace: RwLock<Option<StatementTraceSnapshot>>,
     statement_cache: RwLock<Vec<StatementCacheDecision>>,
+    execution_work: RwLock<Vec<ExecutionWorkRecord>>,
+    execution_sequence: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionWorkRecord {
+    pub query_fingerprint: u64,
+    /// Session-monotonic actual execution identity, including prepared warm runs.
+    /// It is intentionally not the plan-cache lookup occurrence.
+    pub execution_id: u64,
+    pub image_id: u64,
+    pub snapshot: paro_common::cold_work::Snapshot,
 }
 
 impl SessionDiagnostics {
+    pub fn publish_execution_work(&self, query_fingerprint: u64, image_id: u64, snapshot: paro_common::cold_work::Snapshot) {
+        let execution_id = self.execution_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut records = self.execution_work.write().unwrap();
+        records.push(ExecutionWorkRecord { query_fingerprint, execution_id, image_id, snapshot });
+        if records.len() > 64 { records.remove(0); }
+    }
+    pub fn execution_work_snapshot(&self) -> Vec<ExecutionWorkRecord> {
+        self.execution_work.read().unwrap().clone()
+    }
     pub fn publish_optimizer(&self, entries: Vec<OptimizerDiagnostic>) {
         *self.optimizer.write().unwrap() = entries;
     }

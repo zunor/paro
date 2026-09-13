@@ -1094,6 +1094,17 @@ fn populate_paro_optimizers(
                 });
             }
         }
+        for record in ctx.diagnostics.execution_work_snapshot() {
+            for (name, value) in record.snapshot.rows().into_iter().chain(std::iter::once(("image_id".into(), record.image_id))) {
+                entries.push(OptimizerData {
+                    name: format!("statement_execution_work/{:016x}/{}/{}", record.query_fingerprint, record.execution_id, name),
+                    kind: "evidence".into(), last_elapsed_us: 0,
+                    metric_value: i64::try_from(value).unwrap_or(i64::MAX),
+                    metric_unit: if name.ends_with("_bytes") { "bytes" } else if name.ends_with("_ns") { "nanoseconds" } else if name.ends_with("_us") { "microseconds" } else { "count" }.into(),
+                    invocation_count: 1,
+                });
+            }
+        }
         populate_optimizer_data(state, entries);
     }
 }

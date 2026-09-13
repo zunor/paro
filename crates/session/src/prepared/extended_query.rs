@@ -1013,6 +1013,9 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
         }
         if message.max_rows <= 0 && matches!(portal.scroll_mode, ScrollMode::NoScroll) {
             let execution_started = Instant::now();
+            let cold_work = paro_common::cold_work::Window::begin();
+            let cold_diagnostics = cold_work.as_ref().map(|_| snapshot.diagnostics.clone());
+            let cold_image = cold_work.as_ref().map(|_| execution.statement().diagnostic_image_identity());
             let executor = Executor::new(snapshot);
             session.set_executor(executor);
             let mut stream = session.get_executor().execute(execution)?;
@@ -1044,6 +1047,9 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
                 trace.record_span("execution", "fetch_drain", fetch_started);
                 trace.record_value("execution", "rows_returned", row_count as u64);
                 trace.record_span("execution", "portal_execution", execution_started);
+            }
+            if let (Some(window), Some(diagnostics)) = (cold_work, cold_diagnostics) {
+                diagnostics.publish_execution_work(statement_fingerprint(portal.source_sql.as_ref()), cold_image.unwrap(), window.finish());
             }
             portal.execution_state = PortalExecutionState::Exhausted {
                 position: row_count as i64,

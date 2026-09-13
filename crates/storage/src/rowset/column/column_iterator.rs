@@ -748,6 +748,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         expected_num_elements: u32,
         page_pointer: crate::rowset::page::PagePointer,
     ) -> Result<PageDecoderImpl> {
+        let _cold_work = paro_common::cold_work::WorkScope::new(paro_common::cold_work::Kind::Decoder, data.len());
         let mut decoder = match self.meta.encoding {
             EncodingType::Plain => {
                 if self.meta.field_type == crate::rowset::encoding::FieldType::Vector {
