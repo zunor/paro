@@ -45,6 +45,51 @@ struct NarrowRule(RuleId);
 
 struct DomainRule;
 
+struct CountSelectedBindings(Arc<std::sync::atomic::AtomicUsize>);
+impl TransformationRule for CountSelectedBindings {
+    fn id(&self) -> RuleId { crate::cascades::rules::PREDICATE_TRANSFER_RULE }
+    fn matches_root(&self, _: &crate::cascades::memo::LogicalExpr) -> bool { false }
+    fn matches(&self, _: &crate::cascades::memo::LogicalExpr, _: &RuleContext<'_>) -> bool { false }
+    fn apply(&self, _: LogicalExprId, _: &mut TransformContext<'_>) -> Result<Box<[EquivalentExpression]>> {
+        Ok(Box::new([]))
+    }
+    fn selected_quality_bindings(&self, _: &Memo, _: &FrozenCandidate) -> Result<Box<[PatternBinding]>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Box::new([]))
+    }
+}
+
+#[test]
+fn quality_request_rejects_before_binding_construction_but_reopens_stale_reads() {
+    use crate::cascades::quality::BundleFact::{PredicateDomain, JoinRegion, CteConsumerDemand};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for reverse in [false, true] {
+        let mut f = Fixture::new(reverse, [101, 102, 103]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        f.engine.registry.register_transformation(CountSelectedBindings(calls.clone())).unwrap();
+        let evidence = f.evidence([true, true]);
+        // Independent ranking oracle: smaller number of missing facts wins;
+        // equal cost/identity leaves the existing request and its payload intact.
+        for (missing, expected) in [
+            (vec![PredicateDomain, JoinRegion], 1),
+            (vec![PredicateDomain, JoinRegion], 1),
+            (vec![PredicateDomain, JoinRegion, CteConsumerDemand], 1),
+            (vec![PredicateDomain], 2),
+        ] {
+            f.engine.record_quality_production_request(f.goal, &f.frozen, f.reads, &evidence, &missing).unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), expected);
+        }
+        // Only a child fact changes. Ranking cannot authorize retention of
+        // stale work; a worse request must still rebuild in the new context.
+        f.engine.memo.group_mut(f.regions[0]).unwrap().logical_properties.maximum_cardinality = Some(1);
+        let reads = f.engine.winner_fact_reads(f.frozen.reference.group, &f.frozen.winner).unwrap();
+        let reads = f.engine.task_registry.intern_read_set(reads);
+        assert_ne!(reads, f.reads);
+        f.engine.record_quality_production_request(f.goal, &f.frozen, reads, &evidence, &[PredicateDomain, JoinRegion]).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+}
+
 impl TransformationRule for DomainRule {
     fn id(&self) -> RuleId {
         RuleId(201)

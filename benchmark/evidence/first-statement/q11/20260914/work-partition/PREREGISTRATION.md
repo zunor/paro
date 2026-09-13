@@ -44,3 +44,14 @@ production/freeze/read scopes (same ledger, no events), before conditional
 implementation. Repeat OFF/ON/OFF on the refined clean binary; same gates and
 sample counts. Keep first partition artifacts. Do not substitute diagnostic
 freeze2.092ms for the trace-off bucket; its cohort is separate.
+
+Conditional implementation preregistration: refined B11 totals18.3ms, about
+46% of the proposed39.5ms gap; its production request portion is8.24ms.
+Move the existing current-read-set/preference rejection ahead of selected-path
+binding construction. No new cache, identity, policy or search-space change.
+The comparison is independent of binding payloads. Stale facts still replace
+the request even if it ranks worse. Test equal/worse/better requests and child
+fact invalidation with counted binding construction, then engine RF/work/span/
+budget/cancellation tests. Probe OFF/ON/OFF uses the same protocol; preserve
+full counts, fingerprints and captured candidate payloads. Any change in
+logical/physical counts must be explained, not accepted as automatic savings.

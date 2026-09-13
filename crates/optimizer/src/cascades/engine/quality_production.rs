@@ -196,6 +196,20 @@ impl CascadesEngine {
         else {
             return Ok(());
         };
+        // Request preference depends on its obligations/cost/identity, not on
+        // the selected-path binding payload. Keep the existing validated
+        // request before constructing bindings that would immediately be
+        // discarded. A stale read set still requires a replacement, even if
+        // the new request ranks worse; this is not a quality certificate cache.
+        if let Some(previous) = self.quality_production_requests.get(&goal) {
+            let current = self
+                .task_registry
+                .read_set(previous.reads)
+                .is_some_and(|reads| reads.is_current(&self.memo).is_ok_and(|current| current));
+            if current && !request.prefers(previous) {
+                return Ok(());
+            }
+        }
         if missing.contains(&BundleFact::PredicateDomain)
             && self
                 .memo
@@ -209,15 +223,6 @@ impl CascadesEngine {
                 .map(|rule| rule.selected_quality_bindings(&self.memo, frozen))
                 .transpose()?
                 .unwrap_or_default();
-        }
-        if let Some(previous) = self.quality_production_requests.get(&goal) {
-            let current = self
-                .task_registry
-                .read_set(previous.reads)
-                .is_some_and(|reads| reads.is_current(&self.memo).is_ok_and(|current| current));
-            if current && !request.prefers(previous) {
-                return Ok(());
-            }
         }
         self.quality_forced_transform_bindings
             .retain(|(entry_goal, _), _| *entry_goal != goal);
