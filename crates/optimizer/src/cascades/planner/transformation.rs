@@ -1183,16 +1183,16 @@ fn expression_is_only_rule_output(expr: &crate::cascades::memo::LogicalExpr, rul
 }
 
 /// Native shell staging is an admission decision, not a generic conversion
-/// shortcut.  PredicateTransfer's direct shell is allowed only for the
-/// separately proven local subset; its complete semantic peer still needs the
-/// settlement path because that path carries producer/consumer ownership and
-/// residual predicate facts.  Treating every closed owned tree as a shell was
-/// the Q11 quality regression: it preserved an executable plan while dropping
-/// the narrow date-domain/partial-aggregate choice.
+/// shortcut.  A semantic peer may use it only after the owned rewrite has
+/// retained the exact Memo-hole contract; the direct native producer still
+/// remains a separate, conservative candidate.  In particular, this does not
+/// make a partial native PredicateTransfer authoritative: the owned semantic
+/// peer is still constructed and staged as its own alternative.
 fn native_shell_staging_allowed(transformation: PlannerTransformation) -> bool {
     matches!(
         transformation,
-        PlannerTransformation::JoinRegionEnumeration
+        PlannerTransformation::PredicateTransfer
+            | PlannerTransformation::JoinRegionEnumeration
             | PlannerTransformation::AggregateDimensionDeferral
             | PlannerTransformation::AggregateJoinSubsumption
             | PlannerTransformation::AggregateDimensionSharing
@@ -4865,8 +4865,8 @@ mod tests {
     }
 
     #[test]
-    fn predicate_transfer_semantic_peer_keeps_ownership_settlement() {
-        assert!(!native_shell_staging_allowed(
+    fn predicate_transfer_closed_semantic_peer_uses_native_shell() {
+        assert!(native_shell_staging_allowed(
             PlannerTransformation::PredicateTransfer
         ));
         assert!(native_shell_staging_allowed(
