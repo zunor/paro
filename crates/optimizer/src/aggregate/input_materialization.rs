@@ -68,6 +68,19 @@ pub(crate) fn recognizes_aggregate<Child>(operator: &LogicalOperator<Child>) -> 
     })
 }
 
+/// Share the exact scalar/liveness contract with native transformation
+/// producers.  Placement remains a relational proof owned by the caller, but
+/// the decision that an aggregate input is safe and actually narrowing must
+/// not be reimplemented in a second rule path.
+pub(crate) fn is_materializable_candidate(
+    candidate: &Expression,
+    groups: &[Expression],
+    aggregates: &[Expression],
+) -> bool {
+    aggregate_input_is_narrowing_total(candidate)
+        && inputs_are_dead_outside_candidate(candidate, groups, aggregates)
+}
+
 struct MaterializedInput {
     binding_map: HashMap<ColumnBinding, ColumnBinding>,
     binding: ColumnBinding,

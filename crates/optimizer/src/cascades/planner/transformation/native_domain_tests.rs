@@ -3,6 +3,7 @@
 
 use super::*;
 use paro_common::types::LogicalType;
+use paro_function::scalar::FunctionErrorMode;
 use paro_planner::expression::{
     AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType,
     ConstantExpression, FunctionExpression,
@@ -1299,6 +1300,127 @@ fn production_topn_binding_uses_native_shell_without_owned_settlement() {
             .operator,
         LogicalOperator::TopN(_)
     ));
+}
+
+#[test]
+fn production_input_materialization_uses_native_shell_without_owned_settlement() {
+    let mut arithmetic = paro_function::scalar::ScalarFunctionSet::new("-".into());
+    paro_function::scalar::operators::arithmetic::register_arithmetic_functions(&mut arithmetic);
+    let (subtract, _) = arithmetic
+        .bind(&[LogicalType::Integer, LogicalType::Integer])
+        .unwrap();
+    let subtract = paro_function::scalar::BoundScalarFunction::from(subtract)
+        .with_error_mode(FunctionErrorMode::Infallible);
+    let difference = Expression::Function(
+        FunctionExpression::new(
+            subtract.clone(),
+            vec![column(0, 1), column(0, 2)],
+            LogicalType::Integer,
+        )
+        .into(),
+    );
+    let right_difference = Expression::Function(
+        FunctionExpression::new(
+            subtract,
+            vec![column(1, 1), column(1, 2)],
+            LogicalType::Integer,
+        )
+        .into(),
+    );
+    let (sum, _) = paro_function::aggregate::distributive::sum::get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .unwrap();
+    let left = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            0,
+            vec![],
+            vec!["key".into(), "x".into(), "y".into()],
+            vec![LogicalType::Integer; 3],
+        ),
+    ));
+    let right = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        paro_planner::operator::ExpressionGet::new(
+            1,
+            vec![],
+            vec!["key".into(), "u".into(), "v".into()],
+            vec![LogicalType::Integer; 3],
+        ),
+    ));
+    let join = Join::comparison(
+        JoinType::Inner,
+        left,
+        right,
+        vec![paro_planner::operator::JoinCondition::equality(
+            column(0, 0),
+            column(1, 0),
+        )],
+    );
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        OwnedLogicalPlan::synthetic(LogicalOperator::Join(join)),
+        vec![column(1, 0)],
+        vec![],
+        vec![
+            Expression::Aggregate(
+                AggregateExpression::new(sum.clone(), vec![difference], LogicalType::BigInt)
+                    .into(),
+            ),
+            Expression::Aggregate(
+                AggregateExpression::new(sum, vec![right_difference], LogicalType::BigInt).into(),
+            ),
+        ],
+        vec![],
+    );
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate)));
+    let (mut engine, state, root) = frozen_selected(plan);
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::AggregateInputMaterialization,
+        planner_state: state.clone(),
+    };
+    let bindings = rule
+        .bindings(
+            root.logical.id,
+            &RuleContext {
+                memo: engine.memo(),
+                group: root.reference.group,
+            },
+        )
+        .unwrap();
+    assert_eq!(bindings.bindings.len(), 1);
+    let arena_before = state.read().unwrap().staging_arena.len();
+    let mut context = TransformContext::new(engine.memo_mut(), root.reference.group);
+    let outputs = rule
+        .apply_binding(&bindings.bindings[0], &mut context)
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        state.read().unwrap().staging_arena.len(),
+        arena_before,
+        "aggregate input materialization must not round-trip through the owned arena"
+    );
+    let state = state.read().unwrap();
+    let LogicalOperator::Aggregate(aggregate) = &state.payloads.logical[outputs[0].payload.index()]
+        .semantic_template
+        .operator
+    else {
+        panic!("native materialization must preserve the aggregate root");
+    };
+    assert_eq!(
+        aggregate
+            .aggregates
+            .iter()
+            .filter(|expression| {
+                let Expression::Aggregate(aggregate) = *expression else {
+                    return false;
+                };
+                matches!(aggregate.children.as_slice(), [Expression::ColumnRef(column)] if column.binding.column_index == 3)
+            })
+            .count(),
+        2,
+        "each independent join side must receive its own native materialization"
+    );
 }
 
 #[test]

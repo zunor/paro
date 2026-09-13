@@ -556,6 +556,7 @@ impl TransformationRule for PlannerTransformationRule {
                 | PlannerTransformation::TopNIntroduction
                 | PlannerTransformation::JoinRegionEnumeration
                 | PlannerTransformation::AggregateDimensionDeferral
+                | PlannerTransformation::AggregateInputMaterialization
                 | PlannerTransformation::AggregateDimensionSharing
         ) {
             let state = self
@@ -612,6 +613,11 @@ impl TransformationRule for PlannerTransformationRule {
                         .into_iter()
                         .collect()
                 }
+                PlannerTransformation::AggregateInputMaterialization => {
+                    try_native_input_materialization(&binding.root, ctx.memo(), &state, &facts)?
+                        .into_iter()
+                        .collect()
+                }
                 PlannerTransformation::AggregateDimensionSharing => {
                     try_native_dimension_sharing(&binding.root, ctx.memo(), &state, &facts)?
                         .into_iter()
@@ -660,6 +666,7 @@ impl TransformationRule for PlannerTransformationRule {
                         | PlannerTransformation::LimitPushdown
                         | PlannerTransformation::TopNIntroduction
                         | PlannerTransformation::AggregateDimensionDeferral
+                        | PlannerTransformation::AggregateInputMaterialization
                         | PlannerTransformation::AggregateDimensionSharing
                 ))
                 && !direct_native.is_empty();
@@ -1542,6 +1549,443 @@ fn native_shell_child_stats(nodes: &[NativeNode], child: &NativeChild) -> NodeSt
             .unwrap_or_default(),
         NativeChild::MemoGroup { stats, .. } | NativeChild::Group { stats, .. } => stats.clone(),
     }
+}
+
+fn native_shell_child_names(
+    nodes: &[NativeNode],
+    child: &NativeChild,
+) -> Result<Arc<[String]>> {
+    match child {
+        NativeChild::MemoGroup { names, .. } | NativeChild::Group { names, .. } => {
+            Ok(names.clone())
+        }
+        NativeChild::Node(index) => {
+            let operator = nodes
+                .get(*index)
+                .ok_or_else(|| paro_error::internal("native rewrite references unknown node"))?
+                .operator
+                .clone();
+            let mut children = Vec::new();
+            operator.visit_child_links(&mut |child| children.push(child.clone()));
+            let child_names = children
+                .iter()
+                .map(|child| native_shell_child_names(nodes, child))
+                .collect::<Result<Vec<_>>>()?;
+            let child_names = child_names
+                .iter()
+                .map(|names| names.as_ref())
+                .collect::<Vec<_>>();
+            Ok(operator.output_names_from_child_refs(&child_names).into())
+        }
+    }
+}
+
+fn native_shell_layouts_for_nodes(
+    nodes: &[NativeNode],
+) -> Result<Vec<paro_planner::operator::LogicalOutputLayout>> {
+    fn visit(
+        index: usize,
+        nodes: &[NativeNode],
+        layouts: &mut [Option<paro_planner::operator::LogicalOutputLayout>],
+        marks: &mut [u8],
+    ) -> Result<paro_planner::operator::LogicalOutputLayout> {
+        let mark = *marks
+            .get(index)
+            .ok_or_else(|| paro_error::internal("native rewrite references an unknown node"))?;
+        match mark {
+            1 => return Err(paro_error::internal("native shell contains a child cycle")),
+            2 => {
+                return layouts[index]
+                    .clone()
+                    .ok_or_else(|| paro_error::internal("native shell layout is missing"));
+            }
+            _ => {}
+        }
+        marks[index] = 1;
+        let operator = nodes
+            .get(index)
+            .ok_or_else(|| paro_error::internal("native rewrite references an unknown node"))?
+            .operator
+            .clone();
+        let mut children = Vec::new();
+        operator.visit_child_links(&mut |child| children.push(child.clone()));
+        let child_layouts = children
+            .iter()
+            .map(|child| match child {
+                NativeChild::Node(index) => visit(*index, nodes, layouts, marks),
+                NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
+                    Ok(layout.clone())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let child_layouts = child_layouts.iter().collect::<Vec<_>>();
+        let layout = operator.output_layout_from_child_refs(&child_layouts);
+        layouts[index] = Some(layout.clone());
+        marks[index] = 2;
+        Ok(layout)
+    }
+
+    let mut layouts = vec![None; nodes.len()];
+    let mut marks = vec![0_u8; nodes.len()];
+    for index in 0..nodes.len() {
+        visit(index, nodes, &mut layouts, &mut marks)?;
+    }
+    layouts
+        .into_iter()
+        .map(|layout| layout.ok_or_else(|| paro_error::internal("native shell layout is missing")))
+        .collect()
+}
+
+fn native_expression_bindings(expression: &Expression) -> Option<HashSet<ColumnBinding>> {
+    let mut bindings = HashSet::new();
+    let mut valid = true;
+    crate::expression::traversal::visit_expression(expression, &mut |expression| {
+        if let Expression::ColumnRef(column) = expression {
+            if column.depth != 0 {
+                valid = false;
+            } else {
+                bindings.insert(column.binding);
+            }
+        }
+    });
+    (valid && !bindings.is_empty()).then_some(bindings)
+}
+
+fn native_expression_uses_any_binding(
+    expression: &Expression,
+    bindings: &HashSet<ColumnBinding>,
+) -> bool {
+    let mut used = false;
+    crate::expression::traversal::visit_expression(expression, &mut |expression| {
+        if matches!(
+            expression,
+            Expression::ColumnRef(column)
+                if column.depth == 0 && bindings.contains(&column.binding)
+        ) {
+            used = true;
+        }
+    });
+    used
+}
+
+fn native_materialization_side(
+    join: &paro_planner::operator::ComparisonJoin<NativeChild>,
+    candidate: &Expression,
+    left_layout: &paro_planner::operator::LogicalOutputLayout,
+    right_layout: &paro_planner::operator::LogicalOutputLayout,
+) -> Option<bool> {
+    let bindings = native_expression_bindings(candidate)?;
+    if join.conditions.iter().any(|condition| {
+        native_expression_uses_any_binding(&condition.left, &bindings)
+            || native_expression_uses_any_binding(&condition.right, &bindings)
+    }) || join.duplicate_eliminated_columns.iter().any(|expression| {
+        native_expression_uses_any_binding(expression, &bindings)
+    }) {
+        return None;
+    }
+    let left = left_layout.bindings().iter().copied().collect::<HashSet<_>>();
+    if bindings.is_subset(&left) {
+        return Some(true);
+    }
+    let right = right_layout
+        .bindings()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    bindings.is_subset(&right).then_some(false)
+}
+
+/// Materialize the exact candidate at one inner-join input.  The projection
+/// preserves every existing child column and appends one immutable computed
+/// column; the join and aggregate expressions are rebound together before the
+/// shell is published.  This is the same all-or-nothing liveness proof as the
+/// owned rule, but it never detaches the matched Memo shell.
+fn native_materialize_candidate(
+    nodes: &mut Vec<NativeNode>,
+    root_index: usize,
+    join_index: usize,
+    left_side: bool,
+    candidate: &Expression,
+    layouts: &[paro_planner::operator::LogicalOutputLayout],
+    state: &PlannerTransformState,
+) -> Result<bool> {
+    let join = match nodes
+        .get(join_index)
+        .ok_or_else(|| paro_error::internal("native materialization lost its join"))?
+        .operator
+        .clone()
+    {
+        LogicalOperator::Join(Join::Comparison(join)) => join,
+        _ => return Ok(false),
+    };
+    let child = if left_side {
+        join.left.clone()
+    } else {
+        join.right.clone()
+    };
+    let child_layout = native_shell_child_layout(&child, layouts)?;
+    let Some(bindings) = native_expression_bindings(candidate) else {
+        return Ok(false);
+    };
+    if !bindings
+        .iter()
+        .all(|binding| child_layout.bindings().contains(binding))
+    {
+        return Ok(false);
+    }
+    let child_names = native_shell_child_names(nodes, &child)?;
+    let projection_index = state.bind_context.generate_table_index();
+    let old_width = child_layout.len();
+    let mut expressions = child_layout
+        .bindings()
+        .iter()
+        .copied()
+        .zip(child_layout.types().iter().cloned())
+        .map(|(binding, logical_type)| {
+            Expression::ColumnRef(
+                paro_planner::expression::ColumnRefExpression::new(binding, logical_type).into(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expressions.push(candidate.clone());
+    let mut visible_names = child_names.as_ref().to_vec();
+    visible_names.push("__paro_materialized_aggregate_input".to_string());
+    let mut returned_types = child_layout.types().to_vec();
+    returned_types.push(candidate.return_type());
+    let projection = Projection {
+        table_index: projection_index,
+        expressions,
+        visible_count: visible_names.len(),
+        visible_names,
+        visible_qualifier: None,
+        child,
+        returned_types,
+    };
+    let materialized_binding = ColumnBinding::new(projection_index, old_width);
+    let projection_index_in_shell = nodes.len();
+    nodes.push(NativeNode {
+        id: state.bind_context.next_plan_id(),
+        stats: native_shell_child_stats(nodes, &projection.child),
+        operator: LogicalOperator::Projection(projection),
+        source_proofs: Box::new([]),
+    });
+
+    let binding_map = child_layout
+        .bindings()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(ordinal, binding)| {
+            (
+                binding,
+                ColumnBinding::new(projection_index, ordinal),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut rewritten_join = join;
+    let rewritten_child = NativeChild::Node(projection_index_in_shell);
+    if left_side {
+        rewritten_join.left = rewritten_child;
+        rewritten_join.left_projection_map.include(old_width);
+    } else {
+        rewritten_join.right = rewritten_child;
+        rewritten_join.right_projection_map.include(old_width);
+    }
+    for condition in &mut rewritten_join.conditions {
+        condition.left = native_replace_known_bindings(&condition.left, &binding_map);
+        condition.right = native_replace_known_bindings(&condition.right, &binding_map);
+    }
+    for expression in &mut rewritten_join.duplicate_eliminated_columns {
+        *expression = native_replace_known_bindings(expression, &binding_map);
+    }
+    nodes[join_index].operator = LogicalOperator::Join(Join::Comparison(rewritten_join));
+    nodes[join_index].source_proofs = Box::new([]);
+
+    let LogicalOperator::Aggregate(aggregate) = nodes
+        .get(root_index)
+        .ok_or_else(|| paro_error::internal("native materialization lost its aggregate"))?
+        .operator
+        .clone()
+    else {
+        return Ok(false);
+    };
+    let mut rewritten_aggregate = *aggregate;
+    let replacement = Expression::ColumnRef(
+        paro_planner::expression::ColumnRefExpression::new(
+            materialized_binding,
+            candidate.return_type(),
+        )
+        .into(),
+    );
+    for expression in rewritten_aggregate
+        .groups
+        .iter_mut()
+        .chain(rewritten_aggregate.aggregates.iter_mut())
+    {
+        native_replace_equal_subexpressions(expression, candidate, &replacement);
+        *expression = native_replace_known_bindings(expression, &binding_map);
+    }
+    reset_native_aggregate_output(&mut rewritten_aggregate);
+    nodes[root_index].operator = LogicalOperator::Aggregate(Box::new(rewritten_aggregate));
+    nodes[root_index].source_proofs = Box::new([]);
+    Ok(true)
+}
+
+/// Native subset of AggregateInputMaterialization.  The complete owned rule
+/// supports arbitrary join spines; this slice is authoritative only when the
+/// matched root is a plain aggregate over one plain inner join and every
+/// eligible input belongs to one of its two child domains.  If any eligible
+/// candidate falls outside that proof, returning `None` keeps the complete
+/// legacy implementation available instead of silently dropping an output.
+fn try_native_input_materialization(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: &boundary::BoundarySnapshot,
+) -> Result<Option<NativeShell>> {
+    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+        return Ok(None);
+    };
+    if native_shell_contains_control_boundary(&shell) {
+        return Ok(None);
+    }
+    let original_root_layout = shell.root_layout()?;
+    let root = shell.root;
+    let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
+        return Ok(None);
+    };
+    if aggregate.post_reduction.is_some()
+        || !aggregate.has_plain_grouping_domain()
+    {
+        return Ok(None);
+    }
+    let NativeChild::Node(join_index) = aggregate.child.clone() else {
+        return Ok(None);
+    };
+    let LogicalOperator::Join(Join::Comparison(join)) = shell
+        .nodes
+        .get(join_index)
+        .ok_or_else(|| paro_error::internal("native materialization lost its join"))?
+        .operator
+        .clone()
+    else {
+        return Ok(None);
+    };
+    if join.join_type != JoinType::Inner
+        || join.mark_index.is_some()
+        || !join.duplicate_eliminated_columns.is_empty()
+        || join.delim_flipped
+    {
+        return Ok(None);
+    }
+    let layouts = shell.layouts()?;
+    let left_layout = native_shell_child_layout(&join.left, &layouts)?;
+    let right_layout = native_shell_child_layout(&join.right, &layouts)?;
+    let mut candidates = Vec::new();
+    for expression in &aggregate.aggregates {
+        let Expression::Aggregate(aggregate_expression) = expression else {
+            continue;
+        };
+        candidates.extend(
+            aggregate_expression
+                .children
+                .iter()
+                .filter(|candidate| {
+                    input_materialization::is_materializable_candidate(
+                        candidate,
+                        &aggregate.groups,
+                        &aggregate.aggregates,
+                    )
+                })
+                .cloned(),
+        );
+    }
+    let mut unique_candidates = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique_candidates
+            .iter()
+            .any(|seen: &Expression| seen.equals(&candidate))
+        {
+            unique_candidates.push(candidate);
+        }
+    }
+    let candidates = unique_candidates;
+    if candidates.is_empty()
+        || candidates.iter().any(|candidate| {
+            native_materialization_side(&join, candidate, &left_layout, &right_layout)
+                .is_none()
+        })
+    {
+        return Ok(None);
+    }
+
+    let mut nodes = shell.nodes.into_vec();
+    let mut rejected = Vec::<Expression>::new();
+    let mut changed = false;
+    loop {
+        let layouts = native_shell_layouts_for_nodes(&nodes)?;
+        let LogicalOperator::Aggregate(current) = nodes[root].operator.clone() else {
+            return Ok(None);
+        };
+        let candidate = current.aggregates.iter().find_map(|expression| {
+            let Expression::Aggregate(aggregate_expression) = expression else {
+                return None;
+            };
+            aggregate_expression.children.iter().find_map(|candidate| {
+                (input_materialization::is_materializable_candidate(
+                    candidate,
+                    &current.groups,
+                    &current.aggregates,
+                ) && !rejected.iter().any(|seen| seen.equals(candidate)))
+                .then(|| candidate.clone())
+            })
+        });
+        let Some(candidate) = candidate else {
+            break;
+        };
+        let LogicalOperator::Join(Join::Comparison(current_join)) = nodes[join_index]
+            .operator
+            .clone()
+        else {
+            return Ok(None);
+        };
+        let left_layout = native_shell_child_layout(&current_join.left, &layouts)?;
+        let right_layout = native_shell_child_layout(&current_join.right, &layouts)?;
+        let Some(left_side) = native_materialization_side(
+            &current_join,
+            &candidate,
+            &left_layout,
+            &right_layout,
+        ) else {
+            rejected.push(candidate);
+            continue;
+        };
+        if native_materialize_candidate(
+            &mut nodes,
+            root,
+            join_index,
+            left_side,
+            &candidate,
+            &layouts,
+            state,
+        )? {
+            changed = true;
+            rejected.clear();
+        } else {
+            rejected.push(candidate);
+        }
+    }
+    if !changed || !rejected.is_empty() {
+        return Ok(None);
+    }
+    let shell = compact_native_shell(NativeShell {
+        nodes: nodes.into_boxed_slice(),
+        root,
+    })?;
+    if shell.root_layout()? != original_root_layout {
+        return Ok(None);
+    }
+    Ok(Some(shell))
 }
 
 /// The key-domain rule is a shell rewrite: it moves the semi join below the
@@ -2528,6 +2972,21 @@ fn native_replace_known_bindings(
             )
         })
     })
+}
+
+fn native_replace_equal_subexpressions(
+    expression: &mut Expression,
+    target: &Expression,
+    replacement: &Expression,
+) {
+    if expression.equals(target) {
+        *expression = replacement.clone();
+        return;
+    }
+    paro_planner::expression::ExpressionIterator::enumerate_children_mut(
+        expression,
+        |child| native_replace_equal_subexpressions(child, target, replacement),
+    );
 }
 
 fn native_sharing_branch_view(
