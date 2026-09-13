@@ -2,7 +2,9 @@
 """Offline sensitivity, NOT a certificate authorizing candidate removal."""
 import argparse
 import collections
+import gzip
 import json
+from pathlib import Path
 
 
 def coordinates(candidate, project, envelope):
@@ -62,10 +64,17 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('snapshot')
     p.add_argument('--envelope', type=int, default=2 * 1024 ** 3)
+    p.add_argument('--output', type=Path)
     args = p.parse_args()
-    snapshots = [json.loads(line) for line in open(args.snapshot)]
+    opener = gzip.open if args.snapshot.endswith('.gz') else open
+    with opener(args.snapshot, 'rt') as source:
+        snapshots = [json.loads(line) for line in source]
     # Explicit selection by archived count only for report analysis, never a
     # production strategy. Print all largest-search occurrences, not fastest.
     largest = max(s['published_archive'] for s in snapshots)
-    print(json.dumps([analyze(s, args.envelope) for s in snapshots
-                      if s['published_archive'] == largest], indent=2))
+    result = json.dumps([analyze(s, args.envelope) for s in snapshots
+                         if s['published_archive'] == largest], indent=2)
+    if args.output:
+        args.output.write_text(result + '\n')
+    else:
+        print(result)
