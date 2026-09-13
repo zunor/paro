@@ -362,6 +362,7 @@ pub(super) struct PlannerTransformState {
     pub(super) scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 }
 
+#[derive(Clone)]
 pub(super) struct PlannerTransformSavepoint {
     staging_arena_checkpoint: paro_planner::plan::arena::PlanArenaCheckpoint,
     column_count: usize,
@@ -374,6 +375,10 @@ pub(super) struct PlannerTransformSavepoint {
     join_region_insertion_count: usize,
     cte_restriction_count: usize,
     cte_binding_count: usize,
+    /// Partition labels are append-only identities, but their BTreeMap order
+    /// is not an insertion journal.  Snapshot the map so a failed native CTE
+    /// partition cannot leave a symbol that was never published.
+    cte_partition_labels: super::transformation::cte::PartitionLabels,
 }
 
 impl PlannerTransformState {
@@ -399,6 +404,7 @@ impl PlannerTransformState {
             join_region_insertion_count: self.join_region_insertions.len(),
             cte_restriction_count: self.cte_restrictions.len(),
             cte_binding_count: self.cte_bindings.len(),
+            cte_partition_labels: self.cte_partition_labels.clone(),
         }
     }
 
@@ -409,6 +415,7 @@ impl PlannerTransformState {
             .discard_stale_recipes(&self.staging_arena);
         self.cte_restrictions
             .truncate(savepoint.cte_restriction_count);
+        self.cte_partition_labels = savepoint.cte_partition_labels;
         if savepoint.cte_binding_count > self.cte_bindings.len() {
             return Err(paro_error::internal(
                 "planner CTE binding rollback exceeds its append journal",

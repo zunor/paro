@@ -571,7 +571,106 @@ impl TransformationRule for PlannerTransformationRule {
         // for their conservative native subsets. Keep the legacy owned-plan
         // path available for every shape that needs richer semantic handling.
         let mut native_domain_scopes = None;
+        let mut cte_restriction: Option<(GroupId, cte::CteDomainProof)> = None;
+        // Native CTE domain/partition adapters allocate query-local symbols
+        // before the common staging transaction is entered. Enlist a
+        // savepoint before that allocation so a later staging rejection,
+        // cancellation, or Memo rollback cannot leave an unpublishable CTE
+        // symbol or partition label in the planner sidecar.
+        let native_cte_savepoint = if matches!(
+            self.transformation,
+            PlannerTransformation::CteInline
+                | PlannerTransformation::CtePartitionedMaterialization
+                | PlannerTransformation::CteDemandPushdown
+                | PlannerTransformation::CteFilterPushdown
+        ) {
+            let savepoint = self
+                .planner_state
+                .read()
+                .map_err(|_| paro_error::internal("planner transform state poisoned"))?
+                .savepoint();
+            let rollback_state = self.planner_state.clone();
+            let rollback_savepoint = savepoint.clone();
+            ctx.enlist_rollback(move || {
+                let mut state = rollback_state.write().map_err(|_| {
+                    paro_error::internal("planner transform state poisoned during rollback")
+                })?;
+                state.rollback_to(rollback_savepoint)
+            });
+            Some(savepoint)
+        } else {
+            None
+        };
         let direct_native = if matches!(
+            self.transformation,
+            PlannerTransformation::CteInline
+                | PlannerTransformation::CtePartitionedMaterialization
+                | PlannerTransformation::CteDemandPushdown
+                | PlannerTransformation::CteFilterPushdown
+        ) {
+            let mut state = self
+                .planner_state
+                .write()
+                .expect("planner transform state poisoned");
+            let requirement = cte::CteRequirement::from_binding(binding, ctx.memo(), &state)?;
+            if requirement.owner != ctx.memo().canonical_group(target_group) {
+                return Err(paro_error::internal("CTE inline changed sharing ownership"));
+            }
+            match NativeShell::from_pattern_with_layouts(
+                ctx.memo(),
+                &state,
+                &binding.root,
+                &facts,
+            )? {
+                Some((shell, layouts)) => {
+                    if matches!(
+                        self.transformation,
+                        PlannerTransformation::CtePartitionedMaterialization
+                    ) {
+                        requirement.native_partitions(shell, &layouts, &mut state)?
+                    } else if matches!(
+                        self.transformation,
+                        PlannerTransformation::CteDemandPushdown
+                    ) {
+                        match requirement.native_key_domain(
+                            shell,
+                            &layouts,
+                            ctx.memo(),
+                            &mut state,
+                            &facts,
+                        )? {
+                            Some((shell, proof)) => {
+                                cte_restriction = Some((requirement.producer, proof));
+                                vec![shell]
+                            }
+                            None => Vec::new(),
+                        }
+                    } else if matches!(
+                        self.transformation,
+                        PlannerTransformation::CteFilterPushdown
+                    ) {
+                        match requirement.native_filter_domain(
+                            shell,
+                            &layouts,
+                            ctx.memo(),
+                            &mut state,
+                        )? {
+                            Some((shell, proof)) => {
+                                cte_restriction = Some((requirement.producer, proof));
+                                vec![shell]
+                            }
+                            None => Vec::new(),
+                        }
+                    } else {
+                        match requirement.native_inline(shell, &layouts, &state)? {
+                            Some(shell) => vec![shell],
+                            None => Vec::new(),
+                        }
+                    }
+                }
+                None => Vec::new(),
+            }
+        } else if matches!(
             self.transformation,
             PlannerTransformation::PredicateTransfer
                 | PlannerTransformation::KeyDomainTransfer
@@ -680,6 +779,14 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             Vec::new()
         };
+        if direct_native.is_empty() {
+            if let Some(savepoint) = native_cte_savepoint {
+                self.planner_state
+                    .write()
+                    .map_err(|_| paro_error::internal("planner transform state poisoned"))?
+                    .rollback_to(savepoint)?;
+            }
+        }
         let (
             plan,
             source_stats,
@@ -723,6 +830,10 @@ impl TransformationRule for PlannerTransformationRule {
                         | PlannerTransformation::AggregateDimensionDeferral
                         | PlannerTransformation::AggregateInputMaterialization
                         | PlannerTransformation::AggregateDimensionSharing
+                        | PlannerTransformation::CteInline
+                        | PlannerTransformation::CtePartitionedMaterialization
+                        | PlannerTransformation::CteDemandPushdown
+                        | PlannerTransformation::CteFilterPushdown
                 ))
                 && !direct_native.is_empty();
             let (plan, nested_group_holes, selected_proofs) = if native_direct_only {
@@ -789,7 +900,6 @@ impl TransformationRule for PlannerTransformationRule {
                 },
             )
         };
-        let mut cte_restriction = None;
         let plans = if let Some(plan) = plan {
             if matches!(
                 self.transformation,
@@ -1594,6 +1704,8 @@ fn native_shell_staging_allowed(transformation: PlannerTransformation) -> bool {
             | PlannerTransformation::AggregateDimensionDeferral
             | PlannerTransformation::AggregateJoinSubsumption
             | PlannerTransformation::AggregateDimensionSharing
+            | PlannerTransformation::CteInline
+            | PlannerTransformation::CtePartitionedMaterialization
     )
 }
 

@@ -1055,35 +1055,43 @@ pub(super) fn stage_transformed_expression(
             }
             target
         } else {
-            let Some(group) = memo.create_optional_group(
-                options.group_budget,
-                {
-                    let mut allocation = StableFingerprintBuilder::default();
-                    allocation.write_bytes(b"paro.transformed-group.v2");
-                    allocation.write_fingerprint(logical_identity);
-                    allocation.write_u64(node_context.0 as u64);
-                    // An operator shell can expose different output column
-                    // identities (notably a freshly rebound Projection).
-                    // Admission must name the same contract as group reuse.
-                    allocation.write_bytes(&operator_encoding);
-                    allocation.write_u64(schema.columns().len() as u64);
-                    for column in schema.columns() {
-                        allocation.write_u64(column.id.0 as u64);
-                        allocation.write_u64(column.nullable as u64);
-                    }
-                    allocation.write_u64(logical_properties.unique_keys.len() as u64);
-                    for key in &logical_properties.unique_keys {
-                        allocation.write_u64(key.len() as u64);
-                        for column in key {
-                            allocation.write_u64(column.0 as u64);
-                        }
-                    }
-                    allocation.write_u64(logical_properties.outer_references.len() as u64);
-                    for column in &logical_properties.outer_references {
+            let allocation_identity = {
+                let mut allocation = StableFingerprintBuilder::default();
+                allocation.write_bytes(b"paro.transformed-group.v2");
+                allocation.write_fingerprint(logical_identity);
+                allocation.write_u64(node_context.0 as u64);
+                allocation.write_bytes(&operator_encoding);
+                // The optional-group ledger identity must distinguish the
+                // same operator shell over different child groups.  The
+                // logical key keeps children separate, but omitting them
+                // here turns a legitimate alternative into a duplicate
+                // allocation error when two native CTE partitions have the
+                // same local operator over different producer groups.
+                allocation.write_u64(key.children.len() as u64);
+                for child in &key.children {
+                    allocation.write_u64(memo.canonical_group(*child).0 as u64);
+                }
+                allocation.write_u64(schema.columns().len() as u64);
+                for column in schema.columns() {
+                    allocation.write_u64(column.id.0 as u64);
+                    allocation.write_u64(column.nullable as u64);
+                }
+                allocation.write_u64(logical_properties.unique_keys.len() as u64);
+                for key in &logical_properties.unique_keys {
+                    allocation.write_u64(key.len() as u64);
+                    for column in key {
                         allocation.write_u64(column.0 as u64);
                     }
-                    allocation.finish()
-                },
+                }
+                allocation.write_u64(logical_properties.outer_references.len() as u64);
+                for column in &logical_properties.outer_references {
+                    allocation.write_u64(column.0 as u64);
+                }
+                allocation.finish()
+            };
+            let Some(group) = memo.create_optional_group(
+                options.group_budget,
+                allocation_identity,
                 schema,
                 logical_properties.clone(),
                 cardinality.clone(),

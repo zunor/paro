@@ -1075,6 +1075,298 @@ mod tests {
             .iter()
             .all(|child| matches!(child.operator, LogicalOperator::Projection(_))));
     }
+
+    #[test]
+    fn production_inline_uses_native_shell_without_owned_settlement() {
+        let input_plan = owner(OwnedLogicalPlan::synthetic(LogicalOperator::Join(
+            Join::Comparison(ComparisonJoin::new(
+                JoinType::Inner,
+                reference(9, 1),
+                reference(9, 2),
+                vec![],
+            )),
+        )));
+        let mut input = MemoBuilder::build(
+            input_plan,
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let planner_state = input.planner_state.clone();
+        planner_state.write().unwrap().session = Some(
+            paro_context::TestStatementContextBuilder::minimal().build(),
+        );
+        let binding = {
+            let state = planner_state.read().unwrap();
+            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let bindings = matching::scoped_pattern_bindings(
+                PlannerTransformation::CteInline,
+                input.root,
+                expression,
+                &input.memo,
+                &state,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap();
+            assert_eq!(bindings.completion, PatternEnumerationCompletion::Complete);
+            assert_eq!(bindings.bindings.len(), 1);
+            bindings.bindings[0].clone()
+        };
+        let before = planner_state.read().unwrap().staging_arena.len();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::CteInline,
+            planner_state: planner_state.clone(),
+        };
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            planner_state.read().unwrap().staging_arena.len(),
+            before,
+            "native CTE inline must not settle through the owned arena"
+        );
+        let state = planner_state.read().unwrap();
+        assert!(matches!(
+            state.payloads.logical[outputs[0].payload.index()]
+                .semantic_template
+                .operator,
+            LogicalOperator::Join(_)
+        ));
+    }
+
+    #[test]
+    fn native_partition_shell_preserves_each_discriminator_and_layout() {
+        let mut input = MemoBuilder::build(
+            two_discriminator_owner(),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let (binding, requirement, facts) = {
+            let state = input.planner_state.read().unwrap();
+            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let bindings = matching::scoped_pattern_bindings(
+                PlannerTransformation::CtePartitionedMaterialization,
+                input.root,
+                expression,
+                &input.memo,
+                &state,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap();
+            assert_eq!(bindings.completion, PatternEnumerationCompletion::Complete);
+            assert_eq!(bindings.bindings.len(), 1);
+            let binding = bindings.bindings[0].clone();
+            let requirement = CteRequirement::from_binding(&binding, &input.memo, &state).unwrap();
+            let facts = {
+                let mut context = TransformContext::new(&mut input.memo, input.root);
+                boundary::BoundarySnapshot::read(
+                    &mut context,
+                    &state,
+                    &binding.root,
+                    BudgetDimension::RuleWorkPerGroup,
+                )
+                .unwrap()
+                .unwrap()
+            };
+            (binding, requirement, facts)
+        };
+        let (shell, layouts) = {
+            let state = input.planner_state.read().unwrap();
+            NativeShell::from_pattern_with_layouts(
+                &input.memo,
+                &state,
+                &binding.root,
+                &facts,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let original_layout = shell.root_layout().unwrap();
+        let mut state = input.planner_state.write().unwrap();
+        let alternatives = requirement
+            .native_partitions(shell, &layouts, &mut state)
+            .unwrap();
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(state.cte_partition_labels.len(), 2);
+        for alternative in alternatives {
+            assert_eq!(alternative.root_layout().unwrap(), original_layout);
+            let wrappers = alternative
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.operator {
+                    LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(wrappers.len(), 2);
+            assert!(wrappers.iter().all(|symbol| *symbol != 9));
+            assert!(alternative.nodes.iter().all(|node| {
+                !matches!(&node.operator, LogicalOperator::CTERef(reference) if reference.cte_index == 9)
+            }));
+        }
+    }
+
+    #[test]
+    fn production_partition_uses_native_shell_for_all_discriminators() {
+        let mut input = MemoBuilder::build(
+            two_discriminator_owner(),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let planner_state = input.planner_state.clone();
+        planner_state.write().unwrap().session = Some(
+            paro_context::TestStatementContextBuilder::minimal().build(),
+        );
+        let binding = {
+            let state = planner_state.read().unwrap();
+            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let bindings = matching::scoped_pattern_bindings(
+                PlannerTransformation::CtePartitionedMaterialization,
+                input.root,
+                expression,
+                &input.memo,
+                &state,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap();
+            assert_eq!(bindings.completion, PatternEnumerationCompletion::Complete);
+            assert_eq!(bindings.bindings.len(), 1);
+            bindings.bindings[0].clone()
+        };
+        let before_arena = planner_state.read().unwrap().staging_arena.len();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::CtePartitionedMaterialization,
+            planner_state: planner_state.clone(),
+        };
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(planner_state.read().unwrap().staging_arena.len(), before_arena);
+        assert_eq!(planner_state.read().unwrap().cte_partition_labels.len(), 2);
+    }
+
+    #[test]
+    fn production_filter_domain_uses_native_shell_and_records_proof() {
+        let mut input = MemoBuilder::build(
+            owner(OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
+                paro_planner::operator::Filter::new(reference(9, 1), vec![equality(1, 7)]),
+            ))),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let planner_state = input.planner_state.clone();
+        planner_state.write().unwrap().session = Some(
+            paro_context::TestStatementContextBuilder::minimal().build(),
+        );
+        let binding = {
+            let state = planner_state.read().unwrap();
+            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let bindings = matching::scoped_pattern_bindings(
+                PlannerTransformation::CteFilterPushdown,
+                input.root,
+                expression,
+                &input.memo,
+                &state,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap();
+            assert_eq!(bindings.completion, PatternEnumerationCompletion::Complete);
+            assert_eq!(bindings.bindings.len(), 1);
+            bindings.bindings[0].clone()
+        };
+        let before = planner_state.read().unwrap().staging_arena.len();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::CteFilterPushdown,
+            planner_state: planner_state.clone(),
+        };
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(planner_state.read().unwrap().staging_arena.len(), before);
+        assert_eq!(planner_state.read().unwrap().cte_restrictions.len(), 1);
+        assert!(matches!(
+            planner_state.read().unwrap().payloads.logical[outputs[0].payload.index()]
+                .semantic_template
+                .operator,
+            LogicalOperator::MaterializedCTE(_)
+        ));
+        context.rollback().unwrap();
+        let state = planner_state.read().unwrap();
+        assert!(state.cte_bindings.is_empty());
+        assert!(state.cte_restrictions.is_empty());
+    }
+
+    #[test]
+    fn production_key_domain_uses_native_shell_and_records_proof() {
+        let consumers = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Inner,
+                reference(9, 1),
+                super::super::super::tests::test_base_get(2, 8, "domain", 10),
+                vec![JoinCondition::new(
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer)
+                            .into(),
+                    ),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(2, 0), LogicalType::Integer)
+                            .into(),
+                    ),
+                    JoinComparisonType::Equal,
+                )],
+            ),
+        )));
+        let mut input = MemoBuilder::build(
+            owner(consumers),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let planner_state = input.planner_state.clone();
+        planner_state.write().unwrap().session = Some(
+            paro_context::TestStatementContextBuilder::minimal().build(),
+        );
+        let binding = {
+            let state = planner_state.read().unwrap();
+            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let bindings = matching::scoped_pattern_bindings(
+                PlannerTransformation::CteDemandPushdown,
+                input.root,
+                expression,
+                &input.memo,
+                &state,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap();
+            assert_eq!(bindings.completion, PatternEnumerationCompletion::Complete);
+            assert_eq!(bindings.bindings.len(), 1);
+            bindings.bindings[0].clone()
+        };
+        let before = planner_state.read().unwrap().staging_arena.len();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::CteDemandPushdown,
+            planner_state: planner_state.clone(),
+        };
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(planner_state.read().unwrap().staging_arena.len(), before);
+        assert_eq!(planner_state.read().unwrap().cte_restrictions.len(), 1);
+        assert!(matches!(
+            planner_state.read().unwrap().payloads.logical[outputs[0].payload.index()]
+                .semantic_template
+                .operator,
+            LogicalOperator::MaterializedCTE(_)
+        ));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1090,6 +1382,838 @@ pub(super) struct CteRequirement {
 }
 
 impl CteRequirement {
+    /// Inline a CTE directly in the native shell when the binding contains a
+    /// replayable producer group.  The consumer shell is already a complete
+    /// Memo-shaped DAG; exporting it to an owned plan merely to replace each
+    /// CTERef and then importing it again is the bridge this path is intended
+    /// to remove.
+    ///
+    /// This adapter is deliberately conservative.  It only accepts an
+    /// opaque producer `MemoGroup`, validates every occurrence by its exact
+    /// binding path, and reconstructs the producer projection from the
+    /// MaterializedCTE output-column contract.  Unsupported shapes return
+    /// `None`, allowing the semantic peer to preserve completeness.
+    pub(super) fn native_inline(
+        &self,
+        mut shell: NativeShell,
+        layouts: &[paro_planner::operator::LogicalOutputLayout],
+        state: &PlannerTransformState,
+    ) -> Result<Option<NativeShell>> {
+        if self.policy == CTEMaterialize::Materialized {
+            return Ok(None);
+        }
+        let root = shell.root;
+        let LogicalOperator::MaterializedCTE(owner) = shell
+            .nodes
+            .get(root)
+            .ok_or_else(|| paro_error::internal("native CTE inline lost its owner node"))?
+            .operator
+            .clone()
+        else {
+            return Err(paro_error::internal(
+                "native CTE inline lost its owner shell",
+            ));
+        };
+        if owner.cte_index != self.cte_index || self.occurrences.is_empty() {
+            return Ok(None);
+        }
+        let NativeChild::MemoGroup {
+            group: producer_group,
+            reference: producer_reference,
+            ..
+        } = owner.cte_query.clone()
+        else {
+            // A producer expression rather than a group edge would require
+            // importing/owning its descendants.  Keep the semantic peer for
+            // that case until a separate native producer contract exists.
+            return Ok(None);
+        };
+        if state
+            .session
+            .as_ref()
+            .is_some_and(|session| session.cancellation.is_cancelled())
+        {
+            return Ok(None);
+        }
+        if !producer_reference.facts.can_replay
+            || producer_reference.facts.contains_control_region
+            || producer_group != self.producer
+        {
+            return Ok(None);
+        }
+        if producer_reference.bindings.len() != producer_reference.types().len() {
+            return Err(paro_error::internal(
+                "native CTE inline producer has an invalid typed contract",
+            ));
+        }
+        let producer_edge = owner.cte_query.clone();
+        let producer_layout = match &producer_edge {
+            NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => layout,
+            NativeChild::Node(index) => layouts.get(*index).ok_or_else(|| {
+                paro_error::internal("native CTE inline producer layout is missing")
+            })?,
+        };
+        if producer_layout.bindings() != producer_reference.bindings.as_slice()
+            || producer_layout.types() != producer_reference.types()
+        {
+            return Err(paro_error::internal(
+                "native CTE inline producer layout disagrees with its facts",
+            ));
+        }
+
+        let consumer_root = match owner.child {
+            NativeChild::Node(index) => index,
+            NativeChild::MemoGroup { .. } | NativeChild::Group { .. } => return Ok(None),
+        };
+        let original_layout = layouts.get(root).cloned().ok_or_else(|| {
+            paro_error::internal("native CTE inline owner layout is missing")
+        })?;
+        let mut nodes = shell.nodes.into_vec();
+        let mut seen = 0usize;
+        for occurrence in &self.occurrences {
+            let Some(index) = native_path_node(&nodes, consumer_root, &occurrence.path) else {
+                return Ok(None);
+            };
+            let reference = match nodes.get(index).map(|node| &node.operator) {
+                Some(LogicalOperator::CTERef(reference)) => reference.clone(),
+                _ => return Ok(None),
+            };
+            if reference.cte_index != self.cte_index
+                || reference.table_index != occurrence.table_index
+                || reference.column_types.as_slice() != occurrence.output.types()
+            {
+                return Ok(None);
+            }
+            let Some(expressions) = cte_projection_expressions(
+                &owner,
+                producer_layout,
+                &reference,
+            )?
+            else {
+                return Ok(None);
+            };
+            let child = clone_native_memo_group(&producer_edge, state)?;
+            let projection = Projection {
+                table_index: reference.table_index,
+                expressions,
+                visible_names: reference.column_names.clone(),
+                visible_count: reference.column_names.len(),
+                visible_qualifier: Some(reference.relation_alias.clone()),
+                child,
+                returned_types: reference.column_types.clone(),
+            };
+            let node = nodes.get_mut(index).ok_or_else(|| {
+                paro_error::internal("native CTE inline occurrence node disappeared")
+            })?;
+            node.operator = LogicalOperator::Projection(projection);
+            node.source_proofs = Box::new([]);
+            seen += 1;
+        }
+        if seen != self.occurrences.len() {
+            return Err(paro_error::internal(
+                "native CTE inline did not consume its complete occurrence requirement",
+            ));
+        }
+
+        // The owner wrapper is intentionally removed from the reachable
+        // shell.  The consumer is the transformed root; compaction drops the
+        // now-unreachable owner and producer edge while retaining every
+        // opaque Memo group referenced by the new projections.
+        shell = compact_native_shell(NativeShell {
+            nodes: nodes.into_boxed_slice(),
+            root: consumer_root,
+        })?;
+        if shell.root_layout()? != original_layout {
+            return Err(paro_error::internal(
+                "native CTE inline changed the owner output layout",
+            ));
+        }
+        if native_shell_contains_control_boundary(&shell) {
+            return Ok(None);
+        }
+        Ok(Some(shell))
+    }
+
+    /// Push a common consumer predicate into the producer while retaining a
+    /// distinct lexical domain symbol.  The proof is returned to the caller
+    /// so publication can journal the exact restricted producer/input pair;
+    /// it is not inferred from the presence of the Filter node.
+    pub(super) fn native_filter_domain(
+        &self,
+        shell: NativeShell,
+        layouts: &[paro_planner::operator::LogicalOutputLayout],
+        memo: &Memo,
+        state: &mut PlannerTransformState,
+    ) -> Result<Option<(NativeShell, CteDomainProof)>> {
+        let root = shell.root;
+        let LogicalOperator::MaterializedCTE(owner) = shell
+            .nodes
+            .get(root)
+            .ok_or_else(|| paro_error::internal("native CTE filter lost its owner node"))?
+            .operator
+            .clone()
+        else {
+            return Err(paro_error::internal(
+                "native CTE filter lost its owner shell",
+            ));
+        };
+        if owner.cte_index != self.cte_index {
+            return Ok(None);
+        }
+        let NativeChild::MemoGroup {
+            group: producer_group,
+            reference: producer_reference,
+            ..
+        } = owner.cte_query.clone()
+        else {
+            return Ok(None);
+        };
+        if producer_group != self.producer
+            || !producer_reference.facts.can_replay
+            || producer_reference.facts.contains_control_region
+        {
+            return Ok(None);
+        }
+        let Some(references) = self
+            .occurrences
+            .iter()
+            .map(|occurrence| {
+                Some(crate::cte::predicate_domain::FilteredCTERef {
+                    old_bindings: occurrence.output.bindings().to_vec(),
+                    filters: occurrence.predicates.as_ref()?.to_vec(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(predicates) = crate::cte::predicate_domain::derive_producer_predicates(
+            references,
+            &producer_reference.bindings,
+        )
+        else {
+            return Ok(None);
+        };
+        let proof = CteDomainProof::new(self.definition, predicates.clone(), std::iter::empty());
+        if self.domain_is_proved(&proof, memo, state) {
+            return Ok(None);
+        }
+        let symbol = self.domain_symbol(&proof, memo, state);
+        let NativeChild::Node(consumer_root) = owner.child else {
+            return Ok(None);
+        };
+        let original_layout = layouts.get(root).cloned().ok_or_else(|| {
+            paro_error::internal("native CTE filter owner layout is missing")
+        })?;
+        let producer_edge = owner.cte_query.clone();
+        let mut nodes = shell.nodes.into_vec();
+        for occurrence in &self.occurrences {
+            let Some(index) = native_path_node(&nodes, consumer_root, &occurrence.path) else {
+                return Ok(None);
+            };
+            let LogicalOperator::CTERef(reference) = &mut nodes[index].operator else {
+                return Ok(None);
+            };
+            if reference.cte_index != self.cte_index
+                || reference.table_index != occurrence.table_index
+            {
+                return Ok(None);
+            }
+            reference.cte_index = symbol;
+        }
+        let producer = clone_native_memo_group(&producer_edge, state)?;
+        let filter_index = nodes.len();
+        let producer_stats = native_shell_child_stats(&nodes, &producer);
+        nodes.push(NativeNode {
+            id: state.bind_context.next_plan_id(),
+            stats: producer_stats,
+            operator: LogicalOperator::Filter(paro_planner::operator::Filter {
+                expressions: predicates,
+                child: producer,
+                projection_map: paro_planner::operator::ProjectionMap::all(),
+            }),
+            source_proofs: Box::new([]),
+        });
+        let wrapper_index = nodes.len();
+        let consumer = NativeChild::Node(consumer_root);
+        let consumer_stats = native_shell_child_stats(&nodes, &consumer);
+        nodes.push(NativeNode {
+            id: state.bind_context.next_plan_id(),
+            stats: consumer_stats,
+            operator: LogicalOperator::MaterializedCTE(MaterializedCTE {
+                cte_index: symbol,
+                cte_name: owner.cte_name,
+                column_names: owner.column_names,
+                column_types: owner.column_types,
+                output_columns: owner.output_columns,
+                materialized: owner.materialized,
+                ref_count: owner.ref_count,
+                cte_query: NativeChild::Node(filter_index),
+                child: consumer,
+            }),
+            source_proofs: Box::new([]),
+        });
+        let (result, result_layout) = compact_native_shell_with_layout(NativeShell {
+            nodes: nodes.into_boxed_slice(),
+            root: wrapper_index,
+        })?;
+        if result_layout != original_layout {
+            return Err(paro_error::internal(
+                "native CTE filter changed the owner output layout",
+            ));
+        }
+        if native_cte_shell_contains_control_boundary(&result) {
+            return Ok(None);
+        }
+        Ok(Some((result, proof)))
+    }
+
+    /// Restrict a producer to the union of consumer join keys.  The key
+    /// domain is built from direct Memo group edges and native Projection /
+    /// UNION / Semi-Join nodes, matching the owned implementation's logical
+    /// contract without creating an owned subtree or a second arena.
+    pub(super) fn native_key_domain(
+        &self,
+        shell: NativeShell,
+        layouts: &[paro_planner::operator::LogicalOutputLayout],
+        memo: &Memo,
+        state: &mut PlannerTransformState,
+        facts: &boundary::BoundarySnapshot,
+    ) -> Result<Option<(NativeShell, CteDomainProof)>> {
+        use paro_planner::operator::{BoundReference, ComparisonJoin, JoinCondition, SetOperation};
+
+        let root = shell.root;
+        let LogicalOperator::MaterializedCTE(owner) = shell
+            .nodes
+            .get(root)
+            .ok_or_else(|| paro_error::internal("native CTE demand lost its owner node"))?
+            .operator
+            .clone()
+        else {
+            return Err(paro_error::internal(
+                "native CTE demand lost its owner shell",
+            ));
+        };
+        if owner.cte_index != self.cte_index {
+            return Ok(None);
+        }
+        let NativeChild::MemoGroup {
+            group: producer_group,
+            reference: producer_reference,
+            layout: producer_layout,
+            ..
+        } = owner.cte_query.clone()
+        else {
+            return Ok(None);
+        };
+        if producer_group != self.producer
+            || !producer_reference.facts.can_replay
+            || producer_reference.facts.contains_control_region
+        {
+            return Ok(None);
+        }
+        let Some(keys) = self
+            .occurrences
+            .iter()
+            .map(|occurrence| occurrence.keys.clone())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(first) = keys.first() else {
+            return Ok(None);
+        };
+        let ordinals = first.ordinals.clone();
+        if keys.iter().any(|key| key.ordinals != ordinals) {
+            return Ok(None);
+        }
+        let proof = CteDomainProof::new(self.definition, std::iter::empty(), keys.clone());
+        if self.domain_is_proved(&proof, memo, state) {
+            return Ok(None);
+        }
+        let NativeChild::Node(consumer_root) = owner.child.clone() else {
+            return Ok(None);
+        };
+        let original_layout = layouts.get(root).cloned().ok_or_else(|| {
+            paro_error::internal("native CTE demand owner layout is missing")
+        })?;
+        let mut nodes = shell.nodes.to_vec();
+        let mut domain: Option<NativeChild> = None;
+        let mut domain_layout = None;
+        for key in keys {
+            let group = memo.canonical_group(key.group);
+            let transport = facts.transport(memo, state, group, &key.layout)?;
+            let id = state.bind_context.next_plan_id();
+            let reference_id = paro_planner::operator::BoundReferenceId::group_hole(id.0);
+            let reference = BoundReference::new(
+                reference_id,
+                key.layout.bindings().to_vec(),
+                key.layout.types().to_vec(),
+            )
+            .with_facts(transport)?;
+            let stats = NodeStats {
+                estimated_cardinality: facts.cardinality(memo, group),
+                unique_keys: reference.facts.unique_keys.clone(),
+                ..Default::default()
+            };
+            let input = NativeChild::MemoGroup {
+                group,
+                id,
+                stats: stats.clone(),
+                layout: key.layout.as_ref().clone(),
+                names: (0..key.layout.bindings().len())
+                    .map(|index| format!("__cte_domain_{index}"))
+                    .collect::<Vec<_>>()
+                    .into(),
+                reference,
+            };
+            let expressions = key.expressions.to_vec();
+            // The operator's table index is the binding namespace of the
+            // projection output. Generate it once so the layout and payload
+            // use the same identity.
+            let table_index = state.bind_context.generate_table_index();
+            let projection_layout = paro_planner::operator::LogicalOutputLayout::new(
+                expressions.iter().map(Expression::return_type).collect(),
+                (0..expressions.len())
+                    .map(|ordinal| ColumnBinding::new(table_index, ordinal))
+                    .collect(),
+            );
+            let projection_index = nodes.len();
+            nodes.push(NativeNode {
+                id: state.bind_context.next_plan_id(),
+                stats,
+                operator: LogicalOperator::Projection(Projection {
+                    table_index,
+                    expressions,
+                    visible_names: (0..key.ordinals.len())
+                        .map(|ordinal| format!("__cte_key_{ordinal}"))
+                        .collect(),
+                    visible_count: 0,
+                    visible_qualifier: None,
+                    child: input,
+                    returned_types: projection_layout.types().to_vec(),
+                }),
+                source_proofs: Box::new([]),
+            });
+            let projected = NativeChild::Node(projection_index);
+            if let Some(previous) = domain {
+                let types = projection_layout.types().to_vec();
+                let table_index = state.bind_context.generate_table_index();
+                let union_index = nodes.len();
+                nodes.push(NativeNode {
+                    id: state.bind_context.next_plan_id(),
+                    stats: native_shell_child_stats(&nodes, &previous),
+                    operator: LogicalOperator::SetOperation(SetOperation {
+                        table_index,
+                        column_count: types.len(),
+                        left: previous,
+                        right: projected,
+                        setop_type: SetOpType::Union,
+                        setop_all: true,
+                        allow_out_of_order: true,
+                        types: types.clone(),
+                    }),
+                    source_proofs: Box::new([]),
+                });
+                domain = Some(NativeChild::Node(union_index));
+                domain_layout = Some(paro_planner::operator::LogicalOutputLayout::new(
+                    types,
+                    (0..key.ordinals.len())
+                        .map(|ordinal| ColumnBinding::new(table_index, ordinal))
+                        .collect(),
+                ));
+            } else {
+                domain = Some(projected);
+                domain_layout = Some(projection_layout);
+            }
+        }
+        let Some(domain) = domain else {
+            return Ok(None);
+        };
+        let Some(domain_layout) = domain_layout else {
+            return Ok(None);
+        };
+        let conditions = ordinals
+            .iter()
+            .enumerate()
+            .map(|(domain_ordinal, producer_ordinal)| {
+                let binding = *producer_layout
+                    .bindings()
+                    .get(*producer_ordinal)
+                    .ok_or_else(|| paro_error::internal("native CTE key width changed"))?;
+                let ty = producer_layout
+                    .types()
+                    .get(*producer_ordinal)
+                    .cloned()
+                    .ok_or_else(|| paro_error::internal("native CTE key type disappeared"))?;
+                let domain_binding = *domain_layout
+                    .bindings()
+                    .get(domain_ordinal)
+                    .ok_or_else(|| paro_error::internal("native CTE domain width changed"))?;
+                if domain_layout.types().get(domain_ordinal) != Some(&ty) {
+                    return Err(paro_error::internal("native CTE key type changed"));
+                }
+                Ok(JoinCondition::new(
+                    Expression::ColumnRef(ColumnRefExpression::new(binding, ty.clone()).into()),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(domain_binding, ty).into(),
+                    ),
+                    JoinComparisonType::Equal,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let producer = clone_native_memo_group(&owner.cte_query, state)?;
+        let join_index = nodes.len();
+        let (left_projection_map, right_projection_map) =
+            paro_planner::operator::default_join_projections(JoinType::Semi);
+        nodes.push(NativeNode {
+            id: state.bind_context.next_plan_id(),
+            stats: native_shell_child_stats(&nodes, &producer),
+            operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin {
+                join_type: JoinType::Semi,
+                anti_join_mode: paro_planner::operator::AntiJoinMode::Regular,
+                left: producer,
+                right: domain,
+                conditions,
+                mark_index: None,
+                mark_semantics: paro_planner::operator::MarkJoinSemantics::for_join_type(
+                    JoinType::Semi,
+                ),
+                duplicate_eliminated_columns: Vec::new(),
+                delim_flipped: false,
+                build_side_constraint: Default::default(),
+                left_projection_map,
+                right_projection_map,
+            })),
+            source_proofs: Box::new([]),
+        });
+        let symbol = self.domain_symbol(&proof, memo, state);
+        for occurrence in &self.occurrences {
+            let Some(index) = native_path_node(&nodes, consumer_root, &occurrence.path) else {
+                return Ok(None);
+            };
+            let LogicalOperator::CTERef(reference) = &mut nodes[index].operator else {
+                return Ok(None);
+            };
+            if reference.cte_index != self.cte_index
+                || reference.table_index != occurrence.table_index
+            {
+                return Ok(None);
+            }
+            reference.cte_index = symbol;
+        }
+        let consumer = NativeChild::Node(consumer_root);
+        let wrapper_index = nodes.len();
+        nodes.push(NativeNode {
+            id: state.bind_context.next_plan_id(),
+            stats: native_shell_child_stats(&nodes, &consumer),
+            operator: LogicalOperator::MaterializedCTE(MaterializedCTE {
+                cte_index: symbol,
+                cte_name: owner.cte_name,
+                column_names: owner.column_names,
+                column_types: owner.column_types,
+                output_columns: owner.output_columns,
+                materialized: owner.materialized,
+                ref_count: owner.ref_count,
+                cte_query: NativeChild::Node(join_index),
+                child: consumer,
+            }),
+            source_proofs: Box::new([]),
+        });
+        let (result, result_layout) = compact_native_shell_with_layout(NativeShell {
+            nodes: nodes.into_boxed_slice(),
+            root: wrapper_index,
+        })?;
+        if result_layout != original_layout {
+            return Err(paro_error::internal(
+                "native CTE demand changed the owner output layout",
+            ));
+        }
+        if result
+            .nodes
+            .iter()
+            .any(|node| matches!(node.operator, LogicalOperator::RecursiveCTE(_)))
+        {
+            return Ok(None);
+        }
+        Ok(Some((result, proof)))
+    }
+
+    /// Produce partitioned materialization alternatives without first
+    /// exporting the owner/consumer DAG to the owned-plan arena.  Each
+    /// alternative keeps the same opaque producer group and changes only the
+    /// exact CTERef paths belonging to one discriminator.  The labels are
+    /// session identities, not a frontier ordinal, so replaying a binding
+    /// reuses the same symbols.
+    pub(super) fn native_partitions(
+        &self,
+        shell: NativeShell,
+        layouts: &[paro_planner::operator::LogicalOutputLayout],
+        state: &mut PlannerTransformState,
+    ) -> Result<Vec<NativeShell>> {
+        if self.policy != CTEMaterialize::Default || self.occurrences.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let root = shell.root;
+        let LogicalOperator::MaterializedCTE(owner) = shell
+            .nodes
+            .get(root)
+            .ok_or_else(|| paro_error::internal("native CTE partition lost its owner node"))?
+            .operator
+            .clone()
+        else {
+            return Err(paro_error::internal(
+                "native CTE partition lost its owner shell",
+            ));
+        };
+        if owner.cte_index != self.cte_index {
+            return Ok(Vec::new());
+        }
+        let NativeChild::MemoGroup {
+            group: producer_group,
+            reference: producer_reference,
+            ..
+        } = owner.cte_query.clone()
+        else {
+            return Ok(Vec::new());
+        };
+        if producer_group != self.producer
+            || !producer_reference.facts.can_replay
+            || producer_reference.facts.contains_control_region
+        {
+            return Ok(Vec::new());
+        }
+        let NativeChild::Node(consumer_root) = owner.child else {
+            return Ok(Vec::new());
+        };
+        let original_layout = layouts.get(root).cloned().ok_or_else(|| {
+            paro_error::internal("native CTE partition owner layout is missing")
+        })?;
+        let candidates = self
+            .occurrences
+            .iter()
+            .map(occurrence_equalities)
+            .collect::<Vec<_>>();
+        let Some(first) = candidates.first() else {
+            return Ok(Vec::new());
+        };
+        let ordinals = first
+            .iter()
+            .map(|(ordinal, _)| *ordinal)
+            .filter(|ordinal| {
+                candidates
+                    .iter()
+                    .all(|values| values.iter().any(|(candidate, _)| candidate == ordinal))
+            })
+            .collect::<BTreeSet<_>>();
+        let producer_bindings = producer_reference.bindings.clone();
+        let producer_edge = owner.cte_query.clone();
+        let mut results = Vec::new();
+        let mut partitions_seen = BTreeSet::new();
+        for ordinal in ordinals {
+            let mut values = Vec::<Expression>::new();
+            let mut partitions = Vec::<Vec<&CteOccurrenceRequirement>>::new();
+            for (occurrence, values_for_occurrence) in self.occurrences.iter().zip(&candidates) {
+                let Some((_, value)) = values_for_occurrence
+                    .iter()
+                    .find(|(candidate, _)| *candidate == ordinal)
+                else {
+                    return Ok(results);
+                };
+                let partition = if let Some(partition) = values
+                    .iter()
+                    .position(|candidate| candidate.equals(value))
+                {
+                    partition
+                } else {
+                    values.push(value.clone());
+                    partitions.push(Vec::new());
+                    partitions.len() - 1
+                };
+                partitions[partition].push(occurrence);
+            }
+            if partitions.len() < 2 {
+                continue;
+            }
+            let mut assignment = partitions
+                .iter()
+                .enumerate()
+                .flat_map(|(partition, occurrences)| {
+                    occurrences
+                        .iter()
+                        .map(move |occurrence| (occurrence.path.clone(), partition))
+                })
+                .collect::<Vec<_>>();
+            assignment.sort_unstable();
+            let assignment = assignment.into_boxed_slice();
+            if !partitions_seen.insert(assignment.clone()) {
+                continue;
+            }
+            let indices = state
+                .cte_partition_labels
+                .entry((self.cte_index, assignment))
+                .or_insert_with(|| {
+                    partitions
+                        .iter()
+                        .map(|_| state.bind_context.generate_table_index())
+                        .collect()
+                })
+                .clone();
+            let mut domains = Vec::with_capacity(partitions.len());
+            for occurrences in &partitions {
+                let Some(predicates) = crate::cte::predicate_domain::derive_producer_predicates(
+                    occurrences
+                        .iter()
+                        .map(|occurrence| crate::cte::predicate_domain::FilteredCTERef {
+                            old_bindings: occurrence.output.bindings().to_vec(),
+                            filters: occurrence
+                                .predicates
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_vec(),
+                        })
+                        .collect(),
+                    &producer_bindings,
+                ) else {
+                    domains.clear();
+                    break;
+                };
+                domains.push(predicates);
+            }
+            if domains.len() != partitions.len() {
+                continue;
+            }
+
+            let mut nodes = shell.nodes.to_vec();
+            let mut consumer = NativeChild::Node(consumer_root);
+            for (partition, predicates) in domains.into_iter().enumerate().rev() {
+                for occurrence in &partitions[partition] {
+                    let Some(index) = native_path_node(&nodes, consumer_root, &occurrence.path)
+                    else {
+                        return Err(paro_error::internal(
+                            "native CTE partition occurrence path disappeared",
+                        ));
+                    };
+                    let LogicalOperator::CTERef(reference) = &mut nodes[index].operator else {
+                        return Err(paro_error::internal(
+                            "native CTE partition occurrence changed operator",
+                        ));
+                    };
+                    if reference.cte_index != self.cte_index
+                        || reference.table_index != occurrence.table_index
+                    {
+                        return Err(paro_error::internal(
+                            "native CTE partition occurrence changed binding",
+                        ));
+                    }
+                    reference.cte_index = indices[partition];
+                }
+                let producer = clone_native_memo_group(&producer_edge, state)?;
+                let filter_index = nodes.len();
+                let producer_stats = native_shell_child_stats(&nodes, &producer);
+                nodes.push(NativeNode {
+                    id: state.bind_context.next_plan_id(),
+                    stats: producer_stats,
+                    operator: LogicalOperator::Filter(paro_planner::operator::Filter {
+                        expressions: predicates,
+                        child: producer,
+                        projection_map: paro_planner::operator::ProjectionMap::all(),
+                    }),
+                    source_proofs: Box::new([]),
+                });
+                let wrapper_index = nodes.len();
+                let consumer_stats = native_shell_child_stats(&nodes, &consumer);
+                nodes.push(NativeNode {
+                    id: state.bind_context.next_plan_id(),
+                    stats: consumer_stats,
+                    operator: LogicalOperator::MaterializedCTE(MaterializedCTE {
+                        cte_index: indices[partition],
+                        cte_name: format!("{}$domain{}", owner.cte_name, partition + 1),
+                        column_names: owner.column_names.clone(),
+                        column_types: owner.column_types.clone(),
+                        output_columns: owner.output_columns.clone(),
+                        materialized: owner.materialized,
+                        ref_count: partitions[partition].len(),
+                        cte_query: NativeChild::Node(filter_index),
+                        child: consumer,
+                    }),
+                    source_proofs: Box::new([]),
+                });
+                consumer = NativeChild::Node(wrapper_index);
+            }
+            self.validate_native_occurrence_null_extension(&nodes, consumer_root, &indices)?;
+            let NativeChild::Node(result_root) = consumer else {
+                unreachable!("native CTE partition always creates a wrapper")
+            };
+            let (result, result_layout) = compact_native_shell_with_layout(NativeShell {
+                nodes: nodes.into_boxed_slice(),
+                root: result_root,
+            })?;
+            if result_layout != original_layout {
+                return Err(paro_error::internal(
+                    "native CTE partition changed the owner output layout",
+                ));
+            }
+            if native_cte_shell_contains_control_boundary(&result) {
+                continue;
+            }
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    fn validate_native_occurrence_null_extension(
+        &self,
+        nodes: &[NativeNode],
+        root: usize,
+        ctes: &[usize],
+    ) -> Result<()> {
+        let mut pending = vec![(root, false, Vec::new())];
+        let mut seen = 0usize;
+        while let Some((index, null_extended, path)) = pending.pop() {
+            let node = nodes.get(index).ok_or_else(|| {
+                paro_error::internal("native CTE partition references an unknown consumer")
+            })?;
+            if let LogicalOperator::CTERef(reference) = &node.operator {
+                if ctes.contains(&reference.cte_index) {
+                    let occurrence = self
+                        .occurrences
+                        .iter()
+                        .find(|occurrence| occurrence.path.as_ref() == path)
+                        .ok_or_else(|| {
+                            paro_error::internal("native CTE partition introduced an occurrence")
+                        })?;
+                    if occurrence.null_extended != null_extended
+                        || occurrence.table_index != reference.table_index
+                    {
+                        return Err(paro_error::internal(
+                            "native CTE partition changed null-extension ownership",
+                        ));
+                    }
+                    seen += 1;
+                }
+            }
+            let mut children = Vec::new();
+            node.operator
+                .visit_child_links(&mut |child| children.push(child.clone()));
+            for (ordinal, child) in children.into_iter().enumerate() {
+                let NativeChild::Node(child) = child else {
+                    continue;
+                };
+                let extended = input_is_null_extended(&node.operator, ordinal);
+                let mut child_path = path.clone();
+                child_path.push(ordinal);
+                pending.push((child, null_extended || extended, child_path));
+            }
+        }
+        if seen != self.occurrences.len() {
+            return Err(paro_error::internal(
+                "native CTE partition lost occurrence coverage",
+            ));
+        }
+        Ok(())
+    }
+
     fn domain_symbol(
         &self,
         proof: &CteDomainProof,
@@ -1864,4 +2988,118 @@ impl CteRequirement {
         holes.remove(&producer.reference_id);
         Ok(Some(plan))
     }
+}
+
+fn native_path_node(
+    nodes: &[NativeNode],
+    root: usize,
+    path: &[usize],
+) -> Option<usize> {
+    let mut current = root;
+    for ordinal in path {
+        let node = nodes.get(current)?;
+        let mut children = Vec::new();
+        node.operator
+            .visit_child_links(&mut |child| children.push(child.clone()));
+        current = match children.get(*ordinal)? {
+            NativeChild::Node(index) => *index,
+            NativeChild::MemoGroup { .. } | NativeChild::Group { .. } => return None,
+        };
+    }
+    Some(current)
+}
+
+/// A materialized CTE is the intentional result of the partition rewrite,
+/// so the generic native-shell control check (which rejects every CTE
+/// wrapper) is too strict here.  Keep its safety property for recursive
+/// ownership and for opaque inputs whose boundary facts explicitly contain a
+/// control region.
+fn native_cte_shell_contains_control_boundary(shell: &NativeShell) -> bool {
+    shell.nodes.iter().any(|node| {
+        let mut contains = matches!(&node.operator, LogicalOperator::RecursiveCTE(_));
+        node.operator.visit_child_links(&mut |child| match child {
+            NativeChild::MemoGroup { reference, .. } | NativeChild::Group { reference, .. } => {
+                contains |= reference.facts.contains_control_region;
+            }
+            NativeChild::Node(_) => {}
+        });
+        contains
+    })
+}
+
+fn clone_native_memo_group(
+    child: &NativeChild,
+    state: &PlannerTransformState,
+) -> Result<NativeChild> {
+    let NativeChild::MemoGroup {
+        group,
+        stats,
+        layout,
+        names,
+        reference,
+        ..
+    } = child
+    else {
+        return Err(paro_error::internal(
+            "native CTE rewrite requires a Memo group producer edge",
+        ));
+    };
+    let id = state.bind_context.next_plan_id();
+    let mut reference = reference.clone();
+    reference.reference_id =
+        paro_planner::operator::BoundReferenceId::group_hole(id.0);
+    Ok(NativeChild::MemoGroup {
+        group: *group,
+        id,
+        stats: stats.clone(),
+        layout: layout.clone(),
+        names: names.clone(),
+        reference,
+    })
+}
+
+/// Build the positional projection required to replace one CTERef.  The
+/// definition-column mapping is authoritative: a positional shortcut would
+/// silently change semantics for a producer whose output was reordered or
+/// pruned before it reached the materialization boundary.
+fn cte_projection_expressions(
+    owner: &MaterializedCTE<NativeChild>,
+    producer_layout: &paro_planner::operator::LogicalOutputLayout,
+    reference: &CTERef,
+) -> Result<Option<Vec<Expression>>> {
+    if reference.definition_columns.len() != reference.column_types.len()
+        || reference.column_names.len() != reference.column_types.len()
+    {
+        return Ok(None);
+    }
+    let mut expressions = Vec::with_capacity(reference.definition_columns.len());
+    for (ordinal, definition) in reference.definition_columns.iter().enumerate() {
+        let Some(output) = owner
+            .output_columns
+            .iter()
+            .find(|output| output.definition == *definition)
+        else {
+            return Ok(None);
+        };
+        let Some(source_ordinal) = producer_layout
+            .bindings()
+            .iter()
+            .position(|binding| *binding == output.binding)
+        else {
+            return Ok(None);
+        };
+        let Some(source_type) = producer_layout.types().get(source_ordinal) else {
+            return Ok(None);
+        };
+        let Some(returned_type) = reference.column_types.get(ordinal) else {
+            return Ok(None);
+        };
+        if source_type != returned_type {
+            return Ok(None);
+        }
+        expressions.push(Expression::ColumnRef(
+            ColumnRefExpression::new(output.binding, source_type.clone()).into(),
+        ));
+    }
+    Ok(Some(expressions))
 }
