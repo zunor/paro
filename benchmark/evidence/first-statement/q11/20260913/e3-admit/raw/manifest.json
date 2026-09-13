@@ -1,0 +1,893 @@
+{
+  "files": [
+    {
+      "source": "/private/tmp/paro-e3-analysis.json",
+      "archive": "paro-e3-analysis.json.gz",
+      "bytes": 125698,
+      "sha256": "80bacb2a8c0692697b1328183323cd9efc827080a35895aef36cd012656d2004",
+      "gzip_sha256": "c32a22cf512f30cf12e1b7ed5c39f5717b8fdb07f5e6a51dd676175176d943b9"
+    },
+    {
+      "source": "/private/tmp/paro-e3-build.log",
+      "archive": "paro-e3-build.log.gz",
+      "bytes": 1903,
+      "sha256": "80613caf1f5126e360521085cff23c340e849faf7900b87ad319ba7bebaab735",
+      "gzip_sha256": "8a87c32fd52928c89c2eda9d6c00cc7a82fa31877510a6bb823a76739b908dce"
+    },
+    {
+      "source": "/private/tmp/paro-e3-clean-counter-tests.log",
+      "archive": "paro-e3-clean-counter-tests.log.gz",
+      "bytes": 1628,
+      "sha256": "7f5f54a5ae631b5774e8edc8649659504ecd7aef3e8e62dd5ca4522ff2aa5dc8",
+      "gzip_sha256": "b01570a0387fc6247551aa0fdcf14925aa2a11d12143b3d8e31d38ec60578856"
+    },
+    {
+      "source": "/private/tmp/paro-e3-clean-engine-tests.log",
+      "archive": "paro-e3-clean-engine-tests.log.gz",
+      "bytes": 12681,
+      "sha256": "1ab34879aa8d2add1687919c38d256a292bb627224bb080be4ef7fd7d6db68ed",
+      "gzip_sha256": "fa7040392dd1a68bf18775ec229ca83fc9812b785e13ee2a96048f11742cc8c1"
+    },
+    {
+      "source": "/private/tmp/paro-e3-clean-guards-tests.log",
+      "archive": "paro-e3-clean-guards-tests.log.gz",
+      "bytes": 1763,
+      "sha256": "6922150f310f2082e50991334370b05ffb01d1744f963feee2c4c3992f8e87d4",
+      "gzip_sha256": "e263616f3e71b90039808ad279b84ae8af2041cded441cadadfba4fde07ca6fd"
+    },
+    {
+      "source": "/private/tmp/paro-e3-clean-payload-tests.log",
+      "archive": "paro-e3-clean-payload-tests.log.gz",
+      "bytes": 3078,
+      "sha256": "986ba27e78812c37e07238171f7c948034f0a6684556b1020b07601eeffd764b",
+      "gzip_sha256": "4bb556ec8f737278b862242a75b4b38b164a1a375174ec0218d601f81ab8a2d2"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-a-run.log",
+      "archive": "paro-e3-control-a-run.log.gz",
+      "bytes": 1011,
+      "sha256": "c32ca88d3e885dfc77b9f58dae83ed5fd944bb102f2e5b9276159dc8cd952d61",
+      "gzip_sha256": "e8818c663dfb82de001afb07b6808bec49e74a5ee2a43257eb1b66c74ecc9a73"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-a.json",
+      "archive": "paro-e3-control-a.json.gz",
+      "bytes": 42045747,
+      "sha256": "9a4b457a7cc1d470be96542ba554a904ed786e7d2af6e00f464f65e64d744994",
+      "gzip_sha256": "a7bf5acd41e4f52b45397d695b93d75e78b11663c40e10ed93946474ec8ccc71"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-a.q11.block000.parod.log",
+      "archive": "paro-e3-control-a.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-a.q11.block001.parod.log",
+      "archive": "paro-e3-control-a.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-a.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-control-a.q11.diagnostic000.parod.log.gz",
+      "bytes": 55987715,
+      "sha256": "1ce53badb29e23792a6abd1c8fc34efa9363bd5a091233ed5d4476615279dfe8",
+      "gzip_sha256": "aa6bcf104a072c18a7a54d0bf1ef2fe10b55eb83ec986887aef5c8260f61d8fb"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-a.q11.oracle.parod.log",
+      "archive": "paro-e3-control-a.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-b-run.log",
+      "archive": "paro-e3-control-b-run.log.gz",
+      "bytes": 1011,
+      "sha256": "fb78d9c9d16cadbea835434db519914fffff7655068ed546206e5dcdcd11e690",
+      "gzip_sha256": "0f2ba56aa70162843cd93e4c49351c0d42fd5b379a25adfeb91df60f0b27c821"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-b.json",
+      "archive": "paro-e3-control-b.json.gz",
+      "bytes": 42046029,
+      "sha256": "67f046ac7965d0b03519749c7f8e514194a3ebaf26f91d03e57b5574f9e4ab7d",
+      "gzip_sha256": "697388569aee2f3a5e884e6e0f36743408b728676f9582d479a4809a5a75b3c6"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-b.q11.block000.parod.log",
+      "archive": "paro-e3-control-b.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-b.q11.block001.parod.log",
+      "archive": "paro-e3-control-b.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-b.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-control-b.q11.diagnostic000.parod.log.gz",
+      "bytes": 55987867,
+      "sha256": "089cedecf1c347eec3880e174f73c5fe39ac6c5974d2688d378a1e384e28499b",
+      "gzip_sha256": "23d5c652da30cacbc16ba7aa68ec820f6a41061f24833588f094ba1e147a10f6"
+    },
+    {
+      "source": "/private/tmp/paro-e3-control-b.q11.oracle.parod.log",
+      "archive": "paro-e3-control-b.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-guards-build.log",
+      "archive": "paro-e3-guards-build.log.gz",
+      "bytes": 1456,
+      "sha256": "949021d9a3bf13544edda80b2aa33ec13b1a8ae5e20658130fbabdf0e1d159f9",
+      "gzip_sha256": "50332f789c3dbfa9048b045ce6cd3823dda3b1c948ed395d9722cf99ae4ecef4"
+    },
+    {
+      "source": "/private/tmp/paro-e3-guards-default-run.log",
+      "archive": "paro-e3-guards-default-run.log.gz",
+      "bytes": 1015,
+      "sha256": "6578af10319e4a1f3dac4dec2eb06447a0d776bf8e361820f63dc7557a5af505",
+      "gzip_sha256": "2312a12d644996df8713e2b1673524dcfa3c197a493452f16c4fc0d27d1d02fb"
+    },
+    {
+      "source": "/private/tmp/paro-e3-guards-default.json",
+      "archive": "paro-e3-guards-default.json.gz",
+      "bytes": 123999893,
+      "sha256": "4a36ecc029cf5f031ac325bcc87cb93248c7e3d68ec30606d22e4acf29214c85",
+      "gzip_sha256": "ec53be361a7b2d828d3f6f8e0646dea37c014ee0f11d31eee9a9b4c800b19be3"
+    },
+    {
+      "source": "/private/tmp/paro-e3-guards-default.q11.block000.parod.log",
+      "archive": "paro-e3-guards-default.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-guards-default.q11.block001.parod.log",
+      "archive": "paro-e3-guards-default.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-guards-default.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-guards-default.q11.diagnostic000.parod.log.gz",
+      "bytes": 162716825,
+      "sha256": "94e3990a4ee19c5a84002d5aecdd4891cd1f18e61599653ffb4622d2df9fe9fc",
+      "gzip_sha256": "8a7e84592d3f56a9166ed84f03d8636fcc8553eb8415c5a3236129fe9bb22ca7"
+    },
+    {
+      "source": "/private/tmp/paro-e3-guards-default.q11.oracle.parod.log",
+      "archive": "paro-e3-guards-default.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-harness-tests.log",
+      "archive": "paro-e3-harness-tests.log.gz",
+      "bytes": 215,
+      "sha256": "8cf9d965b78c9612eb13f2506e2166e85d4e2dad8034ef84baa6c80b2a7449a1",
+      "gzip_sha256": "6800443f4c66dc65aabcaca6f3bba17863d95a1fa54fcf500964c1d1a7ac1954"
+    },
+    {
+      "source": "/private/tmp/paro-e3-pre-touch-followup-tests.log",
+      "archive": "paro-e3-pre-touch-followup-tests.log.gz",
+      "bytes": 103,
+      "sha256": "6273232de4d3ef7acd4ecafa5c86beeeb974f56586b21089a2990b3f72facbe6",
+      "gzip_sha256": "97effd2ebbe61a3cfcf40329e17e13f516d31d2e57d4b9d61ead10a9bad8e5fd"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-a-run.log",
+      "archive": "paro-e3-r-control-a-run.log.gz",
+      "bytes": 1011,
+      "sha256": "e7845cd3ce0fe74d43d11578f5268ed42c243870cc7a49ca3799e87ffaedef11",
+      "gzip_sha256": "fd0b409891b2ae85a2b72eb3d3893d90ee7c5c5bd17c0b213f32b04950c659b9"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-a.json",
+      "archive": "paro-e3-r-control-a.json.gz",
+      "bytes": 42046044,
+      "sha256": "e6f86f3453d1e1f357f46a8a8af452297b77d8e39e98d7b998c650d606f38701",
+      "gzip_sha256": "e82f8fa71a334d698a39e74d3570cbfba10a45af42c619c406ed7a1adc2a49a1"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-a.q11.block000.parod.log",
+      "archive": "paro-e3-r-control-a.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-a.q11.block001.parod.log",
+      "archive": "paro-e3-r-control-a.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-a.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-r-control-a.q11.diagnostic000.parod.log.gz",
+      "bytes": 55987865,
+      "sha256": "57bfac54a22f35499e6478e26075a4c00efb6ebe6c7e51de43d2ef75db2e0d2a",
+      "gzip_sha256": "344dfa4ae3d79178970163891547e6ca5535d9f1ecadfee8c1fa7076879151e3"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-a.q11.oracle.parod.log",
+      "archive": "paro-e3-r-control-a.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-b-run.log",
+      "archive": "paro-e3-r-control-b-run.log.gz",
+      "bytes": 1011,
+      "sha256": "83eddfda2dfc8b71e28cbe77ae4bc0c717a31db2e1afab68475179999459705d",
+      "gzip_sha256": "f4c6ef8ffc47e2f0aa67400bde5fc7180df8ee924880274d952146c03ffbcdff"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-b.json",
+      "archive": "paro-e3-r-control-b.json.gz",
+      "bytes": 42025425,
+      "sha256": "50026d91e77d0490cb244214c91bcd44da892e8781fb36d427187a241a5c4279",
+      "gzip_sha256": "b8b27b449a8012ec5fec3d0e02ba5185859e56f7c8533d3cebb286f919a22a02"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-b.q11.block000.parod.log",
+      "archive": "paro-e3-r-control-b.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-b.q11.block001.parod.log",
+      "archive": "paro-e3-r-control-b.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-b.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-r-control-b.q11.diagnostic000.parod.log.gz",
+      "bytes": 55963275,
+      "sha256": "c55a85299b816993e54b3b706ea4f96784b2647a530cca6f02a5e164485c5f36",
+      "gzip_sha256": "f83af73729abaa33dd73e6ef62c39c98857aa4c34a045b058af3475547b032e5"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-control-b.q11.oracle.parod.log",
+      "archive": "paro-e3-r-control-b.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-a-run.log",
+      "archive": "paro-e3-r-stream-a-run.log.gz",
+      "bytes": 1011,
+      "sha256": "2fa4703797cb0b6868c2bad76118abe7ef048682adcb75c2835d98a7846c3ae2",
+      "gzip_sha256": "5c74b7230ff51cbeb4e3af79d9c52b49cd0eba80313d3a443aca398b5cf01391"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-a.json",
+      "archive": "paro-e3-r-stream-a.json.gz",
+      "bytes": 42045925,
+      "sha256": "856b76ad166d3c138c5b07670af37454cdfc782021da0d751c9495abb2b0c65f",
+      "gzip_sha256": "a5dfc7ca1e8faf2e611a6752f59bda2b85c7d9b78dbea7b9f351382013a48764"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-a.q11.block000.parod.log",
+      "archive": "paro-e3-r-stream-a.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-a.q11.block001.parod.log",
+      "archive": "paro-e3-r-stream-a.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-a.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-r-stream-a.q11.diagnostic000.parod.log.gz",
+      "bytes": 55987814,
+      "sha256": "baf8f688f0bc24bbe829be3e3fdd94bbc673af77a27cac4b7abf1586c5af0cb1",
+      "gzip_sha256": "686e8e144737adc739a75ba4d1280acd15553ff26e532f95ce0a22d775c6601b"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-a.q11.oracle.parod.log",
+      "archive": "paro-e3-r-stream-a.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-b-run.log",
+      "archive": "paro-e3-r-stream-b-run.log.gz",
+      "bytes": 1011,
+      "sha256": "2756a3f8e8b734ef8215d1d5d38ae13cfc3af35534da6ab8b317867c9a6bbc6f",
+      "gzip_sha256": "4c1711afd7ee776aee363607c48ffead88d1366249eacc482cb5b31fd654ee97"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-b.json",
+      "archive": "paro-e3-r-stream-b.json.gz",
+      "bytes": 42025449,
+      "sha256": "cd40e6422d003410c5ec5728c3148d49936559ba8312ab6e847cc987dc126ced",
+      "gzip_sha256": "50b2787cc6bccf7f905a52e6dafa18e1440e37318a90431b51a56353c7b38b64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-b.q11.block000.parod.log",
+      "archive": "paro-e3-r-stream-b.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-b.q11.block001.parod.log",
+      "archive": "paro-e3-r-stream-b.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-b.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-r-stream-b.q11.diagnostic000.parod.log.gz",
+      "bytes": 55963295,
+      "sha256": "a368d24402b4678560259e12db58267ae043b8b16221db0e05f4def521d9f944",
+      "gzip_sha256": "f843c0aaf94a133d669236b7624fca91cf54a1491f8b82ed4bd00cf01724eb9d"
+    },
+    {
+      "source": "/private/tmp/paro-e3-r-stream-b.q11.oracle.parod.log",
+      "archive": "paro-e3-r-stream-b.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-control-run.log",
+      "archive": "paro-e3-scalar-control-run.log.gz",
+      "bytes": 1011,
+      "sha256": "ab501cff9c45d1ce1edd36d13af874e1f1c583f82d395b3fff4d20148d037192",
+      "gzip_sha256": "0beb2319899abd58bf18125580b6ef056bbefea77ba1a872cdea88eb726bcbd1"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-control.json",
+      "archive": "paro-e3-scalar-control.json.gz",
+      "bytes": 42144777,
+      "sha256": "8b036f604e90bbbe4c76affec7f2ad157a649074979c27377bdb55f0a51f9d16",
+      "gzip_sha256": "a39efaf1ff7366cc8538f002696d505a038676acae3e596aa5b4bdb875814faa"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-control.q11.block000.parod.log",
+      "archive": "paro-e3-scalar-control.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-control.q11.block001.parod.log",
+      "archive": "paro-e3-scalar-control.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-control.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-scalar-control.q11.diagnostic000.parod.log.gz",
+      "bytes": 55987838,
+      "sha256": "c223fee5c3ef8171f4d3c2a9ea31e8e037e1ebe0c30d0eb1e6c72b57129d5009",
+      "gzip_sha256": "041a74a2b69e376beadcd8f2411f9d6914d4926201b418a5bffc8b9faefef8db"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-control.q11.oracle.parod.log",
+      "archive": "paro-e3-scalar-control.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-stream-run.log",
+      "archive": "paro-e3-scalar-stream-run.log.gz",
+      "bytes": 1011,
+      "sha256": "57527f1d8b3c0539d5fe9ec33b28d91ab146175504d51414cf9fe9c62a7c0bac",
+      "gzip_sha256": "31e539ea1fe1902e36a1ee3288385374f523b63a9b150b5fdc970392f62591e2"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-stream.json",
+      "archive": "paro-e3-scalar-stream.json.gz",
+      "bytes": 42124080,
+      "sha256": "50fbb55575bbb4e188989ac86ed57529a20b12951bd7f70538c27a8fb0a0191f",
+      "gzip_sha256": "ce03c1d45e62588c20650d460f7c06f043efda78224cfd1348b34116101da4ed"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-stream.q11.block000.parod.log",
+      "archive": "paro-e3-scalar-stream.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-stream.q11.block001.parod.log",
+      "archive": "paro-e3-scalar-stream.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-stream.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-scalar-stream.q11.diagnostic000.parod.log.gz",
+      "bytes": 55963209,
+      "sha256": "4dfb93ae602c5679b41a7eef0075f3929f62ad456b16157c42dc7dd1609efd86",
+      "gzip_sha256": "5f70cc29dd98ee64032b910c7bd97ad4a0366f3087af6a8acac89d194eeea976"
+    },
+    {
+      "source": "/private/tmp/paro-e3-scalar-stream.q11.oracle.parod.log",
+      "archive": "paro-e3-scalar-stream.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-storage-test.log",
+      "archive": "paro-e3-storage-test.log.gz",
+      "bytes": 2487,
+      "sha256": "38378a591573b9797420946cb418554c385e13cdb98c3140ecde9e164052f250",
+      "gzip_sha256": "85072dead2531053fa8ee96f66db1ef1a0e53e1d073d2b126d70f9f46b9b4c4b"
+    },
+    {
+      "source": "/private/tmp/paro-e3-storage-tests.log",
+      "archive": "paro-e3-storage-tests.log.gz",
+      "bytes": 24390,
+      "sha256": "8a7911a74cb6f144121a9af3e816b187b3b61eec5f12f39e4471a56f673b9ef3",
+      "gzip_sha256": "c0a91ca059a17dd649287791778b67bd35d2dc0c372b3c384bf4115dc9cf5b2f"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-a-run.log",
+      "archive": "paro-e3-stream-a-run.log.gz",
+      "bytes": 1011,
+      "sha256": "a9a15a1ab31f3b346400f4b550d2525bcf5d582b7616719f52f6736fd5ddc853",
+      "gzip_sha256": "725fa3b9b0ba7a7dbd6ee5fababb45bcd5b7ce9c4072c4c7d153881ec5e962b6"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-a.json",
+      "archive": "paro-e3-stream-a.json.gz",
+      "bytes": 42046065,
+      "sha256": "172ff9cdbdf7d7192f065de297fd672aa4deba9f4107fadacf10908a027afa76",
+      "gzip_sha256": "1bb04a6da80d19bae24d904920761c6643b6102688eac26ddb1fd440b559e472"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-a.q11.block000.parod.log",
+      "archive": "paro-e3-stream-a.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-a.q11.block001.parod.log",
+      "archive": "paro-e3-stream-a.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-a.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-stream-a.q11.diagnostic000.parod.log.gz",
+      "bytes": 55987882,
+      "sha256": "6d40251059aaac2eac4623cdb4d9de1154b2ec03ce44e63e158c96fc3fe97db4",
+      "gzip_sha256": "bdaf37af46bd45d7862cfada2e4c5c2b4a919e236b00a6edec9f7978b64fb65f"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-a.q11.oracle.parod.log",
+      "archive": "paro-e3-stream-a.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-b-run.log",
+      "archive": "paro-e3-stream-b-run.log.gz",
+      "bytes": 1011,
+      "sha256": "3d3ad35e49e971c801f5ad217d4d0debddfc3c768d3a6b316c124e624ed59779",
+      "gzip_sha256": "ea75f9df8999c1450848df0c0952d4889cc847cd9a866b41c01b824309e108cd"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-b.json",
+      "archive": "paro-e3-stream-b.json.gz",
+      "bytes": 42045977,
+      "sha256": "33cf3f0cd644ebb09cf7c4cd0f4beacfed5b210fc8d857e71baa8dfa79c81ff0",
+      "gzip_sha256": "e85d59c12a6b5ecc1bb5be4d3ca03570c2496cdd965a56e75c301fe64b199757"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-b.q11.block000.parod.log",
+      "archive": "paro-e3-stream-b.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-b.q11.block001.parod.log",
+      "archive": "paro-e3-stream-b.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-b.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-stream-b.q11.diagnostic000.parod.log.gz",
+      "bytes": 55987851,
+      "sha256": "a3198c9d658fe676e2a9a1c9cb973ff10ad5bb005cf55bb4cfd87abdafda908f",
+      "gzip_sha256": "72feceecbc5c8e485e133150ef81bad98a6de6280f9df0a0fbd59d5fc1bb0232"
+    },
+    {
+      "source": "/private/tmp/paro-e3-stream-b.q11.oracle.parod.log",
+      "archive": "paro-e3-stream-b.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-control-run.log",
+      "archive": "paro-e3-touch-control-run.log.gz",
+      "bytes": 1036,
+      "sha256": "95a8b99b8040746a611384716619936dd61f40316eeb45b3ebecd8c7f0d7a849",
+      "gzip_sha256": "554d0e4bbb6c472e6359fc1cab28b6521eea1f34b7600ccaadf2b66d019baa14"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-control.json",
+      "archive": "paro-e3-touch-control.json.gz",
+      "bytes": 44988408,
+      "sha256": "1c4b7d701f7af16723da13148eebaadc1c7e5b48a619609ff3074c4ce2320d2f",
+      "gzip_sha256": "1311753fd8aa34e5c6dcd1fb3359d1d7c2ee0faeeaea591780ac3636bea79473"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-control.q11.block000.parod.log",
+      "archive": "paro-e3-touch-control.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-control.q11.block001.parod.log",
+      "archive": "paro-e3-touch-control.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-control.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-touch-control.q11.diagnostic000.parod.log.gz",
+      "bytes": 63876905,
+      "sha256": "92805e9060218994b2315f2289958d655a34d61b818e91a31362c4a9ba7e67e2",
+      "gzip_sha256": "4ae99e96a447764515d0f0d24487353dcfa6798ba89eedd88eee5c933c657808"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-control.q11.oracle.parod.log",
+      "archive": "paro-e3-touch-control.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-stream-run.log",
+      "archive": "paro-e3-touch-stream-run.log.gz",
+      "bytes": 1036,
+      "sha256": "ab12fc6b921a2301ff5938d76e9ced155d362d00be4163aee1a4141abdb26dac",
+      "gzip_sha256": "e04461dd3c35bb02890f405933dee65d7103d37f5fde638444dee35088433792"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-stream.json",
+      "archive": "paro-e3-touch-stream.json.gz",
+      "bytes": 44988470,
+      "sha256": "b12f6fae681c79da3ed9e854652be3c3a6f55dee917c761e7f591390423a9322",
+      "gzip_sha256": "6646a79e819e16a28aca90c9372c44be8822d54ac6d66f35110eb2e109a2d1ec"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-stream.q11.block000.parod.log",
+      "archive": "paro-e3-touch-stream.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-stream.q11.block001.parod.log",
+      "archive": "paro-e3-touch-stream.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-stream.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-touch-stream.q11.diagnostic000.parod.log.gz",
+      "bytes": 63876927,
+      "sha256": "03855f2f50664a53302593333b49c7700edf831a918b0ec6e486c6183384e826",
+      "gzip_sha256": "94badbf176644c503a1e184532ed74a8baf86d77af0ced7c907ecdc42d67b6b4"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-stream.q11.oracle.parod.log",
+      "archive": "paro-e3-touch-stream.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-control-run.log",
+      "archive": "paro-e3-touch-verified-control-run.log.gz",
+      "bytes": 1036,
+      "sha256": "d7735d83c4dcf916754f6e57656cbb610c72f148a9def787efbea551f4bb40c8",
+      "gzip_sha256": "8ee07ad019a42df1098ec24e05a816d6bb3e515719aa4fce340f4a76ceb0fe68"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-control.json",
+      "archive": "paro-e3-touch-verified-control.json.gz",
+      "bytes": 45143136,
+      "sha256": "875ab215379295779676a3b0059b1b58fa193f989420fd2040c9524786391669",
+      "gzip_sha256": "7e9613be42c1204eaaeedde2e3f2036879d2ed18868dd2440a42bdc2e3c5f48f"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-control.q11.block000.parod.log",
+      "archive": "paro-e3-touch-verified-control.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-control.q11.block001.parod.log",
+      "archive": "paro-e3-touch-verified-control.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-control.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-touch-verified-control.q11.diagnostic000.parod.log.gz",
+      "bytes": 63886217,
+      "sha256": "b3556661b84fbb4e9b81dcd71ea1b65ec0f1717ae45ef09bdf2d79e5dbe60f0b",
+      "gzip_sha256": "96c8c7cb95ca81db4ebe6c1f1b4bbb19e6c1e5d38768bd90e0714f5bfe43cf6e"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-control.q11.oracle.parod.log",
+      "archive": "paro-e3-touch-verified-control.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-stream-run.log",
+      "archive": "paro-e3-touch-verified-stream-run.log.gz",
+      "bytes": 1036,
+      "sha256": "c545386a30bb6dce79977876648121286eeb3f8f4f14d17aec8e777ad278df7a",
+      "gzip_sha256": "ac444170de637fea2bfe12259ddc3cf1569c16ab804d50e305785e6efdcfaff0"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-stream.json",
+      "archive": "paro-e3-touch-verified-stream.json.gz",
+      "bytes": 45144122,
+      "sha256": "a7a051eeb129e3b20b28ea0b6106ea6ef8eb1f61eae3dd07a418fdcfd3757e39",
+      "gzip_sha256": "be40c37f47ead80c8f9d7795784e4671d42188abbb20348d8f22393021d61a68"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-stream.q11.block000.parod.log",
+      "archive": "paro-e3-touch-verified-stream.q11.block000.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-stream.q11.block001.parod.log",
+      "archive": "paro-e3-touch-verified-stream.q11.block001.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-stream.q11.diagnostic000.parod.log",
+      "archive": "paro-e3-touch-verified-stream.q11.diagnostic000.parod.log.gz",
+      "bytes": 63887174,
+      "sha256": "9587505cae0fdc79feb49763aeec8457d0816799128ccc731a0ee38f5738a5fe",
+      "gzip_sha256": "bc8a7a452e4b1b35c7d3a73063c017004cf376bfa6b92a8302047f7047877a17"
+    },
+    {
+      "source": "/private/tmp/paro-e3-touch-verified-stream.q11.oracle.parod.log",
+      "archive": "paro-e3-touch-verified-stream.q11.oracle.parod.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    }
+  ],
+  "reports": [
+    {
+      "archive": "paro-e3-control-a.json.gz",
+      "source": {
+        "commit": "1e5ff2a7618b7a541751df47928f27ef1275a687",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": true
+    },
+    {
+      "archive": "paro-e3-control-b.json.gz",
+      "source": {
+        "commit": "1e5ff2a7618b7a541751df47928f27ef1275a687",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": true
+    },
+    {
+      "archive": "paro-e3-guards-default.json.gz",
+      "source": {
+        "commit": "583b245bdec6c2c9237c8cd118592e1061851514",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "42a1231fb2b5a8379a9a9ad08953b352313d9a5a60f592b926ccb0cf54d71dcd",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-r-control-a.json.gz",
+      "source": {
+        "commit": "fbdc2221957132f72c8250b0f93dd8403bf91932",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-r-control-b.json.gz",
+      "source": {
+        "commit": "fbdc2221957132f72c8250b0f93dd8403bf91932",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-r-stream-a.json.gz",
+      "source": {
+        "commit": "fbdc2221957132f72c8250b0f93dd8403bf91932",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-r-stream-b.json.gz",
+      "source": {
+        "commit": "fbdc2221957132f72c8250b0f93dd8403bf91932",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-scalar-control.json.gz",
+      "source": {
+        "commit": "fbdc2221957132f72c8250b0f93dd8403bf91932",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-scalar-stream.json.gz",
+      "source": {
+        "commit": "fbdc2221957132f72c8250b0f93dd8403bf91932",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-stream-a.json.gz",
+      "source": {
+        "commit": "1e5ff2a7618b7a541751df47928f27ef1275a687",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": true
+    },
+    {
+      "archive": "paro-e3-stream-b.json.gz",
+      "source": {
+        "commit": "1e5ff2a7618b7a541751df47928f27ef1275a687",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": false,
+      "launch_window_compromised_campaign": true
+    },
+    {
+      "archive": "paro-e3-touch-control.json.gz",
+      "source": {
+        "commit": "fbdc2221957132f72c8250b0f93dd8403bf91932",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": true,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-touch-stream.json.gz",
+      "source": {
+        "commit": "fbdc2221957132f72c8250b0f93dd8403bf91932",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "b7a2c621f2b8871f8f1eb783fb5b4170421bfe8bbe80cfc11cae9ad983d423f0",
+      "pre_touch_diagnostic_only": true,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-touch-verified-control.json.gz",
+      "source": {
+        "commit": "583b245bdec6c2c9237c8cd118592e1061851514",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "42a1231fb2b5a8379a9a9ad08953b352313d9a5a60f592b926ccb0cf54d71dcd",
+      "pre_touch_diagnostic_only": true,
+      "launch_window_compromised_campaign": false
+    },
+    {
+      "archive": "paro-e3-touch-verified-stream.json.gz",
+      "source": {
+        "commit": "583b245bdec6c2c9237c8cd118592e1061851514",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "binary_sha256": "42a1231fb2b5a8379a9a9ad08953b352313d9a5a60f592b926ccb0cf54d71dcd",
+      "pre_touch_diagnostic_only": true,
+      "launch_window_compromised_campaign": false
+    }
+  ]
+}
