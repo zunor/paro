@@ -612,7 +612,13 @@ impl TransformationRule for PlannerTransformationRule {
                     }
                 }
                 PlannerTransformation::JoinRegionEnumeration => {
-                    join_region::try_native_enumeration(&binding.root, ctx.memo(), &state, &facts)?
+                    join_region::try_native_enumeration_with_cache_key(
+                        &binding.root,
+                        ctx.memo(),
+                        &state,
+                        &facts,
+                        region_identity.as_ref(),
+                    )?
                 }
                 PlannerTransformation::AggregateJoinPreaggregation => {
                     native_join_preaggregation::try_native_aggregate_join_preaggregation(

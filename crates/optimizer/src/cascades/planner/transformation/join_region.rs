@@ -187,11 +187,37 @@ pub(super) fn identity_with_facts(
 /// for reductions, projection-sensitive joins, and opaque operators; this
 /// path is intentionally conservative so a missing native capability cannot
 /// turn into a semantic no-op.
+#[cfg(test)]
 pub(super) fn try_native_enumeration(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
+) -> Result<Vec<NativeShell>> {
+    let cache_key = identity_with_facts(binding, memo, state, Some(facts))?.map(|identity| {
+        (
+            memo.canonical_group(match binding {
+                PatternOperand::Group(group) | PatternOperand::Expression { group, .. } => *group,
+            }),
+            identity,
+        )
+    });
+    try_native_enumeration_with_cache_key(binding, memo, state, facts, cache_key.as_ref())
+}
+
+/// Native enumeration with an identity that was already computed by the
+/// transformation task.  `apply_binding` needs the same identity as a
+/// publication guard before it enters this producer; carrying that exact
+/// value through avoids a second graph/fact walk.  The caller must provide an
+/// identity from the same Memo/fact snapshot and before any mutation of either
+/// one.  The public wrapper above remains useful for direct tests and callers
+/// which do not already own that proof.
+pub(super) fn try_native_enumeration_with_cache_key(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: &boundary::BoundarySnapshot,
+    cache_key: Option<&(GroupId, Box<[u8]>)>,
 ) -> Result<Vec<NativeShell>> {
     // Avoid even allocating native plan identities for a binary join. The
     // preflight only counts structurally reorderable children; the complete
@@ -238,15 +264,6 @@ pub(super) fn try_native_enumeration(
         .atoms
         .sort_unstable_by(|left, right| left.tables.cmp(&right.tables));
 
-    let cache_key = identity_with_facts(binding, memo, state, Some(facts))?.map(|identity| {
-        (
-            memo.canonical_group(match binding {
-                PatternOperand::Group(group) | PatternOperand::Expression { group, .. } => *group,
-            }),
-            identity,
-        )
-    });
-
     let mut relation_manager = RelationManager::new();
     let mut column_stats = HashMap::new();
     let mut seen_tables = BTreeSet::new();
@@ -276,7 +293,7 @@ pub(super) fn try_native_enumeration(
                 .cloned(),
         )
         .collect::<HashMap<_, _>>();
-    let graph = if let Some(key) = cache_key.as_ref() {
+    let graph = if let Some(key) = cache_key {
         let cached = {
             let mut cache = state
                 .join_region_cache
