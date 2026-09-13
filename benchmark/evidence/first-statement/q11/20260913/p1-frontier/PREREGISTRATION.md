@@ -13,7 +13,7 @@ archive minus live size and are explicitly unavailable in this initial slice.
 Use clean committed sources and the existing tpcds_compare harness, original
 Q11, seed 72ccb3dc02ce127f61c06b85920a0e75c17a55a60ee341d267251c67611f62b1,
 4 workers/2GB, binary protocol, handoff1, compile evidence1, cold evidence0.
-One fresh block/arm and one separate statement-trace diagnostic; warmup1,
+Two fresh blocks/arm and one separate statement-trace diagnostic; warmup1,
 measurement round1, random seed1, metadata generator-declared (inherited Paro
 declared keys versus DuckDB empty keys disclosed, not silently changed).
 Every arm retains typed/order90, cache-miss, source/binary/SQL/data/harness hashes.
@@ -24,7 +24,7 @@ optimizer time over10%, reduce capture before interpreting snapshots. Heavy
 statement trace is separate from trace-off optimizer scalars. Snapshot on
 statements are diagnostic even when statement trace is off.
 
-Then widths1/2/4/8/unbounded, one fresh run each, snapshot enabled. Changes to
+Then widths1/2/4/8/unbounded, one two-block report each, snapshot enabled. Changes to
 admitted fingerprint, quality and completion are expected diagnostic outcomes,
 not optimizations. Width infinity means no frontier cap (u32 maximum); all other
 safety budgets and external timeout300s remain. Keep all valid slow samples.
@@ -42,3 +42,7 @@ Width changes also change plans, recipes and propagation, so five single runs
 cannot by themselves uniquely identify kernel and per-entry CPU coefficients.
 Choose P3 only if evidence resolves that ambiguity; otherwise report the missing
 attribution rather than fitting a causal decomposition to correlated counts.
+
+Before any measured query: the harness rejected process-blocks=1 at argument
+validation. Its minimum is two; amended to two per arm, not a lowered validation
+gate. The rejected command log is retained; it contains no observations.
