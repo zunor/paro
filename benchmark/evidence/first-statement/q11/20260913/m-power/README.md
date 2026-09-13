@@ -6,6 +6,9 @@ per version. Source control6fce0fc0 versus T1c23ae52a, identical corpus harness,
 4 workers/2GB, original Q11, handoff policy unchanged. Normal E1-off/trace-off,
 first target cache miss, typed ordered90 validation; separate diagnostics/oracles.
 All valid slow observations retained in raw reports and hashed manifest.
+Inherited metadata track is asymmetric: Paro has generator-declared keys,
+DuckDB has none; every report records this. It is unchanged across T1/control,
+but these P/D ratios do not certify symmetric-metadata parity.
 
 ## Power
 
