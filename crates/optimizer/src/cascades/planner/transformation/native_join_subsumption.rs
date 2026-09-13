@@ -133,11 +133,11 @@ fn try_native_shell_with_layout(
     // describes the source expression, not this native rewrite.
     nodes[root].source_proofs = Box::new([]);
 
-    let shell = super::compact_native_shell(NativeShell {
+    let (shell, result_layout) = super::compact_native_shell_with_layout(NativeShell {
         nodes: nodes.into_boxed_slice(),
         root,
     })?;
-    if shell.root_layout()? != original_root_layout {
+    if result_layout != original_root_layout {
         return Ok(None);
     }
     Ok(Some(shell))

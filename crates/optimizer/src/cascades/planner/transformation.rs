@@ -3195,11 +3195,10 @@ fn try_native_dimension_deferral(
         source_proofs: Box::new([]),
     });
 
-    let shell = compact_native_shell(NativeShell {
+    let (shell, result_layout) = compact_native_shell_with_layout(NativeShell {
         nodes: nodes.into_boxed_slice(),
         root: outer_index,
     })?;
-    let result_layout = shell.root_layout()?;
     if result_layout.bindings() != original_root_layout.bindings()
         || result_layout.types() != original_root_layout.types()
     {
@@ -4751,6 +4750,24 @@ fn compact_native_shell(shell: NativeShell) -> Result<NativeShell> {
     let mut marks = vec![0_u8; nodes.len()];
     let mut order = Vec::new();
     visit(root, &nodes, &mut marks, &mut order)?;
+    // Native producers normally build a post-order shell and only append
+    // reachable rewrite nodes. In that case the reachability walk above is
+    // still the required cycle/ownership check, but remapping every operator
+    // and cloning every proof is pure apply-time overhead. Returning the
+    // already compact representation preserves the exact node order and
+    // child indices.
+    if root == nodes.len().saturating_sub(1)
+        && order.len() == nodes.len()
+        && order
+            .iter()
+            .enumerate()
+            .all(|(index, old_index)| index == *old_index)
+    {
+        return Ok(NativeShell {
+            nodes: nodes.into_boxed_slice(),
+            root,
+        });
+    }
     let mut remap = vec![usize::MAX; nodes.len()];
     let mut compacted = Vec::with_capacity(order.len());
     for old_index in order {
@@ -4777,6 +4794,104 @@ fn compact_native_shell(shell: NativeShell) -> Result<NativeShell> {
         nodes: compacted.into_boxed_slice(),
         root: remap[root],
     })
+}
+
+/// Compact a native shell while returning the root layout computed during
+/// compaction. Several native rules need to compare the rewritten output
+/// contract immediately after compaction. Calling `root_layout()` there
+/// would walk every compacted node a second time; computing the layout from
+/// the already remapped child edges keeps that validation in the same pass.
+fn compact_native_shell_with_layout(
+    shell: NativeShell,
+) -> Result<(NativeShell, paro_planner::operator::LogicalOutputLayout)> {
+    fn visit(
+        index: usize,
+        nodes: &[NativeNode],
+        marks: &mut [u8],
+        order: &mut Vec<usize>,
+    ) -> Result<()> {
+        let node = nodes
+            .get(index)
+            .ok_or_else(|| paro_error::internal("native shell references an unknown node"))?;
+        match marks[index] {
+            1 => return Err(paro_error::internal("native shell contains a child cycle")),
+            2 => return Ok(()),
+            _ => {}
+        }
+        marks[index] = 1;
+        let mut children = Vec::new();
+        node.operator
+            .visit_child_links(&mut |child| children.push(child));
+        for child in children {
+            if let NativeChild::Node(index) = child {
+                visit(*index, nodes, marks, order)?;
+            }
+        }
+        marks[index] = 2;
+        order.push(index);
+        Ok(())
+    }
+
+    if shell.nodes.is_empty() || shell.root >= shell.nodes.len() {
+        return Err(paro_error::internal("native shell has no compactable root"));
+    }
+    let root = shell.root;
+    let nodes = shell.nodes.into_vec();
+    let mut marks = vec![0_u8; nodes.len()];
+    let mut order = Vec::new();
+    visit(root, &nodes, &mut marks, &mut order)?;
+    let mut remap = vec![usize::MAX; nodes.len()];
+    let mut compacted = Vec::with_capacity(order.len());
+    let mut compacted_layouts = Vec::with_capacity(order.len());
+    for old_index in order {
+        let node = &nodes[old_index];
+        let operator = node
+            .operator
+            .clone()
+            .try_map_child_links(&mut |child| {
+                Ok::<_, std::convert::Infallible>(match child {
+                    NativeChild::Node(index) => NativeChild::Node(remap[index]),
+                    other => other,
+                })
+            })
+            .expect("native shell child remapping cannot fail");
+        let layout = {
+            let mut children = SmallVec::<[&NativeChild; 2]>::new();
+            operator.visit_child_links(&mut |child| children.push(child));
+            let child_layouts = children
+                .iter()
+                .map(|child| match child {
+                    NativeChild::Node(index) => compacted_layouts.get(*index).ok_or_else(|| {
+                        paro_error::internal("native shell compacted child layout is missing")
+                    }),
+                    NativeChild::MemoGroup { layout, .. }
+                    | NativeChild::Group { layout, .. } => Ok(layout),
+                })
+                .collect::<Result<SmallVec<[_; 2]>>>()?;
+            let child_layouts = child_layouts.iter().copied().collect::<SmallVec<[_; 2]>>();
+            operator.output_layout_from_child_refs(&child_layouts)
+        };
+        remap[old_index] = compacted.len();
+        compacted_layouts.push(layout);
+        compacted.push(NativeNode {
+            id: node.id,
+            stats: node.stats.clone(),
+            operator,
+            source_proofs: node.source_proofs.clone(),
+        });
+    }
+    let compacted_root = remap[root];
+    let root_layout = compacted_layouts
+        .get(compacted_root)
+        .cloned()
+        .ok_or_else(|| paro_error::internal("native shell compacted root layout is missing"))?;
+    Ok((
+        NativeShell {
+            nodes: compacted.into_boxed_slice(),
+            root: compacted_root,
+        },
+        root_layout,
+    ))
 }
 
 /// Recompute facts for one native transformation shell without entering the

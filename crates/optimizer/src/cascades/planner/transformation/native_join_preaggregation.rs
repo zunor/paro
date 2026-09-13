@@ -231,11 +231,11 @@ fn try_native_shell_with_layout(
     nodes[root].operator = LogicalOperator::Aggregate(Box::new(rewritten_aggregate));
     nodes[root].source_proofs = Box::new([]);
 
-    let result = super::compact_native_shell(NativeShell {
+    let (result, result_layout) = super::compact_native_shell_with_layout(NativeShell {
         nodes: nodes.into_boxed_slice(),
         root,
     })?;
-    if result.root_layout()? != original_root_layout {
+    if result_layout != original_root_layout {
         return Ok(None);
     }
     Ok(Some(result))
