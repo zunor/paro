@@ -8490,16 +8490,6 @@ impl CascadesEngine {
             child_costs.reserve(child_frontier_count);
             child_fingerprints.clear();
             child_fingerprints.reserve(child_frontier_count);
-            // A synchronous recipe visit is a prefix microbatch: immutable
-            // payloads may be shared within it, but pricing/admission and every
-            // publication boundary remain sequential. Resolve only candidates
-            // actually reached after budget admission. Drop the preparation on
-            // yield so resumed facts/grants/merges use the ordinary validation.
-            let mut prepared_children = child_frontiers
-                .iter()
-                .flatten()
-                .map(|child| (*child, None::<Arc<Winner>>))
-                .collect::<Vec<_>>();
             let mut budget_blocked = false;
             while self.memo.control().checkpoint()? {
                 if child_yielded && yielded_response_attempted {
@@ -8523,16 +8513,9 @@ impl CascadesEngine {
                     break;
                 };
                 yielded_response_attempted = true;
-                let Ok(child_positions) =
-                    child_combination_positions(&child_ids, &child_frontiers)
-                else {
+                let Ok(children) = child_combination_refs(&child_ids, &child_frontiers) else {
                     continue;
                 };
-                let children = child_positions
-                    .iter()
-                    .zip(&child_frontiers)
-                    .map(|(&index, frontier)| frontier[index])
-                    .collect::<Box<[_]>>();
                 if !combination_state.active(&children) {
                     continue;
                 }
@@ -8627,17 +8610,10 @@ impl CascadesEngine {
                     // handles, not a duplicate winner tree.
                     let mut child_source_work_refs =
                         SmallVec::<[&[SourceWork]; 8]>::with_capacity(child_frontier_count);
-                    let mut remaining = prepared_children.as_mut_slice();
-                    for (frontier, &position) in child_frontiers.iter().zip(&child_positions) {
-                        let (slots, tail) = remaining.split_at_mut(frontier.len());
-                        remaining = tail;
-                        let (child, payload) = &mut slots[position];
-                        if payload.is_none() {
-                            *payload = Some(self.memo.resolve_child_winner_arc(*child).ok_or_else(
-                                || paro_error::internal("child product lost an immutable candidate"),
-                            )?);
-                        }
-                        let winner = payload.as_ref().expect("resolved above");
+                    for child in &child_selections {
+                        let winner = self.memo.resolve_child_winner(*child).ok_or_else(|| {
+                            paro_error::internal("child product lost an immutable candidate")
+                        })?;
                         child_costs.push(winner.cost);
                         child_source_work_refs.push(winner.source_work.as_ref());
                         child_fingerprints.push(winner.physical_fingerprint);
@@ -9476,17 +9452,6 @@ fn child_combination_refs(
     children: &[CandidateId],
     frontiers: &[Vec<ChildWinnerRef>],
 ) -> Result<Box<[ChildWinnerRef]>> {
-    Ok(child_combination_positions(children, frontiers)?
-        .iter()
-        .zip(frontiers)
-        .map(|(&index, frontier)| frontier[index])
-        .collect())
-}
-
-fn child_combination_positions(
-    children: &[CandidateId],
-    frontiers: &[Vec<ChildWinnerRef>],
-) -> Result<SmallVec<[usize; 8]>> {
     if children.len() != frontiers.len() {
         return Err(paro_error::internal(
             "child combination arity disagrees with its recipe",
@@ -9501,9 +9466,10 @@ fn child_combination_positions(
                 .map_err(|_| {
                     paro_error::internal("child combination references a stale candidate")
                 })?;
-            Ok(index)
+            Ok(frontier[index])
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
 }
 
 fn write_f64_fingerprint(builder: &mut StableFingerprintBuilder, value: f64) {
