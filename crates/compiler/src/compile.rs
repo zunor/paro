@@ -71,6 +71,7 @@ pub fn compile_statement_with_parameter_types(
     );
 
     let optimizer_started = Instant::now();
+    paro_optimizer::cascades::memo::diagnostic_snapshot::clear();
     let mut optimizer = paro_optimizer::Optimizer::new(planner.binder, ctx.clone());
     let optimized = match optimizer.optimize(logical_plan) {
         Ok(plan) => plan,
@@ -96,6 +97,9 @@ pub fn compile_statement_with_parameter_types(
     });
     if let Some(trace) = &statement_trace {
         trace.record_span("compile", "optimizer", optimizer_started);
+    }
+    if let Err(error) = paro_optimizer::cascades::memo::diagnostic_snapshot::flush(&statement_tag) {
+        tracing::warn!(%error, "frontier diagnostic snapshot write failed");
     }
     debug!(
         target: targets::OPTIMIZER,

@@ -184,7 +184,12 @@ impl Default for SearchBudget {
             max_rule_work_units_per_group: 65_536,
             max_composition_rule_work_units_per_group: 65_536,
             max_child_frontier_combinations_per_group: 4_096,
-            max_winner_frontier_candidates_per_goal: 256,
+            // P1 sensitivity experiment only: truncation still records its
+            // ordinary search obligation. This is never a completeness mode.
+            max_winner_frontier_candidates_per_goal: std::env::var("PARO_DIAGNOSTIC_FRONTIER_WIDTH")
+                .ok()
+                .and_then(|value| diagnostic_frontier_width(&value))
+                .unwrap_or(256),
             max_join_connected_pairs: 65_536,
             max_join_exact_relations: 12,
             join_beam_width: 64,
@@ -203,6 +208,27 @@ impl Default for SearchBudget {
             max_optional_enforcer_chains_per_goal: 8,
             max_grant_classes: 3,
         }
+    }
+}
+
+fn diagnostic_frontier_width(value: &str) -> Option<u32> {
+    match value.trim() {
+        "unbounded" => Some(u32::MAX),
+        value => value.parse::<u32>().ok().filter(|value| *value > 0),
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_width_tests {
+    #[test]
+    fn malformed_or_zero_does_not_disable_the_frontier() {
+        for value in ["", "0", "-1", "infinity", "4294967296"] {
+            assert_eq!(super::diagnostic_frontier_width(value), None);
+        }
+        for width in [1, 2, 4, 8, 256] {
+            assert_eq!(super::diagnostic_frontier_width(&width.to_string()), Some(width));
+        }
+        assert_eq!(super::diagnostic_frontier_width("unbounded"), Some(u32::MAX));
     }
 }
 

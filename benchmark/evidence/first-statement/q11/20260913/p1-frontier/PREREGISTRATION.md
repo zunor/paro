@@ -1,0 +1,44 @@
+# P1 frontier sensitivity (diagnostic, not production admission)
+
+Control is e3d15422. Probe adds only an opt-in bounded final-frontier snapshot
+and an opt-in frontier-width override; default width remains 256. All other
+budgets, rules, model, expected grant and quality handoff remain unchanged.
+Capture retains immutable candidate handles after search. Serialization occurs
+after the optimizer timer, but remains inside diagnostic compiler/C1. Never
+interpret its compiler/C1 as a normal performance result. No timing is removed
+from normal statements. Snapshot cap 16384; any omission invalidates complete
+counterfactual counts. Replacement/invalidation counts are not inferred from
+archive minus live size and are explicitly unavailable in this initial slice.
+
+Use clean committed sources and the existing tpcds_compare harness, original
+Q11, seed 72ccb3dc02ce127f61c06b85920a0e75c17a55a60ee341d267251c67611f62b1,
+4 workers/2GB, binary protocol, handoff1, compile evidence1, cold evidence0.
+One fresh block/arm and one separate statement-trace diagnostic; warmup1,
+measurement round1, random seed1, metadata generator-declared (inherited Paro
+declared keys versus DuckDB empty keys disclosed, not silently changed).
+Every arm retains typed/order90, cache-miss, source/binary/SQL/data/harness hashes.
+Serial runs only, no concurrent builds/tests. This is a pilot, not W NI/parity.
+
+First compare snapshot off/on/off at width256, same binary. If capture raises
+optimizer time over10%, reduce capture before interpreting snapshots. Heavy
+statement trace is separate from trace-off optimizer scalars. Snapshot on
+statements are diagnostic even when statement trace is off.
+
+Then widths1/2/4/8/unbounded, one fresh run each, snapshot enabled. Changes to
+admitted fingerprint, quality and completion are expected diagnostic outcomes,
+not optimizations. Width infinity means no frontier cap (u32 maximum); all other
+safety budgets and external timeout300s remain. Keep all valid slow samples.
+Report N, optimizer, rules, current frontier sizes, archive count and fingerprints.
+
+Counterfactual analysis must preserve exact source-response equivalence,
+work/span, risk and task-supply gates. A slack local memory coordinate is NOT a
+proof about all parent compositions or actual admission availability. Report an
+optimistic sensitivity projection separately from any proved envelope quotient;
+do not deploy it or invent a safe quantization threshold. Where the current
+envelope contract supplies no compositional equivalence proof, mark unproven.
+Counts from published history are not simultaneous frontier sizes.
+
+Width changes also change plans, recipes and propagation, so five single runs
+cannot by themselves uniquely identify kernel and per-entry CPU coefficients.
+Choose P3 only if evidence resolves that ambiguity; otherwise report the missing
+attribution rather than fitting a causal decomposition to correlated counts.

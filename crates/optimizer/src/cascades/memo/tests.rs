@@ -466,6 +466,8 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
     assert_eq!(profile.frontiers[0].proposals, 2_002);
     assert_eq!(profile.frontiers[0].candidates, 1);
     assert_eq!(profile.frontiers[0].truncations, 0);
+    assert_eq!(diagnostic_snapshot::counts(&memo), (2, 1, 0));
+    assert_eq!(memo.published_winner_count(), 2, "snapshot is read-only");
     assert!(
         memo.resolve_child_winner(ChildWinnerRef {
             group,

@@ -36,6 +36,7 @@ pub struct PhysicalFrontierProfile {
 
 impl Memo {
     pub fn physical_search_profile(&self) -> PhysicalSearchProfile {
+        diagnostic_snapshot::capture(self);
         let mut archived = vec![(0_u64, 0_u64); self.groups.len()];
         let mut source_payloads = std::collections::HashSet::new();
         for candidate in &self.winner_candidates {
