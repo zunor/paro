@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 // P1-only bounded timing. Owned guards survive error/continue paths without
 // borrowing the engine; no per-candidate events or heap allocations.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CostPhaseTimes([std::sync::atomic::AtomicU64; 2]);
 struct CostPhaseTimer {
     times: Arc<CostPhaseTimes>,
