@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
         "engine process. Diagnostic only: target timing is not normal C1."
     ))
     parser.add_argument("--start", type=int, default=1)
+    parser.add_argument("--pre-touch-repetitions", type=int, choices=(1, 2), default=1,
+                        help="Diagnostic only: record a second, warm pre-touch SELECT separately")
     parser.add_argument("--end", type=int, default=99)
     parser.add_argument("--warmups-per-process", type=int, default=1)
     parser.add_argument("--process-blocks", type=int, default=5)
@@ -148,7 +150,9 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def read_pre_touch(path: Path | None) -> dict[str, Any] | None:
+def read_pre_touch(path: Path | None, repetitions: int = 1) -> dict[str, Any] | None:
+    if repetitions not in (1, 2) or (path is None and repetitions != 1):
+        raise ValueError("one or two pre-touch executions require a pre-touch SQL file")
     if path is None:
         return None
     query = path.read_text(encoding="utf-8")
@@ -156,7 +160,8 @@ def read_pre_touch(path: Path | None) -> dict[str, Any] | None:
     if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
         raise ValueError("pre-touch requires exactly one read-only SELECT")
     return {"path": str(path.resolve()), "sha256": content_digest(path),
-            "sql": query, "query_fingerprint": statement_fingerprint(query)}
+            "sql": query, "query_fingerprint": statement_fingerprint(query),
+            "repetitions": repetitions}
 
 
 def require_first_target_miss(evidence: dict[str, Any], query: str) -> None:
@@ -187,6 +192,20 @@ def collect_pre_touch(paro: Any, duck: Any, spec: dict[str, Any] | None,
                            "result_sha256": multiset_digest(normalized[engine])}
         if engine == "paro":
             records[engine]["cache_evidence"] = collect_statement_cache_evidence(paro, spec["sql"])
+        if spec.get("repetitions", 1) == 2:
+            warm_rows, warm_schema, warm_elapsed = (
+                timed_run_paro(paro, spec["sql"], binary)
+                if engine == "paro" else duck.execute(spec["sql"]))
+            assert_compatible_schema(schema, warm_schema)
+            warm_normalized = canonicalize_rows(warm_rows, warm_schema)
+            assert_same_multiset(normalized[engine], warm_normalized)
+            records[engine]["second_execution"] = {
+                "execute_fetch_ms": warm_elapsed, "rows": len(warm_rows),
+                "schema": schema_report(warm_schema),
+                "result_sha256": multiset_digest(warm_normalized)}
+            if engine == "paro":
+                records[engine]["second_execution"]["cache_evidence"] = (
+                    collect_statement_cache_evidence(paro, spec["sql"]))
     if duck is not None:
         assert_compatible_schema(schemas["paro"], schemas["duckdb"])
         assert_same_multiset(normalized["paro"], normalized["duckdb"])
@@ -615,7 +634,7 @@ def main() -> int:
         raise SystemExit("bootstrap-samples must be at least 100")
 
     repo_root = Path(__file__).resolve().parents[2]
-    pre_touch = read_pre_touch(args.pre_touch_sql)
+    pre_touch = read_pre_touch(args.pre_touch_sql, args.pre_touch_repetitions)
     server_binary, build = build_benchmark_server(repo_root, args.build_jobs)
     seed = ImmutableDataSeed.capture(args.server_data_dir)
     harness_files = [
@@ -760,6 +779,7 @@ def main() -> int:
                 "PARO_STATEMENT_CACHE_EVIDENCE": "1",
                 "PARO_COMPILE_WORK_EVIDENCE": os.environ.get("PARO_COMPILE_WORK_EVIDENCE"),
                 "PARO_COLD_WORK_EVIDENCE": os.environ.get("PARO_COLD_WORK_EVIDENCE"),
+                "PARO_DIAGNOSTIC_STREAM_SEQUENTIAL": os.environ.get("PARO_DIAGNOSTIC_STREAM_SEQUENTIAL"),
                 # Explicit diagnostic-only search deadline.  An absent value
                 # means the production/default policy was used; keep this in
                 # the report so a checkpoint run cannot be mistaken for a
