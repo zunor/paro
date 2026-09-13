@@ -667,6 +667,86 @@ fn production_selected_binding_reaches_aggregate_input_on_a_join_side() {
 }
 
 #[test]
+fn production_simple_base_predicate_transfer_skips_owned_settlement() {
+    use paro_planner::operator::{Get, JoinCondition};
+
+    let left = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+        Get::new_without_table(0, vec!["left_key".into()], vec![LogicalType::Integer]),
+    )));
+    let right = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+        Get::new_without_table(1, vec!["right_key".into()], vec![LogicalType::Integer]),
+    )));
+    let join = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
+        JoinType::Inner,
+        left,
+        right,
+        vec![JoinCondition::equality(column(0, 0), column(1, 0))],
+    )));
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        join,
+        vec![equal(0, 0)],
+    )));
+    let mut input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+    let state = input.planner_state.clone();
+    state.write().unwrap().session =
+        Some(paro_context::TestStatementContextBuilder::minimal().build());
+
+    let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let join_group = input
+        .memo
+        .logical_expr(root_expression)
+        .unwrap()
+        .key
+        .children[0];
+    let join_expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
+    let join_children = input
+        .memo
+        .logical_expr(join_expression)
+        .unwrap()
+        .key
+        .children
+        .iter()
+        .copied()
+        .map(PatternOperand::Group)
+        .collect();
+    let binding = PatternBinding {
+        root: PatternOperand::Expression {
+            group: input.root,
+            expression: root_expression,
+            children: Box::new([PatternOperand::Expression {
+                group: join_group,
+                expression: join_expression,
+                children: join_children,
+            }]),
+        },
+        fingerprint: Fingerprint(303),
+    };
+
+    {
+        let state = state.read().unwrap();
+        assert!(native_predicate_transfer_may_apply(
+            &binding.root,
+            &input.memo,
+            &state,
+        )
+        .unwrap());
+    }
+    let arena_before = state.read().unwrap().staging_arena.len();
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::PredicateTransfer,
+        planner_state: state.clone(),
+    };
+    let mut context = TransformContext::new(&mut input.memo, input.root);
+    let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+    assert_eq!(outputs.len(), 1, "native predicate rewrite did not stage");
+    assert_eq!(
+        state.read().unwrap().staging_arena.len(),
+        arena_before,
+        "the authoritative native subset must not materialize an owned plan"
+    );
+}
+
+#[test]
 fn domain_union_declines_distinct_and_incomplete_layouts() {
     let state = state();
     let state = state.read().unwrap();
