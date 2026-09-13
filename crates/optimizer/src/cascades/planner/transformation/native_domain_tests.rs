@@ -414,6 +414,48 @@ fn domain_closure_reaches_an_exact_aggregate_behind_projection() {
 }
 
 #[test]
+fn native_domain_journal_rolls_back_speculative_nodes_and_operators() {
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        boundary(1, 0, &[7]),
+        vec![equal(10, 0)],
+    )));
+    let shell = native(plan);
+    let original_root = shell.root;
+    let original_operator = shell.nodes[original_root].operator.clone();
+    let input = match &original_operator {
+        LogicalOperator::Filter(filter) => filter.child.clone(),
+        _ => panic!("test fixture root should be a filter"),
+    };
+    let mut layouts = shell.layouts().unwrap();
+    let mut nodes = shell.nodes.into_vec();
+    let mut journal = NativeRewriteJournal::default();
+    let checkpoint = journal.checkpoint(&nodes, &layouts);
+
+    journal.record_operator(&nodes, original_root);
+    nodes[original_root].operator = LogicalOperator::DummyScan;
+    let state = state();
+    let state = state.read().unwrap();
+    let _speculative = add_native_filter(
+        &mut nodes,
+        &mut layouts,
+        input,
+        vec![equal(10, 0)],
+        paro_planner::operator::ProjectionMap::all(),
+        &state,
+    )
+    .unwrap();
+
+    assert!(nodes.len() > checkpoint.node_len);
+    journal.rollback(&mut nodes, &mut layouts, checkpoint);
+    assert_eq!(nodes.len(), checkpoint.node_len);
+    assert_eq!(layouts.len(), checkpoint.layout_len);
+    assert!(matches!(
+        nodes[original_root].operator,
+        LogicalOperator::Filter(_)
+    ));
+}
+
+#[test]
 fn production_selected_binding_drives_native_closure_through_projection_and_aggregate() {
     let count = Expression::Aggregate(
         AggregateExpression::new(

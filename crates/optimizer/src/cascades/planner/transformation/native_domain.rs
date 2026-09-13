@@ -315,6 +315,62 @@ struct RoutedDomain {
     moved: bool,
 }
 
+/// A cheap rollback journal for native closure construction.
+///
+/// Predicate routing speculatively walks several alternatives.  The old
+/// implementation cloned the complete shell before every recursive attempt so
+/// a rejected route could be undone.  That made the cost of a local rewrite
+/// proportional to the whole partially-built shell.  The journal records only
+/// operators that were actually replaced; appended nodes and layouts are
+/// discarded by length.  It is deliberately local to one closure, so it does
+/// not introduce a second Memo or result cache.
+#[derive(Default)]
+struct NativeRewriteJournal {
+    operators: Vec<(usize, LogicalOperator<NativeChild>)>,
+}
+
+#[derive(Clone, Copy)]
+struct NativeRewriteCheckpoint {
+    node_len: usize,
+    layout_len: usize,
+    operator_len: usize,
+}
+
+impl NativeRewriteJournal {
+    fn checkpoint(
+        &self,
+        nodes: &[NativeNode],
+        layouts: &[LogicalOutputLayout],
+    ) -> NativeRewriteCheckpoint {
+        NativeRewriteCheckpoint {
+            node_len: nodes.len(),
+            layout_len: layouts.len(),
+            operator_len: self.operators.len(),
+        }
+    }
+
+    fn record_operator(&mut self, nodes: &[NativeNode], index: usize) {
+        self.operators.push((index, nodes[index].operator.clone()));
+    }
+
+    fn rollback(
+        &mut self,
+        nodes: &mut Vec<NativeNode>,
+        layouts: &mut Vec<LogicalOutputLayout>,
+        checkpoint: NativeRewriteCheckpoint,
+    ) {
+        while self.operators.len() > checkpoint.operator_len {
+            let (index, operator) = self
+                .operators
+                .pop()
+                .expect("native rewrite journal length checked");
+            nodes[index].operator = operator;
+        }
+        nodes.truncate(checkpoint.node_len);
+        layouts.truncate(checkpoint.layout_len);
+    }
+}
+
 fn native_child_layout(
     child: &NativeChild,
     layouts: &[LogicalOutputLayout],
@@ -480,6 +536,7 @@ fn push_domain(
     child: NativeChild,
     predicates: Vec<Expression>,
     state: &PlannerTransformState,
+    journal: &mut NativeRewriteJournal,
 ) -> Result<RoutedDomain> {
     if predicates.is_empty() {
         return Ok(RoutedDomain {
@@ -544,6 +601,7 @@ fn push_domain(
                         });
                     };
                     filter.expressions = combined;
+                    journal.record_operator(nodes, index);
                     nodes[index].operator = LogicalOperator::Filter(filter);
                     return Ok(RoutedDomain {
                         child,
@@ -559,10 +617,17 @@ fn push_domain(
             // the source candidate.  This is especially important when the
             // child is an Aggregate: group-key predicates may move, while an
             // aggregate-result residual must remain above that boundary.
-            let snapshot_nodes = nodes.clone();
-            let snapshot_layouts = layouts.clone();
-            let routed = push_domain(nodes, layouts, filter.child.clone(), predicates, state)?;
+            let checkpoint = journal.checkpoint(nodes, layouts);
+            let routed = push_domain(
+                nodes,
+                layouts,
+                filter.child.clone(),
+                predicates,
+                state,
+                journal,
+            )?;
             if !routed.moved {
+                journal.rollback(nodes, layouts, checkpoint);
                 return Ok(RoutedDomain {
                     child,
                     remaining: original_predicates,
@@ -572,8 +637,7 @@ fn push_domain(
             let mut expressions = filter.expressions.to_vec();
             expressions.extend(routed.remaining);
             let Some(expressions) = FilterPushdown::normalize_predicates(expressions) else {
-                *nodes = snapshot_nodes;
-                *layouts = snapshot_layouts;
+                journal.rollback(nodes, layouts, checkpoint);
                 return Ok(RoutedDomain {
                     child,
                     remaining: original_predicates,
@@ -582,6 +646,7 @@ fn push_domain(
             };
             filter.child = routed.child;
             filter.expressions = expressions;
+            journal.record_operator(nodes, index);
             nodes[index].operator = LogicalOperator::Filter(filter);
             Ok(RoutedDomain {
                 child: NativeChild::Node(index),
@@ -609,25 +674,25 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 };
-                let snapshot_nodes = nodes.clone();
-                let snapshot_layouts = layouts.clone();
+                let checkpoint = journal.checkpoint(nodes, layouts);
                 let routed = push_domain(
                     nodes,
                     layouts,
                     projection.child.clone(),
                     vec![predicate],
                     state,
+                    journal,
                 )?;
                 if routed.moved && routed.remaining.is_empty() {
                     projection.child = routed.child;
                     moved = true;
                 } else {
-                    *nodes = snapshot_nodes;
-                    *layouts = snapshot_layouts;
+                    journal.rollback(nodes, layouts, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
             if moved {
+                journal.record_operator(nodes, index);
                 nodes[index].operator = LogicalOperator::Projection(projection);
             }
             Ok(RoutedDomain {
@@ -647,14 +712,14 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 };
-                let snapshot_nodes = nodes.clone();
-                let snapshot_layouts = layouts.clone();
+                let checkpoint = journal.checkpoint(nodes, layouts);
                 let routed = push_domain(
                     nodes,
                     layouts,
                     aggregate.child.clone(),
                     vec![predicate],
                     state,
+                    journal,
                 )?;
                 if routed.moved && routed.remaining.is_empty() {
                     aggregate.child = routed.child;
@@ -663,12 +728,12 @@ fn push_domain(
                         remaining.push(original_predicate);
                     }
                 } else {
-                    *nodes = snapshot_nodes;
-                    *layouts = snapshot_layouts;
+                    journal.rollback(nodes, layouts, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
             if moved {
+                journal.record_operator(nodes, index);
                 nodes[index].operator = LogicalOperator::Aggregate(aggregate);
             }
             // A necessary input condition does not discharge the original
@@ -710,14 +775,14 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 };
-                let snapshot_nodes = nodes.clone();
-                let snapshot_layouts = layouts.clone();
+                let checkpoint = journal.checkpoint(nodes, layouts);
                 let left = push_domain(
                     nodes,
                     layouts,
                     setop.left.clone(),
                     vec![left_predicate],
                     state,
+                    journal,
                 )?;
                 let right = push_domain(
                     nodes,
@@ -725,6 +790,7 @@ fn push_domain(
                     setop.right.clone(),
                     vec![right_predicate],
                     state,
+                    journal,
                 )?;
                 if left.moved
                     && left.remaining.is_empty()
@@ -735,12 +801,12 @@ fn push_domain(
                     setop.right = right.child;
                     moved = true;
                 } else {
-                    *nodes = snapshot_nodes;
-                    *layouts = snapshot_layouts;
+                    journal.rollback(nodes, layouts, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
             if moved {
+                journal.record_operator(nodes, index);
                 nodes[index].operator = LogicalOperator::SetOperation(setop);
             }
             Ok(RoutedDomain {
@@ -778,8 +844,7 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 }
-                let snapshot_nodes = nodes.clone();
-                let snapshot_layouts = layouts.clone();
+                let checkpoint = journal.checkpoint(nodes, layouts);
                 let routed = if left_side {
                     push_domain(
                         nodes,
@@ -787,6 +852,7 @@ fn push_domain(
                         join.left.clone(),
                         vec![original_predicate.clone()],
                         state,
+                        journal,
                     )?
                 } else {
                     push_domain(
@@ -795,6 +861,7 @@ fn push_domain(
                         join.right.clone(),
                         vec![original_predicate.clone()],
                         state,
+                        journal,
                     )?
                 };
                 if routed.moved && routed.remaining.is_empty() {
@@ -805,12 +872,12 @@ fn push_domain(
                     }
                     moved = true;
                 } else {
-                    *nodes = snapshot_nodes;
-                    *layouts = snapshot_layouts;
+                    journal.rollback(nodes, layouts, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
             if moved {
+                journal.record_operator(nodes, index);
                 nodes[index].operator = LogicalOperator::Join(Join::Comparison(join));
             }
             Ok(RoutedDomain {
@@ -843,8 +910,7 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 }
-                let snapshot_nodes = nodes.clone();
-                let snapshot_layouts = layouts.clone();
+                let checkpoint = journal.checkpoint(nodes, layouts);
                 let routed = if left_side {
                     push_domain(
                         nodes,
@@ -852,6 +918,7 @@ fn push_domain(
                         join.left.clone(),
                         vec![original_predicate.clone()],
                         state,
+                        journal,
                     )?
                 } else {
                     push_domain(
@@ -860,6 +927,7 @@ fn push_domain(
                         join.right.clone(),
                         vec![original_predicate.clone()],
                         state,
+                        journal,
                     )?
                 };
                 if routed.moved && routed.remaining.is_empty() {
@@ -870,12 +938,12 @@ fn push_domain(
                     }
                     moved = true;
                 } else {
-                    *nodes = snapshot_nodes;
-                    *layouts = snapshot_layouts;
+                    journal.rollback(nodes, layouts, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
             if moved {
+                journal.record_operator(nodes, index);
                 nodes[index].operator = LogicalOperator::Join(Join::Cross(join));
             }
             Ok(RoutedDomain {
@@ -918,7 +986,15 @@ fn transfer_shell_closure(
     let input = filter.child.clone();
     let input_len = native_child_layout(&input, &layouts)?.len();
     let mut nodes = shell.nodes.into_vec();
-    let routed = push_domain(&mut nodes, &mut layouts, input, predicates, state)?;
+    let mut journal = NativeRewriteJournal::default();
+    let routed = push_domain(
+        &mut nodes,
+        &mut layouts,
+        input,
+        predicates,
+        state,
+        &mut journal,
+    )?;
     if !routed.moved {
         return Ok(None);
     }
