@@ -334,6 +334,7 @@ impl Session {
             rowset_scan_pushdown: settings.rowset_scan_pushdown(),
             parallel_scheduler: settings.parallel_scheduler(),
         };
+        let compile_resources = self.capture_compile_resources(scheduler_threads);
 
         let mut databases = self.instance.database_registry().get_databases();
         databases.sort_by(|left, right| left.name().cmp(right.name()));
@@ -570,6 +571,7 @@ impl Session {
                 databases,
             )),
             limits,
+            compile_resources,
             cancellation,
             services: Arc::new(QueryResources {
                 infra: Arc::new(ExecutionResources {
@@ -620,6 +622,15 @@ impl Session {
 
     pub fn compile_environment_key(&self) -> CompileEnvironmentKey {
         let registry = self.instance.database_registry();
+        let settings = EffectiveSettings::new(self.effective_settings.clone());
+        let threads = self.instance.get_scheduler().number_of_threads().max(1) as usize;
+        let limits = RuntimeLimits {
+            max_threads: settings.threads().unwrap_or(threads),
+            max_memory: settings
+                .memory_limit()
+                .unwrap_or(self.instance.runtime_tuning().snapshot().maximum_memory),
+            ..RuntimeLimits::default()
+        };
         CompileEnvironmentKey::capture(
             self.current_database.name(),
             self.current_schema(),
@@ -629,7 +640,26 @@ impl Session {
                 .get_databases()
                 .iter()
                 .map(|database| (database.id(), database.catalog().gc_epoch())),
-            &EffectiveSettings::new(self.effective_settings.clone()),
+            &settings,
+            &limits,
+            self.capture_compile_resources(threads),
+        )
+    }
+
+    fn capture_compile_resources(
+        &self,
+        scheduler_threads: usize,
+    ) -> paro_context::CompileResources {
+        // Query quota, not free RSS or buffer-pool occupancy: reclaimable
+        // cache pages must not turn a warm compilation into a smaller grant.
+        // This observation reserves nothing; admission still verifies the
+        // query's actual fair share and acquires its execution lease.
+        // The pool envelope here is not divided by concurrent query demand.
+        paro_context::CompileResources::capture(
+            self.instance
+                .get_memory_arbitrator()
+                .available_for_queries(),
+            scheduler_threads,
         )
     }
 
@@ -2128,6 +2158,180 @@ mod tests {
         let frozen = session.freeze_query_context().compile_environment_key();
 
         assert_eq!(live, frozen);
+    }
+
+    #[test]
+    fn lazy_grants_cache_isolates_frozen_resource_expectations() {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance.clone());
+        session
+            .set_session_setting("threads", Value::Integer(1))
+            .unwrap();
+        session
+            .set_session_setting("memory_limit", Value::BigInt(64 << 20))
+            .unwrap();
+        let arbitrator = instance.get_memory_arbitrator();
+        arbitrator.set_buffer_pool_limit(64 << 20);
+        arbitrator.set_shared_cache_floor(0);
+        let statement = paro_parser::parse_one("SELECT 42").unwrap().stmt;
+        let full = session.freeze_query_context();
+        let full_key = full.compile_environment_key();
+        assert_eq!(full_key.expected_grant.unwrap().index, 2);
+        let full_plan = paro_compiler::compile_statement(full.clone(), statement.clone()).unwrap();
+        let paro_execution::pipeline::StatementProgram::Portfolio(portfolio) = full_plan.program()
+        else {
+            panic!("expected immutable portfolio")
+        };
+        assert_eq!(
+            portfolio
+                .grant_search
+                .as_ref()
+                .unwrap()
+                .expected_class
+                .unwrap()
+                .0 as usize,
+            full_key.expected_grant.unwrap().index
+        );
+        session.publish_instance_query_plan(statement.clone(), vec![], &full, full_plan.clone());
+        assert!(session
+            .reusable_instance_query_plan(&statement, &[], &full)
+            .unwrap()
+            .shares_image_with(&full_plan));
+
+        // A real quota change, not free RSS or reclaimable page occupancy.
+        arbitrator.set_system_reserve_bytes(40 << 20);
+        let limited = session.freeze_query_context();
+        let limited_key = limited.compile_environment_key();
+        assert_eq!(limited_key.expected_grant.unwrap().index, 0);
+        assert_ne!(limited_key, full_key);
+        assert_eq!(
+            full.compile_environment_key(),
+            full_key,
+            "a frozen statement must not re-sample live availability"
+        );
+        assert_eq!(session.compile_environment_key(), limited_key);
+        assert!(session
+            .reusable_instance_query_plan(&statement, &[], &limited)
+            .is_none());
+        let limited_plan =
+            paro_compiler::compile_statement(limited.clone(), statement.clone()).unwrap();
+        let paro_execution::pipeline::StatementProgram::Portfolio(portfolio) =
+            limited_plan.program()
+        else {
+            panic!("expected immutable portfolio")
+        };
+        assert_eq!(
+            portfolio
+                .grant_search
+                .as_ref()
+                .unwrap()
+                .expected_class
+                .unwrap()
+                .0 as usize,
+            limited_key.expected_grant.unwrap().index
+        );
+        session.publish_instance_query_plan(
+            statement.clone(),
+            vec![],
+            &limited,
+            limited_plan.clone(),
+        );
+        assert!(!limited_plan.shares_image_with(&full_plan));
+        assert!(session
+            .reusable_instance_query_plan(&statement, &[], &limited)
+            .unwrap()
+            .shares_image_with(&limited_plan));
+        assert!(session
+            .reusable_instance_query_plan(&statement, &[], &full)
+            .unwrap()
+            .shares_image_with(&full_plan));
+        arbitrator.set_system_reserve_bytes(0);
+        assert_eq!(session.compile_environment_key(), full_key);
+    }
+
+    #[test]
+    fn lazy_grants_verified_safe_portfolio_executes_under_reduced_resources() {
+        use paro_execution::pipeline::StatementProgram;
+        use paro_execution::query_executor::{compiled::ExecutionRequest, executor::Executor};
+
+        let instance = Instance::new_in_memory();
+        instance.set_threads(4).unwrap();
+        let mut session = Session::new(1, instance.clone());
+        session
+            .set_session_setting("threads", Value::Integer(4))
+            .unwrap();
+        session
+            .set_session_setting("memory_limit", Value::BigInt(64 << 20))
+            .unwrap();
+        instance
+            .get_memory_arbitrator()
+            .set_buffer_pool_limit(64 << 20);
+        instance.get_memory_arbitrator().set_shared_cache_floor(0);
+        let full = session.freeze_query_context();
+        let statement = paro_parser::parse_one(
+            "SELECT x FROM (VALUES (3), (1), (3), (NULL)) AS t(x) ORDER BY x NULLS LAST",
+        )
+        .unwrap()
+        .stmt;
+        let compiled = paro_compiler::compile_statement(full.clone(), statement).unwrap();
+        let StatementProgram::Portfolio(portfolio) = compiled.program() else {
+            panic!("expected portfolio")
+        };
+        portfolio.verify().unwrap();
+        let coverage = portfolio.grant_search.as_ref().unwrap();
+        let small = portfolio.grant_classes[0];
+        assert_ne!(coverage.expected_class, Some(small.id));
+        assert!(!coverage.optional_classes.contains(&small.id));
+        let admitted = portfolio
+            .admit(small.hard_memory_bytes, 1, 0, |_| true)
+            .unwrap();
+        assert_eq!(admitted.resources.class, small.id);
+        paro_optimizer::physical::PhysicalPlanVerifier::verify(&admitted.plan).unwrap();
+        let safe_variant = portfolio
+            .variants
+            .iter()
+            .find(|variant| {
+                variant.admissible_classes.contains(&small.id)
+                    && variant.physical_fingerprint == admitted.physical_fingerprint
+            })
+            .unwrap();
+        assert_eq!(
+            safe_variant.cost,
+            admitted
+                .plan
+                .properties
+                .get(admitted.plan.root)
+                .unwrap()
+                .cumulative_cost
+        );
+
+        // Execute the original immutable compiled image, not a relabeled or
+        // reconstructed plan. Both quota and worker availability tighten;
+        // the engine test separately forces fallback by memory alone.
+        instance
+            .get_memory_arbitrator()
+            .set_system_reserve_bytes(48 << 20);
+        session.set_session_setting("threads", Value::Integer(1)).unwrap();
+        let runtime = session.freeze_query_context();
+        let mut stream = Executor::new(runtime)
+            .execute(ExecutionRequest::unparameterized(compiled).unwrap())
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(chunk) = stream.fetch().unwrap() {
+            for row in 0..chunk.len() {
+                rows.push(chunk.column(0).unwrap().get_value(row));
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![
+                Value::Integer(1),
+                Value::Integer(3),
+                Value::Integer(3),
+                Value::Null(LogicalType::Integer)
+            ],
+            "duplicates and NULL survive safe fallback execution"
+        );
     }
 
     #[test]

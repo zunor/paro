@@ -2417,6 +2417,15 @@ impl Memo {
             });
     }
 
+    pub(crate) fn record_deferred_grant(&mut self, class: super::ids::ResourceGrantClassId) {
+        self.failed_search_obligations
+            .insert(super::budget::SearchObligation {
+                group: None,
+                reason: super::budget::SearchIncompleteReason::OptionalGrantDeferred(class),
+                witness: Fingerprint(u128::from(class.0)),
+            });
+    }
+
     pub fn groups(&self) -> impl Iterator<Item = &Group> {
         self.groups
             .iter()

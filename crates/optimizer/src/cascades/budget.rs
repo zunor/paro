@@ -21,6 +21,9 @@ pub struct SearchObligation {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SearchIncompleteReason {
+    /// A declared grant has only its mandatory executable baseline; optional
+    /// closure was deferred by resource selection, not rejected by a budget.
+    OptionalGrantDeferred(super::ids::ResourceGrantClassId),
     Budget(BudgetDimension),
     /// Cooperative wall deadline. Work ledgers remain unchanged: this is not
     /// evidence that the configured logical/physical closure was exhausted.

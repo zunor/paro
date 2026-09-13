@@ -1736,7 +1736,7 @@ impl Optimizer {
         });
         let result = if let Some(spec) = analyze_spec {
             OptimizedStatement::ExplainAnalyze {
-                target: self.extract_physical(variants, &grant_classes)?,
+                target: self.extract_physical(variants, &grant_classes, extraction.grant_search)?,
                 spec,
             }
         } else {
@@ -1745,7 +1745,11 @@ impl Optimizer {
                     self.attach_explain_layer(variant, explain)?;
                 }
             }
-            OptimizedStatement::Physical(self.extract_physical(variants, &grant_classes)?)
+            OptimizedStatement::Physical(self.extract_physical(
+                variants,
+                &grant_classes,
+                extraction.grant_search,
+            )?)
         };
         self.ctx.profiler.record(
             OptimizerComponent::PhysicalExtraction,
@@ -1931,6 +1935,7 @@ impl Optimizer {
         &self,
         variants: Vec<crate::cascades::OptimizedVariant>,
         grant_classes: &[ResourceGrantClass],
+        grant_search: Option<crate::physical::GrantSearchCoverage>,
     ) -> Result<PhysicalPlanPortfolio> {
         let class_map = grant_classes
             .iter()
@@ -1993,6 +1998,7 @@ impl Optimizer {
             grant_classes.iter().copied(),
             class_plans,
         )?;
+        let portfolio = portfolio.with_grant_search(grant_search)?;
         portfolio.verify()?;
         Ok(portfolio)
     }
@@ -2654,41 +2660,17 @@ fn resource_grant_classes(
     max_grant_classes: u8,
     spill_available: bool,
 ) -> Box<[ResourceGrantClass]> {
-    let class_limit = usize::from(max_grant_classes.max(1)).min(3);
-    let hard_limits = if max_memory == 0 {
-        vec![u64::MAX]
-    } else {
-        let full = u64::try_from(max_memory).unwrap_or(u64::MAX).max(1);
-        match class_limit {
-            1 => vec![full],
-            2 => vec![(full / 2).max(1), full],
-            _ => vec![(full / 4).max(1), (full / 2).max(1), full],
-        }
-    };
-    let mut previous = None;
-    let class_count = hard_limits.len();
-    let max_threads = max_threads.clamp(1, u16::MAX as usize);
-    hard_limits
+    paro_context::compile_grant_classes(max_memory, max_threads, max_grant_classes)
         .into_iter()
-        .filter(|hard| previous.replace(*hard) != Some(*hard))
-        .enumerate()
-        .map(|(index, hard_memory_bytes)| ResourceGrantClass {
-            id: ResourceGrantClassId::new(index),
-            hard_memory_bytes,
+        .map(|class| ResourceGrantClass {
+            id: ResourceGrantClassId::new(class.index),
+            hard_memory_bytes: class.hard_memory_bytes,
             spill_policy: if spill_available {
                 SpillPolicy::Allowed
             } else {
                 SpillPolicy::Forbidden
             },
-            max_parallel_tasks: u16::try_from(match class_count {
-                1 => max_threads,
-                2 if index == 0 => 1,
-                2 => max_threads,
-                _ if index == 0 => 1,
-                _ if index + 1 == class_count => max_threads,
-                _ => max_threads.div_ceil(2),
-            })
-            .unwrap_or(u16::MAX),
+            max_parallel_tasks: class.max_parallel_tasks,
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -2697,6 +2679,40 @@ fn resource_grant_classes(
 #[cfg(test)]
 mod resource_operating_point_tests {
     use super::resource_grant_classes;
+
+    #[test]
+    fn lazy_grants_default_operating_points_match_frozen_cache_selection() {
+        let budget = crate::cascades::budget::SearchBudget::default();
+        assert_eq!(
+            budget.max_grant_classes, 3,
+            "update the frozen compile-key contract with any default policy change"
+        );
+        let mut context = paro_context::TestStatementContextBuilder::minimal()
+            .build()
+            .as_ref()
+            .clone();
+        context.limits.max_memory = 1024;
+        context.limits.max_threads = 4;
+        let classes = resource_grant_classes(1024, 4, budget.max_grant_classes, false);
+        for memory in [0, 255, 256, 511, 512, 1024, 2048] {
+            for tasks in [0, 1, 2, 4, 8] {
+                context.compile_resources = paro_context::CompileResources::capture(memory, tasks);
+                let key = context.compile_environment_key();
+                let selected = context.compile_resources.expected_grant(
+                    1024, 4, budget.max_grant_classes,
+                );
+                assert_eq!(key.expected_grant, selected);
+                let actual = classes.iter()
+                    .filter(|class| class.hard_memory_bytes <= memory as u64
+                        && usize::from(class.max_parallel_tasks) <= tasks)
+                    .max_by_key(|class| (class.max_parallel_tasks, class.hard_memory_bytes, class.id));
+                assert_eq!(
+                    selected.map(|class| class.index),
+                    actual.map(|class| class.id.index())
+                );
+            }
+        }
+    }
 
     #[test]
     fn low_memory_portfolio_contains_a_serial_executable_operating_point() {

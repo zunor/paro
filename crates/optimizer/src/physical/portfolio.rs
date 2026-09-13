@@ -42,6 +42,39 @@ pub struct PhysicalPlanPortfolio<P = PhysicalPlan> {
     pub objective: ObjectiveProfile,
     pub grant_classes: Box<[ResourceGrantClass]>,
     pub variants: Box<[PortfolioVariant<P>]>,
+    /// None denotes the existing eager producer. Lazy portfolios explicitly
+    /// identify the expected class and the classes actually searched optionally.
+    pub grant_search: Option<GrantSearchCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSearchCoverage {
+    pub expected_class: Option<ResourceGrantClassId>,
+    /// An attempted optional search, not a proof of exhaustive completion.
+    pub optional_classes: BTreeSet<ResourceGrantClassId>,
+    pub mandatory_only_classes: BTreeSet<ResourceGrantClassId>,
+}
+
+impl GrantSearchCoverage {
+    pub fn new(
+        expected_class: Option<ResourceGrantClassId>,
+        declared: impl IntoIterator<Item = ResourceGrantClassId>,
+        optional_started: bool,
+    ) -> Self {
+        let optional_classes: BTreeSet<_> = expected_class
+            .filter(|_| optional_started)
+            .into_iter()
+            .collect();
+        let mandatory_only_classes = declared
+            .into_iter()
+            .filter(|class| !optional_classes.contains(class))
+            .collect();
+        Self {
+            expected_class,
+            optional_classes,
+            mandatory_only_classes,
+        }
+    }
 }
 
 /// Immutable resource operating point selected by portfolio admission.
@@ -150,6 +183,7 @@ impl<P> PhysicalPlanPortfolio<P> {
             .collect::<BTreeSet<_>>();
         Ok(Self {
             objective,
+            grant_search: None,
             grant_classes: classes.into_values().collect::<Vec<_>>().into_boxed_slice(),
             variants: all
                 .into_iter()
@@ -158,6 +192,50 @@ impl<P> PhysicalPlanPortfolio<P> {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         })
+    }
+
+    pub fn with_grant_search(mut self, coverage: Option<GrantSearchCoverage>) -> Result<Self> {
+        self.grant_search = coverage;
+        self.verify_grant_search()?;
+        Ok(self)
+    }
+
+    fn verify_grant_search(&self) -> Result<()> {
+        if let Some(coverage) = &self.grant_search {
+            let classes = self
+                .grant_classes
+                .iter()
+                .map(|class| class.id)
+                .collect::<BTreeSet<_>>();
+            if coverage
+                .expected_class
+                .is_some_and(|class| !classes.contains(&class))
+                || coverage
+                    .optional_classes
+                    .iter()
+                    .any(|class| Some(*class) != coverage.expected_class)
+                || !coverage
+                    .optional_classes
+                    .is_disjoint(&coverage.mandatory_only_classes)
+                || coverage
+                    .optional_classes
+                    .union(&coverage.mandatory_only_classes)
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    != classes
+                || classes.iter().any(|class| {
+                    !self
+                        .variants
+                        .iter()
+                        .any(|v| v.admissible_classes.contains(class))
+                })
+            {
+                return Err(paro_error::internal(
+                    "lazy portfolio has invalid class coverage",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Select only among optimizer-proved variants. Admission never changes
@@ -295,6 +373,7 @@ impl PhysicalPlanPortfolio<PhysicalPlan> {
     }
 
     pub fn verify(&self) -> Result<()> {
+        self.verify_grant_search()?;
         let classes = self
             .grant_classes
             .iter()
@@ -449,6 +528,34 @@ mod tests {
         .unwrap();
         assert_eq!(portfolio.variants.len(), 1);
         assert_eq!(portfolio.variants[0].admissible_classes.len(), 2);
+    }
+
+    #[test]
+    fn lazy_grant_metadata_rejects_missing_or_overlapping_class_coverage() {
+        let classes = [1, 2].map(|id| ResourceGrantClass {
+            id: ResourceGrantClassId(id),
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Forbidden,
+            max_parallel_tasks: 1,
+        });
+        let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
+            classes,
+            classes.map(|class| (class.id, "safe", Fingerprint(7), cost(2.0, 10))),
+        )
+        .unwrap();
+        let coverage =
+            GrantSearchCoverage::new(Some(classes[1].id), classes.map(|class| class.id), true);
+        assert!(portfolio
+            .clone()
+            .with_grant_search(Some(coverage.clone()))
+            .is_ok());
+        let mut invalid = coverage.clone();
+        invalid.mandatory_only_classes.clear();
+        assert!(portfolio.clone().with_grant_search(Some(invalid)).is_err());
+        let mut invalid = coverage;
+        invalid.mandatory_only_classes.insert(classes[1].id);
+        assert!(portfolio.with_grant_search(Some(invalid)).is_err());
     }
 
     #[test]

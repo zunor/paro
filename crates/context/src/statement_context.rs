@@ -27,6 +27,11 @@ pub struct CompileEnvironmentKey {
     pub visible_generation: u64,
     pub catalog_epochs: Vec<(u64, u64)>,
     pub planning_settings_fingerprint: u64,
+    /// Conservative identity: byte-level changes may miss the cache even if
+    /// the selected class is unchanged. This is not a resource reservation.
+    pub compile_resources: crate::CompileResources,
+    pub expected_grant: Option<crate::CompileGrant>,
+    pub grant_limits: (usize, usize),
 }
 
 impl CompileEnvironmentKey {
@@ -43,6 +48,8 @@ impl CompileEnvironmentKey {
         visible_generation: u64,
         catalog_epochs: impl IntoIterator<Item = (u64, u64)>,
         settings: &EffectiveSettings,
+        limits: &RuntimeLimits,
+        compile_resources: crate::CompileResources,
     ) -> Self {
         let mut catalog_epochs = catalog_epochs.into_iter().collect::<Vec<_>>();
         catalog_epochs.sort_unstable_by_key(|(database_id, _)| *database_id);
@@ -53,6 +60,17 @@ impl CompileEnvironmentKey {
             visible_generation,
             catalog_epochs,
             planning_settings_fingerprint: settings.planning_fingerprint(),
+            // The cached compiler uses SearchBudget::default() (three
+            // operating points). Direct engine callers with a custom budget
+            // choose explicitly and do not produce cached compiler images.
+            // The optimizer coupling test guards this default contract.
+            expected_grant: compile_resources.expected_grant(
+                limits.max_memory,
+                limits.max_threads,
+                3,
+            ),
+            compile_resources,
+            grant_limits: (limits.max_memory, limits.max_threads),
         }
     }
 }
@@ -70,6 +88,7 @@ pub struct StatementContext {
     pub random: Arc<SessionRandom>,
     pub databases: Arc<AttachedDatabaseDirectory>,
     pub limits: RuntimeLimits,
+    pub compile_resources: crate::CompileResources,
     pub cancellation: StatementCancellation,
     pub services: Arc<QueryResources>,
     /// Pins acquired by this statement, including its compilation phase.
@@ -336,6 +355,8 @@ impl StatementContext {
                 .iter()
                 .map(|database| (database.id(), database.catalog_epoch())),
             self.settings.as_ref(),
+            &self.limits,
+            self.compile_resources,
         )
     }
 
@@ -365,6 +386,8 @@ mod tests {
             17,
             [(9, 90), (2, 20), (5, 50)],
             context.settings.as_ref(),
+            &context.limits,
+            context.compile_resources,
         );
 
         assert_eq!(key.catalog_epochs, [(2, 20), (5, 50), (9, 90)]);

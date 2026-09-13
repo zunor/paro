@@ -60,6 +60,9 @@ mod cost_identity;
 #[path = "tests/grant_capacity.rs"]
 mod grant_capacity;
 
+#[path = "tests/grant_lazy.rs"]
+mod grant_lazy;
+
 #[test]
 fn streaming_task_supply_is_inherited_from_the_child_pipeline() {
     let calibration = MachineCalibrationBundle::default();

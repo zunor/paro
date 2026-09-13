@@ -54,8 +54,8 @@ use super::engine::{
 use super::ids::{
     AdmissibleGrantSetId, BaseRelationId, CandidateId, ColumnId, Fingerprint, GroupId,
     ImplementationId, LogicalExprId, LogicalPayloadId, OpClassId, OptimizationContextId,
-    PhysicalExprId, PhysicalPayloadId, PropertySetId, QualityPolicyId, RuleId, ScalarExprId,
-    SnapshotId, StableFingerprintBuilder,
+    PhysicalExprId, PhysicalPayloadId, PropertySetId, QualityPolicyId, ResourceGrantClassId,
+    RuleId, ScalarExprId, SnapshotId, StableFingerprintBuilder,
 };
 use super::memo::{
     CardinalityEnvelope, CardinalityRecipeKind, ChildWinnerRef, CteReferenceDomain,
@@ -1626,13 +1626,38 @@ impl OptimizationInput {
                 .memo_mut()
                 .set_cancellation(session.cancellation.clone())?;
         }
-        let grant_optimization = engine.optimize_for_grants(
-            self.root,
-            self.root_goal,
-            AdmissibleGrantSetId(0),
-            grant_classes.values().copied(),
-            self.mode,
-        )?;
+        // Selection and the cache key both consume this statement's frozen
+        // availability. Never sample live resources again inside optimization.
+        let expected_class = statement_context.as_ref().and_then(|session| {
+            session
+                .compile_resources
+                .expected_grant(
+                    session.limits.max_memory,
+                    session.limits.max_threads,
+                    engine.memo().budget().max_grant_classes,
+                )
+                .map(|class| ResourceGrantClassId::new(class.index))
+        });
+        let grant_optimization = if statement_context.is_some() {
+            engine.optimize_for_expected_grant(
+                self.root,
+                self.root_goal,
+                AdmissibleGrantSetId(0),
+                grant_classes.values().copied(),
+                self.mode,
+                expected_class,
+            )?
+        } else {
+            // Standalone Memo callers have no compilation resource snapshot.
+            // Preserve their explicit eager contract rather than inventing one.
+            engine.optimize_for_grants(
+                self.root,
+                self.root_goal,
+                AdmissibleGrantSetId(0),
+                grant_classes.values().copied(),
+                self.mode,
+            )?
+        };
         engine.note_search_return();
         let export_strong_incumbents = self.export_strong_incumbent
             || std::env::var_os("PARO_EXPORT_STRONG_INCUMBENT")
@@ -1665,12 +1690,19 @@ impl OptimizationInput {
             Box::new([])
         };
         let stop = grant_optimization.stop;
+        let grant_search = grant_optimization.grant_search.clone();
+        let mut selected_winners = grant_optimization.winners.into_vec();
+        for safe in grant_optimization.safe_winners {
+            if !selected_winners.iter().any(|winner| {
+                winner.class == safe.class && Arc::ptr_eq(&winner.frozen, &safe.frozen)
+            }) {
+                selected_winners.push(safe);
+            }
+        }
         let extraction_started = Instant::now();
-        let mut variants = Vec::with_capacity(grant_optimization.winners.len());
+        let mut variants = Vec::with_capacity(selected_winners.len());
         debug!(target: targets::OPTIMIZER, groups = engine.memo().group_count(), attempts = ?engine.rule_attempts(), insertions = ?engine.effective_rule_insertions(), "completed Memo search work");
-        for (winner_index, grant_winner) in
-            IntoIterator::into_iter(grant_optimization.winners).enumerate()
-        {
+        for (winner_index, grant_winner) in selected_winners.into_iter().enumerate() {
             let winner = &grant_winner.winner;
             if let Some(trace) = statement_context
                 .as_ref()
@@ -1760,6 +1792,7 @@ impl OptimizationInput {
         {
             let stop_event = match stop.reason {
                 SearchStopReason::Complete => "search_complete",
+                SearchStopReason::SearchIncomplete => "search_incomplete",
                 SearchStopReason::Deadline => "search_stop_deadline",
                 SearchStopReason::BudgetLimited => "search_stop_budget_limited",
                 SearchStopReason::RuleFailure => "search_stop_rule_failure",
@@ -1911,6 +1944,7 @@ impl OptimizationInput {
             physical_search: engine.memo().physical_search_profile(),
         };
         Ok(OptimizationOutput {
+            grant_search,
             variants: variants.into_boxed_slice(),
             rule_attempts,
             rule_insertions,
@@ -1934,6 +1968,7 @@ impl OptimizationInput {
 
 #[derive(Debug)]
 pub struct OptimizationOutput {
+    pub grant_search: Option<crate::physical::GrantSearchCoverage>,
     pub variants: Box<[OptimizedVariant]>,
     /// Rule applications that passed structural matching and budget admission.
     /// Comparing this with `rule_insertions` measures pre-match precision.

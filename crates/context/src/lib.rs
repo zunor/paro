@@ -66,6 +66,8 @@ pub use statement_cancellation::{
     StatementTimeoutDriver,
 };
 pub use statement_context::{CompileEnvironmentKey, StatementContext};
+mod compile_resources;
+pub use compile_resources::{CompileGrant, CompileResources, compile_grant_classes};
 pub use statement_environment::{StatementAuthContext, StatementEnvironment};
 pub use statement_graphs::StatementGraphSnapshots;
 pub use statement_input::StatementInput;

@@ -236,6 +236,14 @@ impl TestStatementContextBuilder {
                     commit_poison: crate::AttachedDatabaseCommitPoisonSnapshot::default(),
                 }],
             )),
+            compile_resources: crate::CompileResources::capture(
+                if limits.max_memory == 0 {
+                    usize::MAX
+                } else {
+                    limits.max_memory
+                },
+                limits.max_threads.max(1),
+            ),
             limits,
             cancellation: StatementCancellation::new(CancellationToken::new(), None),
             services: Arc::new(QueryResources {

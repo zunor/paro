@@ -70,6 +70,8 @@ pub enum SearchMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchStopReason {
     Complete,
+    /// Executable baseline available, but declared optional closure deferred.
+    SearchIncomplete,
     Deadline,
     BudgetLimited,
     RuleFailure,
@@ -206,6 +208,10 @@ pub struct GrantOptimization {
     pub sensitivity: GrantSensitivitySummary,
     pub winners: Box<[GrantWinner]>,
     pub stop: SearchStop,
+    pub grant_search: Option<crate::physical::GrantSearchCoverage>,
+    /// Exact mandatory DAGs, retained even if the expected class produces a
+    /// better optional variant. Never re-price or re-tag these after reset.
+    pub safe_winners: Box<[GrantWinner]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -992,6 +998,7 @@ enum BoundCheckLocation {
 /// recursive goal optimization, and winner verification.
 #[derive(Debug)]
 pub struct CascadesEngine {
+    active_optional_grant: Option<ResourceGrantClass>,
     engine_created_at: Instant,
     mandatory_only: bool,
     preserve_incomplete_physical: bool,
@@ -1243,6 +1250,7 @@ impl CascadesEngine {
             .register_builtin_f1_f4()
             .expect("built-in quality bundles must have unique identities");
         Self {
+            active_optional_grant: None,
             engine_created_at: Instant::now(),
             mandatory_only: false,
             preserve_incomplete_physical: false,
@@ -2477,8 +2485,15 @@ impl CascadesEngine {
             SearchStopReason::Deadline
         } else if budget_limited {
             SearchStopReason::BudgetLimited
-        } else if !obligations.is_empty() {
+        } else if obligations.iter().any(|obligation| {
+            matches!(
+                obligation.reason,
+                super::budget::SearchIncompleteReason::RuleFailure { .. }
+            )
+        }) {
             SearchStopReason::RuleFailure
+        } else if !obligations.is_empty() {
+            SearchStopReason::SearchIncomplete
         } else {
             SearchStopReason::Complete
         };
@@ -2494,6 +2509,7 @@ impl CascadesEngine {
                     .deadline_elapsed_us()
                     .or_else(|| Some(self.memo.control().elapsed_us())),
                 SearchStopReason::BudgetLimited
+                | SearchStopReason::SearchIncomplete
                 | SearchStopReason::RuleFailure
                 | SearchStopReason::QualityPolicySatisfied => {
                     Some(self.memo.control().elapsed_us())
@@ -3250,6 +3266,18 @@ impl CascadesEngine {
     }
 
     fn quality_class_for_goal(&self, goal: OptimizationGoal) -> ResourceGrantClassId {
+        if let Some(class) = self.active_optional_grant {
+            // Shared goals still need the active operating point's identity
+            // at the handoff boundary. The full sharing proof remains in the
+            // registry; this does not relabel a class-specific winner.
+            if match goal.grant {
+                GrantGoalKey::Invariant(_) => true,
+                GrantGoalKey::Parallelism { tasks, .. } => tasks == class.max_parallel_tasks,
+                GrantGoalKey::Class(id) => id == class.id,
+            } {
+                return class.id;
+            }
+        }
         match goal.grant {
             GrantGoalKey::Class(class) => class,
             GrantGoalKey::Parallelism { tasks, .. } => self
@@ -3518,6 +3546,39 @@ impl CascadesEngine {
         classes: impl IntoIterator<Item = ResourceGrantClass>,
         mode: SearchMode,
     ) -> Result<GrantOptimization> {
+        self.optimize_grant_portfolio(root, base_goal, admissible_set, classes, mode, None)
+    }
+
+    /// Production lazy entry point. None means that no declared operating
+    /// point fits the frozen availability; all classes still get P_safe.
+    pub fn optimize_for_expected_grant(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: impl IntoIterator<Item = ResourceGrantClass>,
+        mode: SearchMode,
+        expected_class: Option<ResourceGrantClassId>,
+    ) -> Result<GrantOptimization> {
+        self.optimize_grant_portfolio(
+            root,
+            base_goal,
+            admissible_set,
+            classes,
+            mode,
+            Some(expected_class),
+        )
+    }
+
+    fn optimize_grant_portfolio(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: impl IntoIterator<Item = ResourceGrantClass>,
+        mode: SearchMode,
+        expected: Option<Option<ResourceGrantClassId>>,
+    ) -> Result<GrantOptimization> {
         let mut class_map = BTreeMap::new();
         for class in classes {
             if class.max_parallel_tasks == 0 {
@@ -3533,6 +3594,14 @@ impl CascadesEngine {
             }
         }
         let classes = class_map;
+        if expected
+            .flatten()
+            .is_some_and(|id| !classes.contains_key(&id))
+        {
+            return Err(paro_error::internal(
+                "expected grant is not a declared class",
+            ));
+        }
         if classes.is_empty() {
             return Err(paro_error::internal(
                 "grant portfolio optimization requires at least one class",
@@ -3589,70 +3658,201 @@ impl CascadesEngine {
                     }
                 }
             }
-            self.memo.control().begin_optional();
-            if !self.memo.control().checkpoint()? {
-                self.governor
-                    .resource_stop(BudgetDimension::SearchCandidate);
-                self.record_search_checkpoints(root);
-                let stop = self.search_stop();
-                self.note_search_stop(stop);
-                return incumbent.map(|mut incumbent| {
-                    incumbent.stop = stop;
-                    incumbent
-                });
+            let safe = incumbent.as_ref().ok().cloned();
+            if expected.is_some()
+                && safe
+                    .as_ref()
+                    .is_none_or(|safe| safe.winners.len() != classes.len())
+            {
+                return Err(paro_error::internal(
+                    "lazy grant portfolio requires an exact mandatory winner for every class",
+                ));
             }
-            self.reset_cost_epoch()?;
-            self.optional_search_started =
-                self.collect_rule_work_profile || self.quality_handoff_enabled;
-            let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
-            let goals = classes.values().copied().map(|class| OptimizationGoal {
-                grant: sensitivity.goal_for(admissible_set, class),
-                ..base_goal
-            });
-            self.explore_transformations_with_interleave(Some(PhysicalInterleave::new(
-                root, goals,
-            )))?;
-            self.record_search_checkpoints(root);
-            if self.quality_handoff_reached {
-                if let Some(mut snapshot) =
-                    self.quality_grant_snapshot(root, base_goal, admissible_set, &classes)?
-                {
-                    let stop = self.search_stop();
-                    snapshot.stop = stop;
-                    self.note_search_stop(stop);
-                    return Ok(snapshot);
+            if expected == Some(None) {
+                let mut safe = incumbent?;
+                for class in classes.keys().copied() {
+                    self.memo.record_deferred_grant(class);
                 }
-            }
-            if !self.memo.control().checkpoint()? {
+                self.diagnostic_search_complete = false;
+                safe.stop = self.search_stop();
+                self.note_search_stop(safe.stop);
                 self.record_search_checkpoints(root);
-                return self.stop_with_snapshot_or_fallback(
-                    root,
-                    base_goal,
-                    admissible_set,
-                    &classes,
-                    incumbent,
-                );
+                safe.safe_winners = safe.winners.clone();
+                safe.grant_search = Some(crate::physical::GrantSearchCoverage::new(
+                    None,
+                    classes.keys().copied(),
+                    false,
+                ));
+                return Ok(safe);
             }
-            let result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
-            if self.memo.control().deadline_reached() {
-                self.record_search_checkpoints(root);
-                let fallback = result.or_else(|_| incumbent);
-                return self.stop_with_snapshot_or_fallback(
-                    root,
-                    base_goal,
-                    admissible_set,
-                    &classes,
-                    fallback,
-                );
+            let active_classes = classes
+                .iter()
+                .filter(|(id, _)| expected.is_none_or(|selected| selected == Some(**id)))
+                .map(|(id, class)| (*id, *class))
+                .collect::<BTreeMap<_, _>>();
+            let prior_quality_goals = self.quality_required_goals.clone();
+            if expected.flatten().is_some() {
+                let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
+                self.quality_required_goals = active_classes
+                    .values()
+                    .map(|class| OptimizationGoal {
+                        grant: sensitivity.goal_for(admissible_set, *class),
+                        ..base_goal
+                    })
+                    .collect();
             }
-            if result.is_ok() {
-                self.diagnostic_search_complete = self.memo.search_obligations_empty();
-                self.note_search_stop(self.search_stop());
+            // There must be no fallible early return between installing this
+            // temporary restriction and clearing it below.
+            self.active_optional_grant = expected.flatten().map(|id| classes[&id]);
+            let mut optional_started = false;
+            let result = self.optimize_optional_grants(
+                root,
+                base_goal,
+                admissible_set,
+                &active_classes,
+                incumbent,
+                &mut optional_started,
+            );
+            self.active_optional_grant = None;
+            // Restore the full declared class registry even on cancellation or
+            // failed optional staging; the immutable mandatory DAGs own fallback.
+            self.grant_classes.clone_from(&classes);
+            self.grant_class_sets = classes.keys().map(|id| (*id, admissible_set)).collect();
+            if result.is_err() {
+                self.quality_required_goals = prior_quality_goals;
+                self.quality_production_requests.clear();
+                self.quality_forced_transform_bindings.clear();
+                self.quality_active_forced_transform_binding = None;
             }
+            return result.map(|mut result| {
+                if let Some(expected_class) = expected {
+                    let safe = safe.expect("complete mandatory portfolio checked above");
+                    let mut winners = result.winners.into_vec();
+                    winners.retain(|winner| Some(winner.class) == expected_class);
+                    for winner in &safe.winners {
+                        if !winners
+                            .iter()
+                            .any(|selected| selected.class == winner.class)
+                        {
+                            winners.push(winner.clone());
+                        }
+                    }
+                    winners.sort_by_key(|winner| winner.class);
+                    result.winners = winners.into_boxed_slice();
+                    result.safe_winners = safe.winners;
+                    result.grant_search = Some(crate::physical::GrantSearchCoverage::new(
+                        expected_class,
+                        classes.keys().copied(),
+                        optional_started,
+                    ));
+                    // Active-goal closure is not closure of the declared
+                    // portfolio. Retaining a shared mandatory goal alone is
+                    // not a proof that every class completed optional work.
+                    for class in &result.grant_search.as_ref().unwrap().mandatory_only_classes {
+                        self.memo.record_deferred_grant(*class);
+                    }
+                    self.diagnostic_search_complete = self.memo.search_obligations_empty();
+                    result.stop = self.search_stop();
+                    self.note_search_stop(result.stop);
+                    self.record_search_checkpoints(root);
+                }
+                result
+            });
+        }
+        let mut result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes)?;
+        if let Some(expected_class) = expected {
+            if result.winners.len() != classes.len() {
+                return Err(paro_error::internal(
+                    "lazy grant portfolio requires all mandatory classes",
+                ));
+            }
+            result.safe_winners = result.winners.clone();
+            result.grant_search = Some(crate::physical::GrantSearchCoverage::new(
+                expected_class,
+                classes.keys().copied(),
+                false,
+            ));
+            for class in classes.keys().copied() {
+                self.memo.record_deferred_grant(class);
+            }
+            result.stop = self.search_stop();
+        }
+        self.diagnostic_search_complete = self.memo.search_obligations_empty();
+        self.note_search_stop(self.search_stop());
+        self.record_search_checkpoints(root);
+        Ok(result)
+    }
+
+    fn optimize_optional_grants(
+        &mut self,
+        root: GroupId,
+        base_goal: OptimizationGoal,
+        admissible_set: AdmissibleGrantSetId,
+        classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
+        incumbent: Result<GrantOptimization>,
+        optional_started: &mut bool,
+    ) -> Result<GrantOptimization> {
+        self.memo.control().begin_optional();
+        if !self.memo.control().checkpoint()? {
+            self.governor
+                .resource_stop(BudgetDimension::SearchCandidate);
             self.record_search_checkpoints(root);
+            let stop = self.search_stop();
+            self.note_search_stop(stop);
+            return incumbent.map(|mut incumbent| {
+                incumbent.stop = stop;
+                incumbent
+            });
+        }
+        self.reset_cost_epoch()?;
+        *optional_started = true;
+        self.optional_search_started =
+            self.collect_rule_work_profile || self.quality_handoff_enabled;
+        let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
+        let goals = classes.values().copied().map(|class| OptimizationGoal {
+            grant: sensitivity.goal_for(admissible_set, class),
+            ..base_goal
+        });
+        self.explore_transformations_with_interleave(Some(PhysicalInterleave::new(root, goals)))?;
+        self.record_search_checkpoints(root);
+        if self.quality_handoff_reached {
+            if let Some(mut snapshot) =
+                self.quality_grant_snapshot(root, base_goal, admissible_set, classes)?
+            {
+                let stop = self.search_stop();
+                snapshot.stop = stop;
+                self.note_search_stop(stop);
+                return Ok(snapshot);
+            }
+        }
+        if !self.memo.control().checkpoint()? {
+            self.record_search_checkpoints(root);
+            return self.stop_with_snapshot_or_fallback(
+                root,
+                base_goal,
+                admissible_set,
+                classes,
+                incumbent,
+            );
+        }
+        let result = self.optimize_grant_classes(root, base_goal, admissible_set, classes);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is_query_canceled())
+        {
             return result;
         }
-        let result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
+        if self.memo.control().deadline_reached() {
+            self.record_search_checkpoints(root);
+            let fallback = result.or_else(|_| incumbent);
+            return self.stop_with_snapshot_or_fallback(
+                root,
+                base_goal,
+                admissible_set,
+                classes,
+                fallback,
+            );
+        }
         if result.is_ok() {
             self.diagnostic_search_complete = self.memo.search_obligations_empty();
             self.note_search_stop(self.search_stop());
@@ -3688,6 +3888,8 @@ impl CascadesEngine {
             return Ok(None);
         }
         Ok(Some(GrantOptimization {
+            grant_search: None,
+            safe_winners: Box::new([]),
             sensitivity,
             winners: winners.into_boxed_slice(),
             stop: self.search_stop(),
@@ -3701,10 +3903,14 @@ impl CascadesEngine {
         admissible_set: AdmissibleGrantSetId,
         classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
     ) -> Result<GrantOptimization> {
-        self.grant_class_sets.clear();
-        self.grant_class_sets
-            .extend(classes.keys().copied().map(|class| (class, admissible_set)));
-        self.grant_classes.clone_from(classes);
+        // Optional scheduling narrows work, not the declared grant domain or
+        // the context used to derive shared/RequiredEnforcement child goals.
+        if self.active_optional_grant.is_none() {
+            self.grant_class_sets.clear();
+            self.grant_class_sets
+                .extend(classes.keys().copied().map(|class| (class, admissible_set)));
+            self.grant_classes.clone_from(classes);
+        }
         self.grant_sensitivity.clear();
         let root = self.memo.canonical_group(root);
         let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
@@ -3745,6 +3951,8 @@ impl CascadesEngine {
             return Err(self.infeasible_goal_error(root, last_infeasible.unwrap_or(base_goal)));
         }
         Ok(GrantOptimization {
+            grant_search: None,
+            safe_winners: Box::new([]),
             sensitivity,
             winners: winners.into_boxed_slice(),
             stop: self.search_stop(),
@@ -3811,6 +4019,8 @@ impl CascadesEngine {
             return Ok(None);
         }
         Ok(Some(GrantOptimization {
+            grant_search: None,
+            safe_winners: Box::new([]),
             sensitivity,
             winners: winners.into_boxed_slice(),
             stop: self.search_stop(),
@@ -4035,6 +4245,16 @@ impl CascadesEngine {
 
     fn drain_physical_interleave(&mut self, interleave: &mut PhysicalInterleave) -> Result<()> {
         while let Some((group, goal)) = interleave.pending.pop_first() {
+            if self
+                .active_optional_grant
+                .is_some_and(|class| match goal.grant {
+                    GrantGoalKey::Class(id) => id != class.id,
+                    GrantGoalKey::Parallelism { tasks, .. } => tasks != class.max_parallel_tasks,
+                    GrantGoalKey::Invariant(_) => false,
+                })
+            {
+                continue;
+            }
             if self.quality_handoff_reached {
                 break;
             }

@@ -37,6 +37,7 @@ pub(crate) fn test_session(search_path: Vec<CatalogSearchEntry>) -> Arc<Statemen
         random: base.random.clone(),
         databases: base.databases.clone(),
         limits: base.limits.clone(),
+        compile_resources: base.compile_resources,
         cancellation: base.cancellation.clone(),
         services: Arc::new(QueryResources {
             infra: base.services.infra.clone(),
