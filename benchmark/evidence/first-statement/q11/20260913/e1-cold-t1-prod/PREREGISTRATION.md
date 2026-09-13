@@ -38,3 +38,13 @@ comparison. Separate commit/campaign; final fingerprint must equal matched contr
 handoff synthesis<=2000, C1<=210ms, W noninferior. No E1 instrumentation required
 for its normal timing. No claim of ProofComplete or parity. Preserve baseline4
 failures and user mixed work. No F/domain identity/allocation/executor optimization.
+
+T1 follow-up registration before its first run: clean c23ae52a production
+expected-class implementation; 4 fresh handoff blocks and separately4 default
+blocks, warmup1/ABBA round1, mandatory diagnostic1 each, same seed1/resources/
+SQL/data as E1 controls. E1 scalars off. Handoff and default are not one pooled
+arm. Compare admitted fingerprint with clean E1-off control and prior T1 target
+5c29cf646706c8c8ba84000150211a6b; retain all valid samples. These are pilot gates,
+not formal parity or cross-family noninferiority certification. Report W both
+against DuckDB in each paired campaign and against control; do not infer stage
+cost by subtracting different campaign medians.
