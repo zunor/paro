@@ -18,9 +18,14 @@ pub enum Bucket {
     Publish,
     Quality,
     Finish,
+    QualityEvidence,
+    QualityDomain,
+    QualityProduction,
+    QualityFreeze,
+    QualityReads,
     Unclassified,
 }
-const N: usize = 14;
+const N: usize = 19;
 const NAMES: [&str; N] = [
     "B0_pre",
     "B1_agenda",
@@ -35,6 +40,11 @@ const NAMES: [&str; N] = [
     "B10_publish",
     "B11_quality",
     "B12_finish",
+    "B11_evidence",
+    "B11_domain",
+    "B11_production",
+    "B11_freeze",
+    "B11_reads",
     "unclassified",
 ];
 struct Ledger {
@@ -191,7 +201,7 @@ mod tests {
             slot.borrow_mut().ledger = Some(Ledger {
                 start: Instant::now(),
                 cursor: 0,
-                current: 13,
+                current: N - 1,
                 ns: [0; N],
                 entries: [0; N],
             })
@@ -227,23 +237,23 @@ mod tests {
         let report = new.finish(Instant::now()).unwrap();
         assert_eq!(report.ledger.entries.iter().sum::<u64>(), 0);
         assert_eq!(report.ledger.ns.iter().sum::<u64>(), report.total_ns);
-        assert_eq!(report.ledger.ns[13], report.total_ns);
+        assert_eq!(report.ledger.ns[N - 1], report.total_ns);
     }
     #[test]
     fn nested_intervals_partition_without_double_counting() {
         let mut ledger = Ledger {
             start: Instant::now(),
             cursor: 0,
-            current: 13,
+            current: N - 1,
             ns: [0; N],
             entries: [0; N],
         };
         ledger.change(5, 5);
         ledger.change(12, 2);
         ledger.change(16, 5);
-        ledger.change(20, 13);
-        ledger.change(23, 13);
-        assert_eq!(ledger.ns[13], 8);
+        ledger.change(20, N - 1);
+        ledger.change(23, N - 1);
+        assert_eq!(ledger.ns[N - 1], 8);
         assert_eq!(ledger.ns[5], 11);
         assert_eq!(ledger.ns[2], 4);
         assert_eq!(ledger.ns.iter().sum::<u64>(), 23);

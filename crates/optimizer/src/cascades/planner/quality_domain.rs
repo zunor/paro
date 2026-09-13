@@ -219,6 +219,7 @@ pub(super) fn pending_transfers(
     root: &FrozenCandidate,
     state: &PlannerTransformState,
 ) -> Option<Box<[CandidateId]>> {
+    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityDomain);
     let mut pending = Vec::new();
     let mut visited = BTreeSet::new();
     let mut stack = vec![root];

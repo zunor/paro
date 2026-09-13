@@ -2937,7 +2937,7 @@ impl Memo {
     /// is rejected at the handoff boundary instead of being repaired by a
     /// later search pass.
     pub fn freeze_candidate_tree(&self, root: ChildWinnerRef) -> Result<Arc<FrozenCandidate>> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityFreeze);
         fn visit(
             memo: &Memo,
             reference: ChildWinnerRef,

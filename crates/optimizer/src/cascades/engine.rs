@@ -2582,7 +2582,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         winner: Arc<Winner>,
     ) -> Result<GrantWinner> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityFreeze);
         let started = Instant::now();
         let reference = ChildWinnerRef {
             group: self.memo.canonical_group(root),
@@ -3552,6 +3552,7 @@ impl CascadesEngine {
     }
 
     fn winner_fact_reads(&self, group: GroupId, winner: &Winner) -> Result<ReadSet> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityReads);
         let mut pending = vec![(self.memo.canonical_group(group), winner)];
         let mut visited_candidates = BTreeSet::new();
         let mut groups = BTreeSet::new();

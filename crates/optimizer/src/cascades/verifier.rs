@@ -116,7 +116,7 @@ impl WinnerVerifier {
     /// Replay the precise immutable DAG selected for extraction, including
     /// archived incumbent children no longer retained by a cost frontier.
     pub fn verify_candidate_tree(memo: &Memo, root: super::memo::ChildWinnerRef) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityFreeze);
         let mut pending = vec![root];
         let mut seen = std::collections::BTreeSet::new();
         while let Some(reference) = pending.pop() {

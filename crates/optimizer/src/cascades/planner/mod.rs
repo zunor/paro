@@ -574,6 +574,7 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         frozen: &FrozenCandidate,
         goal: OptimizationGoal,
     ) -> Result<Option<NativeQualityEvidence>> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityEvidence);
         let state = self.state.read().expect("planner transform state poisoned");
         let Some(required) = memo.required(goal.required) else {
             return Ok(None);

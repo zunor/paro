@@ -190,6 +190,7 @@ impl CascadesEngine {
         evidence: &NativeQualityEvidence,
         missing: &[BundleFact],
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityProduction);
         let Some(mut request) =
             QualityProductionRequest::from_candidate(&self.memo, frozen, reads, evidence, missing)
         else {

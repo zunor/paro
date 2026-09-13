@@ -37,3 +37,10 @@ one bucket >=40% of the previously unclassified work and a concrete removable
 operation, preserving workload/choices/fingerprint and completion semantics.
 Width4 observation is overfit and not an admissible optimization: logical
 counts changed despite same Q11 winner. No width experiment this round.
+
+After first OFF/ON/OFF: coverage95.7–96.1%, overhead1.7%; B11~18.2ms,
+B5+B10~3.8ms. Refine B11 within this round into exclusive evidence/domain/
+production/freeze/read scopes (same ledger, no events), before conditional
+implementation. Repeat OFF/ON/OFF on the refined clean binary; same gates and
+sample counts. Keep first partition artifacts. Do not substitute diagnostic
+freeze2.092ms for the trace-off bucket; its cohort is separate.
