@@ -14,6 +14,7 @@ pub(super) mod cte;
 mod join_region;
 mod matching;
 mod native_domain;
+mod native_join_preaggregation;
 mod native_join_subsumption;
 pub(super) mod settlement;
 mod staging;
@@ -578,6 +579,7 @@ impl TransformationRule for PlannerTransformationRule {
                 | PlannerTransformation::LimitPushdown
                 | PlannerTransformation::TopNIntroduction
                 | PlannerTransformation::JoinRegionEnumeration
+                | PlannerTransformation::AggregateJoinPreaggregation
                 | PlannerTransformation::AggregateJoinSubsumption
                 | PlannerTransformation::AggregateDimensionDeferral
                 | PlannerTransformation::AggregateInputMaterialization
@@ -611,6 +613,16 @@ impl TransformationRule for PlannerTransformationRule {
                 }
                 PlannerTransformation::JoinRegionEnumeration => {
                     join_region::try_native_enumeration(&binding.root, ctx.memo(), &state, &facts)?
+                }
+                PlannerTransformation::AggregateJoinPreaggregation => {
+                    native_join_preaggregation::try_native_aggregate_join_preaggregation(
+                        &binding.root,
+                        ctx.memo(),
+                        &state,
+                        &facts,
+                    )?
+                    .into_iter()
+                    .collect()
                 }
                 PlannerTransformation::AggregateJoinSubsumption => {
                     native_join_subsumption::try_native_aggregate_join_subsumption(
@@ -696,6 +708,7 @@ impl TransformationRule for PlannerTransformationRule {
                 || matches!(
                     self.transformation,
                     PlannerTransformation::JoinRegionEnumeration
+                        | PlannerTransformation::AggregateJoinPreaggregation
                         | PlannerTransformation::AggregateJoinSubsumption
                         | PlannerTransformation::KeyDomainTransfer
                         | PlannerTransformation::MarkJoinToSemi
