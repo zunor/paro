@@ -14,6 +14,7 @@ pub(super) mod cte;
 mod join_region;
 mod matching;
 mod native_domain;
+mod native_join_subsumption;
 pub(super) mod settlement;
 mod staging;
 
@@ -577,6 +578,7 @@ impl TransformationRule for PlannerTransformationRule {
                 | PlannerTransformation::LimitPushdown
                 | PlannerTransformation::TopNIntroduction
                 | PlannerTransformation::JoinRegionEnumeration
+                | PlannerTransformation::AggregateJoinSubsumption
                 | PlannerTransformation::AggregateDimensionDeferral
                 | PlannerTransformation::AggregateInputMaterialization
                 | PlannerTransformation::AggregateDimensionSharing
@@ -609,6 +611,16 @@ impl TransformationRule for PlannerTransformationRule {
                 }
                 PlannerTransformation::JoinRegionEnumeration => {
                     join_region::try_native_enumeration(&binding.root, ctx.memo(), &state, &facts)?
+                }
+                PlannerTransformation::AggregateJoinSubsumption => {
+                    native_join_subsumption::try_native_aggregate_join_subsumption(
+                        &binding.root,
+                        ctx.memo(),
+                        &state,
+                        &facts,
+                    )?
+                    .into_iter()
+                    .collect()
                 }
                 PlannerTransformation::KeyDomainTransfer => {
                     try_native_key_domain_transfer(&binding.root, ctx.memo(), &state, &facts)?
@@ -684,6 +696,7 @@ impl TransformationRule for PlannerTransformationRule {
                 || matches!(
                     self.transformation,
                     PlannerTransformation::JoinRegionEnumeration
+                        | PlannerTransformation::AggregateJoinSubsumption
                         | PlannerTransformation::KeyDomainTransfer
                         | PlannerTransformation::MarkJoinToSemi
                         | PlannerTransformation::LimitPushdown
