@@ -880,6 +880,10 @@ impl TransformationRule for PlannerTransformationRule {
                 || matches!(
                     self.transformation,
                     PlannerTransformation::JoinRegionEnumeration
+                        // This producer traverses the complete binding and
+                        // declines unknown descendants, unlike partial domain
+                        // producers. Its owned peer repeats the same rewrite.
+                        | PlannerTransformation::JoinElimination
                         | PlannerTransformation::AggregateJoinPreaggregation
                         | PlannerTransformation::AggregateJoinSubsumption
                         | PlannerTransformation::AggregateNonNullInput

@@ -560,6 +560,54 @@ mod tests {
     }
 
     #[test]
+    fn native_elimination_matches_owned_reference_for_both_outer_sides() {
+        for unique in [false, true] {
+            for observed in [false, true] {
+                for right_outer in [false, true] {
+                    let make_source = || {
+                        let mut source = candidate(unique, observed);
+                        if right_outer {
+                            let LogicalOperator::Projection(projection) = &mut source.operator
+                            else {
+                                unreachable!()
+                            };
+                            let LogicalOperator::Join(Join::Comparison(join)) =
+                                &mut projection.child.operator
+                            else {
+                                unreachable!()
+                            };
+                            std::mem::swap(&mut join.left, &mut join.right);
+                            join.join_type = JoinType::Right;
+                            join.conditions =
+                                vec![JoinCondition::equality(column(1, 0), column(0, 0))];
+                        }
+                        source
+                    };
+                    let source = make_source();
+                    let (expected, changed) = crate::join::elimination::JoinElimination::new()
+                        .optimize_plan_with_change(make_source());
+                    let actual =
+                        rewrite_shell(NativeShell::from_owned(source, &HashMap::new()).unwrap())
+                            .unwrap();
+                    assert_eq!(actual.is_some(), changed);
+                    if let Some(actual) = actual {
+                        let expected = NativeShell::from_owned(expected, &HashMap::new()).unwrap();
+                        assert_eq!(
+                            actual.root_layout().unwrap(),
+                            expected.root_layout().unwrap()
+                        );
+                        assert_eq!(
+                            format!("{:?}", actual.root_operator()),
+                            format!("{:?}", expected.root_operator()),
+                            "native success must include the entire reference rewrite"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_shell_eliminates_unobserved_unique_outer_side() {
         let source = candidate(true, false);
         let expected_layout = source.output_layout();
@@ -740,9 +788,10 @@ mod tests {
         };
         let mut context = TransformContext::new(&mut input.memo, input.root);
         let outputs = rule.apply_binding(&binding, &mut context).unwrap();
-        assert!(
-            !outputs.is_empty(),
-            "native elimination should publish a staged candidate"
+        assert_eq!(
+            outputs.len(),
+            1,
+            "a complete native elimination must not stage the same owned peer"
         );
     }
 }
