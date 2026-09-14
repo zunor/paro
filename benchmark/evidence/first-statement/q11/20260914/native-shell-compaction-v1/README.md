@@ -213,6 +213,19 @@ correction, so no unchanged candidate-count or performance claim is made.
 Window/control/other unhandled descendants still prevent declaring the entire
 JoinElimination path native-only. No Q11 or full SQL regress was run here.
 
+`6e0d86bb` adds native Window dependency traversal for JoinElimination. The
+production wrapped binding first required one owned instantiation and now
+stages its native elimination without a bridge. A second failing regression
+showed the legacy rule could eliminate a side still referenced by a retained
+Window invocation merely because its output was unselected. Both paths now
+retain dependencies of every invocation they leave in the plan, including
+arguments, partitions, ordering and frame expressions traversed by the common
+expression visitor. No future expression-pruning pass is assumed. Eight
+native tests, five reference join-elimination tests and 111 engine tests
+passed. Other unhandled/control descendants and negative-result completeness
+still prevent removing the entire JoinElimination fallback. This contract
+correction has no new Q11/fingerprint or clean performance acceptance yet.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
