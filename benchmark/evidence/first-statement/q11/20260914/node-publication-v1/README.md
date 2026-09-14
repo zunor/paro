@@ -31,3 +31,20 @@ compiler, C1/W and diagnostic readiness/partition/work; no cross-cohort median
 subtraction. Require reproducible compiler benefit with preserved execution
 quality, otherwise remove unsupported optimization layers and record residual
 work. QualityPolicySatisfied remains SearchIncomplete, not ProofComplete.
+
+## Normal pilot order, declared before sampling
+
+Probe (54bbe33a code) two blocks, control (3e4e6a51: 47dc408e code) four
+blocks, probe two blocks. Each invocation retains the existing paired engine
+order, one warmup and one measurement round (two W observations per block),
+seed 2026091401, plus its separate diagnostic block. Four blocks per arm in
+total; no sample-dependent extension. This brackets machine drift without
+pooling normal and diagnostic samples. Compare all compiler samples and
+engine-normalized paired C1/W; small-pilot uncertainty is explicit.
+
+The 2d35b05b experiment is not admitted: suppressing the entire group-write
+footprint changed the triple to 73a08efb/2203/1312. 54bbe33a retains the
+structural publication dependency footprint while avoiding fact invalidation
+on idempotent merges, restoring 2ed1a3e/2500/1436. The CTE cache correction
+changes registry invalidations 97→93 in these diagnostics; final choices,
+costs and all other fixed fields match control. No old statistics restored.
