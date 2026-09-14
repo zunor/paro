@@ -499,6 +499,30 @@ of identical Q11 fingerprint or improved timing is made. Fresh fixed-work,
 runtime semantics and performance acceptance remain outstanding. Unsupported
 aggregate roots/control ownership and other producers still retain fallbacks.
 
+### Aggregate grouping and hidden reduction contracts (98688429, 07e3469b)
+
+The native materialization gate unnecessarily required a nonempty plain
+grouping domain and rejected post-reduction annotations. Production fixtures
+reproduced owned fallback for scalar aggregation and then for a valid hidden
+post-reduction. Materialization leaves the input bag, grouping-set ordinals,
+GROUPING outputs and aggregate output namespace unchanged; only independently
+proven total/narrowing input expressions are moved and rebound.
+
+The existing post-reduction verifier is now generic over child ownership
+(98688429), with its scalar checks unchanged. Native materialization validates
+that same contract before and after rewriting (07e3469b), without an owned
+adapter. Tests cover plain groups, scalar aggregation, grouping sets including
+the empty set plus GROUPING(), and a hidden MAX reduction, under both orders
+of movable/rejected inputs. They compare output types, grouping metadata and
+the entire hidden reduction contract against the reference, retain the rejected
+expression and require one output/no owned instantiation/no arena growth.
+
+Validation: materialization13, planner post-reduction4 and engine111 pass.
+Full optimizer1274 pass/5 fail at the same recorded assertions; none blessed.
+No SQL bag execution, fixed-work fingerprint or Q11 performance experiment
+ran. Control ownership and complete negative-path coverage still prevent a
+claim that this rule's owned fallback can be removed wholesale.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
