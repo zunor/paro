@@ -23,6 +23,86 @@ fn assert_column(expressions: &[Expression], table: usize, ordinal: usize) {
     assert_eq!(column.binding, ColumnBinding::new(table, ordinal));
 }
 
+#[test]
+fn production_deferral_preserves_dimension_key_evaluation_barrier() {
+    use paro_function::scalar::{BoundScalarFunction, FunctionStability, ScalarFunctionSet};
+    use paro_planner::expression::FunctionExpression;
+    for reversed in [false, true] {
+        let make_plan = || {
+            let mut plan = candidate(false);
+            let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                unreachable!()
+            };
+            let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator
+            else {
+                unreachable!()
+            };
+            let mut arithmetic = ScalarFunctionSet::new("-".into());
+            paro_function::scalar::operators::arithmetic::register_arithmetic_functions(
+                &mut arithmetic,
+            );
+            let (function, _) = arithmetic
+                .bind(&[LogicalType::Integer, LogicalType::Integer])
+                .unwrap();
+            let mut function = BoundScalarFunction::from(function);
+            function.stability = FunctionStability::Volatile;
+            let expression = Expression::Function(
+                FunctionExpression::new(
+                    function,
+                    vec![
+                        col(1, 0, LogicalType::Integer),
+                        col(1, 0, LogicalType::Integer),
+                    ],
+                    LogicalType::Integer,
+                )
+                .into(),
+            );
+            assert!(expression.evaluation_properties().is_reorder_fence());
+            join.conditions[0].right = expression;
+            if reversed {
+                let condition = &mut join.conditions[0];
+                std::mem::swap(&mut condition.left, &mut condition.right);
+            }
+            plan
+        };
+        let (_, changed) =
+            dimension_deferral::optimize_plan(make_plan(), &BindContext::new()).unwrap();
+        assert!(!changed, "reference must preserve evaluation boundary");
+        let mut input =
+            MemoBuilder::build(make_plan(), BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.clone();
+        state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
+        let root = input.root;
+        let expression = input.memo.group(root).unwrap().logical_exprs()[0];
+        let binding = matching::scoped_pattern_bindings(
+            PlannerTransformation::AggregateDimensionDeferral,
+            root,
+            expression,
+            &input.memo,
+            &state.read().unwrap(),
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .bindings
+        .first()
+        .cloned()
+        .unwrap();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::AggregateDimensionDeferral,
+            planner_state: state,
+        };
+        let mut context = TransformContext::new(&mut input.memo, root);
+        assert!(
+            rule.apply_binding(&binding, &mut context)
+                .unwrap()
+                .is_empty(),
+            "reversed={reversed}"
+        );
+    }
+}
+
 fn candidate(reference: bool) -> OwnedLogicalPlan {
     let dimension = if reference {
         LogicalOperator::CTERef(CTERef::new(

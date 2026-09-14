@@ -3255,7 +3255,7 @@ fn try_native_dimension_deferral(
     let mut partial_groups = Vec::with_capacity(join.conditions.len() + aggregate.groups.len());
     let mut condition_rewrites = Vec::with_capacity(join.conditions.len());
     for condition in &join.conditions {
-        let (fact_key, fact_on_left) = match (
+        let (fact_key, dimension_key, fact_on_left) = match (
             native_dimension_expression_domain(
                 &condition.left,
                 &fact_bindings,
@@ -3268,14 +3268,16 @@ fn try_native_dimension_deferral(
             ),
         ) {
             (NativeDimensionExpressionDomain::Fact, NativeDimensionExpressionDomain::Dimension) => {
-                (&condition.left, true)
+                (&condition.left, &condition.right, true)
             }
             (NativeDimensionExpressionDomain::Dimension, NativeDimensionExpressionDomain::Fact) => {
-                (&condition.right, false)
+                (&condition.right, &condition.left, false)
             }
             _ => return Ok(None),
         };
-        if !native_dimension_expression_is_movable(fact_key) {
+        if !native_dimension_expression_is_movable(fact_key)
+            || !native_dimension_expression_is_movable(dimension_key)
+        {
             return Ok(None);
         }
         let key_ordinal = native_dimension_insert_unique(&mut partial_groups, fact_key.clone());
