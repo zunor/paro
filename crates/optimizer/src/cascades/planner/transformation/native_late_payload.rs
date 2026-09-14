@@ -32,9 +32,7 @@ pub(super) fn try_native_late_payload_prefix(
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
-    prefix_only_complete: &mut bool,
 ) -> Result<Option<NativeShell>> {
-    *prefix_only_complete = false;
     let Some((shell, mut layouts)) =
         NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
     else {
@@ -126,10 +124,6 @@ pub(super) fn try_native_late_payload_prefix(
     let Some(candidate) = prove_prefix_candidate(&projection, &filter, &get) else {
         return Ok(None);
     };
-    // Row-id lowering needs at least one stored payload output. When every
-    // output becomes a derived scan prefix, no output has a stored_column. Mixed
-    // outputs must retain the owned peer's subsequent row-id opportunity.
-    let only_derived_outputs = candidate.output_indices.len() == projection.expressions.len();
     let source_type = get
         .column_types
         .get(candidate.source_binding.column_index)
@@ -235,7 +229,10 @@ pub(super) fn try_native_late_payload_prefix(
     if result_layout != original_layout {
         return Ok(None);
     }
-    *prefix_only_complete = only_derived_outputs;
+    // This Projection now consumes a derived scan column. The existing
+    // selective row-fetch contract rejects such a column, even when other
+    // outputs are stored payload. The TopN-specific proof does not apply to
+    // this root. Thus the owned prefix-then-rowid peer adds no further rewrite.
     Ok(Some(shell))
 }
 
@@ -581,6 +578,38 @@ mod tests {
     }
 
     #[test]
+    fn mixed_prefix_projection_cannot_chain_rowid_lowering() {
+        use crate::transformation_rejection::{
+            RejectionReasons, TransformationRejectionCounts, TransformationRejectionGuard as Guard,
+        };
+        let (mut plan, prefix_changed) =
+            crate::aggregate::late_payload::rewrite_matched_prefix_node(production_plan(4))
+                .unwrap();
+        assert!(prefix_changed);
+        let LogicalOperator::Projection(output) = &mut plan.operator else {
+            unreachable!()
+        };
+        // Reach the column guard rather than accidentally passing this test
+        // because the synthetic input had no cardinality evidence.
+        output.child.stats.estimated_cardinality =
+            Some(paro_planner::plan::CardinalityEstimate::exact(10));
+        let mut reasons = Some(RejectionReasons::default());
+        let (_, changed) = crate::aggregate::late_payload::rewrite_node_profiled(
+            plan,
+            &BindContext::new(),
+            &crate::cost_model::CostModel::default(),
+            &mut reasons,
+        )
+        .unwrap();
+        assert!(!changed);
+        let mut counts = TransformationRejectionCounts::default();
+        counts.record(reasons.unwrap());
+        assert!(counts
+            .iter()
+            .any(|(guard, count)| guard == Guard::SelectiveInvalidColumn && count == 1));
+    }
+
+    #[test]
     fn prefix_transport_keeps_topn_projected_output_visible() {
         let mut plan = production_plan(6);
         let LogicalOperator::Projection(output) = &mut plan.operator else {
@@ -640,17 +669,10 @@ mod tests {
             )
             .unwrap()
             .expect("production binding should have boundary facts");
-            let mut prefix_complete = false;
-            let shell = try_native_late_payload_prefix(
-                &binding.root,
-                context.memo(),
-                &state,
-                &facts,
-                &mut prefix_complete,
-            )
-            .unwrap()
-            .expect("production binding should take the native prefix path");
-            assert_eq!(prefix_complete, wrapper != 4);
+            let shell =
+                try_native_late_payload_prefix(&binding.root, context.memo(), &state, &facts)
+                    .unwrap()
+                    .expect("production binding should take the native prefix path");
             assert_eq!(
                 shell.root_layout().unwrap().len(),
                 if wrapper == 4 { 2 } else { 1 }
@@ -685,10 +707,10 @@ mod tests {
             };
             let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
             let outputs = rule.apply_binding(&binding, &mut context).unwrap();
-            assert_eq!(outputs.len(), if wrapper == 4 { 2 } else { 1 });
+            assert_eq!(outputs.len(), 1);
             assert_eq!(
                 super::super::semantic_plan::owned_binding_instantiation_count(),
-                bridges + usize::from(wrapper == 4)
+                bridges
             );
         }
     }
