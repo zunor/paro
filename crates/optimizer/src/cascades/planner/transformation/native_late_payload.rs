@@ -3,7 +3,7 @@
 
 //! Native staging for selected late payload lowering paths.
 //!
-//! Projection prefix witnesses, ordinary selective row fetch, and detail TopN
+//! Projection prefix witnesses, ordinary selective row fetch, and both TopN forms
 //! use native selected nodes. Unsupported shapes still reach the owned rule;
 //! a positive native result alone does not imply the entire rule is migrated.
 
@@ -22,7 +22,7 @@ use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 /// Try the supported LatePayloadFetch contracts on the native shell.
 ///
 /// A native miss deliberately returns None so the owned implementation can
-/// still handle aggregate TopN and shapes outside these contracts.
+/// still handle shapes outside these contracts.
 pub(super) fn try_native_late_payload_prefix(
     binding: &PatternOperand,
     memo: &Memo,
@@ -39,6 +39,18 @@ pub(super) fn try_native_late_payload_prefix(
     }
     if matches!(shell.root_operator(), LogicalOperator::TopN(_)) {
         super::native_topn_payload::restore_root_output(&mut shell, binding, memo, state)?;
+        let aggregate_input = match shell.root_operator() {
+            LogicalOperator::TopN(topn) => super::native_topn_payload::node(&topn.child)
+                .and_then(|index| match &shell.nodes[index].operator {
+                    LogicalOperator::Projection(output) => super::native_topn_payload::node(&output.child),
+                    _ => None,
+                })
+                .is_some_and(|index| matches!(shell.nodes[index].operator, LogicalOperator::Aggregate(_))),
+            _ => false,
+        };
+        if aggregate_input {
+            return super::native_aggregate_topn_payload::rewrite(shell, state);
+        }
         return super::native_topn_payload::rewrite(shell, state);
     }
 

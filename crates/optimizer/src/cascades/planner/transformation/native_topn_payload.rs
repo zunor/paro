@@ -32,7 +32,7 @@ struct Source {
     topn_rowid: Option<usize>,
 }
 
-fn node(child: &NativeChild) -> Option<usize> {
+pub(super) fn node(child: &NativeChild) -> Option<usize> {
     match child {
         NativeChild::Node(index) => Some(*index),
         _ => None,
@@ -73,7 +73,7 @@ pub(super) fn restore_root_output(
 }
 
 // Count edges/occurrences, not unique node IDs. Opaque branches cannot prove absence.
-fn occurrences(shell: &NativeShell, child: &NativeChild, table: usize) -> Option<usize> {
+pub(super) fn occurrences(shell: &NativeShell, child: &NativeChild, table: usize) -> Option<usize> {
     let op = &shell.nodes.get(node(child)?)?.operator;
     let mut count = Some(usize::from(
         matches!(op, LogicalOperator::Get(get) if get.table_index == table),
@@ -86,7 +86,7 @@ fn occurrences(shell: &NativeShell, child: &NativeChild, table: usize) -> Option
     count
 }
 
-fn source_get(shell: &NativeShell, child: &NativeChild, table: usize) -> Option<usize> {
+pub(super) fn source_get(shell: &NativeShell, child: &NativeChild, table: usize) -> Option<usize> {
     let index = node(child)?;
     let op = &shell.nodes.get(index)?.operator;
     if matches!(op, LogicalOperator::Get(get) if get.table_index == table) {
@@ -373,10 +373,10 @@ pub(super) fn rewrite(
     Ok(Some(result))
 }
 
-fn column(binding: ColumnBinding, ty: LogicalType) -> Expression {
+pub(super) fn column(binding: ColumnBinding, ty: LogicalType) -> Expression {
     Expression::ColumnRef(ColumnRefExpression::new(binding, ty).into())
 }
-fn projection(
+pub(super) fn projection(
     table_index: usize,
     child: usize,
     expressions: Vec<Expression>,
@@ -392,7 +392,7 @@ fn projection(
         child: NativeChild::Node(child),
     })
 }
-fn push(
+pub(super) fn push(
     nodes: &mut Vec<NativeNode>,
     operator: LogicalOperator<NativeChild>,
     state: &PlannerTransformState,
@@ -442,7 +442,7 @@ fn fetch_sources(sources: &[Source], ordered: bool, carrier: usize) -> Vec<RowFe
         .collect()
 }
 
-fn layout(
+pub(super) fn layout(
     nodes: &[NativeNode],
     index: usize,
 ) -> Result<paro_planner::operator::LogicalOutputLayout> {
@@ -467,7 +467,7 @@ fn layout(
         .output_layout_from_child_refs(&inputs.iter().collect::<Vec<_>>()))
 }
 
-fn append_rowid(
+pub(super) fn append_rowid(
     nodes: &mut [NativeNode],
     index: usize,
     path: &RowIdPath,

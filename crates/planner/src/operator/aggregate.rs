@@ -391,23 +391,6 @@ impl Aggregate {
         aggregate
     }
 
-    pub fn recompute_returned_types(&mut self) {
-        self.group_stats.resize(self.groups.len(), None);
-        // Callers use this method after changing group expressions. Even
-        // though the witness keeps stable catalog identity, its structural
-        // obligations (group coverage, join shape, and merge laws) are stale
-        // until the optimizer proves them again over the settled logical tree.
-        self.group_dependencies.clear();
-        self.group_input_multiplicity = GroupInputMultiplicity::Arbitrary;
-        self.returned_types = self
-            .groups
-            .iter()
-            .map(|expr| expr.return_type())
-            .chain(self.aggregates.iter().map(|expr| expr.return_type()))
-            .chain(self.grouping_functions.iter().map(|_| LogicalType::BigInt))
-            .collect();
-    }
-
     /// Recompute the output schema after relocating expression evaluation
     /// without changing the aggregate's input rows or grouping semantics.
     ///
@@ -439,6 +422,23 @@ impl Aggregate {
 }
 
 impl<Child> Aggregate<Child> {
+    pub fn recompute_returned_types(&mut self) {
+        self.group_stats.resize(self.groups.len(), None);
+        // Callers use this method after changing group expressions. Even
+        // though the witness keeps stable catalog identity, its structural
+        // obligations (group coverage, join shape, and merge laws) are stale
+        // until the optimizer proves them again over the settled logical tree.
+        self.group_dependencies.clear();
+        self.group_input_multiplicity = GroupInputMultiplicity::Arbitrary;
+        self.returned_types = self
+            .groups
+            .iter()
+            .map(|expr| expr.return_type())
+            .chain(self.aggregates.iter().map(|expr| expr.return_type()))
+            .chain(self.grouping_functions.iter().map(|_| LogicalType::BigInt))
+            .collect();
+    }
+
     /// Verify the correctness-bearing local expression domains of the optional
     /// post-aggregate reduction annotation, independently of child ownership.
     pub fn verify_post_reduction(&self) -> Result<()> {
