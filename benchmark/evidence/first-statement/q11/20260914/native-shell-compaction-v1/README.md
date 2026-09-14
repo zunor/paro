@@ -339,6 +339,18 @@ and 111 engine tests passed on the mixed worktree. This restores missing search
 coverage, so unchanged publication counts are NOT claimed against the defective
 version. Q11/fingerprint and clean performance acceptance remain unrun.
 
+KeyDomainTransfer audit found a correctness mismatch before removing fallback:
+the owned rule checks every local probe expression for an evaluation fence,
+while native code checked only Filter/Order. A production Projection containing
+an unused-by-key random() published one native output where the reference
+correctly rejected it. Native now uses the existing borrowed expression visitor
+for the complete local operator, also covering aggregate and join expressions;
+duplicated Filter/Order checks were removed. The deterministic/volatile
+production regression, existing frozen-selected key-transfer test and 111
+engine tests pass. The unsafe candidate removal is an intentional semantic
+correction, not an unchanged-work performance result. The rule still retains
+owned fallback pending the rest of its coverage audit. No Q11/SQL campaign ran.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
