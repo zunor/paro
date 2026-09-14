@@ -48,3 +48,20 @@ structural publication dependency footprint while avoiding fact invalidation
 on idempotent merges, restoring 2ed1a3e/2500/1436. The CTE cache correction
 changes registry invalidations 97→93 in these diagnostics; final choices,
 costs and all other fixed fields match control. No old statistics restored.
+
+## Fixed pilot conclusion and final verification plan
+
+The registered four-block probe did NOT lower compiler time: median 71.097ms
+versus control 69.410ms. C1 did not improve either. Do not extend that sample
+set or claim a speedup from the earlier diagnostic 107→92ms pair. The
+copy/merge/compare publication layer (2d35b05b + 54bbe33a) is withdrawn; its
+code and all negative evidence remain in history. The final code retains the
+direct settled-node handoff and the independently demonstrated CTE producer
+cache correctness repair, without a second fact merge layer.
+
+After withdrawal, run one separate two-block fresh normal verification plus
+its diagnostic cohort and the existing opt-in partition. This is a final-code
+verification pilot, NOT an extension/replacement of the failed four-block
+experiment and not evidence of formal non-inferiority. All three remaining
+optimizer failures stay explicit; in particular RF survivor-domain identity
+is still not a complete build-domain proof. No assertion is weakened to one RF.
