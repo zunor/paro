@@ -1,14 +1,11 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Native staging for the closed scan-prefix subset of late payload lowering.
+//! Native staging for selected late payload lowering paths.
 //!
-//! Row-id payload fetching remains on the authoritative owned rule.  This
-//! adapter handles Projection through unary and unique-source Join paths to
-//! Filter -> Get, whose
-//! semantic witness is an exact ASCII membership predicate.  It therefore
-//! avoids importing an owned tree without claiming that the full rule has
-//! been migrated.
+//! Projection prefix witnesses, ordinary selective row fetch, and detail TopN
+//! use native selected nodes. Unsupported shapes still reach the owned rule;
+//! a positive native result alone does not imply the entire rule is migrated.
 
 use paro_common::error::{self as paro_error, Result};
 #[cfg(test)]
@@ -22,23 +19,27 @@ use paro_planner::operator::{Join, LogicalOperator};
 use super::staging::{NativeChild, NativeShell};
 use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 
-/// Try the exact scan-prefix part of LatePayloadFetch on the native shell.
+/// Try the supported LatePayloadFetch contracts on the native shell.
 ///
 /// A native miss deliberately returns None so the owned implementation can
-/// still handle row-id lowering and shapes outside this contract.
+/// still handle aggregate TopN and shapes outside these contracts.
 pub(super) fn try_native_late_payload_prefix(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Option<NativeShell>> {
-    let Some((shell, mut layouts)) =
+    let Some((mut shell, mut layouts)) =
         NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
     else {
         return Ok(None);
     };
     if super::native_shell_contains_control_boundary(&shell) {
         return Ok(None);
+    }
+    if matches!(shell.root_operator(), LogicalOperator::TopN(_)) {
+        super::native_topn_payload::restore_root_output(&mut shell, binding, memo, state)?;
+        return super::native_topn_payload::rewrite(shell, state);
     }
 
     let root = shell.root;
