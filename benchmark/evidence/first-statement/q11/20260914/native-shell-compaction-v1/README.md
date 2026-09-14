@@ -199,6 +199,20 @@ limit suite (21 tests) and engine suite (111 tests) passed. No guard, budget,
 cost model or stopping policy was changed. This is mixed-worktree correctness
 evidence, not a new Q11 performance or fingerprint acceptance campaign.
 
+`45b76b73` adds native JoinElimination traversal through DISTINCT with explicit
+comparison-column requirements. A real Projection/Distinct/Projection binding
+first reached one owned instantiation; after the change it stages one native
+result with zero bridge calls. Ordinary DISTINCT requires all child columns,
+not only those requested by its parent. This contract was also corrected in
+the legacy reference so a native negative cannot fall back to the weaker
+requirement. DISTINCT ON retains its explicit target and order expressions.
+The reference/native matrix checks ordinary DISTINCT, left-only DISTINCT ON,
+and right-observing DISTINCT ON. Seven native, five legacy join-elimination,
+and 111 engine tests passed. This includes a conservative semantic contract
+correction, so no unchanged candidate-count or performance claim is made.
+Window/control/other unhandled descendants still prevent declaring the entire
+JoinElimination path native-only. No Q11 or full SQL regress was run here.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
