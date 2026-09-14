@@ -3137,10 +3137,9 @@ enum NativeDeferredOuterGroup {
 
 /// Apply the direct-child subset of AggregateDimensionDeferral without first
 /// materializing an OwnedLogicalPlan.  The legacy rule can rotate a complete
-/// multiway join region and inline projection spines; those shapes remain on
-/// its owned path.  This path is intentionally narrower: one plain aggregate,
-/// one plain inner equi-join, a direct Get dimension on the right, and no
-/// projection or control boundary.  For that shape the old recognizer is
+/// multiway join region; that shape remains on its owned path. This path handles
+/// one plain aggregate through transparent projections, one plain inner equi-join,
+/// and a direct Get or CTERef dimension on the right. The old recognizer is
 /// already a local rewrite, so the native result is authoritative and does not
 /// need a second semantic peer.
 fn try_native_dimension_deferral(
@@ -3149,8 +3148,8 @@ fn try_native_dimension_deferral(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Option<NativeShell>> {
-    // The general DimensionRegion matcher intentionally accepts projections,
-    // opaque relations, and associative join shapes. Most of those bindings
+    // The general DimensionRegion matcher also accepts opaque relations and
+    // associative join shapes. Most of those bindings
     // cannot enter this direct-child subset. Reject them from the immutable
     // operator shells before allocating a native node vector; the legacy path
     // will still perform its complete recognizer for every rejected shape.
@@ -3169,15 +3168,38 @@ fn try_native_dimension_deferral(
         .get(shell.root)
         .cloned()
         .ok_or_else(|| paro_error::internal("native dimension shell has no root layout"))?;
-    let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
+    let LogicalOperator::Aggregate(mut aggregate) = shell.root_operator().clone() else {
         return Ok(None);
     };
     if !dimension_deferral::root_eligible(&aggregate) {
         return Ok(None);
     }
-    let NativeChild::Node(join_index) = aggregate.child.clone() else {
-        return Ok(None);
+    let mut edge = &aggregate.child;
+    let mut projections = Vec::new();
+    let join_index = loop {
+        let NativeChild::Node(index) = edge else {
+            return Ok(None);
+        };
+        match &shell.nodes[*index].operator {
+            LogicalOperator::Projection(projection) => {
+                projections.push(projection);
+                edge = &projection.child;
+            }
+            _ => break *index,
+        }
     };
+    let Some(groups) = aggregate.groups.iter()
+        .map(|expression| dimension_deferral::inline_projections(expression, &projections))
+        .collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+    let Some(aggregates) = aggregate.aggregates.iter()
+        .map(|expression| dimension_deferral::inline_projections(expression, &projections))
+        .collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+    aggregate.groups = groups;
+    aggregate.aggregates = aggregates;
     let join_node = shell
         .nodes
         .get(join_index)
@@ -4495,11 +4517,28 @@ fn native_dimension_direct_shape(
     {
         return Ok(false);
     }
+    let mut child_binding = &children[0];
+    loop {
+        let PatternOperand::Expression { expression, children, .. } = child_binding else {
+            return Ok(false);
+        };
+        let logical = memo.logical_expr(*expression)
+            .ok_or_else(|| paro_error::internal("native dimension preflight lost its projection"))?;
+        let payload = state.payloads.logical.get(logical.payload.index())
+            .ok_or_else(|| paro_error::internal("native dimension preflight lost projection payload"))?;
+        if !matches!(payload.semantic_template.operator, LogicalOperator::Projection(_)) {
+            break;
+        }
+        if children.len() != 1 {
+            return Ok(false);
+        }
+        child_binding = &children[0];
+    }
     let PatternOperand::Expression {
         expression: child_expression,
         children: join_children,
         ..
-    } = &children[0]
+    } = child_binding
     else {
         return Ok(false);
     };

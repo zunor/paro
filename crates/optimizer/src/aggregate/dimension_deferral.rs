@@ -465,9 +465,9 @@ fn apply(
     }
 }
 
-fn inline_projection(
+fn inline_projection<Child>(
     expression: &Expression,
-    projection: &paro_planner::operator::Projection,
+    projection: &paro_planner::operator::Projection<Child>,
 ) -> Option<Expression> {
     let invalid = Cell::new(false);
     let result = expression.clone().replace_column_ref(&|column| {
@@ -492,9 +492,9 @@ fn expression_is_movable(expression: &Expression) -> bool {
     properties.can_share_evaluation() && !properties.is_reorder_fence()
 }
 
-fn inline_projections(
+pub(crate) fn inline_projections<Child>(
     expression: &Expression,
-    projections: &[&paro_planner::operator::Projection],
+    projections: &[&paro_planner::operator::Projection<Child>],
 ) -> Option<Expression> {
     projections
         .iter()

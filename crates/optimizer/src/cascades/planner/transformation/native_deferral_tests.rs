@@ -14,6 +14,15 @@ fn col(table: usize, ordinal: usize, ty: LogicalType) -> Expression {
     Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(table, ordinal), ty).into())
 }
 
+fn assert_column(expressions: &[Expression], table: usize, ordinal: usize) {
+    assert_eq!(expressions.len(), 1);
+    let Expression::ColumnRef(column) = &expressions[0] else {
+        panic!("expected exact input column")
+    };
+    assert_eq!(column.depth, 0);
+    assert_eq!(column.binding, ColumnBinding::new(table, ordinal));
+}
+
 fn candidate(reference: bool) -> OwnedLogicalPlan {
     let dimension = if reference {
         LogicalOperator::CTERef(CTERef::new(
@@ -64,6 +73,113 @@ fn candidate(reference: bool) -> OwnedLogicalPlan {
         )],
         vec![],
     ))))
+}
+
+#[test]
+fn production_deferral_inlines_nonidentity_projection_spines() {
+    for depth in [1, 2] {
+        let make_plan = || {
+            let mut plan = candidate(false);
+            let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                unreachable!()
+            };
+            for level in 0..depth {
+                let (label, amount) = if level == 0 {
+                    (
+                        col(1, 1, LogicalType::Varchar),
+                        col(0, 1, LogicalType::Double),
+                    )
+                } else {
+                    (
+                        col(20 + level - 1, 1, LogicalType::Varchar),
+                        col(20 + level - 1, 0, LogicalType::Double),
+                    )
+                };
+                let child = std::mem::replace(&mut aggregate.child, Box::new(candidate(false)));
+                aggregate.child = Box::new(OwnedLogicalPlan::synthetic(
+                    LogicalOperator::Projection(paro_planner::operator::Projection::new(
+                        20 + level,
+                        *child,
+                        vec![amount, label],
+                    )),
+                ));
+            }
+            aggregate.groups = vec![col(19 + depth, 1, LogicalType::Varchar)];
+            let Expression::Aggregate(sum) = &mut aggregate.aggregates[0] else {
+                unreachable!()
+            };
+            sum.children = vec![col(19 + depth, 0, LogicalType::Double)];
+            plan
+        };
+        let bind = BindContext::new();
+        for _ in 0..52 {
+            bind.generate_table_index();
+        }
+        let (expected, changed) = dimension_deferral::optimize_plan(make_plan(), &bind).unwrap();
+        assert!(changed);
+        let mut input =
+            MemoBuilder::build(make_plan(), BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.clone();
+        state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
+        let root = input.root;
+        let expression = input.memo.group(root).unwrap().logical_exprs()[0];
+        let binding = matching::scoped_pattern_bindings(
+            PlannerTransformation::AggregateDimensionDeferral,
+            root,
+            expression,
+            &input.memo,
+            &state.read().unwrap(),
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .bindings
+        .first()
+        .cloned()
+        .unwrap();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::AggregateDimensionDeferral,
+            planner_state: state.clone(),
+        };
+        let before = semantic_plan::owned_binding_instantiation_count();
+        let arena = state.read().unwrap().staging_arena.len();
+        let mut context = TransformContext::new(&mut input.memo, root);
+        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            semantic_plan::owned_binding_instantiation_count(),
+            before,
+            "depth={depth}"
+        );
+        let state = state.read().unwrap();
+        assert_eq!(state.staging_arena.len(), arena);
+        let LogicalOperator::Aggregate(actual) = &state.payloads.logical
+            [outputs[0].payload.index()]
+        .semantic_template
+        .operator
+        else {
+            unreachable!()
+        };
+        assert_eq!(actual.returned_types, expected.types());
+        assert_column(&actual.groups, 1, 1);
+        let join_group = outputs[0].key.children[0];
+        let join_expr = context.memo().group(join_group).unwrap().logical_exprs()[0];
+        let partial_group = context.memo().logical_expr(join_expr).unwrap().key.children[1];
+        let partial_expr = context.memo().group(partial_group).unwrap().logical_exprs()[0];
+        let payload = context.memo().logical_expr(partial_expr).unwrap().payload;
+        let LogicalOperator::Aggregate(partial) = &state.payloads.logical[payload.index()]
+            .semantic_template
+            .operator
+        else {
+            unreachable!()
+        };
+        let Expression::Aggregate(sum) = &partial.aggregates[0] else {
+            unreachable!()
+        };
+        assert_column(&sum.children, 0, 1);
+        assert_column(&partial.groups, 0, 0);
+    }
 }
 
 #[test]
