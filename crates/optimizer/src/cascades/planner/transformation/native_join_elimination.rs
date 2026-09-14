@@ -274,6 +274,15 @@ fn required_children(
                 filter_required_bindings(required, &right_bindings),
             ])
         }
+        LogicalOperator::SetOperation(setop) => {
+            // A set operator owns a new output namespace. Its branches must
+            // retain their complete positional contracts (also for DISTINCT,
+            // INTERSECT and EXCEPT); parent bindings do not name branch columns.
+            Some(vec![
+                child_bindings(&setop.left),
+                child_bindings(&setop.right),
+            ])
+        }
         _ => {
             let mut children = Vec::new();
             operator.visit_child_links(&mut |child| children.push(child));
@@ -667,6 +676,49 @@ mod tests {
     }
 
     #[test]
+    fn set_operations_rewrite_both_selected_branches_with_independent_layouts() {
+        use paro_planner::operator::{SetOpType, SetOperation};
+        for kind in [SetOpType::Union, SetOpType::Intersect, SetOpType::Except] {
+            for all in [false, true] {
+                let make = || {
+                    let right = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(
+                        Projection::new(20, candidate(true, false), vec![column(10, 0)]),
+                    ));
+                    OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::new(
+                        40,
+                        candidate(true, false),
+                        right,
+                        kind,
+                        all,
+                        vec![LogicalType::Integer],
+                    )))
+                };
+                let (reference, changed) = crate::join::elimination::JoinElimination::new()
+                    .optimize_plan_with_change(make());
+                assert!(changed);
+                let native =
+                    rewrite_shell(NativeShell::from_owned(make(), &HashMap::new()).unwrap())
+                        .unwrap()
+                        .expect("both selected branches should be covered natively");
+                assert_eq!(native.root_layout().unwrap(), reference.output_layout());
+                assert!(!native
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node.operator, LogicalOperator::Join(_))));
+                let LogicalOperator::SetOperation(setop) = native.root_operator() else {
+                    panic!("set operation disappeared")
+                };
+                assert_eq!((setop.setop_type, setop.setop_all), (kind, all));
+                let layouts = native.layouts().unwrap();
+                assert!(output_bindings_for_child(&layouts, &setop.left)
+                    .contains(&ColumnBinding::new(10, 0)));
+                assert!(output_bindings_for_child(&layouts, &setop.right)
+                    .contains(&ColumnBinding::new(20, 0)));
+            }
+        }
+    }
+
+    #[test]
     fn native_shell_eliminates_unobserved_unique_outer_side() {
         let source = candidate(true, false);
         let expected_layout = source.output_layout();
@@ -786,20 +838,36 @@ mod tests {
         use paro_context::TestStatementContextBuilder;
         use paro_planner::binder::context::BindContext;
 
-        for wrapper in 0..3 {
+        for wrapper in 0..4 {
             let wrapped = wrapper != 0;
             let plan = if wrapped {
                 let child = if wrapper == 1 {
                     OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(
                         paro_planner::operator::Distinct::new(memo_candidate()),
                     ))
-                } else {
+                } else if wrapper == 2 {
                     window(memo_candidate(), column(10, 0))
+                } else {
+                    OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(
+                        paro_planner::operator::SetOperation::union(
+                            40,
+                            memo_candidate(),
+                            OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                                Get::new_without_table(
+                                    41,
+                                    vec!["key".into()],
+                                    vec![LogicalType::Integer],
+                                ),
+                            ))),
+                            true,
+                            vec![LogicalType::Integer],
+                        ),
+                    ))
                 };
                 OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
                     20,
                     child,
-                    vec![column(10, 0)],
+                    vec![column(if wrapper == 3 { 40 } else { 10 }, 0)],
                 )))
             } else {
                 memo_candidate()
@@ -876,7 +944,7 @@ mod tests {
             assert_eq!(
                 super::super::semantic_plan::owned_binding_instantiation_count(),
                 bridges,
-                "selected DISTINCT/Window ancestor must not force owned construction"
+                "selected ancestor must not force owned construction"
             );
         }
     }
