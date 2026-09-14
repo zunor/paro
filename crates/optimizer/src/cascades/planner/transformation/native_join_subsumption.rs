@@ -184,6 +184,23 @@ fn substitute_detail_join(
     let NativeChild::Node(index) = current.clone() else {
         return Ok(None);
     };
+    if let LogicalOperator::Filter(filter) = &nodes[index].operator {
+        // The owned prelude removes tautologies before matching the join
+        // spine. Only erase a filter proven empty by the same normalizer,
+        // with no output projection or evaluation fence to preserve.
+        if filter.projection_map.is_all()
+            && !filter
+                .expressions
+                .iter()
+                .any(|expression| expression.evaluation_properties().is_reorder_fence())
+            && super::FilterPushdown::normalize_predicates(filter.expressions.clone())
+                .is_some_and(|predicates| predicates.is_empty())
+        {
+            let child = filter.child.clone();
+            return substitute_detail_join(nodes, child, outer_sum);
+        }
+        return Ok(None);
+    }
     let LogicalOperator::Join(Join::Comparison(join)) = nodes[index].operator.clone() else {
         return Ok(None);
     };
@@ -1281,40 +1298,136 @@ mod tests {
     }
 
     #[test]
+    fn native_subsumption_does_not_erase_false_null_or_projecting_filters() {
+        use paro_common::runtime_value::Value;
+        for (value, projected, expected) in [
+            (Value::Boolean(true), false, true),
+            (Value::Boolean(false), false, false),
+            (Value::Null(LogicalType::Boolean), false, false),
+            (Value::Boolean(true), true, false),
+        ] {
+            let mut plan = q18_shape(detail_table(79_004));
+            let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                unreachable!()
+            };
+            let child = std::mem::replace(
+                &mut *aggregate.child,
+                OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+            );
+            let mut filter = paro_planner::operator::Filter::new(
+                child,
+                vec![Expression::Constant(
+                    paro_planner::expression::ConstantExpression::new(value, LogicalType::Boolean)
+                        .into(),
+                )],
+            );
+            if projected {
+                filter.projection_map = ProjectionMap::none();
+            }
+            *aggregate.child = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(filter));
+            let reference = expected.then(|| {
+                let normalized = super::super::FilterPushdown::new().rewrite_plan(
+                    paro_planner::binder::deep_copy::duplicate_plan_preserving_indices(
+                        &plan,
+                        BindContext::new().shared(),
+                    ),
+                );
+                let (reference, changed) =
+                    crate::aggregate::join_subsumption::optimize_root_with_change(normalized);
+                assert!(changed);
+                reference
+            });
+            let shell = NativeShell::from_owned(plan, &HashMap::new()).unwrap();
+            let rewritten = try_native_shell(shell).unwrap();
+            assert_eq!(rewritten.is_some(), expected);
+            if let (Some(rewritten), Some(reference)) = (rewritten, reference) {
+                assert_eq!(rewritten.root_layout().unwrap(), reference.output_layout());
+                let LogicalOperator::Aggregate(actual) = rewritten.root_operator() else {
+                    panic!("native result must retain the outer aggregate")
+                };
+                let LogicalOperator::Aggregate(expected) = &reference.operator else {
+                    panic!("reference result must retain the outer aggregate")
+                };
+                assert_eq!(actual.groups.len(), expected.groups.len());
+                assert!(actual
+                    .groups
+                    .iter()
+                    .zip(&expected.groups)
+                    .all(|(a, b)| a.equals(b)));
+                assert_eq!(actual.aggregates.len(), expected.aggregates.len());
+                assert!(actual
+                    .aggregates
+                    .iter()
+                    .zip(&expected.aggregates)
+                    .all(|(a, b)| a.equals(b)));
+            }
+        }
+    }
+
+    #[test]
     fn production_apply_stages_subsumption_without_owned_settlement() {
-        let plan = q18_shape(detail_table(79_003));
-        let mut input =
-            MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
-        let state = input.planner_state.clone();
-        state.write().unwrap().session =
-            Some(paro_context::TestStatementContextBuilder::minimal().build());
-        let binding = {
-            let state = state.read().unwrap();
-            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
-            let binding = matching::scoped_pattern_bindings(
-                PlannerTransformation::AggregateJoinSubsumption,
-                input.root,
-                expression,
-                &input.memo,
-                &state,
-                None,
-                BudgetDimension::RuleWorkPerGroup,
-            )
-            .unwrap()
-            .bindings
-            .first()
-            .cloned()
-            .expect("the production pattern should match");
-            binding
-        };
-        let arena_before = state.read().unwrap().staging_arena.len();
-        let rule = PlannerTransformationRule {
-            transformation: PlannerTransformation::AggregateJoinSubsumption,
-            planner_state: state.clone(),
-        };
-        let mut context = TransformContext::new(&mut input.memo, input.root);
-        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(state.read().unwrap().staging_arena.len(), arena_before);
+        for trivial_filter in [false, true] {
+            let mut plan = q18_shape(detail_table(79_003));
+            if trivial_filter {
+                let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                    unreachable!()
+                };
+                let child = std::mem::replace(
+                    &mut *aggregate.child,
+                    OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+                );
+                *aggregate.child = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
+                    paro_planner::operator::Filter::new(
+                        child,
+                        vec![Expression::Constant(
+                            paro_planner::expression::ConstantExpression::new(
+                                paro_common::runtime_value::Value::Boolean(true),
+                                LogicalType::Boolean,
+                            )
+                            .into(),
+                        )],
+                    ),
+                ));
+            }
+            let mut input =
+                MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+            let state = input.planner_state.clone();
+            state.write().unwrap().session =
+                Some(paro_context::TestStatementContextBuilder::minimal().build());
+            let binding = {
+                let state = state.read().unwrap();
+                let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+                let binding = matching::scoped_pattern_bindings(
+                    PlannerTransformation::AggregateJoinSubsumption,
+                    input.root,
+                    expression,
+                    &input.memo,
+                    &state,
+                    None,
+                    BudgetDimension::RuleWorkPerGroup,
+                )
+                .unwrap()
+                .bindings
+                .first()
+                .cloned()
+                .expect("the production pattern should match");
+                binding
+            };
+            let arena_before = state.read().unwrap().staging_arena.len();
+            let rule = PlannerTransformationRule {
+                transformation: PlannerTransformation::AggregateJoinSubsumption,
+                planner_state: state.clone(),
+            };
+            let mut context = TransformContext::new(&mut input.memo, input.root);
+            let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
+            let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(
+                super::super::semantic_plan::owned_binding_instantiation_count(),
+                bridges,
+                "trivial_filter={trivial_filter}"
+            );
+            assert_eq!(state.read().unwrap().staging_arena.len(), arena_before);
+        }
     }
 }
