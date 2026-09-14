@@ -827,3 +827,31 @@ fingerprint gate or fresh Q11 campaign was run. These checks use the mixed
 worktree and are not clean performance evidence. User changes are excluded from
 the implementation commit. End-to-end acceptance and overall migration remain
 incomplete.
+
+## Shared unary prefix contract: Window, TopN and EmptyResult
+
+LatePayload native binding transport now covers the remaining unary operators
+supported by the existing prefix witness: Window, TopN and EmptyResult. Owned
+proof/construction and native construction use ownership-generic unary child and
+projection-map accessors. Projection and Aggregate are not admitted by this
+contract. Join prefix transport and row-id fetching remain owned work.
+
+The real Memo/matcher/apply_binding test now exercises eight fixtures, including
+the three new unary wrappers; all pure-prefix cases produce one output without
+owned instantiation. Mixed stored payload still takes the peer path. This is a
+selected-grammar transport check, not independent execution or search closure.
+
+A direct reference counterexample exposed a TopN contract defect: its explicit
+projection map hid the newly appended prefix that the root output referenced.
+Temporarily restoring HEAD's original append_prefix_through_operator while
+keeping the counterexample reproduced the missing-output assertion failure.
+The restored new implementation updates TopN's map through the shared accessor.
+Normal Memo ingress may canonicalize this map, so this counterexample is not
+claimed as a measured Q11 failure or performance bottleneck.
+
+All 19 late_payload-filtered tests pass. Full optimizer: 1283 pass / the same
+five failures (grant declarations, statistics merge fingerprint, nested source
+lane); optimizer/compiler cargo check passes. No bless or unrelated failure fix.
+No SQL regress, independent bag execution, clean fixed-work/fingerprint campaign
+or fresh Q11 measurement in this slice. Mixed-worktree tests do not establish
+performance. Overall bridge migration and its end-to-end gates remain open.
