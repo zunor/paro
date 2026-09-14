@@ -300,7 +300,7 @@ pub(crate) fn build_groups_chunk_for_set(
     group_count: usize,
 ) -> Result<Chunk> {
     if grouping_set.len() == group_count {
-        return Ok(all_groups.clone());
+        return Ok(all_groups.clone_referencing_vectors());
     }
     let mut present = vec![false; group_count];
     for &group_idx in grouping_set {
@@ -311,7 +311,7 @@ pub(crate) fn build_groups_chunk_for_set(
         }
         present[group_idx] = true;
     }
-    let mut groups = all_groups.clone();
+    let mut groups = all_groups.clone_referencing_vectors();
     for (group_idx, is_present) in present.into_iter().enumerate() {
         if is_present {
             continue;

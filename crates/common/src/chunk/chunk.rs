@@ -20,20 +20,10 @@ pub(super) struct ChunkResetState {
     pub(super) columns: Vec<VectorResetState>,
 }
 
-impl Clone for ChunkResetState {
-    fn clone(&self) -> Self {
-        Self {
-            allocator: self.allocator.clone(),
-            columns: self.columns.clone(),
-        }
-    }
-}
-
 /// A collection of vectors representing a batch of rows.
 ///
 /// Chunk is the intermediate representation used by the execution engine.
 /// It holds a set of vectors that all have the same length (cardinality).
-#[derive(Clone)]
 pub struct Chunk {
     /// Column vectors.
     /// Using Arc<Vector> for handle sharing (Zero-copy)
@@ -50,6 +40,84 @@ pub struct Chunk {
     pub(super) allocator: Arc<dyn Allocator>,
 }
 
+/// A read-only batch view.
+///
+/// The view owns no vector buffers or reset workspace.  It borrows the
+/// immutable column handles from a [`Chunk`] for the duration of a consumer
+/// operation; any selection/gather state remains in the referenced vectors.
+/// Mutable operators should use their task-local [`Chunk`] workspace instead
+/// of cloning the input batch.
+#[derive(Clone, Copy)]
+pub struct ChunkView<'a> {
+    columns: &'a [Arc<Vector>],
+    count: usize,
+    capacity: usize,
+}
+
+impl<'a> ChunkView<'a> {
+    /// Number of rows visible through this view.
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.count
+    }
+
+    /// Alias for [`Self::size`].
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether this view has no rows.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Capacity of the source batch.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Number of visible columns.
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Get a read-only column handle.
+    #[inline]
+    pub fn column(&self, idx: usize) -> Option<&Arc<Vector>> {
+        self.columns.get(idx)
+    }
+
+    /// Borrow all column handles without allocating a new vector.
+    #[inline]
+    pub fn columns(&self) -> &'a [Arc<Vector>] {
+        self.columns
+    }
+}
+
+impl Clone for Chunk {
+    /// Clone only the read-only batch representation.
+    ///
+    /// Reset state is mutable task workspace, not part of an input view.  The
+    /// old derived implementation cloned [`VectorResetState`] and allocated a
+    /// complete spare vector for every column.  Callers which need reusable
+    /// output state must retain the original chunk or construct an explicit
+    /// workspace with [`Chunk::try_initialize`].
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.iter().map(Arc::clone).collect(),
+            count: self.count,
+            capacity: self.capacity,
+            initial_capacity: self.initial_capacity,
+            reset_state: None,
+            allocator: self.allocator.clone(),
+        }
+    }
+}
+
 impl std::fmt::Debug for Chunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Chunk")
@@ -64,6 +132,17 @@ impl std::fmt::Debug for Chunk {
 }
 
 impl Chunk {
+    /// Borrow this batch as a read-only view without allocating column handles
+    /// or reset workspace.
+    #[inline]
+    pub fn view(&self) -> ChunkView<'_> {
+        ChunkView {
+            columns: &self.data,
+            count: self.count,
+            capacity: self.capacity,
+        }
+    }
+
     fn try_build_reset_state(
         types: &[LogicalType],
         capacity: usize,

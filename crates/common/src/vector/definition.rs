@@ -130,17 +130,6 @@ impl std::fmt::Debug for VectorResetState {
     }
 }
 
-impl Clone for VectorResetState {
-    fn clone(&self) -> Self {
-        Self::try_new(
-            self.logical_type.clone(),
-            self.initial_capacity,
-            self.allocator.clone(),
-        )
-        .expect("vector reset state clone allocation failed")
-    }
-}
-
 impl Vector {
     /// Create a flat vector with specified capacity and allocator.
     pub fn try_new(

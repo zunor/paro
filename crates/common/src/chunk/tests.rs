@@ -123,6 +123,32 @@ fn test_initialize() {
 }
 
 #[test]
+fn test_clone_is_a_read_only_batch_view_without_reset_workspace() {
+    let chunk = Chunk::try_initialize(
+        &[LogicalType::Integer, LogicalType::Varchar],
+        8,
+        Arc::new(DefaultAllocator::new()),
+    )
+    .unwrap();
+    let source_allocations = chunk.get_allocation_size();
+    let clone = chunk.clone();
+    let view = chunk.view();
+
+    assert!(clone.reset_state.is_none());
+    assert_eq!(clone.get_allocation_size(), source_allocations);
+    assert!(Arc::ptr_eq(
+        chunk.column(0).unwrap(),
+        clone.column(0).unwrap()
+    ));
+    assert_eq!(view.size(), 0);
+    assert_eq!(view.column_count(), 2);
+    assert!(Arc::ptr_eq(
+        view.column(1).unwrap(),
+        chunk.column(1).unwrap()
+    ));
+}
+
+#[test]
 fn test_init_empty() {
     let types = vec![LogicalType::BigInt, LogicalType::Boolean];
     let chunk = crate::test_utils::test_empty_chunk(&types);
