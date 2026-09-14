@@ -77,8 +77,18 @@ fn statistics_read_cache_revalidates_registry_rollback_reinsert_and_merge() {
         .unwrap();
     assert!(memo.cte_registry_revision > published_revision);
     assert_eq!(check(&memo), published);
+    let before_merge_revision = memo.cte_registry_revision;
     memo.merge_groups(canonical, producer).unwrap();
-    assert_ne!(check(&memo), published);
+    assert!(memo.cte_registry_revision > before_merge_revision);
+    assert_eq!(memo.canonical_group(producer), canonical);
+    // Canonicalization changes the registry identity, not the value of two
+    // identical producer fact snapshots. The reader must revalidate without
+    // inventing a different statistics value fingerprint.
+    assert_eq!(check(&memo), published);
+    assert_eq!(
+        *memo.group(reader).unwrap().statistics_read_fingerprint.lock().unwrap(),
+        Some((memo.cte_registry_revision, published))
+    );
     let before_local_change = check(&memo);
     memo.group_mut(reader).unwrap().cardinality.range = Some(CardinalityEnvelope {
         lower: 1,
@@ -87,6 +97,57 @@ fn statistics_read_cache_revalidates_registry_rollback_reinsert_and_merge() {
         upper: 3,
     });
     assert_ne!(check(&memo), before_local_change);
+}
+
+#[test]
+fn statistics_read_cache_revalidates_producer_fact_update_without_registry_change() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let producer = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::new(Fingerprint(17), CardinalityRecipeKind::Statistics, 1, 4, 9),
+    );
+    let mut properties = LogicalProperties::default();
+    properties.cte_references.insert(CteReferenceDomain {
+        cte_index: 7,
+        columns: BTreeMap::from([(CteColumnId(0), ColumnId(2))]),
+    });
+    let reader = memo.create_group(schema(2), properties, GroupCardinality::default());
+    memo.register_cte_producer(7, producer, BTreeMap::from([(CteColumnId(0), ColumnId(1))]))
+        .unwrap();
+    let registry_revision = memo.cte_registry_revision;
+    let producer_registry = memo.cte_producers.clone();
+    let reader_snapshot = memo.group(reader).unwrap().statistics_snapshot_fingerprint();
+    let producer_snapshot = memo.group(producer).unwrap().statistics_snapshot_fingerprint();
+    let before = memo.local_statistics_fingerprint(reader);
+    assert_eq!(
+        before,
+        memo.compute_local_statistics_fingerprint(memo.group(reader).unwrap())
+    );
+    assert_eq!(memo.local_statistics_fingerprint(reader), before);
+
+    // Warm the dependent reader, then change only its existing producer's
+    // facts. Do not mutate the reader or re-register the producer: either
+    // would mask a cache that tracks registry structure but not fact changes.
+    memo.group_mut(producer).unwrap().cardinality.range = Some(CardinalityEnvelope {
+        lower: 1,
+        expected_lower: 2,
+        expected_upper: 2,
+        upper: 3,
+    });
+    assert_eq!(memo.cte_registry_revision, registry_revision);
+    assert_eq!(memo.cte_producers, producer_registry);
+    assert_eq!(memo.canonical_group(producer), producer);
+    assert_eq!(memo.group(reader).unwrap().statistics_snapshot_fingerprint(), reader_snapshot);
+    assert_ne!(memo.group(producer).unwrap().statistics_snapshot_fingerprint(), producer_snapshot);
+    let uncached = memo.compute_local_statistics_fingerprint(memo.group(reader).unwrap());
+    assert_ne!(uncached, before, "producer facts are an actual reader dependency");
+    assert_eq!(
+        memo.local_statistics_fingerprint(reader),
+        uncached,
+        "unchanged registry structure must not hide changed producer facts"
+    );
+    assert_eq!(memo.local_statistics_fingerprint(reader), uncached);
 }
 
 #[test]
