@@ -617,11 +617,20 @@ mod tests {
             "a two-output binding must not be rolled back by a one-output reservation: {:?}",
             result.rule_insertions
         );
-        assert!(
-            result.search_summary.is_complete(),
-            "{:?}",
-            result.search_summary
-        );
+        // The expected class must close its declared rule domain; production
+        // deliberately defers optional search in every other class. Neither
+        // a budget failure nor a missing publication may hide in that list.
+        use crate::cascades::budget::{SearchIncompleteReason, SearchObligation};
+        let deferred = grants.iter()
+            .filter(|class| class.id.index() != expected.index)
+            .map(|class| SearchObligation {
+                group: None,
+                reason: SearchIncompleteReason::OptionalGrantDeferred(class.id),
+                witness: Fingerprint(u128::from(class.id.0)),
+            }).collect::<BTreeSet<_>>();
+        assert!(result.search_summary.exhaustion_events.is_empty());
+        assert_eq!(result.search_summary.obligations.len(), deferred.len());
+        assert_eq!(result.search_summary.obligations.iter().cloned().collect::<BTreeSet<_>>(), deferred);
     }
 
     fn bind_requirement(
