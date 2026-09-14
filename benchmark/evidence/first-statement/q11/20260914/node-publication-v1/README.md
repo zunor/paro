@@ -207,5 +207,17 @@ and its expected retention count remains two. Full SQL regress was not run;
 historical164/20 is not reported as a current result. Search remains
 QualityPolicySatisfied + SearchIncomplete, not ProofComplete.
 
-Recompute with `python analyze.py`; archive hashes are in raw/manifest.json.
+Recompute with the benchmark environment's Python (from repository root:
+`benchmark/.venv/bin/python benchmark/evidence/first-statement/q11/20260914/node-publication-v1/analyze.py`);
+archive hashes are in raw/manifest.json.
 The main user's mixed staged/unstaged edits are excluded from clean evidence.
+
+### Main-worktree integration check (not performance evidence)
+
+After selective integration at836a340c, with the user's original mixed edits
+still present, `cargo test -p paro-optimizer --lib` reports **1310 passed / the
+same3 failed**. The staged patch is byte-for-byte preserved; three-way merged
+tracked contents were checked against a separate integration index. Raw log:
+`paro-node-publication-main-integration-optimizer.log.gz`.
+An initial invocation used the wrong package name `optimizer` and did not run
+tests; its error log is retained separately. No benchmark used this dirty tree.

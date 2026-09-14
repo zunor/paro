@@ -306,6 +306,18 @@
     "gzip_sha256": "8a361e15596c1d42b4559628a6a68b7b22745ed833916d55b6ace80e800ce9bc"
   },
   {
+    "file": "paro-node-publication-main-integration-optimizer.log.gz",
+    "raw_bytes": 134459,
+    "raw_sha256": "7dbfd60e4f608511db3b8a0aeda5055726488892f17174268e08c1b6264b9c68",
+    "gzip_sha256": "be277a9f6efeb713e749352865e37ca7bc12d2dde409436321bc82bc2dcbefed"
+  },
+  {
+    "file": "paro-node-publication-main-integration-tests.log.gz",
+    "raw_bytes": 71,
+    "raw_sha256": "75bc550cfa063be44407cb90a46821082af1ef628ae1b17d097c0ff952e12731",
+    "gzip_sha256": "401b3817cc5d19d0ca322e848d30ff3bbf242d95c4a64c19dc3a22cb54b382b4"
+  },
+  {
     "file": "paro-node-publication-merge-off.json.gz",
     "raw_bytes": 17410749,
     "raw_sha256": "4ce7d50418e9eb705c8d2b1b8a25a1bab069e7bf4ad4d32a3c0f284aaccf5ad3",
@@ -400,6 +412,12 @@
     "raw_bytes": 2105,
     "raw_sha256": "e9d1a2eff7e0ec434c8b0ffba9212ccfb78d8b292798d8610ea290c36cb7b115",
     "gzip_sha256": "0b41f491028e5e968cdbc37b41ed3e3ddd1d8941722525fdf2480761aa3e272e"
+  },
+  {
+    "file": "paro-node-publication-recompute-check.log.gz",
+    "raw_bytes": 0,
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gzip_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
   },
   {
     "file": "paro-node-publication-retained-off0.json.gz",
