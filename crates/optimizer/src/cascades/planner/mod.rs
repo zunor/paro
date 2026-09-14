@@ -33,8 +33,6 @@ use crate::aggregate::{
 use crate::context::SharedColumnStatistics;
 use crate::filter::pushdown::FilterPushdown;
 use crate::join::elimination::JoinElimination;
-use crate::limit::pushdown::LimitPushdown;
-use crate::limit::topn::TopNOptimizer;
 use crate::statistics::gathering::StatisticsGathering;
 use crate::statistics::propagator::StatisticsPropagator;
 use crate::subquery::scalar_aggregate_window;

@@ -21,6 +21,8 @@ mod native_scalar_aggregate_window;
 mod native_join_preaggregation;
 mod native_join_subsumption;
 mod native_non_null_inputs;
+#[cfg(test)]
+mod native_limit_tests;
 pub(super) mod settlement;
 mod staging;
 
@@ -838,11 +840,13 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             Vec::new()
         };
-        // NonNullAggregate's selected grammar is closed: one Aggregate over
-        // Filter/Order/TopN/Limit ending at Get. The native producer covers
-        // the entire binding, including a missing no-NULL proof. A negative
-        // result is not a request to rebuild the same binding as owned IR.
-        if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput)
+        // These selected grammars are closed. NonNullAggregate reaches Get
+        // through unary inputs; LimitProjection ends at a hole; TopN follows
+        // projections to Order and cannot contain another optimizable LIMIT.
+        // Native rejection covers the complete selected rewrite, not a
+        // request to rebuild that binding as owned IR.
+        if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput
+            | PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown)
             && direct_native.is_empty()
         {
             return Ok(Box::new([]));
@@ -5297,18 +5301,8 @@ fn rewrite_planner_expression(
             }
             plan
         }
-        PlannerTransformation::TopNIntroduction => {
-            if !TopNOptimizer::can_optimize(&plan.operator) {
-                return Ok(None);
-            }
-            TopNOptimizer::new().optimize_plan(plan)
-        }
-        PlannerTransformation::LimitPushdown => {
-            let (plan, changed) = LimitPushdown::new().optimize_plan_with_change(plan);
-            if !changed {
-                return Ok(None);
-            }
-            plan
+        PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown => {
+            return Err(paro_error::internal("limit rewrites are native-only Memo transformations"));
         }
         PlannerTransformation::LatePayloadFetch => {
             let (plan, prefix_changed) = late_payload::rewrite_matched_prefix_node(plan)?;
