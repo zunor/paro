@@ -27,6 +27,8 @@ mod native_limit_tests;
 mod native_mark_tests;
 #[cfg(test)]
 mod native_key_domain_tests;
+#[cfg(test)]
+mod native_materialization_tests;
 pub(super) mod settlement;
 mod staging;
 
@@ -2463,10 +2465,10 @@ fn native_materialize_candidate(
 
 /// Native subset of AggregateInputMaterialization.  The complete owned rule
 /// supports arbitrary join spines; this slice is authoritative only when the
-/// matched root is a plain aggregate over one plain inner join and every
-/// eligible input belongs to one of its two child domains.  If any eligible
-/// candidate falls outside that proof, returning `None` keeps the complete
-/// legacy implementation available instead of silently dropping an output.
+/// matched root is a plain aggregate over one plain inner join. Each input
+/// has its own placement/liveness proof; rejected inputs stay at the original
+/// evaluation site, exactly as in the semantic producer. Richer join spines
+/// and unsupported roots still require the remaining migration.
 fn try_native_input_materialization(
     binding: &PatternOperand,
     memo: &Memo,
@@ -2513,46 +2515,6 @@ fn try_native_input_materialization(
     {
         return Ok(None);
     }
-    let left_layout = native_shell_child_layout(&join.left, &layouts)?;
-    let right_layout = native_shell_child_layout(&join.right, &layouts)?;
-    let mut candidates = Vec::new();
-    for expression in &aggregate.aggregates {
-        let Expression::Aggregate(aggregate_expression) = expression else {
-            continue;
-        };
-        candidates.extend(
-            aggregate_expression
-                .children
-                .iter()
-                .filter(|candidate| {
-                    input_materialization::is_materializable_candidate(
-                        candidate,
-                        &aggregate.groups,
-                        &aggregate.aggregates,
-                    )
-                })
-                .cloned(),
-        );
-    }
-    let mut unique_candidates = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        if !unique_candidates
-            .iter()
-            .any(|seen: &Expression| seen.equals(&candidate))
-        {
-            unique_candidates.push(candidate);
-        }
-    }
-    let candidates = unique_candidates;
-    if candidates.is_empty()
-        || candidates.iter().any(|candidate| {
-            native_materialization_side(&join, candidate, &left_layout, &right_layout)
-                .is_none()
-        })
-    {
-        return Ok(None);
-    }
-
     let mut nodes = shell.nodes.into_vec();
     let mut rejected = Vec::<Expression>::new();
     let mut changed = false;
@@ -2608,7 +2570,12 @@ fn try_native_input_materialization(
             rejected.push(candidate);
         }
     }
-    if !changed || !rejected.is_empty() {
+    // Like the semantic producer, keep successful inputs while leaving
+    // rejected expressions at their original evaluation site. A failure to
+    // place one input does not invalidate another input's placement proof.
+    // Successful remapping clears `rejected` above so dependent candidates
+    // are reconsidered under their new bindings.
+    if !changed {
         return Ok(None);
     }
     // The incremental layout vector is the authoritative layout for the
