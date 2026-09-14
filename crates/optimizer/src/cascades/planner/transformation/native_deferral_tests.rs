@@ -25,20 +25,26 @@ fn assert_column(expressions: &[Expression], table: usize, ordinal: usize) {
 
 #[test]
 fn production_deferral_semantic_rejections_do_not_export_owned_ir() {
-    for distinct in [false, true] {
+    for case in [0, 1, 2] {
         let make_plan = || {
             let mut plan = candidate(false);
             let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
                 unreachable!()
             };
-            if distinct {
+            if case == 1 {
                 let Expression::Aggregate(sum) = &mut aggregate.aggregates[0] else {
                     unreachable!()
                 };
                 sum.aggr_type = paro_planner::expression::AggregateType::Distinct;
-            } else {
+            } else if case == 0 {
                 aggregate.groups = vec![col(0, 0, LogicalType::Integer)];
                 aggregate.recompute_returned_types();
+            } else {
+                let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator
+                else {
+                    unreachable!()
+                };
+                join.join_type = JoinType::Left;
             }
             plan
         };
@@ -80,7 +86,7 @@ fn production_deferral_semantic_rejections_do_not_export_owned_ir() {
         assert_eq!(
             semantic_plan::owned_binding_instantiation_count(),
             bridges,
-            "distinct={distinct}"
+            "case={case}"
         );
         assert_eq!(state.read().unwrap().staging_arena.len(), arena);
     }
@@ -498,13 +504,27 @@ fn production_deferral_inlines_nonidentity_projection_spines() {
 
 #[test]
 fn production_deferral_retains_the_exact_dimension_reference() {
-    for reference in [false, true] {
+    for (reference, projected) in [(false, false), (true, false), (false, true), (true, true)] {
+        let make_plan = || {
+            let mut plan = candidate(reference);
+            if projected {
+                let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                    unreachable!()
+                };
+                let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator
+                else {
+                    unreachable!()
+                };
+                join.left_projection_map = paro_planner::operator::ProjectionMap::new(vec![1]);
+                join.right_projection_map = paro_planner::operator::ProjectionMap::new(vec![1]);
+            }
+            plan
+        };
         let bind = BindContext::new();
         for _ in 0..52 {
             bind.generate_table_index();
         }
-        let (expected, changed) =
-            dimension_deferral::optimize_plan(candidate(reference), &bind).unwrap();
+        let (expected, changed) = dimension_deferral::optimize_plan(make_plan(), &bind).unwrap();
         assert!(changed);
         let plan = if reference {
             OwnedLogicalPlan::synthetic(LogicalOperator::MaterializedCTE(
@@ -522,12 +542,12 @@ fn production_deferral_retains_the_exact_dimension_reference() {
                             vec![LogicalType::Integer, LogicalType::Varchar],
                         ),
                     )),
-                    candidate(true),
+                    make_plan(),
                 )
                 .with_ref_count(1),
             ))
         } else {
-            candidate(false)
+            make_plan()
         };
         let mut input =
             MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
@@ -543,6 +563,19 @@ fn production_deferral_retains_the_exact_dimension_reference() {
         let root_expr = input.memo.group(root).unwrap().logical_exprs()[0];
         let join_group = input.memo.logical_expr(root_expr).unwrap().key.children[0];
         let join_expr = input.memo.group(join_group).unwrap().logical_exprs()[0];
+        if projected {
+            let state = state.read().unwrap();
+            let payload = input.memo.logical_expr(join_expr).unwrap().payload;
+            let LogicalOperator::Join(Join::Comparison(join)) = &state.payloads.logical
+                [payload.index()]
+            .semantic_template
+            .operator
+            else {
+                unreachable!()
+            };
+            assert!(join.left_projection_map.is_all());
+            assert!(join.right_projection_map.is_all());
+        }
         let dimension_group = input.memo.logical_expr(join_expr).unwrap().key.children[1];
         let before = input.memo.local_statistics_fingerprint(dimension_group);
         let binding = matching::scoped_pattern_bindings(
