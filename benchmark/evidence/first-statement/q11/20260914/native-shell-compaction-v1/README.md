@@ -327,6 +327,18 @@ The new test, existing frozen-selected MARK production test and 111 engine tests
 pass on the mixed tree. No SQL execution, clean fixed-work fingerprint or Q11
 performance campaign was run for this change. Other rule bridges remain.
 
+Audit correction for the earlier native-only LIMIT change: the native producers
+still rejected an opaque controlled input, although the reference LIMIT/TopN
+rewrite operates above that input and retains it. With fallback removed this
+was a missing legal output, not a valid complete negative. A production test
+reproduced zero outputs where the reference produced one. Both native guards
+now admit the unchanged opaque input; no LIMIT crosses the control boundary.
+Twenty count/offset/rule/control cases compare reference outputs, require zero
+bridges, and verify the exact retained input group. The matrix, 21 limit tests
+and 111 engine tests passed on the mixed worktree. This restores missing search
+coverage, so unchanged publication counts are NOT claimed against the defective
+version. Q11/fingerprint and clean performance acceptance remain unrun.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
