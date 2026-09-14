@@ -904,3 +904,27 @@ positive case. Full optimizer: 1284 passed / same five assertion failures.
 Optimizer/compiler check passes. No bless. Outer-join independent bag execution,
 fixed-work/prefix/fingerprint gates, SQL regress and fresh Q11 were not run;
 mixed-tree unit checks are not performance evidence. Overall migration is open.
+
+## Shared prefix output selection removes an overly strict native fallback
+
+The native output loop used to reject the whole binding if one eligible-looking
+substring lacked a matching predicate; the existing tree proof retained that
+expression and rewrote other witnessed outputs. A production fixture with a
+witnessed width-two prefix and unwitnessed width-one prefix now uses native
+transport, leaving the latter function unchanged. Restoring only HEAD's old
+native proof reproduced the failure to take the native path with this fixture;
+the new shared proof passes through actual Memo/matching/apply with zero owned
+instantiations and one output.
+
+Both adapters now use the same output eligibility/selection contract: known
+nonmatching outputs remain unchanged, missing evidence declines the candidate,
+and conflicting witnessed source/width choices decline rather than silently
+discarding one. Focused tests cover these three states and repeated compatible
+outputs. Source/path evidence remains adapter-specific; native mismatched-source
+paths still fall back, so this is not yet complete prefix-rule parity.
+
+All 21 late_payload tests pass; full optimizer 1285 passed / same five failures.
+Optimizer/compiler check passed before the final test-only addition and moving
+an unused production import into the test module. No bless. No fresh Q11,
+fixed-work/fingerprint, SQL regress or independent bag-execution campaign was
+run. These mixed-tree checks do not establish end-to-end performance or completion.
