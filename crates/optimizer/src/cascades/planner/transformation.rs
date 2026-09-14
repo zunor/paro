@@ -23,6 +23,8 @@ mod native_join_subsumption;
 mod native_non_null_inputs;
 #[cfg(test)]
 mod native_limit_tests;
+#[cfg(test)]
+mod native_mark_tests;
 pub(super) mod settlement;
 mod staging;
 
@@ -859,7 +861,8 @@ impl TransformationRule for PlannerTransformationRule {
         // Native rejection covers the complete selected rewrite, not a
         // request to rebuild that binding as owned IR.
         if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput
-            | PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown)
+            | PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown
+            | PlannerTransformation::MarkJoinToSemi)
             && direct_native.is_empty()
         {
             return Ok(Box::new([]));
@@ -2820,9 +2823,9 @@ fn try_native_mark_join_to_semi(
     let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
         return Ok(None);
     };
-    if native_shell_contains_control_boundary(&shell) {
-        return Ok(None);
-    }
+    // The selected MarkConsumer grammar contains one Filter/Mark pair and
+    // opaque children. Conversion changes neither input nor control scope.
+    // Its complete negative does not need an owned semantic retry.
     let mut nodes = shell.nodes.into_vec();
     let mut rewritten = false;
     for index in 0..nodes.len() {
@@ -5252,10 +5255,7 @@ fn rewrite_planner_expression(
             plan
         }
         PlannerTransformation::MarkJoinToSemi => {
-            let Some(plan) = rewrite_positive_consumed_mark_filter(plan) else {
-                return Ok(None);
-            };
-            plan
+            unreachable!("MARK consumer rewriting is native-only in Memo search")
         }
         PlannerTransformation::JoinElimination => {
             let (plan, changed) = JoinElimination::new().optimize_plan_with_change(plan);
@@ -5354,6 +5354,7 @@ fn rewrite_planner_expression(
 /// still expose the always-true marker, while an ancestor may no longer
 /// require it. Rewrite the staged subtree here and let the ordinary group
 /// contract check accept the smallest ancestor that preserves its full output.
+#[cfg(test)]
 fn rewrite_positive_consumed_mark_filter(plan: OwnedLogicalPlan) -> Option<OwnedLogicalPlan> {
     let mut changed = false;
     let (plan, ()) = plan
