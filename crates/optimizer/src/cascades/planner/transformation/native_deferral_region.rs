@@ -5,6 +5,40 @@ use super::*;
 use crate::aggregate::dimension_deferral::join_region as contract;
 use paro_planner::operator::{JoinCondition, LogicalOutputLayout, ProjectionMap};
 
+/// Recover the observed group of an unchanged selected edge, not an arbitrary
+/// equivalent child. Newly synthesized region joins have no original group.
+pub(super) fn selected_group(
+    shell: &NativeShell,
+    binding: &PatternOperand,
+    target: usize,
+) -> Option<GroupId> {
+    let mut pending = vec![(shell.root, binding)];
+    while let Some((index, operand)) = pending.pop() {
+        let PatternOperand::Expression {
+            group, children, ..
+        } = operand
+        else {
+            continue;
+        };
+        if index == target {
+            return Some(*group);
+        }
+        let mut edges = Vec::new();
+        shell.nodes[index]
+            .operator
+            .visit_child_links(&mut |child| edges.push(child.clone()));
+        if edges.len() != children.len() {
+            return None;
+        }
+        for (edge, child) in edges.into_iter().zip(children.iter()) {
+            if let NativeChild::Node(index) = edge {
+                pending.push((index, child));
+            }
+        }
+    }
+    None
+}
+
 /// Isolate the same widest dimension as the reference rule, using only selected
 /// native edges. Opaque children retain their original group and facts.
 pub(super) fn isolate(

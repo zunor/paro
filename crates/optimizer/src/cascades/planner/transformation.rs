@@ -588,6 +588,7 @@ impl TransformationRule for PlannerTransformationRule {
         // path available for every shape that needs richer semantic handling.
         let mut native_domain_scopes = None;
         let mut native_elimination_checked = false;
+        let mut native_deferral_checked = false;
         let mut cte_restriction: Option<(GroupId, cte::CteDomainProof)> = None;
         // Native CTE domain/partition adapters allocate query-local symbols
         // before the common staging transaction is entered. Enlist a
@@ -811,7 +812,7 @@ impl TransformationRule for PlannerTransformationRule {
                         .collect()
                 }
                 PlannerTransformation::AggregateDimensionDeferral => {
-                    try_native_dimension_deferral(&binding.root, ctx.memo(), &state, &facts)?
+                    try_native_dimension_deferral(&binding.root, ctx.memo(), &state, &facts, &mut native_deferral_checked)?
                         .into_iter()
                         .collect()
                 }
@@ -859,7 +860,7 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             Vec::new()
         };
-        if native_elimination_checked && direct_native.is_empty() {
+        if (native_elimination_checked || native_deferral_checked) && direct_native.is_empty() {
             return Ok(Box::new([]));
         }
         // These selected grammars are closed. NonNullAggregate reaches Get
@@ -3145,6 +3146,7 @@ fn try_native_dimension_deferral(
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
+    checked: &mut bool,
 ) -> Result<Option<NativeShell>> {
     // Reject ineligible root spines before allocating a native node vector.
     // The general fallback retains coverage for unsupported boundary contracts.
@@ -3308,6 +3310,36 @@ fn try_native_dimension_deferral(
         }
     }
     if !has_deferred_payload {
+        return Ok(None);
+    }
+
+    // Match the reference's no-further-key-reduction guard using the exact
+    // selected input's observed facts. Freshly rebuilt fact joins have no
+    // inherited key proof, just as in reference region isolation.
+    let keys = match &join.left {
+        NativeChild::MemoGroup { reference, .. } | NativeChild::Group { reference, .. } => {
+            reference.facts.unique_keys.clone()
+        }
+        NativeChild::Node(index) => {
+            let mut keys = if let Some(group) = native_deferral_region::selected_group(&shell, binding, *index) {
+                facts.transport(memo, state, group, &Arc::new(left_layout.clone()))?.unique_keys.clone()
+            } else {
+                shell.nodes[*index].stats.unique_keys.clone()
+            };
+            // Plain aggregation proves its output grouping key structurally,
+            // even when the selected boundary snapshot has not derived it.
+            if matches!(shell.nodes[*index].operator, LogicalOperator::Aggregate(_)) {
+                keys.extend(crate::statistics::unique_keys::derive_unique_keys_from_facts(
+                    &shell.nodes[*index].operator, &left_layout, &[], &[],
+                ));
+            }
+            keys
+        }
+    };
+    if crate::statistics::unique_keys::expressions_cover_unique_key_from_facts(
+        &left_layout, &keys, &partial_groups.iter().collect::<Vec<_>>(),
+    ) {
+        *checked = true;
         return Ok(None);
     }
 
