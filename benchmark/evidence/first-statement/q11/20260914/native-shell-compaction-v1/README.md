@@ -1032,3 +1032,24 @@ All 21 late_payload tests pass (21 production fixtures). Full optimizer remains
 1285 pass / same five failures. Only tests changed. No bless, fresh Q11, SQL
 regress, fixed-work/fingerprint campaign or new compiler timing in this slice.
 Reject-path authority and both TopN constructions remain migration work.
+
+## Shared ordinary selective admission
+
+Owned and native selective fetch now call one admission algorithm over output
+expressions, child cardinality, exact Get lookup, row-id path proof and source
+statistics. This removes the native copy of column/type/storage checks,
+reduction and benefit logic. The shared implementation also owns bounded
+rejection reasons. The native adapter still supplies a concrete unary source;
+it does not pretend an unsupported path is a fully handled no-rewrite result.
+
+All 21 late_payload tests pass, including the 21 Memo/apply fixtures and upper-
+bound/rollback checks. Full optimizer 1285 pass / same five failures; optimizer
+and compiler check pass. No budget, cost constants, rule-set or stop-policy
+change. No bless. This is contract consolidation ahead of reject-path bridge
+removal, not a claim of fewer production bridges or a measured speedup.
+
+The separately assigned detail-TopN implementation is an unintegrated draft;
+it is excluded from this commit and these test claims. Aggregate-TopN remains
+unmigrated. SQL regress, independent bag execution, fixed-work/fingerprint and
+fresh Q11 acceptance remain open; mixed-tree unit runs are not clean performance
+evidence.
