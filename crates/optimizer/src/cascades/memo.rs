@@ -548,6 +548,27 @@ pub struct LogicalExprKey {
     pub children: Box<[GroupId]>,
 }
 
+/// The single boundary contract used when a planner-produced logical node is
+/// lowered into the Memo.
+///
+/// The key/encoding are the structural identity, while the properties and
+/// cardinality are the fact snapshot for this occurrence.  Keeping them in
+/// one value makes it impossible for publication to insert one representation
+/// and merge a separately reconstructed fact/layout value after the
+/// transaction has already committed.  `PlannerLogicalPayload` carries the
+/// binding layout, scalar roots and producer/consumer proofs for the same
+/// node; this contract carries the Memo-owned portion of that boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct LogicalInsertionContract {
+    pub(crate) target: GroupId,
+    pub(crate) key: LogicalExprKey,
+    pub(crate) payload: LogicalPayloadId,
+    pub(crate) operator_encoding: Option<Box<[u8]>>,
+    pub(crate) proof: EquivalenceProof,
+    pub(crate) logical_properties: LogicalProperties,
+    pub(crate) cardinality: GroupCardinality,
+}
+
 impl LogicalExprKey {
     pub fn stable_fingerprint(&self) -> Fingerprint {
         let mut builder = StableFingerprintBuilder::default();
@@ -2701,6 +2722,45 @@ impl Memo {
             Some(Arc::from(operator_encoding)),
             Some(operator_tag),
         )
+    }
+
+    /// Lower one complete planner node and its fact snapshot atomically.
+    ///
+    /// The caller has already validated any rule-specific output contract,
+    /// but it must not insert the structural expression and then merge facts
+    /// after committing the surrounding transformation.  Keeping both parts
+    /// in this operation gives rollback/retry one journal boundary and makes
+    /// the publication path consume the exact key, encoding and facts that
+    /// staging produced.
+    pub(crate) fn insert_logical_with_facts(
+        &mut self,
+        contract: LogicalInsertionContract,
+    ) -> Result<LogicalExprId> {
+        let LogicalInsertionContract {
+            target,
+            key,
+            payload,
+            operator_encoding,
+            proof,
+            logical_properties,
+            cardinality,
+        } = contract;
+        let logical = match operator_encoding {
+            Some(encoding) => self.insert_logical_with_operator_encoding(
+                target,
+                key,
+                payload,
+                proof,
+                encoding,
+            )?,
+            None => self.insert_logical(target, key, payload, proof)?,
+        };
+        self.update_group_facts(target, |existing, existing_cardinality| {
+            existing.merge_equivalent_facts(&logical_properties)?;
+            *existing_cardinality = std::mem::take(existing_cardinality).canonical_with(cardinality);
+            Ok(())
+        })?;
+        Ok(logical)
     }
 
     fn insert_logical_structural(

@@ -207,6 +207,23 @@ pub struct EquivalentExpression {
     pub proof: EquivalenceProof,
 }
 
+impl EquivalentExpression {
+    /// Consume the complete planner publication value at the Memo boundary.
+    /// Structural identity and the fact snapshot travel together; callers do
+    /// not reconstruct one from the other after the transformation commits.
+    pub(crate) fn into_memo_insertion(self) -> super::memo::LogicalInsertionContract {
+        super::memo::LogicalInsertionContract {
+            target: self.target_group,
+            key: self.key,
+            payload: self.payload,
+            operator_encoding: self.operator_encoding,
+            proof: self.proof,
+            logical_properties: self.logical_properties,
+            cardinality: self.cardinality,
+        }
+    }
+}
+
 pub struct RuleContext<'a> {
     pub memo: &'a Memo,
     pub group: GroupId,

@@ -54,7 +54,7 @@ use super::ids::{
 };
 use super::memo::{
     CandidatePreview, CandidateSummary, ChildWinnerRef, EquivalenceProof, FrozenCandidate,
-    GrantGoalKey, GroupCardinality, LogicalExpr, LogicalProperties, Memo, OptimizationGoal, Winner,
+    GrantGoalKey, LogicalExpr, Memo, OptimizationGoal, Winner,
 };
 use super::properties::{
     MaterializationRequirement, MutationSafetyRequirement, OrderingRequirement, OrderingScope,
@@ -287,7 +287,6 @@ pub(crate) fn selected_proof_rule_ids(logical: &LogicalExpr) -> Box<[RuleId]> {
 
 struct TransformationInsertion {
     groups: BTreeSet<GroupId>,
-    properties: Vec<(GroupId, LogicalProperties, GroupCardinality)>,
     expressions: Vec<(GroupId, LogicalExprId)>,
 }
 
@@ -5152,7 +5151,6 @@ impl CascadesEngine {
                 let insertion = (|| -> Result<TransformationInsertion> {
                     let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Insert);
                     let mut inserted_groups = BTreeSet::new();
-                    let mut inserted_properties = Vec::new();
                     let mut inserted_expressions = Vec::new();
                     for output in outputs {
                         validate_transformation_proof(rule, expression, &output.proof)?;
@@ -5184,22 +5182,9 @@ impl CascadesEngine {
                             .group(target)
                             .map(|group| group.logical_exprs().len())
                             .unwrap_or(0);
-                        let inserted = if let Some(encoding) = output.operator_encoding {
-                            context.memo_mut().insert_logical_with_operator_encoding(
-                                target,
-                                output.key,
-                                output.payload,
-                                output.proof,
-                                encoding,
-                            )?
-                        } else {
-                            context.memo_mut().insert_logical(
-                                target,
-                                output.key,
-                                output.payload,
-                                output.proof,
-                            )?
-                        };
+                        let inserted = context
+                            .memo_mut()
+                            .insert_logical_with_facts(output.into_memo_insertion())?;
                         let after = context
                             .memo()
                             .group(target)
@@ -5209,22 +5194,15 @@ impl CascadesEngine {
                         if after > before {
                             inserted_groups.insert(target);
                             inserted_expressions.push((target, inserted));
-                            inserted_properties.push((
-                                target,
-                                output.logical_properties,
-                                output.cardinality,
-                            ));
                         }
                     }
                     Ok(TransformationInsertion {
                         groups: inserted_groups,
-                        properties: inserted_properties,
                         expressions: inserted_expressions,
                     })
                 })();
                 let TransformationInsertion {
                     groups: mut inserted_groups,
-                    properties: inserted_properties,
                     expressions: inserted_expressions,
                 } = match insertion {
                     Ok(result) => result,
@@ -5354,14 +5332,6 @@ impl CascadesEngine {
                         &output_events[inserted_expressions.len().min(output_events.len())..],
                         output_dimension,
                     )?;
-                    for (target, properties, cardinality) in inserted_properties {
-                        self.memo.update_group_facts(target, |logical, current| {
-                            logical.merge_equivalent_facts(&properties)?;
-                            *current =
-                                std::mem::take(current).canonical_with(cardinality.clone());
-                            Ok(())
-                        })?;
-                    }
                     inserted_groups.extend(locally_written_groups);
                     *self.effective_rule_insertions.entry(rule).or_default() +=
                         u64::try_from(inserted_expressions.len()).unwrap_or(u64::MAX);

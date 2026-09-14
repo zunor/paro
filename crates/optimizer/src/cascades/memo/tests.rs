@@ -284,6 +284,81 @@ fn typed_fact_update_rolls_back_values_and_keeps_write_journal_precise() {
     );
 }
 
+#[test]
+fn logical_insertion_contract_lowers_facts_inside_the_transaction() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let source = memo
+        .insert_logical(
+            group,
+            LogicalExprKey {
+                operator: Fingerprint(40),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(0),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+    let before = (
+        memo.group(group).unwrap().logical_properties.clone(),
+        memo.group(group).unwrap().cardinality.clone(),
+    );
+    let savepoint = memo.transformation_savepoint();
+    let logical_properties = LogicalProperties {
+        maximum_cardinality: Some(9),
+        ..LogicalProperties::default()
+    };
+    let logical = memo
+        .insert_logical_with_facts(LogicalInsertionContract {
+            target: group,
+            key: LogicalExprKey {
+                operator: Fingerprint(41),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            payload: LogicalPayloadId(1),
+            operator_encoding: Some(Box::from(&b"aggregate-contract"[..])),
+            proof: EquivalenceProof::Transformation {
+                rule: RuleId(41),
+                source,
+                premise: Fingerprint(42),
+            },
+            logical_properties,
+            cardinality: GroupCardinality::new(
+                Fingerprint(43),
+                CardinalityRecipeKind::Statistics,
+                1,
+                4,
+                9,
+            ),
+        })
+        .unwrap();
+    assert_eq!(memo.group(group).unwrap().logical_exprs().len(), 2);
+    assert_eq!(
+        memo.group(group)
+            .unwrap()
+            .logical_properties
+            .maximum_cardinality,
+        Some(9)
+    );
+    assert_eq!(memo.logical_expr(logical).unwrap().payload, LogicalPayloadId(1));
+
+    memo.rollback_transformation(savepoint).unwrap();
+    assert_eq!(memo.group(group).unwrap().logical_exprs().len(), 1);
+    assert_eq!(
+        (
+            memo.group(group).unwrap().logical_properties.clone(),
+            memo.group(group).unwrap().cardinality.clone(),
+        ),
+        before
+    );
+}
+
 fn provided() -> ProvidedProperties {
     ProvidedProperties {
         ordering: ProvidedOrdering::Unordered,
