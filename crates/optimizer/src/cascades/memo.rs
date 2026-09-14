@@ -1168,6 +1168,15 @@ fn compare_objective(
 }
 
 #[derive(Debug)]
+struct StatisticsReadCache {
+    registry_revision: u64,
+    /// Values actually read from each lexical producer, in registry order.
+    /// Registry structure can stay fixed while one of these values changes.
+    producers: Box<[Option<(Fingerprint, Fingerprint)>]>,
+    fingerprint: Fingerprint,
+}
+
+#[derive(Debug)]
 pub struct Group {
     pub id: GroupId,
     pub schema: GroupSchema,
@@ -1181,7 +1190,7 @@ pub struct Group {
     /// The read transcript adds definition-to-producer correspondences to
     /// local statistics. Cache its value separately from the registry cursor:
     /// cursor changes cause revalidation, never a new semantic fingerprint.
-    statistics_read_fingerprint: Mutex<Option<(u64, Fingerprint)>>,
+    statistics_read_fingerprint: Mutex<Option<StatisticsReadCache>>,
     logical_exprs: Vec<LogicalExprId>,
     /// Exact operator buckets for scoped pattern matching. The bucket is a
     /// read accelerator only: every expression remains in `logical_exprs`,
@@ -1514,14 +1523,31 @@ impl Memo {
             .statistics_read_fingerprint
             .lock()
             .expect("Memo statistics read cache poisoned");
-        if let Some((previous, fingerprint)) = *cached {
-            if previous == revision {
-                return fingerprint;
+        if let Some(previous) = cached.as_ref() {
+            if previous.registry_revision == revision
+                && previous.producers.iter().copied().eq(self.statistics_read_producers(group))
+            {
+                return previous.fingerprint;
             }
         }
         let fingerprint = self.compute_local_statistics_fingerprint(group);
-        *cached = Some((revision, fingerprint));
+        *cached = Some(StatisticsReadCache {
+            registry_revision: revision,
+            producers: self.statistics_read_producers(group).collect(),
+            fingerprint,
+        });
         fingerprint
+    }
+
+    fn statistics_read_producers<'a>(
+        &'a self,
+        group: &'a Group,
+    ) -> impl Iterator<Item = Option<(Fingerprint, Fingerprint)>> + 'a {
+        group.logical_properties.cte_references.iter()
+            .flat_map(move |reference| self.cte_producers.get(&reference.cte_index).into_iter().flatten())
+            .map(move |producer| self.group(self.canonical_group(producer.group)).map(|group| (
+                group.logical_fact_fingerprint(), group.statistics_snapshot_fingerprint(),
+            )))
     }
 
     fn advance_cte_registry_revision(&mut self) -> Result<()> {

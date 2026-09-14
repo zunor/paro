@@ -85,10 +85,12 @@ fn statistics_read_cache_revalidates_registry_rollback_reinsert_and_merge() {
     // identical producer fact snapshots. The reader must revalidate without
     // inventing a different statistics value fingerprint.
     assert_eq!(check(&memo), published);
-    assert_eq!(
-        *memo.group(reader).unwrap().statistics_read_fingerprint.lock().unwrap(),
-        Some((memo.cte_registry_revision, published))
-    );
+    {
+        let cached = memo.group(reader).unwrap().statistics_read_fingerprint.lock().unwrap();
+        let cached = cached.as_ref().unwrap();
+        assert_eq!(cached.registry_revision, memo.cte_registry_revision);
+        assert_eq!(cached.fingerprint, published);
+    }
     let before_local_change = check(&memo);
     memo.group_mut(reader).unwrap().cardinality.range = Some(CardinalityEnvelope {
         lower: 1,
@@ -148,6 +150,17 @@ fn statistics_read_cache_revalidates_producer_fact_update_without_registry_chang
         "unchanged registry structure must not hide changed producer facts"
     );
     assert_eq!(memo.local_statistics_fingerprint(reader), uncached);
+
+    let savepoint = memo.transformation_savepoint();
+    memo.group_mut(producer).unwrap().logical_properties.maximum_cardinality = Some(5);
+    let changed_proof = memo.compute_local_statistics_fingerprint(memo.group(reader).unwrap());
+    assert_ne!(changed_proof, uncached);
+    assert_eq!(memo.local_statistics_fingerprint(reader), changed_proof);
+    memo.rollback_transformation(savepoint).unwrap();
+    assert_eq!(memo.local_statistics_fingerprint(reader), uncached);
+    // Taking a mutable borrow without changing evidence is not a new value.
+    let _ = memo.group_mut(producer).unwrap();
+    assert_eq!(memo.local_statistics_fingerprint(reader), uncached);
 }
 
 #[test]
@@ -162,15 +175,11 @@ fn non_cte_statistics_cache_is_independent_of_registry_mutations() {
     memo.register_cte_producer(7, group, BTreeMap::from([(CteColumnId(0), ColumnId(1))]))
         .unwrap();
     assert_eq!(memo.local_statistics_fingerprint(group), fingerprint);
-    assert_eq!(
-        *memo
-            .group(group)
-            .unwrap()
-            .statistics_read_fingerprint
-            .lock()
-            .unwrap(),
-        Some((0, fingerprint))
-    );
+    let cached = memo.group(group).unwrap().statistics_read_fingerprint.lock().unwrap();
+    let cached = cached.as_ref().unwrap();
+    assert_eq!(cached.registry_revision, 0);
+    assert_eq!(cached.fingerprint, fingerprint);
+    assert!(cached.producers.is_empty());
 }
 
 fn provided() -> ProvidedProperties {
