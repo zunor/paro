@@ -316,6 +316,17 @@ five reference and 111 engine tests now pass, including fact-update retries.
 These synthetic external fixtures validate planning, not external execution.
 No budget/model/policy changes or new Q11 performance evidence are claimed.
 
+Memo MarkJoinToSemi is now native-only for its closed MarkConsumer grammar
+(Projection/Filter over one MARK pair, whose two children are holes). The old
+owned rewrite is test-only. Conversion retains both exact input groups, so an
+opaque control input no longer forces fallback. A four-case production matrix
+checks local versus correlated marker depth, with/without a materialized control
+input, against the owned reference. The negative initially performed one bridge;
+all cases now use zero, and staged SEMI flags and exact input groups are checked.
+The new test, existing frozen-selected MARK production test and 111 engine tests
+pass on the mixed tree. No SQL execution, clean fixed-work fingerprint or Q11
+performance campaign was run for this change. Other rule bridges remain.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
