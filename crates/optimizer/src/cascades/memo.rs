@@ -2122,30 +2122,25 @@ impl Memo {
         Some(group)
     }
 
-    /// Reusing structure still publishes new derived evidence. Fact-value
-    /// invalidation is separate from the publication dependency footprint:
-    /// consumers of a reused parent still need to observe the newly staged
-    /// descendant alternatives even when the parent's facts did not change.
-    /// Keep that footprint, but do not clear immutable fact identities for an
-    /// idempotent merge. The ordinary merge algebra remains authoritative.
+    /// Reusing structure still publishes new derived evidence. Do not enlist
+    /// a group write (or invalidate readers) when the existing join of facts
+    /// already contains that evidence. Use the same merge algebra as ordinary
+    /// publication; no second derivation or occurrence-local cache is involved.
     pub(crate) fn merge_derived_group_facts(
         &mut self,
         id: GroupId,
         properties: &LogicalProperties,
         cardinality: GroupCardinality,
     ) -> Result<bool> {
-        let id = self.canonical_group(id);
-        let group = self.group(id)
+        let group = self.group(self.canonical_group(id))
             .ok_or_else(|| paro_error::internal("derived publication lost its Memo group"))?;
         if group.logical_properties == *properties && group.cardinality == cardinality {
-            self.record_transformation_group_write(id);
             return Ok(false);
         }
         let mut merged = group.logical_properties.clone();
         merged.merge_equivalent_facts(properties)?;
         let cardinality = group.cardinality.clone().canonical_with(cardinality);
         if merged == group.logical_properties && cardinality == group.cardinality {
-            self.record_transformation_group_write(id);
             return Ok(false);
         }
         let group = self.group_mut(id)

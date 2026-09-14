@@ -164,7 +164,7 @@ fn statistics_read_cache_revalidates_producer_fact_update_without_registry_chang
 }
 
 #[test]
-fn derived_publication_separates_fact_invalidation_from_dependency_footprint() {
+fn derived_publication_noop_does_not_enlist_a_write_but_new_facts_rollback() {
     let mut memo = Memo::new(SearchBudget::default());
     let properties = LogicalProperties::default();
     let cardinality = GroupCardinality::new(Fingerprint(1), CardinalityRecipeKind::Statistics, 1, 4, 9);
@@ -172,7 +172,7 @@ fn derived_publication_separates_fact_invalidation_from_dependency_footprint() {
     let value = memo.local_statistics_fingerprint(group);
     let checkpoint = memo.transformation_savepoint();
     assert!(!memo.merge_derived_group_facts(group, &properties, cardinality.clone()).unwrap());
-    assert!(memo.transformation_group_snapshots.as_ref().unwrap().contains_key(&group));
+    assert!(memo.transformation_group_snapshots.as_ref().unwrap().is_empty());
     assert!(memo.group(group).unwrap().statistics_read_fingerprint.lock().unwrap().is_some());
     let mut refined = properties.clone();
     refined.maximum_cardinality = Some(5);
