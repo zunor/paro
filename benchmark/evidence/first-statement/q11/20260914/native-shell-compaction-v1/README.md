@@ -150,13 +150,30 @@ oracle now also executes the produced reordered projection. Seven native
 scalar tests, four existing scalar-window tests and 111 engine tests passed.
 No clean-source Q11 or fingerprint comparison was run for this slice.
 
+`3533703a` extends the native scalar-window path through selected semi/anti
+reduction carriers on either preserved side. A production matcher regression
+failed native construction before this change and now stages one native
+result for each of Semi/Anti/RightSemi/RightAnti. Window and scalar residual
+are installed before reduction, over the original filtered source; the
+carrier's non-preserved input is retained as its native edge and the outer
+projection is composed at the carrier output. Copied carrier proofs are
+cleared. The independent bag interpreter executes the actual native shell
+against a separate gate bag with duplicate and NULL keys, testing all four
+directions with and without a reordered projection. Its data distinguishes
+SUM-before-reduction from the incorrect SUM-after-reduction placement.
+Budget/retry and fact invalidation tests now include carrier inputs. Eight
+native tests, four scalar-window tests, and 111 engine tests passed on the
+mixed worktree. No performance, clean-source fingerprint, or SQL-regress
+acceptance is inferred. Expanded non-preserved subtrees which could contain
+other rewrites remain outside this producer's completeness claim.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
 PredicateTransfer and LatePayloadFetch also retain owned peers for uncovered
 semantics. Scalar-window support is currently limited to the direct finite
-grammar with Projection/Filter ancestors; reduction carriers and alternative-rich
-source groups still require migration. Merely adding a native adapter for
+grammar with Projection/Filter ancestors and reduction carriers; alternative-rich
+source groups and expanded non-preserved subtrees still require migration. Merely adding a native adapter for
 each rule does not remove those bridges or prove search coverage equivalence.
 Remaining acceptance includes deleting these production fallbacks after
 coverage tests, a clean fixed-work comparison, admitted fingerprint and
