@@ -436,9 +436,11 @@ impl Aggregate {
         self.post_reduction = Some(post_reduction);
         self
     }
+}
 
+impl<Child> Aggregate<Child> {
     /// Verify the correctness-bearing local expression domains of the optional
-    /// post-aggregate reduction annotation.
+    /// post-aggregate reduction annotation, independently of child ownership.
     pub fn verify_post_reduction(&self) -> Result<()> {
         let Some(reduction) = &self.post_reduction else {
             return Ok(());
