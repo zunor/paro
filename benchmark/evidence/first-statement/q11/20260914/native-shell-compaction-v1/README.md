@@ -523,6 +523,32 @@ No SQL bag execution, fixed-work fingerprint or Q11 performance experiment
 ran. Control ownership and complete negative-path coverage still prevent a
 claim that this rule's owned fallback can be removed wholesale.
 
+### Native-only selected input materialization
+
+Production control-owner fixture: an aggregate input is a materialized CTE
+with a real producer and CTERef consumer. The owned reference wraps the owner
+without crossing it; the previous native blanket control check caused one
+owned instantiation. Native placement now does the same, retaining the exact
+owner group beneath its projection. The test checks that group identity and
+its local statistics fingerprint, one output and zero owned instantiations.
+
+Four negative fixtures cover join-live inputs and outer-join barriers, with
+and without that owner. The reference produces no rewrite; native rejection
+now returns directly rather than rebuilding the binding as owned IR. The
+selected AggregateRegion grammar exposes the root aggregate and its join/
+projection spine; nested aggregate inputs terminate at holes and are separately
+scheduled Memo problems. The production owned switch arm is removed, and the
+old tree traversal and its ownership helpers are test-only. Shared scalar
+totality/liveness predicates remain production code. This is a migration of
+the selected binding contract, not a proof that all Memo search is complete.
+
+Validation: materialization15 pass, non-test optimizer and compiler checks
+pass; full optimizer1276 pass/5 fail at the same recorded grant/cache/RF
+assertions. Tests and evidence are from the mixed workspace, not a clean
+performance build. No runtime bag oracle, full fixed-work replay, fingerprint
+or fresh Q11 campaign was added in this slice. Those acceptance gates remain
+outstanding for the overall migration; no speed or parity claim is made.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
