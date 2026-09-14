@@ -417,6 +417,25 @@ the subsumption rule. This change does not establish native coverage of that
 prelude, and does not delete the fallback prematurely. Existing user changes
 were excluded from the commit.
 
+Follow-up: the same production fixture reproduced another owned fallback when
+Filter(TRUE) wrapped the outer detail Get (one owned instantiation instead of
+zero). Native subsumption now resolves identity-filter edges across the visible
+post-order shell in one pass, replacing the earlier join-spine-only handling.
+Operator payloads remain in place; group holes are not expanded. Changed
+ancestors lose their old source proofs, and final compaction/layout validation
+still runs. Nonempty predicates and projection/evaluation barriers are not
+routed by this pass. Production cases cover no wrapper, a join-spine wrapper,
+a detail-scan wrapper and three nested detail-scan wrappers, all with one
+output and zero owned binding instantiations/settlement arena growth.
+
+Follow-up validation: native5/reference5/engine111 pass; full optimizer1272 pass,
+5 fail. The failures match the recorded grant declaration (3), statistics cache
+(1) and ordered RF retention (1) cases, including the same failure locations
+and observed values. They remain unresolved and unblessed. This does not prove
+complete FilterPushdown coverage, runtime semantics or current Q11 speed; no
+performance or SQL campaign ran. Nonempty predicate routing in the subsumption
+prelude and other production bridges remain to be migrated.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
