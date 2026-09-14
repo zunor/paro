@@ -75,6 +75,35 @@ fn widest_dimension_candidate(plan: &OwnedLogicalPlan) -> Option<(usize, usize)>
         .iter()
         .map(|expression| inline_projections(expression, &projections))
         .collect::<Option<Vec<_>>>()?;
+    let all_bindings = region
+        .get_column_bindings()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    select_dimension(
+        &expanded_groups,
+        &expanded_aggregates,
+        &all_bindings,
+        relations.into_iter().filter_map(|relation| {
+            Some((
+                dimension_relation_table_index(relation)?,
+                relation.get_column_bindings().into_iter().collect(),
+            ))
+        }),
+        &conditions,
+    )
+    .map(|table_index| (projections.len(), table_index))
+}
+
+/// Ownership-independent selection. Callers supply exact visible relation
+/// bindings; no plan traversal, allocation identity, or cached statistics enter
+/// the payload-width/tie-break decision.
+pub(crate) fn select_dimension(
+    expanded_groups: &[Expression],
+    expanded_aggregates: &[Expression],
+    all_bindings: &HashSet<ColumnBinding>,
+    dimensions: impl Iterator<Item = (usize, HashSet<ColumnBinding>)>,
+    conditions: &[&JoinCondition],
+) -> Option<usize> {
     if expanded_aggregates.iter().any(|expression| {
         let Expression::Aggregate(aggregate) = expression else {
             return true;
@@ -96,25 +125,14 @@ fn widest_dimension_candidate(plan: &OwnedLogicalPlan) -> Option<(usize, usize)>
     }) {
         return None;
     }
-    let all_bindings = region
-        .get_column_bindings()
-        .into_iter()
-        .collect::<HashSet<_>>();
-
-    relations
-        .into_iter()
-        .filter_map(|relation| {
-            let table_index = dimension_relation_table_index(relation)?;
-            let dimension_bindings = relation
-                .get_column_bindings()
-                .into_iter()
-                .collect::<HashSet<_>>();
+    dimensions
+        .filter_map(|(table_index, dimension_bindings)| {
             let fact_bindings = all_bindings
                 .difference(&dimension_bindings)
                 .copied()
                 .collect::<HashSet<_>>();
             let mut payload_width = 0usize;
-            for group in &expanded_groups {
+            for group in expanded_groups {
                 match expression_domain(group, &fact_bindings, &dimension_bindings) {
                     ExpressionDomain::Dimension if is_movable(group) => {
                         payload_width = payload_width.saturating_add(group_width(group));
@@ -139,7 +157,7 @@ fn widest_dimension_candidate(plan: &OwnedLogicalPlan) -> Option<(usize, usize)>
             Some((payload_width, table_index))
         })
         .max_by_key(|(width, table_index)| (*width, std::cmp::Reverse(*table_index)))
-        .map(|(_, table_index)| (projections.len(), table_index))
+        .map(|(_, table_index)| table_index)
 }
 
 /// A CTE reference is a stable relational leaf just like a base scan. Keeping
@@ -183,7 +201,7 @@ fn collect_inner_equi_region<'a>(
     Some(())
 }
 
-fn is_plain_inner_equi_join(join: &ComparisonJoin) -> bool {
+pub(crate) fn is_plain_inner_equi_join<Child>(join: &ComparisonJoin<Child>) -> bool {
     join.join_type == JoinType::Inner
         && !join.conditions.is_empty()
         && join.mark_index.is_none()
@@ -196,7 +214,7 @@ fn is_plain_inner_equi_join(join: &ComparisonJoin) -> bool {
         })
 }
 
-fn condition_crosses_boundary(
+pub(crate) fn condition_crosses_boundary(
     condition: &JoinCondition,
     fact: &HashSet<ColumnBinding>,
     dimension: &HashSet<ColumnBinding>,
@@ -383,7 +401,7 @@ fn rebuild_inner_equi_region(
 /// evaluates it. A flattened inner-join predicate retains the orientation of
 /// its former tree, which is not necessarily the orientation of the rebuilt
 /// tree.
-fn orient_condition(
+pub(crate) fn orient_condition(
     mut condition: JoinCondition,
     left_bindings: &HashSet<ColumnBinding>,
     right_bindings: &HashSet<ColumnBinding>,
@@ -404,7 +422,10 @@ fn orient_condition(
     }
 }
 
-fn expression_references_any(expression: &Expression, bindings: &HashSet<ColumnBinding>) -> bool {
+pub(crate) fn expression_references_any(
+    expression: &Expression,
+    bindings: &HashSet<ColumnBinding>,
+) -> bool {
     let mut found = false;
     visit_expression(expression, &mut |expression| {
         if let Expression::ColumnRef(column) = expression {

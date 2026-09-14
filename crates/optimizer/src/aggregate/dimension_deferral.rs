@@ -26,7 +26,7 @@ use paro_planner::plan::{NodeStats, OwnedLogicalPlan, PlanNodeId};
 
 use crate::expression::traversal::visit_expression;
 
-mod join_region;
+pub(crate) mod join_region;
 
 /// Necessary root-only eligibility shared by dispatch and both rewrite paths.
 /// These fields belong to the immutable aggregate shell. In particular this
