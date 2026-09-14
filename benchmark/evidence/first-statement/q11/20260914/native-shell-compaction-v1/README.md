@@ -798,3 +798,32 @@ No baseline was blessed. Unit/check runs are from the mixed worktree and are not
 clean performance evidence. No fresh Q11, fixed-work/admitted-prefix replay,
 fingerprint or independent bag-execution campaign was run. Other rules still
 retain owned bridges and those global acceptance gates remain open.
+
+## LatePayload native prefix transport through unary paths
+
+The production binding fixture reproduced a native-prefix fallback behind
+Limit on the original producer. Native transport now follows Filter/Order/Limit
+ancestors to the witnessed Filter/Get, propagates the derived column through
+projection maps, and verifies the original root binding/type layout. The ASCII
+membership scalar witness is shared with the existing rule instead of copied.
+
+Testing the actual apply_binding entry exposed another bridge: even a successful
+native prefix was followed by the owned peer. It is now skipped only when every
+root output was replaced by a derived prefix (no stored payload output remains
+for row-id lowering). Mixed stored-column outputs retain that peer. This is not
+removal of the full LatePayload owned implementation. Join/window/TopN and row-id
+paths still require further migration.
+
+The production test covers direct, Limit, Order, Filter and mixed-output cases.
+Pure-prefix fixtures now return one output with zero owned binding constructions,
+instead of two outputs and one construction; mixed output still returns two and
+performs one owned construction. This is an explicit local publication change,
+not a claim that global search counts or admitted prefixes are unchanged.
+
+Both targeted tests pass. Optimizer/compiler cargo check passes. Full optimizer:
+1282 passed / the same five failure names and assertion values recorded above.
+No bless, SQL regress, independent bag execution, fixed-work/prefix replay,
+fingerprint gate or fresh Q11 campaign was run. These checks use the mixed
+worktree and are not clean performance evidence. User changes are excluded from
+the implementation commit. End-to-end acceptance and overall migration remain
+incomplete.
