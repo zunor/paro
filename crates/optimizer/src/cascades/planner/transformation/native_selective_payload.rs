@@ -31,21 +31,7 @@ pub(super) fn rewrite(
     let LogicalOperator::Projection(mut output) = shell.root_operator().clone() else {
         return Ok(None);
     };
-    if output
-        .expressions
-        .iter()
-        .any(|expression| !expression.evaluation_properties().can_share_evaluation())
-    {
-        return Ok(None);
-    }
     let NativeChild::Node(input) = output.child else {
-        return Ok(None);
-    };
-    let Some(fetched_rows) = shell.nodes[input]
-        .stats
-        .estimated_cardinality
-        .map(|estimate| estimate.max)
-    else {
         return Ok(None);
     };
 
@@ -71,82 +57,44 @@ pub(super) fn rewrite(
         NativeChild::Node(index) => Some(&shell.nodes[*index].operator),
         _ => None,
     };
-    // No Join was traversed above; the count callback is deliberately unknown
-    // rather than claiming uniqueness for an unsupported branch.
-    let Some(path) = prove_rowid_operator(
-        &shell.nodes[input].operator,
-        get.table_index,
-        RowIdPathPolicy::RowPreserving,
-        &resolve,
-        &|_| None,
+    let Some(mut proof) = crate::aggregate::late_payload::prove_selective_projection_inputs(
+        &output.expressions,
+        matches!(shell.nodes[input].operator, LogicalOperator::RowFetch(_)),
+        shell.nodes[input].stats.estimated_cardinality,
+        |table| (table == get.table_index).then_some(get.as_ref()),
+        |table| {
+            prove_rowid_operator(
+                &shell.nodes[input].operator,
+                table,
+                RowIdPathPolicy::RowPreserving,
+                &resolve,
+                &|_| None,
+            )
+        },
+        |table| {
+            (table == get.table_index)
+                .then(|| {
+                    shell.nodes[get_index]
+                        .stats
+                        .estimated_cardinality
+                        .map(|estimate| estimate.expected)
+                })
+                .flatten()
+        },
+        &state.cost_model,
+        &mut None,
     ) else {
         return Ok(None);
     };
-    if path.crosses_join() {
-        return Ok(None);
+    // A concrete unary source can yield at most one materialized namespace.
+    if proof.sources.len() != 1 {
+        return Err(paro_error::internal(
+            "native unary fetch has multiple sources",
+        ));
     }
-    let Some(table) = get
-        .table
-        .as_ref()
-        .filter(|table| table.get_storage().is_some())
-        .cloned()
-    else {
-        return Ok(None);
-    };
-    let mut delayed = HashMap::new();
-    let mut valid = true;
-    for expression in &output.expressions {
-        visit_expression(expression, &mut |expression| {
-            let Expression::ColumnRef(column) = expression else {
-                return;
-            };
-            if column.depth != 0 {
-                valid = false;
-                return;
-            }
-            if column.binding.table_index != get.table_index {
-                return;
-            }
-            let Some(catalog) = get.stored_column(column.binding.column_index) else {
-                valid = false;
-                return;
-            };
-            if table
-                .columns
-                .get(catalog)
-                .is_none_or(|definition| definition.logical_type != column.return_type)
-            {
-                valid = false;
-                return;
-            }
-            delayed.insert(column.binding, catalog);
-        });
-    }
-    if !valid || delayed.is_empty() {
-        return Ok(None);
-    }
-    let Some(carrier_rows) = shell.nodes[get_index]
-        .stats
-        .estimated_cardinality
-        .map(|estimate| estimate.expected)
-    else {
-        return Ok(None);
-    };
-    if fetched_rows >= carrier_rows
-        || state
-            .cost_model
-            .late_row_fetch_benefit(
-                carrier_rows,
-                fetched_rows,
-                delayed
-                    .values()
-                    .map(|&column| table.columns[column].logical_type.clone()),
-                path.stages(),
-            )
-            .is_none()
-    {
-        return Ok(None);
-    }
+    let source = proof.sources.pop().unwrap();
+    let table = source.table;
+    let delayed = source.delayed_bindings;
 
     // All semantic and cost guards precede symbol allocation and mutation.
     let rowid = get.append_virtual_rowid("rowid");

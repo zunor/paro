@@ -475,15 +475,15 @@ fn append_prefix_join_child(
 }
 
 #[derive(Debug)]
-struct SelectiveProjectionCandidate {
-    sources: Vec<SelectiveProjectionSource>,
+pub(crate) struct SelectiveProjectionCandidate {
+    pub(crate) sources: Vec<SelectiveProjectionSource>,
 }
 
 #[derive(Debug)]
-struct SelectiveProjectionSource {
+pub(crate) struct SelectiveProjectionSource {
     source_table_index: usize,
-    table: Arc<TableCatalogEntry>,
-    delayed_bindings: HashMap<ColumnBinding, usize>,
+    pub(crate) table: Arc<TableCatalogEntry>,
+    pub(crate) delayed_bindings: HashMap<ColumnBinding, usize>,
     rowid_path: RowIdPath,
 }
 
@@ -531,9 +531,33 @@ fn prove_selective_projection_candidate_profiled(
     let LogicalOperator::Projection(output) = &plan.operator else {
         return reject(reasons, Guard::SelectiveShape);
     };
-    if matches!(output.child.operator, LogicalOperator::RowFetch(_))
-        || output
-            .expressions
+    prove_selective_projection_inputs(
+        &output.expressions,
+        matches!(output.child.operator, LogicalOperator::RowFetch(_)),
+        output.child.stats.estimated_cardinality,
+        |table| unique_get(output.child.as_ref(), table),
+        |table| prove_rowid_path(output.child.as_ref(), table, RowIdPathPolicy::RowPreserving),
+        |table| source_estimated_rows(output.child.as_ref(), table),
+        cost_model,
+        reasons,
+    )
+}
+
+/// One semantic/cost admission algorithm for owned and native selected inputs.
+/// The adapters provide exact source identity, path proof and statistics only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_selective_projection_inputs<'a>(
+    expressions: &[Expression],
+    child_is_fetch: bool,
+    child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    unique_source: impl Fn(usize) -> Option<&'a Get>,
+    path_for_source: impl Fn(usize) -> Option<RowIdPath>,
+    source_rows: impl Fn(usize) -> Option<u64>,
+    cost_model: &CostModel,
+    reasons: &mut Option<RejectionReasons>,
+) -> Option<SelectiveProjectionCandidate> {
+    if child_is_fetch
+        || expressions
             .iter()
             .any(|expression| !expression.evaluation_properties().can_share_evaluation())
     {
@@ -545,14 +569,11 @@ fn prove_selective_projection_candidate_profiled(
     // irreversible: an underestimated join creates one random lookup per
     // actual row. Charge the interval's upper bound for that lookup frontier,
     // while the eager side below remains based on observed source work.
-    let fetched_rows = output
-        .child
-        .stats
-        .estimated_cardinality
+    let fetched_rows = child_cardinality
         .or_else(|| reject(reasons, Guard::SelectiveMissingCardinality))?
         .max;
     let mut by_source = HashMap::<usize, SelectiveProjectionSource>::new();
-    for expression in &output.expressions {
+    for expression in expressions {
         let mut valid = true;
         visit_expression(expression, &mut |candidate| {
             let Expression::ColumnRef(column) = candidate else {
@@ -562,7 +583,7 @@ fn prove_selective_projection_candidate_profiled(
                 valid = false;
                 return;
             }
-            let Some(get) = unique_get(output.child.as_ref(), column.binding.table_index) else {
+            let Some(get) = unique_source(column.binding.table_index) else {
                 return;
             };
             let Some(table) = get
@@ -607,11 +628,7 @@ fn prove_selective_projection_candidate_profiled(
     let sources = by_source
         .into_values()
         .filter_map(|mut source| {
-            let rowid_path = prove_rowid_path(
-                output.child.as_ref(),
-                source.source_table_index,
-                RowIdPathPolicy::RowPreserving,
-            )
+            let rowid_path = path_for_source(source.source_table_index)
             .or_else(|| reject(reasons, Guard::SelectiveRowIdPath))?;
             // The current sparse fetch frontier has a direct-scan locality
             // model. Once a rowid crosses a join, physical lookups are paid
@@ -624,7 +641,7 @@ fn prove_selective_projection_candidate_profiled(
                 return reject(reasons, Guard::SelectiveJoinLocality);
             }
             let carrier_rows =
-                source_estimated_rows(output.child.as_ref(), source.source_table_index)
+                source_rows(source.source_table_index)
                     .or_else(|| reject(reasons, Guard::SelectiveMissingSourceRows))?;
             if fetched_rows >= carrier_rows {
                 return reject(reasons, Guard::SelectiveNoReduction);
