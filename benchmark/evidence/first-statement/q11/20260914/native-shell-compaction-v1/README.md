@@ -629,3 +629,31 @@ The strengthened projection tests and the existing direct CTE tests pass in
 that full run. Tests use the mixed worktree, not clean performance evidence.
 No fresh Q11, C1/W, SQL regress, complete child-choice/fingerprint comparison,
 or performance gain is claimed by this slice. Budgets/model/policy unchanged.
+
+## Selected native dimension-region isolation (850885b6 / a4800132)
+
+The reference widest-payload selection (including table-identity tie-break),
+plain inner-equi eligibility, boundary predicate membership, and comparison
+orientation now have ownership-independent entry points. Native region isolation
+uses these exact decisions over selected child edges instead of exporting a
+whole owned tree. Fact relations are reconnected in the reference traversal
+order; all fact predicates must be assigned. Group holes stay opaque. Constrained
+or output-restricted joins are not flattened. An already isolated two-relation
+region returns its original node without rebuilding it.
+
+Production fixtures now include three relations, the dimension nested below
+the other join, two projection wrappers, and exchanged root children. Tests
+check zero owned binding instantiations/no staging arena growth, exact fact SUM
+and grouping columns, final dimension column and output types, plus the retained
+fact-side join and its operand orientation. The reference rule accepts each
+fixture independently. Two targeted tests (multiple fixture variants) pass.
+The full optimizer run before adding the exchanged-child variant was 1278/5;
+the five failures and assertions match the preceding entry. The exchanged-child
+variant subsequently passed the targeted run. No failures were blessed.
+
+This does not yet remove the general DimensionDeferral fallback: authoritative
+negative results, unsupported enforcement/output layouts, and broader selected
+region coverage need their own audit. Nor is this an independent bag execution
+oracle, exhaustive search-equivalence proof, or clean Q11 performance result.
+No current C1/W, fingerprint, or fixed-work acceptance is claimed. All mixed
+user files and previously staged evidence were excluded from these commits.
