@@ -17,6 +17,7 @@ mod native_domain;
 mod native_join_elimination;
 mod native_late_payload;
 mod native_post_reduction;
+mod native_scalar_aggregate_window;
 mod native_join_preaggregation;
 mod native_join_subsumption;
 mod native_non_null_inputs;
@@ -691,6 +692,7 @@ impl TransformationRule for PlannerTransformationRule {
                 | PlannerTransformation::AggregateDimensionSharing
                 | PlannerTransformation::LatePayloadFetch
                 | PlannerTransformation::AggregatePostReduction
+                | PlannerTransformation::ScalarAggregateWindow
         ) {
             let state = self
                 .planner_state
@@ -822,6 +824,15 @@ impl TransformationRule for PlannerTransformationRule {
                     .into_iter()
                     .collect()
                 }
+                PlannerTransformation::ScalarAggregateWindow => {
+                    native_scalar_aggregate_window::try_native_scalar_aggregate_window(
+                        &binding.root,
+                        ctx,
+                        &state,
+                    )?
+                    .into_iter()
+                    .collect()
+                }
                 _ => unreachable!("native dispatch guard changed"),
             }
         } else {
@@ -884,6 +895,7 @@ impl TransformationRule for PlannerTransformationRule {
                         | PlannerTransformation::CteDemandPushdown
                         | PlannerTransformation::CteFilterPushdown
                         | PlannerTransformation::AggregatePostReduction
+                        | PlannerTransformation::ScalarAggregateWindow
                 ))
                 && !direct_native.is_empty();
             let (plan, nested_group_holes, selected_proofs) = if native_direct_only {
