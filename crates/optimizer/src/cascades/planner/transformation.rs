@@ -25,6 +25,8 @@ mod native_non_null_inputs;
 mod native_limit_tests;
 #[cfg(test)]
 mod native_mark_tests;
+#[cfg(test)]
+mod native_key_domain_tests;
 pub(super) mod settlement;
 mod staging;
 
@@ -2673,6 +2675,13 @@ fn try_native_key_domain_transfer(
         .ok_or_else(|| paro_error::internal("native key-domain shell lost its probe"))?
         .operator
         .clone();
+    let mut fenced = false;
+    paro_planner::visitor::enumerate_expression_refs(&probe_operator, |expression| {
+        fenced |= expression.evaluation_properties().is_reorder_fence();
+    });
+    if fenced {
+        return Ok(None);
+    }
     let mut conditions = domain.conditions.clone();
     let (mut probe_operator, target_child) = match probe_operator {
         LogicalOperator::Projection(projection) => {
@@ -2719,24 +2728,10 @@ fn try_native_key_domain_transfer(
             (LogicalOperator::Aggregate(aggregate), target)
         }
         LogicalOperator::Filter(filter) => {
-            if filter
-                .expressions
-                .iter()
-                .any(|expression| expression.evaluation_properties().is_reorder_fence())
-            {
-                return Ok(None);
-            }
             let target = filter.child.clone();
             (LogicalOperator::Filter(filter), target)
         }
         LogicalOperator::Order(order) => {
-            if order
-                .orders
-                .iter()
-                .any(|order| order.expression.evaluation_properties().is_reorder_fence())
-            {
-                return Ok(None);
-            }
             let target = order.child.clone();
             (LogicalOperator::Order(order), target)
         }
