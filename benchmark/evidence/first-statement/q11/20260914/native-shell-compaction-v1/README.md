@@ -436,6 +436,39 @@ complete FilterPushdown coverage, runtime semantics or current Q11 speed; no
 performance or SQL campaign ran. Nonempty predicate routing in the subsumption
 prelude and other production bridges remain to be migrated.
 
+### Independently materializable inputs (6ce046b0)
+
+Audit found an additional avoidable bridge: AggregateInputMaterialization's
+native path rejected the entire binding when any otherwise eligible scalar
+could not be placed below the root join. The semantic producer instead retains
+each successful placement and leaves rejected inputs at their original site.
+The native loop now follows that behavior, removing the redundant eager
+candidate collection/deduplication and all-input placement gate. A successful
+binding remap still clears the rejection set and retries dependent expressions.
+
+A new independent production Memo fixture has one narrowing total input whose
+raw column is also a join key (must stay) and another on the opposite input
+(may move). Both candidate orders are checked against the owned reference,
+including preserved rejected expression, output types, one materialized input,
+one output, zero owned instantiations and no settlement arena growth. The test
+uses a test-only infallible scalar contract; it is not a runtime arithmetic or
+bag-semantics oracle. The initial fixture mistakenly used scalar aggregation
+and mixed in the separate plain-grouping gate; after correcting it to grouped
+aggregation, the exact HEAD production function was restored temporarily and
+the corrected test reproduced the owned bridge (1 vs0). Restoring the new
+implementation makes both orders pass.
+
+Validation: materialization12/engine111 pass; full optimizer1273 pass/5 fail,
+with the same three grant-declaration errors, statistics-cache assertion and
+RF-retention assertion recorded above. No failures were blessed. No Q11,
+fixed-work/fingerprint or SQL runtime campaign was run. Richer placement paths
+and unsupported aggregate roots remain outside this native subset.
+
+Subsumption's nonempty-predicate prelude remains open: the existing shared
+domain closure handles inner joins, not the required SEMI boundary routing.
+It cannot be substituted for the complete FilterPushdown prelude unchanged.
+No separate predicate semantics were introduced to bypass that gap.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
