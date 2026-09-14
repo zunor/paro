@@ -773,3 +773,28 @@ Full optimizer: 1282 passed / same five failure names and assertion values.
 No bless, fresh Q11, fixed-work/fingerprint campaign or execution/bag oracle in
 this slice. This closes a concrete fallback contract violation, not the entire
 owned-IR migration. User mixed changes were excluded from the commit.
+
+## DimensionDeferral production fallback removed
+
+DimensionDeferral is now native-only in Memo search. Its production owned
+dispatch is unreachable, and the owned recognizer, traversal, tree construction
+and region rebuilding compile only under cfg(test). Shared scalar substitution,
+dimension selection and condition contracts remain production code. The temporary
+partial-authority flag is removed. A final root-layout mismatch is an explicit
+internal contract error rather than a silent owned retry.
+
+The selected-grammar audit covers aggregate eligibility, projection substitution,
+Get/CTERef dimensions, connected inner-equi isolation, opaque group holes and
+constrained subregions, both-key mobility, grouping domains, key coverage,
+non-distinct/merge eligibility and exact final binding/type identity. Memo
+canonicalizes join projection maps; missing expressions/layouts/arity are errors,
+not permission to expand another group alternative. This is removal of this
+rule's transport implementation, not proof of optimal model-cost search closure.
+
+`cargo check --locked -p paro-optimizer -p paro-compiler --quiet` passes without
+the owned implementation. Full optimizer: 1282 pass / same 5 assertion failures.
+After cfg/import formatting, all 6 native deferral tests pass (multiple fixtures).
+No baseline was blessed. Unit/check runs are from the mixed worktree and are not
+clean performance evidence. No fresh Q11, fixed-work/admitted-prefix replay,
+fingerprint or independent bag-execution campaign was run. Other rules still
+retain owned bridges and those global acceptance gates remain open.
