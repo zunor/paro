@@ -78,6 +78,7 @@ pub(super) fn try_native_scalar_aggregate_window(
 
 #[derive(Clone, Copy)]
 enum Shape {
+    Boundary,
     Join,
     Detail,
     WrapperProjection,
@@ -98,6 +99,15 @@ impl Shape {
                 Some(&[Self::Detail, Self::WrapperProjection])
             }
             (Self::Detail | Self::SourceFilter, LogicalOperator::Filter(_)) => Some(&[Self::Get]),
+            (Self::Detail, LogicalOperator::Join(Join::Comparison(join)))
+                if plain_reduction_carrier(join) =>
+            {
+                if matches!(join.join_type, JoinType::Semi | JoinType::Anti) {
+                    Some(&[Self::Detail, Self::Boundary])
+                } else {
+                    Some(&[Self::Boundary, Self::Detail])
+                }
+            }
             (Self::WrapperProjection, LogicalOperator::Projection(_)) => {
                 Some(&[Self::WrapperAggregate])
             }
@@ -124,6 +134,18 @@ fn expand_binding(
     use crate::cascades::rules::PatternRead;
     if !ctx.admit_fact_work(super::BudgetDimension::RuleWorkPerGroup, 1)? {
         return Ok(None);
+    }
+    if matches!(shape, Shape::Boundary) {
+        // The non-preserved side is opaque in this rewrite. Do not accept an
+        // expanded subtree that could contain another scalar-window witness:
+        // claiming native completeness would then hide its owned peer rewrite.
+        return Ok(match operand {
+            PatternOperand::Group(_) => Some(operand.clone()),
+            PatternOperand::Expression { children, .. } if children.is_empty() => {
+                Some(operand.clone())
+            }
+            _ => None,
+        });
     }
     let (group, expression) = match operand {
         PatternOperand::Expression {
@@ -300,29 +322,75 @@ fn rewrite_shell(
     let mut root_node = nodes
         .pop()
         .ok_or_else(|| paro_error::internal("native scalar window lost root node"))?;
+    let root_id = root_node.id;
+    let root_stats = root_node.stats.clone();
+    let has_carriers = !rewrite.detail_path.is_empty();
+    let input_filter_width = layouts[rewrite.detail_filter_index].len();
     let mut filter = Filter {
         expressions: predicates,
         child: NativeChild::Node(nodes.len()),
-        projection_map: ProjectionMap::new(detail_projection_indices),
+        projection_map: ProjectionMap::new(if has_carriers {
+            (0..input_filter_width).collect()
+        } else {
+            detail_projection_indices.clone()
+        }),
     };
     let window_node = nodes.len();
     nodes.push(NativeNode {
         id: state.bind_context.next_plan_id(),
         stats: nodes
-            .get(detail_index)
+            .get(rewrite.detail_filter_index)
             .map(|node| node.stats.clone())
             .unwrap_or_else(NodeStats::default),
         operator: LogicalOperator::Window(Window {
             window_index,
             expressions: vec![window_expression],
-            child: NativeChild::Node(detail_index),
+            child: NativeChild::Node(rewrite.detail_filter_index),
         }),
         source_proofs: Box::new([]),
     });
     filter.child = NativeChild::Node(window_node);
     root_node.operator = LogicalOperator::Filter(filter);
     root_node.source_proofs = Box::new([]);
+    if has_carriers {
+        root_node.id = state.bind_context.next_plan_id();
+    }
     nodes.push(root_node);
+    let mut replacement = nodes.len() - 1;
+    // Install before any semi/anti reduction: the scalar aggregate is over
+    // the original filtered source, not the surviving reduction rows. Keep
+    // each non-preserved sibling as its exact native edge.
+    for (carrier_index, left) in rewrite.detail_path.into_iter().rev() {
+        let mut carrier_node = nodes[carrier_index].clone();
+        let LogicalOperator::Join(Join::Comparison(carrier)) = &mut carrier_node.operator else {
+            unreachable!()
+        };
+        let (child, projection) = if left {
+            (&mut carrier.left, &mut carrier.left_projection_map)
+        } else {
+            (&mut carrier.right, &mut carrier.right_projection_map)
+        };
+        if carrier_index == detail_index {
+            let NativeChild::Node(old_child) = child else {
+                return Ok(None);
+            };
+            let existing = projection.to_indices(layouts[*old_child].len());
+            let Some(composed) = detail_projection_indices
+                .iter()
+                .map(|ordinal| existing.get(*ordinal).copied())
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            *projection = ProjectionMap::new(composed);
+            carrier_node.id = root_id;
+            carrier_node.stats = root_stats.clone();
+        }
+        *child = NativeChild::Node(replacement);
+        carrier_node.source_proofs = Box::new([]);
+        nodes.push(carrier_node);
+        replacement = nodes.len() - 1;
+    }
     let root = nodes.len() - 1;
     let (shell, result_layout) = super::compact_native_shell_with_layout(NativeShell {
         nodes: nodes.into_boxed_slice(),
@@ -433,6 +501,8 @@ fn rewrite_wrapped_shell(
 }
 
 struct Rewrite {
+    detail_filter_index: usize,
+    detail_path: Vec<(usize, bool)>,
     scalar_binding: ColumnBinding,
     scalar_source_binding: ColumnBinding,
     scalar_expression: Expression,
@@ -446,8 +516,27 @@ fn recognize(
     detail_index: usize,
     scalar_index: usize,
 ) -> Result<Option<Rewrite>> {
+    let mut detail_filter_index = detail_index;
+    let mut detail_path = Vec::new();
+    loop {
+        let Some(node) = nodes.get(detail_filter_index) else {
+            return Ok(None);
+        };
+        let LogicalOperator::Join(Join::Comparison(carrier)) = &node.operator else {
+            break;
+        };
+        if !plain_reduction_carrier(carrier) {
+            return Ok(None);
+        }
+        let left = matches!(carrier.join_type, JoinType::Semi | JoinType::Anti);
+        let NativeChild::Node(child) = (if left { &carrier.left } else { &carrier.right }) else {
+            return Ok(None);
+        };
+        detail_path.push((detail_filter_index, left));
+        detail_filter_index = *child;
+    }
     let LogicalOperator::Filter(detail_filter) = nodes
-        .get(detail_index)
+        .get(detail_filter_index)
         .ok_or_else(|| paro_error::internal("native scalar window lost detail node"))?
         .operator
         .clone()
@@ -561,11 +650,24 @@ fn recognize(
         return Ok(None);
     }
     Ok(Some(Rewrite {
+        detail_filter_index,
+        detail_path,
         scalar_binding,
         scalar_source_binding: ColumnBinding::new(scalar.aggregate_index, 0),
         scalar_expression: scalar.scalar_expression,
         aggregate: aggregate.into_inner(),
     }))
+}
+
+fn plain_reduction_carrier<C>(join: &ComparisonJoin<C>) -> bool {
+    matches!(
+        join.join_type,
+        JoinType::Semi | JoinType::Anti | JoinType::RightSemi | JoinType::RightAnti
+    ) && join.mark_index.is_none()
+        && join.mark_semantics == MarkJoinSemantics::NotMark
+        && join.duplicate_eliminated_columns.is_empty()
+        && !join.delim_flipped
+        && !join.conditions.is_empty()
 }
 
 struct ScalarBranch {
@@ -1069,6 +1171,90 @@ mod tests {
     }
 
     #[test]
+    fn production_reduction_carrier_binding_stays_native() {
+        for kind in [
+            JoinType::Semi,
+            JoinType::Anti,
+            JoinType::RightSemi,
+            JoinType::RightAnti,
+        ] {
+            let mut input = MemoBuilder::build(
+                carrier_shape(kind),
+                BindContext::new(),
+                SearchBudget::default(),
+            )
+            .unwrap();
+            let state = input.planner_state.clone();
+            state.write().unwrap().session =
+                Some(paro_context::TestStatementContextBuilder::minimal().build());
+            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let binding = {
+                let state = state.read().unwrap();
+                matching::scoped_pattern_bindings(
+                    PlannerTransformation::ScalarAggregateWindow,
+                    input.root,
+                    expression,
+                    &input.memo,
+                    &state,
+                    None,
+                    BudgetDimension::RuleWorkPerGroup,
+                )
+                .unwrap()
+                .bindings
+                .first()
+                .cloned()
+                .expect("carrier witness")
+            };
+            let mut ctx = TransformContext::new(&mut input.memo, input.root);
+            let shell =
+                try_native_scalar_aggregate_window(&binding.root, &mut ctx, &state.read().unwrap())
+                    .unwrap()
+                    .expect("reduction carrier must not force an owned bridge");
+            assert!(
+                matches!(shell.root_operator(), LogicalOperator::Join(Join::Comparison(join)) if join.join_type == kind)
+            );
+            let rule = super::super::PlannerTransformationRule {
+                transformation: PlannerTransformation::ScalarAggregateWindow,
+                planner_state: state,
+            };
+            assert_eq!(rule.apply_binding(&binding, &mut ctx).unwrap().len(), 1);
+        }
+    }
+
+    fn carrier_shape(kind: JoinType) -> OwnedLogicalPlan {
+        let mut plan = shape();
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
+            unreachable!()
+        };
+        let detail = std::mem::replace(
+            &mut *join.left,
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+        );
+        let gate = get(60, table());
+        let right = matches!(kind, JoinType::RightSemi | JoinType::RightAnti);
+        let condition = if right {
+            JoinCondition::equality(
+                column(60, 0, LogicalType::BigInt),
+                column(10, 0, LogicalType::BigInt),
+            )
+        } else {
+            JoinCondition::equality(
+                column(10, 0, LogicalType::BigInt),
+                column(60, 0, LogicalType::BigInt),
+            )
+        };
+        let (left, right) = if right {
+            (gate, detail)
+        } else {
+            (detail, gate)
+        };
+        *join.left = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(kind, left, right, vec![condition]),
+        )));
+        plan
+    }
+
+    #[test]
     fn production_binding_builds_native_scalar_window() {
         let mut input =
             MemoBuilder::build(shape(), BindContext::new(), SearchBudget::default()).unwrap();
@@ -1286,9 +1472,72 @@ mod tests {
         fn execute(shell: &NativeShell, rows: &[Row]) -> Vec<Row> {
             let layouts = shell.layouts().unwrap();
             let mut results: Vec<Vec<Row>> = Vec::new();
+            let gate = vec![
+                vec![Some(3), None],
+                vec![Some(3), None],
+                vec![Some(9), None],
+                vec![None, None],
+            ];
             for node in &shell.nodes {
                 let output = match &node.operator {
-                    LogicalOperator::Get(_) => rows.to_vec(),
+                    LogicalOperator::Get(get) => {
+                        if get.table_index == 60 {
+                            gate.clone()
+                        } else {
+                            rows.to_vec()
+                        }
+                    }
+                    LogicalOperator::Join(Join::Comparison(join)) => {
+                        let child = |edge: &NativeChild| match edge {
+                            NativeChild::Node(index) => {
+                                (results[*index].clone(), layouts[*index].clone())
+                            }
+                            NativeChild::Group { layout, .. }
+                            | NativeChild::MemoGroup { layout, .. } => {
+                                assert_eq!(layout.bindings()[0].table_index, 60);
+                                (gate.clone(), layout.clone())
+                            }
+                        };
+                        let (left, left_layout) = child(&join.left);
+                        let (right, right_layout) = child(&join.right);
+                        let preserve_left =
+                            matches!(join.join_type, JoinType::Semi | JoinType::Anti);
+                        let anti = matches!(join.join_type, JoinType::Anti | JoinType::RightAnti);
+                        let (preserved, other, map, width) = if preserve_left {
+                            (&left, &right, &join.left_projection_map, left_layout.len())
+                        } else {
+                            (
+                                &right,
+                                &left,
+                                &join.right_projection_map,
+                                right_layout.len(),
+                            )
+                        };
+                        let projection = map.to_indices(width);
+                        preserved
+                            .iter()
+                            .filter(|row| {
+                                let matched = other.iter().any(|peer| {
+                                    let (l, r) = if preserve_left {
+                                        (*row, peer)
+                                    } else {
+                                        (peer, *row)
+                                    };
+                                    join.conditions.iter().all(|condition| {
+                                        assert_eq!(
+                                            condition.comparison,
+                                            paro_planner::operator::JoinComparisonType::Equal
+                                        );
+                                        value(&condition.left, l, &left_layout)
+                                            .zip(value(&condition.right, r, &right_layout))
+                                            .is_some_and(|(a, b)| a == b)
+                                    })
+                                });
+                                matched != anti
+                            })
+                            .map(|row| projection.iter().map(|index| row[*index]).collect())
+                            .collect()
+                    }
                     LogicalOperator::Projection(projection) => {
                         let NativeChild::Node(child) = projection.child else {
                             panic!("unexpected hole")
@@ -1353,139 +1602,159 @@ mod tests {
             }
             results[shell.root].clone()
         }
-        for wrapped in [false, true] {
-            let plan = if wrapped {
-                OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
-                    80,
-                    shape(),
+        for carrier in [
+            None,
+            Some(JoinType::Semi),
+            Some(JoinType::Anti),
+            Some(JoinType::RightSemi),
+            Some(JoinType::RightAnti),
+        ] {
+            for wrapped in [false, true] {
+                let base = carrier.map_or_else(shape, carrier_shape);
+                let plan = if wrapped {
+                    OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+                        80,
+                        base,
+                        vec![
+                            column(10, 1, LogicalType::Integer),
+                            column(10, 0, LogicalType::BigInt),
+                        ],
+                    )))
+                } else {
+                    base
+                };
+                let mut input =
+                    MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+                let state = input.planner_state.read().unwrap();
+                let mut ctx = TransformContext::new(&mut input.memo, input.root);
+                let shell = try_native_scalar_aggregate_window(
+                    &PatternOperand::Group(input.root),
+                    &mut ctx,
+                    &state,
+                )
+                .unwrap()
+                .unwrap();
+                for rows in [
+                    vec![],
+                    vec![vec![None, None], vec![Some(1), None]],
                     vec![
-                        column(10, 1, LogicalType::Integer),
-                        column(10, 0, LogicalType::BigInt),
+                        vec![Some(3), Some(-2)],
+                        vec![Some(3), Some(-2)],
+                        vec![Some(5), Some(8)],
+                        vec![None, Some(100)],
+                        vec![Some(-1), Some(200)],
+                        vec![Some(9), None],
                     ],
-                )))
-            } else {
-                shape()
-            };
-            let mut input =
-                MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
-            let state = input.planner_state.read().unwrap();
-            let mut ctx = TransformContext::new(&mut input.memo, input.root);
-            let shell = try_native_scalar_aggregate_window(
-                &PatternOperand::Group(input.root),
-                &mut ctx,
-                &state,
-            )
-            .unwrap()
-            .unwrap();
-            for rows in [
-                vec![],
-                vec![vec![None, None], vec![Some(1), None]],
-                vec![
-                    vec![Some(3), Some(-2)],
-                    vec![Some(3), Some(-2)],
-                    vec![Some(5), Some(8)],
-                    vec![None, Some(100)],
-                    vec![Some(-1), Some(200)],
-                    vec![Some(9), None],
-                ],
-            ] {
-                let selected: Vec<Row> = rows
-                    .iter()
-                    .filter(|row| row[0].is_some_and(|key| key > 0))
-                    .cloned()
-                    .collect();
-                let values: Vec<i64> = selected.iter().filter_map(|row| row[1]).collect();
-                let sum: Option<i64> = (!values.is_empty()).then(|| values.iter().sum());
-                let mut expected: Vec<Row> = selected
-                    .into_iter()
-                    .filter(|row| row[0].zip(sum).is_some_and(|(key, sum)| key > sum))
-                    .collect();
-                if wrapped {
-                    for row in &mut expected {
-                        row.swap(0, 1);
+                ] {
+                    let selected: Vec<Row> = rows
+                        .iter()
+                        .filter(|row| row[0].is_some_and(|key| key > 0))
+                        .cloned()
+                        .collect();
+                    let values: Vec<i64> = selected.iter().filter_map(|row| row[1]).collect();
+                    let sum: Option<i64> = (!values.is_empty()).then(|| values.iter().sum());
+                    let mut expected: Vec<Row> = selected
+                        .into_iter()
+                        .filter(|row| row[0].zip(sum).is_some_and(|(key, sum)| key > sum))
+                        .collect();
+                    if let Some(kind) = carrier {
+                        let anti = matches!(kind, JoinType::Anti | JoinType::RightAnti);
+                        expected
+                            .retain(|row| row[0].is_some_and(|key| key == 3 || key == 9) != anti);
                     }
+                    if wrapped {
+                        for row in &mut expected {
+                            row.swap(0, 1);
+                        }
+                    }
+                    assert_eq!(execute(&shell, &rows), expected);
                 }
-                assert_eq!(execute(&shell, &rows), expected);
             }
         }
     }
 
     #[test]
     fn expanded_source_reads_invalidate_and_budget_retry_is_atomic() {
-        let mut input =
-            MemoBuilder::build(shape(), BindContext::new(), SearchBudget::default()).unwrap();
-        let state = input.planner_state.read().unwrap();
-        let groups_before = input.memo.group_count();
-        let arena_before = state.staging_arena.len();
-        input
-            .memo
-            .group_ledger_mut(input.root)
-            .unwrap()
-            .set_limit(BudgetDimension::RuleWorkPerGroup, 2);
-        {
-            let mut ctx = TransformContext::new(&mut input.memo, input.root);
-            assert!(try_native_scalar_aggregate_window(
-                &PatternOperand::Group(input.root),
-                &mut ctx,
-                &state,
-            )
-            .unwrap()
-            .is_none());
+        for plan in [
+            shape(),
+            carrier_shape(JoinType::Semi),
+            carrier_shape(JoinType::RightAnti),
+        ] {
+            let mut input =
+                MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+            let state = input.planner_state.read().unwrap();
+            let groups_before = input.memo.group_count();
+            let arena_before = state.staging_arena.len();
+            input
+                .memo
+                .group_ledger_mut(input.root)
+                .unwrap()
+                .set_limit(BudgetDimension::RuleWorkPerGroup, 2);
+            {
+                let mut ctx = TransformContext::new(&mut input.memo, input.root);
+                assert!(try_native_scalar_aggregate_window(
+                    &PatternOperand::Group(input.root),
+                    &mut ctx,
+                    &state,
+                )
+                .unwrap()
+                .is_none());
+            }
+            assert_eq!(input.memo.group_count(), groups_before);
+            assert_eq!(state.staging_arena.len(), arena_before);
+            input
+                .memo
+                .group_ledger_mut(input.root)
+                .unwrap()
+                .set_limit(BudgetDimension::RuleWorkPerGroup, 65_536);
+            let reads = {
+                let mut ctx = TransformContext::new(&mut input.memo, input.root);
+                assert!(try_native_scalar_aggregate_window(
+                    &PatternOperand::Group(input.root),
+                    &mut ctx,
+                    &state,
+                )
+                .unwrap()
+                .is_some());
+                ctx.take_fact_reads()
+            };
+            assert_eq!(
+                reads.len(),
+                groups_before,
+                "all expanded source groups must be subscribed"
+            );
+            assert!(reads
+                .iter()
+                .all(|read| read.is_current(&input.memo).unwrap()));
+            let source = reads
+                .iter()
+                .find(|read| {
+                    input
+                        .memo
+                        .group(read.group)
+                        .unwrap()
+                        .logical_exprs()
+                        .iter()
+                        .any(|id| {
+                            let payload = input.memo.logical_expr(*id).unwrap().payload;
+                            matches!(
+                                state.payloads.logical[payload.index()]
+                                    .semantic_template
+                                    .operator,
+                                LogicalOperator::Get(_)
+                            )
+                        })
+                })
+                .unwrap();
+            input
+                .memo
+                .group_mut(source.group)
+                .unwrap()
+                .logical_properties
+                .maximum_cardinality = Some(7);
+            assert!(!source.is_current(&input.memo).unwrap());
+            assert_eq!(input.memo.group_count(), groups_before);
+            assert_eq!(state.staging_arena.len(), arena_before);
         }
-        assert_eq!(input.memo.group_count(), groups_before);
-        assert_eq!(state.staging_arena.len(), arena_before);
-        input
-            .memo
-            .group_ledger_mut(input.root)
-            .unwrap()
-            .set_limit(BudgetDimension::RuleWorkPerGroup, 65_536);
-        let reads = {
-            let mut ctx = TransformContext::new(&mut input.memo, input.root);
-            assert!(try_native_scalar_aggregate_window(
-                &PatternOperand::Group(input.root),
-                &mut ctx,
-                &state,
-            )
-            .unwrap()
-            .is_some());
-            ctx.take_fact_reads()
-        };
-        assert_eq!(
-            reads.len(),
-            groups_before,
-            "all expanded source groups must be subscribed"
-        );
-        assert!(reads
-            .iter()
-            .all(|read| read.is_current(&input.memo).unwrap()));
-        let source = reads
-            .iter()
-            .find(|read| {
-                input
-                    .memo
-                    .group(read.group)
-                    .unwrap()
-                    .logical_exprs()
-                    .iter()
-                    .any(|id| {
-                        let payload = input.memo.logical_expr(*id).unwrap().payload;
-                        matches!(
-                            state.payloads.logical[payload.index()]
-                                .semantic_template
-                                .operator,
-                            LogicalOperator::Get(_)
-                        )
-                    })
-            })
-            .unwrap();
-        input
-            .memo
-            .group_mut(source.group)
-            .unwrap()
-            .logical_properties
-            .maximum_cardinality = Some(7);
-        assert!(!source.is_current(&input.memo).unwrap());
-        assert_eq!(input.memo.group_count(), groups_before);
-        assert_eq!(state.staging_arena.len(), arena_before);
     }
 }
