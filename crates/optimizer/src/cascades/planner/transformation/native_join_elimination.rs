@@ -11,8 +11,8 @@
 //!
 //! The adapter is intentionally fail-closed.  It supports the transparent
 //! relational shells used by the scoped outer-join matcher and the exact
-//! comparison-join proof used by the owned rule. An unfamiliar operator or
-//! recursive control node declines the native path. Opaque control inputs must
+//! comparison-join proof used by the owned rule. An unfamiliar operator
+//! declines the native path. Opaque control inputs must
 //! retain their exact identities and multiplicities. Missing key evidence is
 //! a negative for this selected binding, with its fact reads retained for retry.
 
@@ -60,13 +60,6 @@ fn rewrite_shell(shell: NativeShell) -> Result<Option<NativeShell>> {
 }
 
 fn rewrite_shell_result(shell: NativeShell) -> Result<EliminationResult> {
-    if shell
-        .nodes
-        .iter()
-        .any(|node| matches!(node.operator, LogicalOperator::RecursiveCTE(_)))
-    {
-        return Ok(EliminationResult::Unsupported);
-    }
     let control_boundaries = controlled_boundary_occurrences(&shell);
     let root = shell.root;
     let layouts = shell.layouts()?;
@@ -346,6 +339,12 @@ fn required_children(
             // Consumer requirements name its own output, not producer slots.
             child_bindings(&cte.cte_query),
             filter_required_bindings(required, &child_bindings(&cte.child)),
+        ]),
+        LogicalOperator::RecursiveCTE(cte) => Some(vec![
+            // Both arms retain their full positional contracts. No recursive
+            // demand narrowing, unfolding or producer rebinding happens here.
+            child_bindings(&cte.anchor),
+            child_bindings(&cte.recursive),
         ]),
         LogicalOperator::DependentJoin(join) => {
             let mut left = child_bindings(&join.left);
@@ -1039,7 +1038,7 @@ mod tests {
         use paro_planner::binder::context::BindContext;
 
         for unique in [false, true] {
-            for wrapper in 0..6 {
+            for wrapper in 0..7 {
                 let wrapped = wrapper != 0;
                 let plan = if wrapped {
                     let child = if wrapper == 1 {
@@ -1048,6 +1047,26 @@ mod tests {
                         ))
                     } else if wrapper == 2 {
                         window(memo_candidate(), column(10, 0))
+                    } else if wrapper == 6 {
+                        OwnedLogicalPlan::synthetic(LogicalOperator::RecursiveCTE(
+                            paro_planner::operator::RecursiveCTE {
+                                cte_index: 60,
+                                cte_name: "recursive_boundary".into(),
+                                column_names: vec!["key".into()],
+                                column_types: vec![LogicalType::Integer],
+                                union_all: true,
+                                anchor: Box::new(memo_candidate()),
+                                recursive: Box::new(OwnedLogicalPlan::synthetic(
+                                    LogicalOperator::CTERef(paro_planner::operator::CTERef::new(
+                                        60,
+                                        61,
+                                        "recursive_reader".into(),
+                                        vec!["key".into()],
+                                        vec![LogicalType::Integer],
+                                    )),
+                                )),
+                            },
+                        ))
                     } else if wrapper == 5 {
                         let mut consumer = memo_candidate();
                         let LogicalOperator::Projection(projection) = &mut consumer.operator else {
@@ -1109,7 +1128,14 @@ mod tests {
                     OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
                         20,
                         child,
-                        vec![column(if wrapper == 3 { 40 } else { 10 }, 0)],
+                        vec![column(
+                            match wrapper {
+                                3 => 40,
+                                6 => 60,
+                                _ => 10,
+                            },
+                            0,
+                        )],
                     )))
                 } else {
                     memo_candidate()
@@ -1231,6 +1257,37 @@ mod tests {
                         assert_eq!(cte.output_columns.len(), 1);
                         assert_eq!(cte.output_columns[0].binding, ColumnBinding::new(51, 0));
                         assert_eq!(cte.output_columns[0].definition.0, 0);
+                    }
+                }
+                if wrapper == 6 {
+                    if let Some(output) = outputs.first() {
+                        let memo = context.memo();
+                        let group = output.key.children[0];
+                        let expression = memo.group(group).unwrap().logical_exprs()[0];
+                        let logical = memo.logical_expr(expression).unwrap();
+                        let state = rule.planner_state.read().unwrap();
+                        let LogicalOperator::RecursiveCTE(cte) = &state.payloads.logical
+                            [logical.payload.index()]
+                        .semantic_template
+                        .operator
+                        else {
+                            panic!("native staging must retain the recursive wrapper")
+                        };
+                        assert_eq!(cte.cte_index, 60);
+                        assert!(cte.union_all);
+                        assert_eq!(cte.column_types, vec![LogicalType::Integer]);
+                        let recursive =
+                            memo.group(logical.key.children[1]).unwrap().logical_exprs()[0];
+                        let recursive = memo.logical_expr(recursive).unwrap();
+                        let LogicalOperator::CTERef(reference) = &state.payloads.logical
+                            [recursive.payload.index()]
+                        .semantic_template
+                        .operator
+                        else {
+                            panic!("recursive reference must remain an unchanged leaf")
+                        };
+                        assert_eq!(reference.cte_index, 60);
+                        assert_eq!(reference.table_index, 61);
                     }
                 }
                 if !unique {
