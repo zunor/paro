@@ -139,12 +139,23 @@ source-sensitive RF ordering, budget retry, invalidation, and cancellation/
 rollback coverage. No new Q11, admitted-fingerprint comparison, or full SQL
 regression was run for this commit; tests used the mixed working tree.
 
+`9bf11f9f` extends scalar-window native production through selected
+Projection/Filter ancestors. A real scoped matcher binding failed native
+production before this change and now stages one native result, preserving
+the reordered projection and residual filter. Ancestor expressions are
+checked against each rewritten child layout; an ancestor reading the removed
+scalar column is rejected even if its output type remains unchanged. Copied
+ancestor proof lineage is cleared. The nullable/duplicate/negative-value bag
+oracle now also executes the produced reordered projection. Seven native
+scalar tests, four existing scalar-window tests and 111 engine tests passed.
+No clean-source Q11 or fingerprint comparison was run for this slice.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
 PredicateTransfer and LatePayloadFetch also retain owned peers for uncovered
 semantics. Scalar-window support is currently limited to the direct finite
-grammar; projection ancestors, reduction carriers, and alternative-rich
+grammar with Projection/Filter ancestors; reduction carriers and alternative-rich
 source groups still require migration. Merely adding a native adapter for
 each rule does not remove those bridges or prove search coverage equivalence.
 Remaining acceptance includes deleting these production fallbacks after
