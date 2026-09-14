@@ -590,6 +590,11 @@ impl TransformationRule for PlannerTransformationRule {
         // for their conservative native subsets. Keep the legacy owned-plan
         // path available for every shape that needs richer semantic handling.
         let mut native_domain_scopes = None;
+        // PredicateTransfer is usually only a partial native alternative. The
+        // narrow base-join case below can prove that the native shell is the
+        // complete legacy rewrite, but that proof must be carried explicitly
+        // so an incomplete shell still retains its owned semantic peer.
+        let mut native_predicate_transfer_complete = false;
         let mut native_elimination_checked = false;
         let mut cte_restriction: Option<(GroupId, cte::CteDomainProof)> = None;
         // Native CTE domain/partition adapters allocate query-local symbols
@@ -730,7 +735,17 @@ impl TransformationRule for PlannerTransformationRule {
                         native_domain_scopes = Some(scopes);
                         vec![shell]
                     } else {
-                        try_native_predicate_transfer(&binding.root, ctx.memo(), &state, &facts)?
+                        let native = try_native_predicate_transfer(
+                            &binding.root,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                        )?;
+                        native_predicate_transfer_complete = native
+                            .as_ref()
+                            .is_some_and(|native| native.complete);
+                        native
+                            .map(|native| native.shell)
                             .into_iter()
                             .collect()
                     }
@@ -921,6 +936,7 @@ impl TransformationRule for PlannerTransformationRule {
             // partial semantic subset, so they deliberately keep their owned
             // peer.
             let native_direct_only = (native_domain_scopes.is_some()
+                || native_predicate_transfer_complete
                 || matches!(
                     self.transformation,
                     PlannerTransformation::JoinRegionEnumeration
@@ -1907,12 +1923,21 @@ struct PlannerRuleEnvironment {
 /// stay on the legacy path.  Declining those cases is important because a
 /// native fast path must not turn missing semantic coverage into an accepted
 /// no-op.
+#[derive(Debug)]
+struct NativePredicateTransfer {
+    shell: NativeShell,
+    /// Whether this shell is a complete replacement for the legacy
+    /// FilterPushdown result for this exact binding. Partial native shells
+    /// must keep the owned semantic peer in the Memo search.
+    complete: bool,
+}
+
 fn try_native_predicate_transfer(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
-) -> Result<Option<NativeShell>> {
+) -> Result<Option<NativePredicateTransfer>> {
     if !native_predicate_transfer_may_apply(binding, memo, state)? {
         return Ok(None);
     }
@@ -1965,6 +1990,7 @@ fn try_native_predicate_transfer(
     {
         return Ok(None);
     }
+    let complete = native_predicate_transfer_is_complete(&filter.expressions);
 
     let child_layout =
         |child: &NativeChild| -> Result<paro_planner::operator::LogicalOutputLayout> {
@@ -2109,11 +2135,44 @@ fn try_native_predicate_transfer(
         });
         root
     };
-    compact_native_shell(NativeShell {
+    let shell = compact_native_shell(NativeShell {
         nodes: nodes.into_boxed_slice(),
         root,
-    })
-    .map(Some)
+    })?;
+    Ok(Some(NativePredicateTransfer {
+        complete,
+        shell,
+    }))
+}
+
+/// The side-local native shell is only complete for a deliberately small
+/// filter contract. `FilterPushdown` combines conjuncts, derives OR domains,
+/// and may retain fenced or aggregate predicates. A single normalized, bound
+/// comparison is the only case where the native route is known to emit
+/// exactly the same moved predicate without rebuilding the owned tree.
+fn native_predicate_transfer_is_complete(expressions: &[Expression]) -> bool {
+    if expressions.len() != 1 {
+        return false;
+    }
+    let Expression::Comparison(comparison) = &expressions[0] else {
+        return false;
+    };
+    if !comparison.has_bound_input_contract()
+        || comparison.left.return_type() != comparison.right.return_type()
+    {
+        return false;
+    }
+    if !matches!(
+        (comparison.left.as_ref(), comparison.right.as_ref()),
+        (Expression::ColumnRef(column), Expression::Constant(_)) if column.depth == 0
+    ) {
+        return false;
+    }
+    let Some(normalized) = FilterPushdown::normalize_predicates(expressions.iter().cloned())
+    else {
+        return false;
+    };
+    normalized.len() == 1 && normalized[0].equals(&expressions[0])
 }
 
 /// Compare two native child edges as edges, not as semantic group contracts.
@@ -5705,6 +5764,149 @@ mod tests {
         assert!(native_shell_staging_allowed(
             PlannerTransformation::JoinRegionEnumeration
         ));
+    }
+
+    #[test]
+    fn native_predicate_transfer_completeness_gate_is_fail_closed() {
+        let comparison = |value| {
+            Expression::Comparison(
+                paro_planner::expression::ComparisonExpression::new(
+                    paro_planner::expression::ComparisonType::Equal,
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            ColumnBinding::new(12, 0),
+                            LogicalType::BigInt,
+                        )
+                        .into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into(),
+                    ),
+                )
+                .into(),
+            )
+        };
+        let simple = comparison(2);
+        assert!(native_predicate_transfer_is_complete(std::slice::from_ref(
+            &simple,
+        )));
+        assert!(!native_predicate_transfer_is_complete(&[
+            simple.clone(),
+            comparison(3),
+        ]));
+        let disjunction = Expression::Conjunction(
+            paro_planner::expression::ConjunctionExpression::new(
+                paro_planner::expression::ConjunctionType::Or,
+                vec![simple.clone(), comparison(3)],
+            )
+            .into(),
+        );
+        assert!(!native_predicate_transfer_is_complete(&[disjunction]));
+    }
+
+    #[test]
+    fn complete_native_predicate_transfer_skips_owned_binding_bridge() {
+        let predicate = Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
+                paro_planner::expression::ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(12, 0),
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::BigInt(2), LogicalType::BigInt).into(),
+                ),
+            )
+            .into(),
+        );
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
+                JoinType::Inner,
+                OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                    Get::new_without_table(
+                        12,
+                        vec!["left_key".to_string()],
+                        vec![LogicalType::BigInt],
+                    ),
+                ))),
+                OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                    Get::new_without_table(
+                        13,
+                        vec!["right_key".to_string()],
+                        vec![LogicalType::BigInt],
+                    ),
+                ))),
+                Vec::new(),
+            ))),
+            vec![predicate],
+        )));
+        let mut input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
+            .unwrap();
+        let state = input.planner_state.clone();
+        state.write().unwrap().session = Some(
+            paro_context::TestStatementContextBuilder::minimal().build(),
+        );
+        let root = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let binding = {
+            let state = state.read().unwrap();
+            let bindings = matching::scoped_pattern_bindings(
+                PlannerTransformation::PredicateTransfer,
+                input.root,
+                root,
+                &input.memo,
+                &state,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap();
+            bindings
+                .bindings
+                .into_vec()
+                .into_iter()
+                .next()
+                .expect("base join predicate binding")
+        };
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::PredicateTransfer,
+            planner_state: state.clone(),
+        };
+        {
+            let state = state.read().unwrap();
+            let logical = input.memo.logical_expr(root).unwrap();
+            let payload = state.payloads.logical.get(logical.payload.index()).unwrap();
+            let LogicalOperator::Filter(filter) = &payload.semantic_template.operator else {
+                panic!("test root is not a filter")
+            };
+            assert!(native_predicate_transfer_is_complete(&filter.expressions));
+        }
+        {
+            let state = state.read().unwrap();
+            assert!(native_predicate_transfer_may_apply(
+                &binding.root,
+                &input.memo,
+                &state,
+            )
+            .unwrap());
+        }
+        let before = semantic_plan::owned_binding_instantiation_count();
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            semantic_plan::owned_binding_instantiation_count(),
+            before,
+            "a complete native predicate rewrite must not instantiate an owned shell"
+        );
+        let state = state.read().unwrap();
+        let output = state
+            .payloads
+            .logical
+            .get(outputs[0].payload.index())
+            .expect("staged predicate-transfer output");
+        assert!(matches!(output.semantic_template.operator, LogicalOperator::Join(_)));
     }
 
     #[test]
