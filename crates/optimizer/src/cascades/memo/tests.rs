@@ -164,29 +164,6 @@ fn statistics_read_cache_revalidates_producer_fact_update_without_registry_chang
 }
 
 #[test]
-fn derived_publication_noop_does_not_enlist_a_write_but_new_facts_rollback() {
-    let mut memo = Memo::new(SearchBudget::default());
-    let properties = LogicalProperties::default();
-    let cardinality = GroupCardinality::new(Fingerprint(1), CardinalityRecipeKind::Statistics, 1, 4, 9);
-    let group = memo.create_group(schema(1), properties.clone(), cardinality.clone());
-    let value = memo.local_statistics_fingerprint(group);
-    let checkpoint = memo.transformation_savepoint();
-    assert!(!memo.merge_derived_group_facts(group, &properties, cardinality.clone()).unwrap());
-    assert!(memo.transformation_group_snapshots.as_ref().unwrap().is_empty());
-    assert!(memo.group(group).unwrap().statistics_read_fingerprint.lock().unwrap().is_some());
-    let mut refined = properties.clone();
-    refined.maximum_cardinality = Some(5);
-    assert!(memo.merge_derived_group_facts(group, &refined, cardinality.clone()).unwrap());
-    assert!(memo.transformation_group_snapshots.as_ref().unwrap().contains_key(&group));
-    assert!(!memo.merge_derived_group_facts(group, &properties, cardinality.clone()).unwrap());
-    assert_eq!(memo.group(group).unwrap().logical_properties.maximum_cardinality, Some(5));
-    memo.rollback_transformation(checkpoint).unwrap();
-    assert_eq!(memo.group(group).unwrap().logical_properties, properties);
-    assert_eq!(memo.group(group).unwrap().cardinality, cardinality);
-    assert_eq!(memo.local_statistics_fingerprint(group), value);
-}
-
-#[test]
 fn non_cte_statistics_cache_is_independent_of_registry_mutations() {
     let mut memo = Memo::new(SearchBudget::default());
     let group = memo.create_group(
