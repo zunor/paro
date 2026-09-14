@@ -11,9 +11,10 @@
 //!
 //! The adapter is intentionally fail-closed.  It supports the transparent
 //! relational shells used by the scoped outer-join matcher and the exact
-//! comparison-join proof used by the owned rule.  An unfamiliar operator,
-//! control boundary, or incomplete key fact declines the native path and
-//! leaves the authoritative owned implementation available.
+//! comparison-join proof used by the owned rule. An unfamiliar operator or
+//! explicit control node declines the native path. Opaque control inputs must
+//! retain their exact identities and multiplicities. Missing key evidence is
+//! a negative for this selected binding, with its fact reads retained for retry.
 
 use std::collections::HashSet;
 
@@ -47,9 +48,6 @@ pub(super) fn apply_native_join_elimination(
     else {
         return Ok(EliminationResult::Unsupported);
     };
-    if super::native_shell_contains_control_boundary(&shell) {
-        return Ok(EliminationResult::Unsupported);
-    }
     rewrite_shell_result(shell)
 }
 
@@ -62,6 +60,17 @@ fn rewrite_shell(shell: NativeShell) -> Result<Option<NativeShell>> {
 }
 
 fn rewrite_shell_result(shell: NativeShell) -> Result<EliminationResult> {
+    if shell.nodes.iter().any(|node| {
+        matches!(
+            node.operator,
+            LogicalOperator::MaterializedCTE(_)
+                | LogicalOperator::RecursiveCTE(_)
+                | LogicalOperator::CTERef(_)
+        )
+    }) {
+        return Ok(EliminationResult::Unsupported);
+    }
+    let control_boundaries = controlled_boundary_occurrences(&shell);
     let root = shell.root;
     let layouts = shell.layouts()?;
     let original_layout = layouts
@@ -84,10 +93,43 @@ fn rewrite_shell_result(shell: NativeShell) -> Result<EliminationResult> {
         nodes: nodes.into_boxed_slice(),
         root,
     })?;
-    if result_layout != original_layout {
+    if result_layout != original_layout
+        || (!control_boundaries.is_empty()
+            && controlled_boundary_occurrences(&shell) != control_boundaries)
+    {
         return Ok(EliminationResult::Unsupported);
     }
     Ok(EliminationResult::Rewritten(shell))
+}
+
+/// This rule never edits boundary payloads. Equality of identity and edge
+/// multiplicity proves an opaque control input was neither removed nor
+/// duplicated; its immutable layout/facts stay attached to the cloned edge.
+fn controlled_boundary_occurrences(
+    shell: &NativeShell,
+) -> std::collections::BTreeMap<
+    (
+        Option<super::GroupId>,
+        paro_planner::operator::BoundReferenceId,
+    ),
+    usize,
+> {
+    let mut result = std::collections::BTreeMap::new();
+    for node in &shell.nodes {
+        node.operator.visit_child_links(&mut |child| {
+            let (group, reference) = match child {
+                NativeChild::MemoGroup {
+                    group, reference, ..
+                } => (Some(*group), reference),
+                NativeChild::Group { reference, .. } => (None, reference),
+                NativeChild::Node(_) => return,
+            };
+            if reference.facts.contains_control_region {
+                *result.entry((group, reference.reference_id)).or_insert(0) += 1;
+            }
+        });
+    }
+    result
 }
 
 /// Rewrite children before trying to remove the current comparison join.
@@ -577,10 +619,14 @@ mod tests {
     }
 
     fn boundary(table: usize, unique: bool) -> OwnedLogicalPlan {
+        boundary_with_control(table, unique, false)
+    }
+
+    fn boundary_with_control(table: usize, unique: bool, control: bool) -> OwnedLogicalPlan {
         let binding = ColumnBinding::new(table, 0);
         let facts = BoundRelationFactValues {
             can_replay: true,
-            contains_control_region: false,
+            contains_control_region: control,
             unique_keys: if unique {
                 vec![UniqueKey::new(
                     [UniqueKeyColumn {
@@ -829,6 +875,42 @@ mod tests {
             .unwrap(),
             EliminationResult::NoRewrite
         ));
+    }
+
+    #[test]
+    fn opaque_control_boundary_must_survive_native_elimination() {
+        for removed_control in [false, true] {
+            let mut plan = candidate(true, false);
+            let LogicalOperator::Projection(projection) = &mut plan.operator else {
+                unreachable!()
+            };
+            let LogicalOperator::Join(Join::Comparison(join)) = &mut projection.child.operator
+            else {
+                unreachable!()
+            };
+            *join.left = boundary_with_control(0, false, true);
+            *join.right = boundary_with_control(1, true, removed_control);
+            if removed_control {
+                // Two occurrences with the same transport identity must not
+                // collapse to one merely because a set still contains its key.
+                for side in [&mut join.left, &mut join.right] {
+                    let LogicalOperator::BoundReference(reference) = &mut side.operator else {
+                        unreachable!()
+                    };
+                    reference.reference_id = BoundReferenceId::group_hole(42);
+                }
+            }
+            let shell = NativeShell::from_owned(plan, &HashMap::new()).unwrap();
+            let result = rewrite_shell_result(shell).unwrap();
+            if removed_control {
+                assert!(matches!(result, EliminationResult::Unsupported));
+            } else {
+                let EliminationResult::Rewritten(shell) = result else {
+                    panic!("untouched control boundary should be retained natively")
+                };
+                assert!(super::super::native_shell_contains_control_boundary(&shell));
+            }
+        }
     }
 
     #[test]
