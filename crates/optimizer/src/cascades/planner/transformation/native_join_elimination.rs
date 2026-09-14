@@ -12,7 +12,7 @@
 //! The adapter is intentionally fail-closed.  It supports the transparent
 //! relational shells used by the scoped outer-join matcher and the exact
 //! comparison-join proof used by the owned rule. An unfamiliar operator or
-//! explicit control node declines the native path. Opaque control inputs must
+//! recursive control node declines the native path. Opaque control inputs must
 //! retain their exact identities and multiplicities. Missing key evidence is
 //! a negative for this selected binding, with its fact reads retained for retry.
 
@@ -60,14 +60,11 @@ fn rewrite_shell(shell: NativeShell) -> Result<Option<NativeShell>> {
 }
 
 fn rewrite_shell_result(shell: NativeShell) -> Result<EliminationResult> {
-    if shell.nodes.iter().any(|node| {
-        matches!(
-            node.operator,
-            LogicalOperator::MaterializedCTE(_)
-                | LogicalOperator::RecursiveCTE(_)
-                | LogicalOperator::CTERef(_)
-        )
-    }) {
+    if shell
+        .nodes
+        .iter()
+        .any(|node| matches!(node.operator, LogicalOperator::RecursiveCTE(_)))
+    {
         return Ok(EliminationResult::Unsupported);
     }
     let control_boundaries = controlled_boundary_occurrences(&shell);
@@ -344,6 +341,12 @@ fn required_children(
             &empty.child,
             filter_required_bindings(required, &child_bindings(&empty.child)),
         )),
+        LogicalOperator::MaterializedCTE(cte) => Some(vec![
+            // The lexical producer retains all declared definition columns.
+            // Consumer requirements name its own output, not producer slots.
+            child_bindings(&cte.cte_query),
+            filter_required_bindings(required, &child_bindings(&cte.child)),
+        ]),
         LogicalOperator::DependentJoin(join) => {
             let mut left = child_bindings(&join.left);
             let mut right = child_bindings(&join.right);
@@ -1036,7 +1039,7 @@ mod tests {
         use paro_planner::binder::context::BindContext;
 
         for unique in [false, true] {
-            for wrapper in 0..5 {
+            for wrapper in 0..6 {
                 let wrapped = wrapper != 0;
                 let plan = if wrapped {
                     let child = if wrapper == 1 {
@@ -1045,6 +1048,43 @@ mod tests {
                         ))
                     } else if wrapper == 2 {
                         window(memo_candidate(), column(10, 0))
+                    } else if wrapper == 5 {
+                        let mut consumer = memo_candidate();
+                        let LogicalOperator::Projection(projection) = &mut consumer.operator else {
+                            unreachable!()
+                        };
+                        let LogicalOperator::Join(Join::Comparison(join)) =
+                            &mut projection.child.operator
+                        else {
+                            unreachable!()
+                        };
+                        *join.left = OwnedLogicalPlan::synthetic(LogicalOperator::CTERef(
+                            paro_planner::operator::CTERef::new(
+                                50,
+                                0,
+                                "consumer".into(),
+                                vec!["key".into()],
+                                vec![LogicalType::Integer],
+                            ),
+                        ));
+                        OwnedLogicalPlan::synthetic(LogicalOperator::MaterializedCTE(
+                            paro_planner::operator::MaterializedCTE::new(
+                                50,
+                                "retained_producer".into(),
+                                vec!["key".into()],
+                                vec![LogicalType::Integer],
+                                paro_planner::binder::ir::CTEMaterialize::Materialized,
+                                OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                                    Get::new_without_table(
+                                        51,
+                                        vec!["key".into()],
+                                        vec![LogicalType::Integer],
+                                    ),
+                                ))),
+                                consumer,
+                            )
+                            .with_ref_count(1),
+                        ))
                     } else if wrapper == 4 {
                         OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(
                             paro_planner::operator::EmptyResult::new(memo_candidate()),
@@ -1084,9 +1124,11 @@ mod tests {
                     .key
                     .children[0];
                 if wrapped {
-                    for _ in 0..2 {
+                    for depth in 0..2 {
                         let expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
-                        join_group = input.memo.logical_expr(expression).unwrap().key.children[0];
+                        let slot = usize::from(wrapper == 5 && depth == 0);
+                        join_group =
+                            input.memo.logical_expr(expression).unwrap().key.children[slot];
                     }
                 }
                 let join_expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
@@ -1096,6 +1138,13 @@ mod tests {
                     .unwrap()
                     .key
                     .children[1];
+                let left_group = input
+                    .memo
+                    .logical_expr(join_expression)
+                    .unwrap()
+                    .key
+                    .children[0];
+                let reference_facts = input.memo.local_statistics_fingerprint(left_group);
                 let column = {
                     let state = input.planner_state.read().unwrap();
                     state
@@ -1158,6 +1207,32 @@ mod tests {
                     bridges,
                     "selected ancestor must not force owned construction"
                 );
+                if wrapper == 5 {
+                    assert_eq!(
+                        context.memo().local_statistics_fingerprint(left_group),
+                        reference_facts,
+                        "retaining the producer must not change reference cost dependencies"
+                    );
+                    if let Some(output) = outputs.first() {
+                        let cte_group = output.key.children[0];
+                        let memo = context.memo();
+                        let expression = memo.group(cte_group).unwrap().logical_exprs()[0];
+                        let payload = memo.logical_expr(expression).unwrap().payload;
+                        let state = rule.planner_state.read().unwrap();
+                        let LogicalOperator::MaterializedCTE(cte) = &state.payloads.logical
+                            [payload.index()]
+                        .semantic_template
+                        .operator
+                        else {
+                            panic!("native staging must retain the CTE wrapper")
+                        };
+                        assert_eq!(cte.cte_index, 50);
+                        assert_eq!(cte.ref_count, 1);
+                        assert_eq!(cte.output_columns.len(), 1);
+                        assert_eq!(cte.output_columns[0].binding, ColumnBinding::new(51, 0));
+                        assert_eq!(cte.output_columns[0].definition.0, 0);
+                    }
+                }
                 if !unique {
                     let reads = context.take_fact_reads();
                     drop(context);
