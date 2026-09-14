@@ -375,6 +375,26 @@ The two key-domain tests, existing frozen-selected production test and 111
 engine tests pass. This restores missing output coverage; it is not a claim of
 unchanged counts against the prior version. No Q11/SQL performance run was made.
 
+AggregateJoinPreaggregation now returns native positive/negative results without
+the Memo owned fallback. Its local preaggregation wraps the nullable input as a
+whole, preserving control nodes instead of traversing their opaque children.
+The production matrix covers equality/non-equality and a materialized right
+input; the negative first recorded one owned instantiation, then zero. Three
+native tests, five reference preaggregation tests and 111 engine tests passed.
+
+Full optimizer checks immediately before and after this slice both reported
+1271 passed / 5 failed on the mixed worktree. Exact unresolved failures:
+`nary_sharing_plan_is_stable_across_default_budget_envelope`,
+`mark_join_to_semi_is_an_explicit_isolatable_transformation`, and
+`engine_admits_every_partition_discriminator_from_one_binding` reject an
+undeclared expected grant before transformation search;
+`statistics_read_cache_revalidates_registry_rollback_reinsert_and_merge` expects
+the fingerprint to differ after merging equivalent producer groups (Memo-only
+fixture); `nested_filters_share_one_ordered_source_work_lane` sees one rather
+than two retentions in a fixed physical witness. None was fixed or blessed.
+This proves no new failure in this slice, not a clean historical-baseline
+attribution or full migration acceptance. No Q11/SQL performance campaign ran.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
