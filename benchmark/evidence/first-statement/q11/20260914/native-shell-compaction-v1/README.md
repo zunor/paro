@@ -103,6 +103,43 @@ ProofComplete were not run in this pilot.
 
 ## Artifacts
 
+### Subsequent bridge migration status (implementation, not a new performance sample)
+
+The following commits extend native construction after the pilot above:
+`f1ccd481` (CTE), `15d6e4b1` (non-null aggregate input), `5fcb8e57`
+(join elimination), `2221a8f2` / `8f6a8438` (late-payload prefix), `27d155f2`
+(post-reduction), and `7bbe67a2` (scalar aggregate window). The pilot binary
+does not contain these commits; its times cannot establish their benefit.
+
+The scalar-window slice resolves the finite direct detail/scalar source
+grammar in the same Memo. Singleton lookups, including failures, subscribe to
+logical frontier revisions; expansion and construction consume work units.
+The expanded boundary snapshot supplies the actual cost-independent fact
+identity. Native output must satisfy the target group schema: canonical
+carrier templates do not authorize dropping an observable scalar output.
+
+Validation in the mixed workspace: five scalar-native tests pass (production
+binding/staging, output contract rejection, child-fact invalidation and budget
+retry, and an independent nullable/duplicate/negative-value bag interpreter
+over the produced native shell). Four existing scalar-reuse/Q22 tests pass.
+The transformation suite before the additional bag test reports 103 passed,
+one failure: `engine_admits_every_partition_discriminator_from_one_binding`
+rejects `expected grant is not a declared class` at `cte.rs:582`. It was not
+blessed. These are correctness checks, not clean-source performance evidence.
+
+The bridge migration remains incomplete. `apply_binding` still reaches
+`instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
+`NativeShell::from_owned`, and settlement when a native producer misses.
+PredicateTransfer and LatePayloadFetch also retain owned peers for uncovered
+semantics. Scalar-window support is currently limited to the direct finite
+grammar; projection ancestors, reduction carriers, and alternative-rich
+source groups still require migration. Merely adding a native adapter for
+each rule does not remove those bridges or prove search coverage equivalence.
+Remaining acceptance includes deleting these production fallbacks after
+coverage tests, a clean fixed-work comparison, admitted fingerprint and
+child-choice equivalence, and fresh Q11/C1 evidence. None of those gates is
+inferred from the tests above.
+
 - `pilot-v1.json.gz`: complete harness report
 - `pilot-v1.ledger.jsonl.gz`: additive B0--B12 ledger
 - `pilot-v1.q11.block000.parod.log.gz` and `pilot-v1.q11.block001.parod.log.gz`:
