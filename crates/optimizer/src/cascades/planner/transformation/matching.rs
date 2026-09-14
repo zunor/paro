@@ -1170,6 +1170,12 @@ enum PatternScope {
     RowIdPath,
     SubsumptionAggregate,
     SubsumptionInput,
+    PostReductionPath,
+    PostReductionBranch,
+    PostReductionWrapper,
+    PostReductionScalar,
+    PostReductionReduction,
+    PostReductionSource,
     ScalarAggregatePath,
     OuterJoinPath,
     CteInlineOwner,
@@ -1201,6 +1207,11 @@ impl PatternScope {
             Self::Order => Some(&[Op::Projection, Op::Order]),
             Self::MarkConsumer => Some(&[Op::Projection, Op::Filter]),
             Self::LatePayload => Some(&[Op::Projection, Op::TopN]),
+            Self::PostReductionPath => Some(&[Op::Projection, Op::Filter, Op::CrossProduct]),
+            Self::PostReductionBranch => Some(&[Op::Aggregate, Op::Projection]),
+            Self::PostReductionWrapper | Self::PostReductionReduction => Some(&[Op::Aggregate]),
+            Self::PostReductionScalar => Some(&[Op::Projection]),
+            Self::PostReductionSource => Some(&[Op::Get]),
             Self::RowIdPath => Some(&[
                 Op::Get,
                 Op::Filter,
@@ -1267,6 +1278,42 @@ impl PatternScope {
                 LogicalOperator::Aggregate(_) => repeat(Self::Shell),
                 _ => repeat(Self::Hole),
             },
+            // AggregatePostReduction has a deliberately small native path
+            // grammar.  It exposes both sides of the cross product and the
+            // exact scalar wrapper, while the two source Gets remain the
+            // selected Memo expressions.  Richer source paths continue to
+            // use the authoritative owned recognizer.
+            Self::PostReductionPath => match operator {
+                LogicalOperator::Projection(_) | LogicalOperator::Filter(_) => {
+                    repeat(Self::PostReductionPath)
+                }
+                LogicalOperator::Join(Join::Cross(_)) => {
+                    Some(vec![Self::PostReductionBranch; arity])
+                }
+                _ => None,
+            },
+            Self::PostReductionBranch => match operator {
+                LogicalOperator::Aggregate(aggregate) if !aggregate.groups.is_empty() => {
+                    Some(vec![Self::PostReductionSource])
+                }
+                LogicalOperator::Projection(_) => Some(vec![Self::PostReductionWrapper]),
+                _ => None,
+            },
+            Self::PostReductionWrapper => {
+                matches!(operator, LogicalOperator::Aggregate(_))
+                    .then(|| vec![Self::PostReductionScalar])
+            }
+            Self::PostReductionScalar => {
+                matches!(operator, LogicalOperator::Projection(_))
+                    .then(|| vec![Self::PostReductionReduction])
+            }
+            Self::PostReductionReduction => {
+                matches!(operator, LogicalOperator::Aggregate(_))
+                    .then(|| vec![Self::PostReductionSource])
+            }
+            Self::PostReductionSource => {
+                matches!(operator, LogicalOperator::Get(_)).then(|| Vec::new())
+            }
             Self::LatePayload => match operator {
                 LogicalOperator::Projection(_) => repeat(Self::RowIdPath),
                 LogicalOperator::TopN(_) => repeat(Self::LateProjection),
@@ -1357,8 +1404,8 @@ pub(super) fn scoped_pattern_bindings(
         PlannerTransformation::AggregateDimensionDeferral
         | PlannerTransformation::AggregateInputMaterialization => PatternScope::AggregateRegion,
         PlannerTransformation::MarkJoinToSemi => PatternScope::MarkConsumer,
-        PlannerTransformation::AggregatePostReduction
-        | PlannerTransformation::ScalarAggregateWindow => PatternScope::ScalarAggregatePath,
+        PlannerTransformation::AggregatePostReduction => PatternScope::PostReductionPath,
+        PlannerTransformation::ScalarAggregateWindow => PatternScope::ScalarAggregatePath,
         PlannerTransformation::JoinElimination => PatternScope::OuterJoinPath,
         PlannerTransformation::CtePartitionedMaterialization
         | PlannerTransformation::CteInline
@@ -1369,8 +1416,7 @@ pub(super) fn scoped_pattern_bindings(
         }
     };
     let witness = match transformation {
-        PlannerTransformation::AggregatePostReduction
-        | PlannerTransformation::ScalarAggregateWindow => Some(PatternWitness::ScalarAggregate),
+        PlannerTransformation::ScalarAggregateWindow => Some(PatternWitness::ScalarAggregate),
         PlannerTransformation::JoinElimination => Some(PatternWitness::OuterJoin),
         _ => None,
     };

@@ -16,6 +16,7 @@ mod matching;
 mod native_domain;
 mod native_join_elimination;
 mod native_late_payload;
+mod native_post_reduction;
 mod native_join_preaggregation;
 mod native_join_subsumption;
 mod native_non_null_inputs;
@@ -689,6 +690,7 @@ impl TransformationRule for PlannerTransformationRule {
                 | PlannerTransformation::AggregateInputMaterialization
                 | PlannerTransformation::AggregateDimensionSharing
                 | PlannerTransformation::LatePayloadFetch
+                | PlannerTransformation::AggregatePostReduction
         ) {
             let state = self
                 .planner_state
@@ -810,6 +812,16 @@ impl TransformationRule for PlannerTransformationRule {
                     .into_iter()
                     .collect()
                 }
+                PlannerTransformation::AggregatePostReduction => {
+                    native_post_reduction::try_native_aggregate_post_reduction(
+                        &binding.root,
+                        ctx.memo(),
+                        &state,
+                        &facts,
+                    )?
+                    .into_iter()
+                    .collect()
+                }
                 _ => unreachable!("native dispatch guard changed"),
             }
         } else {
@@ -871,6 +883,7 @@ impl TransformationRule for PlannerTransformationRule {
                         | PlannerTransformation::CtePartitionedMaterialization
                         | PlannerTransformation::CteDemandPushdown
                         | PlannerTransformation::CteFilterPushdown
+                        | PlannerTransformation::AggregatePostReduction
                 ))
                 && !direct_native.is_empty();
             let (plan, nested_group_holes, selected_proofs) = if native_direct_only {
