@@ -1,0 +1,748 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Native staging for the conservative join-elimination rule.
+//!
+//! `JoinElimination` only removes a comparison join when the discarded side
+//! is not observable and a complete unique-key witness is available.  The
+//! legacy implementation walks an owned tree to calculate the same required
+//! bindings and then settles the surviving tree back into the Memo.  This
+//! adapter performs that calculation over the immutable shell edges instead.
+//!
+//! The adapter is intentionally fail-closed.  It supports the transparent
+//! relational shells used by the scoped outer-join matcher and the exact
+//! comparison-join proof used by the owned rule.  An unfamiliar operator,
+//! control boundary, or incomplete key fact declines the native path and
+//! leaves the authoritative owned implementation available.
+
+use std::collections::HashSet;
+
+use paro_catalog::entry::ConstraintType;
+use paro_common::error::{self as paro_error, Result};
+use paro_planner::expression::{Expression, ExpressionIterator};
+use paro_planner::operator::{
+    ColumnBinding, ComparisonJoin, Join, JoinComparisonType, LogicalOperator, Projection,
+};
+
+use super::staging::{NativeChild, NativeNode, NativeShell};
+use super::{boundary, Memo, PatternOperand, PlannerTransformState};
+
+/// Try join elimination directly on the pattern shell.
+///
+/// The root remains a node because the scoped matcher wraps an outer join in a
+/// consumer shell.  If a future matcher ever exposes the join itself as the
+/// root, returning `None` is safer than making a group hole the shell root.
+pub(super) fn try_native_join_elimination(
+    root_binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: &boundary::BoundarySnapshot,
+) -> Result<Option<NativeShell>> {
+    let Some((shell, _layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, root_binding, facts)?
+    else {
+        return Ok(None);
+    };
+    if super::native_shell_contains_control_boundary(&shell) {
+        return Ok(None);
+    }
+    rewrite_shell(shell)
+}
+
+fn rewrite_shell(shell: NativeShell) -> Result<Option<NativeShell>> {
+    let root = shell.root;
+    let layouts = shell.layouts()?;
+    let original_layout = layouts
+        .get(root)
+        .cloned()
+        .ok_or_else(|| paro_error::internal("native join elimination has no root layout"))?;
+    let required = output_bindings_from_layout(&original_layout);
+    let mut nodes = shell.nodes.into_vec();
+    let Some((replacement, changed)) = rewrite_node(&mut nodes, &layouts, root, &required)? else {
+        return Ok(None);
+    };
+    if !changed || !matches!(replacement, NativeChild::Node(index) if index == root) {
+        return Ok(None);
+    }
+
+    let (shell, result_layout) = super::compact_native_shell_with_layout(NativeShell {
+        nodes: nodes.into_boxed_slice(),
+        root,
+    })?;
+    if result_layout != original_layout {
+        return Ok(None);
+    }
+    Ok(Some(shell))
+}
+
+/// Rewrite children before trying to remove the current comparison join.
+/// Returning the replacement child lets a parent consume a surviving Memo
+/// boundary without creating an owned subtree for the discarded join.
+fn rewrite_node(
+    nodes: &mut [NativeNode],
+    layouts: &[paro_planner::operator::LogicalOutputLayout],
+    index: usize,
+    required: &HashSet<ColumnBinding>,
+) -> Result<Option<(NativeChild, bool)>> {
+    let source_operator = nodes
+        .get(index)
+        .ok_or_else(|| paro_error::internal("native join elimination lost a node"))?
+        .operator
+        .clone();
+    let mut source_children = Vec::new();
+    source_operator.visit_child_links(&mut |child| source_children.push(child.clone()));
+    let Some(required_children) = required_children(&source_operator, layouts, required) else {
+        // A leaf which cannot contain the witness is harmless.  An unknown
+        // operator with descendants could contain a join, so decline the
+        // entire native binding rather than silently skipping that path.
+        return Ok(source_children
+            .is_empty()
+            .then_some((NativeChild::Node(index), false)));
+    };
+    if required_children.len() != source_children.len() {
+        return Err(paro_error::internal(
+            "native join elimination child requirement arity mismatch",
+        ));
+    }
+
+    let mut replacements = Vec::with_capacity(source_children.len());
+    let mut changed = false;
+    for (child, child_required) in source_children.iter().zip(required_children) {
+        let replacement = match child {
+            NativeChild::Node(child_index) => {
+                let Some((replacement, child_changed)) =
+                    rewrite_node(nodes, layouts, *child_index, &child_required)?
+                else {
+                    return Ok(None);
+                };
+                changed |= child_changed;
+                replacement
+            }
+            NativeChild::MemoGroup { .. } | NativeChild::Group { .. } => child.clone(),
+        };
+        replacements.push(replacement);
+    }
+
+    let mut replacements = replacements.into_iter();
+    let operator = source_operator.try_map_child_links(&mut |_| {
+        replacements
+            .next()
+            .ok_or_else(|| paro_error::internal("native join elimination lost a child replacement"))
+    })?;
+    if replacements.next().is_some() {
+        return Err(paro_error::internal(
+            "native join elimination retained excess child replacements",
+        ));
+    }
+    nodes[index].operator = operator;
+    if changed {
+        // A copied proof belongs to the old child choices.  The transformed
+        // parent is rechecked by the Memo verifier and receives the current
+        // rule proof during staging.
+        nodes[index].source_proofs = Box::new([]);
+    }
+
+    let replacement = match &nodes[index].operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            eliminate_join(nodes, layouts, join, required)
+                .or_else(|| Some(NativeChild::Node(index)))
+        }
+        _ => Some(NativeChild::Node(index)),
+    };
+    let Some(replacement) = replacement else {
+        return Ok(None);
+    };
+    let eliminated = !matches!(&replacement, NativeChild::Node(replacement_index) if *replacement_index == index);
+    Ok(Some((replacement, changed || eliminated)))
+}
+
+/// Calculate the same conservative child requirements as the owned rule.  We
+/// deliberately cover only operators whose child contracts are explicit in
+/// this adapter; an unsupported descendant is a native miss, not an implicit
+/// proof that it is irrelevant.
+fn required_children(
+    operator: &LogicalOperator<NativeChild>,
+    layouts: &[paro_planner::operator::LogicalOutputLayout],
+    required: &HashSet<ColumnBinding>,
+) -> Option<Vec<HashSet<ColumnBinding>>> {
+    let child_bindings = |child: &NativeChild| output_bindings_for_child(layouts, child);
+    let only_child = |child: &NativeChild, mut child_required: HashSet<ColumnBinding>| {
+        child_required.retain(|binding| child_bindings(child).contains(binding));
+        vec![child_required]
+    };
+    match operator {
+        LogicalOperator::Filter(filter) => {
+            let mut child_required =
+                filter_required_bindings(required, &child_bindings(&filter.child));
+            collect_bindings_from_exprs(&filter.expressions, &mut child_required);
+            Some(only_child(&filter.child, child_required))
+        }
+        LogicalOperator::Projection(projection) => Some(vec![projection_child_required_bindings(
+            projection,
+            required,
+            &child_bindings(&projection.child),
+        )]),
+        LogicalOperator::Limit(limit) => {
+            let mut child_required =
+                filter_required_bindings(required, &child_bindings(&limit.child));
+            if let Some(expression) = &limit.limit {
+                collect_bindings_from_expr(expression, &mut child_required);
+            }
+            if let Some(expression) = &limit.offset {
+                collect_bindings_from_expr(expression, &mut child_required);
+            }
+            Some(only_child(&limit.child, child_required))
+        }
+        LogicalOperator::Order(order) => {
+            let mut child_required =
+                filter_required_bindings(required, &child_bindings(&order.child));
+            for order_by in &order.orders {
+                collect_bindings_from_expr(&order_by.expression, &mut child_required);
+            }
+            Some(only_child(&order.child, child_required))
+        }
+        LogicalOperator::TopN(topn) => {
+            let mut child_required =
+                filter_required_bindings(required, &child_bindings(&topn.child));
+            for order_by in &topn.orders {
+                collect_bindings_from_expr(&order_by.expression, &mut child_required);
+            }
+            Some(only_child(&topn.child, child_required))
+        }
+        LogicalOperator::Aggregate(aggregate) => {
+            let mut child_required = HashSet::new();
+            collect_bindings_from_exprs(&aggregate.groups, &mut child_required);
+            collect_bindings_from_exprs(&aggregate.aggregates, &mut child_required);
+            Some(only_child(&aggregate.child, child_required))
+        }
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            let left_bindings = child_bindings(&join.left);
+            let right_bindings = child_bindings(&join.right);
+            let mut left_required = filter_required_bindings(required, &left_bindings);
+            let mut right_required = filter_required_bindings(required, &right_bindings);
+            add_join_local_bindings(
+                join,
+                &left_bindings,
+                &mut left_required,
+                &right_bindings,
+                &mut right_required,
+            );
+            Some(vec![left_required, right_required])
+        }
+        LogicalOperator::Join(Join::Any(join)) => {
+            let left_bindings = child_bindings(&join.left);
+            let right_bindings = child_bindings(&join.right);
+            let mut left_required = filter_required_bindings(required, &left_bindings);
+            let mut right_required = filter_required_bindings(required, &right_bindings);
+            add_bindings_for_child(&join.condition, &left_bindings, &mut left_required);
+            add_bindings_for_child(&join.condition, &right_bindings, &mut right_required);
+            Some(vec![left_required, right_required])
+        }
+        LogicalOperator::Join(Join::Cross(join)) => {
+            let left_bindings = child_bindings(&join.left);
+            let right_bindings = child_bindings(&join.right);
+            Some(vec![
+                filter_required_bindings(required, &left_bindings),
+                filter_required_bindings(required, &right_bindings),
+            ])
+        }
+        _ => {
+            let mut children = Vec::new();
+            operator.visit_child_links(&mut |child| children.push(child));
+            children.is_empty().then(Vec::new)
+        }
+    }
+}
+
+fn eliminate_join(
+    nodes: &[NativeNode],
+    layouts: &[paro_planner::operator::LogicalOutputLayout],
+    join: &ComparisonJoin<NativeChild>,
+    required: &HashSet<ColumnBinding>,
+) -> Option<NativeChild> {
+    if join.join_type == paro_planner::operator::JoinType::Left
+        && join_shape_supported(join)
+        && !has_required_bindings_from_child(required, &join.right, layouts)
+        && conditions_cover_unique_key(nodes, join, &join.right, true)
+    {
+        return Some(join.left.clone());
+    }
+    if join.join_type == paro_planner::operator::JoinType::Right
+        && join_shape_supported(join)
+        && !has_required_bindings_from_child(required, &join.left, layouts)
+        && conditions_cover_unique_key(nodes, join, &join.left, false)
+    {
+        return Some(join.right.clone());
+    }
+    None
+}
+
+fn join_shape_supported(join: &ComparisonJoin<NativeChild>) -> bool {
+    join.mark_index.is_none()
+        && join.duplicate_eliminated_columns.is_empty()
+        && !join.delim_flipped
+        && !join.conditions.is_empty()
+}
+
+fn conditions_cover_unique_key(
+    nodes: &[NativeNode],
+    join: &ComparisonJoin<NativeChild>,
+    eliminated: &NativeChild,
+    eliminate_right: bool,
+) -> bool {
+    let mut key_bindings = HashSet::new();
+    for condition in &join.conditions {
+        if condition.comparison != JoinComparisonType::Equal {
+            return false;
+        }
+        let preserved = if eliminate_right {
+            &condition.left
+        } else {
+            &condition.right
+        };
+        let discarded = if eliminate_right {
+            &condition.right
+        } else {
+            &condition.left
+        };
+        if !matches!(preserved, Expression::ColumnRef(_)) {
+            return false;
+        }
+        let Expression::ColumnRef(column) = discarded else {
+            return false;
+        };
+        key_bindings.insert(column.binding);
+    }
+    if key_bindings.is_empty() {
+        return false;
+    }
+    match eliminated {
+        NativeChild::MemoGroup { reference, .. } | NativeChild::Group { reference, .. } => {
+            reference.facts.unique_keys.iter().any(|key| {
+                !key.columns.is_empty()
+                    && key
+                        .columns
+                        .iter()
+                        .all(|column| key_bindings.contains(&column.binding))
+            })
+        }
+        NativeChild::Node(index) => match &nodes[*index].operator {
+            LogicalOperator::Get(get) => {
+                let Some(table) = get.table.as_ref() else {
+                    return false;
+                };
+                let key_columns = key_bindings
+                    .iter()
+                    .filter(|binding| binding.table_index == get.table_index)
+                    .filter_map(|binding| get.stored_column(binding.column_index))
+                    .collect::<HashSet<_>>();
+                table.constraints().iter().any(|constraint| {
+                    matches!(
+                        constraint.constraint_type,
+                        ConstraintType::Unique | ConstraintType::PrimaryKey
+                    ) && !constraint.columns.is_empty()
+                        && constraint
+                            .columns
+                            .iter()
+                            .all(|column| key_columns.contains(column))
+                })
+            }
+            LogicalOperator::BoundReference(reference) => {
+                reference.facts.unique_keys.iter().any(|key| {
+                    !key.columns.is_empty()
+                        && key
+                            .columns
+                            .iter()
+                            .all(|column| key_bindings.contains(&column.binding))
+                })
+            }
+            _ => false,
+        },
+    }
+}
+
+fn output_bindings_from_layout(
+    layout: &paro_planner::operator::LogicalOutputLayout,
+) -> HashSet<ColumnBinding> {
+    layout.bindings().iter().copied().collect()
+}
+
+fn output_bindings_for_child(
+    layouts: &[paro_planner::operator::LogicalOutputLayout],
+    child: &NativeChild,
+) -> HashSet<ColumnBinding> {
+    match child {
+        NativeChild::Node(index) => layouts
+            .get(*index)
+            .map(output_bindings_from_layout)
+            .unwrap_or_default(),
+        NativeChild::MemoGroup { reference, .. } | NativeChild::Group { reference, .. } => {
+            reference.bindings.iter().copied().collect()
+        }
+    }
+}
+
+fn filter_required_bindings(
+    required: &HashSet<ColumnBinding>,
+    child_bindings: &HashSet<ColumnBinding>,
+) -> HashSet<ColumnBinding> {
+    required
+        .iter()
+        .copied()
+        .filter(|binding| child_bindings.contains(binding))
+        .collect()
+}
+
+fn projection_child_required_bindings(
+    projection: &Projection<NativeChild>,
+    required: &HashSet<ColumnBinding>,
+    child_bindings: &HashSet<ColumnBinding>,
+) -> HashSet<ColumnBinding> {
+    let mut child_required = HashSet::new();
+    for (index, expression) in projection.expressions.iter().enumerate() {
+        if required.contains(&ColumnBinding::new(projection.table_index, index)) {
+            collect_bindings_from_expr(expression, &mut child_required);
+        }
+    }
+    child_required.retain(|binding| child_bindings.contains(binding));
+    child_required
+}
+
+fn has_required_bindings_from_child(
+    required: &HashSet<ColumnBinding>,
+    child: &NativeChild,
+    layouts: &[paro_planner::operator::LogicalOutputLayout],
+) -> bool {
+    let child_bindings = output_bindings_for_child(layouts, child);
+    required
+        .iter()
+        .any(|binding| child_bindings.contains(binding))
+}
+
+fn add_join_local_bindings(
+    join: &ComparisonJoin<NativeChild>,
+    left_bindings: &HashSet<ColumnBinding>,
+    left_required: &mut HashSet<ColumnBinding>,
+    right_bindings: &HashSet<ColumnBinding>,
+    right_required: &mut HashSet<ColumnBinding>,
+) {
+    for condition in &join.conditions {
+        add_bindings_for_child(&condition.left, left_bindings, left_required);
+        add_bindings_for_child(&condition.right, left_bindings, left_required);
+        add_bindings_for_child(&condition.left, right_bindings, right_required);
+        add_bindings_for_child(&condition.right, right_bindings, right_required);
+    }
+    for expression in &join.duplicate_eliminated_columns {
+        add_bindings_for_child(expression, left_bindings, left_required);
+        add_bindings_for_child(expression, right_bindings, right_required);
+    }
+}
+
+fn add_bindings_for_child(
+    expression: &Expression,
+    child_bindings: &HashSet<ColumnBinding>,
+    required: &mut HashSet<ColumnBinding>,
+) {
+    let mut bindings = HashSet::new();
+    collect_bindings_from_expr(expression, &mut bindings);
+    required.extend(
+        bindings
+            .into_iter()
+            .filter(|binding| child_bindings.contains(binding)),
+    );
+}
+
+fn collect_bindings_from_exprs(expressions: &[Expression], bindings: &mut HashSet<ColumnBinding>) {
+    for expression in expressions {
+        collect_bindings_from_expr(expression, bindings);
+    }
+}
+
+fn collect_bindings_from_expr(expression: &Expression, bindings: &mut HashSet<ColumnBinding>) {
+    if let Expression::ColumnRef(column) = expression {
+        bindings.insert(column.binding);
+        return;
+    }
+    ExpressionIterator::enumerate_children(expression, |child| {
+        collect_bindings_from_expr(child, bindings);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::ColumnRefExpression;
+    use paro_planner::operator::bound_reference::{
+        BoundReference, BoundReferenceId, BoundRelationFactValues,
+    };
+    use paro_planner::operator::{Get, JoinCondition, JoinType, LogicalOperator, Projection};
+    use paro_planner::plan::{
+        OwnedLogicalPlan, UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, UniqueKeyProvenance,
+    };
+
+    fn column(table: usize, ordinal: usize) -> Expression {
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table, ordinal), LogicalType::Integer)
+                .into(),
+        )
+    }
+
+    fn boundary(table: usize, unique: bool) -> OwnedLogicalPlan {
+        let binding = ColumnBinding::new(table, 0);
+        let facts = BoundRelationFactValues {
+            can_replay: true,
+            contains_control_region: false,
+            unique_keys: if unique {
+                vec![UniqueKey::new(
+                    [UniqueKeyColumn {
+                        output_index: 0,
+                        binding,
+                    }],
+                    UniqueKeyProvenance::Structural,
+                    UniqueKeyNullSemantics::NullsDistinct,
+                )]
+            } else {
+                Vec::new()
+            },
+            ..BoundRelationFactValues::default()
+        };
+        let reference = BoundReference::new(
+            BoundReferenceId::group_hole(table as u32),
+            vec![binding],
+            vec![LogicalType::Integer],
+        )
+        .with_facts(Arc::new(
+            paro_planner::operator::bound_reference::BoundRelationFacts::new(
+                facts,
+                vec![LogicalType::Integer],
+            ),
+        ))
+        .unwrap();
+        OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference))
+    }
+
+    fn candidate(right_unique: bool, project_right: bool) -> OwnedLogicalPlan {
+        let join = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
+            JoinType::Left,
+            boundary(0, false),
+            boundary(1, right_unique),
+            vec![JoinCondition::equality(column(0, 0), column(1, 0))],
+        )));
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            10,
+            join,
+            vec![column(if project_right { 1 } else { 0 }, 0)],
+        )))
+    }
+
+    fn memo_candidate() -> OwnedLogicalPlan {
+        let left = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+            Get::new_without_table(0, vec!["key".to_string()], vec![LogicalType::Integer]),
+        )));
+        let right = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+            Get::new_without_table(1, vec!["key".to_string()], vec![LogicalType::Integer]),
+        )));
+        let join = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
+            JoinType::Left,
+            left,
+            right,
+            vec![JoinCondition::equality(column(0, 0), column(1, 0))],
+        )));
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            10,
+            join,
+            vec![column(0, 0)],
+        )))
+    }
+
+    #[test]
+    fn native_shell_eliminates_unobserved_unique_outer_side() {
+        let source = candidate(true, false);
+        let expected_layout = source.output_layout();
+        let shell = NativeShell::from_owned(source, &HashMap::new()).unwrap();
+        let rewritten = rewrite_shell(shell)
+            .unwrap()
+            .expect("unique, unobserved outer side should be removable");
+        assert_eq!(rewritten.root_layout().unwrap(), expected_layout);
+        let LogicalOperator::Projection(projection) = rewritten.root_operator() else {
+            panic!("expected projection root")
+        };
+        assert!(matches!(
+            projection.child,
+            NativeChild::Group { .. } | NativeChild::MemoGroup { .. }
+        ));
+    }
+
+    #[test]
+    fn native_shell_keeps_unique_outer_side_when_projected() {
+        let source = candidate(true, true);
+        let shell = NativeShell::from_owned(source, &HashMap::new()).unwrap();
+        assert!(rewrite_shell(shell).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_shell_requires_unique_witness_before_elimination() {
+        let source = candidate(false, false);
+        let shell = NativeShell::from_owned(source, &HashMap::new()).unwrap();
+        assert!(rewrite_shell(shell).unwrap().is_none());
+    }
+
+    #[test]
+    fn production_binding_uses_memo_unique_key_boundary() {
+        use crate::cascades::budget::{BudgetDimension, SearchBudget};
+        use crate::cascades::planner::transformation::{
+            matching, PlannerTransformation, TransformContext,
+        };
+        use crate::cascades::planner::MemoBuilder;
+        use paro_planner::binder::context::BindContext;
+
+        let mut input = MemoBuilder::build(
+            memo_candidate(),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let join_group = input
+            .memo
+            .logical_expr(root_expression)
+            .unwrap()
+            .key
+            .children[0];
+        let join_expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
+        let right_group = input
+            .memo
+            .logical_expr(join_expression)
+            .unwrap()
+            .key
+            .children[1];
+        let column = {
+            let state = input.planner_state.read().unwrap();
+            state
+                .binding_ids
+                .get(1, 0, &LogicalType::Integer)
+                .copied()
+                .expect("right Memo column should be interned")
+        };
+        input
+            .memo
+            .group_mut(right_group)
+            .unwrap()
+            .logical_properties
+            .unique_keys
+            .insert(vec![column].into_boxed_slice());
+        let state = input.planner_state.read().unwrap();
+        let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let binding = matching::scoped_pattern_bindings(
+            PlannerTransformation::JoinElimination,
+            input.root,
+            expression,
+            &input.memo,
+            &state,
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .bindings
+        .first()
+        .cloned()
+        .expect("outer join path should produce a binding");
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let facts = super::boundary::BoundarySnapshot::read(
+            &mut context,
+            &state,
+            &binding.root,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .expect("production binding should have boundary facts");
+        assert!(
+            try_native_join_elimination(&binding.root, context.memo(), &state, &facts)
+                .unwrap()
+                .is_some(),
+            "the native adapter should consume the same Memo binding"
+        );
+    }
+
+    #[test]
+    fn production_apply_stages_native_elimination_candidate() {
+        use crate::cascades::budget::{BudgetDimension, SearchBudget};
+        use crate::cascades::planner::transformation::{
+            matching, PlannerTransformation, PlannerTransformationRule, TransformContext,
+        };
+        use crate::cascades::planner::MemoBuilder;
+        use crate::cascades::rules::TransformationRule;
+        use paro_context::TestStatementContextBuilder;
+        use paro_planner::binder::context::BindContext;
+
+        let mut input = MemoBuilder::build(
+            memo_candidate(),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let join_group = input
+            .memo
+            .logical_expr(root_expression)
+            .unwrap()
+            .key
+            .children[0];
+        let join_expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
+        let right_group = input
+            .memo
+            .logical_expr(join_expression)
+            .unwrap()
+            .key
+            .children[1];
+        let column = {
+            let state = input.planner_state.read().unwrap();
+            state
+                .binding_ids
+                .get(1, 0, &LogicalType::Integer)
+                .copied()
+                .expect("right Memo column should be interned")
+        };
+        input
+            .memo
+            .group_mut(right_group)
+            .unwrap()
+            .logical_properties
+            .unique_keys
+            .insert(vec![column].into_boxed_slice());
+
+        let state = input.planner_state.clone();
+        state.write().unwrap().session = Some(TestStatementContextBuilder::minimal().build());
+        let binding = {
+            let state_read = state.read().unwrap();
+            matching::scoped_pattern_bindings(
+                PlannerTransformation::JoinElimination,
+                input.root,
+                root_expression,
+                &input.memo,
+                &state_read,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .bindings
+            .first()
+            .cloned()
+            .expect("outer join path should produce a binding")
+        };
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::JoinElimination,
+            planner_state: state,
+        };
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+        assert!(
+            !outputs.is_empty(),
+            "native elimination should publish a staged candidate"
+        );
+    }
+}

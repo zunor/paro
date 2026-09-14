@@ -14,6 +14,7 @@ pub(super) mod cte;
 mod join_region;
 mod matching;
 mod native_domain;
+mod native_join_elimination;
 mod native_join_preaggregation;
 mod native_join_subsumption;
 mod native_non_null_inputs;
@@ -682,6 +683,7 @@ impl TransformationRule for PlannerTransformationRule {
                 | PlannerTransformation::AggregateJoinPreaggregation
                 | PlannerTransformation::AggregateJoinSubsumption
                 | PlannerTransformation::AggregateNonNullInput
+                | PlannerTransformation::JoinElimination
                 | PlannerTransformation::AggregateDimensionDeferral
                 | PlannerTransformation::AggregateInputMaterialization
                 | PlannerTransformation::AggregateDimensionSharing
@@ -733,6 +735,16 @@ impl TransformationRule for PlannerTransformationRule {
                 }
                 PlannerTransformation::AggregateJoinSubsumption => {
                     native_join_subsumption::try_native_aggregate_join_subsumption(
+                        &binding.root,
+                        ctx.memo(),
+                        &state,
+                        &facts,
+                    )?
+                    .into_iter()
+                    .collect()
+                }
+                PlannerTransformation::JoinElimination => {
+                    native_join_elimination::try_native_join_elimination(
                         &binding.root,
                         ctx.memo(),
                         &state,
