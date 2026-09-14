@@ -855,3 +855,29 @@ lane); optimizer/compiler cargo check passes. No bless or unrelated failure fix.
 No SQL regress, independent bag execution, clean fixed-work/fingerprint campaign
 or fresh Q11 measurement in this slice. Mixed-worktree tests do not establish
 performance. Overall bridge migration and its end-to-end gates remain open.
+
+## Native prefix transport through selected Join paths
+
+Prefix transport now follows the unique selected source through Comparison,
+Any and Cross joins. It preserves the peer child and updates only the source
+side's projection map, deriving each ancestor layout from both exact child
+layouts before checking the final root layout. No owned tree is exported for
+these successful pure-prefix paths. Mixed payload outputs still require the
+existing subsequent row-id lowering and retain that fallback.
+
+Source occurrence counts are computed once bottom-up over the native shell,
+saturating at two. Opaque group boundaries fail closed: a layout alone is not
+proof that another source occurrence is absent. A repeated edge to the same
+native node counts twice; the production-fixture-derived test checks this rather
+than deduplicating by node ID. No new Memo alternative is selected to prove it.
+
+The real Memo/matching/apply fixture suite now includes both source sides for
+all three join representations (Comparison and Any use Inner), alongside the
+eight prior fixtures. Pure-prefix cases return one output with zero owned
+constructions. Full optimizer: 1283 passed / same five failure names and values.
+Optimizer/compiler check passes. No baseline bless or unrelated edits committed.
+
+This does not establish outer-join bag semantics, all row-id lowering contracts,
+fixed-work search equivalence, admitted fingerprint or fresh Q11 performance.
+Those acceptance gates were not run. Unit/check results are from the mixed
+worktree; no speedup or completed migration is claimed.
