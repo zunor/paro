@@ -90,6 +90,7 @@ fn try_native_shell_with_layout(
     shell: NativeShell,
     original_root_layout: paro_planner::operator::LogicalOutputLayout,
 ) -> paro_common::error::Result<Option<NativeShell>> {
+    let shell = normalize_empty_filter_edges(shell)?;
     let root = shell.root;
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
         return Ok(None);
@@ -143,6 +144,59 @@ fn try_native_shell_with_layout(
     Ok(Some(shell))
 }
 
+/// Resolve identity filters in post-order once, including scan and reduction
+/// inputs. This is the tautology part of the owned pushdown prelude, not a
+/// substitute for routing nonempty predicates. No Memo hole is expanded and
+/// operator payloads stay in place. Unreachable identities are removed by
+/// the existing final compactor only if subsumption actually succeeds.
+fn normalize_empty_filter_edges(mut shell: NativeShell) -> paro_common::error::Result<NativeShell> {
+    let mut aliases = Vec::<Option<NativeChild>>::with_capacity(shell.nodes.len());
+    let mut changed = Vec::with_capacity(shell.nodes.len());
+    for node in &mut shell.nodes {
+        let mut rewritten = false;
+        let mut invalid = false;
+        node.operator.visit_child_links_mut(&mut |child| {
+            if let NativeChild::Node(index) = child {
+                let Some(alias) = aliases.get(*index) else {
+                    invalid = true;
+                    return;
+                };
+                rewritten |= changed[*index];
+                if let Some(alias) = alias {
+                    *child = alias.clone();
+                    rewritten = true;
+                }
+            }
+        });
+        if invalid {
+            return Err(paro_error::internal(
+                "native filter normalization requires post-order edges",
+            ));
+        }
+        let alias = match &node.operator {
+            LogicalOperator::Filter(filter)
+                if filter.projection_map.is_all()
+                    && !filter.expressions.iter().any(|expression| {
+                        expression.evaluation_properties().is_reorder_fence()
+                    })
+                    && super::FilterPushdown::normalize_predicates(filter.expressions.clone())
+                        .is_some_and(|predicates| predicates.is_empty()) =>
+            {
+                Some(filter.child.clone())
+            }
+            _ => None,
+        };
+        rewritten |= alias.is_some();
+        if rewritten {
+            node.source_proofs = Box::new([]);
+        }
+        aliases.push(alias);
+        changed.push(rewritten);
+    }
+    // This producer owns an Aggregate root, never an identity filter root.
+    Ok(shell)
+}
+
 fn outer_sum<Child>(aggregate: &Aggregate<Child>) -> Option<OuterSum> {
     if aggregate.post_reduction.is_some()
         || aggregate.aggregates.len() != 1
@@ -184,23 +238,6 @@ fn substitute_detail_join(
     let NativeChild::Node(index) = current.clone() else {
         return Ok(None);
     };
-    if let LogicalOperator::Filter(filter) = &nodes[index].operator {
-        // The owned prelude removes tautologies before matching the join
-        // spine. Only erase a filter proven empty by the same normalizer,
-        // with no output projection or evaluation fence to preserve.
-        if filter.projection_map.is_all()
-            && !filter
-                .expressions
-                .iter()
-                .any(|expression| expression.evaluation_properties().is_reorder_fence())
-            && super::FilterPushdown::normalize_predicates(filter.expressions.clone())
-                .is_some_and(|predicates| predicates.is_empty())
-        {
-            let child = filter.child.clone();
-            return substitute_detail_join(nodes, child, outer_sum);
-        }
-        return Ok(None);
-    }
     let LogicalOperator::Join(Join::Comparison(join)) = nodes[index].operator.clone() else {
         return Ok(None);
     };
@@ -1366,9 +1403,28 @@ mod tests {
 
     #[test]
     fn production_apply_stages_subsumption_without_owned_settlement() {
-        for trivial_filter in [false, true] {
+        for location in ["none", "spine", "detail", "detail-stack"] {
             let mut plan = q18_shape(detail_table(79_003));
-            if trivial_filter {
+            if matches!(location, "detail" | "detail-stack") {
+                plan = plan.try_fold_post_order(|plan, _: Vec<()>| {
+                    let plan = if matches!(&plan.operator, LogicalOperator::Get(get) if get.table_index == OUTER_DETAIL) {
+                        let mut plan = plan;
+                        for _ in 0..if location == "detail-stack" { 3 } else { 1 } {
+                            plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
+                                paro_planner::operator::Filter::new(plan, vec![Expression::Constant(
+                                    paro_planner::expression::ConstantExpression::new(
+                                        paro_common::runtime_value::Value::Boolean(true),
+                                        LogicalType::Boolean,
+                                    ).into(),
+                                )]),
+                            ));
+                        }
+                        plan
+                    } else { plan };
+                    Ok((plan, ()))
+                }).unwrap().0;
+            }
+            if location == "spine" {
                 let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
                     unreachable!()
                 };
@@ -1425,7 +1481,7 @@ mod tests {
             assert_eq!(
                 super::super::semantic_plan::owned_binding_instantiation_count(),
                 bridges,
-                "trivial_filter={trivial_filter}"
+                "location={location}"
             );
             assert_eq!(state.read().unwrap().staging_arena.len(), arena_before);
         }
