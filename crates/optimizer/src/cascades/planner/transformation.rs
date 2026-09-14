@@ -29,6 +29,8 @@ mod native_mark_tests;
 mod native_key_domain_tests;
 #[cfg(test)]
 mod native_materialization_tests;
+#[cfg(test)]
+mod native_deferral_tests;
 pub(super) mod settlement;
 mod staging;
 
@@ -3160,9 +3162,9 @@ fn try_native_dimension_deferral(
     else {
         return Ok(None);
     };
-    if native_shell_contains_control_boundary(&shell) {
-        return Ok(None);
-    }
+    // The dimension is moved as the same input, not copied or inlined. Fact
+    // inputs likewise remain below the new partial aggregate as whole edges;
+    // neither producer ownership nor a CTE reference's domain is traversed.
     let original_root_layout = layouts
         .get(shell.root)
         .cloned()
@@ -3205,7 +3207,7 @@ fn try_native_dimension_deferral(
             .get(dimension_index)
             .ok_or_else(|| paro_error::internal("native dimension shell lost its dimension"))?
             .operator,
-        LogicalOperator::Get(_)
+        LogicalOperator::Get(_) | LogicalOperator::CTERef(_)
     ) {
         return Ok(None);
     }
@@ -4547,7 +4549,7 @@ fn native_dimension_direct_shape(
         })?;
     if !matches!(
         dimension_payload.semantic_template.operator,
-        LogicalOperator::Get(_)
+        LogicalOperator::Get(_) | LogicalOperator::CTERef(_)
     ) || !dimension_children.is_empty()
     {
         return Ok(false);
