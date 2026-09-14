@@ -39,6 +39,8 @@ pub(super) struct RuleRow {
     native_refresh_size_histogram: BTreeMap<usize, u64>,
     staging_payload_candidates: u64,
     staging_payload_constructed: u64,
+    settled_layout_consumed: u64,
+    settled_cost_view_constructed: u64,
 }
 
 #[derive(Default)]
@@ -78,6 +80,8 @@ impl Attribution {
                             "native_refresh_size_histogram": row.native_refresh_size_histogram,
                             "staging_payload_candidates": row.staging_payload_candidates,
                             "staging_payload_constructed": row.staging_payload_constructed,
+                            "settled_layout_consumed": row.settled_layout_consumed,
+                            "settled_cost_view_constructed": row.settled_cost_view_constructed,
                         }),
                     )
                 })
@@ -165,6 +169,16 @@ pub(crate) fn staging_payload(constructed: bool) {
             let row = ledger.b3.rows.entry(ledger.b3.rule.unwrap_or(0)).or_default();
             if constructed { row.staging_payload_constructed += 1; }
             else { row.staging_payload_candidates += 1; }
+        }
+    });
+}
+
+pub(crate) fn settled_node(cost_view: bool) {
+    SLOT.with(|slot| {
+        if let Some(ledger) = slot.borrow_mut().ledger.as_mut() {
+            let row = ledger.b3.rows.entry(ledger.b3.rule.unwrap_or(0)).or_default();
+            if cost_view { row.settled_cost_view_constructed += 1; }
+            else { row.settled_layout_consumed += 1; }
         }
     });
 }

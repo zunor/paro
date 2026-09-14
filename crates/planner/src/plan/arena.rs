@@ -208,6 +208,14 @@ impl LogicalPlanArena {
         Ok(&self.nodes[index.slot as usize].output)
     }
 
+    /// The immutable output contract derived when this exact node generation
+    /// was appended. Consumers share it rather than deriving a second layout
+    /// from a reconstructed child shell. `slot` rejects rolled-back IDs.
+    pub fn shared_output_layout(&self, index: PlanIndex) -> Result<Arc<LogicalOutputLayout>> {
+        self.get(index)?;
+        Ok(Arc::clone(&self.nodes[index.slot as usize].output))
+    }
+
     pub fn append(&mut self, node: LogicalPlanNode) -> Result<PlanIndex> {
         let mut valid = true;
         node.operator
@@ -515,6 +523,10 @@ mod tests {
             &arena.nodes[child.slot as usize].output,
             &arena.nodes[filter.slot as usize].output,
         ));
+        assert!(Arc::ptr_eq(
+            &arena.shared_output_layout(child).unwrap(),
+            &arena.shared_output_layout(filter).unwrap(),
+        ));
     }
 
     #[test]
@@ -527,6 +539,9 @@ mod tests {
         let replacement = arena.append(identity()).unwrap();
         assert_ne!(removed, replacement);
         assert!(arena.get(removed).is_err());
+        assert!(arena.shared_output_layout(removed).is_err());
+        assert!(arena.shared_output_layout(replacement).is_ok());
+        assert!(LogicalPlanArena::default().shared_output_layout(root).is_err());
         assert!(arena.get(root).is_ok());
         assert!(arena
             .append(LogicalPlanNode {

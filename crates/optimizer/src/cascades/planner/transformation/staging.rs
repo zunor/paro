@@ -555,7 +555,10 @@ pub(super) fn stage_transformed_expression(
     }
 
     enum NodeStagingInput {
-        Owned(OwnedLogicalPlan),
+        Settled {
+            node: paro_planner::plan::arena::LogicalPlanNode<()>,
+            layout: Arc<paro_planner::operator::LogicalOutputLayout>,
+        },
         Native {
             id: paro_planner::plan::PlanNodeId,
             stats: NodeStats,
@@ -572,21 +575,6 @@ pub(super) fn stage_transformed_expression(
         node_context: OptimizationContextId,
         target_child_context: Option<OptimizationContextId>,
         refined_cardinality_kind: Option<CardinalityRecipeKind>,
-    }
-
-    fn resolve_group_hole(
-        session: &mut StagingSession<'_>,
-        plan: OwnedLogicalPlan,
-    ) -> Result<NodeState> {
-        let layout = plan.output_layout();
-        let names = Arc::<[String]>::from(plan.output_names());
-        let (id, stats, operator) = plan.into_parts();
-        let LogicalOperator::BoundReference(reference) = operator else {
-            return Err(paro_error::internal(
-                "native staging expected a Memo group hole",
-            ));
-        };
-        resolve_group_hole_reference(session, id, stats, layout, names, reference)
     }
 
     fn resolve_group_hole_reference(
@@ -686,10 +674,11 @@ pub(super) fn stage_transformed_expression(
             target_child_context,
             refined_cardinality_kind,
         } = request;
-        let (id, stats, semantic_operator, cost_plan, source_proofs) =
+        let (id, stats, semantic_operator, settled_layout, source_proofs) =
             match input {
-                NodeStagingInput::Owned(plan) => {
-                    if let LogicalOperator::BoundReference(reference) = &plan.operator {
+                NodeStagingInput::Settled { node, layout } => {
+                    crate::work_partition::settled_node(false);
+                    if let LogicalOperator::BoundReference(reference) = &node.operator {
                         if target.is_some()
                             || !session
                                 .nested_group_holes
@@ -699,23 +688,23 @@ pub(super) fn stage_transformed_expression(
                                 "staging reached an unregistered or root Memo group hole",
                             ));
                         }
-                        let node = resolve_group_hole(session, plan)?;
+                        let names = Arc::from(node.operator.output_names_from_child_refs(&[]));
+                        let LogicalOperator::BoundReference(reference) = node.operator else { unreachable!() };
+                        let node = resolve_group_hole_reference(
+                            session, node.id, node.stats, Arc::unwrap_or_clone(layout), names, reference,
+                        )?;
                         return Ok(Some((node, None)));
                     }
-                    let (skeleton, children) =
-                        paro_planner::plan::arena::LogicalPlanNode::detach(plan);
-                    let skeleton_id = skeleton.id;
                     let source_proofs = session
                         .selected_proofs
-                        .get(&skeleton_id)
+                        .get(&node.id)
                         .cloned()
                         .unwrap_or_default();
-                    let semantic_operator = skeleton.operator.clone();
                     (
-                        skeleton.id,
-                        skeleton.stats.clone(),
-                        semantic_operator,
-                        Some(skeleton.assemble(children)?),
+                        node.id,
+                        node.stats,
+                        node.operator,
+                        Some(layout),
                         source_proofs,
                     )
                 }
@@ -739,7 +728,7 @@ pub(super) fn stage_transformed_expression(
                 }
             };
         crate::work_partition::staging_payload(false);
-        let native_direct = cost_plan.is_none();
+        let native_direct = settled_layout.is_none();
         if native_direct {
             if let LogicalOperator::Aggregate(aggregate) = &semantic_operator {
                 if aggregate.groups.len() >= 9 {
@@ -772,7 +761,9 @@ pub(super) fn stage_transformed_expression(
             .iter()
             .map(|child| child.layout.as_ref())
             .collect::<Vec<_>>();
-        let output_layout = semantic_operator.output_layout_from_child_refs(&child_layouts);
+        let output_layout = settled_layout.unwrap_or_else(|| {
+            Arc::new(semantic_operator.output_layout_from_child_refs(&child_layouts))
+        });
         let output_bindings = output_layout.bindings();
         let output_types = output_layout.types();
         let child_names = child_states
@@ -989,7 +980,7 @@ pub(super) fn stage_transformed_expression(
                         group,
                         stats: stats.clone(),
                         columns: Arc::clone(&output_columns),
-                        layout: Arc::new(output_layout.clone()),
+                        layout: Arc::clone(&output_layout),
                         names: Arc::clone(&output_names),
                         region_scope: PlannerRegionScope::new(
                             group,
@@ -1097,7 +1088,7 @@ pub(super) fn stage_transformed_expression(
                             group,
                             stats: stats.clone(),
                             columns: Arc::clone(&output_columns),
-                            layout: Arc::new(output_layout.clone()),
+                            layout: Arc::clone(&output_layout),
                             names: Arc::clone(&output_names),
                             region_scope,
                             boundary_reference_id: None,
@@ -1112,7 +1103,7 @@ pub(super) fn stage_transformed_expression(
                         group,
                         stats: stats.clone(),
                         columns: Arc::clone(&output_columns),
-                        layout: Arc::new(output_layout.clone()),
+                        layout: Arc::clone(&output_layout),
                         names: Arc::clone(&output_names),
                         region_scope,
                         boundary_reference_id: None,
@@ -1135,6 +1126,30 @@ pub(super) fn stage_transformed_expression(
         crate::work_partition::staging_payload(true);
         #[cfg(test)]
         STAGING_PAYLOAD_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        // The old path instantiated each child transport, assembled the
+        // parent, detached it, and assembled it again before identity lookup.
+        // Keep the established owned capability/cost contract, but construct
+        // its one-node view only for a genuinely new payload. Exact child
+        // facts have already been reconciled at the publication boundary.
+        let cost_plan = if native_direct {
+            None
+        } else {
+            crate::work_partition::settled_node(true);
+            let children = child_states.iter().map(|child| {
+                let reference = paro_planner::operator::BoundReference::new(
+                    child.boundary_reference_id.ok_or_else(|| paro_error::internal("settled child lost its occurrence"))?,
+                    child.layout.bindings().to_vec(),
+                    child.layout.types().to_vec(),
+                ).with_facts(child.boundary_facts.clone().ok_or_else(|| paro_error::internal("settled child lost published facts"))?)?;
+                Ok(Box::new(OwnedLogicalPlan {
+                    id: child.id, stats: child.stats.clone(),
+                    operator: LogicalOperator::BoundReference(reference),
+                }))
+            }).collect::<Result<Vec<_>>>()?;
+            Some(paro_planner::plan::arena::LogicalPlanNode {
+                id, stats: stats.clone(), operator: semantic_operator.clone(),
+            }.assemble(children)?)
+        };
         let semantic_template = semantic_plan::canonical_template(
             paro_planner::plan::arena::LogicalPlanNode {
                 id, stats: NodeStats::default(), operator: semantic_operator.clone(),
@@ -1461,7 +1476,7 @@ pub(super) fn stage_transformed_expression(
                 group,
                 stats: stats.clone(),
                 columns: output_columns,
-                layout: Arc::new(output_layout),
+                layout: output_layout,
                 names: output_names,
                 region_scope,
                 boundary_reference_id: None,
@@ -1544,7 +1559,7 @@ pub(super) fn stage_transformed_expression(
             StagingInput::Arena(root_index) => {
                 use paro_planner::plan::arena::{LogicalPlanNode, PlanIndex};
                 session.state.staging_arena.get(root_index)?;
-                let mut completed = BTreeMap::<PlanIndex, (LogicalPlanNode<()>, NodeState)>::new();
+                let mut completed = BTreeMap::<PlanIndex, NodeState>::new();
                 let mut root_result = None;
                 let Some(post_order) = session
                     .state
@@ -1561,16 +1576,17 @@ pub(super) fn stage_transformed_expression(
                         statement.cancellation.check()?;
                     }
                     let node = session.state.staging_arena.get(index)?.clone();
+                    let layout = session.state.staging_arena.shared_output_layout(index)?;
                     let is_root = index == root_index;
                     let mut child_states = Vec::new();
                     let operator = node.operator.try_map_child_links(&mut |child| {
-                        let (transport, state) = completed
+                        let state = completed
                             .get(&child)
                             .ok_or_else(|| paro_error::internal("staging lost an arena input"))?;
                         child_states.push(state.clone());
-                        transport.instantiate(transport.id, []).map(Box::new)
+                        Ok::<_, paro_error::ParoError>(())
                     })?;
-                    let plan = OwnedLogicalPlan {
+                    let plan = LogicalPlanNode {
                         id: node.id,
                         stats: node.stats,
                         operator,
@@ -1578,7 +1594,7 @@ pub(super) fn stage_transformed_expression(
                     let Some((mut node, staged)) = stage_node(
                         &mut session,
                         NodeStagingRequest {
-                            input: NodeStagingInput::Owned(plan),
+                            input: NodeStagingInput::Settled { node: plan, layout },
                             target: is_root.then_some(target),
                             required_region_facet: is_root
                                 .then_some(preserved_region_facet)
@@ -1616,23 +1632,12 @@ pub(super) fn stage_transformed_expression(
                                 &layout,
                             )?
                         };
-                        let (types, bindings) = Arc::unwrap_or_clone(layout).into_parts();
                         let reference_id = node.boundary_reference_id.unwrap_or_else(|| {
                             paro_planner::operator::BoundReferenceId::node_occurrence(node.id.0)
                         });
-                        let reference = paro_planner::operator::BoundReference::new(
-                            reference_id,
-                            bindings,
-                            types,
-                        )
-                        .with_facts(facts)?;
-                        let transport = LogicalPlanNode {
-                            id: node.id,
-                            stats: node.stats.clone(),
-                            operator: LogicalOperator::BoundReference(reference),
-                        };
+                        node.boundary_facts = Some(facts);
                         node.boundary_reference_id = Some(reference_id);
-                        completed.insert(index, (transport, node.clone()));
+                        completed.insert(index, node.clone());
                     }
                     if is_root {
                         root_result = Some((node, staged));
