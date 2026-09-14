@@ -1011,3 +1011,24 @@ rollback is tested, not all cancellation/staging-rejection schedules. No bless,
 SQL regress, independent bag execution, fixed-work/fingerprint or fresh Q11
 campaign. Tests are mixed-worktree evidence only. No timing gain or complete
 owned-IR migration is claimed.
+
+## Native selective carrier coverage
+
+Three further production fixtures exercise ordinary Window output, an existing
+virtual rowid, and explicit Filter/Order projection maps over that rowid. The
+Window output retains its original binding in internal carrier slot zero; the
+root references the carrier namespace while fetched payload references the
+materialized namespace. Carrier visibility and BigInt types are checked.
+Existing rowid is reused (one VirtualRowId source, no output-width growth).
+
+The projected-wrapper fixture confirms Memo ingress canonicalizes Filter/Order
+maps to All; the producer correctly handles that actual selected representation.
+No production correction was needed. These cases pass tree-reference needed-
+column checks, actual apply with zero owned constructions, the cardinality-upper
+negative check, and visible-state rollback checks. They are transport/transaction
+coverage, not a bag-execution or performance oracle.
+
+All 21 late_payload tests pass (21 production fixtures). Full optimizer remains
+1285 pass / same five failures. Only tests changed. No bless, fresh Q11, SQL
+regress, fixed-work/fingerprint campaign or new compiler timing in this slice.
+Reject-path authority and both TopN constructions remain migration work.
