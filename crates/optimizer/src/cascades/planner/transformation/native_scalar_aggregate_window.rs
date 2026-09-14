@@ -156,13 +156,19 @@ fn expand_binding(
             return Ok(None);
         }
     }
-    let child_groups = logical.key.children.clone();
     if !ctx.admit_fact_work(
         super::BudgetDimension::RuleWorkPerGroup,
         1 + child_shapes.len(),
     )? {
         return Ok(None);
     }
+    let child_groups = ctx
+        .memo()
+        .logical_expr(expression)
+        .ok_or_else(|| paro_error::internal("scalar window expansion lost its expression"))?
+        .key
+        .children
+        .clone();
     let mut result = Vec::with_capacity(child_shapes.len());
     for (slot, child_shape) in child_shapes.iter().copied().enumerate() {
         let fallback = PatternOperand::Group(child_groups[slot]);
