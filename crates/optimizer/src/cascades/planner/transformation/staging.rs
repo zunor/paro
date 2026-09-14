@@ -2212,6 +2212,55 @@ mod tests {
     }
 
     #[test]
+    fn settled_identity_reuse_retains_fresh_column_facts() {
+        use paro_planner::operator::Filter;
+        use paro_storage::statistics::BaseStatistics;
+        let plan = || OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            test_base_get(0, 70_105, "settled_fact_source", 100), vec![],
+        )));
+        let mut input = MemoBuilder::build(plan(), BindContext::new(), SearchBudget::default()).unwrap();
+        let root = input.root;
+        let mut state = input.planner_state.write().unwrap();
+        state.session = Some(TestStatementContextBuilder::minimal().build());
+        let baseline = input.memo.logical_expr(input.memo.group(root).unwrap().logical_exprs()[0]).unwrap().payload;
+        let mut prior = None;
+        for ndv in [8, 3, 3] {
+            let root_index = state.staging_arena.import(plan()).unwrap();
+            let resident = state.staging_arena.shared_output_layout(root_index).unwrap();
+            let column = *state.binding_ids.get(0, 0, &LogicalType::Integer).unwrap();
+            let stats = Arc::new(ColumnStatistics::with_estimated_distinct(
+                BaseStatistics::create_unknown(LogicalType::Integer), Some(ndv),
+            ));
+            let before = STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get);
+            let staged = stage_transformed_expression(StagingRequest {
+                input: StagingInput::Arena(root_index),
+                input_facts: boundary::BoundarySnapshot::default(),
+                column_stats: Arc::new(HashMap::from([(ColumnBinding::new(0, 0), stats)])),
+                column_stat_scopes: HashMap::new(),
+                target: StagingTarget {
+                    group: root, rule: RuleId(999), budget_class: TransformationBudgetClass::Local,
+                    input_context: OptimizationContextId(0), child_context: OptimizationContextId(0),
+                    refined_cardinality_kind: None,
+                },
+                regions: StagingRegionRequirements {
+                    preserved_facet: None, extended_required_facets: Box::new([]),
+                    inherited_runtime_filter_facet: None,
+                },
+                nested_group_holes: BTreeMap::new(), selected_proofs: HashMap::new(),
+            }, &mut input.memo, &mut state).unwrap().unwrap();
+            assert_eq!(staged.payload, baseline);
+            assert_eq!(STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get), before);
+            assert_eq!(staged.logical_properties.column_domains[&column].ranking_point, ndv as u64);
+            let value = staged.logical_properties.column_domains.clone();
+            if let Some((previous_ndv, previous)) = prior {
+                assert_eq!(value == previous, ndv == previous_ndv);
+            }
+            prior = Some((ndv, value));
+            assert!(Arc::ptr_eq(&resident, &state.staging_arena.shared_output_layout(root_index).unwrap()));
+        }
+    }
+
+    #[test]
     fn root_key_collision_in_another_context_declines_and_rolls_back() {
         let bind_context = BindContext::new();
         let plan = OwnedLogicalPlan::new(
