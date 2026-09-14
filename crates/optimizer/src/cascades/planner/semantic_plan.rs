@@ -10,6 +10,17 @@
 
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static OWNED_BINDING_INSTANTIATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Per-thread audit for migration tests; absent from production builds.
+#[cfg(test)]
+pub(super) fn owned_binding_instantiation_count() -> usize {
+    OWNED_BINDING_INSTANTIATIONS.with(std::cell::Cell::get)
+}
+
 pub(super) fn canonical_template(
     mut plan: paro_planner::plan::arena::LogicalPlanNode<()>,
 ) -> paro_planner::plan::arena::LogicalPlanNode<()> {
@@ -43,6 +54,8 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
     binding: &PatternOperand,
     facts: Option<&boundary::BoundarySnapshot>,
 ) -> Result<Option<InstantiatedPlanWithGroupHoles>> {
+    #[cfg(test)]
+    OWNED_BINDING_INSTANTIATIONS.with(|count| count.set(count.get() + 1));
     fn group_hole_transport(
         state: &PlannerTransformState,
         layout: &PlannerBindingLayout,

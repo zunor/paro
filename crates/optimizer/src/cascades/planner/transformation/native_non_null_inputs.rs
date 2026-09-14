@@ -6,8 +6,9 @@
 //! The owned rule changes a bound aggregate function only after proving that
 //! its input reaches a stored Get column through row-preserving unary
 //! operators. Keep that proof at Memo boundaries and change only the
-//! aggregate payload; unsupported or unknown evidence remains on the
-//! authoritative owned path.
+//! aggregate payload. The selected matcher grammar is closed; unknown
+//! non-NULL evidence yields no rewrite, not an owned fallback. Fact reads
+//! retain responsibility for reopening the rule when evidence changes.
 
 use paro_common::error::Result;
 use paro_planner::expression::{AggregateType, Expression};
@@ -312,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn native_rewrite_keeps_nullable_boundary_on_owned_path() {
+    fn native_nullable_rejection_does_not_instantiate_owned_binding() {
         let input = candidate();
         let mut memo_input =
             MemoBuilder::build(input, BindContext::new(), SearchBudget::default()).unwrap();
@@ -342,9 +343,55 @@ mod tests {
             planner_state: state.clone(),
         };
         let mut context = TransformContext::new(&mut memo_input.memo, root);
+        let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
         assert!(rule
             .apply_binding(&binding, &mut context)
             .unwrap()
             .is_empty());
+        assert_eq!(
+            super::super::semantic_plan::owned_binding_instantiation_count(),
+            bridges,
+            "a complete native negative result must not construct an owned binding"
+        );
+        let reads = context.take_fact_reads();
+        drop(context);
+        let get_group = memo_input
+            .memo
+            .logical_expr(expression)
+            .unwrap()
+            .key
+            .children[0];
+        let column = state
+            .read()
+            .unwrap()
+            .binding_ids
+            .get(0, 0, &paro_common::types::LogicalType::BigInt)
+            .copied()
+            .unwrap();
+        memo_input
+            .memo
+            .group_mut(get_group)
+            .unwrap()
+            .logical_properties
+            .column_values
+            .insert(
+                column,
+                BoundColumnValues::new(BaseStatistics::new(
+                    paro_common::types::LogicalType::BigInt,
+                ))
+                .unwrap(),
+            );
+        assert!(
+            reads
+                .iter()
+                .any(|read| !read.is_current(&memo_input.memo).unwrap()),
+            "native rejection must retain the evidence dependency"
+        );
+        let mut context = TransformContext::new(&mut memo_input.memo, root);
+        assert_eq!(rule.apply_binding(&binding, &mut context).unwrap().len(), 1);
+        assert_eq!(
+            super::super::semantic_plan::owned_binding_instantiation_count(),
+            bridges
+        );
     }
 }

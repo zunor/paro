@@ -28,7 +28,7 @@ use tracing::debug;
 
 use crate::aggregate::{
     dimension_deferral, dimension_sharing, input_materialization, join_preaggregation,
-    join_subsumption, late_payload, non_null_inputs, post_reduction,
+    join_subsumption, late_payload, post_reduction,
 };
 use crate::context::SharedColumnStatistics;
 use crate::filter::pushdown::FilterPushdown;

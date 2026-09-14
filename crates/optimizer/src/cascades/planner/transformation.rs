@@ -838,6 +838,15 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             Vec::new()
         };
+        // NonNullAggregate's selected grammar is closed: one Aggregate over
+        // Filter/Order/TopN/Limit ending at Get. The native producer covers
+        // the entire binding, including a missing no-NULL proof. A negative
+        // result is not a request to rebuild the same binding as owned IR.
+        if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput)
+            && direct_native.is_empty()
+        {
+            return Ok(Box::new([]));
+        }
         if direct_native.is_empty() {
             if let Some(savepoint) = native_cte_savepoint {
                 self.planner_state
@@ -5184,7 +5193,6 @@ fn rewrite_planner_expressions(
     Ok(rewrite_planner_expression(
         transformation,
         plan,
-        column_stats,
         environment,
         rejection_reasons,
     )?
@@ -5195,7 +5203,6 @@ fn rewrite_planner_expressions(
 fn rewrite_planner_expression(
     transformation: PlannerTransformation,
     plan: OwnedLogicalPlan,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     environment: &PlannerRuleEnvironment,
     rejection_reasons: &mut Option<crate::transformation_rejection::RejectionReasons>,
 ) -> Result<Option<OwnedLogicalPlan>> {
@@ -5257,11 +5264,9 @@ fn rewrite_planner_expression(
             plan
         }
         PlannerTransformation::AggregateNonNullInput => {
-            let (plan, changed) = non_null_inputs::optimize_plan_with_change(plan, column_stats);
-            if !changed {
-                return Ok(None);
-            }
-            plan
+            return Err(paro_error::internal(
+                "aggregate non-null input is a native-only Memo transformation",
+            ));
         }
         PlannerTransformation::AggregateDimensionDeferral => {
             let (plan, changed) =
