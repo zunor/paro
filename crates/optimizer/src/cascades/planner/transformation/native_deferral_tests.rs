@@ -24,6 +24,69 @@ fn assert_column(expressions: &[Expression], table: usize, ordinal: usize) {
 }
 
 #[test]
+fn production_deferral_semantic_rejections_do_not_export_owned_ir() {
+    for distinct in [false, true] {
+        let make_plan = || {
+            let mut plan = candidate(false);
+            let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                unreachable!()
+            };
+            if distinct {
+                let Expression::Aggregate(sum) = &mut aggregate.aggregates[0] else {
+                    unreachable!()
+                };
+                sum.aggr_type = paro_planner::expression::AggregateType::Distinct;
+            } else {
+                aggregate.groups = vec![col(0, 0, LogicalType::Integer)];
+                aggregate.recompute_returned_types();
+            }
+            plan
+        };
+        let (_, changed) =
+            dimension_deferral::optimize_plan(make_plan(), &BindContext::new()).unwrap();
+        assert!(!changed);
+        let mut input =
+            MemoBuilder::build(make_plan(), BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.clone();
+        state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
+        let root = input.root;
+        let expression = input.memo.group(root).unwrap().logical_exprs()[0];
+        let binding = matching::scoped_pattern_bindings(
+            PlannerTransformation::AggregateDimensionDeferral,
+            root,
+            expression,
+            &input.memo,
+            &state.read().unwrap(),
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .bindings
+        .first()
+        .cloned()
+        .unwrap();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::AggregateDimensionDeferral,
+            planner_state: state.clone(),
+        };
+        let arena = state.read().unwrap().staging_arena.len();
+        let bridges = semantic_plan::owned_binding_instantiation_count();
+        let mut context = TransformContext::new(&mut input.memo, root);
+        assert!(rule
+            .apply_binding(&binding, &mut context)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            semantic_plan::owned_binding_instantiation_count(),
+            bridges,
+            "distinct={distinct}"
+        );
+        assert_eq!(state.read().unwrap().staging_arena.len(), arena);
+    }
+}
+
+#[test]
 fn production_deferral_respects_existing_partial_key_coverage() {
     use paro_planner::plan::{
         UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, UniqueKeyProvenance,
@@ -199,12 +262,14 @@ fn production_deferral_preserves_dimension_key_evaluation_barrier() {
             planner_state: state,
         };
         let mut context = TransformContext::new(&mut input.memo, root);
+        let bridges = semantic_plan::owned_binding_instantiation_count();
         assert!(
             rule.apply_binding(&binding, &mut context)
                 .unwrap()
                 .is_empty(),
             "reversed={reversed}"
         );
+        assert_eq!(semantic_plan::owned_binding_instantiation_count(), bridges);
     }
 }
 

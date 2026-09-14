@@ -3254,6 +3254,10 @@ fn try_native_dimension_deferral(
         return Ok(None);
     }
 
+    // Region isolation, child identity, and output-layout coverage are known.
+    // The remaining recognition guards are authoritative for this exact
+    // binding; rebuilding it as owned IR cannot supply another legal output.
+    *checked = true;
     let mut partial_groups = Vec::with_capacity(join.conditions.len() + aggregate.groups.len());
     let mut condition_rewrites = Vec::with_capacity(join.conditions.len());
     for condition in &join.conditions {
@@ -3378,6 +3382,8 @@ fn try_native_dimension_deferral(
         merge_functions.push(merge);
     }
 
+    // Construction/layout failure is still unsupported, not semantic refusal.
+    *checked = false;
     let partial_group_index = state.bind_context.generate_table_index();
     let partial_aggregate_index = state.bind_context.generate_table_index();
     let partial_groupings_index = state.bind_context.generate_table_index();
