@@ -1053,3 +1053,37 @@ it is excluded from this commit and these test claims. Aggregate-TopN remains
 unmigrated. SQL regress, independent bag execution, fixed-work/fingerprint and
 fresh Q11 acceptance remain open; mixed-tree unit runs are not clean performance
 evidence.
+
+## Detail TopN selected-native construction (b0e36aa6)
+
+Detail TopN now constructs its ordering-payload fetch before TopN and output-
+payload fetch after TopN directly from selected NativeChild nodes. It uses the
+existing ownership-generic row-id proof and existing benefit model. Successful
+production bindings do not instantiate an owned plan. Aggregate TopN and
+unsupported/negative paths still use the owned fallback; this is not full
+LatePayloadFetch migration.
+
+The real apply/rollback test exposed a production-only output contract gap:
+Memo templates canonicalize the TopN carrier map to All, while metadata still
+declares only the projected outputs. The hidden-ordering fixture directly
+rewrote successfully but staged zero alternatives because its root included
+the hidden integer. Restoring the selected root map with the existing
+`projection_for_bindings` contract fixes that rejection without weakening
+staging's exact output check or importing an owned tree.
+
+Three targeted tests cover five positive production fixtures (both fetch
+frontiers, hidden ordering, derived carrier, comparison join and cross join),
+zero owned instantiations on apply, visible sidecar/Memo rollback, rowid source
+occurrence ambiguity, zero rows, invalid/deep order bindings, null-extension
+and arbitrary-condition join fences. Non-prefix/reordered/repeated direct-shell
+root maps fail closed: compact Projection output numbering cannot yet preserve
+those original namespaces. Multi-source fetch ordering/fingerprint equivalence
+is not established. Native and owned TopN admission still need consolidation;
+positive transport tests do not prove complete equivalence of those algorithms.
+
+Fresh mixed-worktree unit run: 1288 passed / five failed, with the same failure
+names and assertions as the preceding run (three undeclared-grant errors,
+statistics rollback identity, nested source lane). Optimizer check and diff
+whitespace check pass. No failures blessed. No fresh Q11, SQL regress, independent
+bag execution, clean fixed-work/fingerprint campaign or performance claim in
+this slice. The goal remains open.
