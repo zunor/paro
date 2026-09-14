@@ -562,6 +562,40 @@ mod tests {
                 budget.disable_transformation(rule.id());
             }
         }
+        // The session-backed optimizer selects from its frozen resource
+        // snapshot, not the first supplied class. Declare the same operating
+        // points as production so this test reaches multi-output publication.
+        let session = &context.session;
+        let grants = paro_context::compile_grant_classes(
+            session.limits.max_memory,
+            session.limits.max_threads.max(1),
+            budget.max_grant_classes,
+        )
+        .into_iter()
+        .map(|class| ResourceGrantClass {
+            id: super::super::super::super::ids::ResourceGrantClassId::new(class.index),
+            hard_memory_bytes: class.hard_memory_bytes,
+            spill_policy: if session.limits.use_temporary_directory {
+                crate::physical::SpillPolicy::Allowed
+            } else {
+                crate::physical::SpillPolicy::Forbidden
+            },
+            max_parallel_tasks: class.max_parallel_tasks,
+        })
+        .collect::<Vec<_>>();
+        let expected = session
+            .compile_resources
+            .expected_grant(
+                session.limits.max_memory,
+                session.limits.max_threads,
+                budget.max_grant_classes,
+            )
+            .expect("publication fixture must have an available frozen grant");
+        assert!(grants.iter().any(|class| {
+            class.id.index() == expected.index
+                && class.hard_memory_bytes == expected.hard_memory_bytes
+                && class.max_parallel_tasks == expected.max_parallel_tasks
+        }));
         let result = MemoBuilder::build_with_search(
             vec![LogicalAlternative {
                 plan,
@@ -573,12 +607,7 @@ mod tests {
             &context,
         )
         .unwrap()
-        .optimize(&[ResourceGrantClass {
-            id: super::super::super::super::ids::ResourceGrantClassId(0),
-            hard_memory_bytes: u64::MAX,
-            spill_policy: crate::physical::SpillPolicy::Allowed,
-            max_parallel_tasks: 1,
-        }])
+        .optimize(&grants)
         .unwrap();
         assert!(
             result
