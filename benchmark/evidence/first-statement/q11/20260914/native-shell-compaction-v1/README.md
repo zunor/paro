@@ -273,6 +273,19 @@ the native rewrite core, not an end-to-end Memo/CTE execution fixture; productio
 CTE and clean Q11/fingerprint acceptance remain unverified. No performance
 claim follows from permitting this previously rejected native shape.
 
+`2a0e2b3f` adds native MaterializedCTE traversal: producer requirements retain
+the full definition output, while consumer requirements remain in the consumer
+namespace. CTERef leaves are retained without construction. The production
+Memo/binding/apply/staging regression initially observed one owned bridge;
+it now observes zero on both a complete negative and a positive, including
+retry after unique-key fact invalidation. Its consumer contains a real CTERef;
+the test verifies retained producer column mapping, reference count and the
+consumer's unchanged statistics-dependency fingerprint after native staging.
+Twelve native, five reference and 111 engine tests passed on the mixed tree.
+This is not a full SQL/recursive-CTE or frozen-execution acceptance campaign.
+RecursiveCTE still declines this native producer, and Q11 performance and
+clean-source fingerprint equivalence have not been rerun for this slice.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
