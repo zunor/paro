@@ -262,6 +262,17 @@ tests and 111 engine tests passed. NoRewrite means only this selected rule
 binding was checked, not ProofComplete or global search closure. No Q11 or
 clean-source performance/fingerprint evidence was collected for this slice.
 
+`d208b6ce` permits native JoinElimination to retain opaque control inputs when
+their exact boundary identities and edge multiplicities survive unchanged.
+Explicit CTE/recursive/reference nodes remain unsupported. A shell regression
+checks a retained control input and rejects removal even when two occurrences
+share the same transport identity; a set-only test would miss that case.
+Boundary payloads are not rewritten. Twelve native tests, five reference tests
+and 111 engine tests passed on the mixed worktree. This regression exercises
+the native rewrite core, not an end-to-end Memo/CTE execution fixture; production
+CTE and clean Q11/fingerprint acceptance remain unverified. No performance
+claim follows from permitting this previously rejected native shape.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
