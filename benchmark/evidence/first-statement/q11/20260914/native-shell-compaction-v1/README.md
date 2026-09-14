@@ -657,3 +657,27 @@ region coverage need their own audit. Nor is this an independent bag execution
 oracle, exhaustive search-equivalence proof, or clean Q11 performance result.
 No current C1/W, fingerprint, or fixed-work acceptance is claimed. All mixed
 user files and previously staged evidence were excluded from these commits.
+
+## Deferral dimension-key evaluation boundary (af32bcd9)
+
+The fallback-removal audit found a real native/reference contract mismatch:
+native deferral checked only the fact-side join key for evaluation mobility;
+the reference checks both keys. A production Memo/scoped-binding test with a
+test-bound volatile dimension expression reproduced a native output where the
+reference returned unchanged. Both comparison orientations now reject that
+rewrite after checking both keys. Existing positive native fixtures still pass.
+This corrects candidate generation; it is not a claim of identical counts on
+queries that previously exposed this unsupported rewrite.
+
+The first attempted counterexample used CanError alone and did not establish
+a barrier: the existing can_share_evaluation/is_reorder_fence contract does not
+equate fallibility with volatility. That hypothesis was rejected, not used to
+broaden production guards. The regression explicitly tests Volatile metadata;
+it is not an execution oracle for arithmetic or a change to error semantics.
+
+Targeted native_deferral_tests: 3 pass. Full optimizer: 1279 pass / 5 fail, with
+the same five assertion identities/values as the preceding records. No bless,
+no fresh Q11, no clean fixed-work or fingerprint evidence in this slice.
+General fallback removal remains pending, including unique-key no-reduction
+guard parity and authoritative negative coverage; this correction is necessary
+before treating native rejection as final.
