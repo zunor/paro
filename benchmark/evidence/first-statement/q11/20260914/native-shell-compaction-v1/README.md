@@ -711,3 +711,23 @@ No fresh Q11/C1/W or clean fixed-work/fingerprint campaign was run. Candidate
 counts on formerly over-rewritten inputs can change; no global count-equivalence
 claim is made. General deferral fallback and the full owned-IR migration remain
 unfinished; the existing mixed user changes were not included in this slice.
+
+## Covered deferral recognition refusals
+
+After region isolation, exact fact/dimension scopes and identity output layouts
+are established, semantic recognition refusals now bypass owned rebuilding.
+This includes key mobility, group-domain/payload checks and partial-merge
+eligibility. Construction and final layout validation are explicitly outside
+that authoritative interval; unsupported shapes still use the general fallback.
+
+The volatile dimension-key fixture reproduced one owned binding instantiation
+before this change despite returning no output. Both comparison orientations
+now instantiate zero. New production fixtures independently confirm the owned
+reference rejects DISTINCT aggregation and absence of dimension grouping payload;
+native application likewise produces nothing with zero bridges and no staging
+arena growth. Existing positive region/projection/key-coverage tests still pass.
+
+Full optimizer: 1281 passed, the same 5 named failures/assertion values. No bless.
+This is a transport-removal slice, not deletion of every DimensionDeferral
+fallback. No clean Q11, fixed-work/fingerprint equivalence or C1/W measurements
+were run; no performance gain or complete-search equivalence is inferred.
