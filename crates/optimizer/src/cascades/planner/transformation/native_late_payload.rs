@@ -4,7 +4,7 @@
 //! Native staging for the closed scan-prefix subset of late payload lowering.
 //!
 //! Row-id payload fetching remains on the authoritative owned rule.  This
-//! adapter handles Projection through the shared unary prefix transport to
+//! adapter handles Projection through unary and unique-source Join paths to
 //! Filter -> Get, whose
 //! semantic witness is an exact ASCII membership predicate.  It therefore
 //! avoids importing an owned tree without claiming that the full rule has
@@ -18,7 +18,7 @@ use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::expression::Expression;
 #[cfg(test)]
 use paro_planner::expression::OperatorType;
-use paro_planner::operator::{ColumnBinding, Filter, Get, LogicalOperator, Projection};
+use paro_planner::operator::{ColumnBinding, Filter, Get, Join, LogicalOperator, Projection};
 
 use super::staging::{NativeChild, NativeShell};
 use super::{boundary, Memo, PatternOperand, PlannerTransformState};
@@ -35,7 +35,7 @@ pub(super) fn try_native_late_payload_prefix(
     prefix_only_complete: &mut bool,
 ) -> Result<Option<NativeShell>> {
     *prefix_only_complete = false;
-    let Some((shell, layouts)) =
+    let Some((shell, mut layouts)) =
         NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
     else {
         return Ok(None);
@@ -52,6 +52,29 @@ pub(super) fn try_native_late_payload_prefix(
     let LogicalOperator::Projection(projection) = shell.root_operator().clone() else {
         return Ok(None);
     };
+    let Some(source_table) = projection.expressions.iter().find_map(|expression| {
+        let Expression::Function(function) = expression else {
+            return None;
+        };
+        let Some(ScalarPredicateProjection::Utf8Substring {
+            source_argument,
+            start: 1,
+            length: Some(_),
+        }) = function.function.predicate_projection.as_ref()
+        else {
+            return None;
+        };
+        let Expression::ColumnRef(source) = function.children.get(*source_argument)? else {
+            return None;
+        };
+        Some(source.binding.table_index)
+    }) else {
+        return Ok(None);
+    };
+    let source_counts = native_source_occurrences(&shell, source_table);
+    if source_occurrence_at(&source_counts, &projection.child) != Some(1) {
+        return Ok(None);
+    }
     let mut cursor = projection.child.clone();
     let mut ancestors = Vec::new();
     let (filter_index, get_index, filter, mut get) = loop {
@@ -70,14 +93,31 @@ pub(super) fn try_native_late_payload_prefix(
                         break (index, *child, filter.clone(), get.clone());
                     }
                 }
-                ancestors.push(index);
+                ancestors.push((index, 0));
                 cursor = filter.child.clone();
+            }
+            LogicalOperator::Join(join) => {
+                let (left, right) = match join {
+                    Join::Comparison(join) => (&join.left, &join.right),
+                    Join::Any(join) => (&join.left, &join.right),
+                    Join::Cross(join) => (&join.left, &join.right),
+                };
+                let slot = match (
+                    source_occurrence_at(&source_counts, left),
+                    source_occurrence_at(&source_counts, right),
+                ) {
+                    (Some(1), Some(0)) => 0,
+                    (Some(0), Some(1)) => 1,
+                    _ => return Ok(None),
+                };
+                ancestors.push((index, slot));
+                cursor = if slot == 0 { left } else { right }.clone();
             }
             operator => {
                 let Some(child) = prefix_unary_child(operator) else {
                     return Ok(None);
                 };
-                ancestors.push(index);
+                ancestors.push((index, 0));
                 cursor = child.clone();
             }
         }
@@ -142,7 +182,9 @@ pub(super) fn try_native_late_payload_prefix(
     let mut child_layout = nodes[filter_index]
         .operator
         .output_layout_from_child_refs(&[&get_layout]);
-    for index in ancestors.into_iter().rev() {
+    layouts[get_index] = get_layout;
+    layouts[filter_index] = child_layout.clone();
+    for (index, slot) in ancestors.into_iter().rev() {
         let ordinal = child_layout
             .bindings()
             .iter()
@@ -151,17 +193,36 @@ pub(super) fn try_native_late_payload_prefix(
                 paro_error::internal("native prefix ancestor lost the derived column")
             })?;
         let node = &mut nodes[index];
-        let Some((_, projection)) = prefix_unary_child_mut(&mut node.operator) else {
-            return Err(paro_error::internal(
-                "native prefix ancestor changed operator",
-            ));
+        let projection = match &mut node.operator {
+            LogicalOperator::Join(Join::Comparison(join)) => Some(if slot == 0 {
+                &mut join.left_projection_map
+            } else {
+                &mut join.right_projection_map
+            }),
+            LogicalOperator::Join(Join::Any(join)) => Some(if slot == 0 {
+                &mut join.left_projection_map
+            } else {
+                &mut join.right_projection_map
+            }),
+            LogicalOperator::Join(Join::Cross(_)) => None,
+            operator => {
+                prefix_unary_child_mut(operator)
+                    .ok_or_else(|| paro_error::internal("native prefix ancestor changed operator"))?
+                    .1
+            }
         };
         if let Some(projection) = projection {
             projection.include(ordinal);
         }
-        child_layout = node
-            .operator
-            .output_layout_from_child_refs(&[&child_layout]);
+        let mut inputs = Vec::new();
+        node.operator.visit_child_links(&mut |child| {
+            inputs.push(match child {
+                NativeChild::Node(index) => &layouts[*index],
+                NativeChild::Group { layout, .. } | NativeChild::MemoGroup { layout, .. } => layout,
+            })
+        });
+        child_layout = node.operator.output_layout_from_child_refs(&inputs);
+        layouts[index] = child_layout.clone();
         node.source_proofs = Box::new([]);
     }
     nodes[root].operator = LogicalOperator::Projection(projection);
@@ -176,6 +237,30 @@ pub(super) fn try_native_late_payload_prefix(
     }
     *prefix_only_complete = only_derived_outputs;
     Ok(Some(shell))
+}
+
+/// Count exact selected occurrences, not distinct node IDs. An opaque boundary
+/// cannot prove the absence of another source and therefore fails closed.
+fn native_source_occurrences(shell: &NativeShell, table: usize) -> Vec<Option<usize>> {
+    let mut counts = Vec::with_capacity(shell.nodes.len());
+    for node in &shell.nodes {
+        let mut count = Some(usize::from(matches!(&node.operator,
+            LogicalOperator::Get(get) if get.table_index == table)));
+        node.operator.visit_child_links(&mut |child| {
+            count = count
+                .zip(source_occurrence_at(&counts, child))
+                .map(|(left, right)| left.saturating_add(right).min(2));
+        });
+        counts.push(count);
+    }
+    counts
+}
+
+fn source_occurrence_at(counts: &[Option<usize>], child: &NativeChild) -> Option<usize> {
+    let NativeChild::Node(index) = child else {
+        return None;
+    };
+    counts.get(*index).copied().flatten()
 }
 
 struct PrefixCandidate {
@@ -391,6 +476,38 @@ mod tests {
             7 => OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(
                 paro_planner::operator::EmptyResult::new(filter),
             )),
+            8..=13 => {
+                let peer = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
+                    9,
+                    vec!["peer".into()],
+                    vec![LogicalType::Varchar],
+                    source_table(),
+                ))));
+                let (left, right) = if wrapper % 2 == 0 {
+                    (filter, peer)
+                } else {
+                    (peer, filter)
+                };
+                let join = match (wrapper - 8) / 2 {
+                    0 => Join::Cross(paro_planner::operator::CrossProduct::new(left, right)),
+                    1 => Join::comparison(
+                        paro_planner::operator::JoinType::Inner,
+                        left,
+                        right,
+                        vec![],
+                    ),
+                    _ => Join::any(
+                        paro_planner::operator::JoinType::Inner,
+                        left,
+                        right,
+                        Expression::Constant(
+                            ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean)
+                                .into(),
+                        ),
+                    ),
+                };
+                OwnedLogicalPlan::synthetic(LogicalOperator::Join(join))
+            }
             _ => OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(filter, vec![]))),
         };
         OwnedLogicalPlan::new(
@@ -489,7 +606,7 @@ mod tests {
     #[test]
     fn production_binding_builds_native_prefix_shell() {
         use crate::cascades::rules::TransformationRule;
-        for wrapper in 0..8 {
+        for wrapper in 0..14 {
             let mut input = MemoBuilder::build(
                 production_plan(wrapper),
                 BindContext::new(),
@@ -545,6 +662,22 @@ mod tests {
                 projection.expressions.first(),
                 Some(Expression::ColumnRef(column)) if column.binding.column_index == 1
             ));
+            if wrapper == 8 {
+                let mut duplicate = shell.clone();
+                let NativeChild::Node(join_index) = projection.child else {
+                    panic!("expected selected join node")
+                };
+                let LogicalOperator::Join(Join::Cross(join)) =
+                    &mut duplicate.nodes[join_index].operator
+                else {
+                    panic!("expected cross join")
+                };
+                // Two edges to one selected node are two source occurrences,
+                // even though both edges carry the identical native node ID.
+                join.right = join.left.clone();
+                let counts = native_source_occurrences(&duplicate, 7);
+                assert_eq!(counts[join_index], Some(2));
+            }
             drop(state);
             let rule = super::super::PlannerTransformationRule {
                 transformation: PlannerTransformation::LatePayloadFetch,
