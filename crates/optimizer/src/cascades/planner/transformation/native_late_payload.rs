@@ -721,6 +721,45 @@ mod tests {
             if wrapper == 15 {
                 assert!(matches!(projection.expressions[0], Expression::Function(_)));
             }
+            if wrapper == 10 || wrapper == 11 {
+                use crate::aggregate::late_payload::{prove_rowid_operator, RowIdPathPolicy};
+                use paro_planner::operator::JoinType;
+                for (join_type, allowed) in [
+                    (JoinType::Inner, true),
+                    (JoinType::Left, wrapper == 10),
+                    (JoinType::Right, wrapper == 11),
+                    (JoinType::Outer, false),
+                ] {
+                    let mut selected = shell.clone();
+                    let NativeChild::Node(index) = projection.child else {
+                        unreachable!()
+                    };
+                    let LogicalOperator::Join(Join::Comparison(join)) =
+                        &mut selected.nodes[index].operator
+                    else {
+                        unreachable!()
+                    };
+                    join.join_type = join_type;
+                    let counts = native_source_occurrences(&selected, 7);
+                    let resolve = |child: &NativeChild| match child {
+                        NativeChild::Node(index) => Some(&selected.nodes[*index].operator),
+                        _ => None,
+                    };
+                    for policy in [RowIdPathPolicy::RowPreserving, RowIdPathPolicy::NonNull] {
+                        assert_eq!(
+                            prove_rowid_operator(
+                                &selected.nodes[index].operator,
+                                7,
+                                policy,
+                                &resolve,
+                                &|child| source_occurrence_at(&counts, child),
+                            )
+                            .is_some(),
+                            allowed
+                        );
+                    }
+                }
+            }
             if wrapper == 8 {
                 let mut duplicate = shell.clone();
                 let NativeChild::Node(join_index) = projection.child else {

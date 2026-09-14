@@ -664,7 +664,7 @@ fn source_estimated_rows(plan: &OwnedLogicalPlan, table_index: usize) -> Option<
 }
 
 #[derive(Debug)]
-enum RowIdPath {
+pub(crate) enum RowIdPath {
     Get,
     Filter(Box<RowIdPath>),
     Window(Box<RowIdPath>),
@@ -679,20 +679,20 @@ enum RowIdPath {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum RowIdJoinKind {
+pub(crate) enum RowIdJoinKind {
     Comparison,
     Any,
     Cross,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum RowIdJoinSide {
+pub(crate) enum RowIdJoinSide {
     Left,
     Right,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum RowIdPathPolicy {
+pub(crate) enum RowIdPathPolicy {
     /// The row survives each operator one-for-one; used when payload is
     /// removed from an ordinary detail stream.
     RowPreserving,
@@ -1113,68 +1113,98 @@ fn prove_unique_rowid_path(
     source_table_index: usize,
     policy: RowIdPathPolicy,
 ) -> Option<RowIdPath> {
-    match &plan.operator {
+    prove_rowid_operator(
+        &plan.operator,
+        source_table_index,
+        policy,
+        &|child| Some(&child.operator),
+        &|child| Some(count_source_gets(child, source_table_index)),
+    )
+}
+
+/// Row-id semantics depend on selected operators and source occurrences,
+/// not ownership of the selected plan. Missing child evidence fails closed.
+pub(crate) fn prove_rowid_operator<'a, Child: 'a>(
+    operator: &'a LogicalOperator<Child>,
+    source_table_index: usize,
+    policy: RowIdPathPolicy,
+    resolve: &impl Fn(&'a Child) -> Option<&'a LogicalOperator<Child>>,
+    count: &impl Fn(&'a Child) -> Option<usize>,
+) -> Option<RowIdPath> {
+    let recurse = |child| {
+        prove_rowid_operator(resolve(child)?, source_table_index, policy, resolve, count)
+    };
+    match operator {
         LogicalOperator::Get(get) => {
             (get.table_index == source_table_index).then_some(RowIdPath::Get)
         }
         LogicalOperator::Filter(filter) => {
-            prove_unique_rowid_path(filter.child.as_ref(), source_table_index, policy)
+            recurse(&filter.child)
                 .map(|path| RowIdPath::Filter(Box::new(path)))
         }
         LogicalOperator::Window(window) => {
-            prove_unique_rowid_path(window.child.as_ref(), source_table_index, policy)
+            recurse(&window.child)
                 .map(|path| RowIdPath::Window(Box::new(path)))
         }
         LogicalOperator::Order(order) => {
-            prove_unique_rowid_path(order.child.as_ref(), source_table_index, policy)
+            recurse(&order.child)
                 .map(|path| RowIdPath::Order(Box::new(path)))
         }
         LogicalOperator::Limit(limit) => {
-            prove_unique_rowid_path(limit.child.as_ref(), source_table_index, policy)
+            recurse(&limit.child)
                 .map(|path| RowIdPath::Limit(Box::new(path)))
         }
         LogicalOperator::EmptyResult(empty) => {
-            prove_unique_rowid_path(empty.child.as_ref(), source_table_index, policy)
+            recurse(&empty.child)
                 .map(|path| RowIdPath::EmptyResult(Box::new(path)))
         }
         LogicalOperator::Join(Join::Comparison(join)) => prove_join_rowid_path(
             RowIdJoinKind::Comparison,
             join.join_type,
-            join.left.as_ref(),
-            join.right.as_ref(),
+            &join.left,
+            &join.right,
             source_table_index,
             policy,
+            resolve,
+            count,
         ),
         LogicalOperator::Join(Join::Any(join)) => prove_join_rowid_path(
             RowIdJoinKind::Any,
             join.join_type,
-            join.left.as_ref(),
-            join.right.as_ref(),
+            &join.left,
+            &join.right,
             source_table_index,
             policy,
+            resolve,
+            count,
         ),
         LogicalOperator::Join(Join::Cross(join)) => prove_join_rowid_path(
             RowIdJoinKind::Cross,
             JoinType::Inner,
-            join.left.as_ref(),
-            join.right.as_ref(),
+            &join.left,
+            &join.right,
             source_table_index,
             policy,
+            resolve,
+            count,
         ),
         _ => None,
     }
 }
 
-fn prove_join_rowid_path(
+#[allow(clippy::too_many_arguments)]
+fn prove_join_rowid_path<'a, Child: 'a>(
     kind: RowIdJoinKind,
     join_type: JoinType,
-    left: &OwnedLogicalPlan,
-    right: &OwnedLogicalPlan,
+    left: &'a Child,
+    right: &'a Child,
     source_table_index: usize,
     policy: RowIdPathPolicy,
+    resolve: &impl Fn(&'a Child) -> Option<&'a LogicalOperator<Child>>,
+    count: &impl Fn(&'a Child) -> Option<usize>,
 ) -> Option<RowIdPath> {
-    let left_count = count_source_gets(left, source_table_index);
-    let right_count = count_source_gets(right, source_table_index);
+    let left_count = count(left)?;
+    let right_count = count(right)?;
     let (side, child_plan) = match (left_count, right_count) {
         (1, 0) => (RowIdJoinSide::Left, left),
         (0, 1) => (RowIdJoinSide::Right, right),
@@ -1218,7 +1248,7 @@ fn prove_join_rowid_path(
     if !allowed {
         return None;
     }
-    let child = prove_unique_rowid_path(child_plan, source_table_index, policy)?;
+    let child = prove_rowid_operator(resolve(child_plan)?, source_table_index, policy, resolve, count)?;
     Some(RowIdPath::Join {
         kind,
         side,
