@@ -84,7 +84,7 @@ pub(super) fn try_native_late_payload_prefix(
         },
     );
     let Some(candidate) = candidate else {
-        return Ok(None);
+        return super::native_selective_payload::rewrite(shell, layouts, state);
     };
     let path = paths
         .remove(&candidate.source_binding.table_index)
@@ -421,18 +421,26 @@ mod tests {
             )
             .into(),
         );
-        let get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
+        let mut get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
             7,
             vec!["name".to_string()],
             vec![LogicalType::Varchar],
             source_table(),
         ))));
-        let filter = OwnedLogicalPlan::new(
+        if wrapper >= 16 {
+            get.stats.estimated_cardinality =
+                Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+        }
+        let mut filter = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Filter(Filter::new(get, vec![predicate])),
         );
+        if wrapper >= 16 {
+            filter.stats.estimated_cardinality =
+                Some(paro_planner::plan::CardinalityEstimate::exact(100));
+        }
         let filter = match wrapper {
-            0 => filter,
+            0 | 16 | 17 => filter,
             1 => OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Box::new(
                 paro_planner::operator::Limit::new(filter, None, None),
             ))),
@@ -487,7 +495,11 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 8,
                 filter,
-                if wrapper == 4 {
+                if wrapper == 16 {
+                    vec![source_expression]
+                } else if wrapper == 17 {
+                    vec![source_expression.clone(), source_expression]
+                } else if wrapper == 4 {
                     vec![substring(source_expression.clone()), source_expression]
                 } else if wrapper == 14 {
                     vec![
@@ -651,7 +663,24 @@ mod tests {
     #[test]
     fn production_binding_builds_native_prefix_shell() {
         use crate::cascades::rules::TransformationRule;
-        for wrapper in 0..16 {
+        for wrapper in 0..18 {
+            if wrapper >= 16 {
+                let (reference, changed) = crate::aggregate::late_payload::rewrite_node(
+                    production_plan(wrapper),
+                    &BindContext::new(),
+                    &crate::cost_model::CostModel::default(),
+                )
+                .unwrap();
+                assert!(changed);
+                let LogicalOperator::Projection(output) = &reference.operator else {
+                    unreachable!()
+                };
+                let LogicalOperator::RowFetch(fetch) = &output.child.operator else {
+                    unreachable!()
+                };
+                assert_eq!(fetch.sources.len(), 1);
+                assert_eq!(fetch.sources[0].needed_columns.as_ref(), &[0]);
+            }
             if wrapper == 14 || wrapper == 15 {
                 let (reference, changed) =
                     crate::aggregate::late_payload::rewrite_matched_prefix_node(production_plan(
@@ -706,15 +735,66 @@ mod tests {
                     .expect("production binding should take the native prefix path");
             assert_eq!(
                 shell.root_layout().unwrap().len(),
-                if wrapper == 4 || wrapper >= 14 { 2 } else { 1 }
+                if wrapper == 4 || wrapper == 14 || wrapper == 15 || wrapper == 17 {
+                    2
+                } else {
+                    1
+                }
             );
             let LogicalOperator::Projection(projection) = shell.root_operator() else {
                 panic!("expected projection root")
             };
-            assert!(matches!(
-                projection.expressions.get(usize::from(wrapper == 15)),
-                Some(Expression::ColumnRef(column)) if column.binding.column_index == 1
-            ));
+            if wrapper >= 16 {
+                let NativeChild::Node(fetch_index) = projection.child else {
+                    unreachable!()
+                };
+                let LogicalOperator::RowFetch(fetch) = &shell.nodes[fetch_index].operator else {
+                    unreachable!()
+                };
+                assert_eq!(fetch.sources.len(), 1);
+                assert_eq!(fetch.sources[0].needed_columns.as_ref(), &[0]);
+                let Expression::ColumnRef(result) = &projection.expressions[0] else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    result.binding,
+                    ColumnBinding::new(fetch.sources[0].materialized_table_index, 0)
+                );
+                // The same selected shell must reject an upper bound with no
+                // reduction, even if its expected output remains small.
+                let (mut original, original_layouts) = NativeShell::from_pattern_with_layouts(
+                    context.memo(),
+                    &state,
+                    &binding.root,
+                    &facts,
+                )
+                .unwrap()
+                .unwrap();
+                let LogicalOperator::Projection(output) = original.root_operator() else {
+                    unreachable!()
+                };
+                let NativeChild::Node(child) = output.child else {
+                    unreachable!()
+                };
+                original.nodes[child]
+                    .stats
+                    .estimated_cardinality
+                    .as_mut()
+                    .unwrap()
+                    .max = 100_000;
+                assert!(super::super::native_selective_payload::rewrite(
+                    original,
+                    original_layouts,
+                    &state
+                )
+                .unwrap()
+                .is_none());
+            } else {
+                assert!(matches!(
+                    projection.expressions.get(usize::from(wrapper == 15)),
+                    Some(Expression::ColumnRef(column)) if column.binding.column_index == 1
+                ));
+            }
             if wrapper == 14 {
                 assert!(matches!(projection.expressions[1], Expression::Function(_)));
             }
@@ -776,6 +856,13 @@ mod tests {
                 let counts = native_source_occurrences(&duplicate, 7);
                 assert_eq!(counts[join_index], Some(2));
             }
+            let before_publish = (
+                context.memo().group_count(),
+                state.columns.len(),
+                state.scalars.len(),
+                state.binding_ids.checkpoint(),
+                state.payloads.logical.len(),
+            );
             drop(state);
             let rule = super::super::PlannerTransformationRule {
                 transformation: PlannerTransformation::LatePayloadFetch,
@@ -788,6 +875,21 @@ mod tests {
                 super::super::semantic_plan::owned_binding_instantiation_count(),
                 bridges
             );
+            if wrapper >= 16 {
+                drop(outputs);
+                context.rollback().unwrap();
+                let state = input.planner_state.read().unwrap();
+                assert_eq!(
+                    (
+                        input.memo.group_count(),
+                        state.columns.len(),
+                        state.scalars.len(),
+                        state.binding_ids.checkpoint(),
+                        state.payloads.logical.len()
+                    ),
+                    before_publish
+                );
+            }
         }
     }
 }

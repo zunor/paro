@@ -16,6 +16,7 @@ mod matching;
 mod native_domain;
 mod native_join_elimination;
 mod native_late_payload;
+mod native_selective_payload;
 mod native_post_reduction;
 mod native_scalar_aggregate_window;
 mod native_join_preaggregation;

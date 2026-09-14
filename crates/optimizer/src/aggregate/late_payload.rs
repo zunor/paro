@@ -702,7 +702,7 @@ pub(crate) enum RowIdPathPolicy {
 }
 
 impl RowIdPath {
-    fn stages(&self) -> usize {
+    pub(crate) fn stages(&self) -> usize {
         match self {
             Self::Get => 1,
             Self::Filter(child)
@@ -714,7 +714,7 @@ impl RowIdPath {
         }
     }
 
-    fn crosses_join(&self) -> bool {
+    pub(crate) fn crosses_join(&self) -> bool {
         match self {
             Self::Get => false,
             Self::Filter(child)
