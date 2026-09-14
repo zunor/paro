@@ -602,3 +602,30 @@ fbd8df511533f4aa49cfb0cfa354c18f50d4bd5337847b66f1223c9976229b12  pilot-v1.q11.b
 d20bd718509752da18af98b06d2018bba7e35f7d2b695cc1a26ba00d885f5dbb  pilot-v1.q11.diagnostic000.parod.log.gz
 38800222cdeab7c12348c168c38414924c546b23f1c773dabdd94e9ea539b10e  pilot-v1.q11.oracle.parod.log.gz
 ```
+
+## DimensionDeferral projection-spine migration (9e870df2)
+
+The new production Memo/scoped-binding/apply/staging regression reproduces an
+owned binding instantiation for an eligible Aggregate -> nonidentity Projection
+-> Join before the fix (one bridge, expected zero). One- and two-projection
+spines now use the same ownership-generic scalar substitution helper as the
+reference rule. No tree export is needed: native discovery traverses the exact
+visible projection children, then the existing direct-join rewrite consumes
+expanded grouping and aggregate expressions. Existing mobility/merge checks
+remain in place. Multiway dimension isolation and unsupported cases still use
+the old fallback; this is not completion of all DimensionDeferral bridges.
+
+The production tests assert one output, zero owned binding instantiations, no
+staging arena growth, output types, the exact original dimension grouping
+column, and the original fact SUM input and partial grouping key after staging.
+The reference owned rule independently accepts both fixture shapes. This is a
+structural comparison, not an independent execution/bag oracle.
+
+`cargo test --locked -p paro-optimizer --lib --quiet`: 1278 passed, 5 failed.
+The five failure names and assertions match the preceding recorded run: three
+undeclared expected-grant errors, the statistics merge fingerprint assertion,
+and nested source-work retention length 1 versus 2. None was fixed or blessed.
+The strengthened projection tests and the existing direct CTE tests pass in
+that full run. Tests use the mixed worktree, not clean performance evidence.
+No fresh Q11, C1/W, SQL regress, complete child-choice/fingerprint comparison,
+or performance gain is claimed by this slice. Budgets/model/policy unchanged.
