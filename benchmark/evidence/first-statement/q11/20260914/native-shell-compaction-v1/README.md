@@ -1128,3 +1128,33 @@ passes. Runs are mixed-worktree unit evidence only, not fresh performance or
 independent SQL execution. The native aggregate producer is a separate pending
 implementation and must pass real Memo/staging tests before its bridge can be
 considered removed.
+
+### Native aggregate TopN construction
+
+The production LatePayloadFetch dispatch now selects the native aggregate
+producer for TopN -> Projection -> Aggregate bindings. It consumes the shared
+aggregate proof, appends the proven rowid, remaps nondependent group ordinals,
+builds the narrow carrier and post-TopN RowFetch, and restores the selected
+root output contract. No owned tree is instantiated for successful fixtures.
+`Aggregate::recompute_returned_types` is now child-transport generic, so both
+builders use exactly the same dependency/multiplicity invalidation method.
+
+Five production tests cover the exact group/rowid mapping, names, limit/offset,
+order flags and retained cardinality; absent projected payload omits RowFetch;
+payload ordering, absent dependency, null-extended source and non-prefix root
+map reject. All fixtures traverse real Memo/boundary/native construction and
+actual apply/rollback (negative apply paths included). Success paths check zero
+owned instantiations and rollback checks the visible sidecar/Memo counts. No
+dependency was artificially inserted after Memo import. The five tests pass;
+planner aggregate tests 3 pass; compiler check passes. Full optimizer 1295 pass
+/ same five failure names and assertions. No bless.
+
+Read-only comparison with owned apply found no new deterministic construction
+mismatch in these covered shapes. Non-prefix/reordered final output namespaces
+remain a safe native rejection, after symbol allocation; negative authority and
+complete allocation rollback are not closed by this slice. Shared rowid proof
+and producer tests are not independent SQL bag execution. No fresh Q11, full
+SQL regress, complete fixed-work/prefix/fingerprint campaign or timing claim.
+All reported tests used the mixed workspace, not clean performance evidence.
+Other rules and late-payload negative paths still retain owned bridges, so the
+overall migration goal remains open.
