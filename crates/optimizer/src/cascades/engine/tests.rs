@@ -3089,6 +3089,11 @@ fn subscription_delta_matches_an_independent_set_difference() {
             for frontier in [None, Some(revision)] {
                 result.push(PatternRead {
                     group: GroupId(group),
+                    scope: if frontier.is_some() {
+                        ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS)
+                    } else {
+                        ReadScope::FACTS
+                    },
                     logical_frontier_revision: frontier,
                     physical_frontier_revision: None,
                     logical_fact_fingerprint: Fingerprint(revision.into()),
@@ -3129,6 +3134,7 @@ fn physical_child_frontier_change_is_narrowed_to_dependent_recipes() {
     let child = GroupId::new(11);
     let owner_read = PatternRead {
         group: owner,
+        scope: ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS),
         logical_frontier_revision: Some(1),
         physical_frontier_revision: None,
         logical_fact_fingerprint: Fingerprint(2),
@@ -3138,6 +3144,7 @@ fn physical_child_frontier_change_is_narrowed_to_dependent_recipes() {
         owner_read,
         PatternRead {
             group: child,
+            scope: ReadScope::ALL,
             logical_frontier_revision: Some(4),
             physical_frontier_revision: Some(5),
             logical_fact_fingerprint: Fingerprint(6),

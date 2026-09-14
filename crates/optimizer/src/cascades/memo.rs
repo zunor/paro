@@ -1212,6 +1212,20 @@ pub struct Group {
     pub ledger: SearchLedger,
 }
 
+/// The result of a typed update to the relational facts owned by one group.
+///
+/// Structural insertion, physical frontier publication, and fact updates are
+/// deliberately different Memo events.  Callers which only reconcile facts
+/// must not obtain a broad `Group` mutable borrow: that used to invalidate
+/// every cached fact fingerprint even when the update was a no-op and made it
+/// impossible for the engine to describe the corresponding notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupFactChange {
+    pub(crate) group: GroupId,
+    pub(crate) logical_changed: bool,
+    pub(crate) statistics_changed: bool,
+}
+
 impl Group {
     pub fn logical_exprs(&self) -> &[LogicalExprId] {
         &self.logical_exprs
@@ -1239,13 +1253,21 @@ impl Group {
             .get_or_init(|| self.cardinality.stable_snapshot_fingerprint())
     }
 
-    fn invalidate_fact_fingerprints(&mut self) {
+    fn invalidate_logical_fact_fingerprint(&mut self) {
         self.logical_fact_fingerprint.take();
+    }
+
+    fn invalidate_statistics_fingerprints(&mut self) {
         self.statistics_snapshot_fingerprint.take();
         *self
             .statistics_read_fingerprint
             .get_mut()
             .expect("Memo statistics read cache poisoned") = None;
+    }
+
+    fn invalidate_fact_fingerprints(&mut self) {
+        self.invalidate_logical_fact_fingerprint();
+        self.invalidate_statistics_fingerprints();
     }
 
     pub fn physical_exprs(&self) -> &[PhysicalExprId] {
@@ -2114,7 +2136,63 @@ impl Memo {
             .insert(id, snapshot);
     }
 
-    pub fn group_mut(&mut self, id: GroupId) -> Option<&mut Group> {
+    /// Update only the two fact domains owned by a group.
+    ///
+    /// The transformation journal is entered before the closure runs, so a
+    /// later rollback restores the exact pre-update values.  A failed
+    /// closure restores them immediately as well.  Fingerprints and local
+    /// statistics caches are invalidated only when their corresponding value
+    /// actually changed; publication code can use the returned categories to
+    /// wake only the relevant subscribers.
+    pub(crate) fn update_group_facts<F>(
+        &mut self,
+        id: GroupId,
+        update: F,
+    ) -> Result<GroupFactChange>
+    where
+        F: FnOnce(&mut LogicalProperties, &mut GroupCardinality) -> Result<()>,
+    {
+        let id = self.canonical_group(id);
+        self.record_transformation_group_write(id);
+        let (old_properties, old_cardinality) = {
+            let group = self
+                .groups
+                .get(id.index())
+                .ok_or_else(|| paro_error::internal("fact update references an unknown group"))?;
+            (group.logical_properties.clone(), group.cardinality.clone())
+        };
+        let group = self
+            .groups
+            .get_mut(id.index())
+            .ok_or_else(|| paro_error::internal("fact update lost its group"))?;
+        if let Err(error) = update(&mut group.logical_properties, &mut group.cardinality) {
+            group.logical_properties = old_properties;
+            group.cardinality = old_cardinality;
+            return Err(error);
+        }
+        let logical_changed = group.logical_properties != old_properties;
+        let statistics_changed = group.cardinality != old_cardinality
+            || group.logical_properties.cte_references != old_properties.cte_references;
+        if logical_changed {
+            group.invalidate_logical_fact_fingerprint();
+        }
+        if statistics_changed
+            || group.logical_properties.cte_references != old_properties.cte_references
+        {
+            group.invalidate_statistics_fingerprints();
+        }
+        Ok(GroupFactChange {
+            group: id,
+            logical_changed,
+            statistics_changed,
+        })
+    }
+
+    /// Escape hatch retained for test fixtures and the Memo verifier.  Hot
+    /// production paths must use [`Self::update_group_facts`] or the explicit
+    /// structural/frontier APIs above.
+    #[cfg(test)]
+    pub(crate) fn group_mut(&mut self, id: GroupId) -> Option<&mut Group> {
         let id = self.canonical_group(id);
         self.record_transformation_group_write(id);
         let group = self.groups.get_mut(id.index())?;

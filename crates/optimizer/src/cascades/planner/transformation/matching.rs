@@ -3075,6 +3075,46 @@ mod tests {
     }
 
     #[test]
+    fn structure_only_read_ignores_fact_updates_until_facts_are_observed() {
+        let mut memo = Memo::new(SearchBudget::default());
+        let group = memo.create_group(
+            GroupSchema::new(std::iter::empty()).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let structure = PatternRead::structure_from_group(&memo, group).unwrap();
+        assert_eq!(structure.scope, ReadScope::LOGICAL_FRONTIER);
+        assert_eq!(structure.logical_fact_fingerprint, Fingerprint::default());
+        assert_eq!(
+            structure.statistics_snapshot_fingerprint,
+            Fingerprint::default()
+        );
+        let facts_before = PatternRead::facts_from_group(&memo, group).unwrap();
+
+        memo.update_group_facts(group, |properties, cardinality| {
+            properties.maximum_cardinality = Some(11);
+            *cardinality = GroupCardinality::new(
+                Fingerprint(31),
+                CardinalityRecipeKind::Statistics,
+                1,
+                2,
+                3,
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(structure.is_current(&memo).unwrap());
+
+        let merged = crate::cascades::tasks::ReadSet::new([structure, facts_before]);
+        assert_eq!(merged.reads().len(), 1);
+        assert_eq!(
+            merged.reads()[0].scope,
+            ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS)
+        );
+        assert!(!merged.is_current(&memo).unwrap());
+    }
+
+    #[test]
     fn root_dispatch_has_no_equivalence_provenance_input() {
         assert!(transformation_root_operator_matches(
             PlannerTransformation::JoinRegionEnumeration,

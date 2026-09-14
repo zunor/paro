@@ -959,9 +959,6 @@ pub(super) fn stage_transformed_expression(
                 })
             {
                 let group = memo.canonical_group(group);
-                let existing = memo.group_mut(group).ok_or_else(|| {
-                    paro_error::internal("reused transformed expression lost its Memo group")
-                })?;
                 // Reusing identity must not discard facts derived in the new
                 // semantic context. This is particularly important for a CTE
                 // reference after predicate pushdown: its operator key is
@@ -969,11 +966,12 @@ pub(super) fn stage_transformed_expression(
                 // domain. Equivalent facts intersect at the group boundary;
                 // no payload-local snapshot is allowed to freeze the older
                 // estimate.
-                existing
-                    .logical_properties
-                    .merge_equivalent_facts(&logical_properties)?;
-                existing.cardinality =
-                    std::mem::take(&mut existing.cardinality).canonical_with(cardinality.clone());
+                memo.update_group_facts(group, |existing, existing_cardinality| {
+                    existing.merge_equivalent_facts(&logical_properties)?;
+                    *existing_cardinality = std::mem::take(existing_cardinality)
+                        .canonical_with(cardinality.clone());
+                    Ok(())
+                })?;
                 return Ok(Some((
                     NodeState {
                         id,

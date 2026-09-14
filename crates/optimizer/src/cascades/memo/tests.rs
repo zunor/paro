@@ -182,6 +182,108 @@ fn non_cte_statistics_cache_is_independent_of_registry_mutations() {
     assert!(cached.producers.is_empty());
 }
 
+#[test]
+fn typed_fact_updates_report_categories_and_do_not_invalidate_noops() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::new(Fingerprint(1), CardinalityRecipeKind::Statistics, 1, 1, 1),
+    );
+    let logical = memo.group(group).unwrap().logical_fact_fingerprint();
+    let statistics = memo.group(group).unwrap().statistics_snapshot_fingerprint();
+    let local_statistics = memo.local_statistics_fingerprint(group);
+
+    let change = memo
+        .update_group_facts(group, |_properties, _cardinality| Ok(()))
+        .unwrap();
+    assert_eq!(
+        change,
+        GroupFactChange {
+            group,
+            logical_changed: false,
+            statistics_changed: false,
+        }
+    );
+    assert_eq!(memo.group(group).unwrap().logical_fact_fingerprint(), logical);
+    assert_eq!(
+        memo.group(group).unwrap().statistics_snapshot_fingerprint(),
+        statistics
+    );
+    assert_eq!(memo.local_statistics_fingerprint(group), local_statistics);
+
+    let change = memo
+        .update_group_facts(group, |properties, _cardinality| {
+            properties.maximum_cardinality = Some(7);
+            Ok(())
+        })
+        .unwrap();
+    assert!(change.logical_changed);
+    assert!(!change.statistics_changed);
+    assert_ne!(memo.group(group).unwrap().logical_fact_fingerprint(), logical);
+    assert_eq!(
+        memo.group(group).unwrap().statistics_snapshot_fingerprint(),
+        statistics,
+        "a logical-only change does not invalidate the cardinality snapshot"
+    );
+    assert_eq!(memo.local_statistics_fingerprint(group), local_statistics);
+
+    let change = memo
+        .update_group_facts(group, |_properties, cardinality| {
+            *cardinality = GroupCardinality::new(
+                Fingerprint(2),
+                CardinalityRecipeKind::Statistics,
+                2,
+                2,
+                2,
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(!change.logical_changed);
+    assert!(change.statistics_changed);
+    assert_ne!(
+        memo.group(group).unwrap().statistics_snapshot_fingerprint(),
+        statistics
+    );
+}
+
+#[test]
+fn typed_fact_update_rolls_back_values_and_keeps_write_journal_precise() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let original = (
+        memo.group(group).unwrap().logical_properties.clone(),
+        memo.group(group).unwrap().cardinality.clone(),
+    );
+    let savepoint = memo.transformation_savepoint();
+    memo.update_group_facts(group, |properties, cardinality| {
+        properties.maximum_cardinality = Some(3);
+        *cardinality = GroupCardinality::new(
+            Fingerprint(3),
+            CardinalityRecipeKind::Statistics,
+            1,
+            2,
+            3,
+        );
+        Ok(())
+    })
+    .unwrap();
+    memo.rollback_transformation(savepoint).unwrap();
+    assert!(memo.take_transformation_written_groups().is_empty());
+    assert_eq!(
+        (
+            memo.group(group).unwrap().logical_properties.clone(),
+            memo.group(group).unwrap().cardinality.clone(),
+        ),
+        original
+    );
+}
+
 fn provided() -> ProvidedProperties {
     ProvidedProperties {
         ordering: ProvidedOrdering::Unordered,

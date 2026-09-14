@@ -281,9 +281,45 @@ impl PatternBinding {
     }
 }
 
+/// Categories of Memo state observed by one task.
+///
+/// The old read cursor encoded the categories indirectly through two optional
+/// frontier revisions while always taking both fact fingerprints.  That made
+/// a structural reader subscribe to statistics even when it never consumed
+/// them.  Keep the categories in the cursor itself so invalidation and task
+/// identity describe the evidence actually used by the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadScope(u8);
+
+impl ReadScope {
+    pub const LOGICAL_FRONTIER: Self = Self(1 << 0);
+    pub const PHYSICAL_FRONTIER: Self = Self(1 << 1);
+    pub const LOGICAL_FACTS: Self = Self(1 << 2);
+    pub const STATISTICS: Self = Self(1 << 3);
+    pub const FRONTIERS: Self = Self(
+        Self::LOGICAL_FRONTIER.0 | Self::PHYSICAL_FRONTIER.0,
+    );
+    pub const FACTS: Self = Self(Self::LOGICAL_FACTS.0 | Self::STATISTICS.0);
+    pub const ALL: Self = Self(Self::FRONTIERS.0 | Self::FACTS.0);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PatternRead {
     pub group: GroupId,
+    /// The exact Memo categories consumed by this read.
+    pub scope: ReadScope,
     /// `Some` when the matcher enumerated this group's alternatives. A fixed
     /// root expression may consume only group facts/statistics; in that case
     /// peer root insertions must not invalidate and recursively wake the same
@@ -300,7 +336,7 @@ pub struct PatternRead {
 
 impl PatternRead {
     pub fn from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, true, false)
+        Self::read(memo, group, ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS))
     }
 
     /// Read a group for a physical subproblem. In addition to the logical
@@ -308,19 +344,21 @@ impl PatternRead {
     /// parent cannot reuse a child frontier that changed during a nested
     /// optimization request.
     pub fn physical_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, true, true)
+        Self::read(memo, group, ReadScope::ALL)
     }
 
     pub fn facts_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, false, false)
+        Self::read(memo, group, ReadScope::FACTS)
     }
 
-    fn read(
-        memo: &Memo,
-        group: GroupId,
-        reads_frontier: bool,
-        reads_physical_frontier: bool,
-    ) -> Result<Self> {
+    /// Read only the logical structure of a group.  This is intended for
+    /// matchers which do not inspect facts; a statistics update must not wake
+    /// or invalidate such a task.
+    pub fn structure_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
+        Self::read(memo, group, ReadScope::LOGICAL_FRONTIER)
+    }
+
+    fn read(memo: &Memo, group: GroupId, scope: ReadScope) -> Result<Self> {
         let group = memo.canonical_group(group);
         let group_ref = memo
             .group(group)
@@ -329,23 +367,24 @@ impl PatternRead {
         // Readers resolving inherited facts must subscribe to their inputs.
         Ok(Self {
             group,
-            logical_frontier_revision: reads_frontier
+            scope,
+            logical_frontier_revision: scope.contains(ReadScope::LOGICAL_FRONTIER)
                 .then(|| group_ref.logical_expression_version()),
-            physical_frontier_revision: reads_physical_frontier
+            physical_frontier_revision: scope.contains(ReadScope::PHYSICAL_FRONTIER)
                 .then(|| group_ref.physical_frontier_version()),
-            logical_fact_fingerprint: group_ref.logical_fact_fingerprint(),
-            statistics_snapshot_fingerprint: memo.local_statistics_fingerprint(group),
+            logical_fact_fingerprint: scope
+                .contains(ReadScope::LOGICAL_FACTS)
+                .then(|| group_ref.logical_fact_fingerprint())
+                .unwrap_or_default(),
+            statistics_snapshot_fingerprint: scope
+                .contains(ReadScope::STATISTICS)
+                .then(|| memo.local_statistics_fingerprint(group))
+                .unwrap_or_default(),
         })
     }
 
     pub fn is_current(self, memo: &Memo) -> Result<bool> {
-        let current = Self::read(
-            memo,
-            self.group,
-            self.logical_frontier_revision.is_some(),
-            self.physical_frontier_revision.is_some(),
-        )?;
-        Ok(current == self)
+        Ok(self.matches(Self::read(memo, self.group, self.scope)?))
     }
 
     /// Publication uses the same exact read contract as task reuse. Physical
@@ -353,13 +392,53 @@ impl PatternRead {
     /// an older child revision must not be recorded as a current completion;
     /// the engine retries that parent against a fresh targeted ReadSet.
     pub fn is_current_for_publication(self, memo: &Memo) -> Result<bool> {
-        let current = Self::read(
-            memo,
-            self.group,
-            self.logical_frontier_revision.is_some(),
-            self.physical_frontier_revision.is_some(),
-        )?;
-        Ok(current == self)
+        Ok(self.matches(Self::read(memo, self.group, self.scope)?))
+    }
+
+    /// Combine observations of the same group without widening either one.
+    /// The values for a category are taken from a cursor that actually
+    /// observed that category; inactive fields remain zero and are ignored by
+    /// [`Self::matches`].
+    pub fn union(self, other: Self) -> Self {
+        debug_assert_eq!(self.group, other.group);
+        let scope = self.scope.union(other.scope);
+        Self {
+            group: self.group,
+            scope,
+            logical_frontier_revision: if other.scope.contains(ReadScope::LOGICAL_FRONTIER) {
+                other.logical_frontier_revision
+            } else {
+                self.logical_frontier_revision
+            },
+            physical_frontier_revision: if other.scope.contains(ReadScope::PHYSICAL_FRONTIER) {
+                other.physical_frontier_revision
+            } else {
+                self.physical_frontier_revision
+            },
+            logical_fact_fingerprint: if other.scope.contains(ReadScope::LOGICAL_FACTS) {
+                other.logical_fact_fingerprint
+            } else {
+                self.logical_fact_fingerprint
+            },
+            statistics_snapshot_fingerprint: if other.scope.contains(ReadScope::STATISTICS) {
+                other.statistics_snapshot_fingerprint
+            } else {
+                self.statistics_snapshot_fingerprint
+            },
+        }
+    }
+
+    fn matches(self, current: Self) -> bool {
+        self.group == current.group
+            && self.scope == current.scope
+            && (!self.scope.contains(ReadScope::LOGICAL_FRONTIER)
+                || self.logical_frontier_revision == current.logical_frontier_revision)
+            && (!self.scope.contains(ReadScope::PHYSICAL_FRONTIER)
+                || self.physical_frontier_revision == current.physical_frontier_revision)
+            && (!self.scope.contains(ReadScope::LOGICAL_FACTS)
+                || self.logical_fact_fingerprint == current.logical_fact_fingerprint)
+            && (!self.scope.contains(ReadScope::STATISTICS)
+                || self.statistics_snapshot_fingerprint == current.statistics_snapshot_fingerprint)
     }
 }
 
@@ -476,17 +555,7 @@ impl<'a> TransformContext<'a> {
 
     pub fn record_fact_read(&mut self, read: PatternRead) {
         if let Some(previous) = self.fact_reads.get_mut(&read.group) {
-            let frontier = read
-                .logical_frontier_revision
-                .or(previous.logical_frontier_revision);
-            let physical_frontier = read
-                .physical_frontier_revision
-                .or(previous.physical_frontier_revision);
-            *previous = PatternRead {
-                logical_frontier_revision: frontier,
-                physical_frontier_revision: physical_frontier,
-                ..read
-            };
+            *previous = previous.union(read);
         } else {
             self.fact_reads.insert(read.group, read);
         }

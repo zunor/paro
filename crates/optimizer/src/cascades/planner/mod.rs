@@ -81,6 +81,7 @@ use super::rules::{
     CostComposition, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
     ImplementationRegistry, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
     PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, QualityDependency,
+    ReadScope,
     RootDispatch, RuleContext, RulePromise, SidewaysFilterSource, TaskSupplyContract,
     TransformContext, TransformationBudgetClass, TransformationPreflight, TransformationRule,
     WorkSourceId,
@@ -1209,6 +1210,11 @@ fn record_frozen_candidate_trace(
             "optimizer",
             &format!("{read_prefix}.group"),
             read.group.0 as u64,
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.scope"),
+            u64::from(read.scope.bits()),
         );
         trace.record_value(
             "optimizer",

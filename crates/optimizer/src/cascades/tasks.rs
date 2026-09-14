@@ -20,7 +20,7 @@ use super::ids::{
     PhysicalExprId, RuleId,
 };
 use super::memo::{Memo, OptimizationGoal};
-use super::rules::{PatternBinding, PatternOperand, PatternRead};
+use super::rules::{PatternBinding, PatternOperand, PatternRead, ReadScope};
 
 macro_rules! task_id_type {
     ($name:ident) => {
@@ -180,15 +180,26 @@ impl ReadSet {
     }
 
     pub fn new(reads: impl IntoIterator<Item = PatternRead>) -> Self {
-        // Keep distinct read modes for the same group. A transformation may
-        // consume both the enumerated frontier and a later facts snapshot;
-        // collapsing those observations would silently widen the reuse key
-        // and allow a stale application to survive a changed input.
         let mut reads = reads.into_iter().collect::<Vec<_>>();
-        reads.sort_unstable();
-        reads.dedup();
+        // Normalize to one cursor per group.  The cursor's scope is the union
+        // of the categories actually observed by all callers, so this
+        // reduces identity/storage without dropping a frontier or fact
+        // dependency.  It also lets a structural-only reader avoid inheriting
+        // a statistics subscription merely because another task reads the
+        // same group at a different point in the Memo.
+        reads.sort_unstable_by_key(|read| read.group);
+        let mut normalized: Vec<PatternRead> = Vec::with_capacity(reads.len());
+        for read in reads {
+            if let Some(previous) = normalized.last_mut() {
+                if previous.group == read.group {
+                    *previous = previous.union(read);
+                    continue;
+                }
+            }
+            normalized.push(read);
+        }
         Self {
-            reads: reads.into_boxed_slice(),
+            reads: normalized.into_boxed_slice(),
         }
     }
 
@@ -1816,6 +1827,7 @@ mod tests {
     fn single_read_uses_the_same_canonical_shape_as_general_normalization() {
         let read = PatternRead {
             group: GroupId::new(7),
+            scope: ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS),
             logical_frontier_revision: Some(3),
             physical_frontier_revision: None,
             logical_fact_fingerprint: Fingerprint(11),
@@ -2216,6 +2228,7 @@ mod tests {
                 intent,
                 ReadSet::new([PatternRead {
                     group: GroupId::new(1),
+                    scope: ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS),
                     logical_frontier_revision: Some(2),
                     physical_frontier_revision: None,
                     logical_fact_fingerprint: Fingerprint(3),
@@ -2478,6 +2491,7 @@ mod tests {
                 },
                 ReadSet::new([PatternRead {
                     group: GroupId::new(4),
+                    scope: ReadScope::FACTS,
                     logical_frontier_revision: None,
                     physical_frontier_revision: None,
                     logical_fact_fingerprint: Fingerprint(12),

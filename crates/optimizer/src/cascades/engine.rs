@@ -72,7 +72,7 @@ use super::region::{
 use super::rules::WorkSourceId;
 use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PatternBinding,
-    PatternBindingSet, PatternEnumerationCompletion, PatternOperand, PatternRead,
+    PatternBindingSet, PatternEnumerationCompletion, PatternOperand, PatternRead, ReadScope,
     PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof, SourceWork,
     SourceWorkData, TaskSupplyContract, TransformContext, TransformationRule,
     TransformationPreflight,
@@ -3535,12 +3535,13 @@ impl CascadesEngine {
             .group(group)
             .ok_or_else(|| paro_error::internal("unknown group in priced incumbent context"))?;
         let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.priced-incumbent-context.v2");
+        builder.write_bytes(b"paro.priced-incumbent-context.v3");
         builder.write_fingerprint(plan_identity);
         write_semantic_goal_fingerprint(&mut builder, &self.memo, goal, &self.grant_classes)?;
         builder.write_fingerprint(self.memo.calibration().stable_fingerprint());
         builder.write_u64(reads.reads().len() as u64);
         for read in reads.reads() {
+            builder.write_u64(u64::from(read.scope.bits()));
             builder.write_u64(u64::from(read.logical_frontier_revision.is_some()));
             builder.write_u64(u64::from(read.physical_frontier_revision.is_some()));
             builder.write_fingerprint(read.logical_fact_fingerprint);
@@ -5354,14 +5355,12 @@ impl CascadesEngine {
                         output_dimension,
                     )?;
                     for (target, properties, cardinality) in inserted_properties {
-                        let group = self.memo.group_mut(target).ok_or_else(|| {
-                            paro_error::internal("committed transformation lost its target group")
+                        self.memo.update_group_facts(target, |logical, current| {
+                            logical.merge_equivalent_facts(&properties)?;
+                            *current =
+                                std::mem::take(current).canonical_with(cardinality.clone());
+                            Ok(())
                         })?;
-                        group
-                            .logical_properties
-                            .merge_equivalent_facts(&properties)?;
-                        group.cardinality =
-                            std::mem::take(&mut group.cardinality).canonical_with(cardinality);
                     }
                     inserted_groups.extend(locally_written_groups);
                     *self.effective_rule_insertions.entry(rule).or_default() +=
@@ -10730,10 +10729,11 @@ fn visit_read_group_delta(
 
 fn transformation_dependency_fingerprint(dependencies: &[PatternRead]) -> Fingerprint {
     let mut builder = StableFingerprintBuilder::default();
-    builder.write_bytes(b"paro.transformation-dependencies.v2");
+    builder.write_bytes(b"paro.transformation-dependencies.v3");
     builder.write_u64(dependencies.len() as u64);
     for read in dependencies {
         builder.write_u64(read.group.0 as u64);
+        builder.write_u64(u64::from(read.scope.bits()));
         builder.write_u64(u64::from(read.logical_frontier_revision.is_some()));
         builder.write_u64(read.logical_frontier_revision.unwrap_or_default());
         builder.write_u64(u64::from(read.physical_frontier_revision.is_some()));
