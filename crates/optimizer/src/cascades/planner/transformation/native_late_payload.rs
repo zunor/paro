@@ -18,7 +18,7 @@ use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::expression::Expression;
 #[cfg(test)]
 use paro_planner::expression::OperatorType;
-use paro_planner::operator::{ColumnBinding, Filter, Get, Join, LogicalOperator, Projection};
+use paro_planner::operator::{Filter, Get, Join, LogicalOperator, Projection};
 
 use super::staging::{NativeChild, NativeShell};
 use super::{boundary, Memo, PatternOperand, PlannerTransformState};
@@ -260,80 +260,35 @@ fn source_occurrence_at(counts: &[Option<usize>], child: &NativeChild) -> Option
     counts.get(*index).copied().flatten()
 }
 
-struct PrefixCandidate {
-    source_binding: ColumnBinding,
-    byte_width: usize,
-    output_indices: Vec<usize>,
-}
-
 fn prove_prefix_candidate(
     projection: &Projection<NativeChild>,
     filter: &Filter<NativeChild>,
     get: &Get,
-) -> Option<PrefixCandidate> {
+) -> Option<crate::aggregate::late_payload::MatchedPrefixCandidate> {
     let table = get
         .table
         .as_ref()
         .filter(|table| table.get_storage().is_some())?;
-    let mut candidate: Option<PrefixCandidate> = None;
-    for (output_index, expression) in projection.expressions.iter().enumerate() {
-        let Expression::Function(function) = expression else {
-            continue;
-        };
-        let Some(ScalarPredicateProjection::Utf8Substring {
-            source_argument,
-            start: 1,
-            length: Some(length),
-        }) = function.function.predicate_projection.as_ref()
-        else {
-            continue;
-        };
-        let byte_width = usize::try_from(*length).ok().filter(|width| *width > 0)?;
-        let Expression::ColumnRef(source) = function.children.get(*source_argument)? else {
-            return None;
-        };
-        if source.depth != 0
-            || source.binding.table_index != get.table_index
-            || source.return_type != LogicalType::Varchar
-        {
-            return None;
-        }
-        let catalog_column = get.stored_column(source.binding.column_index)?;
-        if table
-            .columns
-            .get(catalog_column)
-            .is_none_or(|definition| definition.logical_type != source.return_type)
-        {
-            return None;
-        }
-        if !filter.expressions.iter().any(|predicate| {
-            prove_prefix_filter_expression(
-                predicate,
-                source.binding,
-                &function.function,
-                byte_width,
-            )
-        }) {
-            return None;
-        }
-        match &mut candidate {
-            Some(candidate)
-                if candidate.source_binding == source.binding
-                    && candidate.byte_width == byte_width =>
+    crate::aggregate::late_payload::prove_prefix_outputs(
+        &projection.expressions,
+        |binding, kernel, byte_width| {
+            if binding.table_index != get.table_index {
+                // This binding has not proven another source path.
+                return None;
+            }
+            let column = get.stored_column(binding.column_index)?;
+            if table
+                .columns
+                .get(column)
+                .is_none_or(|definition| definition.logical_type != LogicalType::Varchar)
             {
-                candidate.output_indices.push(output_index);
+                return None;
             }
-            None => {
-                candidate = Some(PrefixCandidate {
-                    source_binding: source.binding,
-                    byte_width,
-                    output_indices: vec![output_index],
-                });
-            }
-            Some(_) => return None,
-        }
-    }
-    candidate
+            Some(filter.expressions.iter().any(|predicate| {
+                prove_prefix_filter_expression(predicate, binding, kernel, byte_width)
+            }))
+        },
+    )
 }
 
 use crate::aggregate::late_payload::{
@@ -354,7 +309,7 @@ mod tests {
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, OperatorExpression,
     };
-    use paro_planner::operator::Get;
+    use paro_planner::operator::{ColumnBinding, Get};
     use paro_planner::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
 
@@ -367,6 +322,10 @@ mod tests {
     }
 
     fn substring(input: Expression) -> Expression {
+        substring_width(input, 2)
+    }
+
+    fn substring_width(input: Expression, width: i64) -> Expression {
         let functions = get_substring_functions();
         let (function, types) = functions
             .bind(&[
@@ -378,7 +337,7 @@ mod tests {
         let bound = function
             .bind(&ScalarBindInput::new(
                 types,
-                vec![None, Some(Value::BigInt(1)), Some(Value::BigInt(2))],
+                vec![None, Some(Value::BigInt(1)), Some(Value::BigInt(width))],
             ))
             .unwrap();
         Expression::Function(
@@ -390,7 +349,7 @@ mod tests {
                         ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt).into(),
                     ),
                     Expression::Constant(
-                        ConstantExpression::new(Value::BigInt(2), LogicalType::BigInt).into(),
+                        ConstantExpression::new(Value::BigInt(width), LogicalType::BigInt).into(),
                     ),
                 ],
                 LogicalType::Varchar,
@@ -514,6 +473,11 @@ mod tests {
                 filter,
                 if wrapper == 4 {
                     vec![substring(source_expression.clone()), source_expression]
+                } else if wrapper == 14 {
+                    vec![
+                        substring(source_expression.clone()),
+                        substring_width(source_expression, 1),
+                    ]
                 } else {
                     vec![substring(source_expression)]
                 },
@@ -578,6 +542,37 @@ mod tests {
     }
 
     #[test]
+    fn output_proof_distinguishes_nonmatching_missing_and_conflicting_witnesses() {
+        let binding = ColumnBinding::new(7, 0);
+        let expressions = [
+            substring(source(binding)),
+            substring_width(source(binding), 1),
+        ];
+        let candidate =
+            crate::aggregate::late_payload::prove_prefix_outputs(&expressions, |_, _, width| {
+                Some(width == 2)
+            })
+            .unwrap();
+        assert_eq!(candidate.output_indices, [0]);
+        assert!(
+            crate::aggregate::late_payload::prove_prefix_outputs(&expressions, |_, _, _| None,)
+                .is_none()
+        );
+        assert!(crate::aggregate::late_payload::prove_prefix_outputs(
+            &expressions,
+            |_, _, _| Some(true),
+        )
+        .is_none());
+        let repeated = [substring(source(binding)), substring(source(binding))];
+        assert_eq!(
+            crate::aggregate::late_payload::prove_prefix_outputs(&repeated, |_, _, _| Some(true),)
+                .unwrap()
+                .output_indices,
+            [0, 1]
+        );
+    }
+
+    #[test]
     fn mixed_prefix_projection_cannot_chain_rowid_lowering() {
         use crate::transformation_rejection::{
             RejectionReasons, TransformationRejectionCounts, TransformationRejectionGuard as Guard,
@@ -635,7 +630,19 @@ mod tests {
     #[test]
     fn production_binding_builds_native_prefix_shell() {
         use crate::cascades::rules::TransformationRule;
-        for wrapper in 0..14 {
+        for wrapper in 0..15 {
+            if wrapper == 14 {
+                let (reference, changed) =
+                    crate::aggregate::late_payload::rewrite_matched_prefix_node(production_plan(
+                        wrapper,
+                    ))
+                    .unwrap();
+                assert!(changed);
+                let LogicalOperator::Projection(output) = &reference.operator else {
+                    unreachable!()
+                };
+                assert!(matches!(output.expressions[1], Expression::Function(_)));
+            }
             let mut input = MemoBuilder::build(
                 production_plan(wrapper),
                 BindContext::new(),
@@ -675,7 +682,7 @@ mod tests {
                     .expect("production binding should take the native prefix path");
             assert_eq!(
                 shell.root_layout().unwrap().len(),
-                if wrapper == 4 { 2 } else { 1 }
+                if wrapper == 4 || wrapper == 14 { 2 } else { 1 }
             );
             let LogicalOperator::Projection(projection) = shell.root_operator() else {
                 panic!("expected projection root")
@@ -684,6 +691,9 @@ mod tests {
                 projection.expressions.first(),
                 Some(Expression::ColumnRef(column)) if column.binding.column_index == 1
             ));
+            if wrapper == 14 {
+                assert!(matches!(projection.expressions[1], Expression::Function(_)));
+            }
             if wrapper == 8 {
                 let mut duplicate = shell.clone();
                 let NativeChild::Node(join_index) = projection.child else {

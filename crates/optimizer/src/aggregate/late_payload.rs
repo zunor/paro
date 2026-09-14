@@ -97,11 +97,11 @@ pub(crate) fn rewrite_matched_prefix_node(
 }
 
 #[derive(Debug)]
-struct MatchedPrefixCandidate {
+pub(crate) struct MatchedPrefixCandidate {
     source_table_index: usize,
-    source_binding: ColumnBinding,
-    byte_width: usize,
-    output_indices: Vec<usize>,
+    pub(crate) source_binding: ColumnBinding,
+    pub(crate) byte_width: usize,
+    pub(crate) output_indices: Vec<usize>,
 }
 
 /// Replace a leading substring result with a scan-produced prefix only when
@@ -113,8 +113,29 @@ fn prove_matched_prefix_candidate(plan: &OwnedLogicalPlan) -> Option<MatchedPref
     let LogicalOperator::Projection(output) = &plan.operator else {
         return None;
     };
+    prove_prefix_outputs(&output.expressions, |binding, kernel, byte_width| {
+        let get = unique_get(output.child.as_ref(), binding.table_index)?;
+        let column_id = get.stored_column(binding.column_index)?;
+        if column_id >= get.table.as_ref()?.columns.len() {
+            return Some(false);
+        }
+        prove_matched_prefix_use_path(output.child.as_ref(), binding, kernel, byte_width)
+    })
+}
+
+/// Shared output proof: a known nonmatching expression remains unchanged;
+/// unavailable evidence aborts the candidate. Two incompatible witnessed
+/// prefixes cannot be combined into a single-source rewrite.
+pub(crate) fn prove_prefix_outputs(
+    expressions: &[Expression],
+    mut witnessed: impl FnMut(
+        ColumnBinding,
+        &paro_function::scalar::BoundScalarFunction,
+        usize,
+    ) -> Option<bool>,
+) -> Option<MatchedPrefixCandidate> {
     let mut candidate: Option<MatchedPrefixCandidate> = None;
-    for (output_index, expression) in output.expressions.iter().enumerate() {
+    for (output_index, expression) in expressions.iter().enumerate() {
         let Expression::Function(function) = expression else {
             continue;
         };
@@ -133,16 +154,7 @@ fn prove_matched_prefix_candidate(plan: &OwnedLogicalPlan) -> Option<MatchedPref
         if source.depth != 0 || source.return_type != LogicalType::Varchar {
             continue;
         }
-        let get = unique_get(output.child.as_ref(), source.binding.table_index)?;
-        let column_id = get.stored_column(source.binding.column_index)?;
-        if column_id >= get.table.as_ref()?.columns.len()
-            || !prove_matched_prefix_use_path(
-                output.child.as_ref(),
-                source.binding,
-                &function.function,
-                byte_width,
-            )?
-        {
+        if !witnessed(source.binding, &function.function, byte_width)? {
             continue;
         }
         match &mut candidate {
