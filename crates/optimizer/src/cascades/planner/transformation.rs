@@ -588,7 +588,6 @@ impl TransformationRule for PlannerTransformationRule {
         // path available for every shape that needs richer semantic handling.
         let mut native_domain_scopes = None;
         let mut native_elimination_checked = false;
-        let mut native_deferral_checked = false;
         let mut cte_restriction: Option<(GroupId, cte::CteDomainProof)> = None;
         // Native CTE domain/partition adapters allocate query-local symbols
         // before the common staging transaction is entered. Enlist a
@@ -812,7 +811,7 @@ impl TransformationRule for PlannerTransformationRule {
                         .collect()
                 }
                 PlannerTransformation::AggregateDimensionDeferral => {
-                    try_native_dimension_deferral(&binding.root, ctx.memo(), &state, &facts, &mut native_deferral_checked)?
+                    try_native_dimension_deferral(&binding.root, ctx.memo(), &state, &facts)?
                         .into_iter()
                         .collect()
                 }
@@ -860,19 +859,22 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             Vec::new()
         };
-        if (native_elimination_checked || native_deferral_checked) && direct_native.is_empty() {
+        if native_elimination_checked && direct_native.is_empty() {
             return Ok(Box::new([]));
         }
         // These selected grammars are closed. NonNullAggregate reaches Get
         // through unary inputs; LimitProjection ends at a hole; TopN follows
         // projections to Order and cannot contain another optimizable LIMIT.
+        // DimensionDeferral consumes the selected projection/inner-join region;
+        // constrained joins stay opaque and group holes are never expanded.
         // Native rejection covers the complete selected rewrite, not a
         // request to rebuild that binding as owned IR.
         if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput
             | PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown
             | PlannerTransformation::MarkJoinToSemi | PlannerTransformation::KeyDomainTransfer
             | PlannerTransformation::AggregateJoinPreaggregation
-            | PlannerTransformation::AggregateInputMaterialization)
+            | PlannerTransformation::AggregateInputMaterialization
+            | PlannerTransformation::AggregateDimensionDeferral)
             && direct_native.is_empty()
         {
             return Ok(Box::new([]));
@@ -3140,17 +3142,16 @@ enum NativeDeferredOuterGroup {
 /// Apply AggregateDimensionDeferral to the selected native aggregate region.
 /// Projection substitution and widest-dimension selection share the reference
 /// contracts; connected inner-equi regions are rebuilt from native child edges.
-/// Unsupported constrained/layout-restricted shapes retain the general fallback.
+/// Constrained joins remain opaque; all refusals refer to this selected grammar.
 fn try_native_dimension_deferral(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
-    checked: &mut bool,
 ) -> Result<Option<NativeShell>> {
     // Reject ineligible root spines before allocating a native node vector.
-    // The general fallback retains coverage for unsupported boundary contracts.
-    if !native_dimension_direct_shape(binding, memo, state, checked)? {
+    // Opaque group holes are not permission to expand unselected alternatives.
+    if !native_dimension_direct_shape(binding, memo, state)? {
         return Ok(None);
     }
     let Some((mut shell, mut layouts)) =
@@ -3254,10 +3255,6 @@ fn try_native_dimension_deferral(
         return Ok(None);
     }
 
-    // Region isolation, child identity, and output-layout coverage are known.
-    // The remaining recognition guards are authoritative for this exact
-    // binding; rebuilding it as owned IR cannot supply another legal output.
-    *checked = true;
     let mut partial_groups = Vec::with_capacity(join.conditions.len() + aggregate.groups.len());
     let mut condition_rewrites = Vec::with_capacity(join.conditions.len());
     for condition in &join.conditions {
@@ -3343,7 +3340,6 @@ fn try_native_dimension_deferral(
     if crate::statistics::unique_keys::expressions_cover_unique_key_from_facts(
         &left_layout, &keys, &partial_groups.iter().collect::<Vec<_>>(),
     ) {
-        *checked = true;
         return Ok(None);
     }
 
@@ -3382,8 +3378,6 @@ fn try_native_dimension_deferral(
         merge_functions.push(merge);
     }
 
-    // Construction/layout failure is still unsupported, not semantic refusal.
-    *checked = false;
     let partial_group_index = state.bind_context.generate_table_index();
     let partial_aggregate_index = state.bind_context.generate_table_index();
     let partial_groupings_index = state.bind_context.generate_table_index();
@@ -3517,7 +3511,7 @@ fn try_native_dimension_deferral(
     if result_layout.bindings() != original_root_layout.bindings()
         || result_layout.types() != original_root_layout.types()
     {
-        return Ok(None);
+        return Err(paro_error::internal("native dimension deferral changed its root output contract"));
     }
     Ok(Some(shell))
 }
@@ -4531,7 +4525,6 @@ fn native_dimension_direct_shape(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
-    checked: &mut bool,
 ) -> Result<bool> {
     let PatternOperand::Expression {
         expression,
@@ -4596,7 +4589,6 @@ fn native_dimension_direct_shape(
     if join.build_side_constraint != paro_planner::operator::JoinBuildSideConstraint::Either {
         // The shared recognizer treats this as a semantic region boundary;
         // owned isolation must not erase the required materialization side.
-        *checked = true;
         return Ok(false);
     }
     if join.join_type != JoinType::Inner
@@ -5387,12 +5379,7 @@ fn rewrite_planner_expression(
             ));
         }
         PlannerTransformation::AggregateDimensionDeferral => {
-            let (plan, changed) =
-                dimension_deferral::optimize_plan(plan, &environment.bind_context)?;
-            if !changed {
-                return Ok(None);
-            }
-            plan
+            unreachable!("dimension deferral is native-only in Memo search")
         }
         PlannerTransformation::AggregateDimensionSharing => {
             let (plan, changed) =
