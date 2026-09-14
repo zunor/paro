@@ -638,73 +638,114 @@ fn decode_storage_dictionary_child(
     let dictionary_len = dictionary_decoder.count() as usize;
     let unique_len = dictionary_len + usize::from(has_null_slot);
 
+    if logical_type.is_utf8_varlen() || logical_type == &LogicalType::Blob {
+        return decode_borrowed_dictionary_child(
+            logical_type,
+            batch,
+            &dictionary_decoder,
+            dictionary_len,
+            None,
+            has_null_slot,
+            allocator,
+            utf8_verified,
+        );
+    }
+
     let mut child = Vector::try_new(logical_type.clone(), unique_len.max(1), allocator.clone())?;
-    match logical_type {
-        LogicalType::Varchar
-        | LogicalType::VarcharCollation(_)
-        | LogicalType::TsVector
-        | LogicalType::TsQuery
-        | LogicalType::Json
-        | LogicalType::Jsonb => {
-            for idx in 0..dictionary_len {
-                let value = dictionary_decoder
-                    .string_at(idx as u32)
-                    .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
-                let value = if utf8_verified {
-                    // SAFETY: the encoded page's verified-UTF-8 contract covers
-                    // every dictionary value in this batch.
-                    unsafe { std::str::from_utf8_unchecked(&value) }
-                } else {
-                    std::str::from_utf8(&value).map_err(|_| {
-                        paro_error::data_corrupted("dictionary entry is not valid UTF-8")
-                    })?
-                };
-                child.try_set_string(idx, value)?;
-            }
+    let other = logical_type;
+    let width = physical_layout::fixed_row_width(other).map_err(|_| {
+        paro_error::not_supported(format!(
+            "Storage dictionary decode not supported for {other:?}"
+        ))
+    })?;
+    let mut raw = Vec::with_capacity(dictionary_len.saturating_mul(width));
+    for idx in 0..dictionary_len {
+        let value = dictionary_decoder
+            .value_ref_at(idx as u32)
+            .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
+        if value.len() != width {
+            return Err(paro_error::data_corrupted(format!(
+                "Dictionary value width {} does not match {other:?} physical width {width}",
+                value.len(),
+            )));
         }
-        LogicalType::Blob => {
-            for idx in 0..dictionary_len {
-                let value = dictionary_decoder
-                    .string_at(idx as u32)
-                    .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
-                child.try_set_blob(idx, &value)?;
-            }
-        }
-        other => {
-            let width = physical_layout::fixed_row_width(other).map_err(|_| {
-                paro_error::not_supported(format!(
-                    "Storage dictionary decode not supported for {other:?}"
-                ))
-            })?;
-            let mut raw = Vec::with_capacity(dictionary_len.saturating_mul(width));
-            for idx in 0..dictionary_len {
-                let value = dictionary_decoder
-                    .string_at(idx as u32)
-                    .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
-                if value.len() != width {
-                    return Err(paro_error::data_corrupted(format!(
-                        "Dictionary value width {} does not match {other:?} physical width {width}",
-                        value.len(),
-                    )));
-                }
-                raw.extend_from_slice(&value);
-            }
-            let decoded = build_vector_from_bytes(
-                other,
-                &Bytes::from(raw),
-                dictionary_len,
-                allocator.clone(),
-            )?;
-            for idx in 0..dictionary_len {
-                child.try_copy_at(idx, &decoded, idx)?;
-            }
-        }
+        raw.extend_from_slice(value);
+    }
+    let decoded =
+        build_vector_from_bytes(other, &Bytes::from(raw), dictionary_len, allocator.clone())?;
+    for idx in 0..dictionary_len {
+        child.try_copy_at(idx, &decoded, idx)?;
     }
     if has_null_slot {
         child.try_set_null(dictionary_len, true)?;
     }
     child.try_set_count(unique_len)?;
     Ok((child, dictionary_len))
+}
+
+/// Construct a storage dictionary child directly from the immutable encoded
+/// page.  Full scans and sparse row-id scans share this representation: the
+/// former publishes every source code in order, while the latter supplies a
+/// sorted local subset.  Keeping the construction here prevents the full
+/// path from falling back to `Bytes`-returning `string_at` and the generic
+/// varlen setter for every dictionary entry.
+fn decode_borrowed_dictionary_child(
+    logical_type: &LogicalType,
+    batch: &StorageDictionaryBatch,
+    dictionary: &BinaryPlainPageDecoder,
+    dictionary_len: usize,
+    selected_codes: Option<&[u32]>,
+    has_null_slot: bool,
+    allocator: Arc<dyn Allocator>,
+    utf8_verified: bool,
+) -> Result<(Vector, usize)> {
+    let value_count = selected_codes.map_or(dictionary_len, |codes| codes.len());
+    let child_count = value_count + usize::from(has_null_slot);
+    let mut child = Vector::try_new(logical_type.clone(), child_count.max(1), allocator)?;
+    let owner = Arc::new(batch.dictionary.clone());
+
+    // SAFETY: the owner keeps the immutable dictionary page alive for every
+    // out-of-line StringView stored below. All entries are initialized before
+    // the child is published to the dictionary vector.
+    let (entries, validity) = unsafe { child.try_begin_borrowed_varlen_write(child_count, owner)? };
+    for idx in 0..value_count {
+        let source_code = selected_codes.map_or(idx as u32, |codes| codes[idx]);
+        if source_code as usize >= dictionary_len {
+            return Err(paro_error::data_corrupted(format!(
+                "storage dictionary code {source_code} out of range {dictionary_len}"
+            )));
+        }
+        let value = dictionary
+            .value_ref_at(source_code)
+            .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
+        if logical_type.is_utf8_varlen() && !utf8_verified {
+            std::str::from_utf8(value)
+                .map_err(|_| paro_error::data_corrupted("dictionary entry is not valid UTF-8"))?;
+        }
+        let view = if let Some(inline) = StringView::try_inline(value) {
+            inline
+        } else {
+            let len = u32::try_from(value.len())
+                .map_err(|_| paro_error::out_of_range("dictionary value exceeds u32 length"))?;
+            // SAFETY: `value` is a slice of the immutable page retained by
+            // the vector lifetime owner installed above.
+            unsafe { StringView::from_out_of_line(value, value.as_ptr(), len) }
+        };
+        // SAFETY: the write index is below `child_count`, and the returned
+        // buffer has exactly that many initialized writable slots.
+        unsafe { entries.add(idx).write(view) };
+        validity.set_valid(idx);
+    }
+    if has_null_slot {
+        // Keep the null slot physically initialized while validity carries
+        // the SQL NULL meaning.
+        unsafe {
+            entries.add(value_count).write(StringView::empty());
+        }
+        validity.set_invalid(value_count);
+    }
+    child.try_set_count(child_count)?;
+    Ok((child, value_count))
 }
 
 fn decode_storage_dictionary_batch(
@@ -896,50 +937,19 @@ fn decode_sparse_borrowed_varlen_dictionary(
     referenced_codes.dedup();
 
     let has_null_slot = nulls.is_some();
-    let child_count = referenced_codes.len() + usize::from(has_null_slot);
-    let mut child = Vector::try_new(logical_type.clone(), child_count, allocator.clone())?;
-    let owner = Arc::new(batch.dictionary.clone());
-    // SAFETY: every long StringView below points into `batch.dictionary`.
-    // `owner` is a clone of that immutable Bytes allocation and is attached to
-    // the vector before the entries are published. Every entry, including the
-    // optional NULL slot, is initialized in this scope.
-    let (entries, validity) = unsafe { child.try_begin_borrowed_varlen_write(child_count, owner)? };
-    for (index, &code) in referenced_codes.iter().enumerate() {
-        let value = dictionary
-            .value_ref_at(code)
-            .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
-        if logical_type.is_utf8_varlen() && !utf8_verified {
-            std::str::from_utf8(value)
-                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
-        }
-        let view = if let Some(inline) = StringView::try_inline(value) {
-            inline
-        } else {
-            let len = u32::try_from(value.len())
-                .map_err(|_| paro_error::out_of_range("dictionary value exceeds u32 length"))?;
-            // SAFETY: `value` is a slice of the immutable page retained by the
-            // vector lifetime owner installed above.
-            unsafe { StringView::from_out_of_line(value, value.as_ptr(), len) }
-        };
-        // SAFETY: `entries` has exactly `child_count` initialized slots and
-        // every referenced-code index is inside that range.
-        unsafe { entries.add(index).write(view) };
-        validity.set_valid(index);
-    }
-    if has_null_slot {
-        let null_index = referenced_codes.len();
-        // NULL entries still receive a canonical initialized payload.
-        unsafe {
-            entries
-                .add(null_index)
-                .write(StringView::try_inline(&[]).expect("empty StringView is inline"));
-        }
-        validity.set_invalid(null_index);
-    }
-    child.try_set_count(child_count)?;
+    let (child, value_count) = decode_borrowed_dictionary_child(
+        logical_type,
+        batch,
+        &dictionary,
+        dictionary_len,
+        Some(&referenced_codes),
+        has_null_slot,
+        allocator.clone(),
+        utf8_verified,
+    )?;
     let child = Arc::new(child);
 
-    let null_index = referenced_codes.len() as u32;
+    let null_index = value_count as u32;
     let mut local_codes = Vec::with_capacity(rows);
     for row_idx in 0..rows {
         let local_code = if nulls.is_some_and(|flags| flags[row_idx] != 0) {
@@ -959,7 +969,7 @@ fn decode_sparse_borrowed_varlen_dictionary(
         child,
         selection,
         DictionaryInfo {
-            unique_len: child_count,
+            unique_len: value_count + usize::from(has_null_slot),
             provenance_id: None,
             source: DictionarySource::Storage,
         },
@@ -1926,6 +1936,108 @@ mod tests {
         assert_eq!(first.get_string(1), Some("beta"));
         assert_eq!(second.get_string(0), Some("beta"));
         assert_eq!(second.get_string(1), Some("alpha"));
+    }
+
+    #[test]
+    fn full_dictionary_varlen_child_borrows_page_and_preserves_nulls() {
+        let mut builder = BinaryPlainPageBuilder::new(1024);
+        assert!(builder.add_slice(b"short"));
+        assert!(builder.add_slice(b"a dictionary value longer than twelve bytes"));
+        let batch = ColumnBatch::with_storage_dictionary(
+            builder.finish().unwrap(),
+            Bytes::from(
+                [0_u32, 1, 1, 0]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            Some(Bytes::from_static(&[0, 0, 1, 0])),
+        )
+        .with_verified_utf8();
+
+        let vector = decode_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            4,
+            Arc::new(default_allocator()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(vector.get_string(0), Some("short"));
+        assert_eq!(
+            vector.get_string(1),
+            Some("a dictionary value longer than twelve bytes")
+        );
+        assert!(vector.is_null(2));
+        assert_eq!(vector.get_string(3), Some("short"));
+        assert!(vector.child().unwrap().string_heap().is_none());
+    }
+
+    #[test]
+    fn dictionary_cache_does_not_reuse_same_code_for_a_new_page() {
+        let make_dictionary = |value: &'static [u8]| {
+            let mut builder = BinaryPlainPageBuilder::new(128);
+            assert!(builder.add_slice(value));
+            builder.finish().unwrap()
+        };
+        let make_batch = |dictionary: Bytes| {
+            ColumnBatch::with_storage_dictionary(
+                dictionary,
+                Bytes::from(0_u32.to_le_bytes().to_vec()),
+                None,
+            )
+            .with_verified_utf8()
+        };
+        let cache = StorageDictionaryDecoderCache::default();
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let first = decode_column_batch_cached(
+            &LogicalType::Varchar,
+            &make_batch(make_dictionary(b"first dictionary")),
+            1,
+            allocator.clone(),
+            None,
+            &cache,
+            7,
+        )
+        .unwrap();
+        let second = decode_column_batch_cached(
+            &LogicalType::Varchar,
+            &make_batch(make_dictionary(b"second dictionary")),
+            1,
+            allocator,
+            None,
+            &cache,
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(first.get_string(0), Some("first dictionary"));
+        assert_eq!(second.get_string(0), Some("second dictionary"));
+        assert!(!Arc::ptr_eq(
+            first.child().unwrap(),
+            second.child().unwrap()
+        ));
+    }
+
+    #[test]
+    fn full_dictionary_rejects_an_out_of_range_code() {
+        let mut builder = BinaryPlainPageBuilder::new(128);
+        assert!(builder.add_slice(b"only value"));
+        let batch = ColumnBatch::with_storage_dictionary(
+            builder.finish().unwrap(),
+            Bytes::from(1_u32.to_le_bytes().to_vec()),
+            None,
+        )
+        .with_verified_utf8();
+
+        assert!(decode_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            1,
+            Arc::new(default_allocator()),
+            None,
+        )
+        .is_err());
     }
 
     #[test]
