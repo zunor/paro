@@ -867,7 +867,8 @@ impl TransformationRule for PlannerTransformationRule {
         if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput
             | PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown
             | PlannerTransformation::MarkJoinToSemi | PlannerTransformation::KeyDomainTransfer
-            | PlannerTransformation::AggregateJoinPreaggregation)
+            | PlannerTransformation::AggregateJoinPreaggregation
+            | PlannerTransformation::AggregateInputMaterialization)
             && direct_native.is_empty()
         {
             return Ok(Box::new([]));
@@ -2509,12 +2510,12 @@ fn native_materialize_candidate(
     Ok(true)
 }
 
-/// Native subset of AggregateInputMaterialization. The matched root must be
-/// an aggregate over an inner join; placement follows the exact selected
+/// Native producer for the selected AggregateInputMaterialization grammar.
+/// The root must be an aggregate over an inner join; placement follows the exact selected
 /// inner-join spine without expanding any opaque Memo inputs. Each input
 /// has its own placement/liveness proof; rejected inputs stay at the original
-/// evaluation site, exactly as in the semantic producer. Opaque control
-/// ownership and full negative-path coverage still require the remaining migration.
+/// evaluation site, exactly as in the semantic producer. Control ownership
+/// stays attached to the same complete input and is never traversed.
 fn try_native_input_materialization(
     binding: &PatternOperand,
     memo: &Memo,
@@ -2526,9 +2527,9 @@ fn try_native_input_materialization(
     else {
         return Ok(None);
     };
-    if native_shell_contains_control_boundary(&shell) {
-        return Ok(None);
-    }
+    // Placement only crosses selected plain inner joins. A control owner is
+    // retained as one complete input; wrapping it does not enter its producer
+    // or change any reference/consumer domain.
     let root = shell.root;
     let original_root_layout = layouts
         .get(root)
@@ -5346,12 +5347,7 @@ fn rewrite_planner_expression(
             plan
         }
         PlannerTransformation::AggregateInputMaterialization => {
-            let (plan, changed) =
-                input_materialization::optimize_plan(plan, &environment.bind_context)?;
-            if !changed {
-                return Ok(None);
-            }
-            plan
+            unreachable!("aggregate input materialization is native-only in Memo search")
         }
         PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown => {
             return Err(paro_error::internal("limit rewrites are native-only Memo transformations"));

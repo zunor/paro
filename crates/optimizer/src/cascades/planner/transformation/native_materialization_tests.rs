@@ -91,6 +91,175 @@ fn materialized_count<Child>(operator: &LogicalOperator<Child>) -> usize {
         .count()
 }
 
+fn control_plan() -> OwnedLogicalPlan {
+    let mut plan = plan(true);
+    let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+        unreachable!()
+    };
+    let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+        unreachable!()
+    };
+    let names = vec!["k".into(), "x".into(), "y".into()];
+    *join.right = OwnedLogicalPlan::synthetic(LogicalOperator::MaterializedCTE(
+        paro_planner::operator::MaterializedCTE::new(
+            50,
+            "materialized_input".into(),
+            names.clone(),
+            vec![LogicalType::Integer; 3],
+            paro_planner::binder::ir::CTEMaterialize::Materialized,
+            source(51),
+            OwnedLogicalPlan::synthetic(LogicalOperator::CTERef(
+                paro_planner::operator::CTERef::new(
+                    50,
+                    1,
+                    "consumer".into(),
+                    names,
+                    vec![LogicalType::Integer; 3],
+                ),
+            )),
+        )
+        .with_ref_count(1),
+    ));
+    plan
+}
+
+fn rejected_plan(control: bool, outer: bool) -> OwnedLogicalPlan {
+    let mut plan = if control { control_plan() } else { plan(true) };
+    let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+        unreachable!()
+    };
+    let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+        unreachable!()
+    };
+    if outer {
+        join.join_type = JoinType::Left;
+    } else {
+        // Both candidate inputs are used by a join condition and must remain.
+        join.conditions
+            .push(JoinCondition::equality(column(0, 0), column(1, 1)));
+    }
+    plan
+}
+
+#[test]
+fn rejected_native_materialization_does_not_rebuild_the_selected_binding() {
+    for control in [false, true] {
+        for outer in [false, true] {
+            let (_, changed) = input_materialization::optimize_plan(
+                rejected_plan(control, outer),
+                &BindContext::new(),
+            )
+            .unwrap();
+            assert!(!changed);
+            let mut input = MemoBuilder::build(
+                rejected_plan(control, outer),
+                BindContext::new(),
+                SearchBudget::default(),
+            )
+            .unwrap();
+            let state = input.planner_state.clone();
+            state.write().unwrap().session =
+                Some(paro_context::TestStatementContextBuilder::minimal().build());
+            let root_expr = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let binding = matching::scoped_pattern_bindings(
+                PlannerTransformation::AggregateInputMaterialization,
+                input.root,
+                root_expr,
+                &input.memo,
+                &state.read().unwrap(),
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .bindings
+            .first()
+            .cloned()
+            .unwrap();
+            let rule = PlannerTransformationRule {
+                transformation: PlannerTransformation::AggregateInputMaterialization,
+                planner_state: state.clone(),
+            };
+            let bridges = semantic_plan::owned_binding_instantiation_count();
+            let arena = state.read().unwrap().staging_arena.len();
+            let mut context = TransformContext::new(&mut input.memo, input.root);
+            assert!(rule
+                .apply_binding(&binding, &mut context)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                semantic_plan::owned_binding_instantiation_count(),
+                bridges,
+                "control={control}, outer={outer}"
+            );
+            assert_eq!(state.read().unwrap().staging_arena.len(), arena);
+        }
+    }
+}
+
+#[test]
+fn production_materialization_wraps_but_does_not_cross_a_cte_owner() {
+    let bind = BindContext::new();
+    for _ in 0..52 {
+        bind.generate_table_index();
+    }
+    let (reference, changed) = input_materialization::optimize_plan(control_plan(), &bind).unwrap();
+    assert!(changed);
+    assert_eq!(materialized_count(&reference.operator), 1);
+    let mut input =
+        MemoBuilder::build(control_plan(), BindContext::new(), SearchBudget::default()).unwrap();
+    let state = input.planner_state.clone();
+    state.write().unwrap().session =
+        Some(paro_context::TestStatementContextBuilder::minimal().build());
+    let root_expr = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let join_group = input.memo.logical_expr(root_expr).unwrap().key.children[0];
+    let join_expr = input.memo.group(join_group).unwrap().logical_exprs()[0];
+    let control_group = input.memo.logical_expr(join_expr).unwrap().key.children[1];
+    let control_facts = input.memo.local_statistics_fingerprint(control_group);
+    let binding = matching::scoped_pattern_bindings(
+        PlannerTransformation::AggregateInputMaterialization,
+        input.root,
+        root_expr,
+        &input.memo,
+        &state.read().unwrap(),
+        None,
+        BudgetDimension::RuleWorkPerGroup,
+    )
+    .unwrap()
+    .bindings
+    .first()
+    .cloned()
+    .unwrap();
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::AggregateInputMaterialization,
+        planner_state: state.clone(),
+    };
+    let bridges = semantic_plan::owned_binding_instantiation_count();
+    let mut context = TransformContext::new(&mut input.memo, input.root);
+    let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(semantic_plan::owned_binding_instantiation_count(), bridges);
+    let join_group = outputs[0].key.children[0];
+    let join_expr = context.memo().group(join_group).unwrap().logical_exprs()[0];
+    let projection_group = context.memo().logical_expr(join_expr).unwrap().key.children[1];
+    let projection_expr = context
+        .memo()
+        .group(projection_group)
+        .unwrap()
+        .logical_exprs()[0];
+    let projection = context.memo().logical_expr(projection_expr).unwrap();
+    assert_eq!(projection.key.children.as_ref(), &[control_group]);
+    assert!(matches!(
+        &state.read().unwrap().payloads.logical[projection.payload.index()]
+            .semantic_template
+            .operator,
+        LogicalOperator::Projection(_)
+    ));
+    assert_eq!(
+        context.memo().local_statistics_fingerprint(control_group),
+        control_facts
+    );
+}
+
 fn grouping_plan(blocked_first: bool, grouping: usize) -> OwnedLogicalPlan {
     let mut plan = plan(blocked_first);
     let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {

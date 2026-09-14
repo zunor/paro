@@ -12,18 +12,23 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
 use paro_common::error::Result;
+#[cfg(test)]
 use paro_planner::binder::context::BindContext;
-use paro_planner::expression::{
-    ColumnRefExpression, Expression, ExpressionIterator, ExpressionVisitDecision,
-};
-use paro_planner::operator::{
-    ColumnBinding, ComparisonJoin, Join, JoinType, LogicalOperator, Projection,
-};
+#[cfg(test)]
+use paro_planner::expression::ColumnRefExpression;
+use paro_planner::expression::{Expression, ExpressionIterator, ExpressionVisitDecision};
+use paro_planner::operator::ColumnBinding;
+#[cfg(test)]
+use paro_planner::operator::{ComparisonJoin, Join, JoinType, LogicalOperator, Projection};
+#[cfg(test)]
 use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::expression::traversal::visit_expression;
 
+/// Owned reference only; production consumes exact native Memo choices.
+#[cfg(test)]
 pub fn optimize_plan(
     plan: OwnedLogicalPlan,
     bind_context: &BindContext,
@@ -81,12 +86,14 @@ pub(crate) fn is_materializable_candidate(
         && inputs_are_dead_outside_candidate(candidate, groups, aggregates)
 }
 
+#[cfg(test)]
 struct MaterializedInput {
     binding_map: HashMap<ColumnBinding, ColumnBinding>,
     binding: ColumnBinding,
     return_type: paro_common::types::LogicalType,
 }
 
+#[cfg(test)]
 fn materialize_inputs(
     child: &mut OwnedLogicalPlan,
     groups: &mut [Expression],
@@ -207,6 +214,7 @@ fn expression_uses_bindings_outside(
     used
 }
 
+#[cfg(test)]
 fn materialize_at_deepest_join_domain(
     plan: &mut OwnedLogicalPlan,
     expression: &Expression,
@@ -267,6 +275,7 @@ fn materialize_at_deepest_join_domain(
     wrap_projection(plan, expression, bind_context)
 }
 
+#[cfg(test)]
 fn join_uses_bindings(join: &ComparisonJoin, bindings: &HashSet<ColumnBinding>) -> bool {
     join.conditions.iter().any(|condition| {
         expression_uses_any_binding(&condition.left, bindings)
@@ -274,6 +283,7 @@ fn join_uses_bindings(join: &ComparisonJoin, bindings: &HashSet<ColumnBinding>) 
     })
 }
 
+#[cfg(test)]
 fn expression_uses_any_binding(expression: &Expression, bindings: &HashSet<ColumnBinding>) -> bool {
     let mut used = false;
     visit_expression(expression, &mut |expression| {
@@ -287,6 +297,7 @@ fn expression_uses_any_binding(expression: &Expression, bindings: &HashSet<Colum
     used
 }
 
+#[cfg(test)]
 fn include_materialized_binding(
     child: &OwnedLogicalPlan,
     projection: &mut paro_planner::operator::ProjectionMap,
@@ -308,6 +319,7 @@ fn include_materialized_binding(
     }
 }
 
+#[cfg(test)]
 fn wrap_projection(
     plan: &mut OwnedLogicalPlan,
     expression: &Expression,
@@ -359,6 +371,7 @@ fn wrap_projection(
     })
 }
 
+#[cfg(test)]
 fn plain_inner_join(join: &ComparisonJoin) -> bool {
     join.join_type == JoinType::Inner
         && join.mark_index.is_none()
@@ -381,6 +394,7 @@ fn expression_bindings(expression: &Expression) -> Option<HashSet<ColumnBinding>
     (!invalid && !bindings.is_empty()).then_some(bindings)
 }
 
+#[cfg(test)]
 fn remap_join_expressions(
     join: &mut ComparisonJoin,
     bindings: &HashMap<ColumnBinding, ColumnBinding>,
@@ -394,6 +408,7 @@ fn remap_join_expressions(
     }
 }
 
+#[cfg(test)]
 fn remap_bindings(
     expression: Expression,
     bindings: &HashMap<ColumnBinding, ColumnBinding>,
@@ -412,6 +427,7 @@ fn remap_bindings(
     })
 }
 
+#[cfg(test)]
 fn replace_equal_subexpressions(
     expression: &mut Expression,
     target: &Expression,
