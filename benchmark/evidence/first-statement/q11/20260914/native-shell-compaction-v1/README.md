@@ -1158,3 +1158,34 @@ SQL regress, complete fixed-work/prefix/fingerprint campaign or timing claim.
 All reported tests used the mixed workspace, not clean performance evidence.
 Other rules and late-payload negative paths still retain owned bridges, so the
 overall migration goal remains open.
+
+### Negative-authority audit and existing prefix reuse
+
+9182bea0 moves ordinary selective admission before transport construction. The
+shared proof now resolves exact selected source/path/cardinality inputs for all
+shapes, rather than a separate unary shape guard declining before proof. Its
+existing join-locality rejection still forbids post-join ordinary fetch; no new
+cost proof or eligibility is introduced. Successful proof must identify one
+unary source before native construction proceeds. Existing 22 late_payload
+tests pass; full optimizer 1295 pass / same five failures before the next fix.
+
+Audit found a concrete native prefix bug: if Get already has the matching
+derived prefix output, its interning API reuses the existing ordinal. Native
+code incorrectly required that ordinal to be a newly appended suffix. A real
+Memo/apply fixture reproduced `native prefix Get appended a non-suffix output`.
+9dbfd547 accepts reuse within the existing output frontier while retaining
+carrier exposure and exact root validation. The new test verifies the staged
+Projection references that exact existing binding, one output is produced,
+owned instantiations remain zero, and rollback succeeds. 23 late_payload tests
+pass; full optimizer 1296 pass / same five failures. Compiler check passes.
+
+The audit does NOT certify blanket negative authority. A recursion-cut
+PatternOperand::Group is imported by the owned path as a BoundReference, whose
+source-Get count is zero; native source occurrence counting treats it as
+unknown. A concrete source on one join side plus an opaque cyclic sibling can
+therefore produce different uniqueness decisions. Final staging eligibility
+of that hypothesized counterexample has not been tested; unknown cannot simply
+be reclassified as absent. Inner carrier maps and non-prefix final maps also
+remain audit obligations. No negative fallback was removed in this slice.
+No fresh performance campaign, SQL bag execution or full prefix replay; mixed
+worktree tests do not supply clean binary performance evidence.
