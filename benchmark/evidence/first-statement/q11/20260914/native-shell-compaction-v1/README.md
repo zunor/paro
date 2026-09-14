@@ -881,3 +881,26 @@ This does not establish outer-join bag semantics, all row-id lowering contracts,
 fixed-work search equivalence, admitted fingerprint or fresh Q11 performance.
 Those acceptance gates were not run. Unit/check results are from the mixed
 worktree; no speedup or completed migration is claimed.
+
+## Correction: mixed Projection prefix outputs do not chain row-id lowering
+
+The earlier reason for retaining the mixed-output owned peer was too broad.
+TopN row-preserving lowering can retain a derived prefix while fetching another
+stored output, as its existing regression test demonstrates. Ordinary Projection
+selective lowering uses a different contract: any referenced derived scan column
+rejects that proof as SelectiveInvalidColumn. Prefix lowering has already placed
+such a column in its root output; both other row-id proofs require a TopN root.
+
+A new test executes the actual prefix-then-rowid sequence for the mixed fixture,
+supplies cardinality so it cannot stop at MissingCardinality, and verifies the
+explicit SelectiveInvalidColumn reason with no row-id rewrite. Successful native
+prefix results now skip their owned peer regardless of other stored outputs.
+The temporary prefix-only-complete flag is removed. The mixed production fixture
+changes from two outputs/one owned construction to one output/zero constructions.
+Non-prefix and TopN row-id lowering still retain their existing implementation.
+
+All 20 late_payload tests pass, including the existing TopN derived-prefix
+positive case. Full optimizer: 1284 passed / same five assertion failures.
+Optimizer/compiler check passes. No bless. Outer-join independent bag execution,
+fixed-work/prefix/fingerprint gates, SQL regress and fresh Q11 were not run;
+mixed-tree unit checks are not performance evidence. Overall migration is open.
