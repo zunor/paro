@@ -731,3 +731,24 @@ Full optimizer: 1281 passed, the same 5 named failures/assertion values. No bles
 This is a transport-removal slice, not deletion of every DimensionDeferral
 fallback. No clean Q11, fixed-work/fingerprint equivalence or C1/W measurements
 were run; no performance gain or complete-search equivalence is inferred.
+
+## Deferral ingress audit: two proposed gaps rejected
+
+Production tests show Left Join rejection already happens without owned
+instantiation via the earlier structural-impossibility guard. Adding another
+native preflight refusal did not remove work and was withdrawn.
+
+Input join output maps that retain only each side's payload column likewise
+already reach native deferral without owned transport. Memo ingestion invokes
+semantic_plan::canonicalize_projection_maps; tests assert both stored Inner
+Join maps are All, then verify zero bridges, exact retained dimension group,
+unchanged dimension statistics fingerprint and final output types for both Get
+and materialized-CTE reference fixtures. A proposed map-admission relaxation was
+withdrawn: it did not explain a real production fallback.
+
+Only tests change in this slice. All 5 native_deferral_tests pass (multiple
+fixture variants). Full optimizer and fresh performance were not rerun; the
+previous 1281/5 result is not relabeled as a new run. No bridge-count reduction
+or speedup is claimed. Remaining fallback audit must focus on genuinely reachable
+enforcement/region or construction failures, not these canonicalized ingress
+shapes. The overall migration is still incomplete.
