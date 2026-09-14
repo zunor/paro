@@ -250,6 +250,18 @@ unchanged, and unknown descendants still cannot be treated as complete native
 negative results. No Q11, full SQL regression or clean-source performance
 campaign was run for this implementation slice.
 
+`a6e7c721` distinguishes JoinElimination's complete selected-shell NoRewrite
+from Unsupported. A complete negative now returns without owned construction;
+control exclusions, unknown traversal and unrepresentable root/output changes
+still retain their fallback. The absent-unique-key regression first observed
+one bridge. Ten positive/negative cases across five wrappers now observe zero;
+each negative case also updates the unique-key evidence, checks that a prior
+read is stale, and successfully retries natively. A separate root-replacement
+case verifies Unsupported cannot become a complete negative. Eleven native
+tests and 111 engine tests passed. NoRewrite means only this selected rule
+binding was checked, not ProofComplete or global search closure. No Q11 or
+clean-source performance/fingerprint evidence was collected for this slice.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
