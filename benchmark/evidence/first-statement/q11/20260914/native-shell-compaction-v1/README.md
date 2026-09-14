@@ -297,6 +297,15 @@ reference tests and 111 engine tests passed on the mixed tree. The recursive
 fixture tests planning/staging, not termination or execution of recursion.
 No SQL-regress, Q11 timing or clean-source fingerprint campaign was run.
 
+RowFetch is now an explicit selected-rewrite barrier for native JoinElimination,
+matching the reference rule's existing refusal to traverse late materialization.
+The reference/native regression first returned Unsupported instead of a complete
+negative; the production binding first performed one owned instantiation. Both
+now retain the subtree without a bridge, including retry after unique-key facts
+change. This does not remove a previously legal rewrite or certify global search
+completion. Thirteen native tests, five reference tests and 111 engine tests
+passed on the mixed tree; no performance/fingerprint or full SQL run was made.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
