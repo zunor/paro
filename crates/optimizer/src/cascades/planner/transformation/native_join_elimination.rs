@@ -136,6 +136,12 @@ fn rewrite_node(
         .ok_or_else(|| paro_error::internal("native join elimination lost a node"))?
         .operator
         .clone();
+    if matches!(source_operator, LogicalOperator::RowFetch(_)) {
+        // The rule's declared traversal stops at late materialization. This
+        // is a known no-rewrite boundary, not missing native coverage. Keep
+        // its exact child edge and scalar payload; do not inspect inner joins.
+        return Ok(Some((NativeChild::Node(index), false)));
+    }
     let mut source_children = Vec::new();
     source_operator.visit_child_links(&mut |child| source_children.push(child.clone()));
     let Some(required_children) = required_children(&source_operator, layouts, required) else {
@@ -855,6 +861,24 @@ mod tests {
     }
 
     #[test]
+    fn row_fetch_is_a_complete_selected_rewrite_barrier() {
+        let make = || {
+            OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(
+                paro_planner::operator::RowFetch::new(70, vec![], candidate(true, false)),
+            ))
+        };
+        let (reference, changed) =
+            crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+        assert!(!changed, "the reference rule does not traverse row fetch");
+        let shell = NativeShell::from_owned(make(), &HashMap::new()).unwrap();
+        assert_eq!(shell.root_layout().unwrap(), reference.output_layout());
+        assert!(matches!(
+            rewrite_shell_result(shell).unwrap(),
+            EliminationResult::NoRewrite
+        ));
+    }
+
+    #[test]
     fn unsupported_root_replacement_is_not_a_complete_negative() {
         let plan = candidate(true, false);
         let LogicalOperator::Projection(projection) = plan.into_operator() else {
@@ -1038,7 +1062,7 @@ mod tests {
         use paro_planner::binder::context::BindContext;
 
         for unique in [false, true] {
-            for wrapper in 0..7 {
+            for wrapper in 0..8 {
                 let wrapped = wrapper != 0;
                 let plan = if wrapped {
                     let child = if wrapper == 1 {
@@ -1047,6 +1071,10 @@ mod tests {
                         ))
                     } else if wrapper == 2 {
                         window(memo_candidate(), column(10, 0))
+                    } else if wrapper == 7 {
+                        OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(
+                            paro_planner::operator::RowFetch::new(70, vec![], memo_candidate()),
+                        ))
                     } else if wrapper == 6 {
                         OwnedLogicalPlan::synthetic(LogicalOperator::RecursiveCTE(
                             paro_planner::operator::RecursiveCTE {
@@ -1132,6 +1160,7 @@ mod tests {
                             match wrapper {
                                 3 => 40,
                                 6 => 60,
+                                7 => 70,
                                 _ => 10,
                             },
                             0,
@@ -1225,7 +1254,7 @@ mod tests {
                 let outputs = rule.apply_binding(&binding, &mut context).unwrap();
                 assert_eq!(
                     outputs.len(),
-                    usize::from(unique),
+                    usize::from(unique && wrapper != 7),
                     "a complete native elimination must not stage the same owned peer"
                 );
                 assert_eq!(
@@ -1304,7 +1333,10 @@ mod tests {
                         .iter()
                         .any(|read| !read.is_current(&input.memo).unwrap()));
                     let mut context = TransformContext::new(&mut input.memo, input.root);
-                    assert_eq!(rule.apply_binding(&binding, &mut context).unwrap().len(), 1);
+                    assert_eq!(
+                        rule.apply_binding(&binding, &mut context).unwrap().len(),
+                        usize::from(wrapper != 7)
+                    );
                     assert_eq!(
                         super::super::semantic_plan::owned_binding_instantiation_count(),
                         bridges
