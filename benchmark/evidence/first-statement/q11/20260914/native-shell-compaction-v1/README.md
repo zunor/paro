@@ -681,3 +681,33 @@ no fresh Q11, no clean fixed-work or fingerprint evidence in this slice.
 General fallback removal remains pending, including unique-key no-reduction
 guard parity and authoritative negative coverage; this correction is necessary
 before treating native rejection as final.
+
+## Deferral existing-key rejection
+
+The native producer lacked the reference no-further-key-reduction guard. A
+production Memo fixture now uses an actual plain aggregate as the fact input:
+one grouping key is completely covered by the proposed partial key, while a
+two-column grouping key is not. With the incomplete native guard, the covered
+case still emitted a rewrite although the reference with its structural facts
+declined it. The completed guard rejects only full coverage and retains the
+uncovered-key alternative; both production paths instantiate zero owned bindings.
+
+The guard reads the unchanged selected edge's observed group keys (not a peer
+group) and reuses the existing structural key derivation for a visible plain
+Aggregate. This is necessary because the test's selected boundary transport
+did not carry that structural key. New fact joins created by region isolation
+do not inherit an original group's uniqueness certificate. Covered-key rejection
+is authoritative and bypasses owned fallback, which otherwise loses the proof.
+No persistent cache or new key semantics were introduced.
+
+Fixture corrections are explicit: a fabricated group-hole BoundReference cannot
+be imported through MemoBuilder; manually attached ExpressionGet statistics also
+do not establish production boundary uniqueness. Neither was accepted as proof.
+The final fixture derives uniqueness from real aggregate structure and compares
+complete versus incomplete grouping-key coverage.
+
+Full optimizer: 1280 passed / the same 5 failures and assertion values. No bless.
+No fresh Q11/C1/W or clean fixed-work/fingerprint campaign was run. Candidate
+counts on formerly over-rewritten inputs can change; no global count-equivalence
+claim is made. General deferral fallback and the full owned-IR migration remain
+unfinished; the existing mixed user changes were not included in this slice.
