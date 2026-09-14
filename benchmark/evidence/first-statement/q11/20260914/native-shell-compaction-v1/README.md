@@ -395,6 +395,28 @@ than two retentions in a fixed physical witness. None was fixed or blessed.
 This proves no new failure in this slice, not a clean historical-baseline
 attribution or full migration acceptance. No Q11/SQL performance campaign ran.
 
+### Native subsumption through tautological filters (f3b500be)
+
+Production Memo binding previously fell through to owned settlement when an
+otherwise supported subsumption spine began with Filter(TRUE). The native
+spine now removes only a projection-free, evaluation-fence-free filter which
+the existing shared predicate normalizer proves empty. FALSE, typed NULL and
+output-projecting filters remain refused by this producer. The positive
+production fixture checks one output, zero owned binding instantiations and
+no settlement arena growth, both with and without the wrapper. A differential
+fixture compares output layout and outer grouping/SUM expressions with the
+owned FilterPushdown plus root subsumption reference; it is not an execution
+or full search-coverage oracle.
+
+Validation on the mixed worktree: native subsumption5, reference subsumption5,
+engine111 passed. The new test initially failed compilation (typed NULL and
+reference-copy/equality API usage); corrected before commit. No fresh Q11,
+fingerprint, SQL regression or performance campaign ran for this slice.
+The remaining fallback includes a complete FilterPushdown prelude, not merely
+the subsumption rule. This change does not establish native coverage of that
+prelude, and does not delete the fallback prematurely. Existing user changes
+were excluded from the commit.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
