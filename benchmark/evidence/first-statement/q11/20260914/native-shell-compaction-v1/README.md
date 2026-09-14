@@ -226,6 +226,18 @@ passed. Other unhandled/control descendants and negative-result completeness
 still prevent removing the entire JoinElimination fallback. This contract
 correction has no new Q11/fingerprint or clean performance acceptance yet.
 
+`2fd6b1b9` adds native JoinElimination traversal through SetOperation using
+each branch's complete output contract, rather than matching the parent's
+new binding namespace against child bindings. The production UNION wrapper
+first recorded one owned instantiation and now records zero with one native
+staged result. A six-case matrix (UNION/INTERSECT/EXCEPT, ALL/DISTINCT) verifies
+that both selected branches are rewritten, their distinct binding namespaces
+remain intact, output layout matches the reference, and set flags are
+unchanged. Nine native tests, five reference tests and 111 engine tests
+passed. Control and other unhandled descendants still need coverage before
+the rule's negative fallback can be removed. No Q11 performance or clean
+fingerprint acceptance was run for this slice.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
