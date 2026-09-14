@@ -149,9 +149,11 @@ pub(super) fn try_native_late_payload_prefix(
         .get(get_index)
         .ok_or_else(|| paro_error::internal("native prefix shell lost Get layout"))?
         .len();
-    if derived_binding.column_index != get_width_before {
+    // The Get contract interns derived outputs: an exact existing prefix is
+    // reused, otherwise one suffix is appended. Both need carrier exposure.
+    if derived_binding.column_index > get_width_before {
         return Err(paro_error::internal(
-            "native prefix Get appended a non-suffix output",
+            "native prefix Get returned an output beyond its append frontier",
         ));
     }
     let mut filter = filter;
@@ -720,6 +722,46 @@ mod tests {
         };
         assert_eq!(column.binding, ColumnBinding::new(7, 1));
         assert!(output.child.get_column_bindings().contains(&column.binding));
+    }
+
+    #[test]
+    fn production_prefix_reuses_existing_derived_scan_output() {
+        use crate::cascades::rules::TransformationRule;
+        let mut plan = production_plan(0);
+        let LogicalOperator::Projection(output) = &mut plan.operator else { unreachable!() };
+        let LogicalOperator::Filter(filter) = &mut output.child.operator else { unreachable!() };
+        let LogicalOperator::Get(get) = &mut filter.child.operator else { unreachable!() };
+        let reused = get.append_matched_utf8_prefix(0, 2, LogicalType::Varchar);
+        assert_eq!(reused.column_index, 1);
+        let mut input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        input.planner_state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
+        let state = input.planner_state.read().unwrap();
+        let expr = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let bindings = matching::scoped_pattern_bindings(
+            PlannerTransformation::LatePayloadFetch, input.root, expr, &input.memo,
+            &state, None, BudgetDimension::RuleWorkPerGroup,
+        ).unwrap();
+        drop(state);
+        let mut ctx = super::super::TransformContext::new(&mut input.memo, input.root);
+        let rule = super::super::PlannerTransformationRule {
+            transformation: PlannerTransformation::LatePayloadFetch,
+            planner_state: input.planner_state.clone(),
+        };
+        let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
+        let outputs = rule.apply_binding(&bindings.bindings[0], &mut ctx).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(bridges, super::super::semantic_plan::owned_binding_instantiation_count());
+        let state = input.planner_state.read().unwrap();
+        let payload = &state.payloads.logical[outputs[0].payload.index()];
+        let LogicalOperator::Projection(output) = &payload.semantic_template.operator else {
+            unreachable!()
+        };
+        let Expression::ColumnRef(column) = &output.expressions[0] else { unreachable!() };
+        assert_eq!(column.binding, reused);
+        drop(state);
+        drop(outputs);
+        ctx.rollback().unwrap();
     }
 
     #[test]
