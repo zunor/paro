@@ -588,6 +588,7 @@ impl TransformationRule for PlannerTransformationRule {
         // path available for every shape that needs richer semantic handling.
         let mut native_domain_scopes = None;
         let mut native_elimination_checked = false;
+        let mut native_late_payload_complete = false;
         let mut cte_restriction: Option<(GroupId, cte::CteDomainProof)> = None;
         // Native CTE domain/partition adapters allocate query-local symbols
         // before the common staging transaction is entered. Enlist a
@@ -831,6 +832,7 @@ impl TransformationRule for PlannerTransformationRule {
                         ctx.memo(),
                         &state,
                         &facts,
+                        &mut native_late_payload_complete,
                     )?
                     .into_iter()
                     .collect()
@@ -918,6 +920,7 @@ impl TransformationRule for PlannerTransformationRule {
             // partial semantic subset, so they deliberately keep their owned
             // peer.
             let native_direct_only = (native_domain_scopes.is_some()
+                || native_late_payload_complete
                 || matches!(
                     self.transformation,
                     PlannerTransformation::JoinRegionEnumeration

@@ -4,20 +4,23 @@
 //! Native staging for the closed scan-prefix subset of late payload lowering.
 //!
 //! Row-id payload fetching remains on the authoritative owned rule.  This
-//! adapter only handles the local Projection -> Filter -> Get rewrite whose
+//! adapter handles Projection through Filter/Order/Limit to Filter -> Get, whose
 //! semantic witness is an exact ASCII membership predicate.  It therefore
 //! avoids importing an owned tree without claiming that the full rule has
 //! been migrated.
 
 use paro_common::error::{self as paro_error, Result};
+#[cfg(test)]
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::scalar::ScalarPredicateProjection;
-use paro_planner::expression::{ConjunctionType, Expression, OperatorType};
+use paro_planner::expression::Expression;
+#[cfg(test)]
+use paro_planner::expression::OperatorType;
 use paro_planner::operator::{ColumnBinding, Filter, Get, LogicalOperator, Projection};
 
 use super::staging::{NativeChild, NativeShell};
-use super::{Memo, PatternOperand, PlannerTransformState, boundary};
+use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 
 /// Try the exact scan-prefix part of LatePayloadFetch on the native shell.
 ///
@@ -28,7 +31,9 @@ pub(super) fn try_native_late_payload_prefix(
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
+    prefix_only_complete: &mut bool,
 ) -> Result<Option<NativeShell>> {
+    *prefix_only_complete = false;
     let Some((shell, layouts)) =
         NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
     else {
@@ -46,34 +51,46 @@ pub(super) fn try_native_late_payload_prefix(
     let LogicalOperator::Projection(projection) = shell.root_operator().clone() else {
         return Ok(None);
     };
-    let NativeChild::Node(filter_index) = projection.child.clone() else {
-        return Ok(None);
-    };
-    let LogicalOperator::Filter(filter) = shell
-        .nodes
-        .get(filter_index)
-        .ok_or_else(|| paro_error::internal("native late-payload shell lost its filter"))?
-        .operator
-        .clone()
-    else {
-        return Ok(None);
-    };
-    let NativeChild::Node(get_index) = filter.child.clone() else {
-        return Ok(None);
-    };
-    let LogicalOperator::Get(mut get) = shell
-        .nodes
-        .get(get_index)
-        .ok_or_else(|| paro_error::internal("native late-payload shell lost its Get"))?
-        .operator
-        .clone()
-    else {
-        return Ok(None);
+    let mut cursor = projection.child.clone();
+    let mut ancestors = Vec::new();
+    let (filter_index, get_index, filter, mut get) = loop {
+        let NativeChild::Node(index) = cursor else {
+            return Ok(None);
+        };
+        let operator = &shell
+            .nodes
+            .get(index)
+            .ok_or_else(|| paro_error::internal("native prefix path lost a node"))?
+            .operator;
+        match operator {
+            LogicalOperator::Filter(filter) => {
+                if let NativeChild::Node(child) = &filter.child {
+                    if let LogicalOperator::Get(get) = &shell.nodes[*child].operator {
+                        break (index, *child, filter.clone(), get.clone());
+                    }
+                }
+                ancestors.push(index);
+                cursor = filter.child.clone();
+            }
+            LogicalOperator::Order(order) => {
+                ancestors.push(index);
+                cursor = order.child.clone();
+            }
+            LogicalOperator::Limit(limit) => {
+                ancestors.push(index);
+                cursor = limit.child.clone();
+            }
+            _ => return Ok(None),
+        }
     };
 
     let Some(candidate) = prove_prefix_candidate(&projection, &filter, &get) else {
         return Ok(None);
     };
+    // Row-id lowering needs at least one stored payload output. When every
+    // output becomes a derived scan prefix, no output has a stored_column. Mixed
+    // outputs must retain the owned peer's subsequent row-id opportunity.
+    let only_derived_outputs = candidate.output_indices.len() == projection.expressions.len();
     let source_type = get
         .column_types
         .get(candidate.source_binding.column_index)
@@ -122,6 +139,34 @@ pub(super) fn try_native_late_payload_prefix(
     nodes[get_index].source_proofs = Box::new([]);
     nodes[filter_index].operator = LogicalOperator::Filter(filter);
     nodes[filter_index].source_proofs = Box::new([]);
+    let get_layout = nodes[get_index].operator.output_layout_from_child_refs(&[]);
+    let mut child_layout = nodes[filter_index]
+        .operator
+        .output_layout_from_child_refs(&[&get_layout]);
+    for index in ancestors.into_iter().rev() {
+        let ordinal = child_layout
+            .bindings()
+            .iter()
+            .position(|binding| *binding == derived_binding)
+            .ok_or_else(|| {
+                paro_error::internal("native prefix ancestor lost the derived column")
+            })?;
+        let node = &mut nodes[index];
+        match &mut node.operator {
+            LogicalOperator::Filter(filter) => filter.projection_map.include(ordinal),
+            LogicalOperator::Order(order) => order.projection_map.include(ordinal),
+            LogicalOperator::Limit(_) => {}
+            _ => {
+                return Err(paro_error::internal(
+                    "native prefix ancestor changed operator",
+                ))
+            }
+        }
+        child_layout = node
+            .operator
+            .output_layout_from_child_refs(&[&child_layout]);
+        node.source_proofs = Box::new([]);
+    }
     nodes[root].operator = LogicalOperator::Projection(projection);
     nodes[root].source_proofs = Box::new([]);
 
@@ -132,6 +177,7 @@ pub(super) fn try_native_late_payload_prefix(
     if result_layout != original_layout {
         return Ok(None);
     }
+    *prefix_only_complete = only_derived_outputs;
     Ok(Some(shell))
 }
 
@@ -211,54 +257,7 @@ fn prove_prefix_candidate(
     candidate
 }
 
-fn prove_prefix_filter_expression(
-    expression: &Expression,
-    source_binding: ColumnBinding,
-    kernel: &paro_function::scalar::BoundScalarFunction,
-    byte_width: usize,
-) -> bool {
-    if let Expression::Conjunction(conjunction) = expression {
-        if conjunction.conjunction_type != ConjunctionType::And {
-            return false;
-        }
-        return conjunction.children.iter().any(|child| {
-            prove_prefix_filter_expression(child, source_binding, kernel, byte_width)
-        });
-    }
-    let Expression::Operator(operator) = expression else {
-        return false;
-    };
-    if operator.operator_type != OperatorType::In || operator.children.len() < 2 {
-        return false;
-    }
-    let Expression::Function(projected) = &operator.children[0] else {
-        return false;
-    };
-    let Some(ScalarPredicateProjection::Utf8Substring {
-        source_argument,
-        start: 1,
-        length: Some(length),
-    }) = projected.function.predicate_projection.as_ref()
-    else {
-        return false;
-    };
-    if usize::try_from(*length).ok() != Some(byte_width)
-        || !crate::aggregate::semantic_kernels::scalar_kernels_equal(&projected.function, kernel)
-        || !matches!(
-            projected.children.get(*source_argument),
-            Some(Expression::ColumnRef(column))
-                if column.depth == 0 && column.binding == source_binding
-        )
-        || !operator.children[1..].iter().all(|child| {
-            matches!(child, Expression::Constant(constant)
-                if matches!(&constant.value, Value::Varchar(value)
-                    if value.is_ascii() && value.len() == byte_width))
-        })
-    {
-        return false;
-    }
-    true
-}
+use crate::aggregate::late_payload::prove_prefix_filter_expression;
 
 #[cfg(test)]
 mod tests {
@@ -268,8 +267,8 @@ mod tests {
     use paro_catalog::entry::{
         CatalogObjectId, ColumnDefinition, CreateTableInfo, TableCatalogEntry,
     };
-    use paro_function::scalar::ScalarBindInput;
     use paro_function::scalar::string::get_substring_functions;
+    use paro_function::scalar::ScalarBindInput;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, OperatorExpression,
@@ -278,7 +277,7 @@ mod tests {
     use paro_planner::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
 
-    use super::super::{PlannerTransformation, matching};
+    use super::super::{matching, PlannerTransformation};
     use crate::cascades::budget::{BudgetDimension, SearchBudget};
     use crate::cascades::planner::MemoBuilder;
 
@@ -345,7 +344,7 @@ mod tests {
         )
     }
 
-    fn production_plan() -> OwnedLogicalPlan {
+    fn production_plan(wrapper: usize) -> OwnedLogicalPlan {
         let context = BindContext::new();
         let binding = ColumnBinding::new(7, 0);
         let source_expression = source(binding);
@@ -376,12 +375,26 @@ mod tests {
             &context,
             LogicalOperator::Filter(Filter::new(get, vec![predicate])),
         );
+        let filter = match wrapper {
+            0 => filter,
+            1 => OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Box::new(
+                paro_planner::operator::Limit::new(filter, None, None),
+            ))),
+            2 => OwnedLogicalPlan::synthetic(LogicalOperator::Order(
+                paro_planner::operator::Order::new(filter, vec![]),
+            )),
+            _ => OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(filter, vec![]))),
+        };
         OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Projection(Projection::new(
                 8,
                 filter,
-                vec![substring(source_expression)],
+                if wrapper == 4 {
+                    vec![substring(source_expression.clone()), source_expression]
+                } else {
+                    vec![substring(source_expression)]
+                },
             )),
         )
     }
@@ -444,47 +457,75 @@ mod tests {
 
     #[test]
     fn production_binding_builds_native_prefix_shell() {
-        let mut input = MemoBuilder::build(
-            production_plan(),
-            BindContext::new(),
-            SearchBudget::default(),
-        )
-        .unwrap();
-        let state = input.planner_state.read().unwrap();
-        let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
-        let binding = matching::scoped_pattern_bindings(
-            PlannerTransformation::LatePayloadFetch,
-            input.root,
-            expression,
-            &input.memo,
-            &state,
-            None,
-            BudgetDimension::RuleWorkPerGroup,
-        )
-        .unwrap()
-        .bindings
-        .first()
-        .cloned()
-        .expect("production prefix pattern should match");
-        let mut context = super::super::TransformContext::new(&mut input.memo, input.root);
-        let facts = super::super::boundary::BoundarySnapshot::read(
-            &mut context,
-            &state,
-            &binding.root,
-            BudgetDimension::RuleWorkPerGroup,
-        )
-        .unwrap()
-        .expect("production binding should have boundary facts");
-        let shell = try_native_late_payload_prefix(&binding.root, context.memo(), &state, &facts)
+        use crate::cascades::rules::TransformationRule;
+        for wrapper in 0..5 {
+            let mut input = MemoBuilder::build(
+                production_plan(wrapper),
+                BindContext::new(),
+                SearchBudget::default(),
+            )
+            .unwrap();
+            input.planner_state.write().unwrap().session =
+                Some(paro_context::TestStatementContextBuilder::minimal().build());
+            let state = input.planner_state.read().unwrap();
+            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let binding = matching::scoped_pattern_bindings(
+                PlannerTransformation::LatePayloadFetch,
+                input.root,
+                expression,
+                &input.memo,
+                &state,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .bindings
+            .first()
+            .cloned()
+            .expect("production prefix pattern should match");
+            let mut context = super::super::TransformContext::new(&mut input.memo, input.root);
+            let facts = super::super::boundary::BoundarySnapshot::read(
+                &mut context,
+                &state,
+                &binding.root,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .expect("production binding should have boundary facts");
+            let mut prefix_complete = false;
+            let shell = try_native_late_payload_prefix(
+                &binding.root,
+                context.memo(),
+                &state,
+                &facts,
+                &mut prefix_complete,
+            )
             .unwrap()
             .expect("production binding should take the native prefix path");
-        assert_eq!(shell.root_layout().unwrap().len(), 1);
-        let LogicalOperator::Projection(projection) = shell.root_operator() else {
-            panic!("expected projection root")
-        };
-        assert!(matches!(
-            projection.expressions.first(),
-            Some(Expression::ColumnRef(column)) if column.binding.column_index == 1
-        ));
+            assert_eq!(prefix_complete, wrapper != 4);
+            assert_eq!(
+                shell.root_layout().unwrap().len(),
+                if wrapper == 4 { 2 } else { 1 }
+            );
+            let LogicalOperator::Projection(projection) = shell.root_operator() else {
+                panic!("expected projection root")
+            };
+            assert!(matches!(
+                projection.expressions.first(),
+                Some(Expression::ColumnRef(column)) if column.binding.column_index == 1
+            ));
+            drop(state);
+            let rule = super::super::PlannerTransformationRule {
+                transformation: PlannerTransformation::LatePayloadFetch,
+                planner_state: input.planner_state.clone(),
+            };
+            let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
+            let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+            assert_eq!(outputs.len(), if wrapper == 4 { 2 } else { 1 });
+            assert_eq!(
+                super::super::semantic_plan::owned_binding_instantiation_count(),
+                bridges + usize::from(wrapper == 4)
+            );
+        }
     }
 }

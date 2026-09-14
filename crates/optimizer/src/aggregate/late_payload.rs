@@ -243,7 +243,7 @@ fn prove_prefix_join_child(
     }
 }
 
-fn prove_prefix_filter_expression(
+pub(crate) fn prove_prefix_filter_expression(
     expression: &Expression,
     source_binding: ColumnBinding,
     kernel: &paro_function::scalar::BoundScalarFunction,
