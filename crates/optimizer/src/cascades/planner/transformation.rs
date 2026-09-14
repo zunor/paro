@@ -549,6 +549,7 @@ impl TransformationRule for PlannerTransformationRule {
         let expr = binding.root_expression();
         let target_group = ctx.group();
         let facts = {
+            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Staging);
             let state = self
                 .planner_state
                 .read()
@@ -627,7 +628,9 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             None
         };
-        let direct_native = if matches!(
+        let direct_native = {
+        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::NativeConstruct);
+        if matches!(
             self.transformation,
             PlannerTransformation::CteInline
                 | PlannerTransformation::CtePartitionedMaterialization
@@ -877,7 +880,7 @@ impl TransformationRule for PlannerTransformationRule {
             }
         } else {
             Vec::new()
-        };
+        }};
         if native_elimination_checked && direct_native.is_empty() {
             return Ok(Box::new([]));
         }
@@ -919,6 +922,7 @@ impl TransformationRule for PlannerTransformationRule {
             selected_proofs,
             environment,
         ) = {
+            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Staging);
             let state = self
                 .planner_state
                 .read()
@@ -967,6 +971,7 @@ impl TransformationRule for PlannerTransformationRule {
             let (plan, nested_group_holes, selected_proofs) = if native_direct_only {
                 (None, BTreeMap::new(), HashMap::new())
             } else {
+                let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::OwnedRewrite);
                 let Some(instantiated) = semantic_plan::instantiate_bound_plan_with_group_holes(
                     ctx.memo(),
                     &state,
@@ -1029,6 +1034,7 @@ impl TransformationRule for PlannerTransformationRule {
             )
         };
         let plans = if let Some(plan) = plan {
+            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::OwnedRewrite);
             if matches!(
                 self.transformation,
                 PlannerTransformation::CteInline
@@ -1117,6 +1123,7 @@ impl TransformationRule for PlannerTransformationRule {
         if plans.is_empty() && direct_native.is_empty() {
             return Ok(Box::new([]));
         }
+        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Staging);
 
         // These rules produce a bounded shell whose leaves are opaque Memo
         // operands. Re-settling that shell only to turn it back into
@@ -1307,6 +1314,7 @@ impl TransformationRule for PlannerTransformationRule {
                         }
                     }
                 };
+            let guard_partition = crate::work_partition::enter_b3(crate::work_partition::Bucket::SemanticGuard);
             let mut preserved_region_facet = None;
             let mut extended_required_region_facets = enclosing_required_region_facets.clone();
             let output_input_context = source_input_context;
@@ -1373,6 +1381,7 @@ impl TransformationRule for PlannerTransformationRule {
                 );
                 continue;
             }
+            drop(guard_partition);
             prepared.push(PreparedAlternative {
                 plan: prepared_plan,
                 preserved_region_facet,
@@ -5414,6 +5423,7 @@ fn refresh_native_shell_statistics(
     source_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     environment: &PlannerRuleEnvironment,
 ) -> OwnedLogicalPlan {
+    let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
     let children = plan.children();
     let child_layouts = children
         .iter()

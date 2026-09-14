@@ -4928,6 +4928,7 @@ impl CascadesEngine {
                 // The context owns the complete attempt. Its Memo snapshot is
                 // lazy, and rule-specific side state enlists in the same rollback
                 // domain before its first write.
+                let _b3_rule = crate::work_partition::rule(rule.0);
                 let mut context = TransformContext::new(&mut self.memo, group);
                 context.rejection_reasons = self
                     .collect_rule_work_profile

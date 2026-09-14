@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--seed', type=Path, required=True)
     parser.add_argument('--duckdb', type=Path, required=True)
     parser.add_argument('--explain', action='store_true')
+    parser.add_argument('--partition', type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.repo / 'benchmark/corpora'))
     import tpcds_compare as h
@@ -38,6 +39,9 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     log = args.out.with_suffix('.parod.log')
     env = {'PARO_QUALITY_POLICY_HANDOFF': '1', 'PARO_COMPILE_WORK_EVIDENCE': '1'}
+    if args.partition:
+        assert not args.partition.exists(), 'partition log must be new'
+        env['PARO_DIAGNOSTIC_WORK_PARTITION'] = str(args.partition)
     with h.isolated_paro_server(binary, seed, config.listen, log, max_memory='2GB',
                                threads=4, statement_trace=True, trace_sample_id=args.out.name,
                                cache_evidence=True, optimizer_environment=env) as server:

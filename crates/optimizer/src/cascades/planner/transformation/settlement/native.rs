@@ -21,9 +21,12 @@ impl SettlementCache {
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
     ) -> Result<Option<SettledNative>> {
+        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
+        let _site = crate::work_partition::cache_site(crate::work_partition::CacheSite::Native);
         let checkpoint = arena.checkpoint();
         let result = self.settle_native_impl(shell, environment, arena);
         if !matches!(result, Ok(Some(_))) {
+            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Rollback);
             arena.rollback_to(checkpoint)?;
             self.discard_stale_recipes(arena);
         }

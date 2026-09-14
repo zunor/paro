@@ -1,6 +1,10 @@
 //! Opt-in, exclusive wall-time accounting. Nested scopes suspend their parent.
 //! Uninstrumented time remains explicit; this is not a CPU-time profiler.
 use std::{cell::RefCell, marker::PhantomData, rc::Rc, time::Instant};
+mod b3;
+pub(crate) use b3::{
+    cache_site, local_lookup, native_refresh, native_refresh_node, rule, CacheSite, MissKind,
+};
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -23,9 +27,17 @@ pub enum Bucket {
     QualityProduction,
     QualityFreeze,
     QualityReads,
+    NativeConstruct,
+    Statistics,
+    OwnedRewrite,
+    Settlement,
+    Staging,
+    SemanticGuard,
+    Rollback,
+    Encoding,
     Unclassified,
 }
-const N: usize = 19;
+const N: usize = 27;
 const NAMES: [&str; N] = [
     "B0_pre",
     "B1_agenda",
@@ -45,6 +57,14 @@ const NAMES: [&str; N] = [
     "B11_production",
     "B11_freeze",
     "B11_reads",
+    "B3a_native_producer",
+    "B3b_statistics",
+    "B3c_owned_bridge_rewrite",
+    "B3d_settlement",
+    "B3e_staging_preparation",
+    "B3f_semantic_guard",
+    "B3g_rollback",
+    "B3h_encoding_validation",
     "unclassified",
 ];
 struct Ledger {
@@ -53,11 +73,14 @@ struct Ledger {
     current: usize,
     ns: [u64; N],
     entries: [u64; N],
+    b3: b3::Attribution,
 }
 impl Ledger {
     fn change(&mut self, now: u64, next: usize) -> usize {
         let previous = self.current;
-        self.ns[previous] += now - self.cursor;
+        let elapsed = now - self.cursor;
+        self.ns[previous] += elapsed;
+        self.b3.account(previous, elapsed);
         self.cursor = now;
         self.current = next;
         previous
@@ -88,12 +111,28 @@ pub fn enter(bucket: Bucket) -> Scope {
         let ledger = slot.ledger.as_mut()?;
         let previous = ledger.change(ledger.now(), bucket as usize);
         ledger.entries[bucket as usize] += 1;
+        ledger.b3.entered(bucket as usize);
         Some((generation, previous))
     });
     Scope {
         previous,
         _not_send: PhantomData,
     }
+}
+/// Shared helpers are also called outside rule application. Do not move
+/// their pre-search or finalization work into B3 merely by instrumenting them.
+pub(crate) fn enter_b3(bucket: Bucket) -> Scope {
+    if SLOT.with(|slot| slot.borrow().ledger.as_ref().is_some_and(|l| l.b3.active())) {
+        enter(bucket)
+    } else {
+        Scope {
+            previous: None,
+            _not_send: PhantomData,
+        }
+    }
+}
+pub(crate) fn enabled() -> bool {
+    SLOT.with(|slot| slot.borrow().ledger.is_some())
 }
 impl Drop for Scope {
     fn drop(&mut self) {
@@ -124,6 +163,7 @@ pub fn begin(start: Instant) -> Invocation {
             current: Bucket::Unclassified as usize,
             ns: [0; N],
             entries: [0; N],
+            b3: Default::default(),
         });
         slot.generation
     });
@@ -185,6 +225,7 @@ impl Report {
             &serde_json::json!({
                 "pid": std::process::id(), "statement": statement, "success": success,
                 "total_ns": self.total_ns, "sum_ns": self.ledger.ns.iter().sum::<u64>(), "buckets": buckets,
+                "b3_by_rule": self.ledger.b3.json(),
             }),
         )?;
         writeln!(writer)?;
@@ -204,6 +245,7 @@ mod tests {
                 current: N - 1,
                 ns: [0; N],
                 entries: [0; N],
+                b3: Default::default(),
             })
         });
         invocation
@@ -247,6 +289,7 @@ mod tests {
             current: N - 1,
             ns: [0; N],
             entries: [0; N],
+            b3: Default::default(),
         };
         ledger.change(5, 5);
         ledger.change(12, 2);
@@ -257,5 +300,55 @@ mod tests {
         assert_eq!(ledger.ns[5], 11);
         assert_eq!(ledger.ns[2], 4);
         assert_eq!(ledger.ns.iter().sum::<u64>(), 23);
+    }
+
+    #[test]
+    fn b3_attribution_restores_rules_sites_and_is_additive() {
+        let invocation = invocation();
+        let outer = enter(Bucket::Apply);
+        {
+            let _rule = rule(10001);
+            let _native = cache_site(CacheSite::Native);
+            let _sub = enter_b3(Bucket::Statistics);
+            local_lookup(None);
+            {
+                let _rule = rule(10002);
+                let _owned = cache_site(CacheSite::Owned);
+                let _sub = enter_b3(Bucket::Settlement);
+                local_lookup(Some(MissKind::NewContent));
+            }
+            local_lookup(Some(MissKind::SameContentDifferentKey));
+        }
+        drop(outer);
+        let report = invocation.finish(Instant::now()).unwrap();
+        let rows = report.ledger.b3.json();
+        assert_eq!(rows["10001"]["local_hits"][2], 1);
+        assert_eq!(rows["10001"]["local_misses"][2][1], 1);
+        assert_eq!(rows["10002"]["local_misses"][1][0], 1);
+        let attributed: u64 = rows
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|row| {
+                row["ns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap())
+            })
+            .sum();
+        assert_eq!(
+            attributed,
+            report.ledger.ns[Bucket::Apply as usize]
+                + report.ledger.ns[Bucket::NativeConstruct as usize..=Bucket::Encoding as usize]
+                    .iter()
+                    .sum::<u64>()
+        );
+        assert_eq!(report.total_ns, report.ledger.ns.iter().sum::<u64>());
+        // Invocation finished: shared helper cannot create a ledger or charge
+        // a later statement, even when stale instrumentation scopes remain.
+        let _disabled = enter_b3(Bucket::Statistics);
+        local_lookup(None);
+        assert!(!enabled());
     }
 }

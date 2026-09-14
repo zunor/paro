@@ -34,3 +34,36 @@ invalidation. Normal C1/W and diagnostic accounting remain separate.
 No rule, cost, resource budget, frontier, stop or handoff policy changes are
 authorized. The broad direct-only predicate experiment remains rejected.
 Known optimizer and SQL regress failures remain separate and unblessed.
+
+## T1 preregistration after transport correction
+
+T0 found native CTE lexical-domain and aggregate fact-derivation differences
+against the owned contract. Correcting those dependencies is not a
+fingerprint-neutral optimization: b13d3872 is now the corrected control
+(2ed1a3e2fe2f455d4411779edd54856b / 2500 / 1436). The original round anchor
+remains mandatory in every comparison; its 1691/891 target is NOT restored.
+The fresh b13 pilot recovers warm ratio to about .895, but C1 is 226.9ms.
+T1/T2 must explain any further deviation from the corrected triple as well.
+
+T1 uses the existing opt-in work partition. B3a includes inseparable native
+producer guards; B3f is post-construction contract checking, not all guards.
+B3b is propagation/gathering plus their immediate statistic adapters; B3d is
+the rest of settlement/demand/layout/fact residency. B3h is node staging's
+encoding/validation/duplicate handling. Apply residual stays explicit.
+Rollback after apply is reported separately within B3g, not silently added
+to the historic apply-only denominator. `ns` rows are exclusive; refresh
+inclusive cross-checks are NEVER added to them. Rule 0 means unattributed.
+
+Miss classification scans at most 4096 current entries, checks arena
+ownership, and keeps exact operator/scalar/output/input facts/lexical CTE
+identity. Only non-CTERef, non-JoinGraph root annotations that local gathering
+overwrites may differ; root materialization risk remains exact. NewContent
+means no equivalent LIVE entry under this local contract, not never seen in
+history or absence of arbitrary algebraic equivalence. Overflow is Unverified.
+This is diagnostic-only; production keys and invalidation are unchanged.
+
+Predeclared same-binary OFF/ON/OFF diagnostic sequence: compare optimizer
+wall time, exact choices and work counts. More than 10% ON overhead requires
+reduced collection and a new sequence; do not use distorted data. Normal
+C1/W remain trace-off, separate fixed two-block pilots, not formal parity or
+T1 grant non-inferiority campaigns. All valid samples are retained.

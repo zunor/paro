@@ -1058,6 +1058,8 @@ pub(super) fn refresh_statistics(
     state: &PlannerTransformState,
     memo: &Memo,
 ) -> Result<Option<(NativeShell, HashMap<PlanNodeId, SharedColumnStatistics>)>> {
+    let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
+    let _refresh = crate::work_partition::native_refresh(shell.nodes.len());
     use super::settlement::demand;
     use paro_planner::operator::bound_reference::{BoundRelationFactValues, BoundRelationFacts};
     use paro_planner::plan::arena::LogicalPlanNode;
@@ -1121,6 +1123,7 @@ pub(super) fn refresh_statistics(
         if !memo.control().checkpoint()? {
             return Ok(None);
         }
+        crate::work_partition::native_refresh_node();
         let mut layouts = Vec::new();
         let mut maximums = Vec::new();
         let mut columns = HashMap::new();
@@ -1231,6 +1234,7 @@ pub(super) fn refresh_statistics(
         )?;
         operator = local.assemble(inputs)?.into_operator();
         // Match settlement's scalar contract before looking up column domains.
+        let statistics_partition = crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
         crate::expression::scalar_normalizer().visit_operator_expressions(&mut operator);
         let mut context =
             crate::context::OptimizationContext::new(session.clone(), state.bind_context.clone());
@@ -1269,6 +1273,7 @@ pub(super) fn refresh_statistics(
                 &mut context,
             );
         }
+        drop(statistics_partition);
         let (_, stats, operator) = plan.into_parts();
         let mut links = links.into_iter();
         node.operator = operator.try_map_child_links(&mut |_| {

@@ -409,6 +409,7 @@ impl PlannerTransformState {
     }
 
     pub(super) fn rollback_to(&mut self, savepoint: PlannerTransformSavepoint) -> Result<()> {
+        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Rollback);
         self.staging_arena
             .rollback_to(savepoint.staging_arena_checkpoint)?;
         self.settlement_cache

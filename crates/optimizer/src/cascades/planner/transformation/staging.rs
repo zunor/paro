@@ -492,6 +492,7 @@ pub(super) fn stage_transformed_expression(
     memo: &mut Memo,
     state: &mut PlannerTransformState,
 ) -> Result<Option<StagedEquivalent>> {
+    let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Staging);
     let StagingRequest {
         input,
         input_facts,
@@ -672,6 +673,7 @@ pub(super) fn stage_transformed_expression(
         request: NodeStagingRequest,
         child_states: Vec<NodeState>,
     ) -> Result<Option<(NodeState, Option<StagedEquivalent>)>> {
+        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Encoding);
         let NodeStagingRequest {
             input,
             target,

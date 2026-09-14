@@ -16,6 +16,7 @@ use paro_planner::plan::{NodeStats, PlanNodeId};
 use std::hash::{Hash, Hasher};
 
 pub(super) mod demand;
+mod diagnostic;
 mod native;
 pub(super) use native::SettledNative;
 
@@ -399,6 +400,7 @@ impl SettlementCache {
                         });
                 if layout_matches {
                     self.hits += 1;
+                    crate::work_partition::local_lookup(None);
                     return Ok(entry);
                 }
             }
@@ -473,10 +475,14 @@ impl SettlementCache {
         if maybe_cached {
             if let Some(entry) = self.locals.get(&key) {
                 self.hits += 1;
+                crate::work_partition::local_lookup(None);
                 return Ok(entry.clone());
             }
         }
         self.misses += 1;
+        if crate::work_partition::enabled() {
+            crate::work_partition::local_lookup(Some(self.classify_local_miss(&key, &shell.operator, recipes)));
+        }
         let child_layouts = inputs
             .iter()
             .map(|id| self.facts[*id].layout.clone())
@@ -488,6 +494,7 @@ impl SettlementCache {
                 .map(|(ordinal, fact)| self.boundary(ordinal, *fact).map(Box::new))
                 .collect::<Result<Vec<_>>>()?,
         )?;
+        let statistics_partition = crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
         crate::expression::scalar_normalizer().visit_operator_expressions(&mut plan.operator);
         let mut context = crate::context::OptimizationContext::new(
             environment.session.clone(),
@@ -535,6 +542,7 @@ impl SettlementCache {
             plan = *filter.child;
         }
         if let LogicalOperator::BoundReference(reference) = &plan.operator {
+            drop(statistics_partition);
             // An identity filter can disappear during local propagation. Its
             // replacement is an input, not a new relation with unknown column
             // domains. Preserve the exact positional snapshot and hard bound.
@@ -599,6 +607,7 @@ impl SettlementCache {
                 );
             }
         }
+        drop(statistics_partition);
         let facts = self.intern_fact(RelationFacts {
             columns: output
                 .bindings()
@@ -684,9 +693,12 @@ impl SettlementCache {
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
     ) -> Result<Option<SettledExpression>> {
+        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
+        let _site = crate::work_partition::cache_site(crate::work_partition::CacheSite::Owned);
         let checkpoint = arena.checkpoint();
         let result = self.settle_arena_impl(plan, environment, arena);
         if !matches!(result, Ok(Some(_))) {
+            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Rollback);
             arena.rollback_to(checkpoint)?;
             self.discard_stale_recipes(arena);
         }
@@ -1447,6 +1459,44 @@ mod tests {
             cache.hits, 1,
             "cache replay preserves the same input/output contract"
         );
+        // Same local semantics, different pre-gather annotation: production
+        // still misses today. Independently check actual output FactId, not
+        // just the diagnostic comparator, before calling this fragmentation.
+        let prior = cache.local(shell.clone(), &[input], &ctes, &env, &mut arena).unwrap();
+        let misses = cache.misses;
+        let mut annotated = shell.clone();
+        annotated.stats.estimated_cardinality = Some(CardinalityEstimate::exact(999));
+        let repeated = cache.local(annotated.clone(), &[input], &ctes, &env, &mut arena).unwrap();
+        assert_eq!(prior.facts, repeated.facts);
+        assert_eq!(cache.misses, misses + 1);
+        let key = cache.locals.keys().find(|key| key.input_stats == annotated.stats).unwrap();
+        assert!(matches!(cache.classify_local_miss(key, &annotated.operator, &arena),
+            crate::work_partition::MissKind::SameContentDifferentKey));
+        let mut changed_input = key.clone();
+        changed_input.inputs = Box::new([usize::MAX]);
+        assert!(matches!(cache.classify_local_miss(&changed_input, &annotated.operator, &arena),
+            crate::work_partition::MissKind::NewContent));
+    }
+
+    #[test]
+    fn unbound_cte_reference_estimate_is_a_real_local_dependency() {
+        let env = environment();
+        let mut cache = SettlementCache::default();
+        let mut arena = LogicalPlanArena::default();
+        let mut results = Vec::new();
+        for rows in [10, 100] {
+            let mut shell = LogicalPlanNode::from_shell(OwnedLogicalPlan::new(
+                &env.bind_context, LogicalOperator::CTERef(CTERef::new(
+                    2, 3, "unbound".into(), vec!["key".into()], vec![LogicalType::Integer]))));
+            shell.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
+            let result = cache.local(shell.clone(), &[], &CteEnvironment::default(), &env, &mut arena).unwrap();
+            assert_eq!(cache.facts[result.facts].stats.estimated_cardinality.unwrap().expected, rows);
+            results.push(result.facts);
+            let key = cache.locals.keys().find(|key| key.input_stats == shell.stats).unwrap();
+            assert!(matches!(cache.classify_local_miss(key, &shell.operator, &arena),
+                crate::work_partition::MissKind::NewContent));
+        }
+        assert_ne!(results[0], results[1]);
     }
 
     #[test]
