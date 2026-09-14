@@ -351,6 +351,17 @@ engine tests pass. The unsafe candidate removal is an intentional semantic
 correction, not an unchanged-work performance result. The rule still retains
 owned fallback pending the rest of its coverage audit. No Q11/SQL campaign ran.
 
+Memo KeyDomainTransfer now uses its native local-shell implementation for both
+positive and negative outcomes; the owned transfer module is compiled only for
+tests. Opaque controlled inputs are retained, not traversed. A four-case
+projection/control/volatile matrix first observed an owned negative retry and
+now observes zero bridges, while matching reference output presence and exact
+restricted-input/source groups. The matrix, existing frozen-selected key-domain
+test, 111 engine tests and optimizer compilation passed on the mixed tree.
+This does not certify every non-default join payload or all probe-family SQL
+semantics; broader contract and fixed-work/Q11 acceptance remain required.
+No timing or unchanged-fingerprint claim is inferred from removing this entry.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
