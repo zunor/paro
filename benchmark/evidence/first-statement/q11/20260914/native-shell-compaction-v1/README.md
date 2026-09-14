@@ -549,6 +549,29 @@ performance build. No runtime bag oracle, full fixed-work replay, fingerprint
 or fresh Q11 campaign was added in this slice. Those acceptance gates remain
 outstanding for the overall migration; no speed or parity claim is made.
 
+### Direct CTE dimension deferral (1d33286a)
+
+The owned DimensionDeferral recognizer permits Get or CTERef dimensions; native
+preflight and apply permitted only Get and blanket-rejected control references.
+A production Memo fixture with a real enclosing materialized producer and
+CTERef dimension reproduced one owned binding instantiation. The direct native
+path now accepts the same CTERef dimension and moves that exact input once to
+the final join. It neither inlines the reference nor enters/rebuilds its owner.
+
+The test pairs Get and CTERef dimensions with the owned reference, checks one
+output, output types, zero owned instantiations/no arena growth, and verifies
+that the final join consumes the original dimension group with an unchanged
+local statistics fingerprint. No uniqueness assumption or fixed operator-count
+quality policy was added. Projection inlining and widest-dimension join-region
+isolation are still missing from the native path, so the general owned fallback
+has not been deleted or declared redundant.
+
+Validation: the new two-case production test, dimension_deferral5 and engine111
+pass. Full optimizer1277 pass/5 fail at the same recorded grant/cache/RF
+assertions. No SQL runtime bag oracle, clean fixed-work replay, Q11 fingerprint
+or performance campaign was run; no speed or parity claim follows from these
+structural tests. User mixed changes were excluded from the commit.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
