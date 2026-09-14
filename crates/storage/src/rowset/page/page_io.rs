@@ -260,10 +260,42 @@ impl PageIO {
             )));
         }
 
-        reader.seek(SeekFrom::Start(opts.page_pointer.offset))?;
         let mut page_data = vec![0u8; page_size];
-        reader.read_exact(&mut page_data)?;
+        Self::read_page_bytes_into(reader, opts, &mut page_data)?;
         Ok(page_data)
+    }
+
+    /// Read a page directly into a caller-owned destination.
+    ///
+    /// The exact-size contract lets a cache allocate its final backing block
+    /// before I/O, avoiding the temporary page Vec and a second full-page
+    /// copy.  Validation is kept here, before seeking or reading, so a bad
+    /// page pointer cannot partially initialize a destination.
+    pub fn read_page_bytes_into<R: Read + Seek>(
+        reader: &mut R,
+        opts: &PageReadOptions,
+        destination: &mut [u8],
+    ) -> Result<()> {
+        let page_size = opts.page_pointer.size as usize;
+
+        // Minimum page size: footer_size(4) + checksum(4)
+        if page_size < 8 {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: too small ({})",
+                page_size
+            )));
+        }
+        if destination.len() != page_size {
+            return Err(paro_error::invalid_input(format!(
+                "page destination size {} does not match page size {}",
+                destination.len(),
+                page_size
+            )));
+        }
+
+        reader.seek(SeekFrom::Start(opts.page_pointer.offset))?;
+        reader.read_exact(destination)?;
+        Ok(())
     }
 
     /// Parse page footer and uncompressed size from raw page bytes.
@@ -331,23 +363,39 @@ impl PageIO {
         uncompressed_size: u32,
         codec: Option<CompressionType>,
     ) -> Result<Bytes> {
-        let body_size = body_data.len();
-        if body_size == uncompressed_size as usize {
-            return Ok(Bytes::copy_from_slice(body_data));
-        }
+        let mut decompressed = vec![0u8; uncompressed_size as usize];
+        Self::decompress_page_body_into(body_data, uncompressed_size, codec, &mut decompressed)?;
+        Ok(Bytes::from(decompressed))
+    }
 
-        let codec = get_codec(codec.unwrap_or(CompressionType::Lz4));
-        let decompressed = codec.decompress(body_data, uncompressed_size as usize)?;
-
-        if decompressed.len() != uncompressed_size as usize {
-            return Err(paro_error::data_corrupted(format!(
-                "Bad page: uncompressed size mismatch ({} vs {})",
-                decompressed.len(),
-                uncompressed_size
+    /// Decompress a page body into an exact-size caller-owned destination.
+    ///
+    /// Uncompressed pages take the same path and are copied into the final
+    /// destination so callers can use one ownership contract for both page
+    /// encodings.  Codec implementations may override `decompress_into` to
+    /// decode directly into that destination.
+    pub fn decompress_page_body_into(
+        body_data: &[u8],
+        uncompressed_size: u32,
+        codec: Option<CompressionType>,
+        destination: &mut [u8],
+    ) -> Result<()> {
+        let expected_size = uncompressed_size as usize;
+        if destination.len() != expected_size {
+            return Err(paro_error::invalid_input(format!(
+                "decompression destination size {} does not match expected size {}",
+                destination.len(),
+                expected_size
             )));
         }
 
-        Ok(Bytes::from(decompressed))
+        if body_data.len() == expected_size {
+            destination.copy_from_slice(body_data);
+            return Ok(());
+        }
+
+        let codec = get_codec(codec.unwrap_or(CompressionType::Lz4));
+        codec.decompress_into(body_data, expected_size, destination)
     }
 
     /// Compress page body if beneficial.
@@ -570,6 +618,25 @@ mod tests {
     }
 
     #[test]
+    fn raw_page_can_be_read_into_exact_destination() {
+        let body = b"read this page into its final allocation";
+        let mut buffer = Cursor::new(Vec::new());
+        let ptr = PageIO::write_page(&mut buffer, body, &create_test_footer(), body.len() as u32)
+            .unwrap();
+        let opts = PageReadOptions::new(ptr);
+        let mut destination = vec![0_u8; ptr.size as usize];
+
+        PageIO::read_page_bytes_into(&mut buffer, &opts, &mut destination).unwrap();
+        let (_, uncompressed_size, body_size) =
+            PageIO::parse_page_footer(&destination, true).unwrap();
+        assert_eq!(uncompressed_size as usize, body.len());
+        assert_eq!(&destination[..body_size], body);
+
+        let mut short_destination = vec![0_u8; destination.len() - 1];
+        assert!(PageIO::read_page_bytes_into(&mut buffer, &opts, &mut short_destination).is_err());
+    }
+
+    #[test]
     fn test_compress_and_write_with_lz4() {
         // Create compressible data (repeated pattern)
         let body: Vec<u8> = (0..1000).map(|i| (i % 10) as u8).collect();
@@ -598,6 +665,37 @@ mod tests {
 
         assert_eq!(read_body.as_ref(), body.as_slice());
         assert_eq!(uncompressed_size, body.len() as u32);
+    }
+
+    #[test]
+    fn compressed_body_can_be_decompressed_into_caller_buffer() {
+        let body: Vec<u8> = (0..1000).map(|i| (i % 10) as u8).collect();
+        let footer = create_test_footer();
+        let mut buffer = Cursor::new(Vec::new());
+        let codec = Lz4Codec::new();
+        let ptr = PageIO::compress_and_write_page(
+            Some(&codec),
+            DEFAULT_MIN_SPACE_SAVING,
+            &mut buffer,
+            &body,
+            &footer,
+        )
+        .unwrap();
+        let opts = PageReadOptions::new(ptr).with_codec(CompressionType::Lz4);
+        let raw = PageIO::read_page_bytes(&mut buffer, &opts).unwrap();
+        let (_, uncompressed_size, body_size) =
+            PageIO::parse_page_footer(&raw, true).unwrap();
+        assert!(body_size < uncompressed_size as usize);
+
+        let mut destination = vec![0_u8; uncompressed_size as usize];
+        PageIO::decompress_page_body_into(
+            &raw[..body_size],
+            uncompressed_size,
+            opts.codec,
+            &mut destination,
+        )
+        .unwrap();
+        assert_eq!(destination, body);
     }
 
     #[test]

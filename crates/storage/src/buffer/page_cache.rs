@@ -568,7 +568,11 @@ impl PageCache {
                 Ok(())
             });
         }
-        self.get_or_load(key, kind, || Ok(data)).map(Some)
+        self.get_or_load_into(key, kind, data.len(), |destination| {
+            destination.copy_from_slice(&data);
+            Ok(())
+        })
+        .map(Some)
     }
 
     /// Get a cached page or load it with single-flight semantics.
@@ -654,6 +658,127 @@ impl PageCache {
                     return Ok(PageCacheHandle::new(buffer, kind));
                 }
             }
+        }
+    }
+
+    /// Get a cached page or initialize its allocation in place.
+    ///
+    /// The initializer owns the source-side I/O/decode operation and writes
+    /// exactly `size` bytes into the cache allocation.  This is the ownership
+    /// boundary for page readers: the cache remains the owner of the backing
+    /// storage, while the returned handle keeps that storage pinned for the
+    /// immutable consumer view.  The method is intentionally separate from
+    /// `get_or_load` so callers which cannot size their destination up front
+    /// keep the legacy Vec-returning contract.
+    pub fn get_or_load_into<F>(
+        &self,
+        key: PageKey,
+        kind: PageContentKind,
+        size: usize,
+        initializer: F,
+    ) -> Result<PageCacheHandle>
+    where
+        F: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        if kind == PageContentKind::Decoded {
+            return Err(paro_error::invalid_input(
+                "decoded pages require the decoded admission loader",
+            ));
+        }
+        if size == 0 {
+            return Err(paro_error::invalid_input("page data is empty"));
+        }
+
+        loop {
+            let (entry, _) = self.get_or_insert_entry(&key);
+
+            let mut state = entry.state.lock().unwrap();
+            if state.removing {
+                while !state.removed {
+                    state = entry.cvar.wait(state).unwrap();
+                }
+                continue;
+            }
+            match state.slot_mut(kind) {
+                PageSlotState::Ready(slot) => {
+                    let slot_handle = slot.handle.clone();
+                    drop(state);
+
+                    if let Some(buffer) = self.buffer_pool.pin_resident(slot_handle.block_id()) {
+                        self.record_hit(kind);
+                        return Ok(PageCacheHandle::new(buffer, kind));
+                    }
+                    self.handle_unloaded(&key, &entry, kind);
+                    continue;
+                }
+                PageSlotState::Loading => {
+                    state = entry.cvar.wait(state).unwrap();
+                    continue;
+                }
+                PageSlotState::Failed(err) => {
+                    let err = err.clone();
+                    *state.slot_mut(kind) = PageSlotState::Empty;
+                    drop(state);
+                    self.maybe_remove_entry(&key, &entry);
+                    return Err(paro_error::internal(err));
+                }
+                PageSlotState::Empty => {
+                    *state.slot_mut(kind) = PageSlotState::Loading;
+                    drop(state);
+                }
+            }
+
+            self.record_miss(kind);
+            let buffer = match self.allocate(kind, size) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    self.cancel_loading(&key, &entry, kind);
+                    return Err(err);
+                }
+            };
+            let _cold_work = paro_common::cold_work::WorkScope::new(
+                paro_common::cold_work::Kind::BufferFill,
+                size,
+            );
+
+            // SAFETY: the newly allocated buffer is pinned by `buffer` and is
+            // not reachable from the cache until initialization succeeds.
+            let initialize_result = unsafe {
+                buffer
+                    .data_mut()
+                    .ok_or_else(|| paro_error::internal("page cache buffer missing"))
+                    .and_then(initializer)
+            };
+            if let Err(err) = initialize_result {
+                let block_id = buffer.block_handle().map(|block| block.block_id());
+                drop(buffer);
+                if let Some(block_id) = block_id {
+                    let _ = self.buffer_pool.free(block_id);
+                }
+                self.fail_loading(&entry, kind, &err);
+                return Err(err);
+            }
+
+            let Some(block_handle) = buffer.block_handle().cloned() else {
+                let err = paro_error::internal("page cache block handle missing");
+                let block_id = buffer.block_handle().map(|block| block.block_id());
+                drop(buffer);
+                if let Some(block_id) = block_id {
+                    let _ = self.buffer_pool.free(block_id);
+                }
+                self.fail_loading(&entry, kind, &err);
+                return Err(err);
+            };
+
+            let mut state = entry.state.lock().unwrap();
+            *state.slot_mut(kind) = PageSlotState::Ready(PageSlot {
+                handle: block_handle,
+                decoded_meta: None,
+            });
+            entry.cvar.notify_all();
+            drop(state);
+
+            return Ok(PageCacheHandle::new(buffer, kind));
         }
     }
 
@@ -1088,6 +1213,73 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.entries, 1);
+    }
+
+    #[test]
+    fn in_place_loader_uses_cache_allocation_and_reuses_it() {
+        let pool = BufferPool::new_arc(1024 * 1024);
+        let cache = PageCache::new(pool.clone());
+        let key = PageKey::new(1, 2, 0, 3, 1024, 4);
+        let source = [1_u8, 2, 3, 4];
+
+        let first = cache
+            .get_or_load_into(key, PageContentKind::Compressed, source.len(), |destination| {
+                destination.copy_from_slice(&source);
+                Ok(())
+            })
+            .unwrap();
+        let first_ptr = first.data().unwrap().as_ptr();
+        assert_eq!(first.data().unwrap(), source);
+        assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), source.len() as i64);
+        drop(first);
+
+        let mut initialized = false;
+        let second = cache
+            .get_or_load_into(key, PageContentKind::Compressed, source.len(), |destination| {
+                initialized = true;
+                destination.fill(9);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!initialized);
+        assert_eq!(second.data().unwrap().as_ptr(), first_ptr);
+        assert_eq!(second.data().unwrap(), source);
+    }
+
+    #[test]
+    fn in_place_loader_failure_releases_memory_before_retry() {
+        let pool = BufferPool::new_arc(1024 * 1024);
+        let cache = PageCache::new(pool.clone());
+        let key = PageKey::new(1, 2, 0, 3, 1024, 4);
+
+        let first = cache.get_or_load_into(
+            key,
+            PageContentKind::Compressed,
+            4,
+            |_destination| Err(paro_common::error::data_corrupted("synthetic read failure")),
+        );
+        assert!(first.is_err());
+        assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), 0);
+
+        let failed_retry = cache.get_or_load_into(
+            key,
+            PageContentKind::Compressed,
+            4,
+            |destination| {
+                destination.fill(2);
+                Ok(())
+            },
+        );
+        assert!(failed_retry.is_err());
+
+        let recovered = cache
+            .get_or_load_into(key, PageContentKind::Compressed, 4, |destination| {
+                destination.fill(3);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(recovered.data().unwrap(), &[3; 4]);
+        assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), 4);
     }
 
     #[test]

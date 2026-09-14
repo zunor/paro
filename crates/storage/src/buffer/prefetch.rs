@@ -8,14 +8,13 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::Result;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_scheduler::task::Task;
 use paro_scheduler::task::TaskExecutionMode;
@@ -24,6 +23,7 @@ use tracing::trace;
 
 use crate::buffer::{PageCache, PageContentKind, PageKey, DEFAULT_BLOCK_ALLOC_SIZE};
 use crate::metrics::storage_metrics;
+use crate::rowset::page::{PageIO, PagePointer, PageReadOptions};
 
 const SLOW_PREFETCH_ITEM_THRESHOLD: Duration = Duration::from_millis(8);
 const SLOW_PREFETCH_BATCH_THRESHOLD: Duration = Duration::from_millis(20);
@@ -150,22 +150,6 @@ struct PrefetchTask {
     reservation: Option<PrefetchTaskReservation>,
 }
 
-impl PrefetchTask {
-    fn read_page_bytes(file: &mut File, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let page_size = size as usize;
-        if page_size < 8 {
-            return Err(paro_error::data_corrupted(format!(
-                "Bad page: too small ({})",
-                page_size
-            )));
-        }
-        file.seek(SeekFrom::Start(offset))?;
-        let mut page_data = vec![0u8; page_size];
-        file.read_exact(&mut page_data)?;
-        Ok(page_data)
-    }
-}
-
 impl Task for PrefetchTask {
     fn execute(&mut self, _mode: TaskExecutionMode) -> Result<TaskExecutionResult> {
         let batch_bytes = self
@@ -192,9 +176,16 @@ impl Task for PrefetchTask {
             let key = item.key;
             let result = self
                 .cache
-                .get_or_load(key, PageContentKind::Compressed, || {
-                    Self::read_page_bytes(&mut file, item.offset, item.size)
-                });
+                .get_or_load_into(
+                    key,
+                    PageContentKind::Compressed,
+                    item.size as usize,
+                    |destination| {
+                        let options =
+                            PageReadOptions::new(PagePointer::new(item.offset, item.size));
+                        PageIO::read_page_bytes_into(&mut file, &options, destination)
+                    },
+                );
             match result {
                 Ok(_) => {
                     self.registry.mark_ready(key);

@@ -20,7 +20,6 @@ use crate::rowset::page::{PageFooter, PageIO, PagePointer, PageReadOptions};
 
 const SLOW_PAGE_IO_THRESHOLD: Duration = Duration::from_millis(8);
 const SLOW_PAGE_DECOMPRESS_THRESHOLD: Duration = Duration::from_millis(8);
-const SLOW_PAGE_FALLBACK_THRESHOLD: Duration = Duration::from_millis(12);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodedPageAccess {
@@ -200,50 +199,30 @@ impl PageReader {
     ) -> Result<(Bytes, PageFooter, u32)> {
         let key = self.make_key(opts.page_pointer);
 
-        // If no cache, fall back to direct PageIO path (or allocator-aware decompressor).
+        // The same exact-page ownership path is used with and without the
+        // cache. Without a cache the Vec returned by PageIO is moved into
+        // Bytes; with a cache the reader fills the cache allocation directly.
         if self.cache.is_none() {
-            if let Some(decompressor) = &self.options.parallel_decompressor {
-                let io_start = Instant::now();
-                let raw = PageIO::read_page_bytes(reader, opts)?;
-                let io_elapsed = io_start.elapsed();
-                if io_elapsed >= SLOW_PAGE_IO_THRESHOLD {
-                    self.trace_slow_io(&key, io_elapsed, "direct");
-                }
-                let (footer, uncompressed_size, body_size) =
-                    PageIO::parse_page_footer(&raw, opts.verify_checksum)?;
-                let decompress_start = Instant::now();
-                let body = decompressor.decompress_one(
+            let raw = self.read_raw_page(reader, opts, &key)?;
+            let (footer, uncompressed_size, body_size) =
+                PageIO::parse_page_footer(&raw, opts.verify_checksum)?;
+            let decompress_start = Instant::now();
+            let body = if let Some(decompressor) = &self.options.parallel_decompressor {
+                decompressor.decompress_one(
                     &raw[..body_size],
                     uncompressed_size as usize,
                     opts.codec,
-                )?;
-                let decompress_elapsed = decompress_start.elapsed();
-                if decompress_elapsed >= SLOW_PAGE_DECOMPRESS_THRESHOLD {
-                    self.trace_slow_decompress(
-                        &key,
-                        decompress_elapsed,
-                        body_size,
-                        uncompressed_size,
-                    );
-                }
-                return Ok((body, footer, uncompressed_size));
+                )?
+            } else if body_size == uncompressed_size as usize {
+                raw.slice(..body_size)
+            } else {
+                PageIO::decompress_page_body(&raw[..body_size], uncompressed_size, opts.codec)?
+            };
+            let decompress_elapsed = decompress_start.elapsed();
+            if decompress_elapsed >= SLOW_PAGE_DECOMPRESS_THRESHOLD {
+                self.trace_slow_decompress(&key, decompress_elapsed, body_size, uncompressed_size);
             }
-            let fallback_start = Instant::now();
-            let result = PageIO::read_and_decompress_page(reader, opts);
-            let fallback_elapsed = fallback_start.elapsed();
-            if fallback_elapsed >= SLOW_PAGE_FALLBACK_THRESHOLD {
-                trace!(
-                    tablet_id = self.context.tablet_id,
-                    rowset_id = self.context.rowset_id,
-                    rowset_gen = self.context.rowset_gen,
-                    segment_id = self.context.segment_id,
-                    page_offset = key.page_offset,
-                    page_size = key.page_size,
-                    elapsed_ms = fallback_elapsed.as_secs_f64() * 1000.0,
-                    "slow page read+decompress fallback path",
-                );
-            }
-            return result;
+            return Ok((body, footer, uncompressed_size));
         }
 
         // If decompressed cache is enabled, try it first.
@@ -260,24 +239,59 @@ impl PageReader {
         let (footer, uncompressed_size, body_size) =
             PageIO::parse_page_footer(&raw, opts.verify_checksum)?;
         let decompress_start = Instant::now();
-        let body = if let Some(decompressor) = &self.options.parallel_decompressor {
+        let body = if self.options.cache_decompressed {
+            let cache = self
+                .cache
+                .as_ref()
+                .expect("cache-decompressed path requires a page cache");
+            let handle = cache.get_or_load_into(
+                key,
+                PageContentKind::Decompressed,
+                uncompressed_size as usize,
+                |destination| {
+                    if body_size == uncompressed_size as usize {
+                        destination.copy_from_slice(&raw[..body_size]);
+                        Ok(())
+                    } else if let Some(decompressor) = &self.options.parallel_decompressor {
+                        let decoded = decompressor.decompress_one(
+                            &raw[..body_size],
+                            uncompressed_size as usize,
+                            opts.codec,
+                        )?;
+                        if decoded.len() != destination.len() {
+                            return Err(paro_error::data_corrupted(format!(
+                                "Bad page: uncompressed size mismatch ({} vs {})",
+                                decoded.len(),
+                                uncompressed_size
+                            )));
+                        }
+                        destination.copy_from_slice(&decoded);
+                        Ok(())
+                    } else {
+                        PageIO::decompress_page_body_into(
+                            &raw[..body_size],
+                            uncompressed_size,
+                            opts.codec,
+                            destination,
+                        )
+                    }
+                },
+            )?;
+            handle.try_into_bytes()?
+        } else if let Some(decompressor) = &self.options.parallel_decompressor {
             decompressor.decompress_one(
                 &raw[..body_size],
                 uncompressed_size as usize,
                 opts.codec,
             )?
+        } else if body_size == uncompressed_size as usize {
+            raw.slice(..body_size)
         } else {
             PageIO::decompress_page_body(&raw[..body_size], uncompressed_size, opts.codec)?
         };
         let decompress_elapsed = decompress_start.elapsed();
         if decompress_elapsed >= SLOW_PAGE_DECOMPRESS_THRESHOLD {
             self.trace_slow_decompress(&key, decompress_elapsed, body_size, uncompressed_size);
-        }
-
-        if self.options.cache_decompressed {
-            if let Some(cache) = &self.cache {
-                let _ = cache.insert(key, PageContentKind::Decompressed, body.to_vec());
-            }
         }
 
         Ok((body, footer, uncompressed_size))
@@ -399,20 +413,20 @@ impl PageReader {
         reader: &mut R,
         opts: &PageReadOptions,
         key: &PageKey,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let io_start = Instant::now();
         if let Some(cache) = &self.cache {
-            let handle = cache.get_or_load(*key, PageContentKind::Compressed, || {
-                PageIO::read_page_bytes(reader, opts)
-            })?;
-            let data = handle
-                .data()
-                .ok_or_else(|| paro_error::internal("page cache data missing"))?;
+            let handle = cache.get_or_load_into(
+                *key,
+                PageContentKind::Compressed,
+                key.page_size as usize,
+                |destination| PageIO::read_page_bytes_into(reader, opts, destination),
+            )?;
             let io_elapsed = io_start.elapsed();
             if io_elapsed >= SLOW_PAGE_IO_THRESHOLD {
                 self.trace_slow_io(key, io_elapsed, "cache");
             }
-            return Ok(data.to_vec());
+            return handle.try_into_bytes();
         }
 
         let raw = PageIO::read_page_bytes(reader, opts)?;
@@ -420,7 +434,7 @@ impl PageReader {
         if io_elapsed >= SLOW_PAGE_IO_THRESHOLD {
             self.trace_slow_io(key, io_elapsed, "direct");
         }
-        Ok(raw)
+        Ok(Bytes::from(raw))
     }
 
     fn trace_slow_io(&self, key: &PageKey, elapsed: Duration, source: &'static str) {
@@ -545,7 +559,7 @@ impl PageReader {
 struct PendingPage {
     idx: usize,
     key: PageKey,
-    raw: Vec<u8>,
+    raw: Bytes,
     footer: PageFooter,
     uncompressed_size: u32,
     body_size: usize,
@@ -702,6 +716,32 @@ mod tests {
         buffer.set_position(0);
         let (read_body, _, _) = reader.read_page(&mut buffer, &opts).unwrap();
         assert_eq!(read_body.as_ref(), body.as_slice());
+    }
+
+    #[test]
+    fn cached_raw_page_is_borrowed_by_uncompressed_body() {
+        let mut buffer = Cursor::new(Vec::new());
+        let footer = make_data_footer(0, 4);
+        let body = vec![1_u8, 2, 3, 4];
+        let pointer = PageIO::write_page(&mut buffer, &body, &footer, body.len() as u32).unwrap();
+
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let reader = PageReader::new(
+            PageReaderContext::new(1, 1, 1, 0),
+            Some(cache.clone()),
+            PageReaderOptions::default(),
+        );
+        let opts = PageReadOptions::new(pointer);
+
+        let (read_body, _, _) = reader.read_page(&mut buffer, &opts).unwrap();
+        assert_eq!(read_body.as_ref(), body.as_slice());
+
+        let cached = cache
+            .lookup(&reader.page_key(pointer), PageContentKind::Compressed)
+            .unwrap();
+        assert_eq!(read_body.as_ptr(), cached.data().unwrap().as_ptr());
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 1);
     }
 
     #[test]
