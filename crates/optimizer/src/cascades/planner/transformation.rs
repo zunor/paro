@@ -2308,7 +2308,7 @@ fn native_materialization_side(
     bindings.is_subset(&right).then_some(false)
 }
 
-/// Materialize the exact candidate at one inner-join input.  The projection
+/// Materialize the exact candidate at its deepest selected inner-join input. The projection
 /// preserves every existing child column and appends one immutable computed
 /// column; the join and aggregate expressions are rebound together before the
 /// shell is published.  This is the same all-or-nothing liveness proof as the
@@ -2322,6 +2322,39 @@ fn native_materialize_candidate(
     layouts: &mut Vec<paro_planner::operator::LogicalOutputLayout>,
     state: &PlannerTransformState,
 ) -> Result<bool> {
+    let root_join_index = join_index;
+    let mut path = vec![(join_index, left_side)];
+    // Inspect the exact selected spine before allocating the projection.
+    // Crossing stops at a non-inner/opaque input, a live join operand, or a
+    // domain split. With at least one crossing the expression is placed above
+    // that boundary, just as in the semantic producer.
+    loop {
+        let (index, left_side) = *path.last().expect("root crossing exists");
+        let LogicalOperator::Join(Join::Comparison(join)) = &nodes[index].operator else {
+            return Ok(false);
+        };
+        let child = if left_side { &join.left } else { &join.right };
+        let NativeChild::Node(next) = child else {
+            break;
+        };
+        let LogicalOperator::Join(Join::Comparison(next_join)) = &nodes[*next].operator else {
+            break;
+        };
+        if next_join.join_type != JoinType::Inner
+            || next_join.mark_index.is_some()
+            || !next_join.duplicate_eliminated_columns.is_empty()
+            || next_join.delim_flipped
+        {
+            break;
+        }
+        let left_layout = native_shell_child_layout(&next_join.left, layouts)?;
+        let right_layout = native_shell_child_layout(&next_join.right, layouts)?;
+        let Some(side) = native_materialization_side(next_join, candidate, &left_layout, &right_layout) else {
+            break;
+        };
+        path.push((*next, side));
+    }
+    let (join_index, left_side) = *path.last().expect("root crossing exists");
     let join = match nodes
         .get(join_index)
         .ok_or_else(|| paro_error::internal("native materialization lost its join"))?
@@ -2399,36 +2432,48 @@ fn native_materialize_candidate(
             )
         })
         .collect::<HashMap<_, _>>();
-    let mut rewritten_join = join;
-    let rewritten_child = NativeChild::Node(projection_index_in_shell);
-    if left_side {
-        rewritten_join.left = rewritten_child;
-        rewritten_join.left_projection_map.include(old_width);
-    } else {
-        rewritten_join.right = rewritten_child;
-        rewritten_join.right_projection_map.include(old_width);
-    }
-    for condition in &mut rewritten_join.conditions {
-        condition.left = native_replace_known_bindings(&condition.left, &binding_map);
-        condition.right = native_replace_known_bindings(&condition.right, &binding_map);
-    }
-    for expression in &mut rewritten_join.duplicate_eliminated_columns {
-        *expression = native_replace_known_bindings(expression, &binding_map);
-    }
-    let rewritten_join = LogicalOperator::Join(Join::Comparison(rewritten_join));
-    let rewritten_join_layout = {
-        let mut children = SmallVec::<[&NativeChild; 2]>::new();
-        rewritten_join.visit_child_links(&mut |child| children.push(child));
-        let child_layouts = children
+    let mut rewritten_child = NativeChild::Node(projection_index_in_shell);
+    for (join_index, left_side) in path.into_iter().rev() {
+        let LogicalOperator::Join(Join::Comparison(mut rewritten_join)) =
+            nodes[join_index].operator.clone()
+        else {
+            return Err(paro_error::internal("native materialization lost its ancestor"));
+        };
+        let output_ordinal = native_shell_child_layout(&rewritten_child, layouts)?
+            .bindings()
             .iter()
-            .map(|child| native_shell_child_layout(child, layouts))
-            .collect::<Result<SmallVec<[paro_planner::operator::LogicalOutputLayout; 2]>>>()?;
-        let child_layouts = child_layouts.iter().collect::<SmallVec<[_; 2]>>();
-        rewritten_join.output_layout_from_child_refs(&child_layouts)
-    };
-    nodes[join_index].operator = rewritten_join;
-    nodes[join_index].source_proofs = Box::new([]);
-    layouts[join_index] = rewritten_join_layout.clone();
+            .position(|binding| *binding == materialized_binding)
+            .ok_or_else(|| paro_error::internal("native materialized binding lost in ancestor input"))?;
+        if left_side {
+            rewritten_join.left = rewritten_child;
+            rewritten_join.left_projection_map.include(output_ordinal);
+        } else {
+            rewritten_join.right = rewritten_child;
+            rewritten_join.right_projection_map.include(output_ordinal);
+        }
+        for condition in &mut rewritten_join.conditions {
+            condition.left = native_replace_known_bindings(&condition.left, &binding_map);
+            condition.right = native_replace_known_bindings(&condition.right, &binding_map);
+        }
+        for expression in &mut rewritten_join.duplicate_eliminated_columns {
+            *expression = native_replace_known_bindings(expression, &binding_map);
+        }
+        let rewritten_join = LogicalOperator::Join(Join::Comparison(rewritten_join));
+        let rewritten_join_layout = {
+            let mut children = SmallVec::<[&NativeChild; 2]>::new();
+            rewritten_join.visit_child_links(&mut |child| children.push(child));
+            let child_layouts = children
+                .iter()
+                .map(|child| native_shell_child_layout(child, layouts))
+                .collect::<Result<SmallVec<[paro_planner::operator::LogicalOutputLayout; 2]>>>()?;
+            let child_layouts = child_layouts.iter().collect::<SmallVec<[_; 2]>>();
+            rewritten_join.output_layout_from_child_refs(&child_layouts)
+        };
+        nodes[join_index].operator = rewritten_join;
+        nodes[join_index].source_proofs = Box::new([]);
+        layouts[join_index] = rewritten_join_layout;
+        rewritten_child = NativeChild::Node(join_index);
+    }
 
     let LogicalOperator::Aggregate(aggregate) = nodes
         .get(root_index)
@@ -2456,19 +2501,19 @@ fn native_materialize_candidate(
     }
     reset_native_aggregate_output(&mut rewritten_aggregate);
     let rewritten_aggregate = LogicalOperator::Aggregate(Box::new(rewritten_aggregate));
-    let root_layout = rewritten_aggregate.output_layout_from_child_refs(&[&rewritten_join_layout]);
+    let root_layout = rewritten_aggregate.output_layout_from_child_refs(&[&layouts[root_join_index]]);
     nodes[root_index].operator = rewritten_aggregate;
     nodes[root_index].source_proofs = Box::new([]);
     layouts[root_index] = root_layout;
     Ok(true)
 }
 
-/// Native subset of AggregateInputMaterialization.  The complete owned rule
-/// supports arbitrary join spines; this slice is authoritative only when the
-/// matched root is a plain aggregate over one plain inner join. Each input
+/// Native subset of AggregateInputMaterialization. The matched root must be
+/// a plain aggregate over an inner join; placement follows the exact selected
+/// inner-join spine without expanding any opaque Memo inputs. Each input
 /// has its own placement/liveness proof; rejected inputs stay at the original
-/// evaluation site, exactly as in the semantic producer. Richer join spines
-/// and unsupported roots still require the remaining migration.
+/// evaluation site, exactly as in the semantic producer. Unsupported aggregate
+/// roots still require the remaining migration.
 fn try_native_input_materialization(
     binding: &PatternOperand,
     memo: &Memo,

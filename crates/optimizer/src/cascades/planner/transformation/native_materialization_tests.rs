@@ -91,6 +91,147 @@ fn materialized_count<Child>(operator: &LogicalOperator<Child>) -> usize {
         .count()
 }
 
+fn nested_plan(target_left: bool, blocked: bool, outer_left: bool) -> OwnedLogicalPlan {
+    let mut plan = plan(true);
+    let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+        unreachable!()
+    };
+    let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+        unreachable!()
+    };
+    let target = std::mem::replace(
+        &mut *join.right,
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+    );
+    let (left, right) = if target_left {
+        (target, source(2))
+    } else {
+        (source(2), target)
+    };
+    *join.right = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
+        JoinType::Inner,
+        left,
+        right,
+        vec![JoinCondition::equality(
+            column(
+                if target_left { 1 } else { 2 },
+                usize::from(blocked && target_left),
+            ),
+            column(
+                if target_left { 2 } else { 1 },
+                usize::from(blocked && !target_left),
+            ),
+        )],
+    )));
+    if outer_left {
+        std::mem::swap(&mut join.left, &mut join.right);
+        for condition in &mut join.conditions {
+            std::mem::swap(&mut condition.left, &mut condition.right);
+        }
+    }
+    plan
+}
+
+#[test]
+fn production_materialization_reaches_the_deepest_selected_join_input() {
+    for target_left in [true, false] {
+        for blocked in [true, false] {
+            for outer_left in [true, false] {
+                let bind = BindContext::new();
+                for _ in 0..13 {
+                    bind.generate_table_index();
+                }
+                let (reference, changed) = input_materialization::optimize_plan(
+                    nested_plan(target_left, blocked, outer_left),
+                    &bind,
+                )
+                .unwrap();
+                assert!(changed);
+                let (_, widths) = reference
+                    .try_fold_post_order(|plan, children: Vec<Vec<usize>>| {
+                        let mut widths = children.into_iter().flatten().collect::<Vec<_>>();
+                        if let LogicalOperator::Projection(projection) = &plan.operator {
+                            widths.push(projection.expressions.len());
+                        }
+                        Ok((plan, widths))
+                    })
+                    .unwrap();
+                assert_eq!(widths, vec![if blocked { 7 } else { 4 }]);
+                let mut input = MemoBuilder::build(
+                    nested_plan(target_left, blocked, outer_left),
+                    BindContext::new(),
+                    SearchBudget::default(),
+                )
+                .unwrap();
+                let state = input.planner_state.clone();
+                state.write().unwrap().session =
+                    Some(paro_context::TestStatementContextBuilder::minimal().build());
+                let binding = {
+                    let state = state.read().unwrap();
+                    matching::scoped_pattern_bindings(
+                        PlannerTransformation::AggregateInputMaterialization,
+                        input.root,
+                        input.memo.group(input.root).unwrap().logical_exprs()[0],
+                        &input.memo,
+                        &state,
+                        None,
+                        BudgetDimension::RuleWorkPerGroup,
+                    )
+                    .unwrap()
+                    .bindings
+                    .first()
+                    .cloned()
+                    .unwrap()
+                };
+                {
+                    let state = state.read().unwrap();
+                    let mut context = TransformContext::new(&mut input.memo, input.root);
+                    let facts = boundary::BoundarySnapshot::read(
+                        &mut context,
+                        &state,
+                        &binding.root,
+                        BudgetDimension::RuleWorkPerGroup,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let shell = try_native_input_materialization(
+                        &binding.root,
+                        context.memo(),
+                        &state,
+                        &facts,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let native_widths = shell
+                        .nodes
+                        .iter()
+                        .filter_map(|node| match &node.operator {
+                            LogicalOperator::Projection(projection) => {
+                                Some(projection.expressions.len())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        native_widths, widths,
+                        "target_left={target_left}, blocked={blocked}, outer_left={outer_left}"
+                    );
+                    shell.layouts().unwrap();
+                }
+                let rule = PlannerTransformationRule {
+                    transformation: PlannerTransformation::AggregateInputMaterialization,
+                    planner_state: state.clone(),
+                };
+                let bridges = semantic_plan::owned_binding_instantiation_count();
+                let mut context = TransformContext::new(&mut input.memo, input.root);
+                let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(semantic_plan::owned_binding_instantiation_count(), bridges);
+            }
+        }
+    }
+}
+
 #[test]
 fn production_materialization_keeps_success_when_another_input_is_rejected() {
     for blocked_first in [true, false] {
