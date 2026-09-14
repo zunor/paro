@@ -153,6 +153,6 @@ The diagnostic trace reports the quality state as
 | `profile-clean.sample.gz` | `6a6dff9e5b6aadb4ba796da38b3fc89f2c1dc7e50a49a7ae8da5b89989273ab1` |
 
 The compressed normal/diagnostic server logs and their hashes are kept beside
-these artifacts. The diagnostic statement log is intentionally retained even
+these artifacts in [`SHA256SUMS`](SHA256SUMS). The diagnostic statement log is intentionally retained even
 though it is large; it is excluded from normal timing and is not used to
 justify an endpoint performance claim.
