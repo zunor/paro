@@ -167,6 +167,25 @@ mixed worktree. No performance, clean-source fingerprint, or SQL-regress
 acceptance is inferred. Expanded non-preserved subtrees which could contain
 other rewrites remain outside this producer's completeness claim.
 
+`b289ef99` removes the owned fallback for AggregateNonNullInput, including
+negative native results. Its selected matcher grammar is closed (Aggregate
+over Filter/Order/TopN/Limit to Get), with no nested aggregate to rewrite.
+A test-only per-thread bridge audit first observed one owned instantiation
+for a nullable rejection, then zero after the change. The same test updates
+the source to non-NULL, verifies an old fact read is stale, and successfully
+stages the native rewrite without an owned instantiation. The audit has no
+production code or tracing overhead. Two native tests, four non-null-input
+semantic tests, and 111 engine tests passed. The broader transformation run
+reported 108 passed/1 failed: the previously recorded CTE test still rejects
+`expected grant is not a declared class`; it was not modified or blessed.
+These mixed-tree correctness results are not clean performance evidence.
+
+Audit clarification: legacy instantiation does not select an arbitrary
+alternative behind a PatternOperand::Group either; it preserves a typed
+hole. Alternative-rich groups therefore do not by themselves justify an
+owned fallback. Remaining migration must compare the *selected* binding's
+rewrite coverage rather than assume the owned path explores extra choices.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
