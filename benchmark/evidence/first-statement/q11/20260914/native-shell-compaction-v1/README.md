@@ -928,3 +928,26 @@ Optimizer/compiler check passed before the final test-only addition and moving
 an unused production import into the test module. No bless. No fresh Q11,
 fixed-work/fingerprint, SQL regress or independent bag-execution campaign was
 run. These mixed-tree checks do not establish end-to-end performance or completion.
+
+## Source-specific native prefix witnesses
+
+Native prefix selection no longer chooses the first substring's source before
+running the shared output proof. Each referenced source now supplies its own
+exact selected path, with a unique occurrence count and either a Filter/Get
+witness location or a known unfiltered Get. Unfiltered means a known negative;
+opaque/unsupported means missing evidence. Paths are reused only inside the
+current immutable binding invocation, once per source, with no persistent cache
+or new invalidation protocol. Only the accepted source is constructed/changed.
+
+A production fixture puts an unfiltered peer's substring before the witnessed
+source's output. The tree reference and native result retain the first function
+and replace the second output; real Memo/matching/apply emits one result with
+zero owned constructions. This fixture would be rejected by the previous
+first-source algorithm by inspection; that old version was not rerun for this
+slice, so no runtime baseline or measured bridge reduction is asserted.
+
+All five native_late_payload tests pass (16 production fixtures). Full optimizer
+1285 pass / same five failure names and assertion values. Optimizer/compiler
+check passes. No bless, unrelated edits, SQL regress, independent bag execution,
+fixed-work/fingerprint campaign or fresh Q11 evidence. Row-id lowering and other
+owned rule paths remain; this is not a completion or performance claim.
