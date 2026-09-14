@@ -469,6 +469,36 @@ domain closure handles inner joins, not the required SEMI boundary routing.
 It cannot be substituted for the complete FilterPushdown prelude unchanged.
 No separate predicate semantics were introduced to bypass that gap.
 
+### Deep native materialization placement
+
+A production-selected nested-join fixture demonstrated a coverage mismatch
+even on native success: the reference placed a4-column projection on a3-column
+input, whereas native placed a7-column projection on the complete6-column
+intermediate join. Zero owned invocations was therefore not sufficient proof
+of the migrated placement contract.
+
+Native placement now inspects the exact selected inner-join spine before
+allocating its projection. It stops when the next join consumes a candidate
+input, when the candidate spans both sides, or at a non-inner/opaque boundary.
+It then remaps the recorded ancestor chain bottom-up, including the new scalar
+at its actual ordinal in each ancestor input rather than reusing the leaf's
+ordinal. Original candidate liveness and total-evaluation checks are unchanged;
+there is no owned tree reconstruction or child-frontier expansion.
+
+Eight production cases cover target left/right at inner and outer joins,
+with/without an inner join condition blocking further descent. They compare
+native/reference projection width (4 when movable,7 when blocked), validate
+native layouts, and pass actual binding application/staging with one output
+and no owned bridge. These are structural tests with the same test-only total
+scalar fixture above, not SQL execution or an independent bag oracle.
+
+Validation: materialization13 and engine111 pass; full optimizer1274 pass/5
+fail, with the same recorded grant/cache/RF failures. No failures were blessed.
+The change repairs placement coverage and may change selected plans; no claim
+of identical Q11 fingerprint or improved timing is made. Fresh fixed-work,
+runtime semantics and performance acceptance remain outstanding. Unsupported
+aggregate roots/control ownership and other producers still retain fallbacks.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
