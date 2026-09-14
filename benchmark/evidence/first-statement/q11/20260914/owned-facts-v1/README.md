@@ -67,3 +67,26 @@ wall time, exact choices and work counts. More than 10% ON overhead requires
 reduced collection and a new sequence; do not use distorted data. Normal
 C1/W remain trace-off, separate fixed two-block pilots, not formal parity or
 T1 grant non-inferiority campaigns. All valid samples are retained.
+
+## T2 preregistration: new-content result, defer unconsumed payload work
+
+8bb6b8fa OFF/ON/OFF keeps corrected triple 2ed1a3e/2500/1436.
+Optimizer 92.718 / 100.204 / 93.059ms: ON overhead 7.88%, below 10%.
+B3 residual 0.805ms of 30.964ms (97.4% classified). Statistics is 1.431ms,
+owned fallback 0.770ms; native refresh 38 calls/105 nodes, inclusive 0.913ms.
+The actual cache has 65 hits/263 misses: 250 live-new, 13 proved annotation
+differences, no unverified or unresident matches. Do not add a fact cache to
+address a hypothetical dominant refresh cost: that hypothesis is rejected.
+
+Staging preparation/encoding is 8.243+8.586ms. The bounded intervention defers
+canonical extraction-template cloning and native cost vectors until BOTH
+structural reuse paths have completed. Existing identities still merge facts,
+validate context and consume identical scalar/column interning and budgets.
+Owned assemble validation is retained before lookup. No output/plan choice
+changes are authorized. Compare full deterministic counts and frozen choice
+transcripts with corrected control, and show original 4e anchor separately.
+
+Post-change diagnostic records staging nodes reaching payload preparation
+versus actually constructing a new payload. A fixed four-block normal pilot
+(same resources and handoff) will report C1/W, all samples and confidence
+intervals. It is not the 36-block formal W non-inferiority or parity campaign.

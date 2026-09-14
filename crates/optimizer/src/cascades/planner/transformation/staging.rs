@@ -7,6 +7,9 @@ use super::*;
 
 use smallvec::SmallVec;
 
+#[cfg(test)]
+thread_local! { static STAGING_PAYLOAD_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub(super) struct StagedEquivalent {
     pub(super) key: LogicalExprKey,
     pub(super) payload: LogicalPayloadId,
@@ -683,7 +686,7 @@ pub(super) fn stage_transformed_expression(
             target_child_context,
             refined_cardinality_kind,
         } = request;
-        let (id, stats, semantic_operator, semantic_template, cost_plan, source_proofs) =
+        let (id, stats, semantic_operator, cost_plan, source_proofs) =
             match input {
                 NodeStagingInput::Owned(plan) => {
                     if let LogicalOperator::BoundReference(reference) = &plan.operator {
@@ -707,13 +710,11 @@ pub(super) fn stage_transformed_expression(
                         .get(&skeleton_id)
                         .cloned()
                         .unwrap_or_default();
-                    let semantic_template = semantic_plan::canonical_template(skeleton.clone());
                     let semantic_operator = skeleton.operator.clone();
                     (
                         skeleton.id,
                         skeleton.stats.clone(),
                         semantic_operator,
-                        semantic_template,
                         Some(skeleton.assemble(children)?),
                         source_proofs,
                     )
@@ -728,23 +729,16 @@ pub(super) fn stage_transformed_expression(
                         .clone()
                         .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
                         .expect("mapping native group references to a semantic shell cannot fail");
-                    let semantic_template = semantic_plan::canonical_template(
-                        paro_planner::plan::arena::LogicalPlanNode {
-                            id,
-                            stats: NodeStats::default(),
-                            operator: semantic_operator.clone(),
-                        },
-                    );
                     (
                         id,
                         stats.clone(),
                         semantic_operator,
-                        semantic_template,
                         None,
                         source_proofs,
                     )
                 }
             };
+        crate::work_partition::staging_payload(false);
         let native_direct = cost_plan.is_none();
         if native_direct {
             if let LogicalOperator::Aggregate(aggregate) = &semantic_operator {
@@ -845,40 +839,6 @@ pub(super) fn stage_transformed_expression(
                     .and_then(|group| group.logical_properties.maximum_cardinality)
             })
             .collect::<Vec<_>>();
-        let native_cost_inputs = native_direct.then(|| {
-            let child_row_widths = child_states
-                .iter()
-                .map(|child| planner_row_width_from_layout(&child.layout, state.scan_access_cost))
-                .collect::<Vec<_>>();
-            let child_expected_rows = child_states
-                .iter()
-                .map(|child| {
-                    child
-                        .stats
-                        .estimated_cardinality
-                        .map(|cardinality| cardinality.expected as f64)
-                        .unwrap_or(1.0)
-                })
-                .collect::<Vec<_>>();
-            let child_materialization_risk_rows = child_states
-                .iter()
-                .map(|child| {
-                    child
-                        .stats
-                        .materialization_risk_cardinality
-                        .or_else(|| child.stats.estimated_cardinality.map(|rows| rows.max))
-                        .unwrap_or(1)
-                })
-                .collect::<Vec<_>>();
-            let output_row_width =
-                planner_row_width_from_layout(&output_layout, state.scan_access_cost);
-            (
-                child_row_widths,
-                child_expected_rows,
-                child_materialization_risk_rows,
-                output_row_width,
-            )
-        });
         let mut logical_properties =
             derive_logical_properties(&semantic_operator, &child_maximum_cardinalities);
         attach_group_column_domains(
@@ -1169,6 +1129,51 @@ pub(super) fn stage_transformed_expression(
             }
         }
 
+        // Identity reuse still performs all fact merges and context checks.
+        // Only new payloads consume the extraction template and cost vectors.
+        // Read the same child snapshots, never post-merge Memo statistics.
+        crate::work_partition::staging_payload(true);
+        #[cfg(test)]
+        STAGING_PAYLOAD_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        let semantic_template = semantic_plan::canonical_template(
+            paro_planner::plan::arena::LogicalPlanNode {
+                id, stats: NodeStats::default(), operator: semantic_operator.clone(),
+            },
+        );
+        let native_cost_inputs = native_direct.then(|| {
+            let child_row_widths = child_states
+                .iter()
+                .map(|child| planner_row_width_from_layout(&child.layout, state.scan_access_cost))
+                .collect::<Vec<_>>();
+            let child_expected_rows = child_states
+                .iter()
+                .map(|child| {
+                    child
+                        .stats
+                        .estimated_cardinality
+                        .map(|cardinality| cardinality.expected as f64)
+                        .unwrap_or(1.0)
+                })
+                .collect::<Vec<_>>();
+            let child_materialization_risk_rows = child_states
+                .iter()
+                .map(|child| {
+                    child
+                        .stats
+                        .materialization_risk_cardinality
+                        .or_else(|| child.stats.estimated_cardinality.map(|rows| rows.max))
+                        .unwrap_or(1)
+                })
+                .collect::<Vec<_>>();
+            let output_row_width =
+                planner_row_width_from_layout(&output_layout, state.scan_access_cost);
+            (
+                child_row_widths,
+                child_expected_rows,
+                child_materialization_risk_rows,
+                output_row_width,
+            )
+        });
         let Some(scalar_facts) = super::super::scalar_facts::NativeScalarFacts::derive(
             &semantic_template.operator,
             &key.scalars,
@@ -2085,6 +2090,8 @@ mod tests {
         state.session = Some(TestStatementContextBuilder::minimal().build());
         let arena_len = state.staging_arena.len();
         let native = NativeShell::from_owned(native, &HashMap::new()).unwrap();
+        let payload_before = input.memo.logical_expr(root_expression).unwrap().payload;
+        let constructions_before = STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get);
         let staged = stage_transformed_expression(
             StagingRequest {
                 input: StagingInput::Native(native),
@@ -2111,7 +2118,9 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert!(staged.is_some());
+        assert_eq!(staged.as_ref().unwrap().payload, payload_before);
+        assert_eq!(STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get), constructions_before,
+            "exact duplicate must preserve its facts and reuse payload before constructing an extraction clone");
         assert_eq!(state.staging_arena.len(), arena_len);
     }
 
@@ -2164,6 +2173,8 @@ mod tests {
         };
         let mut state = input.planner_state.write().unwrap();
         state.session = Some(TestStatementContextBuilder::minimal().build());
+        let payload_before = input.memo.logical_expr(root_expression).unwrap().payload;
+        let constructions_before = STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get);
         let staged = stage_transformed_expression(
             StagingRequest {
                 input: StagingInput::Native(native),
@@ -2190,7 +2201,9 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert!(staged.is_some());
+        assert_eq!(staged.as_ref().unwrap().payload, payload_before);
+        assert_eq!(STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get), constructions_before,
+            "exact duplicate must preserve its facts and reuse payload before constructing an extraction clone");
     }
 
     #[test]

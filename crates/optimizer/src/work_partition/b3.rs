@@ -37,6 +37,8 @@ pub(super) struct RuleRow {
     native_refresh_visited_nodes: u64,
     native_refresh_inclusive_ns: u64,
     native_refresh_size_histogram: BTreeMap<usize, u64>,
+    staging_payload_candidates: u64,
+    staging_payload_constructed: u64,
 }
 
 #[derive(Default)]
@@ -74,6 +76,8 @@ impl Attribution {
                             "native_refresh_visited_nodes": row.native_refresh_visited_nodes,
                             "native_refresh_inclusive_ns": row.native_refresh_inclusive_ns,
                             "native_refresh_size_histogram": row.native_refresh_size_histogram,
+                            "staging_payload_candidates": row.staging_payload_candidates,
+                            "staging_payload_constructed": row.staging_payload_constructed,
                         }),
                     )
                 })
@@ -151,6 +155,16 @@ pub(crate) fn local_lookup(miss: Option<MissKind>) {
                 None => row.local_hits[b3.site as usize] += 1,
                 Some(kind) => row.local_misses[b3.site as usize][kind as usize] += 1,
             }
+        }
+    });
+}
+
+pub(crate) fn staging_payload(constructed: bool) {
+    SLOT.with(|slot| {
+        if let Some(ledger) = slot.borrow_mut().ledger.as_mut() {
+            let row = ledger.b3.rows.entry(ledger.b3.rule.unwrap_or(0)).or_default();
+            if constructed { row.staging_payload_constructed += 1; }
+            else { row.staging_payload_candidates += 1; }
         }
     });
 }
