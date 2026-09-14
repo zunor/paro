@@ -6,7 +6,7 @@
 //! The scalar aggregate rule is intentionally conservative: its generic
 //! matcher keeps the detail side opaque while it follows the scalar witness.
 //! For the common direct `Filter -> Get` detail shape, a singleton detail
-//! alternative can be expanded as a bounded Memo shell and rewritten without
+//! alternative, including Projection/Filter ancestors, can be expanded as a bounded Memo shell and rewritten without
 //! importing an owned tree.  Any ambiguity, unsupported operator, or missing
 //! evidence returns `None` and leaves the authoritative owned rule available.
 
@@ -91,6 +91,9 @@ enum Shape {
 impl Shape {
     fn children(self, operator: &LogicalOperator<()>) -> Option<&'static [Shape]> {
         match (self, operator) {
+            (Self::Join, LogicalOperator::Projection(_) | LogicalOperator::Filter(_)) => {
+                Some(&[Self::Join])
+            }
             (Self::Join, LogicalOperator::Join(Join::Comparison(_))) => {
                 Some(&[Self::Detail, Self::WrapperProjection])
             }
@@ -196,6 +199,12 @@ fn rewrite_shell(
     let root = shell.root;
     if root + 1 != shell.nodes.len() {
         return Ok(None);
+    }
+    if matches!(
+        shell.root_operator(),
+        LogicalOperator::Projection(_) | LogicalOperator::Filter(_)
+    ) {
+        return rewrite_wrapped_shell(shell, layouts, state);
     }
     let LogicalOperator::Join(Join::Comparison(join)) = shell.root_operator().clone() else {
         return Ok(None);
@@ -323,6 +332,104 @@ fn rewrite_shell(
         return Ok(None);
     }
     Ok(Some(shell))
+}
+
+/// Keep the selected unary ancestors, but validate their expressions against
+/// the rewritten child layout. A removed scalar output cannot be hidden by a
+/// projection with an unchanged output type. This operates on native edges,
+/// never an exported tree, and invalidates copied ancestor proof lineage.
+fn rewrite_wrapped_shell(
+    shell: NativeShell,
+    mut layouts: Vec<paro_planner::operator::LogicalOutputLayout>,
+    state: &PlannerTransformState,
+) -> Result<Option<NativeShell>> {
+    let expected = layouts
+        .get(shell.root)
+        .cloned()
+        .ok_or_else(|| paro_error::internal("scalar window ancestor lost its output layout"))?;
+    let mut join_index = shell.root;
+    loop {
+        let child = match &shell.nodes[join_index].operator {
+            LogicalOperator::Projection(projection) => &projection.child,
+            LogicalOperator::Filter(filter) => &filter.child,
+            LogicalOperator::Join(Join::Comparison(_)) => break,
+            _ => return Ok(None),
+        };
+        let NativeChild::Node(index) = child else {
+            return Ok(None);
+        };
+        // Expanded shells are postorder. Unary ancestors must be contiguous,
+        // so splitting here cannot discard a sibling or a separate witness.
+        if index.checked_add(1) != Some(join_index) {
+            return Ok(None);
+        }
+        join_index = *index;
+    }
+    let mut nodes = shell.nodes.into_vec();
+    let ancestors = nodes.split_off(join_index + 1);
+    layouts.truncate(join_index + 1);
+    let Some(rewritten) = rewrite_shell(
+        NativeShell {
+            nodes: nodes.into_boxed_slice(),
+            root: join_index,
+        },
+        layouts,
+        state,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut child_layout = rewritten.root_layout()?;
+    let mut child_index = rewritten.root;
+    let mut nodes = rewritten.nodes.into_vec();
+    for mut ancestor in ancestors {
+        let allowed = child_layout.bindings().iter().copied().collect();
+        let expressions = match &ancestor.operator {
+            LogicalOperator::Projection(projection) => &projection.expressions,
+            LogicalOperator::Filter(filter) => &filter.expressions,
+            _ => return Ok(None),
+        };
+        if expressions.iter().any(|expression| {
+            let mut unsupported = false;
+            ExpressionIterator::visit(expression, &mut |node| {
+                if matches!(
+                    node,
+                    Expression::Reference(_)
+                        | Expression::Subquery(_)
+                        | Expression::Aggregate(_)
+                        | Expression::Window(_)
+                ) {
+                    unsupported = true;
+                    ExpressionVisitDecision::SkipChildren
+                } else {
+                    ExpressionVisitDecision::Descend
+                }
+            });
+            unsupported || expression_has_binding_outside(expression, &allowed)
+        }) {
+            return Ok(None);
+        }
+        match &mut ancestor.operator {
+            LogicalOperator::Projection(projection) => {
+                projection.child = NativeChild::Node(child_index)
+            }
+            LogicalOperator::Filter(filter) => filter.child = NativeChild::Node(child_index),
+            _ => unreachable!("unary ancestor was checked above"),
+        }
+        child_layout = ancestor
+            .operator
+            .output_layout_from_child_refs(&[&child_layout]);
+        ancestor.source_proofs = Box::new([]);
+        nodes.push(ancestor);
+        child_index = nodes.len() - 1;
+    }
+    if child_layout != expected {
+        return Ok(None);
+    }
+    Ok(Some(NativeShell {
+        nodes: nodes.into_boxed_slice(),
+        root: child_index,
+    }))
 }
 
 struct Rewrite {
@@ -1029,6 +1136,105 @@ mod tests {
     }
 
     #[test]
+    fn production_wrapped_binding_preserves_projection_and_residual() {
+        let residual = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                column(10, 0, LogicalType::BigInt),
+                column(10, 0, LogicalType::BigInt),
+            )
+            .into(),
+        );
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            80,
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+                shape(),
+                vec![residual],
+            ))),
+            vec![
+                column(10, 1, LogicalType::Integer),
+                column(10, 0, LogicalType::BigInt),
+            ],
+        )));
+        let expected = plan.output_layout();
+        let mut input =
+            MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.clone();
+        state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
+        let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let binding = {
+            let state_read = state.read().unwrap();
+            matching::scoped_pattern_bindings(
+                PlannerTransformation::ScalarAggregateWindow,
+                input.root,
+                root_expression,
+                &input.memo,
+                &state_read,
+                None,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .bindings
+            .first()
+            .cloned()
+            .expect("wrapped witness should match")
+        };
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let shell =
+            try_native_scalar_aggregate_window(&binding.root, &mut context, &state.read().unwrap())
+                .unwrap()
+                .expect("wrapped production binding must remain native");
+        assert_eq!(shell.root_layout().unwrap(), expected);
+        assert_eq!(
+            shell
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.operator, LogicalOperator::Window(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            shell
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.operator, LogicalOperator::Filter(_)))
+                .count(),
+            3
+        );
+        let rule = super::super::PlannerTransformationRule {
+            transformation: PlannerTransformation::ScalarAggregateWindow,
+            planner_state: state,
+        };
+        assert_eq!(rule.apply_binding(&binding, &mut context).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ancestor_cannot_observe_removed_scalar_even_with_same_output_type() {
+        let mut plan = shape();
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
+            unreachable!()
+        };
+        join.right_projection_map = ProjectionMap::all();
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            80,
+            plan,
+            vec![column(53, 0, LogicalType::BigInt)],
+        )));
+        let mut input =
+            MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.read().unwrap();
+        let mut ctx = TransformContext::new(&mut input.memo, input.root);
+        assert!(try_native_scalar_aggregate_window(
+            &PatternOperand::Group(input.root),
+            &mut ctx,
+            &state
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
     fn scalar_output_contract_cannot_be_dropped() {
         let mut plan = shape();
         let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
@@ -1083,6 +1289,21 @@ mod tests {
             for node in &shell.nodes {
                 let output = match &node.operator {
                     LogicalOperator::Get(_) => rows.to_vec(),
+                    LogicalOperator::Projection(projection) => {
+                        let NativeChild::Node(child) = projection.child else {
+                            panic!("unexpected hole")
+                        };
+                        results[child]
+                            .iter()
+                            .map(|row| {
+                                projection
+                                    .expressions
+                                    .iter()
+                                    .map(|expr| value(expr, row, &layouts[child]))
+                                    .collect()
+                            })
+                            .collect()
+                    }
                     LogicalOperator::Filter(filter) => {
                         let NativeChild::Node(child) = filter.child else {
                             panic!("unexpected hole")
@@ -1132,41 +1353,60 @@ mod tests {
             }
             results[shell.root].clone()
         }
-        let mut input =
-            MemoBuilder::build(shape(), BindContext::new(), SearchBudget::default()).unwrap();
-        let state = input.planner_state.read().unwrap();
-        let mut ctx = TransformContext::new(&mut input.memo, input.root);
-        let shell = try_native_scalar_aggregate_window(
-            &PatternOperand::Group(input.root),
-            &mut ctx,
-            &state,
-        )
-        .unwrap()
-        .unwrap();
-        for rows in [
-            vec![],
-            vec![vec![None, None], vec![Some(1), None]],
-            vec![
-                vec![Some(3), Some(-2)],
-                vec![Some(3), Some(-2)],
-                vec![Some(5), Some(8)],
-                vec![None, Some(100)],
-                vec![Some(-1), Some(200)],
-                vec![Some(9), None],
-            ],
-        ] {
-            let selected: Vec<Row> = rows
-                .iter()
-                .filter(|row| row[0].is_some_and(|key| key > 0))
-                .cloned()
-                .collect();
-            let values: Vec<i64> = selected.iter().filter_map(|row| row[1]).collect();
-            let sum: Option<i64> = (!values.is_empty()).then(|| values.iter().sum());
-            let expected: Vec<Row> = selected
-                .into_iter()
-                .filter(|row| row[0].zip(sum).is_some_and(|(key, sum)| key > sum))
-                .collect();
-            assert_eq!(execute(&shell, &rows), expected);
+        for wrapped in [false, true] {
+            let plan = if wrapped {
+                OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+                    80,
+                    shape(),
+                    vec![
+                        column(10, 1, LogicalType::Integer),
+                        column(10, 0, LogicalType::BigInt),
+                    ],
+                )))
+            } else {
+                shape()
+            };
+            let mut input =
+                MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+            let state = input.planner_state.read().unwrap();
+            let mut ctx = TransformContext::new(&mut input.memo, input.root);
+            let shell = try_native_scalar_aggregate_window(
+                &PatternOperand::Group(input.root),
+                &mut ctx,
+                &state,
+            )
+            .unwrap()
+            .unwrap();
+            for rows in [
+                vec![],
+                vec![vec![None, None], vec![Some(1), None]],
+                vec![
+                    vec![Some(3), Some(-2)],
+                    vec![Some(3), Some(-2)],
+                    vec![Some(5), Some(8)],
+                    vec![None, Some(100)],
+                    vec![Some(-1), Some(200)],
+                    vec![Some(9), None],
+                ],
+            ] {
+                let selected: Vec<Row> = rows
+                    .iter()
+                    .filter(|row| row[0].is_some_and(|key| key > 0))
+                    .cloned()
+                    .collect();
+                let values: Vec<i64> = selected.iter().filter_map(|row| row[1]).collect();
+                let sum: Option<i64> = (!values.is_empty()).then(|| values.iter().sum());
+                let mut expected: Vec<Row> = selected
+                    .into_iter()
+                    .filter(|row| row[0].zip(sum).is_some_and(|(key, sum)| key > sum))
+                    .collect();
+                if wrapped {
+                    for row in &mut expected {
+                        row.swap(0, 1);
+                    }
+                }
+                assert_eq!(execute(&shell, &rows), expected);
+            }
         }
     }
 
