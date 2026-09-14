@@ -864,7 +864,7 @@ impl TransformationRule for PlannerTransformationRule {
         // request to rebuild that binding as owned IR.
         if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput
             | PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown
-            | PlannerTransformation::MarkJoinToSemi)
+            | PlannerTransformation::MarkJoinToSemi | PlannerTransformation::KeyDomainTransfer)
             && direct_native.is_empty()
         {
             return Ok(Box::new([]));
@@ -2646,9 +2646,9 @@ fn try_native_key_domain_transfer(
     else {
         return Ok(None);
     };
-    if native_shell_contains_control_boundary(&shell) {
-        return Ok(None);
-    }
+    // The selected probe is one operator; its inputs are opaque Memo edges.
+    // We retain those inputs, including control regions, and move only across
+    // the explicitly checked local operator, never into the opaque region.
     let root = shell.root;
     let LogicalOperator::Join(Join::Comparison(domain)) = shell.nodes[root].operator.clone() else {
         return Ok(None);
@@ -5222,7 +5222,7 @@ fn rewrite_planner_expression(
     let rewritten = match transformation {
         PlannerTransformation::PredicateTransfer => FilterPushdown::new().rewrite_plan(plan),
         PlannerTransformation::KeyDomainTransfer => {
-            return crate::filter::domain_transfer::transfer(plan);
+            unreachable!("key-domain transfer is native-only in Memo search")
         }
         PlannerTransformation::CtePartitionedMaterialization => {
             unreachable!("CTE partitioning consumes a native occurrence requirement")
