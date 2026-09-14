@@ -41,6 +41,8 @@ pub(super) struct RuleRow {
     staging_payload_constructed: u64,
     settled_layout_consumed: u64,
     settled_cost_view_constructed: u64,
+    derived_fact_merge_changed: u64,
+    derived_fact_merge_unchanged: u64,
 }
 
 #[derive(Default)]
@@ -82,6 +84,8 @@ impl Attribution {
                             "staging_payload_constructed": row.staging_payload_constructed,
                             "settled_layout_consumed": row.settled_layout_consumed,
                             "settled_cost_view_constructed": row.settled_cost_view_constructed,
+                            "derived_fact_merge_changed": row.derived_fact_merge_changed,
+                            "derived_fact_merge_unchanged": row.derived_fact_merge_unchanged,
                         }),
                     )
                 })
@@ -179,6 +183,16 @@ pub(crate) fn settled_node(cost_view: bool) {
             let row = ledger.b3.rows.entry(ledger.b3.rule.unwrap_or(0)).or_default();
             if cost_view { row.settled_cost_view_constructed += 1; }
             else { row.settled_layout_consumed += 1; }
+        }
+    });
+}
+
+pub(crate) fn derived_fact_merge(changed: bool) {
+    SLOT.with(|slot| {
+        if let Some(ledger) = slot.borrow_mut().ledger.as_mut() {
+            let row = ledger.b3.rows.entry(ledger.b3.rule.unwrap_or(0)).or_default();
+            if changed { row.derived_fact_merge_changed += 1; }
+            else { row.derived_fact_merge_unchanged += 1; }
         }
     });
 }

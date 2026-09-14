@@ -3,7 +3,7 @@
 use std::{cell::RefCell, marker::PhantomData, rc::Rc, time::Instant};
 mod b3;
 pub(crate) use b3::{
-    cache_site, local_lookup, native_refresh, native_refresh_node, rule, staging_payload, settled_node, CacheSite, MissKind,
+    cache_site, local_lookup, native_refresh, native_refresh_node, rule, staging_payload, settled_node, derived_fact_merge, CacheSite, MissKind,
 };
 
 #[derive(Clone, Copy)]
