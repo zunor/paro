@@ -186,6 +186,19 @@ hole. Alternative-rich groups therefore do not by themselves justify an
 owned fallback. Remaining migration must compare the *selected* binding's
 rewrite coverage rather than assume the owned path explores extra choices.
 
+`7cff4944` removes the Memo owned fallbacks for TopNIntroduction and
+LimitPushdown, including native rejection. Their selected scopes cannot
+contain an additional optimizable LIMIT below the matched rewrite: the
+pushdown projection ends at a hole and TopN follows its selected Order chain.
+The production-binding audit first failed on negative LIMIT with one owned
+instantiation. After migration, all ten signed LIMIT/OFFSET cases retain
+their expected zero/one outputs with zero owned instantiations. Positive
+staged payloads retain exact limit, offset, ascending and NULL-order flags;
+pushdown retains its Projection over the newly staged Limit. The existing
+limit suite (21 tests) and engine suite (111 tests) passed. No guard, budget,
+cost model or stopping policy was changed. This is mixed-worktree correctness
+evidence, not a new Q11 performance or fingerprint acceptance campaign.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
