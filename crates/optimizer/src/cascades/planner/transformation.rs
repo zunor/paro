@@ -2902,9 +2902,8 @@ fn try_native_limit_pushdown(
     let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
         return Ok(None);
     };
-    if native_shell_contains_control_boundary(&shell) {
-        return Ok(None);
-    }
+    // The matched projection ends at an opaque input. Moving LIMIT below
+    // that projection does not move it through the input's control region.
     let root = shell.root;
     let LogicalOperator::Limit(limit) = shell.nodes[root].operator.clone() else {
         return Ok(None);
@@ -2973,9 +2972,8 @@ fn try_native_topn_introduction(
     let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
         return Ok(None);
     };
-    if native_shell_contains_control_boundary(&shell) {
-        return Ok(None);
-    }
+    // ORDER's input is retained verbatim. Fusing LIMIT/ORDER above a control
+    // boundary must not be mistaken for pushing through that boundary.
     let root = shell.root;
     let LogicalOperator::Limit(limit) = shell.nodes[root].operator.clone() else {
         return Ok(None);
