@@ -14,11 +14,10 @@ use paro_common::error::{self as paro_error, Result};
 #[cfg(test)]
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::expression::Expression;
 #[cfg(test)]
 use paro_planner::expression::OperatorType;
-use paro_planner::operator::{Filter, Get, Join, LogicalOperator, Projection};
+use paro_planner::operator::{Join, LogicalOperator};
 
 use super::staging::{NativeChild, NativeShell};
 use super::{boundary, Memo, PatternOperand, PlannerTransformState};
@@ -26,7 +25,7 @@ use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 /// Try the exact scan-prefix part of LatePayloadFetch on the native shell.
 ///
 /// A native miss deliberately returns None so the owned implementation can
-/// still handle row-id paths, joins, and other shapes outside this contract.
+/// still handle row-id lowering and shapes outside this contract.
 pub(super) fn try_native_late_payload_prefix(
     binding: &PatternOperand,
     memo: &Memo,
@@ -50,79 +49,57 @@ pub(super) fn try_native_late_payload_prefix(
     let LogicalOperator::Projection(projection) = shell.root_operator().clone() else {
         return Ok(None);
     };
-    let Some(source_table) = projection.expressions.iter().find_map(|expression| {
-        let Expression::Function(function) = expression else {
-            return None;
-        };
-        let Some(ScalarPredicateProjection::Utf8Substring {
-            source_argument,
-            start: 1,
-            length: Some(_),
-        }) = function.function.predicate_projection.as_ref()
-        else {
-            return None;
-        };
-        let Expression::ColumnRef(source) = function.children.get(*source_argument)? else {
-            return None;
-        };
-        Some(source.binding.table_index)
-    }) else {
+    let mut paths = std::collections::HashMap::new();
+    let candidate = crate::aggregate::late_payload::prove_prefix_outputs(
+        &projection.expressions,
+        |binding, kernel, byte_width| {
+            let path = paths.entry(binding.table_index).or_insert_with(|| {
+                native_prefix_path(&shell, &projection.child, binding.table_index)
+            });
+            let path = path.as_ref()?;
+            let LogicalOperator::Get(get) = &shell.nodes[path.get].operator else {
+                return None;
+            };
+            let table = get
+                .table
+                .as_ref()
+                .filter(|table| table.get_storage().is_some())?;
+            let column = get.stored_column(binding.column_index)?;
+            if table
+                .columns
+                .get(column)
+                .is_none_or(|definition| definition.logical_type != LogicalType::Varchar)
+            {
+                return None;
+            }
+            let Some(filter_index) = path.filter else {
+                return Some(false);
+            };
+            let LogicalOperator::Filter(filter) = &shell.nodes[filter_index].operator else {
+                return None;
+            };
+            Some(filter.expressions.iter().any(|predicate| {
+                prove_prefix_filter_expression(predicate, binding, kernel, byte_width)
+            }))
+        },
+    );
+    let Some(candidate) = candidate else {
         return Ok(None);
     };
-    let source_counts = native_source_occurrences(&shell, source_table);
-    if source_occurrence_at(&source_counts, &projection.child) != Some(1) {
-        return Ok(None);
-    }
-    let mut cursor = projection.child.clone();
-    let mut ancestors = Vec::new();
-    let (filter_index, get_index, filter, mut get) = loop {
-        let NativeChild::Node(index) = cursor else {
-            return Ok(None);
-        };
-        let operator = &shell
-            .nodes
-            .get(index)
-            .ok_or_else(|| paro_error::internal("native prefix path lost a node"))?
-            .operator;
-        match operator {
-            LogicalOperator::Filter(filter) => {
-                if let NativeChild::Node(child) = &filter.child {
-                    if let LogicalOperator::Get(get) = &shell.nodes[*child].operator {
-                        break (index, *child, filter.clone(), get.clone());
-                    }
-                }
-                ancestors.push((index, 0));
-                cursor = filter.child.clone();
-            }
-            LogicalOperator::Join(join) => {
-                let (left, right) = match join {
-                    Join::Comparison(join) => (&join.left, &join.right),
-                    Join::Any(join) => (&join.left, &join.right),
-                    Join::Cross(join) => (&join.left, &join.right),
-                };
-                let slot = match (
-                    source_occurrence_at(&source_counts, left),
-                    source_occurrence_at(&source_counts, right),
-                ) {
-                    (Some(1), Some(0)) => 0,
-                    (Some(0), Some(1)) => 1,
-                    _ => return Ok(None),
-                };
-                ancestors.push((index, slot));
-                cursor = if slot == 0 { left } else { right }.clone();
-            }
-            operator => {
-                let Some(child) = prefix_unary_child(operator) else {
-                    return Ok(None);
-                };
-                ancestors.push((index, 0));
-                cursor = child.clone();
-            }
-        }
+    let path = paths
+        .remove(&candidate.source_binding.table_index)
+        .flatten()
+        .ok_or_else(|| paro_error::internal("native prefix witness lost its source path"))?;
+    let filter_index = path
+        .filter
+        .ok_or_else(|| paro_error::internal("native prefix witness lost its filter"))?;
+    let get_index = path.get;
+    let ancestors = path.ancestors;
+    let LogicalOperator::Filter(filter) = shell.nodes[filter_index].operator.clone() else {
+        return Err(paro_error::internal("native prefix witness changed filter"));
     };
-
-    let Some(candidate) = prove_prefix_candidate(&projection, &filter, &get) else {
-        return Ok(None);
+    let LogicalOperator::Get(mut get) = shell.nodes[get_index].operator.clone() else {
+        return Err(paro_error::internal("native prefix witness changed source"));
     };
     let source_type = get
         .column_types
@@ -260,35 +237,74 @@ fn source_occurrence_at(counts: &[Option<usize>], child: &NativeChild) -> Option
     counts.get(*index).copied().flatten()
 }
 
-fn prove_prefix_candidate(
-    projection: &Projection<NativeChild>,
-    filter: &Filter<NativeChild>,
-    get: &Get,
-) -> Option<crate::aggregate::late_payload::MatchedPrefixCandidate> {
-    let table = get
-        .table
-        .as_ref()
-        .filter(|table| table.get_storage().is_some())?;
-    crate::aggregate::late_payload::prove_prefix_outputs(
-        &projection.expressions,
-        |binding, kernel, byte_width| {
-            if binding.table_index != get.table_index {
-                // This binding has not proven another source path.
-                return None;
+struct PrefixPath {
+    ancestors: Vec<(usize, usize)>,
+    filter: Option<usize>,
+    get: usize,
+}
+
+/// Resolve only selected nodes. A unique but unfiltered source is known not to
+/// witness a prefix; an opaque/unsupported source path is missing evidence.
+fn native_prefix_path(
+    shell: &NativeShell,
+    start: &NativeChild,
+    table: usize,
+) -> Option<PrefixPath> {
+    let counts = native_source_occurrences(shell, table);
+    if source_occurrence_at(&counts, start) != Some(1) {
+        return None;
+    }
+    let mut cursor = start;
+    let mut ancestors = Vec::new();
+    loop {
+        let NativeChild::Node(index) = cursor else {
+            return None;
+        };
+        let operator = &shell.nodes.get(*index)?.operator;
+        match operator {
+            LogicalOperator::Get(_) => {
+                return Some(PrefixPath {
+                    ancestors,
+                    filter: None,
+                    get: *index,
+                })
             }
-            let column = get.stored_column(binding.column_index)?;
-            if table
-                .columns
-                .get(column)
-                .is_none_or(|definition| definition.logical_type != LogicalType::Varchar)
-            {
-                return None;
+            LogicalOperator::Filter(filter) => {
+                if let NativeChild::Node(child) = &filter.child {
+                    if matches!(shell.nodes.get(*child)?.operator, LogicalOperator::Get(_)) {
+                        return Some(PrefixPath {
+                            ancestors,
+                            filter: Some(*index),
+                            get: *child,
+                        });
+                    }
+                }
+                ancestors.push((*index, 0));
+                cursor = &filter.child;
             }
-            Some(filter.expressions.iter().any(|predicate| {
-                prove_prefix_filter_expression(predicate, binding, kernel, byte_width)
-            }))
-        },
-    )
+            LogicalOperator::Join(join) => {
+                let (left, right) = match join {
+                    Join::Comparison(join) => (&join.left, &join.right),
+                    Join::Any(join) => (&join.left, &join.right),
+                    Join::Cross(join) => (&join.left, &join.right),
+                };
+                let slot = match (
+                    source_occurrence_at(&counts, left),
+                    source_occurrence_at(&counts, right),
+                ) {
+                    (Some(1), Some(0)) => 0,
+                    (Some(0), Some(1)) => 1,
+                    _ => return None,
+                };
+                ancestors.push((*index, slot));
+                cursor = if slot == 0 { left } else { right };
+            }
+            operator => {
+                cursor = prefix_unary_child(operator)?;
+                ancestors.push((*index, 0));
+            }
+        }
+    }
 }
 
 use crate::aggregate::late_payload::{
@@ -309,7 +325,7 @@ mod tests {
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, OperatorExpression,
     };
-    use paro_planner::operator::{ColumnBinding, Get};
+    use paro_planner::operator::{ColumnBinding, Filter, Get, Projection};
     use paro_planner::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
 
@@ -432,7 +448,7 @@ mod tests {
             7 => OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(
                 paro_planner::operator::EmptyResult::new(filter),
             )),
-            8..=13 => {
+            8..=13 | 15 => {
                 let peer = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
                     9,
                     vec!["peer".into()],
@@ -477,6 +493,11 @@ mod tests {
                     vec![
                         substring(source_expression.clone()),
                         substring_width(source_expression, 1),
+                    ]
+                } else if wrapper == 15 {
+                    vec![
+                        substring(source(ColumnBinding::new(9, 0))),
+                        substring(source_expression),
                     ]
                 } else {
                     vec![substring(source_expression)]
@@ -630,8 +651,8 @@ mod tests {
     #[test]
     fn production_binding_builds_native_prefix_shell() {
         use crate::cascades::rules::TransformationRule;
-        for wrapper in 0..15 {
-            if wrapper == 14 {
+        for wrapper in 0..16 {
+            if wrapper == 14 || wrapper == 15 {
                 let (reference, changed) =
                     crate::aggregate::late_payload::rewrite_matched_prefix_node(production_plan(
                         wrapper,
@@ -641,7 +662,10 @@ mod tests {
                 let LogicalOperator::Projection(output) = &reference.operator else {
                     unreachable!()
                 };
-                assert!(matches!(output.expressions[1], Expression::Function(_)));
+                assert!(matches!(
+                    output.expressions[usize::from(wrapper == 14)],
+                    Expression::Function(_)
+                ));
             }
             let mut input = MemoBuilder::build(
                 production_plan(wrapper),
@@ -682,17 +706,20 @@ mod tests {
                     .expect("production binding should take the native prefix path");
             assert_eq!(
                 shell.root_layout().unwrap().len(),
-                if wrapper == 4 || wrapper == 14 { 2 } else { 1 }
+                if wrapper == 4 || wrapper >= 14 { 2 } else { 1 }
             );
             let LogicalOperator::Projection(projection) = shell.root_operator() else {
                 panic!("expected projection root")
             };
             assert!(matches!(
-                projection.expressions.first(),
+                projection.expressions.get(usize::from(wrapper == 15)),
                 Some(Expression::ColumnRef(column)) if column.binding.column_index == 1
             ));
             if wrapper == 14 {
                 assert!(matches!(projection.expressions[1], Expression::Function(_)));
+            }
+            if wrapper == 15 {
+                assert!(matches!(projection.expressions[0], Expression::Function(_)));
             }
             if wrapper == 8 {
                 let mut duplicate = shell.clone();
