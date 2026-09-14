@@ -27,7 +27,7 @@ use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
 use crate::aggregate::{
-    dimension_deferral, dimension_sharing, input_materialization, join_preaggregation,
+    dimension_deferral, dimension_sharing, input_materialization,
     join_subsumption, late_payload, post_reduction,
 };
 use crate::context::SharedColumnStatistics;

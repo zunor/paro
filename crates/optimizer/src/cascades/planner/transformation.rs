@@ -864,7 +864,8 @@ impl TransformationRule for PlannerTransformationRule {
         // request to rebuild that binding as owned IR.
         if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput
             | PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown
-            | PlannerTransformation::MarkJoinToSemi | PlannerTransformation::KeyDomainTransfer)
+            | PlannerTransformation::MarkJoinToSemi | PlannerTransformation::KeyDomainTransfer
+            | PlannerTransformation::AggregateJoinPreaggregation)
             && direct_native.is_empty()
         {
             return Ok(Box::new([]));
@@ -5293,12 +5294,7 @@ fn rewrite_planner_expression(
             plan
         }
         PlannerTransformation::AggregateJoinPreaggregation => {
-            let (plan, changed) =
-                join_preaggregation::optimize_plan(plan, &environment.bind_context);
-            if !changed {
-                return Ok(None);
-            }
-            plan
+            unreachable!("join preaggregation is native-only in Memo search")
         }
         PlannerTransformation::AggregateJoinSubsumption => {
             let plan = FilterPushdown::new().rewrite_plan(plan);

@@ -10,9 +10,8 @@
 //! module performs the same conservative shape check over the immutable
 //! pattern shell and emits the replacement shell directly.
 //!
-//! The rule remains an alternative, not a cost decision.  Any shape that is
-//! not completely covered here returns `None` and continues through the
-//! authoritative owned implementation.
+//! The rule remains an alternative, not a cost decision. The selected grammar
+//! is closed; a negative native result does not retry an owned rewrite.
 
 use paro_common::error as paro_error;
 use paro_planner::expression::{
@@ -41,9 +40,8 @@ pub(super) fn try_native_aggregate_join_preaggregation(
     else {
         return Ok(None);
     };
-    if super::native_shell_contains_control_boundary(&shell) {
-        return Ok(None);
-    }
+    // Partial aggregation wraps the nullable input as a whole. Neither input
+    // is duplicated or traversed through an opaque control boundary.
     let original_root_layout = layouts
         .get(shell.root)
         .cloned()
@@ -458,38 +456,76 @@ mod tests {
 
     #[test]
     fn production_apply_stages_preaggregation_without_owned_settlement() {
-        let mut input =
-            MemoBuilder::build(candidate(), BindContext::new(), SearchBudget::default()).unwrap();
-        let state = input.planner_state.clone();
-        state.write().unwrap().session =
-            Some(paro_context::TestStatementContextBuilder::minimal().build());
-        let binding = {
-            let state = state.read().unwrap();
-            let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
-            let binding = matching::scoped_pattern_bindings(
-                PlannerTransformation::AggregateJoinPreaggregation,
-                input.root,
-                expression,
-                &input.memo,
-                &state,
-                None,
-                BudgetDimension::RuleWorkPerGroup,
-            )
-            .unwrap()
-            .bindings
-            .first()
-            .cloned()
-            .expect("the production pattern should match");
-            binding
-        };
-        let arena_before = state.read().unwrap().staging_arena.len();
-        let rule = PlannerTransformationRule {
-            transformation: PlannerTransformation::AggregateJoinPreaggregation,
-            planner_state: state.clone(),
-        };
-        let mut context = TransformContext::new(&mut input.memo, input.root);
-        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(state.read().unwrap().staging_arena.len(), arena_before);
+        for eligible in [false, true] {
+            for control in [false, true] {
+                let mut plan = candidate();
+                let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                    unreachable!()
+                };
+                let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator
+                else {
+                    unreachable!()
+                };
+                if !eligible {
+                    join.conditions[0].comparison = JoinComparisonType::NotEqual;
+                }
+                if control {
+                    let child = std::mem::replace(
+                        &mut *join.right,
+                        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+                    );
+                    *join.right = OwnedLogicalPlan::synthetic(LogicalOperator::MaterializedCTE(
+                        paro_planner::operator::MaterializedCTE::new(
+                            50,
+                            "retained_right".into(),
+                            vec!["c0".into()],
+                            vec![LogicalType::BigInt],
+                            paro_planner::binder::ir::CTEMaterialize::Materialized,
+                            input(99, 1),
+                            child,
+                        ),
+                    ));
+                }
+                let mut input =
+                    MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+                let state = input.planner_state.clone();
+                state.write().unwrap().session =
+                    Some(paro_context::TestStatementContextBuilder::minimal().build());
+                let binding = {
+                    let state = state.read().unwrap();
+                    let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+                    let binding = matching::scoped_pattern_bindings(
+                        PlannerTransformation::AggregateJoinPreaggregation,
+                        input.root,
+                        expression,
+                        &input.memo,
+                        &state,
+                        None,
+                        BudgetDimension::RuleWorkPerGroup,
+                    )
+                    .unwrap()
+                    .bindings
+                    .first()
+                    .cloned()
+                    .expect("the production pattern should match");
+                    binding
+                };
+                let arena_before = state.read().unwrap().staging_arena.len();
+                let rule = PlannerTransformationRule {
+                    transformation: PlannerTransformation::AggregateJoinPreaggregation,
+                    planner_state: state.clone(),
+                };
+                let mut context = TransformContext::new(&mut input.memo, input.root);
+                let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
+                let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+                assert_eq!(outputs.len(), usize::from(eligible));
+                assert_eq!(
+                    super::super::semantic_plan::owned_binding_instantiation_count(),
+                    bridges,
+                    "eligible={eligible}, control={control}"
+                );
+                assert_eq!(state.read().unwrap().staging_arena.len(), arena_before);
+            }
+        }
     }
 }
