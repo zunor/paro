@@ -286,6 +286,17 @@ This is not a full SQL/recursive-CTE or frozen-execution acceptance campaign.
 RecursiveCTE still declines this native producer, and Q11 performance and
 clean-source fingerprint equivalence have not been rerun for this slice.
 
+Native recursive-wrapper traversal now retains both arms' full positional
+contracts without unfolding, demand narrowing, or producer rebinding. The
+production-binding matrix first observed an owned instantiation through the
+recursive wrapper; after migration its positive, negative and fact-update
+retry paths use zero bridges. Staged payload checks retain the recursive
+symbol, UNION ALL flag, declared type and self-reference table identity.
+Twelve native tests (including fourteen wrapper/uniqueness cases), five
+reference tests and 111 engine tests passed on the mixed tree. The recursive
+fixture tests planning/staging, not termination or execution of recursion.
+No SQL-regress, Q11 timing or clean-source fingerprint campaign was run.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
