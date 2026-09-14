@@ -263,11 +263,24 @@ fn prove_prefix_filter_expression(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use paro_catalog::entry::{
+        CatalogObjectId, ColumnDefinition, CreateTableInfo, TableCatalogEntry,
+    };
     use paro_function::scalar::ScalarBindInput;
     use paro_function::scalar::string::get_substring_functions;
+    use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, OperatorExpression,
     };
+    use paro_planner::operator::Get;
+    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_storage::table::table_factory::TableFactory;
+
+    use super::super::{PlannerTransformation, matching};
+    use crate::cascades::budget::{BudgetDimension, SearchBudget};
+    use crate::cascades::planner::MemoBuilder;
 
     fn source(binding: ColumnBinding) -> Expression {
         Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Varchar).into())
@@ -303,6 +316,73 @@ mod tests {
                 LogicalType::Varchar,
             )
             .into(),
+        )
+    }
+
+    fn source_table() -> Arc<TableCatalogEntry> {
+        let columns = vec![ColumnDefinition::new(
+            "name".to_string(),
+            LogicalType::Varchar,
+        )];
+        let storage = Arc::new(
+            TableFactory::default()
+                .create_table(&[LogicalType::Varchar])
+                .unwrap(),
+        );
+        Arc::new(
+            TableCatalogEntry::from_info(
+                CreateTableInfo::new(
+                    "paro".into(),
+                    "public".into(),
+                    "prefix_source".into(),
+                    columns,
+                ),
+                storage,
+                CatalogObjectId::from_raw(91_021),
+                0,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn production_plan() -> OwnedLogicalPlan {
+        let context = BindContext::new();
+        let binding = ColumnBinding::new(7, 0);
+        let source_expression = source(binding);
+        let predicate = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::In,
+                vec![
+                    substring(source_expression.clone()),
+                    Expression::Constant(
+                        ConstantExpression::new(
+                            Value::Varchar("ab".to_string()),
+                            LogicalType::Varchar,
+                        )
+                        .into(),
+                    ),
+                ],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
+        let get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
+            7,
+            vec!["name".to_string()],
+            vec![LogicalType::Varchar],
+            source_table(),
+        ))));
+        let filter = OwnedLogicalPlan::new(
+            &context,
+            LogicalOperator::Filter(Filter::new(get, vec![predicate])),
+        );
+        OwnedLogicalPlan::new(
+            &context,
+            LogicalOperator::Projection(Projection::new(
+                8,
+                filter,
+                vec![substring(source_expression)],
+            )),
         )
     }
 
@@ -359,6 +439,52 @@ mod tests {
             binding,
             &projected_function.function,
             2,
+        ));
+    }
+
+    #[test]
+    fn production_binding_builds_native_prefix_shell() {
+        let mut input = MemoBuilder::build(
+            production_plan(),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let state = input.planner_state.read().unwrap();
+        let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let binding = matching::scoped_pattern_bindings(
+            PlannerTransformation::LatePayloadFetch,
+            input.root,
+            expression,
+            &input.memo,
+            &state,
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .bindings
+        .first()
+        .cloned()
+        .expect("production prefix pattern should match");
+        let mut context = super::super::TransformContext::new(&mut input.memo, input.root);
+        let facts = super::super::boundary::BoundarySnapshot::read(
+            &mut context,
+            &state,
+            &binding.root,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .expect("production binding should have boundary facts");
+        let shell = try_native_late_payload_prefix(&binding.root, context.memo(), &state, &facts)
+            .unwrap()
+            .expect("production binding should take the native prefix path");
+        assert_eq!(shell.root_layout().unwrap().len(), 1);
+        let LogicalOperator::Projection(projection) = shell.root_operator() else {
+            panic!("expected projection root")
+        };
+        assert!(matches!(
+            projection.expressions.first(),
+            Some(Expression::ColumnRef(column)) if column.binding.column_index == 1
         ));
     }
 }
