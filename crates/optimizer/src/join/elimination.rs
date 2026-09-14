@@ -147,8 +147,11 @@ impl JoinElimination {
                 LogicalOperator::SetOperation(setop)
             }
             LogicalOperator::Distinct(mut distinct) => {
-                let mut child_required =
-                    filter_required_bindings(required_bindings, distinct.child.as_ref());
+                let mut child_required = if distinct.distinct_targets.is_empty() {
+                    output_bindings(&distinct.child.operator)
+                } else {
+                    filter_required_bindings(required_bindings, distinct.child.as_ref())
+                };
                 collect_bindings_from_exprs(&distinct.distinct_targets, &mut child_required);
                 if let Some(order_by) = &distinct.order_by {
                     for order in order_by {

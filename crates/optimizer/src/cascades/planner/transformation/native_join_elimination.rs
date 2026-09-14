@@ -215,6 +215,22 @@ fn required_children(
             collect_bindings_from_exprs(&aggregate.aggregates, &mut child_required);
             Some(only_child(&aggregate.child, child_required))
         }
+        LogicalOperator::Distinct(distinct) => {
+            let mut child_required = if distinct.distinct_targets.is_empty() {
+                // Ordinary DISTINCT compares every input column, including
+                // columns hidden by a later projection.
+                child_bindings(&distinct.child)
+            } else {
+                filter_required_bindings(required, &child_bindings(&distinct.child))
+            };
+            collect_bindings_from_exprs(&distinct.distinct_targets, &mut child_required);
+            if let Some(orders) = &distinct.order_by {
+                for order in orders {
+                    collect_bindings_from_expr(&order.expression, &mut child_required);
+                }
+            }
+            Some(only_child(&distinct.child, child_required))
+        }
         LogicalOperator::Join(Join::Comparison(join)) => {
             let left_bindings = child_bindings(&join.left);
             let right_bindings = child_bindings(&join.right);
@@ -608,6 +624,37 @@ mod tests {
     }
 
     #[test]
+    fn distinct_comparison_columns_remain_required_below_outer_projection() {
+        for target in [None, Some(0), Some(1)] {
+            let make = || {
+                let mut plan = candidate(true, false);
+                let LogicalOperator::Projection(projection) = &mut plan.operator else {
+                    unreachable!()
+                };
+                let join = std::mem::replace(
+                    &mut *projection.child,
+                    OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+                );
+                let distinct = match target {
+                    None => paro_planner::operator::Distinct::new(join),
+                    Some(side) => {
+                        paro_planner::operator::Distinct::distinct_on(vec![column(side, 0)], join)
+                    }
+                };
+                *projection.child =
+                    OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(distinct));
+                plan
+            };
+            let (_, changed) =
+                crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+            let native =
+                rewrite_shell(NativeShell::from_owned(make(), &HashMap::new()).unwrap()).unwrap();
+            assert_eq!(changed, target == Some(0));
+            assert_eq!(native.is_some(), changed);
+        }
+    }
+
+    #[test]
     fn native_shell_eliminates_unobserved_unique_outer_side() {
         let source = candidate(true, false);
         let expected_layout = source.output_layout();
@@ -727,71 +774,92 @@ mod tests {
         use paro_context::TestStatementContextBuilder;
         use paro_planner::binder::context::BindContext;
 
-        let mut input = MemoBuilder::build(
-            memo_candidate(),
-            BindContext::new(),
-            SearchBudget::default(),
-        )
-        .unwrap();
-        let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
-        let join_group = input
-            .memo
-            .logical_expr(root_expression)
-            .unwrap()
-            .key
-            .children[0];
-        let join_expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
-        let right_group = input
-            .memo
-            .logical_expr(join_expression)
-            .unwrap()
-            .key
-            .children[1];
-        let column = {
-            let state = input.planner_state.read().unwrap();
-            state
-                .binding_ids
-                .get(1, 0, &LogicalType::Integer)
-                .copied()
-                .expect("right Memo column should be interned")
-        };
-        input
-            .memo
-            .group_mut(right_group)
-            .unwrap()
-            .logical_properties
-            .unique_keys
-            .insert(vec![column].into_boxed_slice());
+        for wrapped in [false, true] {
+            let plan = if wrapped {
+                OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+                    20,
+                    OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(
+                        paro_planner::operator::Distinct::new(memo_candidate()),
+                    )),
+                    vec![column(10, 0)],
+                )))
+            } else {
+                memo_candidate()
+            };
+            let mut input =
+                MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+            let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+            let mut join_group = input
+                .memo
+                .logical_expr(root_expression)
+                .unwrap()
+                .key
+                .children[0];
+            if wrapped {
+                for _ in 0..2 {
+                    let expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
+                    join_group = input.memo.logical_expr(expression).unwrap().key.children[0];
+                }
+            }
+            let join_expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
+            let right_group = input
+                .memo
+                .logical_expr(join_expression)
+                .unwrap()
+                .key
+                .children[1];
+            let column = {
+                let state = input.planner_state.read().unwrap();
+                state
+                    .binding_ids
+                    .get(1, 0, &LogicalType::Integer)
+                    .copied()
+                    .expect("right Memo column should be interned")
+            };
+            input
+                .memo
+                .group_mut(right_group)
+                .unwrap()
+                .logical_properties
+                .unique_keys
+                .insert(vec![column].into_boxed_slice());
 
-        let state = input.planner_state.clone();
-        state.write().unwrap().session = Some(TestStatementContextBuilder::minimal().build());
-        let binding = {
-            let state_read = state.read().unwrap();
-            matching::scoped_pattern_bindings(
-                PlannerTransformation::JoinElimination,
-                input.root,
-                root_expression,
-                &input.memo,
-                &state_read,
-                None,
-                BudgetDimension::RuleWorkPerGroup,
-            )
-            .unwrap()
-            .bindings
-            .first()
-            .cloned()
-            .expect("outer join path should produce a binding")
-        };
-        let rule = PlannerTransformationRule {
-            transformation: PlannerTransformation::JoinElimination,
-            planner_state: state,
-        };
-        let mut context = TransformContext::new(&mut input.memo, input.root);
-        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
-        assert_eq!(
-            outputs.len(),
-            1,
-            "a complete native elimination must not stage the same owned peer"
-        );
+            let state = input.planner_state.clone();
+            state.write().unwrap().session = Some(TestStatementContextBuilder::minimal().build());
+            let binding = {
+                let state_read = state.read().unwrap();
+                matching::scoped_pattern_bindings(
+                    PlannerTransformation::JoinElimination,
+                    input.root,
+                    root_expression,
+                    &input.memo,
+                    &state_read,
+                    None,
+                    BudgetDimension::RuleWorkPerGroup,
+                )
+                .unwrap()
+                .bindings
+                .first()
+                .cloned()
+                .expect("outer join path should produce a binding")
+            };
+            let rule = PlannerTransformationRule {
+                transformation: PlannerTransformation::JoinElimination,
+                planner_state: state,
+            };
+            let mut context = TransformContext::new(&mut input.memo, input.root);
+            let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
+            let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+            assert_eq!(
+                outputs.len(),
+                1,
+                "a complete native elimination must not stage the same owned peer"
+            );
+            assert_eq!(
+                super::super::semantic_plan::owned_binding_instantiation_count(),
+                bridges,
+                "selected DISTINCT ancestor must not force owned construction"
+            );
+        }
     }
 }
