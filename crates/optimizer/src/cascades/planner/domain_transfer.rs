@@ -14,6 +14,7 @@ use super::*;
 use crate::expression::traversal::visit_expression;
 use crate::filter::pushdown::FilterPushdown;
 use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
+use std::collections::BTreeSet;
 #[cfg(test)]
 #[path = "domain_transfer_tests.rs"]
 mod tests;
@@ -35,6 +36,131 @@ pub(super) struct OperatorDomainTransfer {
     /// Residuals whose necessary-domain coverage is not established. They
     /// must not be certified as a legal barrier merely because routing stops.
     pub(super) unsupported: bool,
+}
+
+/// The immutable context in which a necessary-domain request was derived.
+///
+/// A domain is not identified by its predicate text alone.  The same
+/// expression can be safe for one relation occurrence and unsafe for another,
+/// and a fact/statistics update must reopen a previously completed local
+/// propagation.  `binding_facts` covers the complete observed binding DAG;
+/// the two group fingerprints retain the cheap, separately inspectable roots
+/// for callers that only consume one facet.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct DomainFactContext {
+    pub(super) relation: GroupId,
+    pub(super) occurrence: LogicalExprId,
+    pub(super) context: OptimizationContextId,
+    pub(super) logical_facts: Fingerprint,
+    pub(super) statistics: Fingerprint,
+    pub(super) binding_facts: Fingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DomainVisit {
+    context: DomainFactContext,
+    path: Box<[usize]>,
+    predicate: Fingerprint,
+}
+
+/// A request-local fixed point for a selected domain route.
+///
+/// This is deliberately not a Memo cache.  It lives for one exact native
+/// closure, records only successful landing points, and supports transactional
+/// rollback for speculative parent routes.  A new fact snapshot therefore
+/// starts with an empty set; no result can leak across statements, contexts or
+/// fact epochs.
+#[derive(Debug, Clone)]
+pub(super) struct DomainFixedPoint {
+    context: DomainFactContext,
+    seen: BTreeSet<DomainVisit>,
+    order: Vec<DomainVisit>,
+}
+
+impl Default for DomainFixedPoint {
+    fn default() -> Self {
+        Self::new(DomainFactContext {
+            relation: GroupId::new(0),
+            occurrence: LogicalExprId::new(0),
+            context: OptimizationContextId::INVALID,
+            logical_facts: Fingerprint::default(),
+            statistics: Fingerprint::default(),
+            binding_facts: Fingerprint::default(),
+        })
+    }
+}
+
+impl DomainFixedPoint {
+    pub(super) fn new(context: DomainFactContext) -> Self {
+        Self {
+            context,
+            seen: BTreeSet::new(),
+            order: Vec::new(),
+        }
+    }
+
+    pub(super) fn root_relation(&self) -> GroupId {
+        self.context.relation
+    }
+
+    fn visit(&self, relation: GroupId, path: &[usize], predicate: &Expression) -> DomainVisit {
+        let mut context = self.context.clone();
+        context.relation = relation;
+        DomainVisit {
+            context,
+            path: path.into(),
+            predicate: normalized_domain_identity(predicate),
+        }
+    }
+
+    pub(super) fn is_seen(
+        &self,
+        relation: GroupId,
+        path: &[usize],
+        predicate: &Expression,
+    ) -> bool {
+        self.seen.contains(&self.visit(relation, path, predicate))
+    }
+
+    /// Record only a successfully consumed predicate.  A failed/unsupported
+    /// route must never enter the fixed point, because doing so would turn an
+    /// unknown boundary into a false completion proof.
+    pub(super) fn record(&mut self, relation: GroupId, path: &[usize], predicate: &Expression) {
+        let visit = self.visit(relation, path, predicate);
+        if self.seen.insert(visit.clone()) {
+            self.order.push(visit);
+        }
+    }
+
+    pub(super) fn checkpoint(&self) -> usize {
+        self.order.len()
+    }
+
+    pub(super) fn rollback(&mut self, checkpoint: usize) {
+        while self.order.len() > checkpoint {
+            let visit = self
+                .order
+                .pop()
+                .expect("domain fixed-point length checked");
+            self.seen.remove(&visit);
+        }
+    }
+}
+
+/// Stable identity of the normalized domain expression.  This is intentionally
+/// finite and syntax-directed: no DNF expansion or guessed implication is
+/// performed here; semantic weakening remains the responsibility of the
+/// transfer contract above/below this helper.
+pub(super) fn normalized_domain_identity(expression: &Expression) -> Fingerprint {
+    let mut normalized = expression.clone();
+    crate::expression::scalar_normalizer()
+        .rewrite_expression(&mut normalized, &LogicalOperator::DummyScan);
+    let mut fingerprint = StableFingerprintBuilder::default();
+    fingerprint.write_bytes(b"paro.necessary-domain.v1");
+    fingerprint.write_fingerprint(crate::cascades::scalar_lowering::expression_fingerprint(
+        &normalized,
+    ));
+    fingerprint.finish()
 }
 
 impl OperatorDomainTransfer {

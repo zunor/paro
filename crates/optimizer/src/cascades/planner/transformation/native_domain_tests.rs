@@ -429,7 +429,15 @@ fn native_domain_journal_rolls_back_speculative_nodes_and_operators() {
     let mut layouts = shell.layouts().unwrap();
     let mut nodes = shell.nodes.into_vec();
     let mut journal = NativeRewriteJournal::default();
-    let checkpoint = journal.checkpoint(&nodes, &layouts);
+    let mut fixed_point = domain_transfer::DomainFixedPoint::default();
+    let checkpoint = journal.checkpoint(&nodes, &layouts, &fixed_point);
+    let relation = match &input {
+        NativeChild::MemoGroup { group, .. } => *group,
+        NativeChild::Node(_) | NativeChild::Group { .. } => fixed_point.root_relation(),
+    };
+    let predicate = equal(10, 0);
+    fixed_point.record(relation, &[], &predicate);
+    assert!(fixed_point.is_seen(relation, &[], &predicate));
 
     journal.record_operator(&nodes, original_root);
     nodes[original_root].operator = LogicalOperator::DummyScan;
@@ -446,13 +454,63 @@ fn native_domain_journal_rolls_back_speculative_nodes_and_operators() {
     .unwrap();
 
     assert!(nodes.len() > checkpoint.node_len);
-    journal.rollback(&mut nodes, &mut layouts, checkpoint);
+    journal.rollback(&mut nodes, &mut layouts, &mut fixed_point, checkpoint);
     assert_eq!(nodes.len(), checkpoint.node_len);
     assert_eq!(layouts.len(), checkpoint.layout_len);
+    assert!(!fixed_point.is_seen(relation, &[], &predicate));
     assert!(matches!(
         nodes[original_root].operator,
         LogicalOperator::Filter(_)
     ));
+}
+
+#[test]
+fn native_domain_fixed_point_does_not_reinstall_an_exact_landing_filter() {
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        boundary(1, 0, &[7]),
+        vec![equal(10, 0)],
+    )));
+    let shell = native(plan);
+    let root = shell.root;
+    let input = match &shell.nodes[root].operator {
+        LogicalOperator::Filter(filter) => filter.child.clone(),
+        _ => panic!("test fixture root should be a filter"),
+    };
+    let mut layouts = shell.layouts().unwrap();
+    let mut nodes = shell.nodes.into_vec();
+    let mut journal = NativeRewriteJournal::default();
+    let mut fixed_point = domain_transfer::DomainFixedPoint::default();
+    let state = state();
+    let state = state.read().unwrap();
+    let predicate = equal(10, 0);
+
+    let first = push_domain(
+        &mut nodes,
+        &mut layouts,
+        input.clone(),
+        vec![predicate.clone()],
+        &state,
+        &mut journal,
+        &mut fixed_point,
+        &[],
+    )
+    .unwrap();
+    assert!(first.moved);
+    let node_count = nodes.len();
+
+    let second = push_domain(
+        &mut nodes,
+        &mut layouts,
+        input,
+        vec![predicate],
+        &state,
+        &mut journal,
+        &mut fixed_point,
+        &[],
+    )
+    .unwrap();
+    assert!(second.moved);
+    assert_eq!(nodes.len(), node_count);
 }
 
 #[test]

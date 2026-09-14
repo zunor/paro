@@ -144,6 +144,60 @@ fn input_layout() -> LogicalOutputLayout {
     )
 }
 
+#[test]
+fn necessary_domain_fixed_point_is_scoped_by_context_facts_and_path() {
+    let predicate = eq(col(10, 0, LogicalType::Integer), int(2));
+    let context = DomainFactContext {
+        relation: GroupId::new(7),
+        occurrence: LogicalExprId::new(3),
+        context: OptimizationContextId::new(2),
+        logical_facts: Fingerprint(11),
+        statistics: Fingerprint(13),
+        binding_facts: Fingerprint(17),
+    };
+    let mut fixed_point = DomainFixedPoint::new(context.clone());
+    assert!(!fixed_point.is_seen(GroupId::new(7), &[], &predicate));
+    fixed_point.record(GroupId::new(7), &[], &predicate);
+    assert!(fixed_point.is_seen(GroupId::new(7), &[], &predicate));
+
+    // Two physical paths to the same semantic group are distinct occurrences;
+    // a result from one branch must not discharge the other branch.
+    assert!(!fixed_point.is_seen(GroupId::new(7), &[1], &predicate));
+    assert!(!fixed_point.is_seen(GroupId::new(8), &[], &predicate));
+
+    for changed in [
+        DomainFactContext {
+            logical_facts: Fingerprint(12),
+            ..context.clone()
+        },
+        DomainFactContext {
+            statistics: Fingerprint(14),
+            ..context.clone()
+        },
+        DomainFactContext {
+            context: OptimizationContextId::new(3),
+            ..context.clone()
+        },
+        DomainFactContext {
+            occurrence: LogicalExprId::new(4),
+            ..context.clone()
+        },
+        DomainFactContext {
+            binding_facts: Fingerprint(18),
+            ..context.clone()
+        },
+    ] {
+        let changed = DomainFixedPoint::new(changed);
+        assert!(!changed.is_seen(GroupId::new(7), &[], &predicate));
+    }
+
+    let checkpoint = fixed_point.checkpoint();
+    fixed_point.record(GroupId::new(7), &[2], &predicate);
+    assert!(fixed_point.is_seen(GroupId::new(7), &[2], &predicate));
+    fixed_point.rollback(checkpoint);
+    assert!(!fixed_point.is_seen(GroupId::new(7), &[2], &predicate));
+}
+
 fn dummy() -> OwnedLogicalPlan {
     OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)
 }

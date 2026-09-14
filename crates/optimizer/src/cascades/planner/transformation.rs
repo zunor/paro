@@ -566,7 +566,8 @@ impl TransformationRule for PlannerTransformationRule {
             };
             facts
         };
-        ctx.record_fact_value(facts.binding_value_fingerprint(ctx.memo(), &binding.root)?);
+        let binding_fact_value = facts.binding_value_fingerprint(ctx.memo(), &binding.root)?;
+        ctx.record_fact_value(binding_fact_value);
         let region_identity = if matches!(
             self.transformation,
             PlannerTransformation::JoinRegionEnumeration
@@ -729,6 +730,7 @@ impl TransformationRule for PlannerTransformationRule {
                         ctx.memo(),
                         &state,
                         &facts,
+                        binding_fact_value,
                     )? {
                         Some(shell) => {
                             native_domain::refresh_statistics(shell, &state, ctx.memo())?

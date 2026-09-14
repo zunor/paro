@@ -30,6 +30,7 @@ pub(super) fn try_transfer(
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
+    binding_fact_value: Fingerprint,
 ) -> Result<Option<NativeShell>> {
     let PatternOperand::Expression {
         children,
@@ -43,6 +44,12 @@ pub(super) fn try_transfer(
         .logical_expr(*expression)
         .and_then(|logical| state.payloads.logical.get(logical.payload.index()))
     else {
+        return Ok(None);
+    };
+    let Some(logical) = memo.logical_expr(*expression) else {
+        return Ok(None);
+    };
+    let Some(metadata) = state.metadata.get(&logical.payload) else {
         return Ok(None);
     };
     let LogicalOperator::Filter(filter) = &payload.semantic_template.operator else {
@@ -105,20 +112,31 @@ pub(super) fn try_transfer(
     if native_shell_contains_control_boundary(&shell) {
         return Ok(None);
     }
+    let binding_group = match binding {
+        PatternOperand::Expression { group, .. } | PatternOperand::Group(group) => *group,
+    };
+    let root_group = memo.canonical_group(binding_group);
+    let Some(root) = memo.group(root_group) else {
+        return Ok(None);
+    };
+    let mut fixed_point = domain_transfer::DomainFixedPoint::new(
+        domain_transfer::DomainFactContext {
+            relation: root_group,
+            occurrence: *expression,
+            context: metadata.input_context,
+            logical_facts: root.logical_fact_fingerprint(),
+            statistics: root.statistics_snapshot_fingerprint(),
+            binding_facts: binding_fact_value,
+        },
+    );
     let nested_path = inputs
         .iter()
         .any(|input| matches!(input, PatternOperand::Expression { .. }));
     let Some(mut shell) = (if nested_path {
-        transfer_shell_closure_with_layouts(shell, layouts, state)?
+        transfer_shell_closure_with_layouts(shell, layouts, state, &mut fixed_point)?
     } else {
         transfer_shell_with_layouts(shell, layouts, state)?
     }) else {
-        return Ok(None);
-    };
-    let Some(logical) = memo.logical_expr(*expression) else {
-        return Ok(None);
-    };
-    let Some(metadata) = state.metadata.get(&logical.payload) else {
         return Ok(None);
     };
     // Canonical templates deliberately erase occurrence output demand. Do
@@ -333,6 +351,12 @@ struct RoutedDomain {
     moved: bool,
 }
 
+fn child_path(path: &[usize], edge: usize) -> Vec<usize> {
+    let mut child = path.to_vec();
+    child.push(edge);
+    child
+}
+
 /// A cheap rollback journal for native closure construction.
 ///
 /// Predicate routing speculatively walks several alternatives.  The old
@@ -352,6 +376,7 @@ struct NativeRewriteCheckpoint {
     node_len: usize,
     layout_len: usize,
     operator_len: usize,
+    fixed_point_len: usize,
 }
 
 impl NativeRewriteJournal {
@@ -359,11 +384,13 @@ impl NativeRewriteJournal {
         &self,
         nodes: &[NativeNode],
         layouts: &[LogicalOutputLayout],
+        fixed_point: &domain_transfer::DomainFixedPoint,
     ) -> NativeRewriteCheckpoint {
         NativeRewriteCheckpoint {
             node_len: nodes.len(),
             layout_len: layouts.len(),
             operator_len: self.operators.len(),
+            fixed_point_len: fixed_point.checkpoint(),
         }
     }
 
@@ -375,6 +402,7 @@ impl NativeRewriteJournal {
         &mut self,
         nodes: &mut Vec<NativeNode>,
         layouts: &mut Vec<LogicalOutputLayout>,
+        fixed_point: &mut domain_transfer::DomainFixedPoint,
         checkpoint: NativeRewriteCheckpoint,
     ) {
         while self.operators.len() > checkpoint.operator_len {
@@ -386,6 +414,7 @@ impl NativeRewriteJournal {
         }
         nodes.truncate(checkpoint.node_len);
         layouts.truncate(checkpoint.layout_len);
+        fixed_point.rollback(checkpoint.fixed_point_len);
     }
 }
 
@@ -555,6 +584,8 @@ fn push_domain(
     predicates: Vec<Expression>,
     state: &PlannerTransformState,
     journal: &mut NativeRewriteJournal,
+    fixed_point: &mut domain_transfer::DomainFixedPoint,
+    path: &[usize],
 ) -> Result<RoutedDomain> {
     if predicates.is_empty() {
         return Ok(RoutedDomain {
@@ -563,7 +594,28 @@ fn push_domain(
             moved: false,
         });
     }
+    let relation = match &child {
+        NativeChild::MemoGroup { group, .. } => *group,
+        NativeChild::Node(_) | NativeChild::Group { .. } => fixed_point.root_relation(),
+    };
+    let fresh_predicates = predicates
+        .iter()
+        .filter(|predicate| !fixed_point.is_seen(relation, path, predicate))
+        .cloned()
+        .collect::<Vec<_>>();
+    if fresh_predicates.is_empty() {
+        // The exact landing point already consumed this request in the same
+        // immutable shell.  Treat it as moved so callers do not reinstall a
+        // residual filter, but do not manufacture another node.
+        return Ok(RoutedDomain {
+            child,
+            remaining: Vec::new(),
+            moved: true,
+        });
+    }
+    let predicates = fresh_predicates;
     let NativeChild::Node(index) = child.clone() else {
+        let recorded_predicates = predicates.clone();
         let child = add_native_filter(
             nodes,
             layouts,
@@ -572,6 +624,9 @@ fn push_domain(
             paro_planner::operator::ProjectionMap::all(),
             state,
         )?;
+        for predicate in &recorded_predicates {
+            fixed_point.record(relation, path, predicate);
+        }
         return Ok(RoutedDomain {
             child,
             remaining: Vec::new(),
@@ -596,11 +651,30 @@ fn push_domain(
         {
             let original_predicates = predicates.clone();
             if matches!(filter.child, NativeChild::MemoGroup { .. }) {
+                let landing_path = child_path(path, 0);
+                let landing_relation = match &filter.child {
+                    NativeChild::MemoGroup { group, .. } => *group,
+                    NativeChild::Node(_) | NativeChild::Group { .. } => relation,
+                };
+                let landing_predicates = predicates
+                    .iter()
+                    .filter(|predicate| {
+                        !fixed_point.is_seen(landing_relation, &landing_path, predicate)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if landing_predicates.is_empty() {
+                    return Ok(RoutedDomain {
+                        child,
+                        remaining: Vec::new(),
+                        moved: true,
+                    });
+                }
                 let layout = native_child_layout(&filter.child, layouts)?;
                 let transfer = domain_transfer::transfer_predicates(
                     &LogicalOperator::Filter(filter.clone()),
                     &[&layout],
-                    &predicates,
+                    &landing_predicates,
                 );
                 if transfer.as_ref().is_some_and(|transfer| {
                     !transfer.unsupported && transfer.remaining.is_empty()
@@ -610,7 +684,7 @@ fn push_domain(
                     // combine the new restriction with the existing filter
                     // before publishing any intermediate stacked filters.
                     let mut combined = filter.expressions.clone();
-                    combined.extend(predicates);
+                    combined.extend(landing_predicates.iter().cloned());
                     let Some(combined) = FilterPushdown::normalize_predicates(combined) else {
                         return Ok(RoutedDomain {
                             child,
@@ -621,6 +695,9 @@ fn push_domain(
                     filter.expressions = combined;
                     journal.record_operator(nodes, index);
                     nodes[index].operator = LogicalOperator::Filter(filter);
+                    for predicate in &landing_predicates {
+                        fixed_point.record(landing_relation, &landing_path, predicate);
+                    }
                     return Ok(RoutedDomain {
                         child,
                         remaining: Vec::new(),
@@ -635,7 +712,7 @@ fn push_domain(
             // the source candidate.  This is especially important when the
             // child is an Aggregate: group-key predicates may move, while an
             // aggregate-result residual must remain above that boundary.
-            let checkpoint = journal.checkpoint(nodes, layouts);
+            let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
             let routed = push_domain(
                 nodes,
                 layouts,
@@ -643,9 +720,11 @@ fn push_domain(
                 predicates,
                 state,
                 journal,
+                fixed_point,
+                &child_path(path, 0),
             )?;
             if !routed.moved {
-                journal.rollback(nodes, layouts, checkpoint);
+                journal.rollback(nodes, layouts, fixed_point, checkpoint);
                 return Ok(RoutedDomain {
                     child,
                     remaining: original_predicates,
@@ -655,7 +734,7 @@ fn push_domain(
             let mut expressions = filter.expressions.to_vec();
             expressions.extend(routed.remaining);
             let Some(expressions) = FilterPushdown::normalize_predicates(expressions) else {
-                journal.rollback(nodes, layouts, checkpoint);
+                journal.rollback(nodes, layouts, fixed_point, checkpoint);
                 return Ok(RoutedDomain {
                     child,
                     remaining: original_predicates,
@@ -692,7 +771,7 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 };
-                let checkpoint = journal.checkpoint(nodes, layouts);
+                let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let routed = push_domain(
                     nodes,
                     layouts,
@@ -700,12 +779,14 @@ fn push_domain(
                     vec![predicate],
                     state,
                     journal,
+                    fixed_point,
+                    &child_path(path, 0),
                 )?;
                 if routed.moved && routed.remaining.is_empty() {
                     projection.child = routed.child;
                     moved = true;
                 } else {
-                    journal.rollback(nodes, layouts, checkpoint);
+                    journal.rollback(nodes, layouts, fixed_point, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
@@ -730,7 +811,7 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 };
-                let checkpoint = journal.checkpoint(nodes, layouts);
+                let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let routed = push_domain(
                     nodes,
                     layouts,
@@ -738,6 +819,8 @@ fn push_domain(
                     vec![predicate],
                     state,
                     journal,
+                    fixed_point,
+                    &child_path(path, 0),
                 )?;
                 if routed.moved && routed.remaining.is_empty() {
                     aggregate.child = routed.child;
@@ -746,7 +829,7 @@ fn push_domain(
                         remaining.push(original_predicate);
                     }
                 } else {
-                    journal.rollback(nodes, layouts, checkpoint);
+                    journal.rollback(nodes, layouts, fixed_point, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
@@ -793,7 +876,7 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 };
-                let checkpoint = journal.checkpoint(nodes, layouts);
+                let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let left = push_domain(
                     nodes,
                     layouts,
@@ -801,6 +884,8 @@ fn push_domain(
                     vec![left_predicate],
                     state,
                     journal,
+                    fixed_point,
+                    &child_path(path, 0),
                 )?;
                 let right = push_domain(
                     nodes,
@@ -809,6 +894,8 @@ fn push_domain(
                     vec![right_predicate],
                     state,
                     journal,
+                    fixed_point,
+                    &child_path(path, 1),
                 )?;
                 if left.moved
                     && left.remaining.is_empty()
@@ -819,7 +906,7 @@ fn push_domain(
                     setop.right = right.child;
                     moved = true;
                 } else {
-                    journal.rollback(nodes, layouts, checkpoint);
+                    journal.rollback(nodes, layouts, fixed_point, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
@@ -862,7 +949,7 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 }
-                let checkpoint = journal.checkpoint(nodes, layouts);
+                let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let routed = if left_side {
                     push_domain(
                         nodes,
@@ -871,6 +958,8 @@ fn push_domain(
                         vec![original_predicate.clone()],
                         state,
                         journal,
+                        fixed_point,
+                        &child_path(path, 0),
                     )?
                 } else {
                     push_domain(
@@ -880,6 +969,8 @@ fn push_domain(
                         vec![original_predicate.clone()],
                         state,
                         journal,
+                        fixed_point,
+                        &child_path(path, 1),
                     )?
                 };
                 if routed.moved && routed.remaining.is_empty() {
@@ -890,7 +981,7 @@ fn push_domain(
                     }
                     moved = true;
                 } else {
-                    journal.rollback(nodes, layouts, checkpoint);
+                    journal.rollback(nodes, layouts, fixed_point, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
@@ -928,7 +1019,7 @@ fn push_domain(
                     remaining.push(original_predicate);
                     continue;
                 }
-                let checkpoint = journal.checkpoint(nodes, layouts);
+                let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let routed = if left_side {
                     push_domain(
                         nodes,
@@ -937,6 +1028,8 @@ fn push_domain(
                         vec![original_predicate.clone()],
                         state,
                         journal,
+                        fixed_point,
+                        &child_path(path, 0),
                     )?
                 } else {
                     push_domain(
@@ -946,6 +1039,8 @@ fn push_domain(
                         vec![original_predicate.clone()],
                         state,
                         journal,
+                        fixed_point,
+                        &child_path(path, 1),
                     )?
                 };
                 if routed.moved && routed.remaining.is_empty() {
@@ -956,7 +1051,7 @@ fn push_domain(
                     }
                     moved = true;
                 } else {
-                    journal.rollback(nodes, layouts, checkpoint);
+                    journal.rollback(nodes, layouts, fixed_point, checkpoint);
                     remaining.push(original_predicate);
                 }
             }
@@ -990,13 +1085,15 @@ fn transfer_shell_closure(
     state: &PlannerTransformState,
 ) -> Result<Option<NativeShell>> {
     let layouts = shell.layouts()?;
-    transfer_shell_closure_with_layouts(shell, layouts, state)
+    let mut fixed_point = domain_transfer::DomainFixedPoint::default();
+    transfer_shell_closure_with_layouts(shell, layouts, state, &mut fixed_point)
 }
 
 fn transfer_shell_closure_with_layouts(
     shell: NativeShell,
     mut layouts: Vec<LogicalOutputLayout>,
     state: &PlannerTransformState,
+    fixed_point: &mut domain_transfer::DomainFixedPoint,
 ) -> Result<Option<NativeShell>> {
     let LogicalOperator::Filter(filter) = shell.root_operator().clone() else {
         return Ok(None);
@@ -1022,6 +1119,8 @@ fn transfer_shell_closure_with_layouts(
         predicates,
         state,
         &mut journal,
+        fixed_point,
+        &[],
     )?;
     if !routed.moved {
         return Ok(None);
