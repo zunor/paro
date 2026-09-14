@@ -306,6 +306,16 @@ change. This does not remove a previously legal rewrite or certify global search
 completion. Thirteen native tests, five reference tests and 111 engine tests
 passed on the mixed tree; no performance/fingerprint or full SQL run was made.
 
+ExternalProject and ExternalTable now share the explicit non-traversal contract
+with RowFetch. The reference rule already leaves these boundaries untouched;
+native rejection no longer constructs an owned tree just to rediscover that
+negative. The external-table fixture includes lateral and parameterized input.
+Both the reference/native barrier check and production bridge audit failed
+before the change. Thirteen native tests (twenty wrapper/uniqueness cases),
+five reference and 111 engine tests now pass, including fact-update retries.
+These synthetic external fixtures validate planning, not external execution.
+No budget/model/policy changes or new Q11 performance evidence are claimed.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
