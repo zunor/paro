@@ -391,6 +391,18 @@ pub struct RootDispatch {
     pub reads: Box<[PatternRead]>,
 }
 
+/// A binding-local, fail-closed result that can be established from the
+/// immutable binding and already-observed Memo facts before entering a rule's
+/// construction transaction.  `NoOutput` is deliberately weaker than an
+/// output identity: it may suppress only a binding which the rule can prove
+/// cannot produce any legal alternative.  Rules which cannot make that proof
+/// must return `Continue` and keep the authoritative apply path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformationPreflight {
+    Continue,
+    NoOutput,
+}
+
 type TransformationRollback = Box<dyn FnOnce() -> Result<()> + 'static>;
 
 pub struct TransformContext<'a> {
@@ -653,6 +665,19 @@ pub trait TransformationRule: Send + Sync {
             matches: self.matches_root(expr),
             reads: Box::new([]),
         })
+    }
+
+    /// Perform a conservative binding-local check before allocating the
+    /// rule's construction transaction.  This is not a semantic recognizer or
+    /// an output identity: `NoOutput` is valid only when the exact binding
+    /// cannot produce a legal result without inspecting any additional Memo
+    /// alternative.  The default preserves the complete rule path.
+    fn preflight_binding(
+        &self,
+        _binding: &PatternBinding,
+        _ctx: &RuleContext<'_>,
+    ) -> Result<TransformationPreflight> {
+        Ok(TransformationPreflight::Continue)
     }
 
     /// Maximum number of alternatives one firing may publish. Local rewrite

@@ -34,7 +34,7 @@ use crate::cascades::rules::{
     DomainProofId, EquivalentExpression, EvaluationOccurrenceId, GrantDependencyDescriptor,
     PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PhysicalImplementation,
     QualityDependency, RulePromise, SidewaysFilterSource, TransformationBudgetClass,
-    TransformationRule,
+    TransformationPreflight, TransformationRule,
 };
 use crate::cascades::tasks::TaskState;
 use crate::physical::ObjectiveProfile;
@@ -422,6 +422,74 @@ impl TransformationRule for AddEquivalent {
         }]
         .into_boxed_slice())
     }
+}
+
+struct PreflightNoOutputRule {
+    apply_calls: Arc<AtomicUsize>,
+}
+
+impl TransformationRule for PreflightNoOutputRule {
+    fn id(&self) -> RuleId {
+        RuleId(55)
+    }
+
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
+        expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
+    }
+
+    fn preflight_binding(
+        &self,
+        _: &PatternBinding,
+        _: &RuleContext<'_>,
+    ) -> Result<TransformationPreflight> {
+        Ok(TransformationPreflight::NoOutput)
+    }
+
+    fn apply(
+        &self,
+        _: LogicalExprId,
+        _: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        self.apply_calls.fetch_add(1, Ordering::Relaxed);
+        unreachable!("a proven no-output binding must not enter rule construction")
+    }
+}
+
+#[test]
+fn binding_preflight_skips_rule_construction_transaction() {
+    let (mut engine, group, goal) = engine(8);
+    let apply_calls = Arc::new(AtomicUsize::new(0));
+    engine
+        .registry
+        .register_transformation(PreflightNoOutputRule {
+            apply_calls: Arc::clone(&apply_calls),
+        })
+        .unwrap();
+    engine.set_rule_work_profile_enabled(true);
+
+    let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+
+    assert_eq!(winner.physical_fingerprint, Fingerprint(11));
+    assert_eq!(apply_calls.load(Ordering::Relaxed), 0);
+    let profile = engine
+        .rule_work_profile()
+        .get(&RuleId(55))
+        .expect("preflight rule should be profiled");
+    assert_eq!(profile.rejected, 1);
+    assert_eq!(
+        profile
+            .rejection_guards
+            .iter()
+            .find(|(guard, _)| {
+                *guard == crate::transformation_rejection::TransformationRejectionGuard::NoOutput
+            })
+            .map(|(_, count)| count),
+        Some(1)
+    );
 }
 
 struct QualityLaneRule;

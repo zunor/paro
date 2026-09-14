@@ -75,6 +75,7 @@ use super::rules::{
     PatternBindingSet, PatternEnumerationCompletion, PatternOperand, PatternRead,
     PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof, SourceWork,
     SourceWorkData, TaskSupplyContract, TransformContext, TransformationRule,
+    TransformationPreflight,
 };
 use super::tasks::{
     BoundContext, BoundProofId, BoundProofKind, Cursor, ReadSet, StopReason, TaskId, TaskIntent,
@@ -4845,15 +4846,88 @@ impl CascadesEngine {
                     continue;
                 }
                 *self.rule_attempts.entry(rule).or_default() += 1;
-                // The context owns the complete attempt. Its Memo snapshot is
-                // lazy, and rule-specific side state enlists in the same rollback
-                // domain before its first write.
+                // A planner rule may prove that this exact binding has no
+                // legal output from its immutable shape alone.  Run that
+                // proof after the normal fire/output reservations (so budget
+                // accounting and retry semantics remain unchanged), but
+                // before constructing a TransformContext or any rule-owned
+                // shell.  The binding read set is retained below, therefore
+                // a later child/fact revision still wakes and retries it.
                 let task_lifecycle_enabled = self.collect_rule_work_profile
                     && self
                         .registry
                         .transformation(rule)
                         .is_some_and(|rule| rule.quality_dependency().is_some());
                 let task_lifecycle_started_at = self.profile_started_at;
+                let preflight = {
+                    let rule_impl = self
+                        .registry
+                        .transformation(rule)
+                        .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
+                    let context = RuleContext {
+                        memo: &self.memo,
+                        group,
+                    };
+                    rule_impl.preflight_binding(binding, &context)?
+                };
+                if preflight == TransformationPreflight::NoOutput {
+                    if self.collect_rule_work_profile {
+                        let mut reasons =
+                            crate::transformation_rejection::RejectionReasons::default();
+                        reasons.record(
+                            crate::transformation_rejection::TransformationRejectionGuard::NoOutput,
+                        );
+                        self.rule_work_profile
+                            .entry(rule)
+                            .or_default()
+                            .rejection_guards
+                            .record(reasons);
+                        self.rule_work_profile.entry(rule).or_default().rejected = self
+                            .rule_work_profile
+                            .get(&rule)
+                            .map_or(1, |profile| profile.rejected.saturating_add(1));
+                    }
+                    let lifecycle_reads = task_lifecycle_enabled.then(|| {
+                        ReadSet::new(
+                            binding_set
+                                .reads
+                                .iter()
+                                .copied()
+                                .chain(application_reads.iter().copied()),
+                        )
+                    });
+                    let mut observed = binding_set.reads.to_vec();
+                    observed.extend(application_reads.iter().copied());
+                    self.seed_transformation_observation(task_id, &observed)?;
+                    Self::note_transformation_task_at(
+                        &mut self.search_milestones,
+                        task_id,
+                        TransformationTaskLifecyclePhase::NoOutput,
+                        lifecycle_reads.as_ref().map(ReadSet::reads),
+                        Some(binding.fingerprint),
+                        1,
+                        Self::lifecycle_elapsed_from(task_lifecycle_started_at),
+                    );
+                    self.transformation_applications
+                        .entry(application_key)
+                        .or_default()
+                        .push(BindingApplication {
+                            binding: binding.clone(),
+                            reads: application_reads.into_boxed_slice(),
+                            fact_value: None,
+                        });
+                    release_transformation_output_reservations(
+                        &mut self.memo,
+                        group,
+                        &output_events,
+                        output_dimension,
+                    )?;
+                    self.complete_transformation_task(transformation_task)?;
+                    continue;
+                }
+                // The context owns the complete attempt. Its Memo snapshot is
+                // lazy, and rule-specific side state enlists in the same rollback
+                // domain before its first write.
                 let mut context = TransformContext::new(&mut self.memo, group);
                 context.rejection_reasons = self
                     .collect_rule_work_profile

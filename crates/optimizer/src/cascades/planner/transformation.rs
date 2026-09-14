@@ -412,6 +412,29 @@ impl TransformationRule for PlannerTransformationRule {
         })
     }
 
+    fn preflight_binding(
+        &self,
+        binding: &PatternBinding,
+        ctx: &RuleContext<'_>,
+    ) -> Result<TransformationPreflight> {
+        // This hook is intentionally limited to the existing structural
+        // no-output proof.  It does not inspect estimates, choose a winner,
+        // or treat a missing fact as a negative result.  Moving the proof
+        // before the construction transaction only removes work which the
+        // authoritative apply path would immediately reject; every uncertain
+        // shape continues through that path unchanged.
+        if binding_is_structurally_impossible(
+            self.transformation,
+            binding,
+            ctx.memo,
+            &self.planner_state,
+        )? {
+            Ok(TransformationPreflight::NoOutput)
+        } else {
+            Ok(TransformationPreflight::Continue)
+        }
+    }
+
     fn promise(
         &self,
         _expr: &crate::cascades::memo::LogicalExpr,
@@ -543,28 +566,6 @@ impl TransformationRule for PlannerTransformationRule {
             facts
         };
         ctx.record_fact_value(facts.binding_value_fingerprint(ctx.memo(), &binding.root)?);
-        // Pattern enumeration intentionally leaves unrelated Memo groups as
-        // opaque holes.  A legacy owned rewrite cannot discover a rule
-        // witness behind such a hole, so reject only bindings which are
-        // missing a necessary node in their *selected* shell.  This is a
-        // fail-closed preflight: it does not inspect estimates, choose a
-        // winner, or replace the rule's semantic recognizer.  Its purpose is
-        // to avoid importing/settling an owned tree which is guaranteed to
-        // return no output.  Keep the boundary snapshot and fact value above
-        // the fast return so the ordinary no-output path retains its exact
-        // invalidation and wake-up reads.
-        if binding_is_structurally_impossible(
-            self.transformation,
-            binding,
-            ctx.memo(),
-            &self.planner_state,
-        )? {
-            crate::transformation_rejection::reject::<()>(
-                &mut ctx.rejection_reasons,
-                crate::transformation_rejection::TransformationRejectionGuard::NoOutput,
-            );
-            return Ok(Box::new([]));
-        }
         let region_identity = if matches!(
             self.transformation,
             PlannerTransformation::JoinRegionEnumeration

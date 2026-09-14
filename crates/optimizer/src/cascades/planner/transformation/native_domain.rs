@@ -90,7 +90,14 @@ pub(super) fn try_transfer(
     if !supported {
         return Ok(None);
     }
-    let Some(shell) = NativeShell::from_pattern(memo, state, binding, facts)? else {
+    // `from_pattern_with_layouts` already computes the exact layouts needed by
+    // both routing and the closure walker.  Reusing that immutable vector is
+    // important here: rebuilding the same post-order layout in
+    // `transfer_shell` used to make every domain binding pay for a second
+    // traversal before any semantic work began.
+    let Some((shell, layouts)) =
+        NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
+    else {
         return Ok(None);
     };
     // This subset moves only within a producer. An opaque ownership/graph
@@ -102,9 +109,9 @@ pub(super) fn try_transfer(
         .iter()
         .any(|input| matches!(input, PatternOperand::Expression { .. }));
     let Some(mut shell) = (if nested_path {
-        transfer_shell_closure(shell, state)?
+        transfer_shell_closure_with_layouts(shell, layouts, state)?
     } else {
-        transfer_shell(shell, state)?
+        transfer_shell_with_layouts(shell, layouts, state)?
     }) else {
         return Ok(None);
     };
@@ -152,11 +159,22 @@ pub(super) fn try_transfer(
     Ok(Some(shell))
 }
 
+/// Test-facing compatibility wrapper. Production callers should pass the
+/// layouts returned by `NativeShell::from_pattern_with_layouts` so the exact
+/// same shell is not walked twice.
 pub(super) fn transfer_shell(
     shell: NativeShell,
     state: &PlannerTransformState,
 ) -> Result<Option<NativeShell>> {
     let layouts = shell.layouts()?;
+    transfer_shell_with_layouts(shell, layouts, state)
+}
+
+fn transfer_shell_with_layouts(
+    shell: NativeShell,
+    layouts: Vec<LogicalOutputLayout>,
+    state: &PlannerTransformState,
+) -> Result<Option<NativeShell>> {
     let LogicalOperator::Filter(filter) = shell.root_operator().clone() else {
         return Ok(None);
     };
@@ -965,11 +983,21 @@ fn push_domain(
 /// ordinary one-hop producer: callers must supply a selected path, so the
 /// implementation never expands a whole child frontier or manufactures a
 /// second optimizer. Every opaque leaf remains the original Memo group hole.
+/// Test-facing compatibility wrapper for the closure helper. The production
+/// path uses the already-computed layouts from the pattern lowering pass.
 fn transfer_shell_closure(
     shell: NativeShell,
     state: &PlannerTransformState,
 ) -> Result<Option<NativeShell>> {
-    let mut layouts = shell.layouts()?;
+    let layouts = shell.layouts()?;
+    transfer_shell_closure_with_layouts(shell, layouts, state)
+}
+
+fn transfer_shell_closure_with_layouts(
+    shell: NativeShell,
+    mut layouts: Vec<LogicalOutputLayout>,
+    state: &PlannerTransformState,
+) -> Result<Option<NativeShell>> {
     let LogicalOperator::Filter(filter) = shell.root_operator().clone() else {
         return Ok(None);
     };
