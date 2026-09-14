@@ -2500,6 +2500,7 @@ fn native_materialize_candidate(
         *expression = native_replace_known_bindings(expression, &binding_map);
     }
     reset_native_aggregate_output(&mut rewritten_aggregate);
+    rewritten_aggregate.verify_post_reduction()?;
     let rewritten_aggregate = LogicalOperator::Aggregate(Box::new(rewritten_aggregate));
     let root_layout = rewritten_aggregate.output_layout_from_child_refs(&[&layouts[root_join_index]]);
     nodes[root_index].operator = rewritten_aggregate;
@@ -2509,11 +2510,11 @@ fn native_materialize_candidate(
 }
 
 /// Native subset of AggregateInputMaterialization. The matched root must be
-/// a plain aggregate over an inner join; placement follows the exact selected
+/// an aggregate over an inner join; placement follows the exact selected
 /// inner-join spine without expanding any opaque Memo inputs. Each input
 /// has its own placement/liveness proof; rejected inputs stay at the original
-/// evaluation site, exactly as in the semantic producer. Unsupported aggregate
-/// roots still require the remaining migration.
+/// evaluation site, exactly as in the semantic producer. Opaque control
+/// ownership and full negative-path coverage still require the remaining migration.
 fn try_native_input_materialization(
     binding: &PatternOperand,
     memo: &Memo,
@@ -2536,11 +2537,13 @@ fn try_native_input_materialization(
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator().clone() else {
         return Ok(None);
     };
-    if aggregate.post_reduction.is_some()
-        || !aggregate.has_plain_grouping_domain()
-    {
-        return Ok(None);
-    }
+    // Materialization preserves the aggregate input bag and does not change
+    // grouping-set ordinals or GROUPING outputs. Its proof depends on scalar
+    // totality/liveness and join placement, not on having a nonempty, plain
+    // grouping domain. Post-reduction expressions refer to unchanged aggregate
+    // outputs, not the remapped input namespace; validate the same contract
+    // before and after rewriting, without constructing an owned adapter.
+    aggregate.verify_post_reduction()?;
     let NativeChild::Node(join_index) = aggregate.child.clone() else {
         return Ok(None);
     };

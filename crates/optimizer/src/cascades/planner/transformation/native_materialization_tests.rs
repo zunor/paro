@@ -91,6 +91,68 @@ fn materialized_count<Child>(operator: &LogicalOperator<Child>) -> usize {
         .count()
 }
 
+fn grouping_plan(blocked_first: bool, grouping: usize) -> OwnedLogicalPlan {
+    let mut plan = plan(blocked_first);
+    let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+        unreachable!()
+    };
+    match grouping {
+        0 => {}
+        1 => aggregate.groups.clear(),
+        2 => {
+            aggregate.grouping_sets = vec![
+                paro_planner::operator::aggregate::GroupingSet {
+                    expressions: vec![0],
+                },
+                paro_planner::operator::aggregate::GroupingSet {
+                    expressions: vec![],
+                },
+            ];
+            aggregate.grouping_functions = vec![vec![0]];
+        }
+        3 => {
+            use paro_planner::expression::{
+                ComparisonExpression, ComparisonType, ReferenceExpression,
+            };
+            let (max, _) = paro_function::aggregate::distributive::minmax::get_max_function()
+                .bind(&[LogicalType::BigInt])
+                .unwrap();
+            let output = Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(11, 0), LogicalType::BigInt).into(),
+            );
+            aggregate.post_reduction =
+                Some(paro_planner::operator::aggregate::PostAggregateReduction {
+                    reduction_index: 15,
+                    reducers: vec![Expression::Aggregate(
+                        AggregateExpression::new(max, vec![output.clone()], LogicalType::BigInt)
+                            .into(),
+                    )],
+                    scalar_expressions: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::BigInt).into(),
+                    )],
+                    predicate: Expression::Comparison(
+                        ComparisonExpression::new(
+                            ComparisonType::Equal,
+                            output,
+                            Expression::ColumnRef(
+                                ColumnRefExpression::new(
+                                    ColumnBinding::new(15, 0),
+                                    LogicalType::BigInt,
+                                )
+                                .into(),
+                            ),
+                        )
+                        .into(),
+                    ),
+                });
+            aggregate.verify_post_reduction().unwrap();
+        }
+        _ => unreachable!(),
+    }
+    aggregate.recompute_returned_types();
+    plan
+}
+
 fn nested_plan(target_left: bool, blocked: bool, outer_left: bool) -> OwnedLogicalPlan {
     let mut plan = plan(true);
     let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
@@ -235,64 +297,106 @@ fn production_materialization_reaches_the_deepest_selected_join_input() {
 #[test]
 fn production_materialization_keeps_success_when_another_input_is_rejected() {
     for blocked_first in [true, false] {
-        let bind = BindContext::new();
-        for _ in 0..13 {
-            bind.generate_table_index();
-        }
-        let (reference, changed) =
-            input_materialization::optimize_plan(plan(blocked_first), &bind).unwrap();
-        assert!(changed);
-        assert_eq!(materialized_count(&reference.operator), 1);
-        let mut input = MemoBuilder::build(
-            plan(blocked_first),
-            BindContext::new(),
-            SearchBudget::default(),
-        )
-        .unwrap();
-        let state = input.planner_state.clone();
-        state.write().unwrap().session =
-            Some(paro_context::TestStatementContextBuilder::minimal().build());
-        let binding = {
-            let state = state.read().unwrap();
-            matching::scoped_pattern_bindings(
-                PlannerTransformation::AggregateInputMaterialization,
-                input.root,
-                input.memo.group(input.root).unwrap().logical_exprs()[0],
-                &input.memo,
-                &state,
-                None,
-                BudgetDimension::RuleWorkPerGroup,
+        for grouping in 0..4 {
+            let bind = BindContext::new();
+            for _ in 0..16 {
+                bind.generate_table_index();
+            }
+            let (reference, changed) =
+                input_materialization::optimize_plan(grouping_plan(blocked_first, grouping), &bind)
+                    .unwrap();
+            assert!(changed);
+            assert_eq!(materialized_count(&reference.operator), 1);
+            let mut input = MemoBuilder::build(
+                grouping_plan(blocked_first, grouping),
+                BindContext::new(),
+                SearchBudget::default(),
             )
-            .unwrap()
-            .bindings
-            .first()
-            .cloned()
-            .expect("production binding")
-        };
-        let rule = PlannerTransformationRule {
-            transformation: PlannerTransformation::AggregateInputMaterialization,
-            planner_state: state.clone(),
-        };
-        let bridges = semantic_plan::owned_binding_instantiation_count();
-        let arena = state.read().unwrap().staging_arena.len();
-        let mut context = TransformContext::new(&mut input.memo, input.root);
-        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(semantic_plan::owned_binding_instantiation_count(), bridges);
-        let state = state.read().unwrap();
-        assert_eq!(state.staging_arena.len(), arena);
-        let operator = &state.payloads.logical[outputs[0].payload.index()]
-            .semantic_template
-            .operator;
-        assert_eq!(materialized_count(operator), 1);
-        let LogicalOperator::Aggregate(actual) = operator else {
-            unreachable!()
-        };
-        let LogicalOperator::Aggregate(expected) = &reference.operator else {
-            unreachable!()
-        };
-        assert_eq!(actual.returned_types, expected.returned_types);
-        let blocked_index = if blocked_first { 0 } else { 1 };
-        assert!(actual.aggregates[blocked_index].equals(&expected.aggregates[blocked_index]));
+            .unwrap();
+            let state = input.planner_state.clone();
+            state.write().unwrap().session =
+                Some(paro_context::TestStatementContextBuilder::minimal().build());
+            let binding = {
+                let state = state.read().unwrap();
+                matching::scoped_pattern_bindings(
+                    PlannerTransformation::AggregateInputMaterialization,
+                    input.root,
+                    input.memo.group(input.root).unwrap().logical_exprs()[0],
+                    &input.memo,
+                    &state,
+                    None,
+                    BudgetDimension::RuleWorkPerGroup,
+                )
+                .unwrap()
+                .bindings
+                .first()
+                .cloned()
+                .expect("production binding")
+            };
+            let rule = PlannerTransformationRule {
+                transformation: PlannerTransformation::AggregateInputMaterialization,
+                planner_state: state.clone(),
+            };
+            let bridges = semantic_plan::owned_binding_instantiation_count();
+            let arena = state.read().unwrap().staging_arena.len();
+            let mut context = TransformContext::new(&mut input.memo, input.root);
+            let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(semantic_plan::owned_binding_instantiation_count(), bridges);
+            let state = state.read().unwrap();
+            assert_eq!(state.staging_arena.len(), arena);
+            let operator = &state.payloads.logical[outputs[0].payload.index()]
+                .semantic_template
+                .operator;
+            assert_eq!(materialized_count(operator), 1);
+            let LogicalOperator::Aggregate(actual) = operator else {
+                unreachable!()
+            };
+            let LogicalOperator::Aggregate(expected) = &reference.operator else {
+                unreachable!()
+            };
+            assert_eq!(actual.returned_types, expected.returned_types);
+            assert_eq!(actual.grouping_functions, expected.grouping_functions);
+            actual.verify_post_reduction().unwrap();
+            assert_eq!(
+                actual.post_reduction.is_some(),
+                expected.post_reduction.is_some()
+            );
+            if let (Some(actual), Some(expected)) =
+                (&actual.post_reduction, &expected.post_reduction)
+            {
+                assert_eq!(actual.reduction_index, expected.reduction_index);
+                assert!(actual.predicate.equals(&expected.predicate));
+                assert_eq!(actual.reducers.len(), expected.reducers.len());
+                assert!(actual
+                    .reducers
+                    .iter()
+                    .zip(&expected.reducers)
+                    .all(|(a, b)| a.equals(b)));
+                assert_eq!(
+                    actual.scalar_expressions.len(),
+                    expected.scalar_expressions.len()
+                );
+                assert!(actual
+                    .scalar_expressions
+                    .iter()
+                    .zip(&expected.scalar_expressions)
+                    .all(|(a, b)| a.equals(b)));
+            }
+            assert_eq!(
+                actual
+                    .grouping_sets
+                    .iter()
+                    .map(|set| &set.expressions)
+                    .collect::<Vec<_>>(),
+                expected
+                    .grouping_sets
+                    .iter()
+                    .map(|set| &set.expressions)
+                    .collect::<Vec<_>>()
+            );
+            let blocked_index = if blocked_first { 0 } else { 1 };
+            assert!(actual.aggregates[blocked_index].equals(&expected.aggregates[blocked_index]));
+        }
     }
 }
