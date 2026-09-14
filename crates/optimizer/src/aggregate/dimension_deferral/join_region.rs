@@ -203,6 +203,7 @@ fn collect_inner_equi_region<'a>(
 
 pub(crate) fn is_plain_inner_equi_join<Child>(join: &ComparisonJoin<Child>) -> bool {
     join.join_type == JoinType::Inner
+        && join.build_side_constraint == paro_planner::operator::JoinBuildSideConstraint::Either
         && !join.conditions.is_empty()
         && join.mark_index.is_none()
         && join.duplicate_eliminated_columns.is_empty()

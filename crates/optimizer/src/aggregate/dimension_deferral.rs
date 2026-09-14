@@ -119,6 +119,7 @@ fn recognize(plan: &OwnedLogicalPlan) -> Option<DimensionDeferral> {
         return None;
     };
     if join.join_type != JoinType::Inner
+        || join.build_side_constraint != paro_planner::operator::JoinBuildSideConstraint::Either
         || join.conditions.is_empty()
         || join.mark_index.is_some()
         || !join.duplicate_eliminated_columns.is_empty()

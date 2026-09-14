@@ -3150,7 +3150,7 @@ fn try_native_dimension_deferral(
 ) -> Result<Option<NativeShell>> {
     // Reject ineligible root spines before allocating a native node vector.
     // The general fallback retains coverage for unsupported boundary contracts.
-    if !native_dimension_direct_shape(binding, memo, state)? {
+    if !native_dimension_direct_shape(binding, memo, state, checked)? {
         return Ok(None);
     }
     let Some((mut shell, mut layouts)) =
@@ -4531,6 +4531,7 @@ fn native_dimension_direct_shape(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
+    checked: &mut bool,
 ) -> Result<bool> {
     let PatternOperand::Expression {
         expression,
@@ -4592,6 +4593,12 @@ fn native_dimension_direct_shape(
     else {
         return Ok(false);
     };
+    if join.build_side_constraint != paro_planner::operator::JoinBuildSideConstraint::Either {
+        // The shared recognizer treats this as a semantic region boundary;
+        // owned isolation must not erase the required materialization side.
+        *checked = true;
+        return Ok(false);
+    }
     if join.join_type != JoinType::Inner
         || join.conditions.is_empty()
         || join.mark_index.is_some()

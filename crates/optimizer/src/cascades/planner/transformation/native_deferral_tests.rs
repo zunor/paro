@@ -24,6 +24,76 @@ fn assert_column(expressions: &[Expression], table: usize, ordinal: usize) {
 }
 
 #[test]
+fn production_deferral_does_not_erase_build_side_enforcement() {
+    use paro_planner::operator::JoinBuildSideConstraint;
+    for constraint in [
+        JoinBuildSideConstraint::Left,
+        JoinBuildSideConstraint::Right,
+    ] {
+        let make_plan = || {
+            let mut plan = candidate(false);
+            let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                unreachable!()
+            };
+            let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator
+            else {
+                unreachable!()
+            };
+            join.build_side_constraint = constraint;
+            plan
+        };
+        let (reference, changed) =
+            dimension_deferral::optimize_plan(make_plan(), &BindContext::new()).unwrap();
+        let LogicalOperator::Aggregate(aggregate) = &reference.operator else {
+            unreachable!()
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = &aggregate.child.operator else {
+            unreachable!()
+        };
+        assert!(
+            !changed,
+            "constrained root must remain a boundary, got {:?}",
+            join.build_side_constraint
+        );
+        assert_eq!(join.build_side_constraint, constraint);
+        let mut input =
+            MemoBuilder::build(make_plan(), BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.clone();
+        state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
+        let root = input.root;
+        let expression = input.memo.group(root).unwrap().logical_exprs()[0];
+        let binding = matching::scoped_pattern_bindings(
+            PlannerTransformation::AggregateDimensionDeferral,
+            root,
+            expression,
+            &input.memo,
+            &state.read().unwrap(),
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .bindings
+        .first()
+        .cloned()
+        .unwrap();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::AggregateDimensionDeferral,
+            planner_state: state.clone(),
+        };
+        let arena = state.read().unwrap().staging_arena.len();
+        let bridges = semantic_plan::owned_binding_instantiation_count();
+        let mut context = TransformContext::new(&mut input.memo, root);
+        assert!(rule
+            .apply_binding(&binding, &mut context)
+            .unwrap()
+            .is_empty());
+        assert_eq!(semantic_plan::owned_binding_instantiation_count(), bridges);
+        assert_eq!(state.read().unwrap().staging_arena.len(), arena);
+    }
+}
+
+#[test]
 fn production_deferral_semantic_rejections_do_not_export_owned_ir() {
     for case in [0, 1, 2] {
         let make_plan = || {
@@ -504,9 +574,43 @@ fn production_deferral_inlines_nonidentity_projection_spines() {
 
 #[test]
 fn production_deferral_retains_the_exact_dimension_reference() {
-    for (reference, projected) in [(false, false), (true, false), (false, true), (true, true)] {
+    for (reference, projected, constrained_fact) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
         let make_plan = || {
             let mut plan = candidate(reference);
+            if constrained_fact {
+                let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+                    unreachable!()
+                };
+                let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator
+                else {
+                    unreachable!()
+                };
+                let fact = std::mem::replace(&mut join.left, Box::new(candidate(false)));
+                let mut inner = Join::comparison(
+                    JoinType::Inner,
+                    *fact,
+                    OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                        Get::new_without_table(2, vec!["key".into()], vec![LogicalType::Integer]),
+                    ))),
+                    vec![JoinCondition::equality(
+                        col(0, 0, LogicalType::Integer),
+                        col(2, 0, LogicalType::Integer),
+                    )],
+                );
+                let Join::Comparison(inner_join) = &mut inner else {
+                    unreachable!()
+                };
+                inner_join.build_side_constraint =
+                    paro_planner::operator::JoinBuildSideConstraint::Right;
+                join.left = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Join(inner)));
+            }
             if projected {
                 let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
                     unreachable!()
@@ -577,6 +681,7 @@ fn production_deferral_retains_the_exact_dimension_reference() {
             assert!(join.right_projection_map.is_all());
         }
         let dimension_group = input.memo.logical_expr(join_expr).unwrap().key.children[1];
+        let original_fact = input.memo.logical_expr(join_expr).unwrap().key.children[0];
         let before = input.memo.local_statistics_fingerprint(dimension_group);
         let binding = matching::scoped_pattern_bindings(
             PlannerTransformation::AggregateDimensionDeferral,
@@ -615,6 +720,33 @@ fn production_deferral_retains_the_exact_dimension_reference() {
             context.memo().logical_expr(joined).unwrap().key.children[0],
             dimension_group
         );
+        let partial = context.memo().logical_expr(joined).unwrap().key.children[1];
+        let partial_expr = context.memo().group(partial).unwrap().logical_exprs()[0];
+        assert_eq!(
+            context
+                .memo()
+                .logical_expr(partial_expr)
+                .unwrap()
+                .key
+                .children[0],
+            original_fact
+        );
+        if constrained_fact {
+            let fact_expr = context.memo().group(original_fact).unwrap().logical_exprs()[0];
+            let payload = context.memo().logical_expr(fact_expr).unwrap().payload;
+            let state = state.read().unwrap();
+            let LogicalOperator::Join(Join::Comparison(join)) = &state.payloads.logical
+                [payload.index()]
+            .semantic_template
+            .operator
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                join.build_side_constraint,
+                paro_planner::operator::JoinBuildSideConstraint::Right
+            );
+        }
         assert_eq!(
             context.memo().local_statistics_fingerprint(dimension_group),
             before
