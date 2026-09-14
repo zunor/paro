@@ -231,6 +231,18 @@ fn required_children(
             }
             Some(only_child(&distinct.child, child_required))
         }
+        LogicalOperator::Window(window) => {
+            let mut child_required =
+                filter_required_bindings(required, &child_bindings(&window.child));
+            // We retain every invocation in this shell. Ignoring dependencies
+            // of an unselected output would leave a dangling scalar reference.
+            for expression in &window.expressions {
+                ExpressionIterator::enumerate_window_children(expression, |child| {
+                    collect_bindings_from_expr(child, &mut child_required);
+                });
+            }
+            Some(only_child(&window.child, child_required))
+        }
         LogicalOperator::Join(Join::Comparison(join)) => {
             let left_bindings = child_bindings(&join.left);
             let right_bindings = child_bindings(&join.right);
@@ -774,13 +786,19 @@ mod tests {
         use paro_context::TestStatementContextBuilder;
         use paro_planner::binder::context::BindContext;
 
-        for wrapped in [false, true] {
+        for wrapper in 0..3 {
+            let wrapped = wrapper != 0;
             let plan = if wrapped {
-                OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
-                    20,
+                let child = if wrapper == 1 {
                     OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(
                         paro_planner::operator::Distinct::new(memo_candidate()),
-                    )),
+                    ))
+                } else {
+                    window(memo_candidate(), column(10, 0))
+                };
+                OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+                    20,
+                    child,
                     vec![column(10, 0)],
                 )))
             } else {
@@ -858,8 +876,55 @@ mod tests {
             assert_eq!(
                 super::super::semantic_plan::owned_binding_instantiation_count(),
                 bridges,
-                "selected DISTINCT ancestor must not force owned construction"
+                "selected DISTINCT/Window ancestor must not force owned construction"
             );
         }
+    }
+
+    fn window(child: OwnedLogicalPlan, input: Expression) -> OwnedLogicalPlan {
+        use paro_planner::expression::{AggregateExpression, WindowExpression, WindowFrame};
+        let (function, _) = paro_function::aggregate::distributive::count::get_count_function()
+            .bind(&[LogicalType::Integer])
+            .unwrap();
+        let invocation = AggregateExpression::new(function, vec![input], LogicalType::BigInt);
+        OwnedLogicalPlan::synthetic(LogicalOperator::Window(
+            paro_planner::operator::Window::new(
+                30,
+                vec![WindowExpression::aggregate(
+                    invocation,
+                    vec![],
+                    vec![],
+                    WindowFrame::default(),
+                )],
+                child,
+            ),
+        ))
+    }
+
+    #[test]
+    fn retained_window_invocation_cannot_reference_an_eliminated_side() {
+        let make = || {
+            let mut plan = candidate(true, false);
+            let LogicalOperator::Projection(projection) = &mut plan.operator else {
+                unreachable!()
+            };
+            let join = std::mem::replace(
+                &mut *projection.child,
+                OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+            );
+            *projection.child = window(join, column(1, 0));
+            plan
+        };
+        let (_, changed) =
+            crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+        assert!(
+            !changed,
+            "the Window invocation is still present even if its output is not selected"
+        );
+        assert!(
+            rewrite_shell(NativeShell::from_owned(make(), &HashMap::new()).unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 }

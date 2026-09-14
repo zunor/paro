@@ -167,11 +167,10 @@ impl JoinElimination {
                 let mut child_required =
                     filter_required_bindings(required_bindings, window.child.as_ref());
 
-                for (idx, expression) in window.expressions.iter().enumerate() {
-                    let window_binding = ColumnBinding::new(window.window_index, idx);
-                    if required_bindings.contains(&window_binding) {
-                        collect_bindings_from_window_expr(expression, &mut child_required);
-                    }
+                // This pass retains the invocations, including outputs not
+                // selected by ancestors; their scalar inputs must remain valid.
+                for expression in &window.expressions {
+                    collect_bindings_from_window_expr(expression, &mut child_required);
                 }
 
                 let child = *window.child;
