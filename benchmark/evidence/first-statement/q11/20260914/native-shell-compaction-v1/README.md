@@ -362,6 +362,19 @@ This does not certify every non-default join payload or all probe-family SQL
 semantics; broader contract and fixed-work/Q11 acceptance remain required.
 No timing or unchanged-fingerprint claim is inferred from removing this entry.
 
+Key-domain output audit distinguished canonical operator layout from the target
+group's ColumnId set. Incoming physical projection maps are normalized, so the
+initial idea of copying their ordinals was rejected. Nevertheless a subset
+target really lost its alternative at staging: the native probe retained full
+output while target metadata requested fewer columns. The rewrite now selects
+the target identities using the existing empty-Filter projection contract,
+without renaming columns or imposing old physical order on a new child.
+Four All/subset/reordered/zero-column cases verify canonical template maps,
+native target binding sets and successful zero-bridge production staging.
+The two key-domain tests, existing frozen-selected production test and 111
+engine tests pass. This restores missing output coverage; it is not a claim of
+unchanged counts against the prior version. No Q11/SQL performance run was made.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
