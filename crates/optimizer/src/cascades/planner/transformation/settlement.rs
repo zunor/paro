@@ -16,6 +16,8 @@ use paro_planner::plan::{NodeStats, PlanNodeId};
 use std::hash::{Hash, Hasher};
 
 pub(super) mod demand;
+mod native;
+pub(super) use native::SettledNative;
 
 type FactId = usize;
 type CteEnvironment = Arc<BTreeMap<usize, FactId>>;
@@ -697,11 +699,6 @@ impl SettlementCache {
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
     ) -> Result<Option<SettledExpression>> {
-        enum Task {
-            Enter(PlanIndex, CteEnvironment),
-            Consumer(PlanIndex, usize, CteEnvironment),
-            Finish(PlanIndex, CteEnvironment, usize),
-        }
         if !environment.control.checkpoint()? {
             return Ok(None);
         }
@@ -712,6 +709,24 @@ impl SettlementCache {
         else {
             return Ok(None);
         };
+        self.settle_root_in(root, environment, arena, |_, _, _| Ok(()))
+    }
+
+    /// Both owned imports and native node batches use this producer-first
+    /// fact schedule. Transport cannot choose a different lexical CTE domain
+    /// or a separate statistics cache.
+    fn settle_root_in(
+        &mut self,
+        root: PlanIndex,
+        environment: &PlannerRuleEnvironment,
+        arena: &mut LogicalPlanArena,
+        mut completed_occurrence: impl FnMut(PlanIndex, PlanIndex, &LogicalPlanArena) -> Result<()>,
+    ) -> Result<Option<SettledExpression>> {
+        enum Task {
+            Enter(PlanIndex, CteEnvironment),
+            Consumer(PlanIndex, usize, CteEnvironment),
+            Finish(PlanIndex, CteEnvironment, usize),
+        }
         let Some(demands) = demand::derive(arena, root, environment)? else {
             return Ok(None);
         };
@@ -799,7 +814,9 @@ impl SettlementCache {
                             .iter()
                             .map(|binding| (*binding, *binding))
                             .collect();
-                        completed.push((arena.append(node)?, facts, statistics, aliases));
+                        let output = arena.append(node)?;
+                        completed_occurrence(index, output, arena)?;
+                        completed.push((output, facts, statistics, aliases));
                         continue;
                     }
                     let mut before = Vec::new();
@@ -866,8 +883,10 @@ impl SettlementCache {
                         })?;
                         remapped.insert(recipe_index, mapped);
                     }
+                    let output = remapped[&local.recipe];
+                    completed_occurrence(index, output, arena)?;
                     completed.push((
-                        remapped[&local.recipe],
+                        output,
                         local.facts,
                         local.statistics,
                         aliases,

@@ -1251,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn production_filter_domain_uses_native_shell_and_records_proof() {
+    fn production_filter_domain_settles_native_facts_and_records_proof() {
         let mut input = MemoBuilder::build(
             owner(OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
                 paro_planner::operator::Filter::new(reference(9, 1), vec![equality(1, 7)]),
@@ -1289,7 +1289,10 @@ mod tests {
         let mut context = TransformContext::new(&mut input.memo, input.root);
         let outputs = rule.apply_binding(&binding, &mut context).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(planner_state.read().unwrap().staging_arena.len(), before);
+        // Native construction no longer skips lexical producer settlement.
+        // Its bounded node batch uses the same arena and node-fact cache,
+        // without reconstructing any opaque Memo descendant as owned IR.
+        assert!(planner_state.read().unwrap().settlement_cache.misses > 0);
         assert_eq!(planner_state.read().unwrap().cte_restrictions.len(), 1);
         assert!(matches!(
             planner_state.read().unwrap().payloads.logical[outputs[0].payload.index()]
@@ -1299,6 +1302,7 @@ mod tests {
         ));
         context.rollback().unwrap();
         let state = planner_state.read().unwrap();
+        assert_eq!(state.staging_arena.len(), before);
         assert!(state.cte_bindings.is_empty());
         assert!(state.cte_restrictions.is_empty());
     }
@@ -3103,3 +3107,7 @@ fn cte_projection_expressions(
     }
     Ok(Some(expressions))
 }
+
+#[cfg(test)]
+#[path = "cte_fact_tests.rs"]
+mod cte_fact_tests;

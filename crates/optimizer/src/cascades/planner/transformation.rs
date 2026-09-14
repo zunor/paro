@@ -1167,6 +1167,33 @@ impl TransformationRule for PlannerTransformationRule {
         for candidate in candidates {
             let (prepared_plan, root_operator, output_layout, retained_group_holes) =
                 match candidate {
+                    PlanCandidate::Native(shell)
+                        if matches!(self.transformation, PlannerTransformation::CteFilterPushdown) =>
+                    {
+                        let mut state = self.planner_state.write()
+                            .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+                        let state = &mut *state;
+                        let Some(settlement::SettledNative { expression, holes, proofs }) = state
+                            .settlement_cache.settle_native_in(shell, &environment, &mut state.staging_arena)?
+                        else { return Ok(Box::new([])); };
+                        let settlement::SettledExpression { plan, statistics, scopes } = expression;
+                        if environment.verify_enabled {
+                            crate::verify::verify_arena_plan(&state.staging_arena.plan(plan)?, || {
+                                environment.session.cancellation.check()
+                            })?;
+                        }
+                        let plan = semantic_plan::freeze_arena_output_layout(
+                            plan, &source_output_columns, state,
+                        )?;
+                        let root_operator = state.staging_arena.get(plan)?.operator.op_type();
+                        let output_layout = state.staging_arena.output_layout(plan)?.clone();
+                        (
+                            PreparedPlan::Settled { plan, column_stats: statistics, scopes, selected_proofs: proofs },
+                            root_operator,
+                            output_layout,
+                            holes,
+                        )
+                    }
                     PlanCandidate::Native(shell) => {
                         let root_operator = shell.root_operator().op_type();
                         let output_layout = shell.root_layout()?;
