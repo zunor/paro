@@ -402,6 +402,114 @@ fn candidate(reference: bool) -> OwnedLogicalPlan {
 }
 
 #[test]
+fn production_deferral_preserves_partial_group_facts_across_transport() {
+    use paro_common::runtime_value::Value;
+    use paro_planner::expression::ConstantExpression;
+    use paro_planner::plan::CardinalityEstimate;
+    let session = paro_context::TestStatementContextBuilder::minimal().build();
+    let bind = BindContext::new();
+    for _ in 0..32 { bind.generate_table_index(); }
+    let mut plan = candidate(false);
+    let LogicalOperator::Aggregate(root) = &mut plan.operator else { unreachable!() };
+    let LogicalOperator::Join(Join::Comparison(join)) = &mut root.child.operator else { unreachable!() };
+    let LogicalOperator::ExpressionGet(fact) = &mut join.left.operator else { unreachable!() };
+    fact.expressions = (0..40).map(|row| vec![
+        Expression::Constant(ConstantExpression::new(Value::Integer(row % 4), LogicalType::Integer).into()),
+        Expression::Constant(ConstantExpression::new(Value::Double(row as f64), LogicalType::Double).into()),
+    ]).collect();
+    join.left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(40));
+    let statistics = Arc::new(HashMap::from([
+        (ColumnBinding::new(0, 0), Arc::new(ColumnStatistics::with_estimated_distinct(
+            paro_storage::statistics::BaseStatistics::create_unknown(LogicalType::Integer), Some(4)))),
+        (ColumnBinding::new(0, 1), Arc::new(ColumnStatistics::with_estimated_distinct(
+            paro_storage::statistics::BaseStatistics::create_unknown(LogicalType::Double), Some(40)))),
+    ]));
+    let mut input = MemoBuilder::build_alternatives(vec![LogicalAlternative {
+        plan, source: AlternativeOrigin::Baseline, column_stats: statistics,
+    }], bind, SearchBudget::default()).unwrap();
+    let state = input.planner_state.clone();
+    state.write().unwrap().session = Some(session.clone());
+    let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let mut binding = matching::scoped_pattern_bindings(
+        PlannerTransformation::AggregateDimensionDeferral, input.root, expression,
+        &input.memo, &state.read().unwrap(), None, BudgetDimension::RuleWorkPerGroup,
+    ).unwrap().bindings.first().cloned().unwrap();
+    // The deferral contract consumes the fact side as an opaque Memo input;
+    // its known facts must survive without re-gathering literal-table stats.
+    // This is the same supported Group edge used for an unexplored fact join.
+    let PatternOperand::Expression { children, .. } = &mut binding.root else { unreachable!() };
+    let PatternOperand::Expression { children, .. } = &mut children[0] else { unreachable!() };
+    let fact_group = match children[0] { PatternOperand::Group(group)
+        | PatternOperand::Expression { group, .. } => group };
+    children[0] = PatternOperand::Group(fact_group);
+    let mut context = TransformContext::new(&mut input.memo, input.root);
+    let (expected, expected_column) = {
+        let state = state.read().unwrap();
+        let facts = boundary::BoundarySnapshot::read(&mut context, &state, &binding.root,
+            BudgetDimension::RuleWorkPerGroup).unwrap().unwrap();
+        let instantiated = semantic_plan::instantiate_bound_plan_with_group_holes(
+            context.memo(), &state, &binding.root, Some(&facts),
+        ).unwrap().unwrap();
+        let (rewritten, changed) = dimension_deferral::optimize_plan(instantiated.plan, &state.bind_context).unwrap();
+        assert!(changed);
+        let environment = PlannerRuleEnvironment {
+            control: context.memo().control().clone(), bind_context: state.bind_context.clone(),
+            session, cost_model: state.cost_model.clone(), budget: context.memo().budget().clone(),
+            verify_enabled: false,
+        };
+        let mut arena = paro_planner::plan::arena::LogicalPlanArena::default();
+        let settled = settlement::SettlementCache::default().settle_arena_in(rewritten, &environment, &mut arena)
+            .unwrap().unwrap();
+        let mut partial = None;
+        for index in arena.post_order(settled.plan).unwrap() {
+            let node = arena.get(index).unwrap();
+            if let LogicalOperator::Aggregate(aggregate) = &node.operator {
+                if aggregate.groups.len() == 1 && aggregate.groups[0].equals(&col(0, 0, LogicalType::Integer)) {
+                    assert_eq!(aggregate.group_stats[0].as_ref().unwrap().get_distinct_count(), 4);
+                    partial = Some((node.stats.clone(),
+                        settled.scopes[&node.id][&ColumnBinding::new(aggregate.group_index, 0)].clone()));
+                }
+            }
+        }
+        partial.expect("owned oracle must derive the narrow group facts")
+    };
+    let outputs = PlannerTransformationRule {
+        transformation: PlannerTransformation::AggregateDimensionDeferral, planner_state: state.clone(),
+    }.apply_binding(&binding, &mut context).unwrap();
+    assert_eq!(outputs.len(), 1);
+    let state = state.read().unwrap();
+    let mut pending = vec![(input.root, outputs[0].payload, outputs[0].key.children.to_vec())];
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    while let Some((group, payload_id, children)) = pending.pop() {
+        let payload = &state.payloads.logical[payload_id.index()];
+        if let LogicalOperator::Aggregate(aggregate) = &payload.semantic_template.operator {
+            if aggregate.groups.len() == 1 && aggregate.groups[0].equals(&col(0, 0, LogicalType::Integer)) {
+                checked += 1;
+                if aggregate.group_stats[0].as_ref().map(|s| s.get_distinct_count() as u64) != Some(expected_column.distinct_evidence().point) {
+                    failures.push(format!("partial group_stats did not retain known input NDV: {:?}", aggregate.group_stats[0]));
+                }
+                let output = payload.column_stats.get(&ColumnBinding::new(aggregate.group_index, 0));
+                if output.map(|s| s.distinct_evidence()) != Some(expected_column.distinct_evidence()) {
+                    failures.push("new partial namespace has no matching output column fact".into());
+                }
+                if context.memo().cardinality_estimate(group).unwrap().1 != expected.estimated_cardinality.unwrap().expected {
+                    failures.push(format!("partial rows {:?}, owned {:?}", context.memo().cardinality_estimate(group), expected));
+                }
+            }
+        }
+        for child in children {
+            let expressions = context.memo().group(child).unwrap().logical_exprs();
+            assert_eq!(expressions.len(), 1);
+            let expression = context.memo().logical_expr(expressions[0]).unwrap();
+            pending.push((child, expression.payload, expression.key.children.to_vec()));
+        }
+    }
+    assert_eq!(checked, 1);
+    assert!(failures.is_empty(), "transport-dependent partial aggregate facts: {failures:?}");
+}
+
+#[test]
 fn production_deferral_inlines_nonidentity_projection_spines() {
     for (depth, nary) in [(1, false), (2, false), (0, true), (2, true)] {
         let make_plan = || {
@@ -511,7 +619,7 @@ fn production_deferral_inlines_nonidentity_projection_spines() {
             "depth={depth}"
         );
         let state = state.read().unwrap();
-        assert_eq!(state.staging_arena.len(), arena);
+        assert!(state.settlement_cache.misses > 0);
         let LogicalOperator::Aggregate(actual) = &state.payloads.logical
             [outputs[0].payload.index()]
         .semantic_template
@@ -569,6 +677,9 @@ fn production_deferral_inlines_nonidentity_projection_spines() {
                 0,
             );
         }
+        drop(state);
+        context.rollback().unwrap();
+        assert_eq!(rule.planner_state.read().unwrap().staging_arena.len(), arena);
     }
 }
 
@@ -752,7 +863,7 @@ fn production_deferral_retains_the_exact_dimension_reference() {
             before
         );
         let state = state.read().unwrap();
-        assert_eq!(state.staging_arena.len(), arena);
+        assert!(state.settlement_cache.misses > 0);
         let LogicalOperator::Aggregate(actual) = &state.payloads.logical
             [outputs[0].payload.index()]
         .semantic_template
@@ -761,5 +872,8 @@ fn production_deferral_retains_the_exact_dimension_reference() {
             panic!("aggregate root")
         };
         assert_eq!(actual.returned_types, expected.types());
+        drop(state);
+        context.rollback().unwrap();
+        assert_eq!(rule.planner_state.read().unwrap().staging_arena.len(), arena);
     }
 }

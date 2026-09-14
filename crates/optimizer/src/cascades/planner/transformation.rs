@@ -1168,8 +1168,23 @@ impl TransformationRule for PlannerTransformationRule {
             let (prepared_plan, root_operator, output_layout, retained_group_holes) =
                 match candidate {
                     PlanCandidate::Native(shell)
-                        if matches!(self.transformation, PlannerTransformation::CteFilterPushdown) =>
+                        if matches!(self.transformation, PlannerTransformation::CteFilterPushdown
+                            | PlannerTransformation::AggregateDimensionDeferral) =>
                     {
+                        // Native rewrites that change a producer domain or
+                        // aggregate namespace must derive their facts before
+                        // staging. Their cache/arena suffix belongs to the
+                        // same transform transaction even when preparation
+                        // fails before the later Memo publication begins.
+                        let savepoint = self.planner_state.read()
+                            .map_err(|_| paro_error::internal("planner transform state poisoned"))?
+                            .savepoint();
+                        let rollback_state = self.planner_state.clone();
+                        ctx.enlist_rollback(move || {
+                            rollback_state.write()
+                                .map_err(|_| paro_error::internal("planner transform state poisoned during rollback"))?
+                                .rollback_to(savepoint)
+                        });
                         let mut state = self.planner_state.write()
                             .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
                         let state = &mut *state;
@@ -3418,6 +3433,15 @@ fn try_native_dimension_deferral(
     if fact_bindings.is_empty() || dimension_bindings.is_empty() {
         return Ok(None);
     }
+    // This relation is moved intact. Its Memo facts (in particular an
+    // externally owned CTE domain) are inputs, not statistics to recompute in
+    // the new aggregate's lexical environment.
+    let dimension_group = native_deferral_region::selected_group(&shell, binding, dimension_index)
+        .ok_or_else(|| paro_error::internal("native deferral lost its unchanged dimension identity"))?;
+    let dimension = NativeChild::memo_group(
+        memo, state, facts, dimension_group, &Arc::new(right_layout.clone()),
+        shell.nodes[dimension_index].operator.output_names_from_child_refs(&[]).into(),
+    )?;
 
     let mut partial_groups = Vec::with_capacity(join.conditions.len() + aggregate.groups.len());
     let mut condition_rewrites = Vec::with_capacity(join.conditions.len());
@@ -3545,6 +3569,21 @@ fn try_native_dimension_deferral(
     let partial_group_index = state.bind_context.generate_table_index();
     let partial_aggregate_index = state.bind_context.generate_table_index();
     let partial_groupings_index = state.bind_context.generate_table_index();
+    let partial_input = if let NativeChild::Node(index) = &join.left {
+        if let Some(group) = native_deferral_region::selected_group(&shell, binding, *index) {
+            NativeChild::memo_group(
+                memo, state, facts, group, &Arc::new(left_layout.clone()),
+                (0..left_layout.len()).map(|i| format!("__bound_reference_{i}"))
+                    .collect::<Vec<_>>().into(),
+            )?
+        } else {
+            // Region isolation synthesized this join. It has no resident
+            // group fact yet and must be settled from its exact inputs.
+            join.left.clone()
+        }
+    } else {
+        join.left.clone()
+    };
     let mut outer_stats = shell.nodes[shell.root].stats.clone();
     outer_stats.unique_keys.clear();
     let mut final_join_stats = shell
@@ -3571,7 +3610,7 @@ fn try_native_dimension_deferral(
     partial_operator.group_index = partial_group_index;
     partial_operator.aggregate_index = partial_aggregate_index;
     partial_operator.groupings_index = partial_groupings_index;
-    partial_operator.child = join.left.clone();
+    partial_operator.child = partial_input;
     partial_operator.groups = partial_groups.clone();
     partial_operator.grouping_sets.clear();
     partial_operator.aggregates = partial_aggregates;
@@ -3607,7 +3646,7 @@ fn try_native_dimension_deferral(
         }
     }
     let mut final_join = join.clone();
-    final_join.left = join.right.clone();
+    final_join.left = dimension;
     final_join.right = NativeChild::Node(partial_index);
     final_join.conditions = final_conditions;
     final_join.left_projection_map = paro_planner::operator::ProjectionMap::all();

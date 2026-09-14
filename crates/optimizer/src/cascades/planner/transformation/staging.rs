@@ -68,6 +68,36 @@ pub(super) enum NativeChild {
     },
 }
 
+impl NativeChild {
+    pub(super) fn memo_group(
+        memo: &Memo,
+        state: &PlannerTransformState,
+        facts: &boundary::BoundarySnapshot,
+        group: GroupId,
+        layout: &PlannerBindingLayout,
+        names: Arc<[String]>,
+    ) -> Result<Self> {
+        if layout.bindings().len() != layout.types().len() {
+            return Err(paro_error::internal("native Memo operand has inconsistent binding/type arity"));
+        }
+        let group = memo.canonical_group(group);
+        let transport = facts.transport(memo, state, group, layout)?;
+        let reference = paro_planner::operator::BoundReference::new(
+            paro_planner::operator::BoundReferenceId::group_hole(state.bind_context.next_plan_id().0),
+            layout.bindings().to_vec(), layout.types().to_vec(),
+        ).with_facts(transport)?;
+        let stats = NodeStats {
+            estimated_cardinality: facts.cardinality(memo, group),
+            unique_keys: reference.facts.unique_keys.clone(),
+            ..Default::default()
+        };
+        Ok(Self::MemoGroup {
+            group, id: state.bind_context.next_plan_id(), stats,
+            layout: layout.as_ref().clone(), names, reference,
+        })
+    }
+}
+
 impl NativeShell {
     /// Build a closed native shell directly from an exact pattern binding.
     ///
@@ -129,25 +159,6 @@ impl NativeShell {
             layout: &PlannerBindingLayout,
             group_names: &mut HashMap<usize, Arc<[String]>>,
         ) -> Result<Built> {
-            if layout.bindings().len() != layout.types().len() {
-                return Err(paro_error::internal(
-                    "native pattern group has inconsistent binding/type arity",
-                ));
-            }
-            let group = memo.canonical_group(group);
-            let transport = facts.transport(memo, state, group, layout)?;
-            let reference_id = paro_planner::operator::BoundReferenceId::group_hole(
-                state.bind_context.next_plan_id().0,
-            );
-            let reference = paro_planner::operator::BoundReference::new(
-                reference_id,
-                layout.bindings().to_vec(),
-                layout.types().to_vec(),
-            )
-            .with_facts(transport)?;
-            let mut stats = NodeStats::default();
-            stats.estimated_cardinality = facts.cardinality(memo, group);
-            stats.unique_keys = reference.facts.unique_keys.clone();
             let names = group_names
                 .entry(layout.bindings().len())
                 .or_insert_with(|| {
@@ -158,14 +169,7 @@ impl NativeShell {
                 })
                 .clone();
             Ok(Built {
-                child: NativeChild::MemoGroup {
-                    group,
-                    id: state.bind_context.next_plan_id(),
-                    stats,
-                    layout: layout.as_ref().clone(),
-                    names: Arc::clone(&names),
-                    reference,
-                },
+                child: NativeChild::memo_group(memo, state, facts, group, layout, names.clone())?,
                 layout: layout.clone(),
                 names,
             })
