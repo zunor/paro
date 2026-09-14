@@ -1087,3 +1087,26 @@ statistics rollback identity, nested source lane). Optimizer check and diff
 whitespace check pass. No failures blessed. No fresh Q11, SQL regress, independent
 bag execution, clean fixed-work/fingerprint campaign or performance claim in
 this slice. The goal remains open.
+
+### Shared detail TopN admission follow-up
+
+The owned adapter and selected-native adapter now call one
+`prove_row_preserving_inputs` contract. Output and ordering binding guards,
+derived-column handling, source/type validation, row-id evidence and both fetch
+benefit decisions are no longer independently implemented in the native path.
+Resolvers supply exact selected source/path/statistics evidence; missing source
+facts are not guessed. This is consolidation of the existing algorithm, not
+new costing or a new cache. Native negative paths still fall back, so this does
+not claim all owned bridges have been removed.
+
+Added a bounded-reason test covering zero limit, unsafe output, missing child
+cardinality, missing source rows and unavailable row-id evidence. It verifies
+early guards perform zero source reads and later guards preserve their specific
+reason. Existing five production fixtures still apply without owned
+instantiation and restore visible state on rollback. Targeted runs: 21
+late_payload tests and 4 native_topn_payload tests pass. Full optimizer now
+1289 pass / the same five failure names and assertions. Optimizer check passes.
+No fresh Q11, full SQL regress, independent execution bag oracle, clean prefix
+replay or new performance evidence. Multi-source deterministic ordering,
+non-prefix root namespace preservation, aggregate TopN and negative-path
+authority remain open.
