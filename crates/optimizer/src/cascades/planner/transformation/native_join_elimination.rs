@@ -136,8 +136,14 @@ fn rewrite_node(
         .ok_or_else(|| paro_error::internal("native join elimination lost a node"))?
         .operator
         .clone();
-    if matches!(source_operator, LogicalOperator::RowFetch(_)) {
-        // The rule's declared traversal stops at late materialization. This
+    if matches!(
+        source_operator,
+        LogicalOperator::RowFetch(_)
+            | LogicalOperator::ExternalProject(_)
+            | LogicalOperator::ExternalTable(_)
+    ) {
+        // The rule's declared traversal stops at late materialization and
+        // external evaluation (including lateral/parameterized calls). This
         // is a known no-rewrite boundary, not missing native coverage. Keep
         // its exact child edge and scalar payload; do not inspect inner joins.
         return Ok(Some((NativeChild::Node(index), false)));
@@ -861,21 +867,74 @@ mod tests {
     }
 
     #[test]
-    fn row_fetch_is_a_complete_selected_rewrite_barrier() {
-        let make = || {
-            OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(
-                paro_planner::operator::RowFetch::new(70, vec![], candidate(true, false)),
-            ))
-        };
-        let (reference, changed) =
-            crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
-        assert!(!changed, "the reference rule does not traverse row fetch");
-        let shell = NativeShell::from_owned(make(), &HashMap::new()).unwrap();
-        assert_eq!(shell.root_layout().unwrap(), reference.output_layout());
-        assert!(matches!(
-            rewrite_shell_result(shell).unwrap(),
-            EliminationResult::NoRewrite
-        ));
+    fn materialization_and_external_are_complete_selected_rewrite_barriers() {
+        for kind in 7..10 {
+            let make = || barrier(kind, candidate(true, false));
+            let (reference, changed) =
+                crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+            assert!(
+                !changed,
+                "the reference rule does not traverse this barrier"
+            );
+            let shell = NativeShell::from_owned(make(), &HashMap::new()).unwrap();
+            assert_eq!(shell.root_layout().unwrap(), reference.output_layout());
+            assert!(matches!(
+                rewrite_shell_result(shell).unwrap(),
+                EliminationResult::NoRewrite
+            ));
+        }
+    }
+
+    fn barrier(kind: usize, child: OwnedLogicalPlan) -> OwnedLogicalPlan {
+        match kind {
+            7 => OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(
+                paro_planner::operator::RowFetch::new(70, vec![], child),
+            )),
+            8 => OwnedLogicalPlan::synthetic(LogicalOperator::ExternalProject(
+                paro_planner::operator::LogicalExternalProject::new(70, child, vec![]),
+            )),
+            9 => {
+                use paro_external::routine::{
+                    bound::BoundRoutineCallMeta,
+                    boundary::{ExecutionBoundary, PlacementClass},
+                    identity::{BuiltinIntrinsicId, RoutineCallIdentity},
+                    spec::{
+                        RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability,
+                        RowSemantics,
+                    },
+                };
+                let call = BoundRoutineCallMeta {
+                    identity: RoutineCallIdentity::Builtin {
+                        intrinsic: BuiltinIntrinsicId::Other("barrier_fixture".into()),
+                        semantic_tags: vec![],
+                    },
+                    semantics: RoutineSemantics {
+                        stability: RoutineStability::Stable,
+                        null_policy: RoutineNullPolicy::CalledOnNullInput,
+                        side_effects: RoutineSideEffects::None,
+                        row_semantics: RowSemantics::RelationExpanding,
+                        may_block: true,
+                    },
+                    boundary: ExecutionBoundary {
+                        placement: PlacementClass::External,
+                        may_block: true,
+                        row_semantics: RowSemantics::RelationExpanding,
+                    },
+                    spec: None,
+                };
+                OwnedLogicalPlan::synthetic(LogicalOperator::ExternalTable(Box::new(
+                    paro_planner::operator::LogicalExternalTable::new(
+                        70,
+                        vec!["key".into()],
+                        vec![LogicalType::Integer],
+                        column(10, 0),
+                        call,
+                    )
+                    .with_child(child, true, true),
+                )))
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -1062,7 +1121,7 @@ mod tests {
         use paro_planner::binder::context::BindContext;
 
         for unique in [false, true] {
-            for wrapper in 0..8 {
+            for wrapper in 0..10 {
                 let wrapped = wrapper != 0;
                 let plan = if wrapped {
                     let child = if wrapper == 1 {
@@ -1071,10 +1130,8 @@ mod tests {
                         ))
                     } else if wrapper == 2 {
                         window(memo_candidate(), column(10, 0))
-                    } else if wrapper == 7 {
-                        OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(
-                            paro_planner::operator::RowFetch::new(70, vec![], memo_candidate()),
-                        ))
+                    } else if wrapper >= 7 {
+                        barrier(wrapper, memo_candidate())
                     } else if wrapper == 6 {
                         OwnedLogicalPlan::synthetic(LogicalOperator::RecursiveCTE(
                             paro_planner::operator::RecursiveCTE {
@@ -1160,7 +1217,7 @@ mod tests {
                             match wrapper {
                                 3 => 40,
                                 6 => 60,
-                                7 => 70,
+                                7..=9 => 70,
                                 _ => 10,
                             },
                             0,
@@ -1254,7 +1311,7 @@ mod tests {
                 let outputs = rule.apply_binding(&binding, &mut context).unwrap();
                 assert_eq!(
                     outputs.len(),
-                    usize::from(unique && wrapper != 7),
+                    usize::from(unique && wrapper < 7),
                     "a complete native elimination must not stage the same owned peer"
                 );
                 assert_eq!(
@@ -1335,7 +1392,7 @@ mod tests {
                     let mut context = TransformContext::new(&mut input.memo, input.root);
                     assert_eq!(
                         rule.apply_binding(&binding, &mut context).unwrap().len(),
-                        usize::from(wrapper != 7)
+                        usize::from(wrapper < 7)
                     );
                     assert_eq!(
                         super::super::semantic_plan::owned_binding_instantiation_count(),
