@@ -281,6 +281,7 @@ fn runtime_filter_source_retentions(
     build_domain: CompactRange,
     exactness: RuntimeFilterExactness,
     semantic_proof: Fingerprint,
+    build_domain_identity: Fingerprint,
     evaluation: Fingerprint,
 ) -> Result<Box<[SidewaysFilterSource]>> {
     sources
@@ -298,8 +299,14 @@ fn runtime_filter_source_retentions(
             };
             let expected_retained_ppm = retained_ratio_ppm(retained.expected, source.rows.expected);
             let mut domain = StableFingerprintBuilder::default();
-            domain.write_bytes(b"paro.runtime-filter-domain.v1");
+            domain.write_bytes(b"paro.runtime-filter-domain.v2");
             domain.write_fingerprint(semantic_proof);
+            // The semantic build relation/key domain is not the physical
+            // implementation and not the evaluation occurrence.  Keeping it
+            // in the proof identity prevents nested same-shaped joins from
+            // sharing a domain while allowing physical alternatives in one
+            // logical group to share the proof.
+            domain.write_fingerprint(build_domain_identity);
             domain.write_u64(source.source.0 as u64);
             Ok(SidewaysFilterSource {
                 source: source.source,
@@ -317,12 +324,29 @@ fn runtime_filter_source_retentions(
         .map(Vec::into_boxed_slice)
 }
 
+/// Identify one physical evaluation occurrence without using it as the
+/// semantic build-domain proof. The logical expression occurrence and goal
+/// make nested same-shaped joins distinct; the physical fingerprint
+/// distinguishes genuinely different implementations of that occurrence.
+pub(super) fn runtime_filter_evaluation_identity(
+    expression: LogicalExprId,
+    goal: OptimizationGoal,
+    physical_fingerprint: Fingerprint,
+) -> Fingerprint {
+    let mut identity = StableFingerprintBuilder::default();
+    identity.write_bytes(b"paro.runtime-filter-evaluation.v2");
+    identity.write_u64(expression.0 as u64);
+    identity.write_fingerprint(optimization_goal_fingerprint(goal));
+    identity.write_fingerprint(physical_fingerprint);
+    identity.finish()
+}
+
 pub(super) fn planner_cost_composition(
     metadata: &PlannerOperatorMetadata,
     flavor: PhysicalImplementationFlavor,
     facts: &ResolvedPlannerCostFacts,
     max_concurrent_tasks: u16,
-    physical_fingerprint: Fingerprint,
+    evaluation_identity: Fingerprint,
 ) -> Result<CostComposition> {
     if metadata.operator_type == LogicalOperatorType::EmptyResult {
         return Ok(CostComposition::LocalOnly);
@@ -387,7 +411,14 @@ pub(super) fn planner_cost_composition(
                 build_domain,
                 exactness,
                 metadata.operator_fingerprint,
-                physical_fingerprint,
+                facts
+                    .runtime_filter_build_left_domain_identity
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "runtime-filter build-left candidate lost its domain identity",
+                        )
+                    })?,
+                evaluation_identity,
             )?,
         });
     }
@@ -423,7 +454,10 @@ pub(super) fn planner_cost_composition(
                 build_domain,
                 exactness,
                 metadata.operator_fingerprint,
-                physical_fingerprint,
+                facts.runtime_filter_build_domain_identity.ok_or_else(|| {
+                    paro_error::internal("runtime-filter candidate lost its build domain identity")
+                })?,
+                evaluation_identity,
             )?,
         });
     }
@@ -558,10 +592,19 @@ fn build_probe_byte_work_ppm(facts: &ResolvedPlannerCostFacts) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{retained_ratio_ppm, retained_upper_ratio_ppm, selected_node_grant_contract};
+    use super::{
+        retained_ratio_ppm, retained_upper_ratio_ppm, runtime_filter_source_retentions,
+        selected_node_grant_contract,
+    };
+    use crate::cascades::cost::CompactRange;
+    use crate::cascades::ids::Fingerprint;
     use crate::cascades::ids::{AdmissibleGrantSetId, ResourceGrantClassId};
     use crate::cascades::memo::GrantGoalKey;
+    use crate::cascades::planner::costing::RuntimeFilterExactness;
+    use crate::cascades::planner::state::ResolvedRuntimeFilterSource;
+    use crate::cascades::planner::state::RuntimeFilterProbeMultiplicity;
     use crate::cascades::rules::GrantDependencyDescriptor;
+    use crate::cascades::rules::WorkSourceId;
     use crate::physical::PhysicalGrantContract;
 
     #[test]
@@ -596,6 +639,49 @@ mod tests {
     #[test]
     fn retained_upper_ratio_dominates_the_expected_ratio() {
         assert_eq!(retained_upper_ratio_ppm(1.0, 10.0, 250_000), 250_000);
+    }
+
+    #[test]
+    fn runtime_filter_domain_is_shared_only_for_the_same_semantic_build() {
+        let sources = [ResolvedRuntimeFilterSource {
+            source: WorkSourceId(7),
+            rows: CompactRange::point(100.0).unwrap(),
+            multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        }];
+        let first = runtime_filter_source_retentions(
+            &sources,
+            CompactRange::point(10.0).unwrap(),
+            RuntimeFilterExactness::Expected,
+            Fingerprint(1),
+            Fingerprint(11),
+            Fingerprint(101),
+        )
+        .unwrap();
+        let same_build_different_evaluation = runtime_filter_source_retentions(
+            &sources,
+            CompactRange::point(10.0).unwrap(),
+            RuntimeFilterExactness::Expected,
+            Fingerprint(1),
+            Fingerprint(11),
+            Fingerprint(202),
+        )
+        .unwrap();
+        let different_build = runtime_filter_source_retentions(
+            &sources,
+            CompactRange::point(10.0).unwrap(),
+            RuntimeFilterExactness::Expected,
+            Fingerprint(1),
+            Fingerprint(22),
+            Fingerprint(303),
+        )
+        .unwrap();
+
+        assert_eq!(first[0].domain, same_build_different_evaluation[0].domain);
+        assert_ne!(
+            first[0].evaluation,
+            same_build_different_evaluation[0].evaluation
+        );
+        assert_ne!(first[0].domain, different_build[0].domain);
     }
 }
 

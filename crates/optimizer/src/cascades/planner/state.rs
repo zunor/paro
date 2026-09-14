@@ -672,6 +672,13 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) runtime_filter_probe_sources: Box<[ResolvedRuntimeFilterSource]>,
     pub(super) runtime_filter_build_left_probe_sources: Box<[ResolvedRuntimeFilterSource]>,
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
+    /// Identity of the logical relation/key domain that produces a runtime
+    /// filter.  This is deliberately separate from the physical operator
+    /// fingerprint and from the evaluation occurrence: two physical
+    /// implementations of one Memo group share it, while nested joins with
+    /// the same operator shape do not alias one another.
+    pub(super) runtime_filter_build_domain_identity: Option<Fingerprint>,
+    pub(super) runtime_filter_build_left_domain_identity: Option<Fingerprint>,
     pub(super) runtime_filter_build_left_distinct_expected: Option<u64>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }

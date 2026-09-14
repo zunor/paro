@@ -472,6 +472,18 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
                     .and_then(|domain| domain.expected())
             })
             .or(template.runtime_filter_build_distinct_expected),
+        runtime_filter_build_domain_identity: children
+            .get(1)
+            .zip(template.runtime_filter_build_domain_column)
+            .and_then(|(group, column)| {
+                runtime_filter_domain_identity(memo, *group, column, JoinKeySide::Right)
+            }),
+        runtime_filter_build_left_domain_identity: children
+            .first()
+            .zip(template.runtime_filter_build_left_domain_column)
+            .and_then(|(group, column)| {
+                runtime_filter_domain_identity(memo, *group, column, JoinKeySide::Left)
+            }),
         runtime_filter_build_left_distinct_expected: children
             .first()
             .zip(template.runtime_filter_build_left_domain_column)
@@ -552,6 +564,36 @@ fn join_key_domain_column<Child>(
     binding_ids
         .get(binding.table_index, binding.column_index, &logical_type)
         .copied()
+}
+
+/// Return the identity of a logical runtime-filter build domain.
+///
+/// A physical implementation is intentionally absent: all implementations
+/// of the same canonical Memo group and key column may reuse the semantic
+/// proof.  The group identity prevents two nested, same-shaped relations from
+/// being deduplicated merely because they have the same operator fingerprint;
+/// fact/statistics snapshots make a proof stale when the relation's evidence
+/// changes.  Group ids are Memo-local semantic identities, not physical
+/// occurrence ids, so this remains stable across physical alternatives.
+fn runtime_filter_domain_identity(
+    memo: &Memo,
+    group: GroupId,
+    column: ColumnId,
+    side: JoinKeySide,
+) -> Option<Fingerprint> {
+    let group = memo.canonical_group(group);
+    let group_ref = memo.group(group)?;
+    let mut identity = StableFingerprintBuilder::default();
+    identity.write_bytes(b"paro.runtime-filter-build-domain.v2");
+    identity.write_u64(group.0 as u64);
+    identity.write_u64(column.0 as u64);
+    identity.write_u64(match side {
+        JoinKeySide::Left => 0,
+        JoinKeySide::Right => 1,
+    });
+    identity.write_fingerprint(group_ref.logical_fact_fingerprint());
+    identity.write_fingerprint(memo.local_statistics_fingerprint(group));
+    Some(identity.finish())
 }
 
 pub(super) fn infer_runtime_filter_probe_multiplicity<'a>(

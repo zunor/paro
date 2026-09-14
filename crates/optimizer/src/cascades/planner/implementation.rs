@@ -279,7 +279,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 metadata.implementations.baseline,
                 &cost_facts,
                 max_concurrent_tasks,
-                physical_fingerprint,
+                runtime_filter_evaluation_identity(expr, goal, physical_fingerprint),
             )?,
             spillable,
             enforcer_cost_input: planner_enforcer_cost_input(
@@ -439,7 +439,7 @@ impl PhysicalImplementation for AlternativeImplementation {
             self.flavor,
             &cost_facts,
             max_concurrent_tasks,
-            physical_fingerprint,
+            runtime_filter_evaluation_identity(expr, goal, physical_fingerprint),
         )?;
         let task_supply = planner_task_supply_contract(
             metadata,

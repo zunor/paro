@@ -253,6 +253,8 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         runtime_filter_probe_sources: Box::new([]),
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_domain_identity: None,
+        runtime_filter_build_left_domain_identity: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
@@ -294,6 +296,8 @@ fn non_source_width_cannot_manufacture_pipeline_tasks() {
         runtime_filter_probe_sources: Box::new([]),
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_domain_identity: None,
+        runtime_filter_build_left_domain_identity: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
@@ -331,6 +335,8 @@ fn scan_parallelism_uses_pre_predicate_physical_work() {
         runtime_filter_probe_sources: Box::new([]),
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_domain_identity: None,
+        runtime_filter_build_left_domain_identity: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
@@ -402,6 +408,8 @@ fn replaceable_runtime_filter_work_is_serial_until_bound_to_a_source() {
         runtime_filter_probe_sources: Box::new([]),
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_domain_identity: None,
+        runtime_filter_build_left_domain_identity: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: vec![LogicalType::BigInt].into_boxed_slice(),
     };
@@ -446,6 +454,8 @@ fn runtime_filter_tuple_work_counts_only_rows_delivered_to_the_join() {
         runtime_filter_probe_sources: Box::new([]),
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_domain_identity: None,
+        runtime_filter_build_left_domain_identity: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: vec![LogicalType::BigInt].into_boxed_slice(),
     };
@@ -555,6 +565,9 @@ fn expression_cost_facts_read_current_group_cardinality() {
         initial.runtime_filter_build_left_distinct_expected,
         Some(25)
     );
+    let initial_domain_identity = initial
+        .runtime_filter_build_left_domain_identity
+        .expect("the build column must have a semantic domain identity");
 
     memo.group_mut(child).unwrap().cardinality =
         GroupCardinality::new(Fingerprint(3), CardinalityRecipeKind::JoinRegion, 4, 5, 6);
@@ -569,6 +582,11 @@ fn expression_cost_facts_read_current_group_cardinality() {
     let refined = expression_cost_facts(&memo, parent, &[child], &template).unwrap();
     assert_eq!(refined.child_rows[0].expected, 5.0);
     assert_eq!(refined.runtime_filter_build_left_distinct_expected, Some(5));
+    assert_ne!(
+        refined.runtime_filter_build_left_domain_identity,
+        Some(initial_domain_identity),
+        "fact changes must invalidate the runtime-filter domain proof"
+    );
 }
 
 #[test]
@@ -1863,7 +1881,7 @@ fn nested_filters_share_one_ordered_source_work_lane() {
 }
 
 #[test]
-fn nested_filters_allow_build_left_on_a_different_source() {
+fn nested_filters_do_not_merge_distinct_build_domains() {
     let optimized =
         nested_runtime_filter_input(paro_planner::operator::join::JoinBuildSideConstraint::Either)
             .optimize(&test_grant_classes())
@@ -1871,38 +1889,28 @@ fn nested_filters_allow_build_left_on_a_different_source() {
     let root = optimized.strong_incumbent_plans[0].frozen();
     assert_eq!(
         root.physical.key.implementation,
-        PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER
+        PLANNER_HASH_JOIN_RUNTIME_FILTER
     );
     assert_eq!(
         root.children[0].physical.key.implementation,
         PLANNER_HASH_JOIN_RUNTIME_FILTER
     );
-    let CostComposition::SidewaysFilter {
-        filtered_child,
-        sources,
-        ..
-    } = &root.winner.cost_composition
-    else {
-        panic!("build-left RF must retain its source-work composition");
-    };
-    assert_eq!(*filtered_child, 1);
-    assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0].source, WorkSourceId(2));
-    let mut lanes = root
+    let lane = root
         .winner
         .source_work
         .iter()
-        .map(|lane| (lane.source.0, lane.source_rows, lane.filters.len()))
-        .collect::<Vec<_>>();
-    lanes.sort_unstable();
-    assert_eq!(lanes, vec![(0, 20_000, 1), (1, 20, 0), (2, 500, 1)]);
+        .find(|lane| lane.source == WorkSourceId(0))
+        .expect("the two nested filters must reach the fact source");
+    assert_eq!(lane.retentions.len(), 2);
+    assert_eq!(lane.filters.len(), 2);
+    assert_ne!(lane.retentions[0].domain, lane.retentions[1].domain);
+    assert_ne!(lane.filters[0].evaluation, lane.filters[1].evaluation);
 
     let variant = optimized.variants.into_vec().remove(0);
     let consumers =
         nested_runtime_filter_consumers(variant.plan, variant.contracts, variant.enforcers);
     assert_eq!(consumers.len(), 2);
-    assert_eq!((consumers[0].0, consumers[1].0), (0, 2));
-    assert_ne!(consumers[0].1, consumers[1].1);
+    assert_eq!((consumers[0].0, consumers[1].0), (0, 0));
 }
 
 #[test]
