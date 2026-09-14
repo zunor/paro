@@ -431,6 +431,12 @@ mod tests {
             get.stats.estimated_cardinality =
                 Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
         }
+        if wrapper == 19 || wrapper == 20 {
+            let LogicalOperator::Get(get) = &mut get.operator else {
+                unreachable!()
+            };
+            get.append_virtual_rowid("existing_rowid");
+        }
         let mut filter = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Filter(Filter::new(get, vec![predicate])),
@@ -439,8 +445,43 @@ mod tests {
             filter.stats.estimated_cardinality =
                 Some(paro_planner::plan::CardinalityEstimate::exact(100));
         }
+        if wrapper == 20 {
+            let LogicalOperator::Filter(filter) = &mut filter.operator else {
+                unreachable!()
+            };
+            filter.projection_map = paro_planner::operator::ProjectionMap::new(vec![0]);
+        }
         let filter = match wrapper {
-            0 | 16 | 17 => filter,
+            0 | 16 | 17 | 19 => filter,
+            18 => {
+                let function = paro_function::window::WindowFunction::row_number();
+                let frame = paro_planner::expression::WindowFrame::get_default_frame(&function);
+                let mut window = OwnedLogicalPlan::synthetic(LogicalOperator::Window(
+                    paro_planner::operator::Window::new(
+                        9,
+                        vec![paro_planner::expression::WindowExpression::native(
+                            function,
+                            vec![],
+                            vec![],
+                            vec![],
+                            frame,
+                            false,
+                        )],
+                        filter,
+                    ),
+                ));
+                window.stats.estimated_cardinality =
+                    Some(paro_planner::plan::CardinalityEstimate::exact(100));
+                window
+            }
+            20 => {
+                let mut order = paro_planner::operator::Order::new(filter, vec![]);
+                order.projection_map = paro_planner::operator::ProjectionMap::new(vec![0]);
+                let mut order = OwnedLogicalPlan::synthetic(LogicalOperator::Order(order));
+                order.stats.estimated_cardinality =
+                    Some(paro_planner::plan::CardinalityEstimate::exact(100));
+                order
+            }
             1 => OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Box::new(
                 paro_planner::operator::Limit::new(filter, None, None),
             ))),
@@ -495,8 +536,16 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 8,
                 filter,
-                if wrapper == 16 {
+                if wrapper == 16 || wrapper == 19 || wrapper == 20 {
                     vec![source_expression]
+                } else if wrapper == 18 {
+                    vec![
+                        source_expression,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(ColumnBinding::new(9, 0), LogicalType::BigInt)
+                                .into(),
+                        ),
+                    ]
                 } else if wrapper == 17 {
                     vec![source_expression.clone(), source_expression]
                 } else if wrapper == 4 {
@@ -663,7 +712,7 @@ mod tests {
     #[test]
     fn production_binding_builds_native_prefix_shell() {
         use crate::cascades::rules::TransformationRule;
-        for wrapper in 0..18 {
+        for wrapper in 0..21 {
             if wrapper >= 16 {
                 let (reference, changed) = crate::aggregate::late_payload::rewrite_node(
                     production_plan(wrapper),
@@ -735,7 +784,8 @@ mod tests {
                     .expect("production binding should take the native prefix path");
             assert_eq!(
                 shell.root_layout().unwrap().len(),
-                if wrapper == 4 || wrapper == 14 || wrapper == 15 || wrapper == 17 {
+                if wrapper == 4 || wrapper == 14 || wrapper == 15 || wrapper == 17 || wrapper == 18
+                {
                     2
                 } else {
                     1
@@ -760,6 +810,70 @@ mod tests {
                     result.binding,
                     ColumnBinding::new(fetch.sources[0].materialized_table_index, 0)
                 );
+                if wrapper == 18 {
+                    let Expression::ColumnRef(ordinary) = &projection.expressions[1] else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        ordinary.binding,
+                        ColumnBinding::new(fetch.carrier_table_index, 0)
+                    );
+                    let NativeChild::Node(carrier_index) = fetch.child else {
+                        unreachable!()
+                    };
+                    let LogicalOperator::Projection(carrier) = &shell.nodes[carrier_index].operator
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(carrier.visible_count, 0);
+                    assert!(
+                        matches!(&carrier.expressions[0], Expression::ColumnRef(column)
+                        if column.binding == ColumnBinding::new(9, 0))
+                    );
+                    assert_eq!(
+                        carrier.returned_types,
+                        vec![LogicalType::BigInt, LogicalType::BigInt]
+                    );
+                }
+                if wrapper == 19 || wrapper == 20 {
+                    let get = shell
+                        .nodes
+                        .iter()
+                        .find_map(|node| match &node.operator {
+                            LogicalOperator::Get(get) if get.table_index == 7 => Some(get),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        get.column_sources
+                            .iter()
+                            .filter(|source| matches!(
+                                source,
+                                paro_planner::operator::GetColumnSource::VirtualRowId
+                            ))
+                            .count(),
+                        1
+                    );
+                    assert_eq!(get.returned_types.len(), 2);
+                }
+                if wrapper == 20 {
+                    // Memo ingress expands output maps to the canonical
+                    // layout; test that real representation, not an invented
+                    // narrow map that bypasses binding construction.
+                    for node in &shell.nodes {
+                        match &node.operator {
+                            LogicalOperator::Filter(filter) => assert_eq!(
+                                filter.projection_map,
+                                paro_planner::operator::ProjectionMap::all()
+                            ),
+                            LogicalOperator::Order(order) => assert_eq!(
+                                order.projection_map,
+                                paro_planner::operator::ProjectionMap::all()
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
                 // The same selected shell must reject an upper bound with no
                 // reduction, even if its expected output remains small.
                 let (mut original, original_layouts) = NativeShell::from_pattern_with_layouts(
