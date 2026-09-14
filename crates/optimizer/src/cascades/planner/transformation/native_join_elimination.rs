@@ -283,6 +283,39 @@ fn required_children(
                 child_bindings(&setop.right),
             ])
         }
+        LogicalOperator::EmptyResult(empty) => Some(only_child(
+            &empty.child,
+            filter_required_bindings(required, &child_bindings(&empty.child)),
+        )),
+        LogicalOperator::DependentJoin(join) => {
+            let mut left = child_bindings(&join.left);
+            let mut right = child_bindings(&join.right);
+            if let Some(payload) = join.any_all_payload() {
+                collect_bindings_from_exprs(&payload.expression_children, &mut left);
+                collect_bindings_from_exprs(&payload.expression_children, &mut right);
+            }
+            if let Some(condition) = join.join_condition() {
+                collect_bindings_from_expr(condition, &mut left);
+                collect_bindings_from_expr(condition, &mut right);
+            }
+            Some(vec![left, right])
+        }
+        LogicalOperator::Update(update) => {
+            let mut child_required = child_bindings(&update.child);
+            collect_bindings_from_exprs(&update.expressions, &mut child_required);
+            Some(vec![child_required])
+        }
+        LogicalOperator::Explain(_)
+        | LogicalOperator::CopyTo(_)
+        | LogicalOperator::Delete(_)
+        | LogicalOperator::Insert(_)
+        | LogicalOperator::GraphExpand(_) => {
+            // These wrappers consume their children's complete contracts.
+            // They are traversed, never removed or moved across a boundary.
+            let mut children = Vec::new();
+            operator.visit_child_links(&mut |child| children.push(child_bindings(child)));
+            Some(children)
+        }
         _ => {
             let mut children = Vec::new();
             operator.visit_child_links(&mut |child| children.push(child));
@@ -719,6 +752,46 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_traversal_matches_reference_without_changing_output_contracts() {
+        for kind in 0..3 {
+            let make = || match kind {
+                0 => OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(
+                    paro_planner::operator::EmptyResult::new(candidate(true, false)),
+                )),
+                1 => OwnedLogicalPlan::synthetic(LogicalOperator::Explain(
+                    paro_planner::operator::Explain::new(
+                        candidate(true, false),
+                        paro_planner::operator::ExplainSpec::default(),
+                    ),
+                )),
+                _ => OwnedLogicalPlan::synthetic(LogicalOperator::DependentJoin(
+                    Box::new(paro_planner::operator::DependentJoin::scalar(
+                        candidate(true, false),
+                        boundary(2, false),
+                        vec![],
+                        None,
+                    )),
+                )),
+            };
+            let (reference, changed) =
+                crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+            assert!(changed);
+            let native = rewrite_shell(NativeShell::from_owned(make(), &HashMap::new()).unwrap())
+                .unwrap()
+                .expect("wrapper should be traversed");
+            assert_eq!(native.root_layout().unwrap(), reference.output_layout());
+            assert_eq!(
+                native.root_operator().op_type(),
+                reference.operator.op_type()
+            );
+            assert!(!native
+                .nodes
+                .iter()
+                .any(|node| matches!(node.operator, LogicalOperator::Join(_))));
+        }
+    }
+
+    #[test]
     fn native_shell_eliminates_unobserved_unique_outer_side() {
         let source = candidate(true, false);
         let expected_layout = source.output_layout();
@@ -838,7 +911,7 @@ mod tests {
         use paro_context::TestStatementContextBuilder;
         use paro_planner::binder::context::BindContext;
 
-        for wrapper in 0..4 {
+        for wrapper in 0..5 {
             let wrapped = wrapper != 0;
             let plan = if wrapped {
                 let child = if wrapper == 1 {
@@ -847,6 +920,10 @@ mod tests {
                     ))
                 } else if wrapper == 2 {
                     window(memo_candidate(), column(10, 0))
+                } else if wrapper == 4 {
+                    OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(
+                        paro_planner::operator::EmptyResult::new(memo_candidate()),
+                    ))
                 } else {
                     OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(
                         paro_planner::operator::SetOperation::union(
