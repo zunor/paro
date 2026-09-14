@@ -77,12 +77,42 @@ fn candidate(reference: bool) -> OwnedLogicalPlan {
 
 #[test]
 fn production_deferral_inlines_nonidentity_projection_spines() {
-    for depth in [1, 2] {
+    for (depth, nary) in [(1, false), (2, false), (0, true), (2, true)] {
         let make_plan = || {
             let mut plan = candidate(false);
             let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
                 unreachable!()
             };
+            if nary {
+                let child = std::mem::replace(&mut aggregate.child, Box::new(candidate(false)));
+                aggregate.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Join(
+                    Join::comparison(
+                        JoinType::Inner,
+                        *child,
+                        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                            Get::new_without_table(
+                                2,
+                                vec!["key".into()],
+                                vec![LogicalType::Integer],
+                            ),
+                        ))),
+                        vec![JoinCondition::equality(
+                            col(0, 0, LogicalType::Integer),
+                            col(2, 0, LogicalType::Integer),
+                        )],
+                    ),
+                )));
+                if depth == 2 {
+                    let LogicalOperator::Join(Join::Comparison(join)) =
+                        &mut aggregate.child.operator
+                    else {
+                        unreachable!()
+                    };
+                    std::mem::swap(&mut join.left, &mut join.right);
+                    let condition = &mut join.conditions[0];
+                    std::mem::swap(&mut condition.left, &mut condition.right);
+                }
+            }
             for level in 0..depth {
                 let (label, amount) = if level == 0 {
                     (
@@ -104,11 +134,13 @@ fn production_deferral_inlines_nonidentity_projection_spines() {
                     )),
                 ));
             }
-            aggregate.groups = vec![col(19 + depth, 1, LogicalType::Varchar)];
-            let Expression::Aggregate(sum) = &mut aggregate.aggregates[0] else {
-                unreachable!()
-            };
-            sum.children = vec![col(19 + depth, 0, LogicalType::Double)];
+            if depth > 0 {
+                aggregate.groups = vec![col(19 + depth, 1, LogicalType::Varchar)];
+                let Expression::Aggregate(sum) = &mut aggregate.aggregates[0] else {
+                    unreachable!()
+                };
+                sum.children = vec![col(19 + depth, 0, LogicalType::Double)];
+            }
             plan
         };
         let bind = BindContext::new();
@@ -179,6 +211,38 @@ fn production_deferral_inlines_nonidentity_projection_spines() {
         };
         assert_column(&sum.children, 0, 1);
         assert_column(&partial.groups, 0, 0);
+        if nary {
+            let fact = context
+                .memo()
+                .logical_expr(partial_expr)
+                .unwrap()
+                .key
+                .children[0];
+            let fact_expression = context.memo().group(fact).unwrap().logical_exprs()[0];
+            let payload = context
+                .memo()
+                .logical_expr(fact_expression)
+                .unwrap()
+                .payload;
+            let LogicalOperator::Join(Join::Comparison(join)) = &state.payloads.logical
+                [payload.index()]
+            .semantic_template
+            .operator
+            else {
+                panic!("fact region must retain the other join")
+            };
+            assert_eq!(join.conditions.len(), 1);
+            assert_column(
+                std::slice::from_ref(&join.conditions[0].left),
+                if depth == 2 { 2 } else { 0 },
+                0,
+            );
+            assert_column(
+                std::slice::from_ref(&join.conditions[0].right),
+                if depth == 2 { 0 } else { 2 },
+                0,
+            );
+        }
     }
 }
 

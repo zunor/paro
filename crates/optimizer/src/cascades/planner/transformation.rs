@@ -20,6 +20,7 @@ mod native_post_reduction;
 mod native_scalar_aggregate_window;
 mod native_join_preaggregation;
 mod native_join_subsumption;
+mod native_deferral_region;
 mod native_non_null_inputs;
 #[cfg(test)]
 mod native_limit_tests;
@@ -3135,28 +3136,22 @@ enum NativeDeferredOuterGroup {
     Dimension(Expression),
 }
 
-/// Apply the direct-child subset of AggregateDimensionDeferral without first
-/// materializing an OwnedLogicalPlan.  The legacy rule can rotate a complete
-/// multiway join region; that shape remains on its owned path. This path handles
-/// one plain aggregate through transparent projections, one plain inner equi-join,
-/// and a direct Get or CTERef dimension on the right. The old recognizer is
-/// already a local rewrite, so the native result is authoritative and does not
-/// need a second semantic peer.
+/// Apply AggregateDimensionDeferral to the selected native aggregate region.
+/// Projection substitution and widest-dimension selection share the reference
+/// contracts; connected inner-equi regions are rebuilt from native child edges.
+/// Unsupported constrained/layout-restricted shapes retain the general fallback.
 fn try_native_dimension_deferral(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Option<NativeShell>> {
-    // The general DimensionRegion matcher also accepts opaque relations and
-    // associative join shapes. Most of those bindings
-    // cannot enter this direct-child subset. Reject them from the immutable
-    // operator shells before allocating a native node vector; the legacy path
-    // will still perform its complete recognizer for every rejected shape.
+    // Reject ineligible root spines before allocating a native node vector.
+    // The general fallback retains coverage for unsupported boundary contracts.
     if !native_dimension_direct_shape(binding, memo, state)? {
         return Ok(None);
     }
-    let Some((shell, layouts)) =
+    let Some((mut shell, mut layouts)) =
         NativeShell::from_pattern_with_layouts(memo, state, binding, facts)?
     else {
         return Ok(None);
@@ -3200,6 +3195,9 @@ fn try_native_dimension_deferral(
         };
     aggregate.groups = groups;
     aggregate.aggregates = aggregates;
+    let Some(join_index) = native_deferral_region::isolate(
+        &mut shell, &mut layouts, join_index, &aggregate, state,
+    )? else { return Ok(None); };
     let join_node = shell
         .nodes
         .get(join_index)
@@ -4565,31 +4563,6 @@ fn native_dimension_direct_shape(
             .iter()
             .any(|condition| condition.comparison != JoinComparisonType::Equal)
         || join_children.len() != 2
-    {
-        return Ok(false);
-    }
-    let PatternOperand::Expression {
-        expression: dimension_expression,
-        children: dimension_children,
-        ..
-    } = &join_children[1]
-    else {
-        return Ok(false);
-    };
-    let dimension_logical = memo.logical_expr(*dimension_expression).ok_or_else(|| {
-        paro_error::internal("native dimension preflight lost its dimension expression")
-    })?;
-    let dimension_payload = state
-        .payloads
-        .logical
-        .get(dimension_logical.payload.index())
-        .ok_or_else(|| {
-            paro_error::internal("native dimension preflight lost its dimension payload")
-        })?;
-    if !matches!(
-        dimension_payload.semantic_template.operator,
-        LogicalOperator::Get(_) | LogicalOperator::CTERef(_)
-    ) || !dimension_children.is_empty()
     {
         return Ok(false);
     }
