@@ -1990,7 +1990,7 @@ fn try_native_predicate_transfer(
     {
         return Ok(None);
     }
-    let complete = native_predicate_transfer_is_complete(&filter.expressions);
+    let original_expressions = filter.expressions.clone();
 
     let child_layout =
         |child: &NativeChild| -> Result<paro_planner::operator::LogicalOutputLayout> {
@@ -2044,6 +2044,29 @@ fn try_native_predicate_transfer(
     }
     if left_filters.is_empty() && right_filters.is_empty() {
         return Ok(None);
+    }
+
+    // FilterPushdown owns the authoritative conjunct normalization contract.
+    // A native shell may bypass the owned bridge only when each side's local
+    // predicates already have exactly the representation that the existing
+    // combiner would emit. This admits independent simple predicates while
+    // rejecting tightening, contradiction, constant folding, and any other
+    // case where merely moving the original expressions would change the
+    // legacy result. Root residuals are intentionally compared as the
+    // untouched source sequence below.
+    let complete = native_predicate_transfer_is_complete(
+        &original_expressions,
+        &left_filters,
+        &right_filters,
+        &remaining,
+    );
+    if complete {
+        left_filters = FilterPushdown::normalize_predicates(left_filters).ok_or_else(|| {
+            paro_error::internal("complete predicate transfer became unsatisfiable")
+        })?;
+        right_filters = FilterPushdown::normalize_predicates(right_filters).ok_or_else(|| {
+            paro_error::internal("complete predicate transfer became unsatisfiable")
+        })?;
     }
 
     let join_stats = shell
@@ -2145,16 +2168,64 @@ fn try_native_predicate_transfer(
     }))
 }
 
-/// The side-local native shell is only complete for a deliberately small
-/// filter contract. `FilterPushdown` combines conjuncts, derives OR domains,
-/// and may retain fenced or aggregate predicates. A single normalized, bound
-/// comparison is the only case where the native route is known to emit
-/// exactly the same moved predicate without rebuilding the owned tree.
-fn native_predicate_transfer_is_complete(expressions: &[Expression]) -> bool {
-    if expressions.len() != 1 {
+/// The side-local native shell is complete only when the existing
+/// `FilterPushdown` contract emits the same local predicate sequences. The
+/// direct-comparison precondition deliberately excludes OR/AND trees,
+/// derived expressions, constants and unsupported comparison forms. It is a
+/// proof boundary, not an approximation: a predicate that the combiner would
+/// merge, prune, fold, or reject keeps the owned semantic peer.
+fn native_predicate_transfer_is_complete(
+    expressions: &[Expression],
+    left_filters: &[Expression],
+    right_filters: &[Expression],
+    remaining: &[Expression],
+) -> bool {
+    if left_filters.is_empty() && right_filters.is_empty() {
         return false;
     }
-    let Expression::Comparison(comparison) = &expressions[0] else {
+    if !expressions
+        .iter()
+        .chain(left_filters)
+        .chain(right_filters)
+        .all(native_predicate_transfer_simple_comparison)
+    {
+        return false;
+    }
+    let Some(left_normalized) = FilterPushdown::normalize_predicates(left_filters.iter().cloned())
+    else {
+        return false;
+    };
+    let Some(right_normalized) =
+        FilterPushdown::normalize_predicates(right_filters.iter().cloned())
+    else {
+        return false;
+    };
+    left_normalized.len() == left_filters.len()
+        && left_normalized
+            .iter()
+            .zip(left_filters)
+            .all(|(normalized, original)| normalized.equals(original))
+        && right_normalized.len() == right_filters.len()
+        && right_normalized
+            .iter()
+            .zip(right_filters)
+            .all(|(normalized, original)| normalized.equals(original))
+        && expressions
+            .iter()
+            .filter(|expression| {
+                !left_filters
+                    .iter()
+                    .any(|local| local.equals(expression))
+                    && !right_filters
+                        .iter()
+                        .any(|local| local.equals(expression))
+            })
+            .zip(remaining)
+            .all(|(source, residual)| source.equals(residual))
+}
+
+fn native_predicate_transfer_simple_comparison(expression: &Expression) -> bool {
+    let Expression::Comparison(comparison) = expression else {
         return false;
     };
     if !comparison.has_bound_input_contract()
@@ -2162,17 +2233,19 @@ fn native_predicate_transfer_is_complete(expressions: &[Expression]) -> bool {
     {
         return false;
     }
-    if !matches!(
+    matches!(
+        comparison.comparison_type,
+        paro_planner::expression::ComparisonType::Equal
+            | paro_planner::expression::ComparisonType::NotEqual
+            | paro_planner::expression::ComparisonType::LessThan
+            | paro_planner::expression::ComparisonType::LessThanOrEqual
+            | paro_planner::expression::ComparisonType::GreaterThan
+            | paro_planner::expression::ComparisonType::GreaterThanOrEqual
+    ) && matches!(
         (comparison.left.as_ref(), comparison.right.as_ref()),
-        (Expression::ColumnRef(column), Expression::Constant(_)) if column.depth == 0
-    ) {
-        return false;
-    }
-    let Some(normalized) = FilterPushdown::normalize_predicates(expressions.iter().cloned())
-    else {
-        return false;
-    };
-    normalized.len() == 1 && normalized[0].equals(&expressions[0])
+        (Expression::ColumnRef(column), Expression::Constant(constant))
+            if column.depth == 0 && !constant.value.is_null()
+    )
 }
 
 /// Compare two native child edges as edges, not as semantic group contracts.
@@ -5768,13 +5841,13 @@ mod tests {
 
     #[test]
     fn native_predicate_transfer_completeness_gate_is_fail_closed() {
-        let comparison = |value| {
+        let comparison = |column_index, value| {
             Expression::Comparison(
                 paro_planner::expression::ComparisonExpression::new(
                     paro_planner::expression::ComparisonType::Equal,
                     Expression::ColumnRef(
                         ColumnRefExpression::new(
-                            ColumnBinding::new(12, 0),
+                            ColumnBinding::new(12, column_index),
                             LogicalType::BigInt,
                         )
                         .into(),
@@ -5786,22 +5859,39 @@ mod tests {
                 .into(),
             )
         };
-        let simple = comparison(2);
-        assert!(native_predicate_transfer_is_complete(std::slice::from_ref(
-            &simple,
-        )));
-        assert!(!native_predicate_transfer_is_complete(&[
-            simple.clone(),
-            comparison(3),
-        ]));
+        let simple = comparison(0, 2);
+        assert!(native_predicate_transfer_is_complete(
+            std::slice::from_ref(&simple),
+            std::slice::from_ref(&simple),
+            &[],
+            &[],
+        ));
+        let independent = comparison(1, 3);
+        assert!(native_predicate_transfer_is_complete(
+            &[simple.clone(), independent.clone()],
+            &[simple.clone(), independent],
+            &[],
+            &[],
+        ));
+        assert!(!native_predicate_transfer_is_complete(
+            &[simple.clone(), comparison(0, 3)],
+            &[simple.clone(), comparison(0, 3)],
+            &[],
+            &[],
+        ));
         let disjunction = Expression::Conjunction(
             paro_planner::expression::ConjunctionExpression::new(
                 paro_planner::expression::ConjunctionType::Or,
-                vec![simple.clone(), comparison(3)],
+                vec![simple.clone(), comparison(0, 3)],
             )
             .into(),
         );
-        assert!(!native_predicate_transfer_is_complete(&[disjunction]));
+        assert!(!native_predicate_transfer_is_complete(
+            std::slice::from_ref(&disjunction),
+            std::slice::from_ref(&disjunction),
+            &[],
+            &[],
+        ));
     }
 
     #[test]
@@ -5880,7 +5970,12 @@ mod tests {
             let LogicalOperator::Filter(filter) = &payload.semantic_template.operator else {
                 panic!("test root is not a filter")
             };
-            assert!(native_predicate_transfer_is_complete(&filter.expressions));
+            assert!(native_predicate_transfer_is_complete(
+                &filter.expressions,
+                &filter.expressions,
+                &[],
+                &[],
+            ));
         }
         {
             let state = state.read().unwrap();
