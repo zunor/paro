@@ -979,3 +979,35 @@ allocator rewind. No files or benchmarks were changed by the auditing agent.
 SQL regress, independent bag execution, fixed-work/fingerprint and fresh Q11
 gates remain unrun for this slice. The mixed-tree checks do not constitute
 end-to-end acceptance. Overall migration remains incomplete.
+
+## Ordinary Projection native RowFetch construction
+
+When prefix selection produces no result, the same selected native shell now
+feeds ordinary selective row-fetch lowering. The shared row-id proof checks its
+unary path; post-join fetch and TopN remain excluded. Guard ordering keeps all
+symbol allocation after semantic/type/stored-column checks and the existing
+cost model's child-max/source-expected reduction/benefit test. No new cost model
+or weaker row-id policy was added.
+
+Construction appends the virtual rowid, exposes it through exact unary maps,
+creates an internal carrier and RowFetch, rebases the original output and checks
+the final binding/type layout. Affected lineage is cleared; unchanged nodes keep
+their proofs. Successful results enter existing native staging and avoid the
+owned peer. Rejected/unsupported cases still fall back; ordinary Projection is
+not yet declared entirely native-only, and both TopN constructions remain owned.
+
+Production Memo/matching/apply fixtures cover single and repeated payload output,
+compare needed catalog columns with the tree reference, and verify one result
+with no owned instantiation. Raising only the selected input cardinality upper
+bound to source cardinality refuses the rewrite. Explicit rollback after actual
+publication restores Memo group, column, scalar, binding and logical-payload
+counts. This checks visible state, not shared allocator rewind.
+
+All 21 late_payload tests pass; full optimizer 1285 pass / same five failures.
+Optimizer/compiler check passes. Independent read-only review found no definite
+missing guard in this unary success path; it called out ordinary Window-output
+carriers, projected wrappers and existing-rowid coverage still needed. Explicit
+rollback is tested, not all cancellation/staging-rejection schedules. No bless,
+SQL regress, independent bag execution, fixed-work/fingerprint or fresh Q11
+campaign. Tests are mixed-worktree evidence only. No timing gain or complete
+owned-IR migration is claimed.
