@@ -238,6 +238,18 @@ passed. Control and other unhandled descendants still need coverage before
 the rule's negative fallback can be removed. No Q11 performance or clean
 fingerprint acceptance was run for this slice.
 
+`0e74592b` extends native JoinElimination requirements through EmptyResult,
+DependentJoin and the remaining full-child-contract wrappers (Explain,
+CopyTo/Delete/Insert/GraphExpand), plus Update expression dependencies.
+The production EmptyResult wrapper first required one owned instantiation
+and now produces its native result with zero bridges. Reference comparisons
+cover EmptyResult, Explain and scalar DependentJoin output contracts; this
+does not claim end-to-end DML/graph execution coverage. Ten native tests,
+five reference tests and 111 engine tests passed. CTE/control exclusion is
+unchanged, and unknown descendants still cannot be treated as complete native
+negative results. No Q11, full SQL regression or clean-source performance
+campaign was run for this implementation slice.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
