@@ -752,3 +752,24 @@ previous 1281/5 result is not relabeled as a new run. No bridge-count reduction
 or speedup is claimed. Remaining fallback audit must focus on genuinely reachable
 enforcement/region or construction failures, not these canonicalized ingress
 shapes. The overall migration is still incomplete.
+
+## Deferral build-side constraint boundary
+
+A reachable legacy fallback violation was reproduced: a root join constrained
+to Left became Either after owned region isolation and deferral. Both the shared
+inner-equi region eligibility and reference recognizer now treat non-Either
+joins as opaque boundaries. Native root preflight rejects these bindings
+authoritatively instead of handing them to the constraint-erasing fallback.
+
+This does not forbid an unconstrained outer rewrite over a constrained fact
+component. New fixtures with Get and materialized-CTE dimensions confirm that
+component remains the identical original fact group below partial aggregation,
+retains its Right build constraint, and uses zero owned binding instantiations.
+Root Left and Right constraints are both checked, with no output, no bridges,
+and no staging arena growth. No rule budget/model/stop-policy change was made;
+formerly invalid constraint-crossing outputs are intentionally no longer emitted.
+
+Full optimizer: 1282 passed / same five failure names and assertion values.
+No bless, fresh Q11, fixed-work/fingerprint campaign or execution/bag oracle in
+this slice. This closes a concrete fallback contract violation, not the entire
+owned-IR migration. User mixed changes were excluded from the commit.
