@@ -951,3 +951,31 @@ All five native_late_payload tests pass (16 production fixtures). Full optimizer
 check passes. No bless, unrelated edits, SQL regress, independent bag execution,
 fixed-work/fingerprint campaign or fresh Q11 evidence. Row-id lowering and other
 owned rule paths remain; this is not a completion or performance claim.
+
+## Ownership-generic row-id proof, ahead of native RowFetch construction
+
+The existing row-id structural proof now accepts selected operators, a child
+resolver and exact source occurrence counts. The owned caller delegates to this
+same algorithm; Join kind/side policy and the whitelist are unchanged. Prefix
+transport is deliberately not reused as row-id legality: TopN/Projection remain
+barriers, and Any join policy differs between RowPreserving and NonNull.
+
+Tests resolve actual native shell children from the production prefix fixtures
+and check both policies with Inner/Left/Right/full-outer comparison joins on both
+source sides. NULL-extended source sides are refused. Existing late_payload
+tests still exercise the owned entry. All 21 pass; full optimizer 1285 pass /
+same five failures. Optimizer/compiler check passes. No bless. This step removes
+owned ownership from the proof algorithm, not yet from RowFetch construction or
+its production call chain. No bridge-count or timing improvement is asserted.
+
+Read-only independent audit confirms the next implementation slice: ordinary
+Projection selective native construction before both TopN variants. Preserve
+child cardinality max versus source expected, derived-column rejection and
+SelectiveJoinLocality; create rowid -> internal carrier -> RowFetch -> exact
+original output in native staging. Savepoints restore visible planner state,
+not the shared atomic table-index allocator; rollback tests must not assert
+allocator rewind. No files or benchmarks were changed by the auditing agent.
+
+SQL regress, independent bag execution, fixed-work/fingerprint and fresh Q11
+gates remain unrun for this slice. The mixed-tree checks do not constitute
+end-to-end acceptance. Overall migration remains incomplete.
