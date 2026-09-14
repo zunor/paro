@@ -481,7 +481,7 @@ pub(crate) struct SelectiveProjectionCandidate {
 
 #[derive(Debug)]
 pub(crate) struct SelectiveProjectionSource {
-    source_table_index: usize,
+    pub(crate) source_table_index: usize,
     pub(crate) table: Arc<TableCatalogEntry>,
     pub(crate) delayed_bindings: HashMap<ColumnBinding, usize>,
     rowid_path: RowIdPath,

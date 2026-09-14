@@ -35,17 +35,63 @@ pub(super) fn rewrite(
         return Ok(None);
     };
 
-    // Ordinary selective fetching currently has no post-join locality proof.
-    // Resolve the single unary source without constructing another tree.
+    // Eligibility is decided by the shared selected-input proof, including
+    // its post-join locality rejection. Transport shape is not a second guard.
+    let Some(mut proof) = crate::aggregate::late_payload::prove_selective_projection_inputs(
+        &output.expressions,
+        matches!(shell.nodes[input].operator, LogicalOperator::RowFetch(_)),
+        shell.nodes[input].stats.estimated_cardinality,
+        |table| {
+            if super::native_topn_payload::occurrences(&shell, &output.child, table) != Some(1) {
+                return None;
+            }
+            let index = super::native_topn_payload::source_get(&shell, &output.child, table)?;
+            match &shell.nodes[index].operator {
+                LogicalOperator::Get(get) => Some(get.as_ref()),
+                _ => None,
+            }
+        },
+        |table| {
+            prove_rowid_operator(
+                &shell.nodes[input].operator,
+                table,
+                RowIdPathPolicy::RowPreserving,
+                &|child| match child {
+                    NativeChild::Node(index) => Some(&shell.nodes[*index].operator),
+                    _ => None,
+                },
+                &|child| super::native_topn_payload::occurrences(&shell, child, table),
+            )
+        },
+        |table| {
+            let index = super::native_topn_payload::source_get(&shell, &output.child, table)?;
+            Some(shell.nodes[index].stats.estimated_cardinality?.expected)
+        },
+        &state.cost_model,
+        &mut None,
+    ) else {
+        return Ok(None);
+    };
+    // Shared admission excludes join-crossing fetch paths. Its successful
+    // witness therefore has one unary source; a mismatch is an invariant error.
+    if proof.sources.len() != 1 {
+        return Err(paro_error::internal(
+            "native unary fetch has multiple sources",
+        ));
+    }
+    let source = proof.sources.pop().unwrap();
     let mut cursor = input;
     let mut ancestors = Vec::new();
     let get_index = loop {
         let operator = &shell.nodes[cursor].operator;
-        if matches!(operator, LogicalOperator::Get(_)) {
+        if matches!(operator, LogicalOperator::Get(get) if get.table_index == source.source_table_index)
+        {
             break cursor;
         }
         let Some(NativeChild::Node(child)) = prefix_unary_child(operator) else {
-            return Ok(None);
+            return Err(paro_error::internal(
+                "selective rowid proof lost its unary path",
+            ));
         };
         ancestors.push(cursor);
         cursor = *child;
@@ -53,46 +99,6 @@ pub(super) fn rewrite(
     let LogicalOperator::Get(mut get) = shell.nodes[get_index].operator.clone() else {
         unreachable!()
     };
-    let resolve = |child: &NativeChild| match child {
-        NativeChild::Node(index) => Some(&shell.nodes[*index].operator),
-        _ => None,
-    };
-    let Some(mut proof) = crate::aggregate::late_payload::prove_selective_projection_inputs(
-        &output.expressions,
-        matches!(shell.nodes[input].operator, LogicalOperator::RowFetch(_)),
-        shell.nodes[input].stats.estimated_cardinality,
-        |table| (table == get.table_index).then_some(get.as_ref()),
-        |table| {
-            prove_rowid_operator(
-                &shell.nodes[input].operator,
-                table,
-                RowIdPathPolicy::RowPreserving,
-                &resolve,
-                &|_| None,
-            )
-        },
-        |table| {
-            (table == get.table_index)
-                .then(|| {
-                    shell.nodes[get_index]
-                        .stats
-                        .estimated_cardinality
-                        .map(|estimate| estimate.expected)
-                })
-                .flatten()
-        },
-        &state.cost_model,
-        &mut None,
-    ) else {
-        return Ok(None);
-    };
-    // A concrete unary source can yield at most one materialized namespace.
-    if proof.sources.len() != 1 {
-        return Err(paro_error::internal(
-            "native unary fetch has multiple sources",
-        ));
-    }
-    let source = proof.sources.pop().unwrap();
     let table = source.table;
     let delayed = source.delayed_bindings;
 
