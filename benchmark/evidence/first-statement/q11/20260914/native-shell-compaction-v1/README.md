@@ -1110,3 +1110,21 @@ No fresh Q11, full SQL regress, independent execution bag oracle, clean prefix
 replay or new performance evidence. Multi-source deterministic ordering,
 non-prefix root namespace preservation, aggregate TopN and negative-path
 authority remain open.
+
+### Shared aggregate TopN proof (3415b2de)
+
+Aggregate payload proof now consumes a generic selected Projection/operator,
+explicit cardinality inputs and source/path resolvers. The owned wrapper uses
+that same proof; dependency choice, max-benefit ranking, plain grouping domain,
+non-null rowid policy and rejection of ordering by delayed payload are unchanged.
+No native aggregate construction is claimed by this commit alone.
+
+New selected-evidence test exercises missing non-null path, absent source and
+missing carrier cardinality with exact bounded rejection reasons, and the
+existing aggregate-output-cardinality fallback to the carrier domain. It checks
+the selected dependency and catalog-column mapping. 22 late_payload tests pass;
+full optimizer 1290 pass / same five failures and assertions. Optimizer check
+passes. Runs are mixed-worktree unit evidence only, not fresh performance or
+independent SQL execution. The native aggregate producer is a separate pending
+implementation and must pass real Memo/staging tests before its bridge can be
+considered removed.
