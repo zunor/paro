@@ -4,7 +4,8 @@
 //! Native staging for the closed scan-prefix subset of late payload lowering.
 //!
 //! Row-id payload fetching remains on the authoritative owned rule.  This
-//! adapter handles Projection through Filter/Order/Limit to Filter -> Get, whose
+//! adapter handles Projection through the shared unary prefix transport to
+//! Filter -> Get, whose
 //! semantic witness is an exact ASCII membership predicate.  It therefore
 //! avoids importing an owned tree without claiming that the full rule has
 //! been migrated.
@@ -72,15 +73,13 @@ pub(super) fn try_native_late_payload_prefix(
                 ancestors.push(index);
                 cursor = filter.child.clone();
             }
-            LogicalOperator::Order(order) => {
+            operator => {
+                let Some(child) = prefix_unary_child(operator) else {
+                    return Ok(None);
+                };
                 ancestors.push(index);
-                cursor = order.child.clone();
+                cursor = child.clone();
             }
-            LogicalOperator::Limit(limit) => {
-                ancestors.push(index);
-                cursor = limit.child.clone();
-            }
-            _ => return Ok(None),
         }
     };
 
@@ -152,15 +151,13 @@ pub(super) fn try_native_late_payload_prefix(
                 paro_error::internal("native prefix ancestor lost the derived column")
             })?;
         let node = &mut nodes[index];
-        match &mut node.operator {
-            LogicalOperator::Filter(filter) => filter.projection_map.include(ordinal),
-            LogicalOperator::Order(order) => order.projection_map.include(ordinal),
-            LogicalOperator::Limit(_) => {}
-            _ => {
-                return Err(paro_error::internal(
-                    "native prefix ancestor changed operator",
-                ))
-            }
+        let Some((_, projection)) = prefix_unary_child_mut(&mut node.operator) else {
+            return Err(paro_error::internal(
+                "native prefix ancestor changed operator",
+            ));
+        };
+        if let Some(projection) = projection {
+            projection.include(ordinal);
         }
         child_layout = node
             .operator
@@ -257,7 +254,9 @@ fn prove_prefix_candidate(
     candidate
 }
 
-use crate::aggregate::late_payload::prove_prefix_filter_expression;
+use crate::aggregate::late_payload::{
+    prefix_unary_child, prefix_unary_child_mut, prove_prefix_filter_expression,
+};
 
 #[cfg(test)]
 mod tests {
@@ -383,6 +382,15 @@ mod tests {
             2 => OwnedLogicalPlan::synthetic(LogicalOperator::Order(
                 paro_planner::operator::Order::new(filter, vec![]),
             )),
+            5 => OwnedLogicalPlan::synthetic(LogicalOperator::Window(
+                paro_planner::operator::Window::new(9, vec![], filter),
+            )),
+            6 => OwnedLogicalPlan::synthetic(LogicalOperator::TopN(
+                paro_planner::operator::TopN::new(filter, vec![], 3, 0),
+            )),
+            7 => OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(
+                paro_planner::operator::EmptyResult::new(filter),
+            )),
             _ => OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(filter, vec![]))),
         };
         OwnedLogicalPlan::new(
@@ -456,9 +464,32 @@ mod tests {
     }
 
     #[test]
+    fn prefix_transport_keeps_topn_projected_output_visible() {
+        let mut plan = production_plan(6);
+        let LogicalOperator::Projection(output) = &mut plan.operator else {
+            panic!("expected output projection")
+        };
+        let LogicalOperator::TopN(topn) = &mut output.child.operator else {
+            panic!("expected TopN")
+        };
+        topn.projection_map = paro_planner::operator::ProjectionMap::new(vec![0]);
+        let (rewritten, changed) =
+            crate::aggregate::late_payload::rewrite_matched_prefix_node(plan).unwrap();
+        assert!(changed);
+        let LogicalOperator::Projection(output) = &rewritten.operator else {
+            panic!("expected output projection")
+        };
+        let Expression::ColumnRef(column) = &output.expressions[0] else {
+            panic!("expected derived prefix column")
+        };
+        assert_eq!(column.binding, ColumnBinding::new(7, 1));
+        assert!(output.child.get_column_bindings().contains(&column.binding));
+    }
+
+    #[test]
     fn production_binding_builds_native_prefix_shell() {
         use crate::cascades::rules::TransformationRule;
-        for wrapper in 0..5 {
+        for wrapper in 0..8 {
             let mut input = MemoBuilder::build(
                 production_plan(wrapper),
                 BindContext::new(),

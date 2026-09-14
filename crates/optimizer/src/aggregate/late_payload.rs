@@ -166,6 +166,36 @@ fn prove_matched_prefix_candidate(plan: &OwnedLogicalPlan) -> Option<MatchedPref
     candidate
 }
 
+/// Unary operators that preserve the witnessed source value. Projection and
+/// aggregation are deliberately absent: they require a different proof.
+pub(crate) fn prefix_unary_child<Child>(operator: &LogicalOperator<Child>) -> Option<&Child> {
+    match operator {
+        LogicalOperator::Filter(op) => Some(&op.child),
+        LogicalOperator::Order(op) => Some(&op.child),
+        LogicalOperator::Limit(op) => Some(&op.child),
+        LogicalOperator::TopN(op) => Some(&op.child),
+        LogicalOperator::Window(op) => Some(&op.child),
+        LogicalOperator::EmptyResult(op) => Some(&op.child),
+        _ => None,
+    }
+}
+
+/// The same transport contract, including any output map that must expose a
+/// newly appended child value. Independent of owned-tree or native child IDs.
+pub(crate) fn prefix_unary_child_mut<Child>(
+    operator: &mut LogicalOperator<Child>,
+) -> Option<(&mut Child, Option<&mut ProjectionMap>)> {
+    match operator {
+        LogicalOperator::Filter(op) => Some((&mut op.child, Some(&mut op.projection_map))),
+        LogicalOperator::Order(op) => Some((&mut op.child, Some(&mut op.projection_map))),
+        LogicalOperator::TopN(op) => Some((&mut op.child, Some(&mut op.projection_map))),
+        LogicalOperator::Limit(op) => Some((&mut op.child, None)),
+        LogicalOperator::Window(op) => Some((&mut op.child, None)),
+        LogicalOperator::EmptyResult(op) => Some((&mut op.child, None)),
+        _ => None,
+    }
+}
+
 fn prove_matched_prefix_use_path(
     plan: &OwnedLogicalPlan,
     source_binding: ColumnBinding,
@@ -186,20 +216,13 @@ fn prove_matched_prefix_use_path(
             }
             prove_matched_prefix_use_path(filter.child.as_ref(), source_binding, kernel, byte_width)
         }
-        LogicalOperator::Window(window) => {
-            prove_matched_prefix_use_path(window.child.as_ref(), source_binding, kernel, byte_width)
-        }
-        LogicalOperator::Order(order) => {
-            prove_matched_prefix_use_path(order.child.as_ref(), source_binding, kernel, byte_width)
-        }
-        LogicalOperator::Limit(limit) => {
-            prove_matched_prefix_use_path(limit.child.as_ref(), source_binding, kernel, byte_width)
-        }
-        LogicalOperator::TopN(topn) => {
-            prove_matched_prefix_use_path(topn.child.as_ref(), source_binding, kernel, byte_width)
-        }
-        LogicalOperator::EmptyResult(empty) => {
-            prove_matched_prefix_use_path(empty.child.as_ref(), source_binding, kernel, byte_width)
+        operator if prefix_unary_child(operator).is_some() => {
+            prove_matched_prefix_use_path(
+                prefix_unary_child(operator)?.as_ref(),
+                source_binding,
+                kernel,
+                byte_width,
+            )
         }
         LogicalOperator::Join(Join::Comparison(join)) => prove_prefix_join_child(
             join.left.as_ref(),
@@ -353,63 +376,24 @@ fn append_prefix_through_operator(
     source_binding: ColumnBinding,
     byte_width: usize,
 ) -> Result<ColumnBinding> {
+    if let Some((child, projection)) = prefix_unary_child_mut(&mut plan.operator) {
+        let binding = append_get_matched_prefix_projection(
+            child.as_mut(),
+            table_index,
+            source_binding,
+            byte_width,
+        )?;
+        if let Some(projection) = projection {
+            let ordinal = child
+                .get_column_bindings()
+                .iter()
+                .position(|candidate| *candidate == binding)
+                .ok_or_else(|| rewrite_invariant("Unary operator hid an appended prefix binding"))?;
+            projection.include(ordinal);
+        }
+        return Ok(binding);
+    }
     match &mut plan.operator {
-        LogicalOperator::Filter(filter) => {
-            let binding = append_get_matched_prefix_projection(
-                filter.child.as_mut(),
-                table_index,
-                source_binding,
-                byte_width,
-            )?;
-            let child_index = filter
-                .child
-                .get_column_bindings()
-                .iter()
-                .position(|candidate| *candidate == binding)
-                .ok_or_else(|| rewrite_invariant("Filter hid an appended prefix binding"))?;
-            filter.projection_map.include(child_index);
-            Ok(binding)
-        }
-        LogicalOperator::Window(window) => append_get_matched_prefix_projection(
-            window.child.as_mut(),
-            table_index,
-            source_binding,
-            byte_width,
-        ),
-        LogicalOperator::Order(order) => {
-            let binding = append_get_matched_prefix_projection(
-                order.child.as_mut(),
-                table_index,
-                source_binding,
-                byte_width,
-            )?;
-            let child_index = order
-                .child
-                .get_column_bindings()
-                .iter()
-                .position(|candidate| *candidate == binding)
-                .ok_or_else(|| rewrite_invariant("Order hid an appended prefix binding"))?;
-            order.projection_map.include(child_index);
-            Ok(binding)
-        }
-        LogicalOperator::Limit(limit) => append_get_matched_prefix_projection(
-            limit.child.as_mut(),
-            table_index,
-            source_binding,
-            byte_width,
-        ),
-        LogicalOperator::TopN(topn) => append_get_matched_prefix_projection(
-            topn.child.as_mut(),
-            table_index,
-            source_binding,
-            byte_width,
-        ),
-        LogicalOperator::EmptyResult(empty) => append_get_matched_prefix_projection(
-            empty.child.as_mut(),
-            table_index,
-            source_binding,
-            byte_width,
-        ),
         LogicalOperator::Join(Join::Comparison(join)) => append_prefix_join_child(
             join.left.as_mut(),
             join.right.as_mut(),
