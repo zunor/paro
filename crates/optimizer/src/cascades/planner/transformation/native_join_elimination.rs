@@ -27,29 +27,41 @@ use paro_planner::operator::{
 use super::staging::{NativeChild, NativeNode, NativeShell};
 use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 
-/// Try join elimination directly on the pattern shell.
-///
-/// The root remains a node because the scoped matcher wraps an outer join in a
-/// consumer shell.  If a future matcher ever exposes the join itself as the
-/// root, returning `None` is safer than making a group hole the shell root.
-pub(super) fn try_native_join_elimination(
+/// Completion of this selected rewrite, independent of global search state.
+pub(super) enum EliminationResult {
+    /// Coverage is missing, or the shell/output contract could not be built.
+    Unsupported,
+    /// The entire selected shell was checked. This is not search completion.
+    NoRewrite,
+    Rewritten(NativeShell),
+}
+
+pub(super) fn apply_native_join_elimination(
     root_binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
-) -> Result<Option<NativeShell>> {
+) -> Result<EliminationResult> {
     let Some((shell, _layouts)) =
         NativeShell::from_pattern_with_layouts(memo, state, root_binding, facts)?
     else {
-        return Ok(None);
+        return Ok(EliminationResult::Unsupported);
     };
     if super::native_shell_contains_control_boundary(&shell) {
-        return Ok(None);
+        return Ok(EliminationResult::Unsupported);
     }
-    rewrite_shell(shell)
+    rewrite_shell_result(shell)
 }
 
+#[cfg(test)]
 fn rewrite_shell(shell: NativeShell) -> Result<Option<NativeShell>> {
+    Ok(match rewrite_shell_result(shell)? {
+        EliminationResult::Rewritten(shell) => Some(shell),
+        _ => None,
+    })
+}
+
+fn rewrite_shell_result(shell: NativeShell) -> Result<EliminationResult> {
     let root = shell.root;
     let layouts = shell.layouts()?;
     let original_layout = layouts
@@ -59,10 +71,13 @@ fn rewrite_shell(shell: NativeShell) -> Result<Option<NativeShell>> {
     let required = output_bindings_from_layout(&original_layout);
     let mut nodes = shell.nodes.into_vec();
     let Some((replacement, changed)) = rewrite_node(&mut nodes, &layouts, root, &required)? else {
-        return Ok(None);
+        return Ok(EliminationResult::Unsupported);
     };
-    if !changed || !matches!(replacement, NativeChild::Node(index) if index == root) {
-        return Ok(None);
+    if !changed {
+        return Ok(EliminationResult::NoRewrite);
+    }
+    if !matches!(replacement, NativeChild::Node(index) if index == root) {
+        return Ok(EliminationResult::Unsupported);
     }
 
     let (shell, result_layout) = super::compact_native_shell_with_layout(NativeShell {
@@ -70,9 +85,9 @@ fn rewrite_shell(shell: NativeShell) -> Result<Option<NativeShell>> {
         root,
     })?;
     if result_layout != original_layout {
-        return Ok(None);
+        return Ok(EliminationResult::Unsupported);
     }
-    Ok(Some(shell))
+    Ok(EliminationResult::Rewritten(shell))
 }
 
 /// Rewrite children before trying to remove the current comparison join.
@@ -764,14 +779,14 @@ mod tests {
                         paro_planner::operator::ExplainSpec::default(),
                     ),
                 )),
-                _ => OwnedLogicalPlan::synthetic(LogicalOperator::DependentJoin(
-                    Box::new(paro_planner::operator::DependentJoin::scalar(
+                _ => OwnedLogicalPlan::synthetic(LogicalOperator::DependentJoin(Box::new(
+                    paro_planner::operator::DependentJoin::scalar(
                         candidate(true, false),
                         boundary(2, false),
                         vec![],
                         None,
-                    )),
-                )),
+                    ),
+                ))),
             };
             let (reference, changed) =
                 crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
@@ -789,6 +804,31 @@ mod tests {
                 .iter()
                 .any(|node| matches!(node.operator, LogicalOperator::Join(_))));
         }
+    }
+
+    #[test]
+    fn unsupported_root_replacement_is_not_a_complete_negative() {
+        let plan = candidate(true, false);
+        let LogicalOperator::Projection(projection) = plan.into_operator() else {
+            unreachable!()
+        };
+        let mut join_plan = *projection.child;
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut join_plan.operator else {
+            unreachable!()
+        };
+        join.right_projection_map = paro_planner::operator::ProjectionMap::none();
+        assert!(matches!(
+            rewrite_shell_result(NativeShell::from_owned(join_plan, &HashMap::new()).unwrap())
+                .unwrap(),
+            EliminationResult::Unsupported
+        ));
+        assert!(matches!(
+            rewrite_shell_result(
+                NativeShell::from_owned(candidate(false, false), &HashMap::new()).unwrap()
+            )
+            .unwrap(),
+            EliminationResult::NoRewrite
+        ));
     }
 
     #[test]
@@ -893,9 +933,11 @@ mod tests {
         .unwrap()
         .expect("production binding should have boundary facts");
         assert!(
-            try_native_join_elimination(&binding.root, context.memo(), &state, &facts)
-                .unwrap()
-                .is_some(),
+            matches!(
+                apply_native_join_elimination(&binding.root, context.memo(), &state, &facts)
+                    .unwrap(),
+                EliminationResult::Rewritten(_)
+            ),
             "the native adapter should consume the same Memo binding"
         );
     }
@@ -911,118 +953,150 @@ mod tests {
         use paro_context::TestStatementContextBuilder;
         use paro_planner::binder::context::BindContext;
 
-        for wrapper in 0..5 {
-            let wrapped = wrapper != 0;
-            let plan = if wrapped {
-                let child = if wrapper == 1 {
-                    OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(
-                        paro_planner::operator::Distinct::new(memo_candidate()),
-                    ))
-                } else if wrapper == 2 {
-                    window(memo_candidate(), column(10, 0))
-                } else if wrapper == 4 {
-                    OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(
-                        paro_planner::operator::EmptyResult::new(memo_candidate()),
-                    ))
+        for unique in [false, true] {
+            for wrapper in 0..5 {
+                let wrapped = wrapper != 0;
+                let plan = if wrapped {
+                    let child = if wrapper == 1 {
+                        OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(
+                            paro_planner::operator::Distinct::new(memo_candidate()),
+                        ))
+                    } else if wrapper == 2 {
+                        window(memo_candidate(), column(10, 0))
+                    } else if wrapper == 4 {
+                        OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(
+                            paro_planner::operator::EmptyResult::new(memo_candidate()),
+                        ))
+                    } else {
+                        OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(
+                            paro_planner::operator::SetOperation::union(
+                                40,
+                                memo_candidate(),
+                                OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+                                    Get::new_without_table(
+                                        41,
+                                        vec!["key".into()],
+                                        vec![LogicalType::Integer],
+                                    ),
+                                ))),
+                                true,
+                                vec![LogicalType::Integer],
+                            ),
+                        ))
+                    };
+                    OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+                        20,
+                        child,
+                        vec![column(if wrapper == 3 { 40 } else { 10 }, 0)],
+                    )))
                 } else {
-                    OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(
-                        paro_planner::operator::SetOperation::union(
-                            40,
-                            memo_candidate(),
-                            OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
-                                Get::new_without_table(
-                                    41,
-                                    vec!["key".into()],
-                                    vec![LogicalType::Integer],
-                                ),
-                            ))),
-                            true,
-                            vec![LogicalType::Integer],
-                        ),
-                    ))
+                    memo_candidate()
                 };
-                OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
-                    20,
-                    child,
-                    vec![column(if wrapper == 3 { 40 } else { 10 }, 0)],
-                )))
-            } else {
-                memo_candidate()
-            };
-            let mut input =
-                MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
-            let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
-            let mut join_group = input
-                .memo
-                .logical_expr(root_expression)
-                .unwrap()
-                .key
-                .children[0];
-            if wrapped {
-                for _ in 0..2 {
-                    let expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
-                    join_group = input.memo.logical_expr(expression).unwrap().key.children[0];
+                let mut input =
+                    MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+                let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+                let mut join_group = input
+                    .memo
+                    .logical_expr(root_expression)
+                    .unwrap()
+                    .key
+                    .children[0];
+                if wrapped {
+                    for _ in 0..2 {
+                        let expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
+                        join_group = input.memo.logical_expr(expression).unwrap().key.children[0];
+                    }
+                }
+                let join_expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
+                let right_group = input
+                    .memo
+                    .logical_expr(join_expression)
+                    .unwrap()
+                    .key
+                    .children[1];
+                let column = {
+                    let state = input.planner_state.read().unwrap();
+                    state
+                        .binding_ids
+                        .get(1, 0, &LogicalType::Integer)
+                        .copied()
+                        .expect("right Memo column should be interned")
+                };
+                input
+                    .memo
+                    .group_mut(right_group)
+                    .unwrap()
+                    .logical_properties
+                    .unique_keys
+                    .insert(vec![column].into_boxed_slice());
+
+                if !unique {
+                    input
+                        .memo
+                        .group_mut(right_group)
+                        .unwrap()
+                        .logical_properties
+                        .unique_keys
+                        .clear();
+                }
+                let state = input.planner_state.clone();
+                state.write().unwrap().session =
+                    Some(TestStatementContextBuilder::minimal().build());
+                let binding = {
+                    let state_read = state.read().unwrap();
+                    matching::scoped_pattern_bindings(
+                        PlannerTransformation::JoinElimination,
+                        input.root,
+                        root_expression,
+                        &input.memo,
+                        &state_read,
+                        None,
+                        BudgetDimension::RuleWorkPerGroup,
+                    )
+                    .unwrap()
+                    .bindings
+                    .first()
+                    .cloned()
+                    .expect("outer join path should produce a binding")
+                };
+                let rule = PlannerTransformationRule {
+                    transformation: PlannerTransformation::JoinElimination,
+                    planner_state: state,
+                };
+                let mut context = TransformContext::new(&mut input.memo, input.root);
+                let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
+                let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+                assert_eq!(
+                    outputs.len(),
+                    usize::from(unique),
+                    "a complete native elimination must not stage the same owned peer"
+                );
+                assert_eq!(
+                    super::super::semantic_plan::owned_binding_instantiation_count(),
+                    bridges,
+                    "selected ancestor must not force owned construction"
+                );
+                if !unique {
+                    let reads = context.take_fact_reads();
+                    drop(context);
+                    input
+                        .memo
+                        .group_mut(right_group)
+                        .unwrap()
+                        .logical_properties
+                        .unique_keys
+                        .insert(vec![column].into_boxed_slice());
+                    assert!(reads
+                        .iter()
+                        .any(|read| !read.is_current(&input.memo).unwrap()));
+                    let mut context = TransformContext::new(&mut input.memo, input.root);
+                    assert_eq!(rule.apply_binding(&binding, &mut context).unwrap().len(), 1);
+                    assert_eq!(
+                        super::super::semantic_plan::owned_binding_instantiation_count(),
+                        bridges
+                    );
                 }
             }
-            let join_expression = input.memo.group(join_group).unwrap().logical_exprs()[0];
-            let right_group = input
-                .memo
-                .logical_expr(join_expression)
-                .unwrap()
-                .key
-                .children[1];
-            let column = {
-                let state = input.planner_state.read().unwrap();
-                state
-                    .binding_ids
-                    .get(1, 0, &LogicalType::Integer)
-                    .copied()
-                    .expect("right Memo column should be interned")
-            };
-            input
-                .memo
-                .group_mut(right_group)
-                .unwrap()
-                .logical_properties
-                .unique_keys
-                .insert(vec![column].into_boxed_slice());
-
-            let state = input.planner_state.clone();
-            state.write().unwrap().session = Some(TestStatementContextBuilder::minimal().build());
-            let binding = {
-                let state_read = state.read().unwrap();
-                matching::scoped_pattern_bindings(
-                    PlannerTransformation::JoinElimination,
-                    input.root,
-                    root_expression,
-                    &input.memo,
-                    &state_read,
-                    None,
-                    BudgetDimension::RuleWorkPerGroup,
-                )
-                .unwrap()
-                .bindings
-                .first()
-                .cloned()
-                .expect("outer join path should produce a binding")
-            };
-            let rule = PlannerTransformationRule {
-                transformation: PlannerTransformation::JoinElimination,
-                planner_state: state,
-            };
-            let mut context = TransformContext::new(&mut input.memo, input.root);
-            let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
-            let outputs = rule.apply_binding(&binding, &mut context).unwrap();
-            assert_eq!(
-                outputs.len(),
-                1,
-                "a complete native elimination must not stage the same owned peer"
-            );
-            assert_eq!(
-                super::super::semantic_plan::owned_binding_instantiation_count(),
-                bridges,
-                "selected ancestor must not force owned construction"
-            );
         }
     }
 

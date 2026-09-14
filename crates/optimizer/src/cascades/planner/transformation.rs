@@ -578,6 +578,7 @@ impl TransformationRule for PlannerTransformationRule {
         // for their conservative native subsets. Keep the legacy owned-plan
         // path available for every shape that needs richer semantic handling.
         let mut native_domain_scopes = None;
+        let mut native_elimination_checked = false;
         let mut cte_restriction: Option<(GroupId, cte::CteDomainProof)> = None;
         // Native CTE domain/partition adapters allocate query-local symbols
         // before the common staging transaction is entered. Enlist a
@@ -752,14 +753,23 @@ impl TransformationRule for PlannerTransformationRule {
                     .collect()
                 }
                 PlannerTransformation::JoinElimination => {
-                    native_join_elimination::try_native_join_elimination(
+                    use native_join_elimination::EliminationResult;
+                    match native_join_elimination::apply_native_join_elimination(
                         &binding.root,
                         ctx.memo(),
                         &state,
                         &facts,
-                    )?
-                    .into_iter()
-                    .collect()
+                    )? {
+                        EliminationResult::Unsupported => Vec::new(),
+                        EliminationResult::NoRewrite => {
+                            native_elimination_checked = true;
+                            Vec::new()
+                        }
+                        EliminationResult::Rewritten(shell) => {
+                            native_elimination_checked = true;
+                            vec![shell]
+                        }
+                    }
                 }
                 PlannerTransformation::AggregateNonNullInput => {
                     native_non_null_inputs::try_native_aggregate_non_null_input(
@@ -840,6 +850,9 @@ impl TransformationRule for PlannerTransformationRule {
         } else {
             Vec::new()
         };
+        if native_elimination_checked && direct_native.is_empty() {
+            return Ok(Box::new([]));
+        }
         // These selected grammars are closed. NonNullAggregate reaches Get
         // through unary inputs; LimitProjection ends at a hole; TopN follows
         // projections to Order and cannot contain another optimizable LIMIT.
