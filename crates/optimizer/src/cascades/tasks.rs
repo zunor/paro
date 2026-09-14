@@ -190,13 +190,25 @@ impl ReadSet {
         reads.sort_unstable_by_key(|read| read.group);
         let mut normalized: Vec<PatternRead> = Vec::with_capacity(reads.len());
         for read in reads {
-            if let Some(previous) = normalized.last_mut() {
-                if previous.group == read.group {
+            let mut merged = false;
+            for previous in normalized.iter_mut().rev() {
+                if previous.group != read.group {
+                    break;
+                }
+                // Two observations of the same category may have been taken
+                // at different Memo revisions.  They are mergeable only when
+                // their snapshots agree; otherwise retaining both cursors is
+                // required to prevent a newer observation from hiding an
+                // older stale dependency.
+                if previous.can_union(read) {
                     *previous = previous.union(read);
-                    continue;
+                    merged = true;
+                    break;
                 }
             }
-            normalized.push(read);
+            if !merged {
+                normalized.push(read);
+            }
         }
         Self {
             reads: normalized.into_boxed_slice(),
@@ -1835,6 +1847,49 @@ mod tests {
         };
 
         assert_eq!(ReadSet::single(read), ReadSet::new([read]));
+    }
+
+    #[test]
+    fn normalization_does_not_hide_an_older_same_category_revision() {
+        let first = PatternRead {
+            group: GroupId::new(7),
+            scope: ReadScope::LOGICAL_FRONTIER,
+            logical_frontier_revision: Some(3),
+            physical_frontier_revision: None,
+            logical_fact_fingerprint: Fingerprint::default(),
+            statistics_snapshot_fingerprint: Fingerprint::default(),
+        };
+        let second = PatternRead {
+            logical_frontier_revision: Some(4),
+            ..first
+        };
+
+        let normalized = ReadSet::new([first, second]);
+        assert_eq!(normalized.reads(), &[first, second]);
+        assert!(!first.can_union(second));
+    }
+
+    #[test]
+    fn normalization_merges_disjoint_categories_for_one_group() {
+        let structure = PatternRead {
+            group: GroupId::new(7),
+            scope: ReadScope::LOGICAL_FRONTIER,
+            logical_frontier_revision: Some(3),
+            physical_frontier_revision: None,
+            logical_fact_fingerprint: Fingerprint::default(),
+            statistics_snapshot_fingerprint: Fingerprint::default(),
+        };
+        let facts = PatternRead {
+            group: structure.group,
+            scope: ReadScope::FACTS,
+            logical_frontier_revision: None,
+            physical_frontier_revision: None,
+            logical_fact_fingerprint: Fingerprint(11),
+            statistics_snapshot_fingerprint: Fingerprint(13),
+        };
+
+        let normalized = ReadSet::new([structure, facts]);
+        assert_eq!(normalized.reads(), &[structure.union(facts)]);
     }
 
     #[test]

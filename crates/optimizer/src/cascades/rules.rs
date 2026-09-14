@@ -445,6 +445,25 @@ impl PatternRead {
         }
     }
 
+    /// Whether two observations can be represented by one cursor without
+    /// losing a revision.  A read set may observe the same group more than
+    /// once while a task is assembled; if the same category changed between
+    /// those observations, both snapshots remain semantically significant.
+    pub fn can_union(self, other: Self) -> bool {
+        if self.group != other.group {
+            return false;
+        }
+        let overlap = self.scope.0 & other.scope.0;
+        (overlap & ReadScope::LOGICAL_FRONTIER.0 == 0
+            || self.logical_frontier_revision == other.logical_frontier_revision)
+            && (overlap & ReadScope::PHYSICAL_FRONTIER.0 == 0
+                || self.physical_frontier_revision == other.physical_frontier_revision)
+            && (overlap & ReadScope::LOGICAL_FACTS.0 == 0
+                || self.logical_fact_fingerprint == other.logical_fact_fingerprint)
+            && (overlap & ReadScope::STATISTICS.0 == 0
+                || self.statistics_snapshot_fingerprint == other.statistics_snapshot_fingerprint)
+    }
+
     fn matches(self, current: Self) -> bool {
         self.group == current.group
             && self.scope == current.scope
