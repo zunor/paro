@@ -133,3 +133,84 @@ fn production_key_domain_respects_the_entire_probe_evaluation_barrier() {
         }
     }
 }
+
+#[test]
+fn key_domain_uses_the_canonical_memo_output_not_physical_projection_maps() {
+    use paro_planner::operator::ProjectionMap;
+    for map in [
+        ProjectionMap::all(),
+        ProjectionMap::new(vec![1]),
+        ProjectionMap::new(vec![1, 0]),
+        ProjectionMap::none(),
+    ] {
+        let mut plan = candidate(false, false);
+        let LogicalOperator::Join(Join::Comparison(domain)) = &mut plan.operator else {
+            unreachable!()
+        };
+        let LogicalOperator::Projection(probe) = &mut domain.left.operator else {
+            unreachable!()
+        };
+        probe.expressions.push(col(0));
+        probe.returned_types.push(LogicalType::Integer);
+        domain.left_projection_map = map;
+        let mut target_bindings = plan.output_layout().bindings().to_vec();
+        target_bindings.sort();
+        let mut input =
+            MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.clone();
+        state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
+        let root = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let binding = matching::scoped_pattern_bindings(
+            PlannerTransformation::KeyDomainTransfer,
+            input.root,
+            root,
+            &input.memo,
+            &state.read().unwrap(),
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .bindings
+        .first()
+        .cloned()
+        .unwrap();
+        let mut ctx = TransformContext::new(&mut input.memo, input.root);
+        {
+            let state = state.read().unwrap();
+            let facts = boundary::BoundarySnapshot::read(
+                &mut ctx,
+                &state,
+                &binding.root,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .unwrap();
+            let original = NativeShell::from_pattern(ctx.memo(), &state, &binding.root, &facts)
+                .unwrap()
+                .unwrap();
+            let LogicalOperator::Join(Join::Comparison(domain)) = original.root_operator() else {
+                unreachable!()
+            };
+            assert!(domain.left_projection_map.is_all());
+            assert!(domain.right_projection_map.is_none());
+            let expected = original.root_layout().unwrap();
+            assert_eq!(
+                expected.bindings(),
+                &[ColumnBinding::new(10, 0), ColumnBinding::new(10, 1)]
+            );
+            let rewritten =
+                try_native_key_domain_transfer(&binding.root, ctx.memo(), &state, &facts)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(rewritten.root_layout().unwrap().bindings(), target_bindings);
+        }
+        let before = semantic_plan::owned_binding_instantiation_count();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::KeyDomainTransfer,
+            planner_state: state,
+        };
+        assert_eq!(rule.apply_binding(&binding, &mut ctx).unwrap().len(), 1);
+        assert_eq!(semantic_plan::owned_binding_instantiation_count(), before);
+    }
+}

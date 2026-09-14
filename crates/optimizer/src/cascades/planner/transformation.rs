@@ -2638,7 +2638,7 @@ fn try_native_key_domain_transfer(
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
 ) -> Result<Option<NativeShell>> {
-    let PatternOperand::Expression { .. } = binding else {
+    let PatternOperand::Expression { expression, .. } = binding else {
         return Ok(None);
     };
     let Some((shell, layouts)) =
@@ -2650,6 +2650,25 @@ fn try_native_key_domain_transfer(
     // We retain those inputs, including control regions, and move only across
     // the explicitly checked local operator, never into the opaque region.
     let root = shell.root;
+    let logical = memo.logical_expr(*expression)
+        .ok_or_else(|| paro_error::internal("key-domain target expression missing"))?;
+    let target_columns = &state.metadata.get(&logical.payload)
+        .ok_or_else(|| paro_error::internal("key-domain target metadata missing"))?
+        .output_columns;
+    // Canonical templates omit lifetime projection maps. Restore the target
+    // ColumnId set, not the previous physical ordinal map. Final presentation
+    // remains responsible for ordering those identities.
+    let output_projection = layouts[root].bindings().iter()
+        .zip(layouts[root].types()).enumerate()
+        .filter_map(|(index, (binding, ty))| {
+            state.binding_ids.get(binding.table_index, binding.column_index, ty)
+                .filter(|column| target_columns.contains(column)).map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    if output_projection.len() != target_columns.len() {
+        return Err(paro_error::internal("key-domain target columns are absent from its semantic layout"));
+    }
+    let project_output = output_projection.len() != layouts[root].len();
     let LogicalOperator::Join(Join::Comparison(domain)) = shell.nodes[root].operator.clone() else {
         return Ok(None);
     };
@@ -2799,6 +2818,22 @@ fn try_native_key_domain_transfer(
     }
     nodes[root].operator = probe_operator;
     nodes[root].source_proofs = Box::new([]);
+    let root = if project_output {
+        let projected = nodes.len();
+        nodes.push(NativeNode {
+            id: state.bind_context.next_plan_id(),
+            stats: nodes[root].stats.clone(),
+            operator: LogicalOperator::Filter(Filter {
+                expressions: vec![],
+                child: NativeChild::Node(root),
+                projection_map: paro_planner::operator::ProjectionMap::new(output_projection),
+            }),
+            source_proofs: Box::new([]),
+        });
+        projected
+    } else {
+        root
+    };
     compact_native_shell(NativeShell {
         nodes: nodes.into_boxed_slice(),
         root,
