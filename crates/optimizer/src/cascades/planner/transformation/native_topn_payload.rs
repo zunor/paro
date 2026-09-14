@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 struct Source {
     table_index: usize,
-    get: usize,
     table: Arc<TableCatalogEntry>,
     ordered: HashMap<usize, usize>,
     output: HashMap<usize, usize>,
@@ -127,135 +126,61 @@ pub(super) fn rewrite(
     let Some(input) = node(&output.child) else {
         return Ok(None);
     };
-    if matches!(shell.nodes[input].operator, LogicalOperator::RowFetch(_))
-        || output.expressions.iter().any(|e| {
-            !e.evaluation_properties().can_share_evaluation()
-                || !matches!(e, Expression::ColumnRef(c) if c.depth == 0)
-        })
-    {
-        return Ok(None);
-    }
-    let mut ordered = HashSet::new();
-    for order in &topn.orders {
-        let Expression::ColumnRef(c) = &order.expression else {
-            return Ok(None);
-        };
-        if c.depth != 0
-            || c.binding.table_index != output.table_index
-            || c.binding.column_index >= output.expressions.len()
-        {
-            return Ok(None);
-        }
-        ordered.insert(c.binding.column_index);
-    }
-    let projected = match topn.projection_map.as_columns() {
-        None => (0..output.expressions.len()).collect::<Vec<_>>(),
-        Some(indices) if indices.iter().all(|&i| i < output.expressions.len()) => indices.to_vec(),
-        _ => return Ok(None),
-    };
-    let mut sources = HashMap::<usize, Source>::new();
-    for (index, expression) in output.expressions.iter().enumerate() {
-        if !ordered.contains(&index) && !projected.contains(&index) {
-            continue;
-        }
-        let Expression::ColumnRef(c) = expression else {
-            unreachable!()
-        };
-        if occurrences(&shell, &output.child, c.binding.table_index) != Some(1) {
-            return Ok(None);
-        }
-        let Some(get_index) = source_get(&shell, &output.child, c.binding.table_index) else {
-            return Ok(None);
-        };
-        let LogicalOperator::Get(get) = &shell.nodes[get_index].operator else {
-            unreachable!()
-        };
-        let Some(table) = &get.table else {
-            return Ok(None);
-        };
-        if table.get_storage().is_none() {
-            continue;
-        }
-        let Some(catalog) = get.stored_column(c.binding.column_index) else {
-            continue;
-        };
-        if table
-            .columns
-            .get(catalog)
-            .is_none_or(|def| def.logical_type != c.return_type)
-        {
-            return Ok(None);
-        }
-        let source = sources
-            .entry(c.binding.table_index)
-            .or_insert_with(|| Source {
-                table_index: c.binding.table_index,
-                get: get_index,
-                table: table.clone(),
-                ordered: HashMap::new(),
-                output: HashMap::new(),
-                path: RowIdPath::Get,
-                rowid: c.binding,
-                ordered_table: None,
-                output_table: None,
-                narrow_rowid: 0,
-                topn_rowid: None,
-            });
-        if ordered.contains(&index) {
-            source.ordered.insert(index, catalog);
-        } else {
-            source.output.insert(index, catalog);
-        }
-    }
-    let Some(output_rows) = shell.nodes[input]
-        .stats
-        .estimated_cardinality
-        .map(|c| c.expected)
-    else {
-        return Ok(None);
-    };
-    let Ok(topn_rows) = u64::try_from(total_rows) else {
-        return Ok(None);
-    };
-    let topn_rows = topn_rows.min(output_rows);
-    let mut sources = sources
-        .into_values()
-        .filter_map(|mut source| {
-            source.path = prove_rowid_operator(
+    let Some(candidate) = crate::aggregate::late_payload::prove_row_preserving_inputs(
+        total_rows,
+        &topn.orders,
+        &topn.projection_map,
+        &output,
+        matches!(shell.nodes[input].operator, LogicalOperator::RowFetch(_)),
+        shell.nodes[input].stats.estimated_cardinality,
+        |table| {
+            if occurrences(&shell, &output.child, table) != Some(1) {
+                return None;
+            }
+            let index = source_get(&shell, &output.child, table)?;
+            match &shell.nodes[index].operator {
+                LogicalOperator::Get(get) => Some(get.as_ref()),
+                _ => None,
+            }
+        },
+        |table| {
+            prove_rowid_operator(
                 &shell.nodes[input].operator,
-                source.table_index,
+                table,
                 RowIdPathPolicy::RowPreserving,
                 &|child| shell.nodes.get(node(child)?).map(|n| &n.operator),
-                &|child| occurrences(&shell, child, source.table_index),
-            )?;
-            let rows = shell.nodes[source.get]
-                .stats
-                .estimated_cardinality?
-                .expected
-                .max(output_rows);
-            for (columns, fetched) in [
-                (&mut source.ordered, output_rows),
-                (&mut source.output, topn_rows),
-            ] {
-                if state
-                    .cost_model
-                    .late_row_fetch_benefit(
-                        rows,
-                        fetched,
-                        columns.keys().map(|&i| output.expressions[i].return_type()),
-                        source.path.stages(),
-                    )
-                    .is_none()
-                {
-                    columns.clear();
-                }
-            }
-            (!source.ordered.is_empty() || !source.output.is_empty()).then_some(source)
+                &|child| occurrences(&shell, child, table),
+            )
+        },
+        |table| {
+            let index = source_get(&shell, &output.child, table)?;
+            Some(shell.nodes[index].stats.estimated_cardinality?.expected)
+        },
+        &state.cost_model,
+        &mut None,
+    ) else {
+        return Ok(None);
+    };
+    let projected = topn.projection_map.as_columns().map_or_else(
+        || (0..output.expressions.len()).collect::<Vec<_>>(),
+        |v| v.to_vec(),
+    );
+    let mut sources = candidate
+        .sources
+        .into_iter()
+        .map(|source| Source {
+            table_index: source.source_table_index,
+            table: source.table,
+            ordered: source.ordered_catalog_columns,
+            output: source.output_catalog_columns,
+            path: source.rowid_path,
+            rowid: ColumnBinding::new(source.source_table_index, 0),
+            ordered_table: None,
+            output_table: None,
+            narrow_rowid: 0,
+            topn_rowid: None,
         })
         .collect::<Vec<_>>();
-    if sources.is_empty() {
-        return Ok(None);
-    }
     // Same ordinal naming contract as Projection::name_at (owned-only API).
     let names = (0..output.expressions.len())
         .map(|i| {

@@ -200,6 +200,79 @@ fn fetch_columns(shell: &NativeShell) -> Vec<Vec<usize>> {
 }
 
 #[test]
+fn native_detail_topn_shared_admission_keeps_missing_facts_and_guard_reasons() {
+    use crate::aggregate::late_payload::prove_row_preserving_inputs;
+    use crate::transformation_rejection::{
+        RejectionReasons, TransformationRejectionCounts, TransformationRejectionGuard as Guard,
+    };
+    use std::cell::Cell;
+
+    with_shell(fixture(0), |shell, state| {
+        let LogicalOperator::TopN(topn) = shell.root_operator() else {
+            unreachable!()
+        };
+        let LogicalOperator::Projection(output) = &shell.nodes[node(&topn.child).unwrap()].operator
+        else {
+            unreachable!()
+        };
+        let input = node(&output.child).unwrap();
+        let get_index = source_get(&shell, &output.child, 7).unwrap();
+        let LogicalOperator::Get(get) = &shell.nodes[get_index].operator else {
+            unreachable!()
+        };
+        for (case, expected, expected_source_reads) in [
+            (0, Guard::TopNZeroLimit, 0),
+            (1, Guard::TopNUnsafeOutput, 0),
+            (2, Guard::TopNMissingCardinality, 2),
+            (3, Guard::TopNMissingSourceRows, 2),
+            (4, Guard::TopNRowIdPath, 2),
+        ] {
+            let source_reads = Cell::new(0);
+            let mut reasons = Some(RejectionReasons::default());
+            let result = prove_row_preserving_inputs(
+                if case == 0 {
+                    0
+                } else {
+                    topn.limit + topn.offset
+                },
+                &topn.orders,
+                &topn.projection_map,
+                output,
+                case == 1,
+                if case == 2 {
+                    None
+                } else {
+                    shell.nodes[input].stats.estimated_cardinality
+                },
+                |table| {
+                    assert_eq!(table, 7);
+                    source_reads.set(source_reads.get() + 1);
+                    Some(get.as_ref())
+                },
+                |_| {
+                    if case == 4 {
+                        None
+                    } else {
+                        Some(RowIdPath::Get)
+                    }
+                },
+                |_| if case == 3 { None } else { Some(100_000) },
+                &state.cost_model,
+                &mut reasons,
+            );
+            assert!(result.is_none(), "case {case}");
+            assert_eq!(source_reads.get(), expected_source_reads);
+            let mut counts = TransformationRejectionCounts::default();
+            counts.record(reasons.unwrap());
+            assert_eq!(
+                counts.iter().filter(|(_, n)| *n != 0).collect::<Vec<_>>(),
+                vec![(expected, 1)]
+            );
+        }
+    });
+}
+
+#[test]
 fn native_detail_topn_preserves_two_fetch_frontiers_without_owned_bridge() {
     for kind in 0..5 {
         let (_, changed) = crate::aggregate::late_payload::rewrite_node(

@@ -488,22 +488,22 @@ pub(crate) struct SelectiveProjectionSource {
 }
 
 #[derive(Debug)]
-struct RowPreservingCandidate {
-    sources: Vec<RowPreservingSource>,
+pub(crate) struct RowPreservingCandidate {
+    pub(crate) sources: Vec<RowPreservingSource>,
 }
 
 #[derive(Debug)]
-struct RowPreservingSource {
-    source_table_index: usize,
-    table: Arc<TableCatalogEntry>,
+pub(crate) struct RowPreservingSource {
+    pub(crate) source_table_index: usize,
+    pub(crate) table: Arc<TableCatalogEntry>,
     /// Output columns needed to evaluate TopN ordering. These are fetched after
     /// the selective relational child but before TopN builds its heap.
-    ordered_catalog_columns: HashMap<usize, usize>,
+    pub(crate) ordered_catalog_columns: HashMap<usize, usize>,
     /// Output-only columns fetched after TopN has reduced the carrier to its
     /// bounded result cardinality.
-    output_catalog_columns: HashMap<usize, usize>,
+    pub(crate) output_catalog_columns: HashMap<usize, usize>,
     benefit: f64,
-    rowid_path: RowIdPath,
+    pub(crate) rowid_path: RowIdPath,
 }
 
 #[derive(Debug)]
@@ -938,7 +938,41 @@ fn prove_row_preserving_candidate_profiled(
     let LogicalOperator::Projection(output) = &topn.child.operator else {
         return reject(reasons, Guard::TopNProjectionShape);
     };
-    if matches!(output.child.operator, LogicalOperator::RowFetch(_))
+    prove_row_preserving_inputs(
+        topn.total_rows(),
+        &topn.orders,
+        &topn.projection_map,
+        output,
+        matches!(output.child.operator, LogicalOperator::RowFetch(_)),
+        output.child.stats.estimated_cardinality,
+        |table| unique_get(output.child.as_ref(), table),
+        |table| prove_rowid_path(output.child.as_ref(), table, RowIdPathPolicy::RowPreserving),
+        |table| source_estimated_rows(output.child.as_ref(), table),
+        cost_model,
+        reasons,
+    )
+}
+
+/// One admission contract over exact selected inputs, independent of their
+/// owned or Memo-native child transport. Callers must resolve unique sources
+/// and path evidence without exploring unselected alternatives.
+pub(crate) fn prove_row_preserving_inputs<'a, Child>(
+    total_rows: usize,
+    orders: &[paro_planner::binder::ir::OrderByNode],
+    projection_map: &ProjectionMap,
+    output: &Projection<Child>,
+    child_is_fetch: bool,
+    child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    unique_source: impl Fn(usize) -> Option<&'a Get>,
+    path_for_source: impl Fn(usize) -> Option<RowIdPath>,
+    source_rows: impl Fn(usize) -> Option<u64>,
+    cost_model: &CostModel,
+    reasons: &mut Option<RejectionReasons>,
+) -> Option<RowPreservingCandidate> {
+    if total_rows == 0 {
+        return reject(reasons, Guard::TopNZeroLimit);
+    }
+    if child_is_fetch
         || output
             .expressions
             .iter()
@@ -953,8 +987,7 @@ fn prove_row_preserving_candidate_profiled(
     {
         return reject(reasons, Guard::TopNOutputExpression);
     }
-    let ordered_outputs = topn
-        .orders
+    let ordered_outputs = orders
         .iter()
         .map(|order| {
             let Expression::ColumnRef(column) = &order.expression else {
@@ -968,7 +1001,7 @@ fn prove_row_preserving_candidate_profiled(
         .collect::<Option<HashSet<_>>>()
         .or_else(|| reject(reasons, Guard::TopNOrderBinding))?;
     let projected_outputs =
-        checked_projection_indices(&topn.projection_map, output.expressions.len())
+        checked_projection_indices(projection_map, output.expressions.len())
             .or_else(|| reject(reasons, Guard::TopNProjectionMap))?
             .into_iter()
             .collect::<HashSet<_>>();
@@ -986,7 +1019,7 @@ fn prove_row_preserving_candidate_profiled(
         if column.depth != 0 {
             continue;
         }
-        let get = unique_get(output.child.as_ref(), column.binding.table_index)
+        let get = unique_source(column.binding.table_index)
             .or_else(|| reject(reasons, Guard::TopNSource))?;
         let table = get
             .table
@@ -1028,13 +1061,10 @@ fn prove_row_preserving_candidate_profiled(
         }
     }
 
-    let output_rows = output
-        .child
-        .stats
-        .estimated_cardinality
+    let output_rows = child_cardinality
         .or_else(|| reject(reasons, Guard::TopNMissingCardinality))?
         .expected;
-    let topn_rows = u64::try_from(topn.total_rows())
+    let topn_rows = u64::try_from(total_rows)
         .ok()
         .or_else(|| reject(reasons, Guard::TopNMissingCardinality))?
         .min(output_rows);
@@ -1044,12 +1074,8 @@ fn prove_row_preserving_candidate_profiled(
     let sources = by_source
         .into_values()
         .filter_map(|mut source| {
-            let rowid_path = prove_rowid_path(
-                output.child.as_ref(),
-                source.source_table_index,
-                RowIdPathPolicy::RowPreserving,
-            )
-            .or_else(|| reject(reasons, Guard::TopNRowIdPath))?;
+            let rowid_path = path_for_source(source.source_table_index)
+                .or_else(|| reject(reasons, Guard::TopNRowIdPath))?;
             let carrier_stages = rowid_path.stages();
             // Eager materialization starts at the source scan, not at the
             // final relational frontier. A selective join can reduce a large
@@ -1058,7 +1084,7 @@ fn prove_row_preserving_candidate_profiled(
             // Conversely, a fanout may make the frontier larger than the
             // source, so retain the larger expected work domain.
             let carrier_rows =
-                source_estimated_rows(output.child.as_ref(), source.source_table_index)
+                source_rows(source.source_table_index)
                     .or_else(|| reject(reasons, Guard::TopNMissingSourceRows))?
                     .max(output_rows);
             let ordered_benefit = cost_model.late_row_fetch_benefit(
