@@ -507,13 +507,13 @@ pub(crate) struct RowPreservingSource {
 }
 
 #[derive(Debug)]
-struct Candidate {
-    dependency: usize,
-    source_table_index: usize,
-    table: Arc<TableCatalogEntry>,
-    dependent_catalog_columns: HashMap<usize, usize>,
+pub(crate) struct AggregateTopNCandidate {
+    pub(crate) dependency: usize,
+    pub(crate) source_table_index: usize,
+    pub(crate) table: Arc<TableCatalogEntry>,
+    pub(crate) dependent_catalog_columns: HashMap<usize, usize>,
     benefit: f64,
-    rowid_path: RowIdPath,
+    pub(crate) rowid_path: RowIdPath,
 }
 
 /// Prove that output expressions can fetch base-table payload after a
@@ -748,7 +748,7 @@ fn prove_candidate_profiled(
     plan: &OwnedLogicalPlan,
     cost_model: &CostModel,
     reasons: &mut Option<RejectionReasons>,
-) -> Option<Candidate> {
+) -> Option<AggregateTopNCandidate> {
     let LogicalOperator::TopN(topn) = &plan.operator else {
         return reject(reasons, Guard::AggregateShape);
     };
@@ -758,7 +758,53 @@ fn prove_candidate_profiled(
     let LogicalOperator::Projection(output) = &topn.child.operator else {
         return reject(reasons, Guard::AggregateProjectionShape);
     };
-    if matches!(output.child.operator, LogicalOperator::RowFetch(_))
+    let input_cardinality = match &output.child.operator {
+        LogicalOperator::Aggregate(aggregate) => aggregate.child.stats.estimated_cardinality,
+        _ => None,
+    };
+    prove_aggregate_topn_inputs(
+        topn.total_rows(),
+        &topn.orders,
+        output,
+        &output.child.operator,
+        output.child.stats.estimated_cardinality,
+        input_cardinality,
+        |table| match &output.child.operator {
+            LogicalOperator::Aggregate(aggregate) => unique_get(aggregate.child.as_ref(), table),
+            _ => None,
+        },
+        |table| match &output.child.operator {
+            LogicalOperator::Aggregate(aggregate) => prove_rowid_path(
+                aggregate.child.as_ref(),
+                table,
+                RowIdPathPolicy::NonNull,
+            ),
+            _ => None,
+        },
+        cost_model,
+        reasons,
+    )
+}
+
+/// Aggregate payload admission over one selected child transport. The group
+/// dependency, non-null row-id witness and ordering constraints are shared by
+/// owned and native construction, rather than re-proved by each adapter.
+pub(crate) fn prove_aggregate_topn_inputs<'a, Child>(
+    total_rows: usize,
+    orders: &[paro_planner::binder::ir::OrderByNode],
+    output: &Projection<Child>,
+    child_operator: &LogicalOperator<Child>,
+    child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    aggregate_input_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    unique_source: impl Fn(usize) -> Option<&'a Get>,
+    path_for_source: impl Fn(usize) -> Option<RowIdPath>,
+    cost_model: &CostModel,
+    reasons: &mut Option<RejectionReasons>,
+) -> Option<AggregateTopNCandidate> {
+    if total_rows == 0 {
+        return reject(reasons, Guard::AggregateZeroLimit);
+    }
+    if matches!(child_operator, LogicalOperator::RowFetch(_))
         || output
             .expressions
             .iter()
@@ -773,7 +819,7 @@ fn prove_candidate_profiled(
     {
         return reject(reasons, Guard::AggregateOutputExpression);
     }
-    let LogicalOperator::Aggregate(aggregate) = &output.child.operator else {
+    let LogicalOperator::Aggregate(aggregate) = child_operator else {
         return reject(reasons, Guard::AggregateInputShape);
     };
     // Scalar aggregates produce at most one row, so a TopN cannot amortize a
@@ -802,7 +848,7 @@ fn prove_candidate_profiled(
     {
         return reject(reasons, Guard::AggregateOutputBinding);
     }
-    for order in &topn.orders {
+    for order in orders {
         let Expression::ColumnRef(column) = &order.expression else {
             return reject(reasons, Guard::AggregateOrderBinding);
         };
@@ -836,13 +882,9 @@ fn prove_candidate_profiled(
                 return reject(reasons, Guard::AggregateDependentColumn);
             }
             let source_table_index = first_column.binding.table_index;
-            let rowid_path = prove_rowid_path(
-                aggregate.child.as_ref(),
-                source_table_index,
-                RowIdPathPolicy::NonNull,
-            )
-            .or_else(|| reject(reasons, Guard::AggregateRowIdPath))?;
-            let get = unique_get(aggregate.child.as_ref(), source_table_index)
+            let rowid_path = path_for_source(source_table_index)
+                .or_else(|| reject(reasons, Guard::AggregateRowIdPath))?;
+            let get = unique_source(source_table_index)
                 .or_else(|| reject(reasons, Guard::AggregateSource))?;
             let table = get
                 .table
@@ -870,21 +912,14 @@ fn prove_candidate_profiled(
                 payload_types.push(column.return_type.clone());
                 dependent_catalog_columns.insert(group_index, catalog_column);
             }
-            let carrier_rows = aggregate
-                .child
-                .stats
-                .estimated_cardinality
+            let carrier_rows = aggregate_input_cardinality
                 .or_else(|| reject(reasons, Guard::AggregateMissingCardinality))?
                 .expected;
-            let topn_rows = u64::try_from(topn.total_rows())
+            let topn_rows = u64::try_from(total_rows)
                 .ok()
                 .or_else(|| reject(reasons, Guard::AggregateMissingCardinality))?;
             let fetched_rows = topn_rows.min(
-                output
-                    .child
-                    .stats
-                    .estimated_cardinality
-                    .map_or(carrier_rows, |estimate| estimate.expected),
+                child_cardinality.map_or(carrier_rows, |estimate| estimate.expected),
             );
             let benefit = cost_model
                 .late_row_fetch_benefit(
@@ -894,7 +929,7 @@ fn prove_candidate_profiled(
                     rowid_path.stages(),
                 )
                 .or_else(|| reject(reasons, Guard::AggregateNoBenefit))?;
-            let candidate = Candidate {
+            let candidate = AggregateTopNCandidate {
                 dependency,
                 source_table_index,
                 table,
@@ -902,7 +937,7 @@ fn prove_candidate_profiled(
                 benefit,
                 rowid_path,
             };
-            let allowed = topn.orders.iter().all(|order| {
+            let allowed = orders.iter().all(|order| {
                 let Expression::ColumnRef(column) = &order.expression else {
                     return false;
                 };
@@ -1313,7 +1348,7 @@ fn count_source_gets(plan: &OwnedLogicalPlan, source_table_index: usize) -> usiz
 
 fn apply_rewrite(
     plan: OwnedLogicalPlan,
-    candidate: Candidate,
+    candidate: AggregateTopNCandidate,
     bind_context: &BindContext,
 ) -> Result<OwnedLogicalPlan> {
     let (topn_id, topn_stats, operator) = plan.into_parts();

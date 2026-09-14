@@ -482,6 +482,57 @@ fn ordering_by_delayed_payload_keeps_preserving_plan() {
 }
 
 #[test]
+fn aggregate_topn_shared_admission_requires_selected_evidence() {
+    use super::late_payload::{prove_aggregate_topn_inputs, RowIdPath};
+    use crate::transformation_rejection::{
+        RejectionReasons, TransformationRejectionCounts, TransformationRejectionGuard as Guard,
+    };
+    let plan = candidate(false);
+    let LogicalOperator::TopN(topn) = &plan.operator else { unreachable!() };
+    let LogicalOperator::Projection(output) = &topn.child.operator else { unreachable!() };
+    let LogicalOperator::Aggregate(aggregate) = &output.child.operator else { unreachable!() };
+    let get = super::late_payload::unique_get(aggregate.child.as_ref(), SOURCE).unwrap();
+    for (case, expected) in [
+        (0, None),
+        (1, Some(Guard::AggregateRowIdPath)),
+        (2, Some(Guard::AggregateSource)),
+        (3, Some(Guard::AggregateMissingCardinality)),
+        (4, None),
+    ] {
+        let mut reasons = Some(RejectionReasons::default());
+        let result = prove_aggregate_topn_inputs(
+            topn.total_rows(), &topn.orders, output, &output.child.operator,
+            if case == 4 { None } else { output.child.stats.estimated_cardinality },
+            if case == 3 { None } else { aggregate.child.stats.estimated_cardinality },
+            |source| {
+                assert_eq!(source, SOURCE);
+                if case == 2 { None } else { Some(get) }
+            },
+            |source| {
+                assert_eq!(source, SOURCE);
+                if case == 1 { None } else { Some(RowIdPath::Get) }
+            },
+            &CostModel::default(), &mut reasons,
+        );
+        let mut counts = TransformationRejectionCounts::default();
+        counts.record(reasons.unwrap());
+        let actual = counts.iter().filter(|(_, n)| *n != 0).collect::<Vec<_>>();
+        if let Some(expected) = expected {
+            assert!(result.is_none());
+            assert_eq!(actual, vec![(expected, 1)]);
+        } else {
+            let result = result.expect("complete selected evidence");
+            assert!(actual.is_empty());
+            assert_eq!(result.dependency, 0);
+            assert_eq!(result.source_table_index, SOURCE);
+            assert_eq!(result.dependent_catalog_columns.len(), 2);
+            assert_eq!(result.dependent_catalog_columns.get(&1), Some(&1));
+            assert_eq!(result.dependent_catalog_columns.get(&2), Some(&2));
+        }
+    }
+}
+
+#[test]
 fn hidden_order_key_has_an_internal_name_during_row_preserving_rewrite() {
     let context = BindContext::new();
     let (optimized, changed) = optimize_plan(
