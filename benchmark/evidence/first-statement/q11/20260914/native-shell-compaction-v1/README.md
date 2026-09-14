@@ -127,6 +127,18 @@ one failure: `engine_admits_every_partition_discriminator_from_one_binding`
 rejects `expected grant is not a declared class` at `cte.rs:582`. It was not
 blessed. These are correctness checks, not clean-source performance evidence.
 
+`3c1e04bb` removes the duplicate owned JoinElimination peer after complete
+native success. The production-binding regression first failed with two
+staged outputs instead of one, then passed after the dispatch change. This
+is a staged-output count, not an inserted-expression or performance result.
+The native implementation declines unknown descendants rather than claiming
+partial traversal is complete. Six native tests (including a left/right,
+unique/nonunique, observable/unobservable reference matrix), five existing
+join-elimination tests, and 111 engine tests passed. The engine run includes
+source-sensitive RF ordering, budget retry, invalidation, and cancellation/
+rollback coverage. No new Q11, admitted-fingerprint comparison, or full SQL
+regression was run for this commit; tests used the mixed working tree.
+
 The bridge migration remains incomplete. `apply_binding` still reaches
 `instantiate_bound_plan_with_group_holes`, `rewrite_planner_expressions`,
 `NativeShell::from_owned`, and settlement when a native producer misses.
