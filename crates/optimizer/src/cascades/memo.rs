@@ -1221,14 +1221,21 @@ pub struct Group {
     /// Transformation consumers use it to distinguish a completed match from
     /// one whose child frontier has since changed, including through rollback.
     logical_expression_version: u64,
-    /// Monotone publication cursor for the physical expressions and winner
-    /// frontiers owned by this group. Physical parents subscribe to the
-    /// specific child groups they read instead of a Memo-global generation.
-    physical_frontier_version: u64,
+    /// Monotone cursor for the physical implementation domain owned by this
+    /// group. Adding an implementation is a dependency of every observed
+    /// physical goal; publishing a winner is not. Keeping this separate from
+    /// the goal frontiers prevents an unrelated goal publication from
+    /// invalidating a parent which reads only one exact child goal.
+    physical_implementation_version: u64,
     physical_exprs: Vec<PhysicalExprId>,
     logical_index: BTreeMap<LogicalExprKey, Vec<LogicalExprId>>,
     physical_index: BTreeMap<PhysicalExprKey, PhysicalExprId>,
     winner_frontiers: BTreeMap<OptimizationGoal, WinnerFrontier>,
+    /// Each goal owns its own visible candidate revision. A parent read is
+    /// keyed by the complete goal (including grant and context), so a change
+    /// to goal B cannot invalidate a read of goal A merely because both live
+    /// in the same Memo group.
+    physical_frontier_versions: BTreeMap<OptimizationGoal, u64>,
     winner_proposals: u64,
     pub ledger: SearchLedger,
 }
@@ -1295,8 +1302,15 @@ impl Group {
         &self.physical_exprs
     }
 
-    pub fn physical_frontier_version(&self) -> u64 {
-        self.physical_frontier_version
+    pub fn physical_implementation_version(&self) -> u64 {
+        self.physical_implementation_version
+    }
+
+    pub fn physical_frontier_version(&self, goal: OptimizationGoal) -> u64 {
+        self.physical_frontier_versions
+            .get(&goal)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn winner(&self, goal: OptimizationGoal) -> Option<&Winner> {
@@ -1459,6 +1473,11 @@ impl Memo {
         );
         for group in &mut self.groups {
             group.winner_frontiers.clear();
+            group.physical_frontier_versions.clear();
+            group.physical_implementation_version = group
+                .physical_implementation_version
+                .checked_add(1)
+                .ok_or_else(|| paro_error::internal("Memo physical implementation revision overflow"))?;
         }
         Ok(())
     }
@@ -2051,11 +2070,12 @@ impl Memo {
             logical_exprs: Vec::new(),
             logical_operator_index: BTreeMap::new(),
             logical_expression_version: 0,
-            physical_frontier_version: 0,
+            physical_implementation_version: 0,
             physical_exprs: Vec::new(),
             logical_index: BTreeMap::new(),
             physical_index: BTreeMap::new(),
             winner_frontiers: BTreeMap::new(),
+            physical_frontier_versions: BTreeMap::new(),
             winner_proposals: 0,
             ledger: SearchLedger::new(self.budget.clone()),
         });
@@ -2903,10 +2923,12 @@ impl Memo {
         let group = &mut self.groups[target.index()];
         group.physical_index.insert(key, id);
         group.physical_exprs.push(id);
-        group.physical_frontier_version = group
-            .physical_frontier_version
+        group.physical_implementation_version = group
+            .physical_implementation_version
             .checked_add(1)
-            .ok_or_else(|| paro_error::internal("Memo physical frontier revision overflow"))?;
+            .ok_or_else(|| {
+                paro_error::internal("Memo physical implementation revision overflow")
+            })?;
         Ok(id)
     }
 
@@ -3005,10 +3027,13 @@ impl Memo {
                 .groups
                 .get_mut(group.index())
                 .ok_or_else(|| paro_error::internal("winner group disappeared"))?;
-            group.physical_frontier_version = group
-                .physical_frontier_version
+            let revision = group
+                .physical_frontier_versions
+                .entry(goal)
+                .or_default();
+            *revision = revision
                 .checked_add(1)
-                .ok_or_else(|| paro_error::internal("Memo physical frontier revision overflow"))?;
+                .ok_or_else(|| paro_error::internal("Memo physical goal revision overflow"))?;
         }
         Ok(insertion.selected_changed)
     }
@@ -3250,13 +3275,17 @@ impl Memo {
         canonical_group
             .physical_exprs
             .append(&mut secondary_group.physical_exprs);
-        canonical_group.physical_frontier_version = canonical_group
-            .physical_frontier_version
-            .max(secondary_group.physical_frontier_version)
+        canonical_group.physical_implementation_version = canonical_group
+            .physical_implementation_version
+            .max(secondary_group.physical_implementation_version)
             .checked_add(1)
-            .ok_or_else(|| paro_error::internal("Memo physical frontier revision overflow"))?;
+            .ok_or_else(|| {
+                paro_error::internal("Memo physical implementation revision overflow")
+            })?;
         canonical_group.winner_frontiers.clear();
         secondary_group.winner_frontiers.clear();
+        canonical_group.physical_frontier_versions.clear();
+        secondary_group.physical_frontier_versions.clear();
 
         self.recanonicalize_after_merge();
         Ok(canonical)
@@ -3303,6 +3332,10 @@ impl Memo {
             group.logical_operator_index.clear();
             group.physical_index.clear();
             group.winner_frontiers.clear();
+            group.physical_frontier_versions.clear();
+            group.physical_implementation_version = group
+                .physical_implementation_version
+                .saturating_add(1);
             group.logical_exprs.sort_unstable();
             let mut unique = BTreeMap::<(LogicalExprKey, Option<Arc<[u8]>>), LogicalExprId>::new();
             for expression in std::mem::take(&mut group.logical_exprs) {

@@ -14,7 +14,8 @@ use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupS
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::ids::{
     AdmissibleGrantSetId, CalibrationRevisionId, CandidateId, ColumnId, LogicalPayloadId,
-    OptimizationContextId, PhysicalExprId, PhysicalPayloadId, ResourceGrantClassId,
+    OptimizationContextId, PhysicalExprId, PhysicalPayloadId, PropertySetId,
+    ResourceGrantClassId,
 };
 use crate::cascades::memo::{
     GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, OptimizationContext,
@@ -1477,9 +1478,160 @@ fn physical_recipe_publication_registers_exact_parent_before_child_is_optimized(
     let child_goal = goal;
     let parents = engine
         .physical_parents
-        .get(&child)
+        .get(&(child, child_goal))
         .expect("publishing a recipe must install its reverse child edge");
     assert!(parents.contains(&(root, child_goal, PhysicalExprId(0), recipe_fingerprint)));
+}
+
+#[test]
+fn physical_read_of_one_goal_is_not_invalidated_by_another_goal_publication() {
+    let (mut engine, root, goal_a) = strong_tree_engine();
+    let root_expression = engine
+        .memo()
+        .group(root)
+        .and_then(|group| group.logical_exprs().first().copied())
+        .expect("the tree fixture has a root expression");
+    let child = engine
+        .memo()
+        .logical_expr(root_expression)
+        .and_then(|expression| expression.key.children.first().copied())
+        .expect("the tree fixture has one physical child");
+
+    let parent_implementation = TreeImplementation {
+        id: ImplementationId(41),
+        operator: Fingerprint(200),
+        child: Some(child),
+        child_row_goal: Some(RowGoal::All),
+        local_score: 0.0,
+        mandatory: true,
+    };
+    let parent_candidate = parent_implementation
+        .candidates(
+            root_expression,
+            goal_a,
+            &ImplementationContext {
+                memo: engine.memo(),
+                group: root,
+            },
+        )
+        .unwrap()
+        .into_vec()
+        .pop()
+        .expect("the parent implementation has one candidate");
+    engine
+        .admit_candidate(
+            root,
+            root_expression,
+            ImplementationId(41),
+            goal_a,
+            parent_candidate,
+        )
+        .unwrap();
+
+    // Materialize both goal frontiers first. The later publication must not
+    // be confused with the physical implementation-domain insertion.
+    engine.optimize_group(child, goal_a).unwrap();
+    let goal_b = OptimizationGoal {
+        row_goal: RowGoal::AtMost(1),
+        ..goal_a
+    };
+    engine.optimize_group(child, goal_b).unwrap();
+    let goal_a_revision = engine
+        .memo()
+        .group(child)
+        .expect("the child group remains canonical")
+        .physical_frontier_version(goal_a);
+    let goal_b_revision = engine
+        .memo()
+        .group(child)
+        .expect("the child group remains canonical")
+        .physical_frontier_version(goal_b);
+    let before = engine.physical_read_set(root, goal_a).unwrap();
+    let goal_b_read = PatternRead::physical_from_group(engine.memo(), child, goal_b).unwrap();
+    let child_reads = ReadSet::new(
+        before
+            .reads()
+            .iter()
+            .copied()
+            .filter(|read| read.group == child)
+            .chain(std::iter::once(goal_b_read)),
+    );
+    assert_eq!(
+        child_reads
+            .reads()
+            .iter()
+            .filter(|read| read.physical_goal.is_some())
+            .count(),
+        2,
+        "different physical goals must retain independent read cursors"
+    );
+
+    let mut changed_b = engine
+        .memo()
+        .group(child)
+        .and_then(|group| group.winner(goal_b))
+        .cloned()
+        .expect("goal B has a winner");
+    changed_b.local_cost = cost(2.0);
+    changed_b.cost = cost(2.0);
+    engine
+        .memo_mut()
+        .record_winner(child, goal_b, changed_b)
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .memo()
+            .group(child)
+            .expect("the child group remains canonical")
+            .physical_frontier_version(goal_a),
+        goal_a_revision,
+        "goal B publication must not advance goal A's frontier revision"
+    );
+    assert!(
+        engine
+            .memo()
+            .group(child)
+            .expect("the child group remains canonical")
+            .physical_frontier_version(goal_b)
+            > goal_b_revision,
+        "goal B publication must advance its own frontier revision"
+    );
+
+    assert!(
+        before.is_current(engine.memo()).unwrap(),
+        "publishing goal B must not invalidate a parent that reads goal A"
+    );
+    // The earlier goal-A publication may have left the parent dirty. Remove
+    // that already-observed work so the next assertions isolate goal B.
+    engine.physical_dirty_recipes.remove(&(root, goal_a));
+
+    // Exercise the production publication/invalidation path rather than
+    // relying only on a manually assembled ReadSet.  An unrelated frontier
+    // publication must not dirty the parent; a related one must dirty it and
+    // allow the parent to recover through the ordinary optimizer entry point.
+    engine
+        .note_physical_frontier_change(child, goal_b, true)
+        .unwrap();
+    assert!(!engine
+        .physical_dirty_recipes
+        .contains_key(&(root, goal_a)));
+    let mut unrelated = PhysicalInterleave::new(root, [goal_a]);
+    unrelated.pending.remove(&(root, goal_a));
+    engine.enqueue_physical_ancestors([(child, goal_b)], &mut unrelated);
+    assert!(!unrelated.pending.contains(&(root, goal_a)));
+    engine
+        .note_physical_frontier_change(child, goal_a, true)
+        .unwrap();
+    assert!(engine
+        .physical_dirty_recipes
+        .contains_key(&(root, goal_a)));
+    engine.optimize_group(root, goal_a).unwrap();
+
+    let counters = engine.search_work_counters();
+    assert_eq!(counters["physical_unrelated_goal_invalidation_count"], 0);
+    assert!(counters["physical_unrelated_goal_notification_avoided_count"] > 0);
+    assert!(counters["physical_related_goal_notification_count"] > 0);
 }
 
 fn engine(optional_rules: u32) -> (CascadesEngine, GroupId, OptimizationGoal) {
@@ -3095,6 +3247,8 @@ fn subscription_delta_matches_an_independent_set_difference() {
                         ReadScope::FACTS
                     },
                     logical_frontier_revision: frontier,
+                    physical_goal: None,
+                    physical_implementation_revision: None,
                     physical_frontier_revision: None,
                     logical_fact_fingerprint: Fingerprint(revision.into()),
                     statistics_snapshot_fingerprint: Fingerprint(u128::from(revision) + 1),
@@ -3132,10 +3286,19 @@ fn subscription_delta_matches_an_independent_set_difference() {
 fn physical_child_frontier_change_is_narrowed_to_dependent_recipes() {
     let owner = GroupId::new(10);
     let child = GroupId::new(11);
+    let child_goal = OptimizationGoal {
+        required: PropertySetId::new(0),
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
     let owner_read = PatternRead {
         group: owner,
         scope: ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS),
         logical_frontier_revision: Some(1),
+        physical_goal: None,
+        physical_implementation_revision: None,
         physical_frontier_revision: None,
         logical_fact_fingerprint: Fingerprint(2),
         statistics_snapshot_fingerprint: Fingerprint(3),
@@ -3146,6 +3309,8 @@ fn physical_child_frontier_change_is_narrowed_to_dependent_recipes() {
             group: child,
             scope: ReadScope::ALL,
             logical_frontier_revision: Some(4),
+            physical_goal: Some(child_goal),
+            physical_implementation_revision: Some(1),
             physical_frontier_revision: Some(5),
             logical_fact_fingerprint: Fingerprint(6),
             statistics_snapshot_fingerprint: Fingerprint(7),
@@ -3162,7 +3327,7 @@ fn physical_child_frontier_change_is_narrowed_to_dependent_recipes() {
 
     assert_eq!(
         physical_changed_child_groups(owner, Some(&previous), &current),
-        BTreeSet::from([child])
+        BTreeSet::from([(child, child_goal)])
     );
     assert!(!physical_read_requires_full_recost(
         owner,

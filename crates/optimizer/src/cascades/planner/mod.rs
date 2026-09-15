@@ -1228,6 +1228,48 @@ fn record_frozen_candidate_trace(
         );
         trace.record_value(
             "optimizer",
+            &format!("{read_prefix}.physical_goal_present"),
+            u64::from(read.physical_goal.is_some()),
+        );
+        if let Some(goal) = read.physical_goal {
+            trace.record_value(
+                "optimizer",
+                &format!("{read_prefix}.physical_goal_required"),
+                goal.required.0 as u64,
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{read_prefix}.physical_goal_row_goal"),
+                goal.row_goal.stable_tag(),
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{read_prefix}.physical_goal_objective"),
+                goal.objective.stable_tag(),
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{read_prefix}.physical_goal_grant"),
+                goal.grant.stable_tag(),
+            );
+            trace.record_value(
+                "optimizer",
+                &format!("{read_prefix}.physical_goal_context"),
+                goal.context.0 as u64,
+            );
+        }
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.physical_implementation_present"),
+            u64::from(read.physical_implementation_revision.is_some()),
+        );
+        trace.record_value(
+            "optimizer",
+            &format!("{read_prefix}.physical_implementation_revision"),
+            read.physical_implementation_revision.unwrap_or_default(),
+        );
+        trace.record_value(
+            "optimizer",
             &format!("{read_prefix}.logical_fact_lo"),
             read.logical_fact_fingerprint.0 as u64,
         );

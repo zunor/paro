@@ -1105,8 +1105,10 @@ pub struct CascadesEngine {
     /// only the parent goals whose recipes consumed that child, then walks the
     /// already registered ancestor chain. This index is query-local and is
     /// rebuilt lazily as new native/settled recipes are admitted.
-    physical_parents:
-        BTreeMap<GroupId, BTreeSet<(GroupId, OptimizationGoal, PhysicalExprId, Fingerprint)>>,
+    physical_parents: BTreeMap<
+        (GroupId, OptimizationGoal),
+        BTreeSet<(GroupId, OptimizationGoal, PhysicalExprId, Fingerprint)>,
+    >,
     /// Child groups observed by each physical subproblem.  Recipes are
     /// published incrementally, so maintaining this small deduplicated index
     /// at publication avoids rescanning the global recipe table every time a
@@ -1155,6 +1157,15 @@ pub struct CascadesEngine {
     physical_subproblem_evaluations: u64,
     physical_stale_retries: u64,
     physical_implementation_requests: u64,
+    /// Goal-scoped invalidation accounting. These counters are diagnostic
+    /// evidence for the dependency contract; they do not control scheduling.
+    physical_unrelated_goal_invalidation_count: u64,
+    physical_unrelated_goal_notification_avoided_count: u64,
+    physical_related_goal_notification_count: u64,
+    physical_merged_notification_count: u64,
+    physical_readset_rebuild_count: u64,
+    physical_recipe_reprocess_count: u64,
+    physical_completion_invalidation_count: u64,
     /// Logical frontier growth is append-only.  Keep the exact implementation
     /// visit identity so a later physical recost can discover only newly
     /// published logical expressions.  The mandatory/optional bit is part of
@@ -1342,6 +1353,13 @@ impl CascadesEngine {
             physical_subproblem_evaluations: 0,
             physical_stale_retries: 0,
             physical_implementation_requests: 0,
+            physical_unrelated_goal_invalidation_count: 0,
+            physical_unrelated_goal_notification_avoided_count: 0,
+            physical_related_goal_notification_count: 0,
+            physical_merged_notification_count: 0,
+            physical_readset_rebuild_count: 0,
+            physical_recipe_reprocess_count: 0,
+            physical_completion_invalidation_count: 0,
             physical_implementation_seen: BTreeSet::new(),
             physical_implementation_expression_evaluations: 0,
             physical_implementation_expression_skips: 0,
@@ -1705,10 +1723,13 @@ impl CascadesEngine {
 
     fn recanonicalize_physical_parents(&mut self) {
         let previous = std::mem::take(&mut self.physical_parents);
-        for (child, parents) in previous {
+        for ((child, child_goal), parents) in previous {
             let child = self.memo.canonical_group(child);
             for (parent, goal, physical, recipe) in parents {
-                self.physical_parents.entry(child).or_default().insert((
+                self.physical_parents
+                    .entry((child, child_goal))
+                    .or_default()
+                    .insert((
                     self.memo.canonical_group(parent),
                     goal,
                     physical,
@@ -3063,9 +3084,73 @@ impl CascadesEngine {
         selected_changed: bool,
     ) -> Result<bool> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
+        self.mark_physical_parents_dirty((self.memo.canonical_group(group), goal));
         self.note_physical_candidate(group, goal, selected_changed)?;
         self.record_diagnostic_checkpoints();
         Ok(self.should_yield_physical_interleave_step())
+    }
+
+    /// An implementation-domain update is visible to every exact goal that
+    /// has a registered parent recipe. It is intentionally broader than a
+    /// goal-frontier update: a newly inserted physical expression may be
+    /// applicable to more than one goal.
+    fn note_physical_implementation_change(&mut self, group: GroupId) {
+        let group = self.memo.canonical_group(group);
+        let goals = self
+            .physical_goals
+            .get(&group)
+            .cloned()
+            .unwrap_or_default();
+        for goal in goals {
+            self.mark_physical_parents_dirty((group, goal));
+        }
+    }
+
+    fn mark_physical_parents_dirty(&mut self, key: (GroupId, OptimizationGoal)) {
+        let Some(parents) = self.physical_parents.get(&key).cloned() else {
+            return;
+        };
+        for (parent, parent_goal, physical, recipe) in parents {
+            let dirty = self
+                .physical_dirty_recipes
+                .entry((self.memo.canonical_group(parent), parent_goal))
+                .or_default();
+            if dirty.insert((physical, recipe)) {
+                self.physical_related_goal_notification_count = self
+                    .physical_related_goal_notification_count
+                    .saturating_add(1);
+            } else {
+                self.physical_merged_notification_count = self
+                    .physical_merged_notification_count
+                    .saturating_add(1);
+            }
+        }
+    }
+
+    /// Completion is a separate response dimension from candidate cost. A
+    /// parent which has registered this child goal may need to retry when the
+    /// child closes its declared domain, but that transition must not be
+    /// reported as a frontier/cost change or as a proof of global completion.
+    fn note_physical_completion_change(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        complete: bool,
+    ) {
+        let key = (self.memo.canonical_group(group), goal);
+        let previous = self
+            .physical_task_cache
+            .get(&key)
+            .map(|entry| entry.complete);
+        if previous == Some(complete) {
+            return;
+        }
+        if previous.is_some() {
+            self.physical_completion_invalidation_count = self
+                .physical_completion_invalidation_count
+                .saturating_add(1);
+        }
+        self.mark_physical_parents_dirty(key);
     }
 
     fn try_quality_handoff_candidate(
@@ -3471,8 +3556,7 @@ impl CascadesEngine {
         self.physical_quality_demanded_groups = self
             .physical_parents
             .keys()
-            .copied()
-            .map(|group| self.memo.canonical_group(group))
+            .map(|(group, _)| self.memo.canonical_group(*group))
             .collect();
         self.physical_quality_scheduled_groups.clear();
         Ok(())
@@ -3545,6 +3629,12 @@ impl CascadesEngine {
         builder.write_u64(reads.reads().len() as u64);
         for read in reads.reads() {
             builder.write_u64(u64::from(read.scope.bits()));
+            builder.write_u64(u64::from(read.physical_goal.is_some()));
+            if let Some(physical_goal) = read.physical_goal {
+                write_optimization_goal_fingerprint(&mut builder, physical_goal);
+            }
+            builder.write_u64(u64::from(read.physical_implementation_revision.is_some()));
+            builder.write_u64(read.physical_implementation_revision.unwrap_or_default());
             builder.write_u64(u64::from(read.logical_frontier_revision.is_some()));
             builder.write_u64(u64::from(read.physical_frontier_revision.is_some()));
             builder.write_fingerprint(read.logical_fact_fingerprint);
@@ -4223,71 +4313,83 @@ impl CascadesEngine {
         if self.quality_handoff_enabled && self.optional_search_started {
             self.physical_quality_demanded_groups.insert(child);
         }
-        self.physical_parents.entry(child).or_default().insert((
-            parent,
-            parent_goal,
-            physical,
-            recipe,
-        ));
+        self.physical_parents
+            .entry((child, child_goal))
+            .or_default()
+            .insert((parent, parent_goal, physical, recipe));
     }
 
-    /// Add a changed group's exact physical targets and walk only the reverse
-    /// recipe edges already observed by this engine. Child and parent goals
-    /// stay in the dependency index; a root goal is never substituted for a
-    /// child's materialization, partitioning, or grant contract.
+    /// Add changed physical subproblems and walk only the reverse recipe edges
+    /// already observed by this engine. The child goal is part of the walk;
+    /// a publication for another goal in the same group cannot wake a parent
+    /// which did not read it.
     fn enqueue_physical_ancestors(
         &mut self,
-        changed_groups: impl IntoIterator<Item = GroupId>,
+        changed_subproblems: impl IntoIterator<Item = (GroupId, OptimizationGoal)>,
         interleave: &mut PhysicalInterleave,
     ) {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
-        let mut groups = VecDeque::new();
+        let mut subproblems = VecDeque::new();
         let mut visited = BTreeSet::new();
-        for group in changed_groups {
+        for (group, changed_goal) in changed_subproblems {
             let group = self.memo.canonical_group(group);
-            // A logical publication can change the local implementation set
-            // without changing an already-indexed child frontier.  Queue the
-            // exact physical goals that have actually been observed for this
-            // group before walking its ancestors.  Relying on the root queue
-            // alone delays a new branch implementation until a later parent
-            // recursion, which is precisely the gap between a published
-            // aggregate choice and a root-consumable quality candidate.
-            if let Some(goals) = self.physical_goals.get(&group).cloned() {
-                for goal in goals {
-                    interleave.pending.insert((group, goal));
-                    self.infeasible_goals.remove(&(group, goal));
-                }
+            if self
+                .physical_parents
+                .keys()
+                .any(|(candidate_group, candidate_goal)| {
+                    *candidate_group == group && *candidate_goal != changed_goal
+                })
+                && !self
+                    .physical_parents
+                    .contains_key(&(group, changed_goal))
+            {
+                // This is the publication shape that used to be delivered
+                // through the group-wide revision. Keep it as an explicit
+                // avoided-work counter rather than pretending it was an
+                // actual invalidation after the goal-scoped fix.
+                self.physical_unrelated_goal_notification_avoided_count = self
+                    .physical_unrelated_goal_notification_avoided_count
+                    .saturating_add(1);
             }
+            // A logical publication may be supplied as one observed goal per
+            // call by the caller. Do not infer a group-wide dependency here:
+            // physical frontier changes are keyed by the exact child goal.
+            interleave.pending.insert((group, changed_goal));
+            self.infeasible_goals.remove(&(group, changed_goal));
+            subproblems.push_back((group, changed_goal));
             if group == interleave.root {
                 let root_goals = interleave.goals.clone();
                 for goal in root_goals {
                     interleave.pending.insert((group, goal));
                     self.infeasible_goals.remove(&(group, goal));
+                    subproblems.push_back((group, goal));
                 }
             }
-            groups.push_back(group);
         }
-        while let Some(group) = groups.pop_front() {
-            if !visited.insert(group) {
+        while let Some((group, child_goal)) = subproblems.pop_front() {
+            if !visited.insert((group, child_goal)) {
                 continue;
             }
-            let Some(parents) = self.physical_parents.get(&group) else {
+            let Some(parents) = self.physical_parents.get(&(group, child_goal)).cloned() else {
                 continue;
             };
-            for &(parent, goal, physical, recipe) in parents {
+            for (parent, goal, physical, recipe) in parents {
                 let parent = self.memo.canonical_group(parent);
-                // The parent owns the observable response. Its recursive
-                // physical pass will pull the changed child goal on demand;
-                // queueing both sides made every publication pay a separate
-                // readiness visit for a child that can never be returned by
-                // this interleave. The root remains explicitly queued above.
-                interleave.pending.insert((parent, goal));
+                if interleave.pending.insert((parent, goal)) {
+                    self.physical_related_goal_notification_count = self
+                        .physical_related_goal_notification_count
+                        .saturating_add(1);
+                } else {
+                    self.physical_merged_notification_count = self
+                        .physical_merged_notification_count
+                        .saturating_add(1);
+                }
                 self.physical_dirty_recipes
                     .entry((parent, goal))
                     .or_default()
                     .insert((physical, recipe));
                 self.infeasible_goals.remove(&(parent, goal));
-                groups.push_back(parent);
+                subproblems.push_back((parent, goal));
             }
         }
     }
@@ -4336,7 +4438,7 @@ impl CascadesEngine {
                 // from the recipe/combination cursor rather than rescanning
                 // the whole child frontier.
                 interleave.pending.insert((group, goal));
-                self.enqueue_physical_ancestors([group], interleave);
+                self.enqueue_physical_ancestors([(group, goal)], interleave);
             }
             self.record_diagnostic_checkpoints();
         }
@@ -5415,7 +5517,21 @@ impl CascadesEngine {
                         fact_value,
                     });
                 if let Some(interleave) = interleave.as_mut() {
-                    self.enqueue_physical_ancestors(inserted_groups.iter().copied(), interleave);
+                    let mut changed_subproblems = Vec::new();
+                    for group in inserted_groups.iter().copied() {
+                        let group = self.memo.canonical_group(group);
+                        if let Some(goals) = self.physical_goals.get(&group) {
+                            changed_subproblems.extend(
+                                goals.iter().copied().map(|goal| (group, goal)),
+                            );
+                        }
+                        if group == interleave.root {
+                            changed_subproblems.extend(
+                                interleave.goals.iter().copied().map(|goal| (group, goal)),
+                            );
+                        }
+                    }
+                    self.enqueue_physical_ancestors(changed_subproblems, interleave);
                 }
                 for target in inserted_groups {
                     self.schedule_transformation_dependents(target, &mut agenda)?;
@@ -5590,6 +5706,34 @@ impl CascadesEngine {
             (
                 "physical_implementation_expression_skip_count",
                 self.physical_implementation_expression_skips,
+            ),
+            (
+                "physical_unrelated_goal_invalidation_count",
+                self.physical_unrelated_goal_invalidation_count,
+            ),
+            (
+                "physical_unrelated_goal_notification_avoided_count",
+                self.physical_unrelated_goal_notification_avoided_count,
+            ),
+            (
+                "physical_related_goal_notification_count",
+                self.physical_related_goal_notification_count,
+            ),
+            (
+                "physical_merged_notification_count",
+                self.physical_merged_notification_count,
+            ),
+            (
+                "physical_readset_rebuild_count",
+                self.physical_readset_rebuild_count,
+            ),
+            (
+                "physical_recipe_reprocess_count",
+                self.physical_recipe_reprocess_count,
+            ),
+            (
+                "physical_completion_invalidation_count",
+                self.physical_completion_invalidation_count,
             ),
             (
                 "optimization_context_count",
@@ -6798,12 +6942,26 @@ impl CascadesEngine {
         } else {
             None
         };
+        let implementation_revision_before = self
+            .memo
+            .group(group)
+            .map(|group| group.physical_implementation_version())
+            .unwrap_or_default();
         let physical = self.memo.insert_physical(
             group,
             candidate.key,
             candidate.payload,
             candidate.provided,
         )?;
+        let implementation_changed = self
+            .memo
+            .group(group)
+            .map(|group| group.physical_implementation_version())
+            .unwrap_or(implementation_revision_before)
+            != implementation_revision_before;
+        if implementation_changed {
+            self.note_physical_implementation_change(group);
+        }
         let recipe_key = (physical, goal, candidate.physical_fingerprint);
         let recipe_fingerprint = candidate.physical_fingerprint;
         let child_dependencies = candidate
@@ -6922,11 +7080,15 @@ impl CascadesEngine {
         // recipe sequence below; observing the owner's physical frontier here
         // would make every local publication invalidate the task that made
         // it. Child physical frontiers remain exact dependencies and are
-        // still read with `physical_from_group`.
+        // read with the child goal that the recipe actually consumes.
         let mut reads = vec![PatternRead::from_group(&self.memo, group)?];
         if let Some(children) = self.physical_read_dependencies.get(&(group, goal)) {
-            for (child, _) in children.iter().copied() {
-                reads.push(PatternRead::physical_from_group(&self.memo, child)?);
+            for (child, child_goal) in children.iter().copied() {
+                reads.push(PatternRead::physical_from_group(
+                    &self.memo,
+                    child,
+                    child_goal,
+                )?);
             }
         }
         Ok(ReadSet::new(reads))
@@ -6969,6 +7131,7 @@ impl CascadesEngine {
         // Child frontiers are part of the exact parent response. Capture them
         // before requesting the task so a changed child selects a new
         // evaluation, while an unchanged incomplete task remains reusable.
+        self.physical_readset_rebuild_count = self.physical_readset_rebuild_count.saturating_add(1);
         let read_set = self.physical_read_set(group, goal)?;
         let requested_read_set = read_set.clone();
         let mut new_evaluation = false;
@@ -7186,13 +7349,15 @@ impl CascadesEngine {
             };
             self.task_registry
                 .complete_current(task, &self.memo, outcome)?;
+            let cache_complete = !self.preserve_incomplete_physical
+                && self.memo.search_obligations_empty();
+            self.note_physical_completion_change(group, goal, cache_complete);
             self.physical_task_cache.insert(
                 cache_key,
                 PhysicalTaskCacheEntry {
                     reads: requested_read_set.clone(),
                     recipe_cursor: recipe_count,
-                    complete: !self.preserve_incomplete_physical
-                        && self.memo.search_obligations_empty(),
+                    complete: cache_complete,
                 },
             );
             return Ok(());
@@ -7233,12 +7398,14 @@ impl CascadesEngine {
             };
             self.task_registry
                 .complete_current(task, &self.memo, outcome)?;
+            let cache_complete = !self.preserve_incomplete_physical;
+            self.note_physical_completion_change(group, goal, cache_complete);
             self.physical_task_cache.insert(
                 cache_key,
                 PhysicalTaskCacheEntry {
                     reads: requested_read_set.clone(),
                     recipe_cursor: recipe_count,
-                    complete: !self.preserve_incomplete_physical,
+                    complete: cache_complete,
                 },
             );
             return Ok(());
@@ -7285,6 +7452,7 @@ impl CascadesEngine {
                 // exact post-child ReadSet before publication; otherwise a
                 // later parent could either miss a child change or retain a
                 // provisional pre-child snapshot.
+                self.physical_readset_rebuild_count = self.physical_readset_rebuild_count.saturating_add(1);
                 let post_child_reads = self.physical_read_set(group, goal)?;
                 self.task_registry.replace_current_read_set(
                     task,
@@ -7363,6 +7531,7 @@ impl CascadesEngine {
                     std::iter::empty(),
                     outcome,
                 )?;
+                self.note_physical_completion_change(group, goal, complete);
                 self.physical_task_cache.insert(
                     cache_key,
                     PhysicalTaskCacheEntry {
@@ -8178,7 +8347,7 @@ impl CascadesEngine {
                 let before = self
                     .memo
                     .group(group)
-                    .map(|group| group.physical_frontier_version())
+                    .map(|group| group.physical_frontier_version(goal))
                     .unwrap_or_default();
                 let joint_cost_proof =
                     build_joint_cost_proof(&self.memo, group, recipe, cached.local_cost)?;
@@ -8210,7 +8379,7 @@ impl CascadesEngine {
                 let after = self
                     .memo
                     .group(group)
-                    .map(|group| group.physical_frontier_version())
+                    .map(|group| group.physical_frontier_version(goal))
                     .unwrap_or(before);
                 Ok((after != before, selected_changed, published_candidate))
             }
@@ -8277,6 +8446,8 @@ impl CascadesEngine {
             } else if sequence < recipe_start {
                 continue;
             }
+            self.physical_recipe_reprocess_count =
+                self.physical_recipe_reprocess_count.saturating_add(1);
             if !self.memo.control().checkpoint()? {
                 break;
             }
@@ -8478,7 +8649,7 @@ impl CascadesEngine {
             let parent_frontier_revision = self
                 .memo
                 .group(group)
-                .map(|group| group.physical_frontier_version())
+                .map(|group| group.physical_frontier_version(goal))
                 .unwrap_or_default();
             let mut combination_state = self
                 .child_combination_states
@@ -8875,7 +9046,7 @@ impl CascadesEngine {
             let current_parent_frontier_revision = self
                 .memo
                 .group(group)
-                .map(|group| group.physical_frontier_version())
+                .map(|group| group.physical_frontier_version(goal))
                 .unwrap_or(parent_frontier_revision);
             if current_parent_frontier_revision != combination_state.parent_frontier_revision {
                 let rechecks = combination_state
@@ -8936,7 +9107,7 @@ impl CascadesEngine {
             combination_state.parent_frontier_revision = self
                 .memo
                 .group(group)
-                .map(|group| group.physical_frontier_version())
+                .map(|group| group.physical_frontier_version(goal))
                 .unwrap_or(current_parent_frontier_revision);
             self.child_combination_states
                 .insert(recipe_key, combination_state);
@@ -8994,21 +9165,31 @@ fn physical_changed_child_groups(
     owner: GroupId,
     previous: Option<&ReadSet>,
     current: &ReadSet,
-) -> BTreeSet<GroupId> {
+) -> BTreeSet<(GroupId, OptimizationGoal)> {
     let Some(previous) = previous else {
         return BTreeSet::new();
     };
     previous
         .reads()
         .iter()
-        .filter(|read| read.group != owner)
+        .filter(|read| read.group != owner && read.physical_goal.is_some())
         .filter_map(|previous_read| {
             current
                 .reads()
                 .iter()
-                .find(|read| read.group == previous_read.group)
+                .find(|read| {
+                    read.group == previous_read.group
+                        && read.physical_goal == previous_read.physical_goal
+                })
                 .filter(|current_read| *current_read != previous_read)
-                .map(|_| previous_read.group)
+                .map(|_| {
+                    (
+                        previous_read.group,
+                        previous_read
+                            .physical_goal
+                            .expect("physical read has an exact goal"),
+                    )
+                })
         })
         .collect()
 }
@@ -9050,11 +9231,18 @@ fn physical_read_requires_full_recost(
     // a complete recost. A group appearing only in the current ReadSet belongs
     // to a newly appended local recipe; the cursor visits it without
     // invalidating the processed prefix.
-    for previous_read in previous.reads().iter().filter(|read| read.group != owner) {
+    for previous_read in previous
+        .reads()
+        .iter()
+        .filter(|read| read.group != owner && read.physical_goal.is_some())
+    {
         let current_group_count = current
             .reads()
             .iter()
-            .filter(|read| read.group == previous_read.group)
+            .filter(|read| {
+                read.group == previous_read.group
+                    && read.physical_goal == previous_read.physical_goal
+            })
             .count();
         if current_group_count != 1 {
             return true;
@@ -10705,6 +10893,12 @@ fn transformation_dependency_fingerprint(dependencies: &[PatternRead]) -> Finger
     for read in dependencies {
         builder.write_u64(read.group.0 as u64);
         builder.write_u64(u64::from(read.scope.bits()));
+        builder.write_u64(u64::from(read.physical_goal.is_some()));
+        if let Some(physical_goal) = read.physical_goal {
+            write_optimization_goal_fingerprint(&mut builder, physical_goal);
+        }
+        builder.write_u64(u64::from(read.physical_implementation_revision.is_some()));
+        builder.write_u64(read.physical_implementation_revision.unwrap_or_default());
         builder.write_u64(u64::from(read.logical_frontier_revision.is_some()));
         builder.write_u64(read.logical_frontier_revision.unwrap_or_default());
         builder.write_u64(u64::from(read.physical_frontier_revision.is_some()));

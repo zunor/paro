@@ -342,10 +342,18 @@ pub struct PatternRead {
     /// peer root insertions must not invalidate and recursively wake the same
     /// binding task.
     pub logical_frontier_revision: Option<u64>,
-    /// `Some` for physical tasks which consume the group's published
-    /// physical frontier. The revision is owned by the group so unrelated
-    /// child publications do not invalidate this task. It is deliberately
-    /// absent from transformation reads.
+    /// The complete goal whose physical frontier is consumed. The goal
+    /// carries required properties, row goal, objective, grant, and context;
+    /// it must never be replaced with a group-wide winner identity.
+    pub physical_goal: Option<OptimizationGoal>,
+    /// `Some` for physical tasks which consume the group's implementation
+    /// domain. Adding a physical implementation can affect every goal, while
+    /// publishing a winner affects only `physical_goal` below.
+    pub physical_implementation_revision: Option<u64>,
+    /// `Some` for physical tasks which consume the exact goal frontier. The
+    /// revision is owned by that goal, so an unrelated child publication does
+    /// not invalidate this task. It is deliberately absent from
+    /// transformation reads.
     pub physical_frontier_revision: Option<u64>,
     pub logical_fact_fingerprint: Fingerprint,
     pub statistics_snapshot_fingerprint: Fingerprint,
@@ -353,33 +361,59 @@ pub struct PatternRead {
 
 impl PatternRead {
     pub fn from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS))
+        Self::read(
+            memo,
+            group,
+            ReadScope::LOGICAL_FRONTIER.union(ReadScope::FACTS),
+            None,
+        )
     }
 
     /// Read a group for a physical subproblem. In addition to the logical
     /// frontier and facts, the task observes physical publications so a
     /// parent cannot reuse a child frontier that changed during a nested
     /// optimization request.
-    pub fn physical_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, ReadScope::ALL)
+    pub fn physical_from_group(
+        memo: &Memo,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> Result<Self> {
+        Self::read(memo, group, ReadScope::ALL, Some(goal))
     }
 
     pub fn facts_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, ReadScope::FACTS)
+        Self::read(memo, group, ReadScope::FACTS, None)
     }
 
     /// Read only the logical structure of a group.  This is intended for
     /// matchers which do not inspect facts; a statistics update must not wake
     /// or invalidate such a task.
     pub fn structure_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
-        Self::read(memo, group, ReadScope::LOGICAL_FRONTIER)
+        Self::read(memo, group, ReadScope::LOGICAL_FRONTIER, None)
     }
 
-    fn read(memo: &Memo, group: GroupId, scope: ReadScope) -> Result<Self> {
+    fn read(
+        memo: &Memo,
+        group: GroupId,
+        scope: ReadScope,
+        requested_physical_goal: Option<OptimizationGoal>,
+    ) -> Result<Self> {
         let group = memo.canonical_group(group);
         let group_ref = memo
             .group(group)
             .ok_or_else(|| paro_error::internal("rule binding read an unknown group"))?;
+        let physical_goal = if scope.contains(ReadScope::PHYSICAL_FRONTIER) {
+            Some(requested_physical_goal.ok_or_else(|| {
+                paro_error::internal("physical read must identify the exact optimization goal")
+            })?)
+        } else {
+            if requested_physical_goal.is_some() {
+                return Err(paro_error::internal(
+                    "non-physical read carried a physical goal",
+                ));
+            }
+            None
+        };
         // A cursor observes one recipe, not an unmetered recursive estimate.
         // Readers resolving inherited facts must subscribe to their inputs.
         Ok(Self {
@@ -387,8 +421,12 @@ impl PatternRead {
             scope,
             logical_frontier_revision: scope.contains(ReadScope::LOGICAL_FRONTIER)
                 .then(|| group_ref.logical_expression_version()),
-            physical_frontier_revision: scope.contains(ReadScope::PHYSICAL_FRONTIER)
-                .then(|| group_ref.physical_frontier_version()),
+            physical_goal,
+            physical_implementation_revision: scope
+                .contains(ReadScope::PHYSICAL_FRONTIER)
+                .then(|| group_ref.physical_implementation_version()),
+            physical_frontier_revision: physical_goal
+                .map(|goal| group_ref.physical_frontier_version(goal)),
             logical_fact_fingerprint: scope
                 .contains(ReadScope::LOGICAL_FACTS)
                 .then(|| group_ref.logical_fact_fingerprint())
@@ -401,7 +439,12 @@ impl PatternRead {
     }
 
     pub fn is_current(self, memo: &Memo) -> Result<bool> {
-        Ok(self.matches(Self::read(memo, self.group, self.scope)?))
+        Ok(self.matches(Self::read(
+            memo,
+            self.group,
+            self.scope,
+            self.physical_goal,
+        )?))
     }
 
     /// Publication uses the same exact read contract as task reuse. Physical
@@ -409,7 +452,12 @@ impl PatternRead {
     /// an older child revision must not be recorded as a current completion;
     /// the engine retries that parent against a fresh targeted ReadSet.
     pub fn is_current_for_publication(self, memo: &Memo) -> Result<bool> {
-        Ok(self.matches(Self::read(memo, self.group, self.scope)?))
+        Ok(self.matches(Self::read(
+            memo,
+            self.group,
+            self.scope,
+            self.physical_goal,
+        )?))
     }
 
     /// Combine observations of the same group without widening either one.
@@ -426,6 +474,19 @@ impl PatternRead {
                 other.logical_frontier_revision
             } else {
                 self.logical_frontier_revision
+            },
+            physical_goal: if other.scope.contains(ReadScope::PHYSICAL_FRONTIER) {
+                other.physical_goal
+            } else {
+                self.physical_goal
+            },
+            physical_implementation_revision: if other
+                .scope
+                .contains(ReadScope::PHYSICAL_FRONTIER)
+            {
+                other.physical_implementation_revision
+            } else {
+                self.physical_implementation_revision
             },
             physical_frontier_revision: if other.scope.contains(ReadScope::PHYSICAL_FRONTIER) {
                 other.physical_frontier_revision
@@ -457,7 +518,10 @@ impl PatternRead {
         (overlap & ReadScope::LOGICAL_FRONTIER.0 == 0
             || self.logical_frontier_revision == other.logical_frontier_revision)
             && (overlap & ReadScope::PHYSICAL_FRONTIER.0 == 0
-                || self.physical_frontier_revision == other.physical_frontier_revision)
+                || (self.physical_goal == other.physical_goal
+                    && self.physical_implementation_revision
+                        == other.physical_implementation_revision
+                    && self.physical_frontier_revision == other.physical_frontier_revision))
             && (overlap & ReadScope::LOGICAL_FACTS.0 == 0
                 || self.logical_fact_fingerprint == other.logical_fact_fingerprint)
             && (overlap & ReadScope::STATISTICS.0 == 0
@@ -470,7 +534,10 @@ impl PatternRead {
             && (!self.scope.contains(ReadScope::LOGICAL_FRONTIER)
                 || self.logical_frontier_revision == current.logical_frontier_revision)
             && (!self.scope.contains(ReadScope::PHYSICAL_FRONTIER)
-                || self.physical_frontier_revision == current.physical_frontier_revision)
+                || (self.physical_goal == current.physical_goal
+                    && self.physical_implementation_revision
+                        == current.physical_implementation_revision
+                    && self.physical_frontier_revision == current.physical_frontier_revision))
             && (!self.scope.contains(ReadScope::LOGICAL_FACTS)
                 || self.logical_fact_fingerprint == current.logical_fact_fingerprint)
             && (!self.scope.contains(ReadScope::STATISTICS)
