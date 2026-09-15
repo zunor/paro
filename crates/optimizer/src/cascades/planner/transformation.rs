@@ -39,8 +39,8 @@ pub(super) mod settlement;
 mod staging;
 
 use staging::{
-    NativeChild, NativeNode, NativeShell, StagingInput, StagingRegionRequirements, StagingRequest,
-    StagingTarget, stage_transformed_expression,
+    NativeChild, NativeNode, NativeShell, ResidentNodeContract, StagingInput,
+    StagingRegionRequirements, StagingRequest, StagingTarget, stage_transformed_expression,
 };
 
 fn settle_with_session_arena(
@@ -736,20 +736,22 @@ impl TransformationRule for PlannerTransformationRule {
                 .expect("planner transform state poisoned");
             match self.transformation {
                 PlannerTransformation::PredicateTransfer => {
-                    let domain = match native_domain::try_transfer(
+                    let shell = match native_domain::try_transfer(
                         &binding.root,
                         ctx.memo(),
                         &state,
                         &facts,
                         binding_fact_value,
                     )? {
-                        Some(shell) => {
-                            native_domain::refresh_statistics(shell, &state, ctx.memo())?
-                        }
+                        Some(shell) => Some(shell),
                         None => None,
                     };
-                    if let Some((shell, scopes)) = domain {
-                        native_domain_scopes = Some(scopes);
+                    if let Some(shell) = shell {
+                        // Refreshing and resident-contract construction happen
+                        // in the common staging transaction below. The native
+                        // producer must not perform a second settlement before
+                        // that transaction can consume its shell.
+                        native_domain_scopes = Some(HashMap::new());
                         vec![shell]
                     } else {
                         let native = try_native_predicate_transfer(
@@ -1149,13 +1151,13 @@ impl TransformationRule for PlannerTransformationRule {
                 shell: NativeShell,
                 column_stats: SharedColumnStatistics,
                 scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
-                resident_nodes: HashMap<paro_planner::plan::PlanNodeId, settlement::ResidentNodeContract>,
+                resident_nodes: HashMap<paro_planner::plan::PlanNodeId, ResidentNodeContract>,
             },
             Settled {
                 plan: paro_planner::plan::arena::PlanIndex,
                 column_stats: SharedColumnStatistics,
                 scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
-                resident_nodes: HashMap<paro_planner::plan::PlanNodeId, settlement::ResidentNodeContract>,
+                resident_nodes: HashMap<paro_planner::plan::PlanNodeId, ResidentNodeContract>,
                 selected_proofs: HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
             },
         }
@@ -1190,25 +1192,32 @@ impl TransformationRule for PlannerTransformationRule {
             let (prepared_plan, root_operator, output_layout, retained_group_holes) =
                 match candidate {
                     PlanCandidate::Native(shell)
-                        if matches!(self.transformation, PlannerTransformation::CteFilterPushdown
-                            | PlannerTransformation::AggregateDimensionDeferral) =>
+                        if matches!(self.transformation, PlannerTransformation::CteFilterPushdown) =>
                     {
                         // Native rewrites that change a producer domain or
                         // aggregate namespace must derive their facts before
                         // staging. Their cache/arena suffix belongs to the
                         // same transform transaction even when preparation
                         // fails before the later Memo publication begins.
-                        let savepoint = self.planner_state.read()
+                        let savepoint = self
+                            .planner_state
+                            .read()
                             .map_err(|_| paro_error::internal("planner transform state poisoned"))?
                             .savepoint();
                         let rollback_state = self.planner_state.clone();
                         ctx.enlist_rollback(move || {
-                            rollback_state.write()
-                                .map_err(|_| paro_error::internal("planner transform state poisoned during rollback"))?
+                            rollback_state
+                                .write()
+                                .map_err(|_| {
+                                    paro_error::internal(
+                                        "planner transform state poisoned during rollback",
+                                    )
+                                })?
                                 .rollback_to(savepoint)
                         });
-                        let mut state = self.planner_state.write()
-                            .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+                        let mut state = self.planner_state.write().map_err(|_| {
+                            paro_error::internal("planner transform state poisoned")
+                        })?;
                         let settled = {
                             let state = &mut *state;
                             let PlannerTransformState {
@@ -1485,33 +1494,54 @@ impl TransformationRule for PlannerTransformationRule {
                         child_context,
                         nested_group_holes,
                     } = prepared;
-                    let (plan, column_stats, column_stat_scopes, resident_nodes, selected_proofs) = match plan {
-                        PreparedPlan::Native {
-                            shell,
-                            column_stats,
-                            scopes,
-                            resident_nodes,
-                        } => (
-                            StagingInput::Native(shell),
-                            column_stats,
-                            scopes,
-                            resident_nodes,
-                            HashMap::new(),
-                        ),
-                        PreparedPlan::Settled {
-                            plan,
-                            column_stats,
-                            scopes,
-                            resident_nodes,
-                            selected_proofs,
-                        } => (
-                            StagingInput::Arena(plan),
-                            column_stats,
-                            scopes,
-                            resident_nodes,
-                            selected_proofs,
-                        ),
-                    };
+                    let (plan, column_stats, column_stat_scopes, resident_nodes, selected_proofs) =
+                        match plan {
+                            PreparedPlan::Native {
+                                shell,
+                                column_stats,
+                                scopes,
+                                resident_nodes,
+                            } => {
+                                let (shell, scopes, resident_nodes) =
+                                    if matches!(
+                                        self.transformation,
+                                        PlannerTransformation::PredicateTransfer
+                                            | PlannerTransformation::AggregateDimensionDeferral
+                                    ) {
+                                        let Some((shell, scopes, resident_nodes)) =
+                                            native_domain::refresh_statistics(shell, state, memo)?
+                                        else {
+                                            return Ok(None);
+                                        };
+                                        (shell, scopes, resident_nodes)
+                                    } else {
+                                        (shell, scopes, resident_nodes)
+                                    };
+                                (
+                                    StagingInput::Native {
+                                        shell,
+                                        resident_nodes,
+                                    },
+                                    column_stats,
+                                    scopes,
+                                    HashMap::new(),
+                                    HashMap::new(),
+                                )
+                            }
+                            PreparedPlan::Settled {
+                                plan,
+                                column_stats,
+                                scopes,
+                                resident_nodes,
+                                selected_proofs,
+                            } => (
+                                StagingInput::Arena(plan),
+                                column_stats,
+                                scopes,
+                                resident_nodes,
+                                selected_proofs,
+                            ),
+                        };
                     let Some(expression) = stage_transformed_expression(
                         StagingRequest {
                             input: plan,

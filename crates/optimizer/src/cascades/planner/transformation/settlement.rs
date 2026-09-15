@@ -15,6 +15,8 @@ use paro_planner::plan::arena::{LogicalPlanArena, LogicalPlanNode, PlanIndex};
 use paro_planner::plan::{NodeStats, PlanNodeId};
 use std::hash::{Hash, Hasher};
 
+use super::staging::{ResidentInputFacts, ResidentNodeContract};
+
 pub(super) mod demand;
 mod diagnostic;
 mod native;
@@ -106,7 +108,7 @@ fn operator_shape_tag<Child>(
 
 /// Only the shared scalar visitor may establish absence of expression roots.
 /// The operator whitelist keeps unsupported payloads out of the fast path.
-fn operator_has_no_scalar_payload<Child>(operator: &LogicalOperator<Child>) -> bool {
+pub(super) fn operator_has_no_scalar_payload<Child>(operator: &LogicalOperator<Child>) -> bool {
     if let LogicalOperator::Get(get) = operator {
         return get.runtime_filter_expressions.is_empty();
     }
@@ -185,21 +187,6 @@ pub(in crate::cascades::planner) struct SettlementCache {
     test_identity: TestResidentIdentity,
 }
 
-/// The exact structural result of settling one occurrence.  Column and
-/// scalar IDs belong to the planner session's catalogs, not to settlement's
-/// private namespace.  The output layout and input fact identities are kept
-/// with the contract so staging can validate that it is consuming the same
-/// occurrence rather than merely trusting an operator fingerprint.
-#[derive(Debug, Clone)]
-pub(super) struct ResidentNodeContract {
-    pub(super) operator_fingerprint: Fingerprint,
-    pub(super) operator_encoding: Box<[u8]>,
-    pub(super) scalar_roots: Box<[ScalarExprId]>,
-    pub(super) output_columns: Box<[ColumnId]>,
-    pub(super) output_layout: LogicalOutputLayout,
-    pub(super) input_facts: Box<[FactId]>,
-}
-
 pub(super) struct SettledExpression<Plan = PlanIndex> {
     pub(super) plan: Plan,
     pub(super) statistics: SharedColumnStatistics,
@@ -213,34 +200,6 @@ struct TestResidentIdentity {
     columns: ColumnCatalog,
     scalars: ScalarArena,
     binding_ids: BindingCatalog,
-}
-
-fn intern_columns_into(
-    bindings: &mut BindingCatalog,
-    columns: &mut ColumnCatalog,
-    layout: &LogicalOutputLayout,
-) -> Result<Box<[ColumnId]>> {
-    layout
-        .bindings()
-        .iter()
-        .zip(layout.types())
-        .map(|(binding, ty)| {
-            if let Some(id) = bindings.get(binding.table_index, binding.column_index, ty) {
-                return Ok(*id);
-            }
-            let column = columns.intern(
-                ty.clone(),
-                true,
-                ColumnOrigin::Internal {
-                    key: Fingerprint(columns.len() as u128),
-                },
-                ColumnVisibility::Visible,
-                None,
-            )?;
-            bindings.insert(binding.table_index, binding.column_index, ty, column)?;
-            Ok(column)
-        })
-        .collect()
 }
 
 impl SettlementCache {
@@ -444,17 +403,22 @@ impl SettlementCache {
             .operator
             .output_layout_from_child_refs(&child_layout_refs);
         drop(child_layout_refs);
-        let output_columns =
-            intern_columns_into(identity.binding_ids, identity.columns, &shell_output_layout)?;
+        let output_columns = super::staging::intern_columns_into(
+            identity,
+            &shell_output_layout,
+            super::staging::ColumnInternOrigin::Internal,
+            None,
+        )?;
         for id in inputs {
             let fact = self.facts.get_mut(*id).ok_or_else(|| {
                 paro_error::internal("settlement input references an unknown fact")
             })?;
             if fact.binding_columns.is_none() {
-                fact.binding_columns = Some(intern_columns_into(
-                    identity.binding_ids,
-                    identity.columns,
+                fact.binding_columns = Some(super::staging::intern_columns_into(
+                    identity,
                     &fact.layout,
+                    super::staging::ColumnInternOrigin::Internal,
+                    None,
                 )?);
                 self.input_column_cache_misses += 1;
             } else {
@@ -694,7 +658,7 @@ impl SettlementCache {
         output_layout: &LogicalOutputLayout,
         inputs: &[FactId],
         identity: &mut PlannerResidentIdentity<'_>,
-        settled_input_layout: &LogicalOutputLayout,
+        settled_output_layout: &LogicalOutputLayout,
         settled_output_columns: &[ColumnId],
         settled_scalar_roots: &[ScalarExprId],
         settled_operator_encoding: &[u8],
@@ -706,12 +670,9 @@ impl SettlementCache {
         // statistics/normalization pass actually changed the operator or its
         // output layout.
         let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) =
-            if output_layout == settled_input_layout {
-                let (fingerprint, encoding) = query_operator_identity(
-                    operator,
-                    settled_scalar_roots,
-                    identity.scalars,
-                )?;
+            if output_layout == settled_output_layout {
+                let (fingerprint, encoding) =
+                    query_operator_identity(operator, settled_scalar_roots, identity.scalars)?;
                 if encoding.as_ref() == settled_operator_encoding {
                     (
                         settled_output_columns.to_vec().into_boxed_slice(),
@@ -736,7 +697,7 @@ impl SettlementCache {
             scalar_roots,
             output_columns,
             output_layout: output_layout.clone(),
-            input_facts: inputs.into(),
+            input_facts: ResidentInputFacts::Settlement(inputs.into()),
         })
     }
 
@@ -747,10 +708,11 @@ impl SettlementCache {
         inputs: &[FactId],
         identity: &mut PlannerResidentIdentity<'_>,
     ) -> Result<(Box<[ColumnId]>, Box<[ScalarExprId]>, Fingerprint, Box<[u8]>)> {
-        let output_columns = intern_columns_into(
-            identity.binding_ids,
-            identity.columns,
+        let output_columns = super::staging::intern_columns_into(
+            identity,
             output_layout,
+            super::staging::ColumnInternOrigin::Internal,
+            None,
         )?;
         let child_columns = inputs
             .iter()

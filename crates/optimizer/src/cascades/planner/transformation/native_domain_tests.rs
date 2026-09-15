@@ -155,7 +155,7 @@ fn rebound_columns(shell: &NativeShell) -> Vec<Vec<ColumnBinding>> {
 #[test]
 fn domain_union_routes_each_ordinal_and_preserves_duplicate_null_bags() {
     let state = state();
-    let state = state.read().unwrap();
+    let state = state.write().unwrap();
     for base in [0, 100] {
         let union = SetOperation::union(
             base + 30,
@@ -883,7 +883,7 @@ fn domain_refresh_prunes_child_filter_to_parent_aggregate_demand() {
     let state = state();
     state.write().unwrap().session =
         Some(paro_context::TestStatementContextBuilder::minimal().build());
-    let state = state.read().unwrap();
+    let mut state = state.write().unwrap();
     let memo = MemoBuilder::build(
         OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         BindContext::new(),
@@ -908,7 +908,7 @@ fn domain_refresh_prunes_child_filter_to_parent_aggregate_demand() {
         ),
     )));
     let shell = transfer_shell(shell, &state).unwrap().unwrap();
-    let (shell, _) = refresh_statistics(shell, &state, &memo).unwrap().unwrap();
+    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo).unwrap().unwrap();
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator() else {
         panic!("group-only aggregate must remain the root");
     };

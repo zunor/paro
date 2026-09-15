@@ -18,6 +18,110 @@ pub(super) struct StagedEquivalent {
     pub(super) cardinality: GroupCardinality,
 }
 
+/// Fact witnesses have deliberately different namespaces. A settlement
+/// witness names an entry in the settlement-local fact transaction; native
+/// witnesses distinguish a Memo boundary snapshot from a local shell edge.
+/// Keeping the distinction in the shared contract prevents a private FactId
+/// from being mistaken for a Memo fact or for a local derived fact.
+#[derive(Debug, Clone)]
+pub(super) enum ResidentInputFact {
+    Memo(Arc<paro_planner::operator::bound_reference::BoundRelationFacts>),
+    Local {
+        node_id: paro_planner::plan::PlanNodeId,
+        stats: NodeStats,
+        columns: Box<[ColumnId]>,
+        layout: paro_planner::operator::LogicalOutputLayout,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum ResidentInputFacts {
+    Settlement(Box<[usize]>),
+    Native(Box<[ResidentInputFact]>),
+}
+
+/// The one structural result passed from a planner producer to Memo staging.
+/// Settlement and native preparation use the same identity namespace and the
+/// same contract; only their fact-witness domain differs. Facts are evidence
+/// for validation and dependency tracking, never a substitute for the current
+/// Memo read at publication.
+#[derive(Debug, Clone)]
+pub(super) struct ResidentNodeContract {
+    pub(super) operator_fingerprint: Fingerprint,
+    pub(super) operator_encoding: Box<[u8]>,
+    pub(super) scalar_roots: Box<[ScalarExprId]>,
+    pub(super) output_columns: Box<[ColumnId]>,
+    pub(super) output_layout: paro_planner::operator::LogicalOutputLayout,
+    pub(super) input_facts: ResidentInputFacts,
+}
+
+impl ResidentNodeContract {
+    fn input_fact_count(&self) -> usize {
+        match &self.input_facts {
+            ResidentInputFacts::Settlement(facts) => facts.len(),
+            ResidentInputFacts::Native(facts) => facts.len(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ColumnInternOrigin {
+    Derived,
+    Internal,
+}
+
+/// Intern one layout into the single planner-session identity namespace.
+/// Settlement and native preparation deliberately share this helper; the
+/// origin policy only preserves the historical provenance for newly-created
+/// columns and never changes an existing binding's identity.
+pub(super) fn intern_columns_into(
+    identity: &mut PlannerResidentIdentity<'_>,
+    layout: &paro_planner::operator::LogicalOutputLayout,
+    origin: ColumnInternOrigin,
+    names: Option<&[String]>,
+) -> Result<Box<[ColumnId]>> {
+    layout
+        .bindings()
+        .iter()
+        .zip(layout.types())
+        .enumerate()
+        .map(|(index, (binding, ty))| {
+            if let Some(id) = identity
+                .binding_ids
+                .get(binding.table_index, binding.column_index, ty)
+                .copied()
+            {
+                return Ok(id);
+            }
+            let origin = match origin {
+                ColumnInternOrigin::Derived => ColumnOrigin::Derived {
+                    key: typed_binding_fingerprint(
+                        *binding,
+                        logical_type_fingerprint(ty),
+                    ),
+                },
+                ColumnInternOrigin::Internal => ColumnOrigin::Internal {
+                    key: Fingerprint(identity.columns.len() as u128),
+                },
+            };
+            let id = identity.columns.intern(
+                ty.clone(),
+                true,
+                origin,
+                ColumnVisibility::Visible,
+                names.and_then(|names| names.get(index).cloned()),
+            )?;
+            identity.binding_ids.insert(
+                binding.table_index,
+                binding.column_index,
+                ty,
+                id,
+            )?;
+            Ok(id)
+        })
+        .collect()
+}
+
 pub(super) enum StagingInput {
     /// A settled occurrence already owned by the session arena.
     Arena(paro_planner::plan::arena::PlanIndex),
@@ -25,7 +129,13 @@ pub(super) enum StagingInput {
     /// The shell is already flattened in post-order, so staging maps its
     /// child links to Memo groups without detaching/assembling an owned tree
     /// or importing it into a second arena.
-    Native(NativeShell),
+    Native {
+        shell: NativeShell,
+        /// A native preparation contract is produced in the same sidecar
+        /// transaction as staging.  Empty means the caller intentionally
+        /// needs the ordinary native path (for example a non-target rule).
+        resident_nodes: HashMap<paro_planner::plan::PlanNodeId, ResidentNodeContract>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -463,12 +573,12 @@ pub(super) struct StagingRequest {
     pub(super) input_facts: boundary::BoundarySnapshot,
     pub(super) column_stats: SharedColumnStatistics,
     pub(super) column_stat_scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
-    /// Structural lowering already produced by settlement in the same
-    /// planner-session catalogs.  A settled occurrence is consumed exactly
-    /// once; native shells leave this map empty and use the normal staging
-    /// path.
+    /// Structural lowering already produced by settlement or native
+    /// preparation in the same planner-session catalogs. Each occurrence is
+    /// consumed exactly once; an empty map intentionally selects the ordinary
+    /// lowering path.
     pub(super) resident_nodes:
-        HashMap<paro_planner::plan::PlanNodeId, settlement::ResidentNodeContract>,
+        HashMap<paro_planner::plan::PlanNodeId, ResidentNodeContract>,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
     /// Opaque Memo inputs retained by the transformed expression. Inputs
@@ -559,21 +669,21 @@ pub(super) fn stage_transformed_expression(
         facts: boundary::BoundarySnapshot,
         search_candidates: HashMap<paro_planner::plan::PlanNodeId, OwnedLogicalPlan>,
         selected_proofs: HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
-        resident_nodes:
-            HashMap<paro_planner::plan::PlanNodeId, settlement::ResidentNodeContract>,
+        resident_nodes: HashMap<paro_planner::plan::PlanNodeId, ResidentNodeContract>,
     }
 
     enum NodeStagingInput {
         Settled {
             node: paro_planner::plan::arena::LogicalPlanNode<()>,
             layout: Arc<paro_planner::operator::LogicalOutputLayout>,
-            resident: Option<settlement::ResidentNodeContract>,
+            resident: Option<ResidentNodeContract>,
         },
         Native {
             id: paro_planner::plan::PlanNodeId,
             stats: NodeStats,
             operator: LogicalOperator<GroupId>,
             source_proofs: Box<[EquivalenceProof]>,
+            resident: Option<ResidentNodeContract>,
         },
     }
 
@@ -684,65 +794,72 @@ pub(super) fn stage_transformed_expression(
             target_child_context,
             refined_cardinality_kind,
         } = request;
-        let (id, stats, semantic_operator, settled_layout, source_proofs, resident) =
-            match input {
-                NodeStagingInput::Settled {
-                    node,
-                    layout,
-                    resident,
-                } => {
-                    crate::work_partition::settled_node(false);
-                    if let LogicalOperator::BoundReference(reference) = &node.operator {
-                        if target.is_some()
-                            || !session
-                                .nested_group_holes
-                                .contains_key(&reference.reference_id)
-                        {
-                            return Err(paro_error::internal(
-                                "staging reached an unregistered or root Memo group hole",
-                            ));
-                        }
-                        let names = Arc::from(node.operator.output_names_from_child_refs(&[]));
-                        let LogicalOperator::BoundReference(reference) = node.operator else { unreachable!() };
-                        let node = resolve_group_hole_reference(
-                            session, node.id, node.stats, Arc::unwrap_or_clone(layout), names, reference,
-                        )?;
-                        return Ok(Some((node, None)));
+        let (id, stats, semantic_operator, settled_layout, source_proofs, resident) = match input {
+            NodeStagingInput::Settled {
+                node,
+                layout,
+                resident,
+            } => {
+                crate::work_partition::settled_node(false);
+                if let LogicalOperator::BoundReference(reference) = &node.operator {
+                    if target.is_some()
+                        || !session
+                            .nested_group_holes
+                            .contains_key(&reference.reference_id)
+                    {
+                        return Err(paro_error::internal(
+                            "staging reached an unregistered or root Memo group hole",
+                        ));
                     }
-                    let source_proofs = session
-                        .selected_proofs
-                        .get(&node.id)
-                        .cloned()
-                        .unwrap_or_default();
-                    (
+                    let names = Arc::from(node.operator.output_names_from_child_refs(&[]));
+                    let LogicalOperator::BoundReference(reference) = node.operator else {
+                        unreachable!()
+                    };
+                    let node = resolve_group_hole_reference(
+                        session,
                         node.id,
                         node.stats,
-                        node.operator,
-                        Some(layout),
-                        source_proofs,
-                        resident,
-                    )
+                        Arc::unwrap_or_clone(layout),
+                        names,
+                        reference,
+                    )?;
+                    return Ok(Some((node, None)));
                 }
-                NodeStagingInput::Native {
-                    id,
-                    stats,
-                    operator,
+                let source_proofs = session
+                    .selected_proofs
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or_default();
+                (
+                    node.id,
+                    node.stats,
+                    node.operator,
+                    Some(layout),
                     source_proofs,
-                } => {
-                    let semantic_operator = operator
-                        .clone()
-                        .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
-                        .expect("mapping native group references to a semantic shell cannot fail");
-                    (
-                        id,
-                        stats.clone(),
-                        semantic_operator,
-                        None,
-                        source_proofs,
-                        None,
-                    )
-                }
-            };
+                    resident,
+                )
+            }
+            NodeStagingInput::Native {
+                id,
+                stats,
+                operator,
+                source_proofs,
+                resident,
+            } => {
+                let semantic_operator = operator
+                    .clone()
+                    .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
+                    .expect("mapping native group references to a semantic shell cannot fail");
+                (
+                    id,
+                    stats.clone(),
+                    semantic_operator,
+                    None,
+                    source_proofs,
+                    resident,
+                )
+            }
+        };
         crate::work_partition::staging_payload(false);
         let native_direct = settled_layout.is_none();
         if native_direct {
@@ -778,17 +895,59 @@ pub(super) fn stage_transformed_expression(
             .map(|child| child.layout.as_ref())
             .collect::<Vec<_>>();
         if let Some(contract) = resident.as_ref() {
-            if contract.input_facts.len() != child_states.len() {
+            if contract.input_fact_count() != child_states.len() {
                 return Err(paro_error::internal(
-                    "settled resident contract has an incompatible fact arity",
+                    "resident contract has an incompatible fact arity",
                 ));
+            }
+            if let ResidentInputFacts::Native(expected_facts) = &contract.input_facts {
+                for (expected, child) in expected_facts.iter().zip(&child_states) {
+                    let Some(actual) = child.boundary_facts.as_ref() else {
+                        return Err(paro_error::internal(
+                            "native resident contract lost an input fact witness",
+                        ));
+                    };
+                    match expected {
+                        ResidentInputFact::Memo(expected) => {
+                            // Pointer equality is the normal same-snapshot
+                            // path; structural equality permits an
+                            // equivalent transport rebuilt after an
+                            // unchanged fact revision, but never accepts a
+                            // changed column domain, lineage, uniqueness
+                            // proof, or row bound.
+                            if !Arc::ptr_eq(expected, actual)
+                                && expected.as_ref() != actual.as_ref()
+                            {
+                                return Err(paro_error::internal(
+                                    "native resident contract is stale for a Memo input fact",
+                                ));
+                            }
+                        }
+                        ResidentInputFact::Local {
+                            node_id,
+                            stats,
+                            columns,
+                            layout,
+                        } => {
+                            if child.id != *node_id
+                                || child.stats != *stats
+                                || child.columns.as_ref() != columns.as_ref()
+                                || child.layout.as_ref() != layout
+                            {
+                                return Err(paro_error::internal(
+                                    "native resident contract is stale for a local input fact",
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
         let output_layout = match (settled_layout, resident.as_ref()) {
             (Some(layout), Some(contract)) => {
                 if layout.as_ref() != &contract.output_layout {
                     return Err(paro_error::internal(
-                        "settled resident contract disagrees with arena output layout",
+                    "resident contract disagrees with arena output layout",
                     ));
                 }
                 layout
@@ -834,47 +993,23 @@ pub(super) fn stage_transformed_expression(
                     != Some(column)
                 {
                     return Err(paro_error::internal(
-                        "settled resident contract uses a foreign column identity",
+                        "resident contract uses a foreign column identity",
                     ));
                 }
             }
             Arc::from(contract.output_columns.clone())
         } else {
-            let mut output_columns = Vec::with_capacity(output_bindings.len());
-            for (index, (binding, logical_type)) in output_bindings
-                .iter()
-                .copied()
-                .zip(output_types.iter().cloned())
-                .enumerate()
-            {
-                let type_domain = logical_type_fingerprint(&logical_type);
-                let id = if let Some(id) = state
-                    .binding_ids
-                    .get(binding.table_index, binding.column_index, &logical_type)
-                    .copied()
-                {
-                    id
-                } else {
-                    let id = state.columns.intern(
-                        logical_type.clone(),
-                        true,
-                        ColumnOrigin::Derived {
-                            key: typed_binding_fingerprint(binding, type_domain),
-                        },
-                        ColumnVisibility::Visible,
-                        output_names.get(index).cloned(),
-                    )?;
-                    state.binding_ids.insert(
-                        binding.table_index,
-                        binding.column_index,
-                        &logical_type,
-                        id,
-                    )?;
-                    id
-                };
-                output_columns.push(id);
-            }
-            output_columns.into()
+            intern_columns_into(
+                &mut PlannerResidentIdentity {
+                    columns: &mut state.columns,
+                    scalars: &mut state.scalars,
+                    binding_ids: &mut state.binding_ids,
+                },
+                &output_layout,
+                ColumnInternOrigin::Derived,
+                Some(output_names.as_ref()),
+            )?
+            .into()
         };
         let unique_columns: BTreeSet<_> = output_columns.iter().copied().collect();
         let schema = GroupSchema::new(
@@ -1576,7 +1711,7 @@ pub(super) fn stage_transformed_expression(
         // A native shell has no real Get/scan leaf. Search providers require
         // an owned scan occurrence and therefore cannot be produced from this
         // direct GroupRef path; such rules remain on the settled path.
-        StagingInput::Native(_) => Vec::new(),
+        StagingInput::Native { .. } => Vec::new(),
     };
     let search_context = if !provider_roots.is_empty() {
         let session_context = state
@@ -1735,7 +1870,11 @@ pub(super) fn stage_transformed_expression(
                 }
                 root_result.ok_or_else(|| paro_error::internal("staging has no completed root"))?
             }
-            StagingInput::Native(native) => {
+            StagingInput::Native {
+                shell: native,
+                resident_nodes,
+            } => {
+                session.resident_nodes = resident_nodes;
                 if native.nodes.is_empty() || native.root >= native.nodes.len() {
                     return Err(paro_error::internal("native staging has no valid root"));
                 }
@@ -1752,69 +1891,69 @@ pub(super) fn stage_transformed_expression(
                     }
                     let is_root = index == root_index;
                     let mut child_states = Vec::new();
-                    let operator =
-                        native_node
-                            .operator
-                            .try_map_child_links(&mut |child| match child {
-                                NativeChild::Node(child_index) => {
-                                    let (group, state) = completed
-                                        .get(child_index)
-                                        .and_then(Option::as_ref)
-                                        .cloned()
-                                        .ok_or_else(|| {
-                                            paro_error::internal(
+                    let operator = native_node.operator.try_map_child_links(&mut |child| {
+                        match child {
+                            NativeChild::Node(child_index) => {
+                                let (group, state) = completed
+                                    .get(child_index)
+                                    .and_then(Option::as_ref)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        paro_error::internal(
                                             "native staging referenced an incomplete child node",
                                         )
-                                        })?;
-                                    child_states.push(state);
-                                    Ok::<_, paro_error::ParoError>(group)
-                                }
-                                NativeChild::MemoGroup {
+                                    })?;
+                                child_states.push(state);
+                                Ok::<_, paro_error::ParoError>(group)
+                            }
+                            NativeChild::MemoGroup {
+                                group,
+                                id,
+                                stats,
+                                layout,
+                                names,
+                                reference,
+                            } => {
+                                let group = session.memo.canonical_group(group);
+                                let node = resolve_direct_group_reference(
+                                    &mut session,
                                     group,
                                     id,
                                     stats,
                                     layout,
                                     names,
                                     reference,
-                                } => {
-                                    let group = session.memo.canonical_group(group);
-                                    let node = resolve_direct_group_reference(
-                                        &mut session,
-                                        group,
-                                        id,
-                                        stats,
-                                        layout,
-                                        names,
-                                        reference,
-                                    )?;
-                                    if node.group != group {
-                                        return Err(paro_error::internal(
+                                )?;
+                                if node.group != group {
+                                    return Err(paro_error::internal(
                                         "native Memo group reference changed its group identity",
                                     ));
-                                    }
-                                    child_states.push(node);
-                                    Ok::<_, paro_error::ParoError>(group)
                                 }
-                                NativeChild::Group {
+                                child_states.push(node);
+                                Ok::<_, paro_error::ParoError>(group)
+                            }
+                            NativeChild::Group {
+                                id,
+                                stats,
+                                layout,
+                                names,
+                                reference,
+                            } => {
+                                let node = resolve_group_hole_reference(
+                                    &mut session,
                                     id,
                                     stats,
                                     layout,
                                     names,
                                     reference,
-                                } => {
-                                    let node = resolve_group_hole_reference(
-                                        &mut session,
-                                        id,
-                                        stats,
-                                        layout,
-                                        names,
-                                        reference,
-                                    )?;
-                                    let group = node.group;
-                                    child_states.push(node);
-                                    Ok::<_, paro_error::ParoError>(group)
-                                }
-                            })?;
+                                )?;
+                                let group = node.group;
+                                child_states.push(node);
+                                Ok::<_, paro_error::ParoError>(group)
+                            }
+                        }
+                    })?;
+                    let resident = session.resident_nodes.remove(&native_node.id);
                     let Some((mut node, staged)) = stage_node(
                         &mut session,
                         NodeStagingRequest {
@@ -1823,6 +1962,7 @@ pub(super) fn stage_transformed_expression(
                                 stats: native_node.stats,
                                 operator,
                                 source_proofs: native_node.source_proofs,
+                                resident,
                             },
                             target: is_root.then_some(target),
                             required_region_facet: is_root
@@ -2194,7 +2334,10 @@ mod tests {
         let constructions_before = STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get);
         let staged = stage_transformed_expression(
             StagingRequest {
-                input: StagingInput::Native(native),
+                input: StagingInput::Native {
+                    shell: native,
+                    resident_nodes: HashMap::new(),
+                },
                 input_facts: boundary::BoundarySnapshot::default(),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),
@@ -2278,7 +2421,10 @@ mod tests {
         let constructions_before = STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get);
         let staged = stage_transformed_expression(
             StagingRequest {
-                input: StagingInput::Native(native),
+                input: StagingInput::Native {
+                    shell: native,
+                    resident_nodes: HashMap::new(),
+                },
                 input_facts: boundary::BoundarySnapshot::default(),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),

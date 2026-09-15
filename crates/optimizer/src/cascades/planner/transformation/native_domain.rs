@@ -11,6 +11,10 @@ use crate::cascades::planner::domain_transfer;
 use crate::expression::traversal::visit_expression;
 use paro_planner::operator::{BoundReference, BoundReferenceId, LogicalOutputLayout};
 use paro_planner::plan::PlanNodeId;
+use super::staging::{
+    intern_columns_into, ColumnInternOrigin, ResidentInputFact, ResidentInputFacts,
+    ResidentNodeContract,
+};
 
 fn local_domain(predicate: &Expression) -> bool {
     domain_transfer::is_local_domain(predicate)
@@ -1154,9 +1158,15 @@ fn transfer_shell_closure_with_layouts(
 /// never an owned descendant tree, and is never inserted as a Memo alternative.
 pub(super) fn refresh_statistics(
     mut shell: NativeShell,
-    state: &PlannerTransformState,
+    state: &mut PlannerTransformState,
     memo: &Memo,
-) -> Result<Option<(NativeShell, HashMap<PlanNodeId, SharedColumnStatistics>)>> {
+) -> Result<
+    Option<(
+        NativeShell,
+        HashMap<PlanNodeId, SharedColumnStatistics>,
+        HashMap<PlanNodeId, ResidentNodeContract>,
+    )>,
+> {
     let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
     let _refresh = crate::work_partition::native_refresh(shell.nodes.len());
     use super::settlement::demand;
@@ -1209,14 +1219,18 @@ pub(super) fn refresh_statistics(
         });
     }
     struct Completed {
+        id: PlanNodeId,
         stats: NodeStats,
         layout: LogicalOutputLayout,
         maximum: Option<u64>,
         columns: SharedColumnStatistics,
         aliases: demand::BindingMap,
+        output_columns: Box<[ColumnId]>,
+        names: Arc<[String]>,
     }
     let mut completed = Vec::<Completed>::new();
     let mut scopes = HashMap::new();
+    let mut resident_nodes = HashMap::new();
     let mut scan_bindings = demand::ScanBindings::new();
     for (index, node) in shell.nodes.iter_mut().enumerate() {
         if !memo.control().checkpoint()? {
@@ -1229,6 +1243,7 @@ pub(super) fn refresh_statistics(
         let mut positional_columns = Vec::new();
         let mut input_aliases = Vec::new();
         let mut before = Vec::new();
+        let mut input_facts = Vec::new();
         node.operator.visit_child_links(&mut |child| match child {
             NativeChild::Node(index) => before.push(original_layouts[*index].clone()),
             NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
@@ -1252,6 +1267,7 @@ pub(super) fn refresh_statistics(
                             .collect(),
                     );
                     let input_columns = reference.column_statistics();
+                    input_facts.push(ResidentInputFact::Memo(reference.facts.clone()));
                     for (binding, column) in layout.bindings().iter().zip(&input_columns) {
                         columns.insert(*binding, column.clone());
                     }
@@ -1286,6 +1302,12 @@ pub(super) fn refresh_statistics(
                         },
                         input.layout.types().to_vec(),
                     ));
+                    input_facts.push(ResidentInputFact::Local {
+                        node_id: input.id,
+                        stats: input.stats.clone(),
+                        columns: input.output_columns.clone(),
+                        layout: input.layout.clone(),
+                    });
                     let reference = BoundReference::new(
                         BoundReferenceId::input_ordinal(links.len()),
                         input.layout.bindings().to_vec(),
@@ -1382,15 +1404,126 @@ pub(super) fn refresh_statistics(
         })?;
         node.stats = stats.clone();
         scopes.insert(node.id, context.column_stats.clone());
+        let mut native_children = Vec::new();
+        node.operator
+            .visit_child_links(&mut |child| native_children.push(child.clone()));
+        let child_names = native_children
+            .iter()
+            .map(|child| match child {
+                NativeChild::Node(child) => completed
+                    .get(*child)
+                    .map(|completed| completed.names.as_ref())
+                    .ok_or_else(|| paro_error::internal("native resident child name is missing")),
+                NativeChild::MemoGroup { names, .. } | NativeChild::Group { names, .. } => {
+                    Ok(names.as_ref())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let child_columns = {
+            let mut identity = PlannerResidentIdentity {
+                columns: &mut state.columns,
+                scalars: &mut state.scalars,
+                binding_ids: &mut state.binding_ids,
+            };
+            native_children
+                .iter()
+                .map(|child| match child {
+                    NativeChild::Node(child) => completed
+                        .get(*child)
+                        .map(|completed| completed.output_columns.clone())
+                        .ok_or_else(|| {
+                            paro_error::internal("native resident child columns are missing")
+                        }),
+                    NativeChild::MemoGroup { layout, names, .. } => intern_columns_into(
+                        &mut identity,
+                        layout,
+                        ColumnInternOrigin::Derived,
+                        Some(names.as_ref()),
+                    ),
+                    NativeChild::Group { .. } => Err(paro_error::internal(
+                        "native resident contract crossed an owned group transport",
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let child_column_refs = child_columns
+            .iter()
+            .map(|columns| columns.as_ref())
+            .collect::<Vec<_>>();
+        let semantic_operator = node
+            .operator
+            .clone()
+            .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
+            .expect("native resident semantic operator cannot fail");
+        let child_name_refs = child_names.as_slice();
+        let output_names: Arc<[String]> = semantic_operator
+            .output_names_from_child_refs(child_name_refs)
+            .into();
+        let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) = {
+            let mut identity = PlannerResidentIdentity {
+                columns: &mut state.columns,
+                scalars: &mut state.scalars,
+                binding_ids: &mut state.binding_ids,
+            };
+            let output_columns = intern_columns_into(
+                &mut identity,
+                &layout,
+                ColumnInternOrigin::Derived,
+                Some(output_names.as_ref()),
+            )?;
+            let scalar_roots = if super::settlement::operator_has_no_scalar_payload(
+                &semantic_operator,
+            ) {
+                Box::new([])
+            } else {
+                intern_operator_scalars(
+                    &semantic_operator,
+                    &output_columns,
+                    &child_column_refs,
+                    identity.binding_ids,
+                    identity.columns,
+                    identity.scalars,
+                )?
+            };
+            let (operator_fingerprint, operator_encoding) =
+                query_operator_identity(&semantic_operator, &scalar_roots, identity.scalars)?;
+            (
+                output_columns,
+                scalar_roots,
+                operator_fingerprint,
+                operator_encoding,
+            )
+        };
+        if resident_nodes
+            .insert(
+                node.id,
+                ResidentNodeContract {
+                    operator_fingerprint,
+                    operator_encoding,
+                    scalar_roots,
+                    output_columns: output_columns.clone(),
+                    output_layout: layout.clone(),
+                    input_facts: ResidentInputFacts::Native(input_facts.into_boxed_slice()),
+                },
+            )
+            .is_some()
+        {
+            return Err(paro_error::internal(
+                "native resident contract was assigned twice",
+            ));
+        }
         completed.push(Completed {
+            id: node.id,
             stats,
             layout,
             maximum,
             columns: context.column_stats,
             aliases,
+            output_columns,
+            names: output_names,
         });
     }
-    Ok(Some((shell, scopes)))
+    Ok(Some((shell, scopes, resident_nodes)))
 }
 
 #[cfg(test)]
