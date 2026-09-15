@@ -385,6 +385,7 @@ pub(super) struct PlannerTransformSavepoint {
     binding_checkpoint: usize,
     logical_payload_count: usize,
     physical_checkpoint: PhysicalPayloadCheckpoint,
+    native_relation_checkpoint: usize,
     expression_group_insertion_count: usize,
     metadata_runtime_filter_change_count: usize,
     join_region_insertion_count: usize,
@@ -414,6 +415,7 @@ impl PlannerTransformState {
             binding_checkpoint: self.binding_ids.checkpoint(),
             logical_payload_count: self.payloads.logical.len(),
             physical_checkpoint: self.payloads.physical_checkpoint(),
+            native_relation_checkpoint: self.settlement_cache.native_checkpoint(),
             expression_group_insertion_count: self.expression_group_insertions.len(),
             metadata_runtime_filter_change_count: self.metadata_runtime_filter_changes.len(),
             join_region_insertion_count: self.join_region_insertions.len(),
@@ -429,6 +431,8 @@ impl PlannerTransformState {
             .rollback_to(savepoint.staging_arena_checkpoint)?;
         self.settlement_cache
             .discard_stale_recipes(&self.staging_arena);
+        self.settlement_cache
+            .rollback_native_to(savepoint.native_relation_checkpoint);
         self.cte_restrictions
             .truncate(savepoint.cte_restriction_count);
         self.cte_partition_labels = savepoint.cte_partition_labels;

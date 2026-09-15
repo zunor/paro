@@ -36,7 +36,7 @@ impl ExpressionRewriter {
     }
 
     /// Visit and rewrite expressions in a logical operator.
-    pub(crate) fn visit_operator_expressions(&mut self, op: &mut LogicalOperator) {
+    pub(crate) fn visit_operator_expressions<Child>(&mut self, op: &mut LogicalOperator<Child>) {
         // Expression rules do not inspect the surrounding operator today; use a stable leaf
         // for the `Rule::apply` context slot so we never clone a full [`LogicalOperator`].
         let rule_ctx = LogicalOperator::DummyScan;

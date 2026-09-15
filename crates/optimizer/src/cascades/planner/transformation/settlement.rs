@@ -69,6 +69,55 @@ struct LocalShape {
     input_stats: NodeStats,
 }
 
+/// The native producer has no arena recipe to own.  It still needs the same
+/// relation-level fact identity as ordinary settlement, however, otherwise a
+/// repeated native alternative re-runs statistics propagation merely because
+/// its plan-node occurrence changed.  Keep the input snapshot in the entry so
+/// a lookup is validated by content and dependency state, not by an
+/// occurrence-local integer or pointer address.
+#[derive(Debug, Clone)]
+pub(super) struct NativeRelationInput {
+    pub(super) facts:
+        Arc<paro_planner::operator::bound_reference::BoundRelationFacts>,
+    pub(super) layout: LogicalOutputLayout,
+    pub(super) stats: NodeStats,
+    pub(super) maximum: Option<u64>,
+    pub(super) column_fingerprints: Box<[Fingerprint]>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct NativeRelationEntry {
+    pub(super) operator: LogicalOperator<BoundReference>,
+    pub(super) operator_fingerprint: Fingerprint,
+    pub(super) operator_encoding: Box<[u8]>,
+    pub(super) scalar_roots: Box<[ScalarExprId]>,
+    pub(super) output_columns: Box<[ColumnId]>,
+    pub(super) stats: NodeStats,
+    pub(super) layout: LogicalOutputLayout,
+    pub(super) maximum: Option<u64>,
+    pub(super) columns: SharedColumnStatistics,
+    pub(super) inputs: Box<[NativeRelationInput]>,
+    pub(super) id: u64,
+}
+
+fn native_relation_inputs_match(
+    entry: &NativeRelationEntry,
+    layout: &LogicalOutputLayout,
+    inputs: &[NativeRelationInput],
+) -> bool {
+    entry.layout == *layout
+        && entry.inputs.len() == inputs.len()
+        && entry.inputs.iter().zip(inputs).all(|(cached, current)| {
+            let facts_same = Arc::ptr_eq(&cached.facts, &current.facts)
+                || cached.facts == current.facts;
+            cached.layout == current.layout
+                && cached.stats == current.stats
+                && cached.maximum == current.maximum
+                && facts_same
+                && cached.column_fingerprints == current.column_fingerprints
+        })
+}
+
 fn operator_shape_tag<Child>(
     operator: &LogicalOperator<Child>,
     scalars: &ScalarArena,
@@ -176,11 +225,23 @@ pub(in crate::cascades::planner) struct SettlementCache {
     /// weak pointer can only match the original allocation.
     column_pointers: HashMap<usize, (std::sync::Weak<ColumnStatistics>, usize)>,
     scan_bindings: demand::ScanBindings,
+    /// Native local facts share this owner with ordinary settlement but do
+    /// not enter the logical-plan arena.  The map is keyed by the canonical
+    /// operator encoding; every hit still compares the complete immutable
+    /// input snapshots and output layout before reusing statistics.
+    native_relations: BTreeMap<Box<[u8]>, Vec<Arc<NativeRelationEntry>>>,
+    native_relation_insertions: Vec<(Box<[u8]>, u64)>,
+    next_native_relation_id: u64,
     pub(in crate::cascades::planner) hits: u64,
     pub(in crate::cascades::planner) misses: u64,
     pub(in crate::cascades::planner) invalidation_visits: u64,
     pub(in crate::cascades::planner) input_column_cache_hits: u64,
     pub(in crate::cascades::planner) input_column_cache_misses: u64,
+    pub(in crate::cascades::planner) native_relation_hits: u64,
+    pub(in crate::cascades::planner) native_relation_misses: u64,
+    pub(in crate::cascades::planner) native_relation_fact_evaluations: u64,
+    pub(in crate::cascades::planner) native_relation_owned_assembly_skips: u64,
+    pub(in crate::cascades::planner) native_relation_invalidations: u64,
     #[cfg(test)]
     test_arena: LogicalPlanArena,
     #[cfg(test)]
@@ -203,6 +264,83 @@ struct TestResidentIdentity {
 }
 
 impl SettlementCache {
+    pub(in crate::cascades::planner) fn native_checkpoint(&self) -> usize {
+        self.native_relation_insertions.len()
+    }
+
+    /// Roll back only entries published after the planner savepoint.  Native
+    /// entries deliberately do not own arena slots, so arena prefix checks
+    /// cannot discover them.  Keeping an insertion journal gives them the
+    /// same transaction boundary without pinning or copying a Memo.
+    pub(in crate::cascades::planner) fn rollback_native_to(&mut self, checkpoint: usize) {
+        while self.native_relation_insertions.len() > checkpoint {
+            let (operator, id) = self
+                .native_relation_insertions
+                .pop()
+                .expect("native relation journal length checked");
+            if let Some(entries) = self.native_relations.get_mut(&operator) {
+                entries.retain(|entry| entry.id != id);
+                if entries.is_empty() {
+                    self.native_relations.remove(&operator);
+                }
+            }
+            self.native_relation_invalidations = self.native_relation_invalidations.saturating_add(1);
+        }
+    }
+
+    /// Look up a native local relation after its cheap structural identity has
+    /// been formed.  Input facts are compared in full: a new statistics or
+    /// domain snapshot cannot reuse an old propagated result, while a new
+    /// plan-node occurrence with the same relation facts can.
+    pub(super) fn native_lookup(
+        &mut self,
+        operator: &[u8],
+        layout: &LogicalOutputLayout,
+        inputs: &[NativeRelationInput],
+    ) -> Option<Arc<NativeRelationEntry>> {
+        let Some(entries) = self.native_relations.get(operator) else {
+            self.native_relation_misses += 1;
+            return None;
+        };
+        let entry = entries
+            .iter()
+            .find(|entry| native_relation_inputs_match(entry, layout, inputs));
+        if let Some(entry) = entry {
+            self.native_relation_hits += 1;
+            return Some(Arc::clone(entry));
+        }
+        self.native_relation_misses += 1;
+        None
+    }
+
+    pub(super) fn native_insert(
+        &mut self,
+        operator: Box<[u8]>,
+        mut entry: NativeRelationEntry,
+    ) -> Arc<NativeRelationEntry> {
+        if let Some(existing) = self.native_relations.get(&operator).and_then(|entries| {
+            entries.iter().find(|cached| {
+                native_relation_inputs_match(cached, &entry.layout, &entry.inputs)
+            })
+        }) {
+            return Arc::clone(existing);
+        }
+        let id = self.next_native_relation_id;
+        self.next_native_relation_id = self.next_native_relation_id.saturating_add(1);
+        entry.id = id;
+        let entry = Arc::new(entry);
+        self.native_relations
+            .entry(operator.clone())
+            .or_default()
+            .push(Arc::clone(&entry));
+        self.native_relation_insertions.push((operator, id));
+        entry
+    }
+
+    pub(in crate::cascades::planner) fn native_relation_entry_count(&self) -> u64 {
+        self.native_relations.values().map(|entries| entries.len() as u64).sum()
+    }
+
     pub(in crate::cascades::planner) fn discard_stale_recipes(&mut self, arena: &LogicalPlanArena) {
         if self
             .recipe_prefix
@@ -281,6 +419,53 @@ impl SettlementCache {
         self.column_pointers
             .insert(pointer, (Arc::downgrade(column), id));
         Ok(id)
+    }
+
+    /// Fingerprint a local native child whose compact boundary fact does not
+    /// itself carry column values. Memo boundary inputs use the immutable
+    /// `BoundRelationFacts` value directly; computing this encoding for them
+    /// would duplicate their already-versioned column evidence. This remains
+    /// intentionally separate from a `ColumnId`: structural identity and
+    /// fact validity have different lifetimes, and a fact change must miss
+    /// even when the binding ordinal is unchanged.
+    pub(super) fn native_column_fingerprint(
+        column: &ColumnStatistics,
+    ) -> Result<Fingerprint> {
+        let mut encoder = StableFingerprintBuilder::default();
+        encoder.write_bytes(b"paro.native.relation-column.v1");
+        crate::cascades::scalar::encode_logical_type(
+            &mut encoder,
+            column.statistics().get_type(),
+        );
+        encoder.write_bytes(&column.to_bytes()?);
+        let distinct = column.distinct_evidence();
+        encoder.write_u64(distinct.lower);
+        encoder.write_u64(distinct.upper.is_some() as u64);
+        encoder.write_u64(distinct.upper.unwrap_or(0));
+        encoder.write_u64(distinct.point);
+        match distinct.provenance {
+            paro_storage::statistics::DistinctProvenance::Unknown => encoder.write_u64(0),
+            paro_storage::statistics::DistinctProvenance::Derived => encoder.write_u64(1),
+            paro_storage::statistics::DistinctProvenance::ObservedFull => encoder.write_u64(2),
+            paro_storage::statistics::DistinctProvenance::ObservedPartial {
+                observed_rows,
+                total_rows,
+            } => {
+                encoder.write_u64(3);
+                encoder.write_u64(observed_rows);
+                encoder.write_u64(total_rows);
+            }
+        }
+        encoder.write_u64(column.guaranteed_distinct_upper().is_some() as u64);
+        encoder.write_u64(column.guaranteed_distinct_upper().unwrap_or(0));
+        encoder.write_u64(column.is_storage_observation() as u64);
+        if let Some(distribution) = column.estimated_numeric_distribution() {
+            encoder.write_u64(1);
+            encoder.write_bytes(&distribution.encoding());
+        } else {
+            encoder.write_u64(0);
+        }
+        Ok(encoder.finish())
     }
 
     fn boundary(&self, ordinal: usize, fact: FactId) -> Result<OwnedLogicalPlan> {
@@ -1127,6 +1312,127 @@ mod tests {
                 )],
             )),
         )
+    }
+
+    fn native_relation_input(rows: u64) -> NativeRelationInput {
+        use paro_planner::operator::bound_reference::{
+            BoundRelationFactValues, BoundRelationFacts,
+        };
+
+        NativeRelationInput {
+            facts: Arc::new(BoundRelationFacts::new(
+                BoundRelationFactValues {
+                    cardinality: Some(CardinalityEstimate::exact(rows)),
+                    contains_control_region: false,
+                    ..BoundRelationFactValues::default()
+                },
+                vec![LogicalType::Integer],
+            )),
+            layout: LogicalOutputLayout::new(
+                vec![LogicalType::Integer],
+                vec![ColumnBinding::new(0, 0)],
+            ),
+            stats: NodeStats {
+                estimated_cardinality: Some(CardinalityEstimate::exact(rows)),
+                ..NodeStats::default()
+            },
+            maximum: None,
+            column_fingerprints: Box::new([]),
+        }
+    }
+
+    fn native_relation_entry(input: NativeRelationInput) -> NativeRelationEntry {
+        NativeRelationEntry {
+            operator: LogicalOperator::DummyScan,
+            operator_fingerprint: Fingerprint::default(),
+            operator_encoding: Box::new([]),
+            scalar_roots: Box::new([]),
+            output_columns: Box::new([]),
+            stats: NodeStats::default(),
+            layout: LogicalOutputLayout::new(Vec::new(), Vec::new()),
+            maximum: None,
+            columns: Arc::default(),
+            inputs: Box::new([input]),
+            id: 0,
+        }
+    }
+
+    #[test]
+    fn native_relation_facts_reuse_only_with_the_same_input_snapshot() {
+        let mut cache = SettlementCache::default();
+        let input = native_relation_input(10);
+        let layout = LogicalOutputLayout::new(Vec::new(), Vec::new());
+        let entry = cache.native_insert(
+            Box::from(&b"native-shape"[..]),
+            native_relation_entry(input.clone()),
+        );
+        assert_eq!(cache.native_relation_entry_count(), 1);
+        assert!(cache
+            .native_lookup(b"native-shape", &layout, std::slice::from_ref(&input))
+            .is_some());
+        let changed = native_relation_input(11);
+        assert!(cache
+            .native_lookup(b"native-shape", &layout, std::slice::from_ref(&changed))
+            .is_none());
+        assert_eq!(cache.native_relation_hits, 1);
+        assert_eq!(cache.native_relation_misses, 1);
+        assert_eq!(entry.id, 0);
+    }
+
+    #[test]
+    fn native_relation_local_column_evidence_is_part_of_the_fact_version() {
+        let mut cache = SettlementCache::default();
+        let input = native_relation_input(10);
+        let layout = LogicalOutputLayout::new(Vec::new(), Vec::new());
+        cache.native_insert(
+            Box::from(&b"native-local"[..]),
+            native_relation_entry(input.clone()),
+        );
+        let mut changed_columns = input;
+        changed_columns.column_fingerprints = Box::new([Fingerprint(7)]);
+        assert!(cache
+            .native_lookup(
+                b"native-local",
+                &layout,
+                std::slice::from_ref(&changed_columns),
+            )
+            .is_none());
+        assert_eq!(cache.native_relation_hits, 0);
+        assert_eq!(cache.native_relation_misses, 1);
+    }
+
+    #[test]
+    fn native_relation_checkpoint_rolls_back_only_new_entries() {
+        let mut cache = SettlementCache::default();
+        let input = native_relation_input(10);
+        let layout = LogicalOutputLayout::new(Vec::new(), Vec::new());
+        cache.native_insert(
+            Box::from(&b"before"[..]),
+            native_relation_entry(input.clone()),
+        );
+        let checkpoint = cache.native_checkpoint();
+        cache.native_insert(
+            Box::from(&b"after"[..]),
+            native_relation_entry(input),
+        );
+        assert_eq!(cache.native_relation_entry_count(), 2);
+        cache.rollback_native_to(checkpoint);
+        assert_eq!(cache.native_relation_entry_count(), 1);
+        assert!(cache
+            .native_lookup(
+                b"before",
+                &layout,
+                std::slice::from_ref(&native_relation_input(10)),
+            )
+            .is_some());
+        assert!(cache
+            .native_lookup(
+                b"after",
+                &layout,
+                std::slice::from_ref(&native_relation_input(10)),
+            )
+            .is_none());
+        assert_eq!(cache.native_relation_invalidations, 1);
     }
 
     #[test]

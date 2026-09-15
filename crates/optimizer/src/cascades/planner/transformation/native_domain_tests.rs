@@ -927,6 +927,51 @@ fn domain_refresh_prunes_child_filter_to_parent_aggregate_demand() {
 }
 
 #[test]
+fn repeated_native_refresh_reuses_relation_facts_without_reusing_stale_stats() {
+    let state = state();
+    state.write().unwrap().session =
+        Some(paro_context::TestStatementContextBuilder::minimal().build());
+    let mut state = state.write().unwrap();
+    let memo = MemoBuilder::build(
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+        BindContext::new(),
+        SearchBudget::default(),
+    )
+    .unwrap()
+    .memo;
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        boundary(1, 0, &[7, 2]),
+        vec![column(0, 7)],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let shell = native(OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
+        Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate))),
+            vec![equal(10, 0)],
+        ),
+    )));
+    let shell = transfer_shell(shell, &state).unwrap().unwrap();
+    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo).unwrap().unwrap();
+    let evaluations = state.settlement_cache.native_relation_fact_evaluations;
+    let hits = state.settlement_cache.native_relation_hits;
+    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo).unwrap().unwrap();
+    assert!(
+        state.settlement_cache.native_relation_hits > hits,
+        "the second occurrence should reuse an immutable relation fact entry"
+    );
+    assert_eq!(
+        state.settlement_cache.native_relation_fact_evaluations, evaluations,
+        "a repeated relation must not rerun propagation/gathering"
+    );
+    assert!(!shell.nodes.is_empty());
+}
+
+#[test]
 fn production_selected_binding_derives_mixed_aggregate_domain_through_constant_projection() {
     use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
     let constant = |v| {

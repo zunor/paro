@@ -15,6 +15,7 @@ use super::staging::{
     intern_columns_into, ColumnInternOrigin, ResidentInputFact, ResidentInputFacts,
     ResidentNodeContract,
 };
+use super::settlement::{NativeRelationEntry, NativeRelationInput};
 
 fn local_domain(predicate: &Expression) -> bool {
     domain_transfer::is_local_domain(predicate)
@@ -1156,6 +1157,49 @@ fn transfer_shell_closure_with_layouts(
 /// Statistics use the existing one-operator propagation/gathering contracts.
 /// The temporary adapter contains only this shell and immutable input facts,
 /// never an owned descendant tree, and is never inserted as a Memo alternative.
+fn detach_bound_operator(
+    operator: LogicalOperator<Box<OwnedLogicalPlan>>,
+) -> Result<LogicalOperator<BoundReference>> {
+    let mut ordinal = 0;
+    operator.try_map_child_links(&mut |child| {
+        let reference = match &child.operator {
+            LogicalOperator::BoundReference(reference) => reference.clone(),
+            _ => {
+                return Err(paro_error::internal(
+                    "native relation cache input is not a bound reference",
+                ));
+            }
+        };
+        // The temporary reference may carry a group-hole or occurrence ID
+        // after demand lowering.  Cache storage is positional by construction
+        // and must not leak that transport identity into the reusable entry.
+        let mut reference = reference;
+        reference.reference_id = BoundReferenceId::input_ordinal(ordinal);
+        ordinal += 1;
+        Ok(reference)
+    })
+}
+
+fn attach_native_operator(
+    operator: LogicalOperator<BoundReference>,
+    links: &[NativeChild],
+) -> Result<LogicalOperator<NativeChild>> {
+    let mut ordinal = 0;
+    let operator = operator.try_map_child_links(&mut |_reference| {
+        let child = links.get(ordinal).cloned().ok_or_else(|| {
+            paro_error::internal("native relation cache input arity changed")
+        })?;
+        ordinal += 1;
+        Ok::<NativeChild, paro_error::ParoError>(child)
+    })?;
+    if ordinal != links.len() {
+        return Err(paro_error::internal(
+            "native relation cache retained an excess child reference",
+        ));
+    }
+    Ok(operator)
+}
+
 pub(super) fn refresh_statistics(
     mut shell: NativeShell,
     state: &mut PlannerTransformState,
@@ -1244,6 +1288,7 @@ pub(super) fn refresh_statistics(
         let mut input_aliases = Vec::new();
         let mut before = Vec::new();
         let mut input_facts = Vec::new();
+        let mut native_inputs = Vec::new();
         node.operator.visit_child_links(&mut |child| match child {
             NativeChild::Node(index) => before.push(original_layouts[*index].clone()),
             NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
@@ -1251,7 +1296,7 @@ pub(super) fn refresh_statistics(
             }
         });
         let mut links = Vec::new();
-        let mut operator = node.operator.clone().try_map_child_links(&mut |child| {
+        let operator = node.operator.clone().try_map_child_links(&mut |child| {
             let (stats, layout, maximum, reference) = match &child {
                 NativeChild::MemoGroup {
                     stats,
@@ -1268,6 +1313,21 @@ pub(super) fn refresh_statistics(
                     );
                     let input_columns = reference.column_statistics();
                     input_facts.push(ResidentInputFact::Memo(reference.facts.clone()));
+                    native_inputs.push(NativeRelationInput {
+                        facts: reference.facts.clone(),
+                        layout: layout.clone(),
+                        stats: stats.clone(),
+                        maximum: reference.facts.maximum_cardinality,
+                        // Memo boundary facts already carry the complete
+                        // immutable column values/provenance used to derive
+                        // these views. Re-encoding the derived columns here
+                        // would price the same fact twice. Local child nodes
+                        // below are different: their synthetic boundary facts
+                        // intentionally contain only row/uniqueness facts, so
+                        // their derived column views need the explicit
+                        // content fingerprint.
+                        column_fingerprints: Box::new([]),
+                    });
                     for (binding, column) in layout.bindings().iter().zip(&input_columns) {
                         columns.insert(*binding, column.clone());
                     }
@@ -1292,6 +1352,12 @@ pub(super) fn refresh_statistics(
                         columns.insert(*binding, column.clone());
                         input_columns.push(column.clone());
                     }
+                    let column_fingerprints = input_columns
+                        .iter()
+                        .map(|column| {
+                            settlement::SettlementCache::native_column_fingerprint(column)
+                        })
+                        .collect::<Result<Box<[_]>>>()?;
                     positional_columns.push(input_columns);
                     let facts = Arc::new(BoundRelationFacts::new(
                         BoundRelationFactValues {
@@ -1302,6 +1368,13 @@ pub(super) fn refresh_statistics(
                         },
                         input.layout.types().to_vec(),
                     ));
+                    native_inputs.push(NativeRelationInput {
+                        facts: facts.clone(),
+                        layout: input.layout.clone(),
+                        stats: input.stats.clone(),
+                        maximum: input.maximum,
+                        column_fingerprints,
+                    });
                     input_facts.push(ResidentInputFact::Local {
                         node_id: input.id,
                         stats: input.stats.clone(),
@@ -1341,7 +1414,7 @@ pub(super) fn refresh_statistics(
             stats: NodeStats::default(),
             operator,
         });
-        let (local, aliases) = demand::apply(
+        let (mut local, aliases) = demand::apply(
             local,
             demand::Inputs {
                 old_carriers: &carriers[index],
@@ -1353,26 +1426,173 @@ pub(super) fn refresh_statistics(
             &mut scan_bindings,
             &state.bind_context,
         )?;
-        operator = local.assemble(inputs)?.into_operator();
-        // Match settlement's scalar contract before looking up column domains.
-        let statistics_partition = crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
-        crate::expression::scalar_normalizer().visit_operator_expressions(&mut operator);
+        // Establish the structural identity before running the expensive
+        // relation-property fold. This is a construction-time admission key,
+        // not a fact result: changed input facts must still miss and be
+        // re-derived.
+        let statistics_partition =
+            crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
+        crate::expression::scalar_normalizer().visit_operator_expressions(&mut local.operator);
+        let semantic_operator = local
+            .operator
+            .clone()
+            .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
+            .expect("native relation semantic operator cannot fail");
+        if local.operator.op_type() != node.operator.op_type() {
+            drop(statistics_partition);
+            return Ok(None);
+        }
+        if matches!(&local.operator, LogicalOperator::Filter(filter)
+            if filter.expressions.is_empty() && filter.projection_map.is_identity(layouts[0].len()))
+        {
+            // An input alias is a different settlement result, not an extra
+            // zero-predicate physical operator licensed by this producer.
+            drop(statistics_partition);
+            return Ok(None);
+        }
+        let child_names = links
+            .iter()
+            .map(|child| match child {
+                NativeChild::Node(child) => completed
+                    .get(*child)
+                    .map(|completed| completed.names.as_ref())
+                    .ok_or_else(|| paro_error::internal("native relation child name is missing")),
+                NativeChild::MemoGroup { names, .. } | NativeChild::Group { names, .. } => {
+                    Ok(names.as_ref())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let child_columns = {
+            let mut identity = PlannerResidentIdentity {
+                columns: &mut state.columns,
+                scalars: &mut state.scalars,
+                binding_ids: &mut state.binding_ids,
+            };
+            links
+                .iter()
+                .map(|child| match child {
+                    NativeChild::Node(child) => completed
+                        .get(*child)
+                        .map(|completed| completed.output_columns.clone())
+                        .ok_or_else(|| {
+                            paro_error::internal("native relation child columns are missing")
+                        }),
+                    NativeChild::MemoGroup { layout, names, .. } => intern_columns_into(
+                        &mut identity,
+                        layout,
+                        ColumnInternOrigin::Derived,
+                        Some(names.as_ref()),
+                    ),
+                    NativeChild::Group { .. } => Err(paro_error::internal(
+                        "native resident contract crossed an owned group transport",
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let child_column_refs = child_columns
+            .iter()
+            .map(|columns| columns.as_ref())
+            .collect::<Vec<_>>();
+        let output_names: Arc<[String]> = semantic_operator
+            .output_names_from_child_refs(child_names.as_slice())
+            .into();
+        let layout_before = local
+            .operator
+            .output_layout_from_child_refs(&layouts.iter().collect::<Vec<_>>());
+        let (pre_output_columns, pre_scalar_roots, pre_operator_fingerprint, pre_operator_encoding) =
+            {
+                let mut identity = PlannerResidentIdentity {
+                    columns: &mut state.columns,
+                    scalars: &mut state.scalars,
+                    binding_ids: &mut state.binding_ids,
+                };
+                let output_columns = intern_columns_into(
+                    &mut identity,
+                    &layout_before,
+                    ColumnInternOrigin::Derived,
+                    Some(output_names.as_ref()),
+                )?;
+                let scalar_roots = if super::settlement::operator_has_no_scalar_payload(
+                    &semantic_operator,
+                ) {
+                    Box::new([])
+                } else {
+                    intern_operator_scalars(
+                        &semantic_operator,
+                        &output_columns,
+                        &child_column_refs,
+                        identity.binding_ids,
+                        identity.columns,
+                        identity.scalars,
+                    )?
+                };
+                let (fingerprint, encoding) = query_operator_identity(
+                    &semantic_operator,
+                    &scalar_roots,
+                    identity.scalars,
+                )?;
+                (output_columns, scalar_roots, fingerprint, encoding)
+            };
+        if let Some(cached) = state.settlement_cache.native_lookup(
+            &pre_operator_encoding,
+            &layout_before,
+            &native_inputs,
+        ) {
+            state
+                .settlement_cache
+                .native_relation_owned_assembly_skips = state
+                .settlement_cache
+                .native_relation_owned_assembly_skips
+                .saturating_add(1);
+            node.operator = attach_native_operator(cached.operator.clone(), &links)?;
+            node.stats = cached.stats.clone();
+            let cached_columns = cached.columns.clone();
+            scopes.insert(node.id, cached_columns.clone());
+            if resident_nodes
+                .insert(
+                    node.id,
+                    ResidentNodeContract {
+                        operator_fingerprint: cached.operator_fingerprint,
+                        operator_encoding: cached.operator_encoding.clone(),
+                        scalar_roots: cached.scalar_roots.clone(),
+                        output_columns: cached.output_columns.clone(),
+                        output_layout: cached.layout.clone(),
+                        input_facts: ResidentInputFacts::Native(input_facts.into_boxed_slice()),
+                    },
+                )
+                .is_some()
+            {
+                return Err(paro_error::internal(
+                    "native resident contract was assigned twice",
+                ));
+            }
+            drop(statistics_partition);
+            completed.push(Completed {
+                id: node.id,
+                stats: cached.stats.clone(),
+                layout: cached.layout.clone(),
+                maximum: cached.maximum,
+                columns: cached_columns,
+                aliases,
+                output_columns: cached.output_columns.clone(),
+                names: output_names,
+            });
+            continue;
+        }
+        // Only a cache miss needs the owned child assembly and the expensive
+        // statistics fold.  A hit above can attach the immutable relation
+        // operator directly to the current NativeChild links.
+        state.settlement_cache.native_relation_fact_evaluations = state
+            .settlement_cache
+            .native_relation_fact_evaluations
+            .saturating_add(1);
+        let operator = local.assemble(inputs)?.into_operator();
         let mut context =
             crate::context::OptimizationContext::new(session.clone(), state.bind_context.clone());
         context.cost_model = state.cost_model.clone();
         let input = Arc::new(columns);
         let mut propagator = StatisticsPropagator::with_statistics_map(input.as_ref().clone());
         let operator = propagator.propagate_operator(session.as_ref(), operator);
-        if operator.op_type() != node.operator.op_type() {
-            return Ok(None);
-        }
-        if matches!(&operator, LogicalOperator::Filter(filter)
-            if filter.expressions.is_empty() && filter.projection_map.is_identity(layouts[0].len()))
-        {
-            // An input alias is a different settlement result, not an extra
-            // zero-predicate physical operator licensed by this producer.
-            return Ok(None);
-        }
         context.column_stats = Arc::new(propagator.take_statistics_map());
         let plan = OwnedLogicalPlan {
             id: node.id,
@@ -1396,113 +1616,103 @@ pub(super) fn refresh_statistics(
         }
         drop(statistics_partition);
         let (_, stats, operator) = plan.into_parts();
-        let mut links = links.into_iter();
-        node.operator = operator.try_map_child_links(&mut |_| {
-            links
-                .next()
-                .ok_or_else(|| paro_error::internal("native statistics changed child arity"))
-        })?;
+        let cached_operator = detach_bound_operator(operator)?;
+        node.operator = attach_native_operator(cached_operator.clone(), &links)?;
         node.stats = stats.clone();
-        scopes.insert(node.id, context.column_stats.clone());
-        let mut native_children = Vec::new();
-        node.operator
-            .visit_child_links(&mut |child| native_children.push(child.clone()));
-        let child_names = native_children
-            .iter()
-            .map(|child| match child {
-                NativeChild::Node(child) => completed
-                    .get(*child)
-                    .map(|completed| completed.names.as_ref())
-                    .ok_or_else(|| paro_error::internal("native resident child name is missing")),
-                NativeChild::MemoGroup { names, .. } | NativeChild::Group { names, .. } => {
-                    Ok(names.as_ref())
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let child_columns = {
-            let mut identity = PlannerResidentIdentity {
-                columns: &mut state.columns,
-                scalars: &mut state.scalars,
-                binding_ids: &mut state.binding_ids,
-            };
-            native_children
-                .iter()
-                .map(|child| match child {
-                    NativeChild::Node(child) => completed
-                        .get(*child)
-                        .map(|completed| completed.output_columns.clone())
-                        .ok_or_else(|| {
-                            paro_error::internal("native resident child columns are missing")
-                        }),
-                    NativeChild::MemoGroup { layout, names, .. } => intern_columns_into(
-                        &mut identity,
-                        layout,
-                        ColumnInternOrigin::Derived,
-                        Some(names.as_ref()),
-                    ),
-                    NativeChild::Group { .. } => Err(paro_error::internal(
-                        "native resident contract crossed an owned group transport",
-                    )),
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
-        let child_column_refs = child_columns
-            .iter()
-            .map(|columns| columns.as_ref())
-            .collect::<Vec<_>>();
+        let output_columns_stats = context.column_stats.clone();
+        scopes.insert(node.id, output_columns_stats.clone());
         let semantic_operator = node
             .operator
             .clone()
             .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
             .expect("native resident semantic operator cannot fail");
-        let child_name_refs = child_names.as_slice();
         let output_names: Arc<[String]> = semantic_operator
-            .output_names_from_child_refs(child_name_refs)
+            .output_names_from_child_refs(child_names.as_slice())
             .into();
-        let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) = {
-            let mut identity = PlannerResidentIdentity {
-                columns: &mut state.columns,
-                scalars: &mut state.scalars,
-                binding_ids: &mut state.binding_ids,
-            };
-            let output_columns = intern_columns_into(
-                &mut identity,
-                &layout,
-                ColumnInternOrigin::Derived,
-                Some(output_names.as_ref()),
-            )?;
-            let scalar_roots = if super::settlement::operator_has_no_scalar_payload(
-                &semantic_operator,
-            ) {
-                Box::new([])
-            } else {
-                intern_operator_scalars(
+        let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) =
+            if layout == layout_before
+                && query_operator_identity(
                     &semantic_operator,
-                    &output_columns,
-                    &child_column_refs,
-                    identity.binding_ids,
-                    identity.columns,
-                    identity.scalars,
-                )?
+                    &pre_scalar_roots,
+                    &state.scalars,
+                )
+                .is_ok_and(|(_, encoding)| encoding == pre_operator_encoding)
+            {
+                (
+                    pre_output_columns,
+                    pre_scalar_roots,
+                    pre_operator_fingerprint,
+                    pre_operator_encoding.clone(),
+                )
+            } else {
+                let mut identity = PlannerResidentIdentity {
+                    columns: &mut state.columns,
+                    scalars: &mut state.scalars,
+                    binding_ids: &mut state.binding_ids,
+                };
+                let output_columns = intern_columns_into(
+                    &mut identity,
+                    &layout,
+                    ColumnInternOrigin::Derived,
+                    Some(output_names.as_ref()),
+                )?;
+                let scalar_roots = if super::settlement::operator_has_no_scalar_payload(
+                    &semantic_operator,
+                ) {
+                    Box::new([])
+                } else {
+                    intern_operator_scalars(
+                        &semantic_operator,
+                        &output_columns,
+                        &child_column_refs,
+                        identity.binding_ids,
+                        identity.columns,
+                        identity.scalars,
+                    )?
+                };
+                let (operator_fingerprint, operator_encoding) =
+                    query_operator_identity(&semantic_operator, &scalar_roots, identity.scalars)?;
+                (
+                    output_columns,
+                    scalar_roots,
+                    operator_fingerprint,
+                    operator_encoding,
+                )
             };
-            let (operator_fingerprint, operator_encoding) =
-                query_operator_identity(&semantic_operator, &scalar_roots, identity.scalars)?;
-            (
-                output_columns,
-                scalar_roots,
+        let columns = output_columns_stats;
+        let cached = state.settlement_cache.native_insert(
+            pre_operator_encoding.clone(),
+            NativeRelationEntry {
+                operator: cached_operator,
                 operator_fingerprint,
-                operator_encoding,
-            )
-        };
+                operator_encoding: operator_encoding.clone(),
+                scalar_roots: scalar_roots.clone(),
+                output_columns: output_columns.clone(),
+                stats: stats.clone(),
+                layout: layout.clone(),
+                maximum,
+                columns: columns.clone(),
+                inputs: native_inputs.into_boxed_slice(),
+                id: 0,
+            },
+        );
+        // The cache is the canonical publisher.  If an equivalent relation
+        // was inserted earlier in this transaction, use its immutable
+        // identities and facts instead of publishing a second locally
+        // assembled version.
+        node.operator = attach_native_operator(cached.operator.clone(), &links)?;
+        node.stats = cached.stats.clone();
+        let columns = cached.columns.clone();
+        scopes.insert(node.id, columns.clone());
         if resident_nodes
             .insert(
                 node.id,
                 ResidentNodeContract {
-                    operator_fingerprint,
-                    operator_encoding,
-                    scalar_roots,
-                    output_columns: output_columns.clone(),
-                    output_layout: layout.clone(),
+                    operator_fingerprint: cached.operator_fingerprint,
+                    operator_encoding: cached.operator_encoding.clone(),
+                    scalar_roots: cached.scalar_roots.clone(),
+                    output_columns: cached.output_columns.clone(),
+                    output_layout: cached.layout.clone(),
                     input_facts: ResidentInputFacts::Native(input_facts.into_boxed_slice()),
                 },
             )

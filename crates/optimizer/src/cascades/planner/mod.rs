@@ -1910,6 +1910,30 @@ impl OptimizationInput {
                 "settlement_invalidation_visit_count",
                 state.settlement_cache.invalidation_visits,
             );
+            work_counters.insert(
+                "native_relation_fact_cache_hits",
+                state.settlement_cache.native_relation_hits,
+            );
+            work_counters.insert(
+                "native_relation_fact_cache_misses",
+                state.settlement_cache.native_relation_misses,
+            );
+            work_counters.insert(
+                "native_relation_fact_evaluations",
+                state.settlement_cache.native_relation_fact_evaluations,
+            );
+            work_counters.insert(
+                "native_relation_owned_assembly_skips",
+                state.settlement_cache.native_relation_owned_assembly_skips,
+            );
+            work_counters.insert(
+                "native_relation_fact_cache_entries",
+                state.settlement_cache.native_relation_entry_count(),
+            );
+            work_counters.insert(
+                "native_relation_fact_cache_rollbacks",
+                state.settlement_cache.native_relation_invalidations,
+            );
             work_counters.extend(state.payloads.schedule_counters());
             let join_region_cache = state
                 .join_region_cache
