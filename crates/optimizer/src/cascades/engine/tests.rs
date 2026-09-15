@@ -2523,8 +2523,8 @@ fn child_combination_event_interning_is_exact() {
         goal,
         candidate: CandidateId::new(2),
     };
-    let first = [left, right];
-    let reordered = [right, left];
+    let first = [left.candidate, right.candidate];
+    let reordered = [right.candidate, left.candidate];
     let event = engine
         .intern_child_combination_event(PhysicalExprId(7), goal, Fingerprint(11), &first)
         .unwrap();

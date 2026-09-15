@@ -7,6 +7,19 @@
 
 use super::*;
 
+#[test]
+fn child_combination_refs_rebuilds_exact_choices_from_stable_ids() {
+    let (_, _, child, goal) = resume_engine(false);
+    let candidates = [CandidateId::new(41), CandidateId::new(7)];
+    let goals = [(child, goal), (child, goal)];
+    let refs = child_combination_refs(&candidates, &goals).unwrap();
+    assert_eq!(refs.len(), candidates.len());
+    assert_eq!(refs[0].group, child);
+    assert_eq!(refs[0].goal, goal);
+    assert_eq!(refs[0].candidate, CandidateId::new(41));
+    assert_eq!(refs[1].candidate, CandidateId::new(7));
+}
+
 // Reuse the existing source-response toy. Only the initial parent recipe can
 // be withheld: its sequential prefix is legal in the same open source context.
 struct ResumeImplementation {

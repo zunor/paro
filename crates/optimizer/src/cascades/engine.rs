@@ -513,10 +513,11 @@ enum CombinationAdmission {
 
 #[derive(Debug, Clone)]
 struct CostedChildCombination {
-    /// Exact immutable child choices.  CandidateId is the semantic identity;
-    /// this copy is the payload needed to build a Winner without consulting a
-    /// later frontier ordinal.
-    children: Box<[ChildWinnerRef]>,
+    /// Exact child choices are the map key.  The recipe's ordered child goals
+    /// provide the remaining group/goal part of each reference, so retaining
+    /// a second `Box<[ChildWinnerRef]>` here only duplicated the tuple and
+    /// allocated once per priced combination.  A Winner or diagnostic event
+    /// materializes the precise references at its publication boundary.
     local_cost: SearchCost,
     cost: SearchCost,
     source_work: Box<[SourceWork]>,
@@ -695,11 +696,11 @@ impl ChildCombinationState {
         self.active_frontiers = current;
     }
 
-    fn active(&self, children: &[ChildWinnerRef]) -> bool {
-        children.iter().enumerate().all(|(index, child)| {
+    fn active_ids(&self, children: &[CandidateId]) -> bool {
+        children.iter().enumerate().all(|(index, candidate)| {
             self.active_frontiers
                 .get(index)
-                .is_some_and(|frontier| frontier.binary_search(&child.candidate).is_ok())
+                .is_some_and(|frontier| frontier.binary_search(candidate).is_ok())
         })
     }
 
@@ -2959,13 +2960,15 @@ impl CascadesEngine {
         physical: PhysicalExprId,
         recipe: Fingerprint,
         candidate: CandidateId,
-        children: Box<[ChildWinnerRef]>,
+        children: &[CandidateId],
+        child_goals: &[(GroupId, OptimizationGoal)],
         cost: SearchCost,
-    ) {
+    ) -> Result<()> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
         if !self.collect_rule_work_profile {
-            return;
+            return Ok(());
         }
+        let children = child_combination_refs(children, child_goals)?;
         self.note_candidate_lifecycle(CandidateLifecycleEvent {
             stage: CandidateLifecycleStage::ParentPublished,
             elapsed_us: self.lifecycle_elapsed_us(),
@@ -2987,6 +2990,7 @@ impl CascadesEngine {
             expected_cost_bits: Some(cost.score.range.expected.to_bits()),
             upper_cost_bits: Some(cost.score.range.upper.to_bits()),
         });
+        Ok(())
     }
 
     fn note_safe_candidate(&mut self, candidate: CandidateId) {
@@ -8090,17 +8094,13 @@ impl CascadesEngine {
         physical: PhysicalExprId,
         goal: OptimizationGoal,
         recipe: Fingerprint,
-        children: &[ChildWinnerRef],
+        children: &[CandidateId],
     ) -> Result<Fingerprint> {
         let identity = ChildCombinationIdentity {
             physical,
             goal,
             recipe,
-            children: children
-                .iter()
-                .map(|child| child.candidate)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            children: children.to_vec().into_boxed_slice(),
         };
         if let Some(event) = self.child_combination_events.get(&identity).copied() {
             return Ok(event);
@@ -8182,10 +8182,11 @@ impl CascadesEngine {
                     .unwrap_or_default();
                 let joint_cost_proof =
                     build_joint_cost_proof(&self.memo, group, recipe, cached.local_cost)?;
+                let child_refs = child_combination_refs(children, &recipe.child_goals)?;
                 let winner = Winner {
                     candidate: CandidateId::INVALID,
                     expression: physical,
-                    children: cached.children.clone(),
+                    children: child_refs,
                     enforcers: enforced.steps.clone(),
                     enforcer_cost_input: recipe.enforcer_cost_input,
                     provided: enforced.provided.clone(),
@@ -8261,7 +8262,6 @@ impl CascadesEngine {
         // backing allocations for every physical recipe made the same parent
         // pay an avoidable allocation cost before any candidate was compared.
         let mut child_frontiers = Vec::<Vec<ChildWinnerRef>>::new();
-        let mut child_selections = Vec::<ChildWinnerRef>::new();
         let mut child_costs = Vec::<SearchCost>::new();
         let mut child_fingerprints = Vec::<Fingerprint>::new();
         let mut source_work_scratch = Vec::<SourceWork>::new();
@@ -8529,9 +8529,9 @@ impl CascadesEngine {
                 let rechecks = combination_state
                     .priced
                     .iter()
-                    .filter(|(_, cached)| {
+                    .filter(|(children, cached)| {
                         matches!(cached.admission, CombinationAdmission::FrontierTruncated)
-                            && combination_state.active(&cached.children)
+                            && combination_state.active_ids(children)
                     })
                     .map(|(children, _)| children.clone())
                     .take(if child_yielded { 1 } else { usize::MAX })
@@ -8548,12 +8548,12 @@ impl CascadesEngine {
                             &mut combination_state,
                             &children,
                             true,
-                        )?;
+                    )?;
                     if let Some(candidate) = published_candidate {
-                        let (child_refs, cost) = combination_state
+                        let cost = combination_state
                             .priced
                             .get(&children)
-                            .map(|cached| (cached.children.clone(), cached.cost))
+                            .map(|cached| cached.cost)
                             .ok_or_else(|| {
                                 paro_error::internal(
                                     "published child combination disappeared before timeline recording",
@@ -8565,9 +8565,10 @@ impl CascadesEngine {
                             physical,
                             recipe.physical_fingerprint,
                             candidate,
-                            child_refs,
+                            &children,
+                            &recipe.child_goals,
                             cost,
-                        );
+                        )?;
                     }
                     if frontier_changed {
                         if self.note_physical_frontier_change(group, goal, selected_changed)? {
@@ -8584,8 +8585,6 @@ impl CascadesEngine {
             }
 
             let child_frontier_count = recipe.child_goals.len();
-            child_selections.clear();
-            child_selections.reserve(child_frontier_count);
             child_costs.clear();
             child_costs.reserve(child_frontier_count);
             child_fingerprints.clear();
@@ -8598,10 +8597,7 @@ impl CascadesEngine {
                 let pending = combination_state
                     .budget_rejected
                     .iter()
-                    .find(|children| {
-                        child_combination_refs(children, &child_frontiers)
-                            .is_ok_and(|children| combination_state.active(&children))
-                    })
+                    .find(|children| combination_state.active_ids(children))
                     .cloned();
                 let (child_ids, mandatory, pending_retry) = if let Some(children) = pending {
                     (children, false, true)
@@ -8613,10 +8609,7 @@ impl CascadesEngine {
                     break;
                 };
                 yielded_response_attempted = true;
-                let Ok(children) = child_combination_refs(&child_ids, &child_frontiers) else {
-                    continue;
-                };
-                if !combination_state.active(&children) {
+                if !combination_state.active_ids(&child_ids) {
                     continue;
                 }
                 if combination_state.resource_rejected.contains(&child_ids) {
@@ -8633,12 +8626,12 @@ impl CascadesEngine {
                             &mut combination_state,
                             &child_ids,
                             false,
-                        )?;
+                    )?;
                     if let Some(candidate) = published_candidate {
-                        let (child_refs, cost) = combination_state
+                        let cost = combination_state
                             .priced
                             .get(&child_ids)
-                            .map(|cached| (cached.children.clone(), cached.cost))
+                            .map(|cached| cached.cost)
                             .ok_or_else(|| {
                                 paro_error::internal(
                                     "published child combination disappeared before timeline recording",
@@ -8650,9 +8643,10 @@ impl CascadesEngine {
                             physical,
                             recipe.physical_fingerprint,
                             candidate,
-                            child_refs,
+                            &child_ids,
+                            &recipe.child_goals,
                             cost,
-                        );
+                        )?;
                     }
                     if frontier_changed {
                         if self.note_physical_frontier_change(group, goal, selected_changed)? {
@@ -8677,7 +8671,7 @@ impl CascadesEngine {
                         physical,
                         goal,
                         recipe.physical_fingerprint,
-                        &children,
+                        &child_ids,
                     )?;
                     let decision = self
                         .memo
@@ -8696,10 +8690,8 @@ impl CascadesEngine {
                 if pending_retry {
                     combination_state.budget_rejected.remove(&child_ids);
                 }
-                child_selections.clear();
                 let kernel_partition = crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
                 let kernel_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 0);
-                child_selections.extend(children.iter().copied());
                 child_costs.clear();
                 child_fingerprints.clear();
                 source_work_scratch.clear();
@@ -8712,10 +8704,19 @@ impl CascadesEngine {
                     // handles, not a duplicate winner tree.
                     let mut child_source_work_refs =
                         SmallVec::<[&[SourceWork]; 8]>::with_capacity(child_frontier_count);
-                    for child in &child_selections {
-                        let winner = self.memo.resolve_child_winner(*child).ok_or_else(|| {
-                            paro_error::internal("child product lost an immutable candidate")
-                        })?;
+                    for (candidate, (child, child_goal)) in
+                        child_ids.iter().copied().zip(recipe.child_goals.iter().copied())
+                    {
+                        let winner = self
+                            .memo
+                            .resolve_child_winner(ChildWinnerRef {
+                                group: child,
+                                goal: child_goal,
+                                candidate,
+                            })
+                            .ok_or_else(|| {
+                                paro_error::internal("child product lost an immutable candidate")
+                            })?;
                         child_costs.push(winner.cost);
                         child_source_work_refs.push(winner.source_work.as_ref());
                         child_fingerprints.push(winner.physical_fingerprint);
@@ -8797,7 +8798,7 @@ impl CascadesEngine {
                         physical: Some(physical),
                         recipe: Some(recipe.physical_fingerprint),
                         rule: None,
-                        children: children.clone(),
+                        children: child_combination_refs(&child_ids, &recipe.child_goals)?,
                         facts: Box::new([]),
                         expected_cost_bits: Some(cost.score.range.expected.to_bits()),
                         upper_cost_bits: Some(cost.score.range.upper.to_bits()),
@@ -8812,7 +8813,6 @@ impl CascadesEngine {
                 combination_state.priced.insert(
                     child_ids.clone(),
                     CostedChildCombination {
-                        children,
                         local_cost,
                         cost,
                         source_work,
@@ -8830,12 +8830,12 @@ impl CascadesEngine {
                         &mut combination_state,
                         &child_ids,
                         false,
-                    )?;
+                )?;
                 if let Some(candidate) = published_candidate {
-                    let (child_refs, cost) = combination_state
+                    let cost = combination_state
                         .priced
                         .get(&child_ids)
-                        .map(|cached| (cached.children.clone(), cached.cost))
+                        .map(|cached| cached.cost)
                         .ok_or_else(|| {
                             paro_error::internal(
                                 "published child combination disappeared before timeline recording",
@@ -8847,9 +8847,10 @@ impl CascadesEngine {
                         physical,
                         recipe.physical_fingerprint,
                         candidate,
-                        child_refs,
+                        &child_ids,
+                        &recipe.child_goals,
                         cost,
-                    );
+                    )?;
                 }
                 if frontier_changed {
                     if self.note_physical_frontier_change(group, goal, selected_changed)? {
@@ -8880,9 +8881,9 @@ impl CascadesEngine {
                 let rechecks = combination_state
                     .priced
                     .iter()
-                    .filter(|(_, cached)| {
+                    .filter(|(children, cached)| {
                         matches!(cached.admission, CombinationAdmission::FrontierTruncated)
-                            && combination_state.active(&cached.children)
+                            && combination_state.active_ids(children)
                     })
                     .map(|(children, _)| children.clone())
                     .collect::<Vec<_>>();
@@ -8897,12 +8898,12 @@ impl CascadesEngine {
                             &mut combination_state,
                             &children,
                             true,
-                        )?;
+                    )?;
                     if let Some(candidate) = published_candidate {
-                        let (child_refs, cost) = combination_state
+                        let cost = combination_state
                             .priced
                             .get(&children)
-                            .map(|cached| (cached.children.clone(), cached.cost))
+                            .map(|cached| cached.cost)
                             .ok_or_else(|| {
                                 paro_error::internal(
                                     "published child combination disappeared before timeline recording",
@@ -8914,9 +8915,10 @@ impl CascadesEngine {
                             physical,
                             recipe.physical_fingerprint,
                             candidate,
-                            child_refs,
+                            &children,
+                            &recipe.child_goals,
                             cost,
-                        );
+                        )?;
                     }
                     if frontier_changed {
                         if self.note_physical_frontier_change(group, goal, selected_changed)? {
@@ -9554,23 +9556,22 @@ fn next_stable_combination(
 
 fn child_combination_refs(
     children: &[CandidateId],
-    frontiers: &[Vec<ChildWinnerRef>],
+    child_goals: &[(GroupId, OptimizationGoal)],
 ) -> Result<Box<[ChildWinnerRef]>> {
-    if children.len() != frontiers.len() {
+    if children.len() != child_goals.len() {
         return Err(paro_error::internal(
             "child combination arity disagrees with its recipe",
         ));
     }
     children
         .iter()
-        .zip(frontiers)
-        .map(|(candidate, frontier)| {
-            let index = frontier
-                .binary_search_by_key(candidate, |child| child.candidate)
-                .map_err(|_| {
-                    paro_error::internal("child combination references a stale candidate")
-                })?;
-            Ok(frontier[index])
+        .zip(child_goals)
+        .map(|(candidate, (group, goal))| {
+            Ok(ChildWinnerRef {
+                group: *group,
+                goal: *goal,
+                candidate: *candidate,
+            })
         })
         .collect::<Result<Vec<_>>>()
         .map(Vec::into_boxed_slice)
