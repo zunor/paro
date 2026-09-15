@@ -180,6 +180,8 @@ pub struct NativeQualityShape {
 pub struct QualityEvidenceDiagnostics {
     pub local_summary_cache_hits: u64,
     pub local_summary_cache_misses: u64,
+    pub composed_summary_cache_hits: u64,
+    pub composed_summary_cache_misses: u64,
     pub local_summary_nodes: u64,
 }
 

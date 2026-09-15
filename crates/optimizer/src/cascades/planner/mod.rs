@@ -154,9 +154,12 @@ struct PlannerQualityEvidenceProvider {
 
 #[derive(Debug, Default)]
 struct LocalQualitySummaryCache {
-    entries: BTreeMap<CandidateId, LocalQualitySummary>,
+    entries: BTreeMap<CandidateId, Arc<LocalQualitySummary>>,
+    composed: BTreeMap<CandidateId, Arc<LocalQualitySummary>>,
     hits: u64,
     misses: u64,
+    composed_hits: u64,
+    composed_misses: u64,
     nodes: u64,
 }
 
@@ -186,6 +189,9 @@ struct LocalQualitySummary {
     has_graph: bool,
     has_dependent: bool,
     contains_union: bool,
+    /// Pre-order choices for the immutable selected DAG. This is populated
+    /// only in `composed`; local entries deliberately keep it empty.
+    choices: Arc<[(CandidateId, Fingerprint)]>,
 }
 
 /// Return only proof-bearing rule identities for the expression selected by a
@@ -359,7 +365,7 @@ fn local_quality_summary(
 ) -> LocalQualitySummary {
     if let Some(summary) = cache.entries.get(&frozen.reference.candidate) {
         cache.hits = cache.hits.saturating_add(1);
-        return summary.clone();
+        return (**summary).clone();
     }
     cache.misses = cache.misses.saturating_add(1);
 
@@ -528,24 +534,43 @@ fn local_quality_summary(
         Some(LogicalOperator::SetOperation(setop))
             if setop.setop_type == paro_planner::operator::SetOpType::Union && setop.setop_all
     );
-    cache.entries.insert(frozen.reference.candidate, summary.clone());
+    cache.entries
+        .insert(frozen.reference.candidate, Arc::new(summary.clone()));
     summary
 }
 
 fn compose_quality_summary(
     frozen: &FrozenCandidate,
-    cache: &LocalQualitySummaryCache,
-    visited: &mut BTreeSet<CandidateId>,
-) -> Option<LocalQualitySummary> {
-    if !visited.insert(frozen.reference.candidate) {
+    cache: &mut LocalQualitySummaryCache,
+    active: &mut BTreeSet<CandidateId>,
+) -> Option<Arc<LocalQualitySummary>> {
+    if let Some(summary) = cache.composed.get(&frozen.reference.candidate) {
+        cache.composed_hits = cache.composed_hits.saturating_add(1);
+        return Some(Arc::clone(summary));
+    }
+    cache.composed_misses = cache.composed_misses.saturating_add(1);
+    if !active.insert(frozen.reference.candidate) {
         return None;
     }
-    let mut summary = cache.entries.get(&frozen.reference.candidate)?.clone();
+    let local = cache.entries.get(&frozen.reference.candidate)?.clone();
+    let mut summary = (*local).clone();
+    let mut choices = vec![(frozen.reference.candidate, summary.choice)];
+    let mut choice_ids = BTreeSet::from([frozen.reference.candidate]);
     for child in frozen.children.iter() {
-        if let Some(child) = compose_quality_summary(child, cache, visited) {
-            summary.merge_child(child);
+        let child = compose_quality_summary(child, cache, active)?;
+        summary.merge_child((*child).clone());
+        for (candidate, choice) in child.choices.iter().copied() {
+            if choice_ids.insert(candidate) {
+                choices.push((candidate, choice));
+            }
         }
     }
+    summary.choices = choices.into_boxed_slice().into();
+    active.remove(&frozen.reference.candidate);
+    let summary = Arc::new(summary);
+    cache
+        .composed
+        .insert(frozen.reference.candidate, Arc::clone(&summary));
     Some(summary)
 }
 
@@ -597,14 +622,12 @@ fn collect_cached_choices(
     choices: &mut Vec<Fingerprint>,
     visited: &mut BTreeSet<CandidateId>,
 ) {
-    if !visited.insert(frozen.reference.candidate) {
-        return;
-    }
-    if let Some(summary) = cache.entries.get(&frozen.reference.candidate) {
-        choices.push(summary.choice);
-    }
-    for child in frozen.children.iter() {
-        collect_cached_choices(child, cache, choices, visited);
+    if let Some(summary) = cache.composed.get(&frozen.reference.candidate) {
+        for (candidate, choice) in summary.choices.iter().copied() {
+            if visited.insert(candidate) {
+                choices.push(choice);
+            }
+        }
     }
 }
 
@@ -688,8 +711,7 @@ fn selected_aggregate_region_witnesses(
             if setop.setop_type == paro_planner::operator::SetOpType::Union && setop.setop_all {
                 for (index, arm) in union.children.iter().enumerate() {
                     path.push(index as u32);
-                    let mut summary_visited = BTreeSet::new();
-                    let summary = compose_quality_summary(arm, cache, &mut summary_visited)?;
+                    let summary = cache.composed.get(&arm.reference.candidate)?;
                     if summary.region_shape.aggregates > 0
                         && summary.region_shape.joins > 0
                         && !summary.contains_union
@@ -761,8 +783,7 @@ fn selected_aggregate_region_witnesses(
         cache,
     )?;
     if witnesses.is_empty() {
-        let mut summary_visited = BTreeSet::new();
-        let summary = compose_quality_summary(root, cache, &mut summary_visited)?;
+        let summary = cache.composed.get(&root.reference.candidate)?;
         if summary.region_shape.aggregates > 0 {
             let mut choices = Vec::new();
             let mut choice_visited = BTreeSet::new();
@@ -806,9 +827,8 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             .lock()
             .expect("quality summary cache poisoned");
         local_quality_summary(frozen, &state, &mut local_summaries);
-        let mut summary_visited = BTreeSet::new();
-        let Some(summary) =
-            compose_quality_summary(frozen, &local_summaries, &mut summary_visited)
+        let mut active = BTreeSet::new();
+        let Some(summary) = compose_quality_summary(frozen, &mut local_summaries, &mut active)
         else {
             return Ok(None);
         };
@@ -958,6 +978,8 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         QualityEvidenceDiagnostics {
             local_summary_cache_hits: cache.hits,
             local_summary_cache_misses: cache.misses,
+            composed_summary_cache_hits: cache.composed_hits,
+            composed_summary_cache_misses: cache.composed_misses,
             local_summary_nodes: cache.nodes,
         }
     }

@@ -5687,6 +5687,14 @@ impl CascadesEngine {
                 quality_evidence_diagnostics.local_summary_cache_misses,
             ),
             (
+                "quality_composed_summary_cache_hit_count",
+                quality_evidence_diagnostics.composed_summary_cache_hits,
+            ),
+            (
+                "quality_composed_summary_cache_miss_count",
+                quality_evidence_diagnostics.composed_summary_cache_misses,
+            ),
+            (
                 "quality_local_summary_node_count",
                 quality_evidence_diagnostics.local_summary_nodes,
             ),
