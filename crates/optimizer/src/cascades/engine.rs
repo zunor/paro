@@ -5554,11 +5554,6 @@ impl CascadesEngine {
         if let Some((reason, fingerprint)) = first_invalid {
             self.note_strong_incumbent_invalidation(reason, fingerprint);
         }
-        let quality_evidence_diagnostics = self
-            .quality_evidence_provider
-            .as_ref()
-            .map(|provider| provider.diagnostics())
-            .unwrap_or_default();
         let mut counters = BTreeMap::from([
             ("winner_proposal_count", self.memo.winner_proposal_count()),
             ("published_winner_count", self.memo.published_winner_count()),
@@ -5677,26 +5672,6 @@ impl CascadesEngine {
             (
                 "quality_policy_candidate_evaluation_count",
                 self.quality_candidate_evaluation_count,
-            ),
-            (
-                "quality_local_summary_cache_hit_count",
-                quality_evidence_diagnostics.local_summary_cache_hits,
-            ),
-            (
-                "quality_local_summary_cache_miss_count",
-                quality_evidence_diagnostics.local_summary_cache_misses,
-            ),
-            (
-                "quality_composed_summary_cache_hit_count",
-                quality_evidence_diagnostics.composed_summary_cache_hits,
-            ),
-            (
-                "quality_composed_summary_cache_miss_count",
-                quality_evidence_diagnostics.composed_summary_cache_misses,
-            ),
-            (
-                "quality_local_summary_node_count",
-                quality_evidence_diagnostics.local_summary_nodes,
             ),
             (
                 "quality_policy_ready_goal_count",

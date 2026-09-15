@@ -173,18 +173,6 @@ pub struct NativeQualityShape {
     pub join_region_witness_nodes: u32,
 }
 
-/// Bounded diagnostics for composable evidence producers. These counters are
-/// structural work attribution only; they never participate in a quality
-/// decision and contain no candidate facts that could become stale.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct QualityEvidenceDiagnostics {
-    pub local_summary_cache_hits: u64,
-    pub local_summary_cache_misses: u64,
-    pub composed_summary_cache_hits: u64,
-    pub composed_summary_cache_misses: u64,
-    pub local_summary_nodes: u64,
-}
-
 /// Production producers must inspect the exact frozen DAG they are asked to
 /// certify. They may not discover a replacement plan or read a stale frontier.
 pub trait QualityEvidenceProvider: std::fmt::Debug {
@@ -195,10 +183,6 @@ pub trait QualityEvidenceProvider: std::fmt::Debug {
         frozen: &FrozenCandidate,
         goal: OptimizationGoal,
     ) -> Result<Option<NativeQualityEvidence>>;
-
-    fn diagnostics(&self) -> QualityEvidenceDiagnostics {
-        QualityEvidenceDiagnostics::default()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
