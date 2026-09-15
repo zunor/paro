@@ -8,7 +8,7 @@ mod domain_transfer;
 mod quality_domain;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::physical::{ObjectiveProfile, ResourceGrantClass, SpillPolicy};
@@ -70,7 +70,7 @@ use super::properties::{
 };
 use super::quality::{
     AggregateRegionWitness, BundleCapability, BundleFact, NativeQualityEvidence,
-    NativeQualityShape, QualityEvidenceProvider, QualityPolicyStatus,
+    NativeQualityShape, QualityEvidenceDiagnostics, QualityEvidenceProvider, QualityPolicyStatus,
 };
 use super::region::{
     FacetCriticality, RegionArtifactDependencyContract, RegionArtifactKind, RegionBoundaryEndpoint,
@@ -143,6 +143,49 @@ const COST_OPTIMIZED_SEARCH_POLICY: QualityPolicyId = QualityPolicyId(1);
 #[derive(Debug)]
 struct PlannerQualityEvidenceProvider {
     state: Arc<RwLock<PlannerTransformState>>,
+    /// Structural summaries are query-local and deliberately fact-free. A
+    /// frozen child can participate in several root candidates, so retaining
+    /// its immutable contract here avoids rebuilding the same identity,
+    /// payload and shape evidence for every parent. Mutable Memo facts are
+    /// never stored in this cache; the caller still derives a fresh ReadSet
+    /// and region fact fingerprint for every evaluation.
+    local_summaries: Mutex<LocalQualitySummaryCache>,
+}
+
+#[derive(Debug, Default)]
+struct LocalQualitySummaryCache {
+    entries: BTreeMap<CandidateId, LocalQualitySummary>,
+    hits: u64,
+    misses: u64,
+    nodes: u64,
+}
+
+/// The reusable part of quality evidence for one exact frozen node. It is
+/// intentionally composable: a parent combines these immutable summaries
+/// with the current fact/read evidence instead of caching a root certificate.
+/// In particular, no statistics, ReadSet, CTE fact version, or aggregate
+/// witness is retained here.
+#[derive(Debug, Clone, Default)]
+struct LocalQualitySummary {
+    exact_contract: bool,
+    choice: Fingerprint,
+    rules: BTreeSet<RuleId>,
+    shape: NativeQualityShape,
+    region_shape: SelectedAggregateRegionShape,
+    cte_producers: BTreeSet<usize>,
+    cte_consumers: BTreeSet<usize>,
+    cte_producer_witnesses: BTreeSet<usize>,
+    has_filter: bool,
+    has_get: bool,
+    has_join: bool,
+    has_join_region: bool,
+    has_aggregate: bool,
+    has_cte_consumer: bool,
+    has_cte_producer: bool,
+    has_ordering: bool,
+    has_graph: bool,
+    has_dependent: bool,
+    contains_union: bool,
 }
 
 /// Return only proof-bearing rule identities for the expression selected by a
@@ -256,20 +299,6 @@ fn frozen_choice_fingerprint(frozen: &FrozenCandidate) -> Fingerprint {
     choice.finish()
 }
 
-fn collect_frozen_choices(
-    frozen: &FrozenCandidate,
-    choices: &mut Vec<Fingerprint>,
-    visited: &mut BTreeSet<CandidateId>,
-) {
-    if !visited.insert(frozen.reference.candidate) {
-        return;
-    }
-    choices.push(frozen_choice_fingerprint(frozen));
-    for child in frozen.children.iter() {
-        collect_frozen_choices(child, choices, visited);
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct SelectedAggregateRegionShape {
     aggregates: u32,
@@ -323,22 +352,150 @@ fn aggregate_merge_contract_matches<OuterChild, PartialChild>(
     })
 }
 
-fn selected_aggregate_region_shape(
+fn local_quality_summary(
     frozen: &FrozenCandidate,
     state: &PlannerTransformState,
-    visited: &mut BTreeSet<CandidateId>,
-) -> SelectedAggregateRegionShape {
-    if !visited.insert(frozen.reference.candidate) {
-        return SelectedAggregateRegionShape::default();
+    cache: &mut LocalQualitySummaryCache,
+) -> LocalQualitySummary {
+    if let Some(summary) = cache.entries.get(&frozen.reference.candidate) {
+        cache.hits = cache.hits.saturating_add(1);
+        return summary.clone();
     }
+    cache.misses = cache.misses.saturating_add(1);
+
+    // Populate children before publishing this node. A frozen candidate is an
+    // immutable DAG; the cache stores only this node's local summary. The
+    // caller composes a root with a visited set so shared CTE/UNION children
+    // contribute exactly once, matching the previous selected-DAG walk.
+    for child in frozen.children.iter() {
+        local_quality_summary(child, state, cache);
+    }
+
+    let mut summary = LocalQualitySummary {
+        exact_contract: true,
+        choice: frozen_choice_fingerprint(frozen),
+        ..LocalQualitySummary::default()
+    };
+    cache.nodes = cache.nodes.saturating_add(1);
+    summary.shape.nodes = 1;
+
     let operator = state
         .payloads
         .logical
         .get(frozen.logical.payload.index())
         .map(|payload| &payload.semantic_template.operator);
-    let mut shape = SelectedAggregateRegionShape::default();
-    if matches!(operator, Some(LogicalOperator::Aggregate(_))) {
-        shape.aggregates = 1;
+    let metadata = state.metadata.get(&frozen.logical.payload);
+    let physical_payload = state.payloads.get_physical(frozen.physical.payload);
+    if frozen.physical.id != frozen.winner.expression
+        || frozen.logical.id != frozen.physical.key.logical
+        || frozen.physical.key.children.len() != frozen.logical.key.children.len()
+        || frozen
+            .physical
+            .key
+            .children
+            .iter()
+            .zip(frozen.logical.key.children.iter())
+            .any(|(physical_child, logical_child)| *physical_child != *logical_child)
+        || frozen.children.len() != frozen.winner.children.len()
+        || frozen
+            .children
+            .iter()
+            .zip(frozen.winner.children.iter())
+            .any(|(child, reference)| child.reference != *reference)
+        || operator.is_none()
+        || metadata.is_none()
+        || physical_payload.is_none()
+    {
+        summary.exact_contract = false;
+    } else if !selected_physical_contract_is_exact(
+        &frozen.logical,
+        &frozen.physical,
+        metadata.expect("metadata checked above"),
+        &physical_payload.expect("payload checked above"),
+    ) {
+        summary.exact_contract = false;
+    }
+
+    if let Some(metadata) = metadata {
+        let selected_rules = selected_payload_rule_proofs(&frozen.logical, metadata);
+        if metadata.origin_rule.is_some() && selected_rules.is_empty() {
+            // An origin marker without a selected-DAG proof is only audit
+            // history, never a quality witness.
+            summary.exact_contract = false;
+        }
+        summary.rules.extend(selected_rules.iter().copied());
+        summary.exact_contract &= frozen.winner.provided.result_guarantee == ResultGuarantee::Exact
+            && metadata.provided.result_guarantee == ResultGuarantee::Exact;
+        match metadata.operator_type {
+            LogicalOperatorType::Filter | LogicalOperatorType::FullTextFilterScan => {
+                summary.has_filter = true
+            }
+            LogicalOperatorType::Get
+            | LogicalOperatorType::SearchScan
+            | LogicalOperatorType::TableFunctionGet => summary.has_get = true,
+            LogicalOperatorType::ComparisonJoin
+            | LogicalOperatorType::AnyJoin
+            | LogicalOperatorType::CrossProduct => {
+                summary.has_join = true;
+                summary.has_join_region = frozen.winner.joint_cost_proof.is_some();
+                summary.shape.joins = 1;
+                if frozen.winner.joint_cost_proof.is_some() {
+                    summary.shape.join_region_witness_nodes = 1;
+                }
+            }
+            LogicalOperatorType::Aggregate => {
+                summary.has_aggregate = true;
+                summary.shape.aggregates = 1;
+            }
+            LogicalOperatorType::CTERef => {
+                summary.has_cte_consumer = true;
+                if let Some(LogicalOperator::CTERef(reference)) = operator {
+                    summary.cte_consumers.insert(reference.cte_index);
+                } else {
+                    summary.exact_contract = false;
+                }
+            }
+            LogicalOperatorType::MaterializedCTE | LogicalOperatorType::RecursiveCTE => {
+                summary.has_cte_producer = true;
+                let cte_index = match operator {
+                    Some(LogicalOperator::MaterializedCTE(cte)) => Some(cte.cte_index),
+                    Some(LogicalOperator::RecursiveCTE(cte)) => Some(cte.cte_index),
+                    _ => None,
+                };
+                if let Some(cte_index) = cte_index {
+                    summary.cte_producers.insert(cte_index);
+                    if selected_rules.iter().any(|rule| {
+                        matches!(
+                            *rule,
+                            CTE_DEMAND_PUSHDOWN_RULE
+                                | CTE_FILTER_PUSHDOWN_RULE
+                                | CTE_PARTITIONED_MATERIALIZATION_RULE
+                        )
+                    }) {
+                        summary.cte_producer_witnesses.insert(cte_index);
+                    }
+                } else {
+                    summary.exact_contract = false;
+                }
+            }
+            LogicalOperatorType::Order | LogicalOperatorType::TopN => summary.has_ordering = true,
+            LogicalOperatorType::DependentJoin => summary.has_dependent = true,
+            LogicalOperatorType::GraphMatch
+            | LogicalOperatorType::GraphScan
+            | LogicalOperatorType::GraphExpand
+            | LogicalOperatorType::CreatePropertyGraph => summary.has_graph = true,
+            _ => {}
+        }
+    }
+    if matches!(
+        frozen.physical.key.implementation,
+        PLANNER_HASH_JOIN_RUNTIME_FILTER | PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER
+    ) {
+        summary.shape.runtime_filter_joins = 1;
+    }
+
+    if let Some(LogicalOperator::Aggregate(outer)) = operator {
+        summary.region_shape.aggregates = 1;
         if frozen.children.len() == 1 {
             let join = &frozen.children[0];
             if let Some(LogicalOperator::Join(Join::Comparison(join_operator))) = state
@@ -348,11 +505,7 @@ fn selected_aggregate_region_shape(
                 .map(|payload| &payload.semantic_template.operator)
             {
                 if !join_operator.conditions.is_empty() && join.children.len() == 2 {
-                    let outer = match operator {
-                        Some(LogicalOperator::Aggregate(outer)) => outer,
-                        _ => unreachable!("aggregate operator disappeared during inspection"),
-                    };
-                    shape.decomposed = join.children.iter().any(|partial| {
+                    summary.region_shape.decomposed = join.children.iter().any(|partial| {
                         matches!(
                             state
                                 .payloads
@@ -368,15 +521,91 @@ fn selected_aggregate_region_shape(
         }
     }
     if matches!(operator, Some(LogicalOperator::Join(_))) {
-        shape.joins = 1;
+        summary.region_shape.joins = 1;
+    }
+    summary.contains_union = matches!(
+        operator,
+        Some(LogicalOperator::SetOperation(setop))
+            if setop.setop_type == paro_planner::operator::SetOpType::Union && setop.setop_all
+    );
+    cache.entries.insert(frozen.reference.candidate, summary.clone());
+    summary
+}
+
+fn compose_quality_summary(
+    frozen: &FrozenCandidate,
+    cache: &LocalQualitySummaryCache,
+    visited: &mut BTreeSet<CandidateId>,
+) -> Option<LocalQualitySummary> {
+    if !visited.insert(frozen.reference.candidate) {
+        return None;
+    }
+    let mut summary = cache.entries.get(&frozen.reference.candidate)?.clone();
+    for child in frozen.children.iter() {
+        if let Some(child) = compose_quality_summary(child, cache, visited) {
+            summary.merge_child(child);
+        }
+    }
+    Some(summary)
+}
+
+impl LocalQualitySummary {
+    fn merge_child(&mut self, child: Self) {
+        self.exact_contract &= child.exact_contract;
+        self.rules.extend(child.rules);
+        self.shape.nodes = self.shape.nodes.saturating_add(child.shape.nodes);
+        self.shape.aggregates = self.shape.aggregates.saturating_add(child.shape.aggregates);
+        self.shape.joins = self.shape.joins.saturating_add(child.shape.joins);
+        self.shape.runtime_filter_joins = self
+            .shape
+            .runtime_filter_joins
+            .saturating_add(child.shape.runtime_filter_joins);
+        self.shape.join_region_witness_nodes = self
+            .shape
+            .join_region_witness_nodes
+            .saturating_add(child.shape.join_region_witness_nodes);
+        self.region_shape.aggregates = self
+            .region_shape
+            .aggregates
+            .saturating_add(child.region_shape.aggregates);
+        self.region_shape.joins = self
+            .region_shape
+            .joins
+            .saturating_add(child.region_shape.joins);
+        self.region_shape.decomposed |= child.region_shape.decomposed;
+        self.cte_producers.extend(child.cte_producers);
+        self.cte_consumers.extend(child.cte_consumers);
+        self.cte_producer_witnesses
+            .extend(child.cte_producer_witnesses);
+        self.has_filter |= child.has_filter;
+        self.has_get |= child.has_get;
+        self.has_join |= child.has_join;
+        self.has_join_region |= child.has_join_region;
+        self.has_aggregate |= child.has_aggregate;
+        self.has_cte_consumer |= child.has_cte_consumer;
+        self.has_cte_producer |= child.has_cte_producer;
+        self.has_ordering |= child.has_ordering;
+        self.has_graph |= child.has_graph;
+        self.has_dependent |= child.has_dependent;
+        self.contains_union |= child.contains_union;
+    }
+}
+
+fn collect_cached_choices(
+    frozen: &FrozenCandidate,
+    cache: &LocalQualitySummaryCache,
+    choices: &mut Vec<Fingerprint>,
+    visited: &mut BTreeSet<CandidateId>,
+) {
+    if !visited.insert(frozen.reference.candidate) {
+        return;
+    }
+    if let Some(summary) = cache.entries.get(&frozen.reference.candidate) {
+        choices.push(summary.choice);
     }
     for child in frozen.children.iter() {
-        let child_shape = selected_aggregate_region_shape(child, state, visited);
-        shape.aggregates = shape.aggregates.saturating_add(child_shape.aggregates);
-        shape.joins = shape.joins.saturating_add(child_shape.joins);
-        shape.decomposed |= child_shape.decomposed;
+        collect_cached_choices(child, cache, choices, visited);
     }
-    shape
 }
 
 fn collect_region_fact_fingerprint(
@@ -431,38 +660,12 @@ fn collect_region_fact_fingerprint(
     Some(fingerprint.finish())
 }
 
-fn selected_subtree_contains_union(
-    frozen: &FrozenCandidate,
-    state: &PlannerTransformState,
-    visited: &mut BTreeSet<CandidateId>,
-) -> bool {
-    if !visited.insert(frozen.reference.candidate) {
-        return false;
-    }
-    let is_union = state
-        .payloads
-        .logical
-        .get(frozen.logical.payload.index())
-        .is_some_and(|payload| {
-            matches!(
-                &payload.semantic_template.operator,
-                LogicalOperator::SetOperation(setop)
-                    if setop.setop_type == paro_planner::operator::SetOpType::Union
-                        && setop.setop_all
-            )
-        });
-    is_union
-        || frozen
-            .children
-            .iter()
-            .any(|child| selected_subtree_contains_union(child, state, visited))
-}
-
 fn selected_aggregate_region_witnesses(
     memo: &Memo,
     state: &PlannerTransformState,
     root: &FrozenCandidate,
     goal: OptimizationGoal,
+    cache: &LocalQualitySummaryCache,
 ) -> Option<Vec<AggregateRegionWitness>> {
     let mut witnesses = Vec::new();
     let mut path = Vec::new();
@@ -474,6 +677,7 @@ fn selected_aggregate_region_witnesses(
         goal: OptimizationGoal,
         path: &mut Vec<u32>,
         witnesses: &mut Vec<AggregateRegionWitness>,
+        cache: &LocalQualitySummaryCache,
     ) -> Option<()> {
         let operator = state
             .payloads
@@ -484,16 +688,15 @@ fn selected_aggregate_region_witnesses(
             if setop.setop_type == paro_planner::operator::SetOpType::Union && setop.setop_all {
                 for (index, arm) in union.children.iter().enumerate() {
                     path.push(index as u32);
-                    let mut shape_visited = BTreeSet::new();
-                    let shape = selected_aggregate_region_shape(arm, state, &mut shape_visited);
-                    let mut union_visited = BTreeSet::new();
-                    if shape.aggregates > 0
-                        && shape.joins > 0
-                        && !selected_subtree_contains_union(arm, state, &mut union_visited)
+                    let mut summary_visited = BTreeSet::new();
+                    let summary = compose_quality_summary(arm, cache, &mut summary_visited)?;
+                    if summary.region_shape.aggregates > 0
+                        && summary.region_shape.joins > 0
+                        && !summary.contains_union
                     {
                         let mut choices = Vec::new();
                         let mut choice_visited = BTreeSet::new();
-                        collect_frozen_choices(arm, &mut choices, &mut choice_visited);
+                        collect_cached_choices(arm, cache, &mut choices, &mut choice_visited);
                         let fact_fingerprint =
                             collect_region_fact_fingerprint(memo, union, arm, goal)?;
                         let mut region = StableFingerprintBuilder::default();
@@ -515,17 +718,35 @@ fn selected_aggregate_region_witnesses(
                             anchor: arm.reference.candidate,
                             fact_fingerprint,
                             choices: choices.into_boxed_slice(),
-                            covered: shape.decomposed,
+                            covered: summary.region_shape.decomposed,
                         });
                     }
-                    visit_union(memo, state, arm, root_candidate, goal, path, witnesses)?;
+                    visit_union(
+                        memo,
+                        state,
+                        arm,
+                        root_candidate,
+                        goal,
+                        path,
+                        witnesses,
+                        cache,
+                    )?;
                     path.pop();
                 }
                 return Some(());
             }
         }
         for child in union.children.iter() {
-            visit_union(memo, state, child, root_candidate, goal, path, witnesses)?;
+            visit_union(
+                memo,
+                state,
+                child,
+                root_candidate,
+                goal,
+                path,
+                witnesses,
+                cache,
+            )?;
         }
         Some(())
     }
@@ -537,14 +758,15 @@ fn selected_aggregate_region_witnesses(
         goal,
         &mut path,
         &mut witnesses,
+        cache,
     )?;
     if witnesses.is_empty() {
-        let mut shape_visited = BTreeSet::new();
-        let shape = selected_aggregate_region_shape(root, state, &mut shape_visited);
-        if shape.aggregates > 0 {
+        let mut summary_visited = BTreeSet::new();
+        let summary = compose_quality_summary(root, cache, &mut summary_visited)?;
+        if summary.region_shape.aggregates > 0 {
             let mut choices = Vec::new();
             let mut choice_visited = BTreeSet::new();
-            collect_frozen_choices(root, &mut choices, &mut choice_visited);
+            collect_cached_choices(root, cache, &mut choices, &mut choice_visited);
             let fact_fingerprint = collect_region_fact_fingerprint(memo, root, root, goal)?;
             let mut region = StableFingerprintBuilder::default();
             region.write_bytes(b"paro.quality.aggregate-region.root.v1");
@@ -559,7 +781,7 @@ fn selected_aggregate_region_witnesses(
                 anchor: root.reference.candidate,
                 fact_fingerprint,
                 choices: choices.into_boxed_slice(),
-                covered: shape.decomposed,
+                covered: summary.region_shape.decomposed,
             });
         }
     }
@@ -579,225 +801,30 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         let Some(required) = memo.required(goal.required) else {
             return Ok(None);
         };
-        let mut capabilities = BTreeSet::new();
-        let mut facts = BTreeSet::new();
-        let mut choices = Vec::new();
-        let mut rules = BTreeSet::new();
-        let mut shape = NativeQualityShape::default();
-        let mut cte_producers = BTreeSet::new();
-        let mut cte_consumers = BTreeSet::new();
-        let mut cte_producer_witnesses = BTreeSet::new();
-        let mut has_filter = false;
-        let mut has_get = false;
-        let mut has_join = false;
-        let mut has_join_region = false;
-        let mut has_aggregate = false;
-        let mut has_cte_consumer = false;
-        let mut has_cte_producer = false;
-        let mut has_ordering = false;
-        let mut has_graph = false;
-        let mut has_dependent = false;
-        let mut exact_contract = true;
-        let mut visited = BTreeSet::new();
-
-        fn visit(
-            frozen: &FrozenCandidate,
-            state: &PlannerTransformState,
-            choices: &mut Vec<Fingerprint>,
-            rules: &mut BTreeSet<RuleId>,
-            shape: &mut NativeQualityShape,
-            cte_producers: &mut BTreeSet<usize>,
-            cte_consumers: &mut BTreeSet<usize>,
-            cte_producer_witnesses: &mut BTreeSet<usize>,
-            has_filter: &mut bool,
-            has_get: &mut bool,
-            has_join: &mut bool,
-            has_join_region: &mut bool,
-            has_aggregate: &mut bool,
-            has_cte_consumer: &mut bool,
-            has_cte_producer: &mut bool,
-            has_ordering: &mut bool,
-            has_graph: &mut bool,
-            has_dependent: &mut bool,
-            exact_contract: &mut bool,
-            visited: &mut BTreeSet<CandidateId>,
-        ) -> Result<()> {
-            if !visited.insert(frozen.reference.candidate) {
-                return Ok(());
-            }
-            shape.nodes = shape.nodes.saturating_add(1);
-            if frozen.physical.id != frozen.winner.expression
-                || frozen.logical.id != frozen.physical.key.logical
-                || frozen.physical.key.children.len() != frozen.logical.key.children.len()
-                || frozen
-                    .physical
-                    .key
-                    .children
-                    .iter()
-                    .zip(frozen.logical.key.children.iter())
-                    .any(|(physical_child, logical_child)| *physical_child != *logical_child)
-                || frozen.children.len() != frozen.winner.children.len()
-                || frozen
-                    .children
-                    .iter()
-                    .zip(frozen.winner.children.iter())
-                    .any(|(child, reference)| child.reference != *reference)
-            {
-                *exact_contract = false;
-                return Ok(());
-            }
-            let Some(metadata) = state.metadata.get(&frozen.logical.payload) else {
-                *exact_contract = false;
-                return Ok(());
-            };
-            let Some(physical_payload) = state.payloads.get_physical(frozen.physical.payload)
-            else {
-                *exact_contract = false;
-                return Ok(());
-            };
-            if !selected_physical_contract_is_exact(
-                &frozen.logical,
-                &frozen.physical,
-                metadata,
-                &physical_payload,
-            ) {
-                *exact_contract = false;
-                return Ok(());
-            }
-            choices.push(frozen_choice_fingerprint(frozen));
-            let selected_rules = selected_payload_rule_proofs(&frozen.logical, metadata);
-            if metadata.origin_rule.is_some() && selected_rules.is_empty() {
-                // The sidecar says this payload came from a rule, but the
-                // selected Memo expression has no corresponding equivalence
-                // proof.  Fail closed instead of trusting origin metadata.
-                *exact_contract = false;
-                return Ok(());
-            }
-            rules.extend(selected_rules.iter().copied());
-            *exact_contract &= frozen.winner.provided.result_guarantee == ResultGuarantee::Exact
-                && metadata.provided.result_guarantee == ResultGuarantee::Exact;
-            match metadata.operator_type {
-                LogicalOperatorType::Filter | LogicalOperatorType::FullTextFilterScan => {
-                    *has_filter = true
-                }
-                LogicalOperatorType::Get
-                | LogicalOperatorType::SearchScan
-                | LogicalOperatorType::TableFunctionGet => *has_get = true,
-                LogicalOperatorType::ComparisonJoin
-                | LogicalOperatorType::AnyJoin
-                | LogicalOperatorType::CrossProduct => {
-                    *has_join = true;
-                    *has_join_region |= frozen.winner.joint_cost_proof.is_some();
-                    shape.joins = shape.joins.saturating_add(1);
-                    if frozen.winner.joint_cost_proof.is_some() {
-                        shape.join_region_witness_nodes =
-                            shape.join_region_witness_nodes.saturating_add(1);
-                    }
-                }
-                LogicalOperatorType::Aggregate => {
-                    *has_aggregate = true;
-                    shape.aggregates = shape.aggregates.saturating_add(1);
-                }
-                LogicalOperatorType::CTERef => {
-                    *has_cte_consumer = true;
-                    if let LogicalOperator::CTERef(reference) = &state.payloads.logical
-                        [frozen.logical.payload.index()]
-                    .semantic_template
-                    .operator
-                    {
-                        cte_consumers.insert(reference.cte_index);
-                    }
-                }
-                LogicalOperatorType::MaterializedCTE | LogicalOperatorType::RecursiveCTE => {
-                    *has_cte_producer = true;
-                    let cte_index = match &state.payloads.logical[frozen.logical.payload.index()]
-                        .semantic_template
-                        .operator
-                    {
-                        LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
-                        LogicalOperator::RecursiveCTE(cte) => Some(cte.cte_index),
-                        _ => None,
-                    };
-                    if let Some(cte_index) = cte_index {
-                        cte_producers.insert(cte_index);
-                        if selected_rules.iter().any(|rule| {
-                            matches!(
-                                *rule,
-                                CTE_DEMAND_PUSHDOWN_RULE
-                                    | CTE_FILTER_PUSHDOWN_RULE
-                                    | CTE_PARTITIONED_MATERIALIZATION_RULE
-                            )
-                        }) {
-                            cte_producer_witnesses.insert(cte_index);
-                        }
-                    }
-                }
-                LogicalOperatorType::Order | LogicalOperatorType::TopN => *has_ordering = true,
-                LogicalOperatorType::DependentJoin => *has_dependent = true,
-                LogicalOperatorType::GraphMatch
-                | LogicalOperatorType::GraphScan
-                | LogicalOperatorType::GraphExpand
-                | LogicalOperatorType::CreatePropertyGraph => *has_graph = true,
-                _ => {}
-            }
-            if matches!(
-                frozen.physical.key.implementation,
-                PLANNER_HASH_JOIN_RUNTIME_FILTER | PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER
-            ) {
-                shape.runtime_filter_joins = shape.runtime_filter_joins.saturating_add(1);
-            }
-            for child in frozen.children.iter() {
-                visit(
-                    child,
-                    state,
-                    choices,
-                    rules,
-                    shape,
-                    cte_producers,
-                    cte_consumers,
-                    cte_producer_witnesses,
-                    has_filter,
-                    has_get,
-                    has_join,
-                    has_join_region,
-                    has_aggregate,
-                    has_cte_consumer,
-                    has_cte_producer,
-                    has_ordering,
-                    has_graph,
-                    has_dependent,
-                    exact_contract,
-                    visited,
-                )?;
-            }
-            Ok(())
-        }
-
-        visit(
-            frozen,
-            &state,
-            &mut choices,
-            &mut rules,
-            &mut shape,
-            &mut cte_producers,
-            &mut cte_consumers,
-            &mut cte_producer_witnesses,
-            &mut has_filter,
-            &mut has_get,
-            &mut has_join,
-            &mut has_join_region,
-            &mut has_aggregate,
-            &mut has_cte_consumer,
-            &mut has_cte_producer,
-            &mut has_ordering,
-            &mut has_graph,
-            &mut has_dependent,
-            &mut exact_contract,
-            &mut visited,
-        )?;
-        if !exact_contract || choices.is_empty() {
+        let mut local_summaries = self
+            .local_summaries
+            .lock()
+            .expect("quality summary cache poisoned");
+        local_quality_summary(frozen, &state, &mut local_summaries);
+        let mut summary_visited = BTreeSet::new();
+        let Some(summary) =
+            compose_quality_summary(frozen, &local_summaries, &mut summary_visited)
+        else {
+            return Ok(None);
+        };
+        if !summary.exact_contract {
             return Ok(None);
         }
+        let mut choices = Vec::new();
+        let mut visited = BTreeSet::new();
+        collect_cached_choices(frozen, &local_summaries, &mut choices, &mut visited);
+        if choices.is_empty() {
+            return Ok(None);
+        }
+
+        let mut capabilities = BTreeSet::new();
+        let mut facts = BTreeSet::new();
+        let rules = &summary.rules;
 
         let has_any = |candidates: &[RuleId]| candidates.iter().any(|rule| rules.contains(rule));
         if frozen.winner.provided.satisfies(required) {
@@ -808,8 +835,8 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             return Ok(None);
         };
         if pending_domain_transfers.is_empty()
-            && has_filter
-            && has_get
+            && summary.has_filter
+            && summary.has_get
             && has_any(&[
                 PREDICATE_TRANSFER_RULE,
                 KEY_DOMAIN_TRANSFER_RULE,
@@ -818,19 +845,25 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         {
             facts.insert(BundleFact::PredicateDomain);
         }
-        if has_join && has_join_region {
+        if summary.has_join && summary.has_join_region {
             facts.insert(BundleFact::JoinRegion);
         }
-        let Some(aggregate_regions) =
-            selected_aggregate_region_witnesses(memo, &state, frozen, goal)
+        let Some(aggregate_regions) = selected_aggregate_region_witnesses(
+            memo,
+            &state,
+            frozen,
+            goal,
+            &local_summaries,
+        )
         else {
             return Ok(None);
         };
+        let mut shape = summary.shape;
         shape.aggregate_witness_nodes = aggregate_regions
             .iter()
             .filter(|witness| witness.covered)
             .count() as u32;
-        if has_aggregate
+        if summary.has_aggregate
             && !aggregate_regions.is_empty()
             && aggregate_regions.iter().all(|witness| witness.covered)
         {
@@ -840,18 +873,18 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         // that has a selected consumer has its own proof-bearing restriction.
         // This prevents one branch/consumer's transform from certifying a
         // different branch that merely shares the same CTE index.
-        if has_cte_consumer
-            && has_cte_producer
-            && !cte_consumers.is_empty()
-            && cte_consumers.is_subset(&cte_producers)
-            && cte_producers.is_subset(&cte_producer_witnesses)
+        if summary.has_cte_consumer
+            && summary.has_cte_producer
+            && !summary.cte_consumers.is_empty()
+            && summary.cte_consumers.is_subset(&summary.cte_producers)
+            && summary.cte_producers.is_subset(&summary.cte_producer_witnesses)
         {
             facts.insert(BundleFact::CteConsumerDemand);
         }
-        if exact_contract && (has_aggregate || has_join) {
+        if summary.exact_contract && (summary.has_aggregate || summary.has_join) {
             facts.insert(BundleFact::NullSemantics);
         }
-        if exact_contract {
+        if summary.exact_contract {
             facts.insert(BundleFact::ProviderCapability);
         }
         if matches!(
@@ -861,22 +894,22 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             facts.insert(BundleFact::OrderingDemand);
         }
 
-        if has_filter && has_get {
+        if summary.has_filter && summary.has_get {
             capabilities.insert(BundleCapability::ScanPredicate);
         }
-        if has_join {
+        if summary.has_join {
             capabilities.insert(BundleCapability::SmallJoin);
         }
-        if has_aggregate && has_cte_consumer && has_cte_producer {
+        if summary.has_aggregate && summary.has_cte_consumer && summary.has_cte_producer {
             capabilities.insert(BundleCapability::SharedAggregate);
         }
-        if has_dependent {
+        if summary.has_dependent {
             capabilities.insert(BundleCapability::CorrelatedSubquery);
         }
-        if has_ordering {
+        if summary.has_ordering {
             capabilities.insert(BundleCapability::Ordering);
         }
-        if has_graph {
+        if summary.has_graph {
             capabilities.insert(BundleCapability::GraphProvider);
         }
 
@@ -893,7 +926,7 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         proof.write_bytes(b"paro.quality.native-evidence.v1");
         proof.write_fingerprint(region);
         proof.write_u64(rules.len() as u64);
-        for rule in &rules {
+        for rule in rules {
             proof.write_u64(rule.0 as u64);
         }
         proof.write_u64(capabilities.len() as u64);
@@ -912,9 +945,21 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             applicability_proof: proof.finish(),
             choices: choices.into_boxed_slice(),
             aggregate_regions: aggregate_regions.into_boxed_slice(),
-            selected_rules: rules.into_iter().collect(),
+            selected_rules: rules.iter().copied().collect(),
             shape,
         }))
+    }
+
+    fn diagnostics(&self) -> QualityEvidenceDiagnostics {
+        let cache = self
+            .local_summaries
+            .lock()
+            .expect("quality summary cache poisoned");
+        QualityEvidenceDiagnostics {
+            local_summary_cache_hits: cache.hits,
+            local_summary_cache_misses: cache.misses,
+            local_summary_nodes: cache.nodes,
+        }
     }
 }
 
@@ -1524,6 +1569,7 @@ impl OptimizationInput {
             engine.set_quality_policy_handoff_enabled(true);
             engine.set_quality_evidence_provider(Arc::new(PlannerQualityEvidenceProvider {
                 state: self.planner_state.clone(),
+                local_summaries: Mutex::new(LocalQualitySummaryCache::default()),
             }));
         }
         engine.prime_grant_context(grant_classes.values().copied())?;
