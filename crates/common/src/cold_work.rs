@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 pub const MAX_OPERATORS: usize = 1024;
-const KINDS: usize = 6;
+const KINDS: usize = 9;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -64,8 +64,28 @@ pub fn enabled() -> bool {
 }
 
 #[derive(Clone, Copy)]
-pub enum Kind { BufferFill, Decoder, Dictionary, ZoneMap, GlobalInit, LocalInit }
-const NAMES: [&str; KINDS] = ["buffer_fill", "decoder", "dictionary", "zone_map", "global_init", "local_init"];
+pub enum Kind {
+    BufferFill,
+    Decoder,
+    BitShuffleDecompress,
+    BitShuffleUnshuffle,
+    BitShuffleMaterialize,
+    Dictionary,
+    ZoneMap,
+    GlobalInit,
+    LocalInit,
+}
+const NAMES: [&str; KINDS] = [
+    "buffer_fill",
+    "decoder",
+    "bitshuffle_decompress",
+    "bitshuffle_unshuffle",
+    "bitshuffle_materialize",
+    "dictionary",
+    "zone_map",
+    "global_init",
+    "local_init",
+];
 
 pub struct WorkScope {
     started: Instant,

@@ -444,6 +444,10 @@ impl BitShufflePageDecoder {
         // Decompress only after the page header and the embedded LZ4 size
         // prefix agree on the exact output allocation.
         let compressed_data = &self.data[BITSHUFFLE_PAGE_HEADER_SIZE..];
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::BitShuffleDecompress,
+            compressed_data.len(),
+        );
         let decompressed = decompress_size_prepended_exact(compressed_data, expected_size)?;
 
         self.shuffled_data = Some(Bytes::from(decompressed));
@@ -792,6 +796,10 @@ impl BitShufflePageDecoder {
                 output.len(),
             )));
         }
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::BitShuffleMaterialize,
+            expected_size,
+        );
         if let Some(decoded) = &self.decoded_data {
             output.copy_from_slice(decoded);
             return Ok(());
@@ -973,6 +981,10 @@ fn bitunshuffle_into(
             "BitShuffle page has an invalid block layout",
         ));
     }
+    let _cold_work = paro_common::cold_work::WorkScope::new(
+        paro_common::cold_work::Kind::BitShuffleUnshuffle,
+        data.len(),
+    );
     output.fill(0);
 
     for block_start in (0..num_elements).step_by(block_elements) {
