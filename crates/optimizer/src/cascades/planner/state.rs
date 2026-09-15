@@ -362,6 +362,21 @@ pub(super) struct PlannerTransformState {
     pub(super) scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 }
 
+/// A borrow-only view of the one planning-session identity namespace.
+///
+/// Settlement used to own another `ColumnCatalog`, `BindingCatalog`, and
+/// `ScalarArena`.  Besides doing the same lowering twice, that made a
+/// `ColumnId` or `ScalarExprId` look valid simply because its ordinal happened
+/// to exist in the other catalog.  The view deliberately carries no storage:
+/// settlement and staging must use the catalogs owned by
+/// `PlannerTransformState`, while facts and occurrence bindings remain
+/// separate values layered on top of these structural identities.
+pub(super) struct PlannerResidentIdentity<'a> {
+    pub(super) columns: &'a mut ColumnCatalog,
+    pub(super) scalars: &'a mut ScalarArena,
+    pub(super) binding_ids: &'a mut BindingCatalog,
+}
+
 #[derive(Clone)]
 pub(super) struct PlannerTransformSavepoint {
     staging_arena_checkpoint: paro_planner::plan::arena::PlanArenaCheckpoint,

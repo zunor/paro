@@ -48,9 +48,20 @@ fn settle_with_session_arena(
     plan: OwnedLogicalPlan,
     environment: &PlannerRuleEnvironment,
 ) -> Result<Option<settlement::SettledExpression>> {
-    state
-        .settlement_cache
-        .settle_arena_in(plan, environment, &mut state.staging_arena)
+    let PlannerTransformState {
+        settlement_cache,
+        staging_arena,
+        columns,
+        scalars,
+        binding_ids,
+        ..
+    } = state;
+    let mut identity = PlannerResidentIdentity {
+        columns,
+        scalars,
+        binding_ids,
+    };
+    settlement_cache.settle_arena_in(plan, environment, staging_arena, &mut identity)
 }
 
 pub(super) fn register_transformations(
@@ -1138,11 +1149,13 @@ impl TransformationRule for PlannerTransformationRule {
                 shell: NativeShell,
                 column_stats: SharedColumnStatistics,
                 scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
+                resident_nodes: HashMap<paro_planner::plan::PlanNodeId, settlement::ResidentNodeContract>,
             },
             Settled {
                 plan: paro_planner::plan::arena::PlanIndex,
                 column_stats: SharedColumnStatistics,
                 scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
+                resident_nodes: HashMap<paro_planner::plan::PlanNodeId, settlement::ResidentNodeContract>,
                 selected_proofs: HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
             },
         }
@@ -1196,23 +1209,56 @@ impl TransformationRule for PlannerTransformationRule {
                         });
                         let mut state = self.planner_state.write()
                             .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
-                        let state = &mut *state;
-                        let Some(settlement::SettledNative { expression, holes, proofs }) = state
-                            .settlement_cache.settle_native_in(shell, &environment, &mut state.staging_arena)?
+                        let settled = {
+                            let state = &mut *state;
+                            let PlannerTransformState {
+                                settlement_cache,
+                                staging_arena,
+                                columns,
+                                scalars,
+                                binding_ids,
+                                ..
+                            } = state;
+                            let mut identity = PlannerResidentIdentity {
+                                columns,
+                                scalars,
+                                binding_ids,
+                            };
+                            let result = settlement_cache.settle_native_in(
+                                shell,
+                                &environment,
+                                staging_arena,
+                                &mut identity,
+                            );
+                            drop(identity);
+                            result?
+                        };
+                        let Some(settlement::SettledNative { expression, holes, proofs }) = settled
                         else { return Ok(Box::new([])); };
-                        let settlement::SettledExpression { plan, statistics, scopes } = expression;
+                        let settlement::SettledExpression {
+                            plan,
+                            statistics,
+                            scopes,
+                            resident_nodes,
+                        } = expression;
                         if environment.verify_enabled {
                             crate::verify::verify_arena_plan(&state.staging_arena.plan(plan)?, || {
                                 environment.session.cancellation.check()
                             })?;
                         }
                         let plan = semantic_plan::freeze_arena_output_layout(
-                            plan, &source_output_columns, state,
+                            plan, &source_output_columns, &mut state,
                         )?;
                         let root_operator = state.staging_arena.get(plan)?.operator.op_type();
                         let output_layout = state.staging_arena.output_layout(plan)?.clone();
                         (
-                            PreparedPlan::Settled { plan, column_stats: statistics, scopes, selected_proofs: proofs },
+                            PreparedPlan::Settled {
+                                plan,
+                                column_stats: statistics,
+                                scopes,
+                                resident_nodes,
+                                selected_proofs: proofs,
+                            },
                             root_operator,
                             output_layout,
                             holes,
@@ -1226,6 +1272,7 @@ impl TransformationRule for PlannerTransformationRule {
                                 shell,
                                 column_stats: source_stats.clone(),
                                 scopes: native_domain_scopes.take().unwrap_or_default(),
+                                resident_nodes: HashMap::new(),
                             },
                             root_operator,
                             output_layout,
@@ -1259,12 +1306,37 @@ impl TransformationRule for PlannerTransformationRule {
                                     shell,
                                     column_stats: source_stats.clone(),
                                     scopes: HashMap::new(),
+                                    resident_nodes: HashMap::new(),
                                 },
                                 root_operator,
                                 output_layout,
                                 retained_group_holes,
                             )
                         } else {
+                            // Settlement interns the shared session identities
+                            // and appends the arena before the semantic guard
+                            // and Memo publication below.  Enlist its
+                            // savepoint at the first such write so an
+                            // incompatible or duplicate result cannot leak
+                            // resident columns/scalars into the next binding.
+                            let savepoint = self
+                                .planner_state
+                                .read()
+                                .map_err(|_| {
+                                    paro_error::internal("planner transform state poisoned")
+                                })?
+                                .savepoint();
+                            let rollback_state = self.planner_state.clone();
+                            ctx.enlist_rollback(move || {
+                                rollback_state
+                                    .write()
+                                    .map_err(|_| {
+                                        paro_error::internal(
+                                            "planner transform state poisoned during rollback",
+                                        )
+                                    })?
+                                    .rollback_to(savepoint)
+                            });
                             let settled = {
                                 let mut planner_state = self
                                     .planner_state
@@ -1276,6 +1348,7 @@ impl TransformationRule for PlannerTransformationRule {
                                 plan,
                                 statistics: column_stats,
                                 scopes,
+                                resident_nodes,
                             }) = settled
                             else {
                                 return Ok(Box::new([]));
@@ -1307,6 +1380,7 @@ impl TransformationRule for PlannerTransformationRule {
                                     plan,
                                     column_stats,
                                     scopes,
+                                    resident_nodes,
                                     selected_proofs,
                                 },
                                 root_operator,
@@ -1411,26 +1485,30 @@ impl TransformationRule for PlannerTransformationRule {
                         child_context,
                         nested_group_holes,
                     } = prepared;
-                    let (plan, column_stats, column_stat_scopes, selected_proofs) = match plan {
+                    let (plan, column_stats, column_stat_scopes, resident_nodes, selected_proofs) = match plan {
                         PreparedPlan::Native {
                             shell,
                             column_stats,
                             scopes,
+                            resident_nodes,
                         } => (
                             StagingInput::Native(shell),
                             column_stats,
                             scopes,
+                            resident_nodes,
                             HashMap::new(),
                         ),
                         PreparedPlan::Settled {
                             plan,
                             column_stats,
                             scopes,
+                            resident_nodes,
                             selected_proofs,
                         } => (
                             StagingInput::Arena(plan),
                             column_stats,
                             scopes,
+                            resident_nodes,
                             selected_proofs,
                         ),
                     };
@@ -1456,6 +1534,7 @@ impl TransformationRule for PlannerTransformationRule {
                                 inherited_runtime_filter_facet: source_runtime_filter_facet,
                             },
                             nested_group_holes,
+                            resident_nodes,
                             selected_proofs,
                         },
                         memo,

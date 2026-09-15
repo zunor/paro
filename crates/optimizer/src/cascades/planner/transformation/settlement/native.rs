@@ -20,11 +20,12 @@ impl SettlementCache {
         shell: NativeShell,
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
+        identity: &mut PlannerResidentIdentity<'_>,
     ) -> Result<Option<SettledNative>> {
         let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
         let _site = crate::work_partition::cache_site(crate::work_partition::CacheSite::Native);
         let checkpoint = arena.checkpoint();
-        let result = self.settle_native_impl(shell, environment, arena);
+        let result = self.settle_native_impl(shell, environment, arena, identity);
         if !matches!(result, Ok(Some(_))) {
             let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Rollback);
             arena.rollback_to(checkpoint)?;
@@ -38,6 +39,7 @@ impl SettlementCache {
         shell: NativeShell,
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
+        identity: &mut PlannerResidentIdentity<'_>,
     ) -> Result<Option<SettledNative>> {
         let root = shell.root;
         let mut indices = Vec::with_capacity(shell.nodes.len());
@@ -111,7 +113,7 @@ impl SettlementCache {
             .ok_or_else(|| paro_error::internal("native settlement lost its root"))?;
         let mut proofs = HashMap::<PlanNodeId, Box<[EquivalenceProof]>>::new();
         let Some(expression) =
-            self.settle_root_in(root, environment, arena, |source, output, arena| {
+            self.settle_root_in(root, environment, arena, identity, |source, output, arena| {
                 if let Some(inherited) = source_proofs.get(&source) {
                     if matches!(arena.get(output)?.operator, LogicalOperator::BoundReference(_)) {
                         // Staging consumes an opaque operand without creating
@@ -144,6 +146,18 @@ impl SettlementCache {
             holes,
             proofs,
         }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn settle_native_test_in(
+        &mut self,
+        shell: NativeShell,
+        environment: &PlannerRuleEnvironment,
+        arena: &mut LogicalPlanArena,
+    ) -> Result<Option<SettledNative>> {
+        self.with_test_identity(|cache, identity| {
+            cache.settle_native_in(shell, environment, arena, identity)
+        })
     }
 }
 
@@ -200,13 +214,13 @@ mod tests {
         let mut cache = SettlementCache::default();
         let empty = arena.checkpoint();
         let first = cache
-            .settle_native_in(values(&environment, 4), &environment, &mut arena)
+            .settle_native_test_in(values(&environment, 4), &environment, &mut arena)
             .unwrap()
             .unwrap();
         let first_node = arena.get(first.expression.plan).unwrap().clone();
         let misses = cache.misses;
         let next = cache
-            .settle_native_in(values(&environment, 4), &environment, &mut arena)
+            .settle_native_test_in(values(&environment, 4), &environment, &mut arena)
             .unwrap()
             .unwrap();
         let next_node = arena.get(next.expression.plan).unwrap();
@@ -215,7 +229,7 @@ mod tests {
         assert_ne!(first_node.id, next_node.id);
         assert_eq!(first_node.stats, next_node.stats);
         let changed = cache
-            .settle_native_in(values(&environment, 9), &environment, &mut arena)
+            .settle_native_test_in(values(&environment, 9), &environment, &mut arena)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -233,7 +247,7 @@ mod tests {
         cache.discard_stale_recipes(&arena);
         assert!(cache.locals.is_empty());
         let rebuilt = cache
-            .settle_native_in(values(&environment, 4), &environment, &mut arena)
+            .settle_native_test_in(values(&environment, 4), &environment, &mut arena)
             .unwrap()
             .unwrap();
         assert!(!arena.owns(first.expression.plan));
@@ -253,7 +267,7 @@ mod tests {
         let mut arena = LogicalPlanArena::default();
         let mut cache = SettlementCache::default();
         assert!(cache
-            .settle_native_in(values(&environment, 4), &environment, &mut arena)
+            .settle_native_test_in(values(&environment, 4), &environment, &mut arena)
             .unwrap()
             .is_none());
         assert!(arena.is_empty());
@@ -270,7 +284,7 @@ mod tests {
             source_proofs: Box::new([]),
         });
         assert!(cache
-            .settle_native_in(
+            .settle_native_test_in(
                 NativeShell {
                     nodes: invalid.into_boxed_slice(),
                     root: 1

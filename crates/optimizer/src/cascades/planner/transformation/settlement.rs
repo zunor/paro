@@ -144,13 +144,15 @@ struct SettledLocal {
     /// Statistics needed by this operator's expressions, including columns
     /// which are consumed locally but not returned by its projection map.
     statistics: SharedColumnStatistics,
+    /// The structural lowering produced while the local node was settled.
+    /// Staging consumes this immutable contract instead of interning the same
+    /// operator a second time.  It is deliberately separate from `facts`:
+    /// the structure may be reused with a new fact version.
+    resident: Option<ResidentNodeContract>,
 }
 
 #[derive(Debug, Default)]
 pub(in crate::cascades::planner) struct SettlementCache {
-    columns: ColumnCatalog,
-    bindings: BindingCatalog,
-    scalars: ScalarArena,
     locals: BTreeMap<LocalKey, SettledLocal>,
     recipe_prefix: Option<paro_planner::plan::arena::PlanArenaCheckpoint>,
     local_shapes: BTreeSet<LocalShape>,
@@ -179,12 +181,38 @@ pub(in crate::cascades::planner) struct SettlementCache {
     pub(in crate::cascades::planner) input_column_cache_misses: u64,
     #[cfg(test)]
     test_arena: LogicalPlanArena,
+    #[cfg(test)]
+    test_identity: TestResidentIdentity,
+}
+
+/// The exact structural result of settling one occurrence.  Column and
+/// scalar IDs belong to the planner session's catalogs, not to settlement's
+/// private namespace.  The output layout and input fact identities are kept
+/// with the contract so staging can validate that it is consuming the same
+/// occurrence rather than merely trusting an operator fingerprint.
+#[derive(Debug, Clone)]
+pub(super) struct ResidentNodeContract {
+    pub(super) operator_fingerprint: Fingerprint,
+    pub(super) operator_encoding: Box<[u8]>,
+    pub(super) scalar_roots: Box<[ScalarExprId]>,
+    pub(super) output_columns: Box<[ColumnId]>,
+    pub(super) output_layout: LogicalOutputLayout,
+    pub(super) input_facts: Box<[FactId]>,
 }
 
 pub(super) struct SettledExpression<Plan = PlanIndex> {
     pub(super) plan: Plan,
     pub(super) statistics: SharedColumnStatistics,
     pub(super) scopes: HashMap<PlanNodeId, SharedColumnStatistics>,
+    pub(super) resident_nodes: HashMap<PlanNodeId, ResidentNodeContract>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestResidentIdentity {
+    columns: ColumnCatalog,
+    scalars: ScalarArena,
+    binding_ids: BindingCatalog,
 }
 
 fn intern_columns_into(
@@ -216,9 +244,6 @@ fn intern_columns_into(
 }
 
 impl SettlementCache {
-    pub(in crate::cascades::planner) fn bound_import_counts(&self) -> (u64, u64) {
-        self.scalars.bound_import_counts()
-    }
     pub(in crate::cascades::planner) fn discard_stale_recipes(&mut self, arena: &LogicalPlanArena) {
         if self
             .recipe_prefix
@@ -358,10 +383,11 @@ impl SettlementCache {
         ctes: &CteEnvironment,
         environment: &PlannerRuleEnvironment,
         recipes: &mut LogicalPlanArena,
+        identity: &mut PlannerResidentIdentity<'_>,
     ) -> Result<SettledLocal> {
         let scalar_free = operator_has_no_scalar_payload(&shell.operator);
         let shape = LocalShape {
-            operator_tag: operator_shape_tag(&shell.operator, &self.scalars)?,
+            operator_tag: operator_shape_tag(&shell.operator, identity.scalars)?,
             inputs: inputs.into(),
             input_stats: shell.stats.clone(),
         };
@@ -414,19 +440,20 @@ impl SettlementCache {
             .iter()
             .map(|id| self.facts[*id].maximum)
             .collect::<Vec<_>>();
-        let output = shell
+        let shell_output_layout = shell
             .operator
             .output_layout_from_child_refs(&child_layout_refs);
         drop(child_layout_refs);
-        let output_columns = intern_columns_into(&mut self.bindings, &mut self.columns, &output)?;
+        let output_columns =
+            intern_columns_into(identity.binding_ids, identity.columns, &shell_output_layout)?;
         for id in inputs {
             let fact = self.facts.get_mut(*id).ok_or_else(|| {
                 paro_error::internal("settlement input references an unknown fact")
             })?;
             if fact.binding_columns.is_none() {
                 fact.binding_columns = Some(intern_columns_into(
-                    &mut self.bindings,
-                    &mut self.columns,
+                    identity.binding_ids,
+                    identity.columns,
                     &fact.layout,
                 )?);
                 self.input_column_cache_misses += 1;
@@ -442,21 +469,21 @@ impl SettlementCache {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let (roots, operator_identity) = if scalar_free {
+        let (roots, operator_encoding) = if scalar_free {
             let roots: Box<[ScalarExprId]> = Box::new([]);
-            let identity = query_operator_identity(&shell.operator, &roots, &self.scalars)?.1;
-            (roots, identity)
+            let encoding = query_operator_identity(&shell.operator, &roots, identity.scalars)?.1;
+            (roots, encoding)
         } else {
             let roots = intern_operator_scalars(
                 &shell.operator,
                 &output_columns,
                 &child_columns,
-                &mut self.bindings,
-                &mut self.columns,
-                &mut self.scalars,
+                identity.binding_ids,
+                identity.columns,
+                identity.scalars,
             )?;
-            let identity = query_operator_identity(&shell.operator, &roots, &self.scalars)?.1;
-            (roots, identity)
+            let encoding = query_operator_identity(&shell.operator, &roots, identity.scalars)?.1;
+            (roots, encoding)
         };
         let cte = if let LogicalOperator::CTERef(reference) = &shell.operator {
             ctes.get(&reference.cte_index)
@@ -465,7 +492,7 @@ impl SettlementCache {
             None
         };
         let key = LocalKey {
-            operator: operator_identity,
+            operator: operator_encoding,
             scalars: roots,
             output: output_columns,
             inputs: inputs.into(),
@@ -555,6 +582,7 @@ impl SettlementCache {
                 facts,
                 shape: shape.clone(),
                 statistics: context.column_stats,
+                resident: None,
             };
             self.local_shapes.insert(shape);
             self.local_shape_entries
@@ -565,7 +593,7 @@ impl SettlementCache {
             self.recipe_prefix = Some(recipes.checkpoint());
             return Ok(entry);
         }
-        let (plan, output, maximum) = gathering.gather_local(
+        let (plan, output_layout, maximum) = gathering.gather_local(
             plan,
             &child_layouts,
             &child_maxima,
@@ -600,7 +628,7 @@ impl SettlementCache {
         if let LogicalOperator::SetOperation(_) = &plan.operator {
             if inputs.len() == 2 {
                 crate::statistics::gathering::merge_set_operation_column_statistics(
-                    &output,
+                    &output_layout,
                     &self.facts[inputs[0]].columns,
                     &self.facts[inputs[1]].columns,
                     &mut context,
@@ -608,11 +636,21 @@ impl SettlementCache {
             }
         }
         drop(statistics_partition);
+        let resident = Some(self.resident_contract(
+            &plan.operator,
+            &output_layout,
+            inputs,
+            identity,
+            &shell_output_layout,
+            &key.output,
+            &key.scalars,
+            &key.operator,
+        )?);
         let facts = self.intern_fact(RelationFacts {
-            columns: output
+            columns: output_layout
                 .bindings()
                 .iter()
-                .zip(output.types())
+                .zip(output_layout.types())
                 .map(|(binding, ty)| {
                     context
                         .column_stats
@@ -621,7 +659,7 @@ impl SettlementCache {
                         .unwrap_or_else(|| ColumnStatistics::create_unknown(ty.clone()))
                 })
                 .collect(),
-            layout: output,
+            layout: output_layout,
             stats: plan.stats.clone(),
             maximum,
             column_ids: Box::new([]),
@@ -632,6 +670,7 @@ impl SettlementCache {
             facts,
             shape: shape.clone(),
             statistics: context.column_stats,
+            resident,
         };
         self.local_shapes.insert(shape);
         self.local_shape_entries
@@ -641,6 +680,106 @@ impl SettlementCache {
         self.locals.insert(key, entry.clone());
         self.recipe_prefix = Some(recipes.checkpoint());
         Ok(entry)
+    }
+
+    /// Build the direct lowering contract from the post-statistics operator.
+    /// This is the only point at which the settled occurrence is interned;
+    /// staging receives the resulting IDs and does not walk the scalar tree a
+    /// second time.  The input FactIds are retained as an exact dependency
+    /// witness even though the current staging consumer only needs the
+    /// structural part of the contract.
+    fn resident_contract<Child>(
+        &self,
+        operator: &LogicalOperator<Child>,
+        output_layout: &LogicalOutputLayout,
+        inputs: &[FactId],
+        identity: &mut PlannerResidentIdentity<'_>,
+        settled_input_layout: &LogicalOutputLayout,
+        settled_output_columns: &[ColumnId],
+        settled_scalar_roots: &[ScalarExprId],
+        settled_operator_encoding: &[u8],
+    ) -> Result<ResidentNodeContract> {
+        // The pre-statistics lowering above already interned the exact shell
+        // into the session catalogs to form `LocalKey`.  Statistics gathering
+        // normally changes only facts; reuse those identities after checking
+        // the final semantic encoding.  Re-run scalar lowering only when the
+        // statistics/normalization pass actually changed the operator or its
+        // output layout.
+        let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) =
+            if output_layout == settled_input_layout {
+                let (fingerprint, encoding) = query_operator_identity(
+                    operator,
+                    settled_scalar_roots,
+                    identity.scalars,
+                )?;
+                if encoding.as_ref() == settled_operator_encoding {
+                    (
+                        settled_output_columns.to_vec().into_boxed_slice(),
+                        settled_scalar_roots.to_vec().into_boxed_slice(),
+                        fingerprint,
+                        encoding,
+                    )
+                } else {
+                    self.relower_resident_contract(
+                        operator,
+                        output_layout,
+                        inputs,
+                        identity,
+                    )?
+                }
+            } else {
+                self.relower_resident_contract(operator, output_layout, inputs, identity)?
+            };
+        Ok(ResidentNodeContract {
+            operator_fingerprint,
+            operator_encoding,
+            scalar_roots,
+            output_columns,
+            output_layout: output_layout.clone(),
+            input_facts: inputs.into(),
+        })
+    }
+
+    fn relower_resident_contract<Child>(
+        &self,
+        operator: &LogicalOperator<Child>,
+        output_layout: &LogicalOutputLayout,
+        inputs: &[FactId],
+        identity: &mut PlannerResidentIdentity<'_>,
+    ) -> Result<(Box<[ColumnId]>, Box<[ScalarExprId]>, Fingerprint, Box<[u8]>)> {
+        let output_columns = intern_columns_into(
+            identity.binding_ids,
+            identity.columns,
+            output_layout,
+        )?;
+        let child_columns = inputs
+            .iter()
+            .map(|id| {
+                self.facts[*id].binding_columns.as_deref().ok_or_else(|| {
+                    paro_error::internal("settlement input has no interned layout columns")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let scalar_roots = if operator_has_no_scalar_payload(operator) {
+            Box::new([])
+        } else {
+            intern_operator_scalars(
+                operator,
+                &output_columns,
+                &child_columns,
+                identity.binding_ids,
+                identity.columns,
+                identity.scalars,
+            )?
+        };
+        let (operator_fingerprint, operator_encoding) =
+            query_operator_identity(operator, &scalar_roots, identity.scalars)?;
+        Ok((
+            output_columns,
+            scalar_roots,
+            operator_fingerprint,
+            operator_encoding,
+        ))
     }
 
     fn output_layout_matches<Child>(
@@ -670,6 +809,37 @@ impl SettlementCache {
             plan: self.test_arena.export(settled.plan)?,
             statistics: settled.statistics,
             scopes: settled.scopes,
+            resident_nodes: settled.resident_nodes,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_test_identity<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut PlannerResidentIdentity<'_>) -> R,
+    ) -> R {
+        let mut owned = std::mem::take(&mut self.test_identity);
+        let result = {
+            let mut view = PlannerResidentIdentity {
+                columns: &mut owned.columns,
+                scalars: &mut owned.scalars,
+                binding_ids: &mut owned.binding_ids,
+            };
+            f(self, &mut view)
+        };
+        self.test_identity = owned;
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) fn settle_arena_test_in(
+        &mut self,
+        plan: OwnedLogicalPlan,
+        environment: &PlannerRuleEnvironment,
+        arena: &mut LogicalPlanArena,
+    ) -> Result<Option<SettledExpression>> {
+        self.with_test_identity(|cache, identity| {
+            cache.settle_arena_in(plan, environment, arena, identity)
         })
     }
 
@@ -680,7 +850,7 @@ impl SettlementCache {
         environment: &PlannerRuleEnvironment,
     ) -> Result<SettledExpression> {
         let mut arena = std::mem::take(&mut self.test_arena);
-        let result = self.settle_arena_in(plan, environment, &mut arena);
+        let result = self.settle_arena_test_in(plan, environment, &mut arena);
         self.test_arena = arena;
         result?.ok_or_else(|| paro_error::internal("test settlement was interrupted"))
     }
@@ -692,11 +862,12 @@ impl SettlementCache {
         plan: OwnedLogicalPlan,
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
+        identity: &mut PlannerResidentIdentity<'_>,
     ) -> Result<Option<SettledExpression>> {
         let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
         let _site = crate::work_partition::cache_site(crate::work_partition::CacheSite::Owned);
         let checkpoint = arena.checkpoint();
-        let result = self.settle_arena_impl(plan, environment, arena);
+        let result = self.settle_arena_impl(plan, environment, arena, identity);
         if !matches!(result, Ok(Some(_))) {
             let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Rollback);
             arena.rollback_to(checkpoint)?;
@@ -710,6 +881,7 @@ impl SettlementCache {
         plan: OwnedLogicalPlan,
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
+        identity: &mut PlannerResidentIdentity<'_>,
     ) -> Result<Option<SettledExpression>> {
         if !environment.control.checkpoint()? {
             return Ok(None);
@@ -721,7 +893,7 @@ impl SettlementCache {
         else {
             return Ok(None);
         };
-        self.settle_root_in(root, environment, arena, |_, _, _| Ok(()))
+        self.settle_root_in(root, environment, arena, identity, |_, _, _| Ok(()))
     }
 
     /// Both owned imports and native node batches use this producer-first
@@ -732,6 +904,7 @@ impl SettlementCache {
         root: PlanIndex,
         environment: &PlannerRuleEnvironment,
         arena: &mut LogicalPlanArena,
+        identity: &mut PlannerResidentIdentity<'_>,
         mut completed_occurrence: impl FnMut(PlanIndex, PlanIndex, &LogicalPlanArena) -> Result<()>,
     ) -> Result<Option<SettledExpression>> {
         enum Task {
@@ -754,6 +927,7 @@ impl SettlementCache {
             demand::BindingMap,
         )>::new();
         let mut scopes = HashMap::new();
+        let mut resident_nodes = HashMap::new();
         while let Some(task) = pending.pop() {
             environment.session.cancellation.check()?;
             if !environment.control.checkpoint()? {
@@ -869,6 +1043,7 @@ impl SettlementCache {
                         &ctes,
                         environment,
                         arena,
+                        identity,
                     )?;
                     let mut remapped = BTreeMap::new();
                     for recipe_index in arena.post_order(local.recipe)? {
@@ -896,6 +1071,20 @@ impl SettlementCache {
                         remapped.insert(recipe_index, mapped);
                     }
                     let output = remapped[&local.recipe];
+                    if let Some(contract) = local.resident.clone() {
+                        let node = arena.get(output)?;
+                        if matches!(node.operator, LogicalOperator::BoundReference(_)) {
+                            return Err(paro_error::internal(
+                                "settled resident contract crossed an opaque group boundary",
+                            ));
+                        }
+                        if arena.output_layout(output)? != &contract.output_layout {
+                            return Err(paro_error::internal(
+                                "settled resident contract has an incompatible output layout",
+                            ));
+                        }
+                        resident_nodes.insert(node.id, contract);
+                    }
                     completed_occurrence(index, output, arena)?;
                     completed.push((
                         output,
@@ -914,6 +1103,7 @@ impl SettlementCache {
             plan: root,
             statistics,
             scopes,
+            resident_nodes,
         }))
     }
 }
@@ -1151,7 +1341,7 @@ mod tests {
                     .map(|columns| (columns.as_ptr(), columns.to_vec()))
             })
             .collect::<Vec<_>>();
-        let native_column_count = cache.columns.len();
+        let native_column_count = cache.test_identity.columns.len();
         assert_eq!(cache.input_column_cache_misses, 1);
         let second = cache
             .settle(
@@ -1163,7 +1353,7 @@ mod tests {
         assert_eq!(cache.hits, 2);
         assert_eq!(cache.input_column_cache_misses, 1);
         assert_eq!(cache.input_column_cache_hits, 1);
-        assert_eq!(cache.columns.len(), native_column_count);
+        assert_eq!(cache.test_identity.columns.len(), native_column_count);
         assert_eq!(
             cache
                 .facts
@@ -1188,7 +1378,7 @@ mod tests {
         let mut arena = LogicalPlanArena::default();
         let empty = arena.checkpoint();
         let first = cache
-            .settle_arena_in(
+            .settle_arena_test_in(
                 project(
                     &environment.bind_context,
                     values(&environment.bind_context, 4),
@@ -1199,7 +1389,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let retained = arena.checkpoint();
-        let native_columns = cache.columns.len();
+        let native_columns = cache.test_identity.columns.len();
         let interned_layouts = cache.input_column_cache_misses;
         assert!(!cache.locals.is_empty());
         for _ in 0..1000 {
@@ -1220,7 +1410,7 @@ mod tests {
         assert!(cache.invalidation_visits > 0);
         assert!(cache.locals.is_empty());
         let next = cache
-            .settle_arena_in(
+            .settle_arena_test_in(
                 project(
                     &environment.bind_context,
                     values(&environment.bind_context, 4),
@@ -1232,7 +1422,7 @@ mod tests {
             .unwrap();
         assert!(!arena.owns(first.plan));
         assert!(arena.owns(next.plan));
-        assert_eq!(cache.columns.len(), native_columns);
+        assert_eq!(cache.test_identity.columns.len(), native_columns);
         assert_eq!(
             cache.input_column_cache_misses, interned_layouts,
             "recipe rollback must not invalidate the immutable fact/column namespace"
@@ -1447,7 +1637,9 @@ mod tests {
         let ctes = CteEnvironment::default();
         for _ in 0..2 {
             let result = cache
-                .local(shell.clone(), &[input], &ctes, &env, &mut arena)
+                .with_test_identity(|cache, identity| {
+                    cache.local(shell.clone(), &[input], &ctes, &env, &mut arena, identity)
+                })
                 .unwrap();
             let facts = &cache.facts[result.facts];
             assert_eq!(facts.stats.estimated_cardinality.unwrap().expected, 2);
@@ -1462,11 +1654,19 @@ mod tests {
         // Same local semantics, different pre-gather annotation: production
         // still misses today. Independently check actual output FactId, not
         // just the diagnostic comparator, before calling this fragmentation.
-        let prior = cache.local(shell.clone(), &[input], &ctes, &env, &mut arena).unwrap();
+        let prior = cache
+            .with_test_identity(|cache, identity| {
+                cache.local(shell.clone(), &[input], &ctes, &env, &mut arena, identity)
+            })
+            .unwrap();
         let misses = cache.misses;
         let mut annotated = shell.clone();
         annotated.stats.estimated_cardinality = Some(CardinalityEstimate::exact(999));
-        let repeated = cache.local(annotated.clone(), &[input], &ctes, &env, &mut arena).unwrap();
+        let repeated = cache
+            .with_test_identity(|cache, identity| {
+                cache.local(annotated.clone(), &[input], &ctes, &env, &mut arena, identity)
+            })
+            .unwrap();
         assert_eq!(prior.facts, repeated.facts);
         assert_eq!(cache.misses, misses + 1);
         let key = cache.locals.keys().find(|key| key.input_stats == annotated.stats).unwrap();
@@ -1489,7 +1689,18 @@ mod tests {
                 &env.bind_context, LogicalOperator::CTERef(CTERef::new(
                     2, 3, "unbound".into(), vec!["key".into()], vec![LogicalType::Integer]))));
             shell.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
-            let result = cache.local(shell.clone(), &[], &CteEnvironment::default(), &env, &mut arena).unwrap();
+            let result = cache
+                .with_test_identity(|cache, identity| {
+                    cache.local(
+                        shell.clone(),
+                        &[],
+                        &CteEnvironment::default(),
+                        &env,
+                        &mut arena,
+                        identity,
+                    )
+                })
+                .unwrap();
             assert_eq!(cache.facts[result.facts].stats.estimated_cardinality.unwrap().expected, rows);
             results.push(result.facts);
             let key = cache.locals.keys().find(|key| key.input_stats == shell.stats).unwrap();

@@ -463,6 +463,12 @@ pub(super) struct StagingRequest {
     pub(super) input_facts: boundary::BoundarySnapshot,
     pub(super) column_stats: SharedColumnStatistics,
     pub(super) column_stat_scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
+    /// Structural lowering already produced by settlement in the same
+    /// planner-session catalogs.  A settled occurrence is consumed exactly
+    /// once; native shells leave this map empty and use the normal staging
+    /// path.
+    pub(super) resident_nodes:
+        HashMap<paro_planner::plan::PlanNodeId, settlement::ResidentNodeContract>,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
     /// Opaque Memo inputs retained by the transformed expression. Inputs
@@ -501,6 +507,7 @@ pub(super) fn stage_transformed_expression(
         input_facts,
         column_stats,
         column_stat_scopes,
+        resident_nodes,
         target:
             StagingTarget {
                 group: target,
@@ -552,12 +559,15 @@ pub(super) fn stage_transformed_expression(
         facts: boundary::BoundarySnapshot,
         search_candidates: HashMap<paro_planner::plan::PlanNodeId, OwnedLogicalPlan>,
         selected_proofs: HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
+        resident_nodes:
+            HashMap<paro_planner::plan::PlanNodeId, settlement::ResidentNodeContract>,
     }
 
     enum NodeStagingInput {
         Settled {
             node: paro_planner::plan::arena::LogicalPlanNode<()>,
             layout: Arc<paro_planner::operator::LogicalOutputLayout>,
+            resident: Option<settlement::ResidentNodeContract>,
         },
         Native {
             id: paro_planner::plan::PlanNodeId,
@@ -674,9 +684,13 @@ pub(super) fn stage_transformed_expression(
             target_child_context,
             refined_cardinality_kind,
         } = request;
-        let (id, stats, semantic_operator, settled_layout, source_proofs) =
+        let (id, stats, semantic_operator, settled_layout, source_proofs, resident) =
             match input {
-                NodeStagingInput::Settled { node, layout } => {
+                NodeStagingInput::Settled {
+                    node,
+                    layout,
+                    resident,
+                } => {
                     crate::work_partition::settled_node(false);
                     if let LogicalOperator::BoundReference(reference) = &node.operator {
                         if target.is_some()
@@ -706,6 +720,7 @@ pub(super) fn stage_transformed_expression(
                         node.operator,
                         Some(layout),
                         source_proofs,
+                        resident,
                     )
                 }
                 NodeStagingInput::Native {
@@ -724,6 +739,7 @@ pub(super) fn stage_transformed_expression(
                         semantic_operator,
                         None,
                         source_proofs,
+                        None,
                     )
                 }
             };
@@ -761,9 +777,28 @@ pub(super) fn stage_transformed_expression(
             .iter()
             .map(|child| child.layout.as_ref())
             .collect::<Vec<_>>();
-        let output_layout = settled_layout.unwrap_or_else(|| {
-            Arc::new(semantic_operator.output_layout_from_child_refs(&child_layouts))
-        });
+        if let Some(contract) = resident.as_ref() {
+            if contract.input_facts.len() != child_states.len() {
+                return Err(paro_error::internal(
+                    "settled resident contract has an incompatible fact arity",
+                ));
+            }
+        }
+        let output_layout = match (settled_layout, resident.as_ref()) {
+            (Some(layout), Some(contract)) => {
+                if layout.as_ref() != &contract.output_layout {
+                    return Err(paro_error::internal(
+                        "settled resident contract disagrees with arena output layout",
+                    ));
+                }
+                layout
+            }
+            (Some(layout), None) => layout,
+            (None, Some(contract)) => Arc::new(contract.output_layout.clone()),
+            (None, None) => {
+                Arc::new(semantic_operator.output_layout_from_child_refs(&child_layouts))
+            }
+        };
         let output_bindings = output_layout.bindings();
         let output_types = output_layout.types();
         let child_names = child_states
@@ -777,41 +812,70 @@ pub(super) fn stage_transformed_expression(
                 "transformed plan output binding/type arity mismatch",
             ));
         }
-        let mut output_columns = Vec::with_capacity(output_bindings.len());
-        for (index, (binding, logical_type)) in output_bindings
-            .iter()
-            .copied()
-            .zip(output_types.iter().cloned())
-            .enumerate()
-        {
-            let type_domain = logical_type_fingerprint(&logical_type);
-            let id = if let Some(id) = state
-                .binding_ids
-                .get(binding.table_index, binding.column_index, &logical_type)
-                .copied()
+        let output_columns: Arc<[ColumnId]> = if let Some(contract) = resident.as_ref() {
+            if contract.output_columns.len() != output_bindings.len()
+                || contract.output_layout.bindings() != output_bindings
+                || contract.output_layout.types() != output_types
             {
-                id
-            } else {
-                let id = state.columns.intern(
-                    logical_type.clone(),
-                    true,
-                    ColumnOrigin::Derived {
-                        key: typed_binding_fingerprint(binding, type_domain),
-                    },
-                    ColumnVisibility::Visible,
-                    output_names.get(index).cloned(),
-                )?;
-                state.binding_ids.insert(
-                    binding.table_index,
-                    binding.column_index,
-                    &logical_type,
-                    id,
-                )?;
-                id
-            };
-            output_columns.push(id);
-        }
-        let output_columns: Arc<[ColumnId]> = output_columns.into();
+                return Err(paro_error::internal(
+                    "settled resident contract changed output column mapping",
+                ));
+            }
+            for ((binding, logical_type), column) in output_bindings
+                .iter()
+                .copied()
+                .zip(output_types.iter())
+                .zip(contract.output_columns.iter().copied())
+            {
+                if state
+                    .binding_ids
+                    .get(binding.table_index, binding.column_index, logical_type)
+                    .copied()
+                    != Some(column)
+                {
+                    return Err(paro_error::internal(
+                        "settled resident contract uses a foreign column identity",
+                    ));
+                }
+            }
+            Arc::from(contract.output_columns.clone())
+        } else {
+            let mut output_columns = Vec::with_capacity(output_bindings.len());
+            for (index, (binding, logical_type)) in output_bindings
+                .iter()
+                .copied()
+                .zip(output_types.iter().cloned())
+                .enumerate()
+            {
+                let type_domain = logical_type_fingerprint(&logical_type);
+                let id = if let Some(id) = state
+                    .binding_ids
+                    .get(binding.table_index, binding.column_index, &logical_type)
+                    .copied()
+                {
+                    id
+                } else {
+                    let id = state.columns.intern(
+                        logical_type.clone(),
+                        true,
+                        ColumnOrigin::Derived {
+                            key: typed_binding_fingerprint(binding, type_domain),
+                        },
+                        ColumnVisibility::Visible,
+                        output_names.get(index).cloned(),
+                    )?;
+                    state.binding_ids.insert(
+                        binding.table_index,
+                        binding.column_index,
+                        &logical_type,
+                        id,
+                    )?;
+                    id
+                };
+                output_columns.push(id);
+            }
+            output_columns.into()
+        };
         let unique_columns: BTreeSet<_> = output_columns.iter().copied().collect();
         let schema = GroupSchema::new(
             unique_columns
@@ -868,20 +932,40 @@ pub(super) fn stage_transformed_expression(
         // Scalar interning only borrows child column identities.  Cloning each
         // `Box<[ColumnId]>` here made every post-order staging node copy the
         // complete child layout before the native Memo key was built.
-        let child_columns = child_states
-            .iter()
-            .map(|child| child.columns.as_ref())
-            .collect::<Vec<_>>();
-        let scalar_roots = intern_operator_scalars(
-            &semantic_operator,
-            &output_columns,
-            &child_columns,
-            &mut state.binding_ids,
-            &mut state.columns,
-            &mut state.scalars,
-        )?;
-        let (operator_fingerprint, operator_encoding) =
-            query_operator_identity(&semantic_operator, &scalar_roots, &state.scalars)?;
+        let (scalar_roots, operator_fingerprint, operator_encoding) =
+            if let Some(contract) = resident.as_ref() {
+                // The arena occurrence is immutable between settlement and
+                // staging.  Its contract was produced from that occurrence
+                // and the same session catalogs, so copying these small ID
+                // slices is sufficient; no scalar walk, interning, or
+                // operator re-encoding is needed here.
+                if contract.output_columns.as_ref() != output_columns.as_ref() {
+                    return Err(paro_error::internal(
+                        "settled resident contract disagrees with output identities",
+                    ));
+                }
+                (
+                    contract.scalar_roots.clone(),
+                    contract.operator_fingerprint,
+                    contract.operator_encoding.clone(),
+                )
+            } else {
+                let child_columns = child_states
+                    .iter()
+                    .map(|child| child.columns.as_ref())
+                    .collect::<Vec<_>>();
+                let scalar_roots = intern_operator_scalars(
+                    &semantic_operator,
+                    &output_columns,
+                    &child_columns,
+                    &mut state.binding_ids,
+                    &mut state.columns,
+                    &mut state.scalars,
+                )?;
+                let (operator_fingerprint, operator_encoding) =
+                    query_operator_identity(&semantic_operator, &scalar_roots, &state.scalars)?;
+                (scalar_roots, operator_fingerprint, operator_encoding)
+            };
         let key = LogicalExprKey {
             operator: operator_fingerprint,
             scalars: scalar_roots,
@@ -1552,6 +1636,7 @@ pub(super) fn stage_transformed_expression(
             facts: input_facts,
             search_candidates,
             selected_proofs,
+            resident_nodes,
         };
         let (root, staged) = match input {
             StagingInput::Arena(root_index) => {
@@ -1575,6 +1660,7 @@ pub(super) fn stage_transformed_expression(
                     }
                     let node = session.state.staging_arena.get(index)?.clone();
                     let layout = session.state.staging_arena.shared_output_layout(index)?;
+                    let resident = session.resident_nodes.remove(&node.id);
                     let is_root = index == root_index;
                     let mut child_states = Vec::new();
                     let operator = node.operator.try_map_child_links(&mut |child| {
@@ -1592,7 +1678,11 @@ pub(super) fn stage_transformed_expression(
                     let Some((mut node, staged)) = stage_node(
                         &mut session,
                         NodeStagingRequest {
-                            input: NodeStagingInput::Settled { node: plan, layout },
+                            input: NodeStagingInput::Settled {
+                                node: plan,
+                                layout,
+                                resident,
+                            },
                             target: is_root.then_some(target),
                             required_region_facet: is_root
                                 .then_some(preserved_region_facet)
@@ -1794,6 +1884,11 @@ pub(super) fn stage_transformed_expression(
                 "transformation rewrite discarded an opaque Memo group hole",
             ));
         }
+        if !session.resident_nodes.is_empty() {
+            return Err(paro_error::internal(
+                "settlement produced an unconsumed resident lowering contract",
+            ));
+        }
         (root, staged, session.pending_runtime_filter_facets)
     };
     let Some(staged) = staged else {
@@ -1971,6 +2066,7 @@ mod tests {
                 ),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),
+                resident_nodes: HashMap::new(),
                 target: StagingTarget {
                     group: input.root,
                     rule: RuleId(999),
@@ -2025,6 +2121,7 @@ mod tests {
                 input_facts: boundary::BoundarySnapshot::default(),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),
+                resident_nodes: HashMap::new(),
                 target: StagingTarget {
                     group: input.root,
                     rule: RuleId(999),
@@ -2101,6 +2198,7 @@ mod tests {
                 input_facts: boundary::BoundarySnapshot::default(),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),
+                resident_nodes: HashMap::new(),
                 target: StagingTarget {
                     group: root,
                     rule: RuleId(999),
@@ -2184,6 +2282,7 @@ mod tests {
                 input_facts: boundary::BoundarySnapshot::default(),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),
+                resident_nodes: HashMap::new(),
                 target: StagingTarget {
                     group: root,
                     rule: RuleId(1_000),
@@ -2235,6 +2334,7 @@ mod tests {
                 input_facts: boundary::BoundarySnapshot::default(),
                 column_stats: Arc::new(HashMap::from([(ColumnBinding::new(0, 0), stats)])),
                 column_stat_scopes: HashMap::new(),
+                resident_nodes: HashMap::new(),
                 target: StagingTarget {
                     group: root, rule: RuleId(999), budget_class: TransformationBudgetClass::Local,
                     input_context: OptimizationContextId(0), child_context: OptimizationContextId(0),
@@ -2256,6 +2356,76 @@ mod tests {
             prior = Some((ndv, value));
             assert!(Arc::ptr_eq(&resident, &state.staging_arena.shared_output_layout(root_index).unwrap()));
         }
+    }
+
+    #[test]
+    fn production_settlement_contract_is_consumed_without_second_identity_lowering() {
+        let make_plan = || {
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+                test_base_get(0, 70_106, "resident_contract_source", 32),
+                vec![],
+            )))
+        };
+        let mut input =
+            MemoBuilder::build(make_plan(), BindContext::new(), SearchBudget::default()).unwrap();
+        let root = input.root;
+        let mut state = input.planner_state.write().unwrap();
+        let session = TestStatementContextBuilder::minimal().build();
+        state.session = Some(session.clone());
+        let environment = PlannerRuleEnvironment {
+            control: input.memo.control().clone(),
+            bind_context: state.bind_context.clone(),
+            session,
+            cost_model: state.cost_model.clone(),
+            budget: input.memo.budget().clone(),
+            verify_enabled: false,
+        };
+        let settled =
+            super::super::settle_with_session_arena(&mut state, make_plan(), &environment)
+                .unwrap()
+                .unwrap();
+        assert!(
+            !settled.resident_nodes.is_empty(),
+            "settlement must publish at least one resident node contract"
+        );
+        let columns_before_staging = state.columns.len();
+        let scalars_before_staging = state.scalars.len();
+        let resident_nodes = settled.resident_nodes;
+        let staged = stage_transformed_expression(
+            StagingRequest {
+                input: StagingInput::Arena(settled.plan),
+                input_facts: boundary::BoundarySnapshot::default(),
+                column_stats: settled.statistics,
+                column_stat_scopes: settled.scopes,
+                resident_nodes,
+                target: StagingTarget {
+                    group: root,
+                    rule: RuleId(991),
+                    budget_class: TransformationBudgetClass::Local,
+                    input_context: OptimizationContextId(0),
+                    child_context: OptimizationContextId(0),
+                    refined_cardinality_kind: None,
+                },
+                regions: StagingRegionRequirements {
+                    preserved_facet: None,
+                    extended_required_facets: Box::new([]),
+                    inherited_runtime_filter_facet: None,
+                },
+                nested_group_holes: BTreeMap::new(),
+                selected_proofs: HashMap::new(),
+            },
+            &mut input.memo,
+            &mut state,
+        )
+        .unwrap()
+        .expect("resident contract should reach the production staging path");
+        // A new Memo payload is allowed here: the test isolates the lowering
+        // contract, not the separate logical-expression identity policy.
+        // The resident IDs must nevertheless be consumed without extending
+        // either session identity catalog.
+        assert!(staged.key.operator != Fingerprint::default());
+        assert_eq!(state.columns.len(), columns_before_staging);
+        assert_eq!(state.scalars.len(), scalars_before_staging);
     }
 
     #[test]
@@ -2305,6 +2475,7 @@ mod tests {
                             input_facts: boundary::BoundarySnapshot::default(),
                             column_stats: Arc::new(HashMap::new()),
                             column_stat_scopes: HashMap::new(),
+                            resident_nodes: HashMap::new(),
                             target: StagingTarget {
                                 group: root,
                                 rule: RuleId(999),
@@ -2376,6 +2547,7 @@ mod tests {
                             input_facts: boundary::BoundarySnapshot::default(),
                             column_stats: Arc::new(HashMap::new()),
                             column_stat_scopes: HashMap::new(),
+                            resident_nodes: HashMap::new(),
                             target: StagingTarget {
                                 group: root,
                                 rule: JOIN_REGION_ENUMERATION_RULE,

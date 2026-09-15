@@ -1937,9 +1937,11 @@ impl OptimizationInput {
             let (hits, misses) = state.scalars.bound_import_counts();
             work_counters.insert("memo_scalar_import_hits", hits);
             work_counters.insert("memo_scalar_import_misses", misses);
-            let (hits, misses) = state.settlement_cache.bound_import_counts();
-            work_counters.insert("settlement_scalar_import_hits", hits);
-            work_counters.insert("settlement_scalar_import_misses", misses);
+            // Settlement and staging now borrow the same session scalar
+            // arena. Keep one authoritative counter; separate "settlement"
+            // totals would imply a namespace that no longer exists.
+            work_counters.insert("planner_scalar_import_hits", hits);
+            work_counters.insert("planner_scalar_import_misses", misses);
         }
         let search_summary = SearchSummary {
             groups: u64::try_from(engine.memo().canonical_group_count()).unwrap_or(u64::MAX),
