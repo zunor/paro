@@ -82,7 +82,10 @@ pub(super) struct NativeRelationInput {
     pub(super) layout: LogicalOutputLayout,
     pub(super) stats: NodeStats,
     pub(super) maximum: Option<u64>,
-    pub(super) column_fingerprints: Box<[Fingerprint]>,
+    /// Fingerprints are immutable evidence for the exact output column
+    /// snapshot.  Native refresh shares this slice across every parent edge
+    /// instead of recomputing it for each consumer.
+    pub(super) column_fingerprints: Arc<[Fingerprint]>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +99,12 @@ pub(super) struct NativeRelationEntry {
     pub(super) layout: LogicalOutputLayout,
     pub(super) maximum: Option<u64>,
     pub(super) columns: SharedColumnStatistics,
+    /// Completed relation evidence is part of the immutable cache entry.
+    /// Reusing a native relation must not reconstruct its boundary facts or
+    /// re-hash its ordered columns on every parent occurrence.
+    pub(super) facts: Arc<paro_planner::operator::bound_reference::BoundRelationFacts>,
+    pub(super) ordered_columns: Arc<[Arc<ColumnStatistics>]>,
+    pub(super) column_fingerprints: Arc<[Fingerprint]>,
     pub(super) inputs: Box<[NativeRelationInput]>,
     pub(super) id: u64,
 }
@@ -114,7 +123,7 @@ fn native_relation_inputs_match(
                 && cached.stats == current.stats
                 && cached.maximum == current.maximum
                 && facts_same
-                && cached.column_fingerprints == current.column_fingerprints
+                && cached.column_fingerprints.as_ref() == current.column_fingerprints.as_ref()
         })
 }
 
@@ -241,6 +250,8 @@ pub(in crate::cascades::planner) struct SettlementCache {
     pub(in crate::cascades::planner) native_relation_misses: u64,
     pub(in crate::cascades::planner) native_relation_fact_evaluations: u64,
     pub(in crate::cascades::planner) native_relation_owned_assembly_skips: u64,
+    pub(in crate::cascades::planner) native_relation_ordered_column_view_reuses: u64,
+    pub(in crate::cascades::planner) native_relation_cached_evidence_reuses: u64,
     pub(in crate::cascades::planner) native_relation_invalidations: u64,
     #[cfg(test)]
     test_arena: LogicalPlanArena,
@@ -1337,11 +1348,14 @@ mod tests {
                 ..NodeStats::default()
             },
             maximum: None,
-            column_fingerprints: Box::new([]),
+            column_fingerprints: Arc::from([]),
         }
     }
 
     fn native_relation_entry(input: NativeRelationInput) -> NativeRelationEntry {
+        let facts = Arc::clone(&input.facts);
+        let ordered_columns = Arc::from(input.facts.column_statistics().to_vec());
+        let column_fingerprints = Arc::clone(&input.column_fingerprints);
         NativeRelationEntry {
             operator: LogicalOperator::DummyScan,
             operator_fingerprint: Fingerprint::default(),
@@ -1352,6 +1366,9 @@ mod tests {
             layout: LogicalOutputLayout::new(Vec::new(), Vec::new()),
             maximum: None,
             columns: Arc::default(),
+            facts,
+            ordered_columns,
+            column_fingerprints,
             inputs: Box::new([input]),
             id: 0,
         }
@@ -1389,7 +1406,7 @@ mod tests {
             native_relation_entry(input.clone()),
         );
         let mut changed_columns = input;
-        changed_columns.column_fingerprints = Box::new([Fingerprint(7)]);
+        changed_columns.column_fingerprints = Arc::from([Fingerprint(7)]);
         assert!(cache
             .native_lookup(
                 b"native-local",

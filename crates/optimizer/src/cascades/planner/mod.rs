@@ -2857,6 +2857,18 @@ impl OptimizationInput {
                 state.settlement_cache.native_relation_owned_assembly_skips,
             );
             work_counters.insert(
+                "native_relation_ordered_column_view_reuses",
+                state
+                    .settlement_cache
+                    .native_relation_ordered_column_view_reuses,
+            );
+            work_counters.insert(
+                "native_relation_cached_evidence_reuses",
+                state
+                    .settlement_cache
+                    .native_relation_cached_evidence_reuses,
+            );
+            work_counters.insert(
                 "native_relation_fact_cache_entries",
                 state.settlement_cache.native_relation_entry_count(),
             );

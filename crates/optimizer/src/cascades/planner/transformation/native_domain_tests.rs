@@ -959,6 +959,12 @@ fn repeated_native_refresh_reuses_relation_facts_without_reusing_stale_stats() {
     let (shell, _, _) = refresh_statistics(shell, &mut state, &memo).unwrap().unwrap();
     let evaluations = state.settlement_cache.native_relation_fact_evaluations;
     let hits = state.settlement_cache.native_relation_hits;
+    let evidence_reuses = state
+        .settlement_cache
+        .native_relation_cached_evidence_reuses;
+    let view_reuses = state
+        .settlement_cache
+        .native_relation_ordered_column_view_reuses;
     let (shell, _, _) = refresh_statistics(shell, &mut state, &memo).unwrap().unwrap();
     assert!(
         state.settlement_cache.native_relation_hits > hits,
@@ -967,6 +973,14 @@ fn repeated_native_refresh_reuses_relation_facts_without_reusing_stale_stats() {
     assert_eq!(
         state.settlement_cache.native_relation_fact_evaluations, evaluations,
         "a repeated relation must not rerun propagation/gathering"
+    );
+    assert!(
+        state.settlement_cache.native_relation_cached_evidence_reuses > evidence_reuses,
+        "a cached relation must reuse its immutable completed evidence"
+    );
+    assert!(
+        state.settlement_cache.native_relation_ordered_column_view_reuses > view_reuses,
+        "a repeated parent edge must reuse the completed positional column view"
     );
     assert!(!shell.nodes.is_empty());
 }

@@ -137,7 +137,7 @@ pub(super) fn try_transfer(
     let nested_path = inputs
         .iter()
         .any(|input| matches!(input, PatternOperand::Expression { .. }));
-    let Some(mut shell) = (if nested_path {
+    let Some((mut shell, layouts)) = (if nested_path {
         transfer_shell_closure_with_layouts(shell, layouts, state, &mut fixed_point)?
     } else {
         transfer_shell_with_layouts(shell, layouts, state)?
@@ -147,7 +147,6 @@ pub(super) fn try_transfer(
     // Canonical templates deliberately erase occurrence output demand. Do
     // not suppress the semantic producer until this result owns that exact
     // ordered output again, including residual Filter projection maps.
-    let layouts = shell.layouts()?;
     if let LogicalOperator::Filter(filter) = &mut shell.nodes[shell.root].operator {
         let child_layout = match &filter.child {
             NativeChild::Node(index) => &layouts[*index],
@@ -164,7 +163,34 @@ pub(super) fn try_transfer(
         };
         filter.projection_map = projection;
     }
-    let output = shell.root_layout()?;
+    // The post-closure child layouts were already derived above for rebinding
+    // the residual filter. Recompute only the root from those cached child
+    // views: the projection map may change the root output layout, so simply
+    // reusing the old root entry would be stale, while walking the whole shell
+    // again through `root_layout()` is redundant on every accepted binding.
+    let mut output_children = SmallVec::<[LogicalOutputLayout; 2]>::new();
+    let mut output_child_count = 0;
+    shell.nodes[shell.root]
+        .operator
+        .visit_child_links(&mut |child| {
+            output_child_count += 1;
+            let layout = match child {
+                NativeChild::Node(index) => layouts.get(*index).cloned(),
+                NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
+                    Some(layout.clone())
+                }
+            };
+            if let Some(layout) = layout {
+                output_children.push(layout);
+            }
+        });
+    if output_children.len() != output_child_count {
+        return Ok(None);
+    }
+    let output_child_refs = output_children.iter().collect::<SmallVec<[_; 2]>>();
+    let output = shell.nodes[shell.root]
+        .operator
+        .output_layout_from_child_refs(&output_child_refs);
     let columns = output
         .bindings()
         .iter()
@@ -191,13 +217,14 @@ pub(super) fn transfer_shell(
 ) -> Result<Option<NativeShell>> {
     let layouts = shell.layouts()?;
     transfer_shell_with_layouts(shell, layouts, state)
+        .map(|result| result.map(|(shell, _layouts)| shell))
 }
 
 fn transfer_shell_with_layouts(
     shell: NativeShell,
-    layouts: Vec<LogicalOutputLayout>,
+    mut layouts: Vec<LogicalOutputLayout>,
     state: &PlannerTransformState,
-) -> Result<Option<NativeShell>> {
+) -> Result<Option<(NativeShell, Vec<LogicalOutputLayout>)>> {
     let LogicalOperator::Filter(filter) = shell.root_operator().clone() else {
         return Ok(None);
     };
@@ -298,16 +325,20 @@ fn transfer_shell_with_layouts(
             continue;
         }
         let next = nodes.len();
+        let child_layout = native_child_layout(&child, &layouts)?;
+        let operator = LogicalOperator::Filter(Filter {
+            child,
+            expressions: predicates,
+            projection_map: paro_planner::operator::ProjectionMap::all(),
+        });
+        let output_layout = operator.output_layout_from_child_refs(&[&child_layout]);
         nodes.push(NativeNode {
             id: state.bind_context.next_plan_id(),
             stats: NodeStats::default(),
-            operator: LogicalOperator::Filter(Filter {
-                child,
-                expressions: predicates,
-                projection_map: paro_planner::operator::ProjectionMap::all(),
-            }),
+            operator,
             source_proofs: Box::new([]),
         });
+        layouts.push(output_layout);
         children.push(NativeChild::Node(next));
     }
     let mut children = children.into_iter();
@@ -316,6 +347,22 @@ fn transfer_shell_with_layouts(
             .next()
             .ok_or_else(|| paro_error::internal("native domain lost a child"))
     })?;
+    let output_layout = {
+        let mut operator_children = SmallVec::<[&NativeChild; 2]>::new();
+        operator.visit_child_links(&mut |child| operator_children.push(child));
+        let operator_child_layouts = operator_children
+            .iter()
+            .map(|child| match child {
+                NativeChild::Node(index) => layouts.get(*index).ok_or_else(|| {
+                    paro_error::internal("native domain child layout is missing")
+                }),
+                NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
+                    Ok(layout)
+                }
+            })
+            .collect::<Result<SmallVec<[&LogicalOutputLayout; 2]>>>()?;
+        operator.output_layout_from_child_refs(&operator_child_layouts)
+    };
     let next = nodes.len();
     nodes.push(NativeNode {
         id: state.bind_context.next_plan_id(),
@@ -323,26 +370,37 @@ fn transfer_shell_with_layouts(
         operator,
         source_proofs: nodes[input].source_proofs.clone(),
     });
+    layouts.push(output_layout);
     let root = if remaining.is_empty() && filter.projection_map.is_identity(layouts[input].len()) {
         next
     } else {
         let root = nodes.len();
+        let child_layout = layouts
+            .get(next)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("native domain root layout is missing"))?;
+        let operator = LogicalOperator::Filter(Filter {
+            expressions: remaining,
+            child: NativeChild::Node(next),
+            projection_map: filter.projection_map,
+        });
+        let output_layout = operator.output_layout_from_child_refs(&[&child_layout]);
         nodes.push(NativeNode {
             id: state.bind_context.next_plan_id(),
             stats: NodeStats::default(),
-            operator: LogicalOperator::Filter(Filter {
-                expressions: remaining,
-                child: NativeChild::Node(next),
-                projection_map: filter.projection_map,
-            }),
+            operator,
             source_proofs: Box::new([]),
         });
+        layouts.push(output_layout);
         root
     };
-    compact_native_shell(NativeShell {
-        nodes: nodes.into_boxed_slice(),
-        root,
-    })
+    super::compact_native_shell_with_layouts(
+        NativeShell {
+            nodes: nodes.into_boxed_slice(),
+            root,
+        },
+        layouts,
+    )
     .map(Some)
 }
 
@@ -1092,6 +1150,7 @@ fn transfer_shell_closure(
     let layouts = shell.layouts()?;
     let mut fixed_point = domain_transfer::DomainFixedPoint::default();
     transfer_shell_closure_with_layouts(shell, layouts, state, &mut fixed_point)
+        .map(|result| result.map(|(shell, _layouts)| shell))
 }
 
 fn transfer_shell_closure_with_layouts(
@@ -1099,7 +1158,7 @@ fn transfer_shell_closure_with_layouts(
     mut layouts: Vec<LogicalOutputLayout>,
     state: &PlannerTransformState,
     fixed_point: &mut domain_transfer::DomainFixedPoint,
-) -> Result<Option<NativeShell>> {
+) -> Result<Option<(NativeShell, Vec<LogicalOutputLayout>)>> {
     let LogicalOperator::Filter(filter) = shell.root_operator().clone() else {
         return Ok(None);
     };
@@ -1147,10 +1206,13 @@ fn transfer_shell_closure_with_layouts(
             "native domain root became a group hole",
         ));
     };
-    compact_native_shell(NativeShell {
-        nodes: nodes.into_boxed_slice(),
-        root,
-    })
+    super::compact_native_shell_with_layouts(
+        NativeShell {
+            nodes: nodes.into_boxed_slice(),
+            root,
+        },
+        layouts,
+    )
     .map(Some)
 }
 
@@ -1194,17 +1256,41 @@ pub(super) fn refresh_statistics(
     };
     // Solve only this closed local shell. Memo holes retain their complete
     // interfaces; narrowing a new Filter does not narrow its input Memo group.
-    let original_layouts = shell.layouts()?;
+    // The output layout and carrier layout use the same child edges. Derive
+    // both in one post-order walk so every native node pays for child-link
+    // lookup only once; the two layouts still remain separate contracts.
+    let mut original_layouts = Vec::<LogicalOutputLayout>::with_capacity(shell.nodes.len());
     let mut carriers = Vec::<LogicalOutputLayout>::with_capacity(shell.nodes.len());
     for node in &shell.nodes {
-        let mut inputs = Vec::new();
-        node.operator.visit_child_links(&mut |child| match child {
-            NativeChild::Node(index) => inputs.push(&carriers[*index]),
-            NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
-                inputs.push(layout)
+        let (layout, carrier) = {
+            let mut children = SmallVec::<[&NativeChild; 2]>::new();
+            node.operator
+                .visit_child_links(&mut |child| children.push(child));
+            let mut output_inputs = SmallVec::<[&LogicalOutputLayout; 2]>::new();
+            let mut carrier_inputs = SmallVec::<[&LogicalOutputLayout; 2]>::new();
+            for child in children {
+                match child {
+                    NativeChild::Node(index) => {
+                        output_inputs.push(original_layouts.get(*index).ok_or_else(|| {
+                            paro_error::internal("native shell output layout is incomplete")
+                        })?);
+                        carrier_inputs.push(carriers.get(*index).ok_or_else(|| {
+                            paro_error::internal("native shell carrier layout is incomplete")
+                        })?);
+                    }
+                    NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
+                        output_inputs.push(layout);
+                        carrier_inputs.push(layout);
+                    }
+                }
             }
-        });
-        let carrier = node.operator.carrier_layout_from_child_refs(&inputs);
+            (
+                node.operator.output_layout_from_child_refs(&output_inputs),
+                node.operator
+                    .carrier_layout_from_child_refs(&carrier_inputs),
+            )
+        };
+        original_layouts.push(layout);
         carriers.push(carrier);
     }
     let mut wanted = vec![BTreeSet::new(); shell.nodes.len()];
@@ -1240,10 +1326,56 @@ pub(super) fn refresh_statistics(
         stats: NodeStats,
         layout: LogicalOutputLayout,
         maximum: Option<u64>,
-        columns: SharedColumnStatistics,
+        /// Columns in the exact positional order of `layout`.  This is an
+        /// immutable view of the completed relation.  Parent edges share the
+        /// slice; they must not rebuild a pointer vector merely to feed
+        /// positional set-operation statistics.
+        ordered_columns: Arc<[Arc<ColumnStatistics>]>,
+        /// The local boundary fact is immutable for this refresh snapshot.
+        /// Parent edges clone the Arc instead of reconstructing the same
+        /// cardinality/types/unique-key witness.
+        facts: Arc<BoundRelationFacts>,
+        /// Column evidence is also fixed for this completed node. Keeping the
+        /// derived fingerprints here avoids hashing every input edge again.
+        column_fingerprints: Arc<[Fingerprint]>,
         aliases: demand::BindingMap,
         output_columns: Box<[ColumnId]>,
         names: Arc<[String]>,
+    }
+    fn completed_evidence(
+        layout: &LogicalOutputLayout,
+        stats: &NodeStats,
+        maximum: Option<u64>,
+        columns: &SharedColumnStatistics,
+    ) -> Result<(
+        Arc<BoundRelationFacts>,
+        Arc<[Arc<ColumnStatistics>]>,
+        Arc<[Fingerprint]>,
+    )> {
+        let facts = Arc::new(BoundRelationFacts::new(
+            BoundRelationFactValues {
+                cardinality: stats.estimated_cardinality,
+                maximum_cardinality: maximum,
+                unique_keys: stats.unique_keys.clone(),
+                ..BoundRelationFactValues::default()
+            },
+            layout.types().to_vec(),
+        ));
+        let ordered_columns = layout
+            .bindings()
+            .iter()
+            .map(|binding| {
+                columns
+                    .get(binding)
+                    .cloned()
+                    .ok_or_else(|| paro_error::internal("native relation output column missing"))
+            })
+            .collect::<Result<Arc<[_]>>>()?;
+        let column_fingerprints = ordered_columns
+            .iter()
+            .map(|column| settlement::SettlementCache::native_column_fingerprint(column.as_ref()))
+            .collect::<Result<Arc<[_]>>>()?;
+        Ok((facts, ordered_columns, column_fingerprints))
     }
     let mut completed = Vec::<Completed>::new();
     let mut scopes = HashMap::new();
@@ -1268,7 +1400,7 @@ pub(super) fn refresh_statistics(
         let mut layouts = Vec::new();
         let mut maximums = Vec::new();
         let mut columns = HashMap::new();
-        let mut positional_columns = Vec::new();
+        let mut positional_columns = SmallVec::<[Arc<[Arc<ColumnStatistics>]>; 2]>::new();
         let mut input_aliases = Vec::new();
         let mut before = Vec::new();
         let mut input_facts = Vec::new();
@@ -1295,7 +1427,8 @@ pub(super) fn refresh_statistics(
                             .map(|binding| (*binding, *binding))
                             .collect(),
                     );
-                    let input_columns = reference.column_statistics();
+                    let input_columns: Arc<[Arc<ColumnStatistics>]> =
+                        reference.facts.column_statistics().to_vec().into();
                     input_facts.push(ResidentInputFact::Memo(reference.facts.clone()));
                     native_inputs.push(NativeRelationInput {
                         facts: reference.facts.clone(),
@@ -1310,9 +1443,9 @@ pub(super) fn refresh_statistics(
                         // intentionally contain only row/uniqueness facts, so
                         // their derived column views need the explicit
                         // content fingerprint.
-                        column_fingerprints: Box::new([]),
+                        column_fingerprints: Arc::from([]),
                     });
-                    for (binding, column) in layout.bindings().iter().zip(&input_columns) {
+                    for (binding, column) in layout.bindings().iter().zip(input_columns.iter()) {
                         columns.insert(*binding, column.clone());
                     }
                     positional_columns.push(input_columns);
@@ -1328,36 +1461,28 @@ pub(super) fn refresh_statistics(
                         .get(*index)
                         .ok_or_else(|| paro_error::internal("native statistics input not ready"))?;
                     input_aliases.push(input.aliases.clone());
-                    let mut input_columns = Vec::with_capacity(input.layout.len());
-                    for binding in input.layout.bindings() {
-                        let column = input.columns.get(binding).ok_or_else(|| {
-                            paro_error::internal("native statistics output column missing")
-                        })?;
-                        columns.insert(*binding, column.clone());
-                        input_columns.push(column.clone());
-                    }
-                    let column_fingerprints = input_columns
+                    for (binding, column) in input
+                        .layout
+                        .bindings()
                         .iter()
-                        .map(|column| {
-                            settlement::SettlementCache::native_column_fingerprint(column)
-                        })
-                        .collect::<Result<Box<[_]>>>()?;
-                    positional_columns.push(input_columns);
-                    let facts = Arc::new(BoundRelationFacts::new(
-                        BoundRelationFactValues {
-                            cardinality: input.stats.estimated_cardinality,
-                            maximum_cardinality: input.maximum,
-                            unique_keys: input.stats.unique_keys.clone(),
-                            ..BoundRelationFactValues::default()
-                        },
-                        input.layout.types().to_vec(),
-                    ));
+                        .copied()
+                        .zip(input.ordered_columns.iter())
+                    {
+                        columns.insert(binding, Arc::clone(column));
+                    }
+                    positional_columns.push(Arc::clone(&input.ordered_columns));
+                    state
+                        .settlement_cache
+                        .native_relation_ordered_column_view_reuses = state
+                        .settlement_cache
+                        .native_relation_ordered_column_view_reuses
+                        .saturating_add(1);
                     native_inputs.push(NativeRelationInput {
-                        facts: facts.clone(),
+                        facts: Arc::clone(&input.facts),
                         layout: input.layout.clone(),
                         stats: input.stats.clone(),
                         maximum: input.maximum,
-                        column_fingerprints,
+                        column_fingerprints: Arc::clone(&input.column_fingerprints),
                     });
                     input_facts.push(ResidentInputFact::Local {
                         node_id: input.id,
@@ -1370,7 +1495,7 @@ pub(super) fn refresh_statistics(
                         input.layout.bindings().to_vec(),
                         input.layout.types().to_vec(),
                     )
-                    .with_facts(facts)?;
+                    .with_facts(Arc::clone(&input.facts))?;
                     (
                         input.stats.clone(),
                         input.layout.clone(),
@@ -1411,10 +1536,6 @@ pub(super) fn refresh_statistics(
         let statistics_partition =
             crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
         crate::expression::scalar_normalizer().visit_operator_expressions(&mut local);
-        let semantic_operator = local
-            .clone()
-            .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
-            .expect("native relation semantic operator cannot fail");
         if local.op_type() != node.operator.op_type() {
             drop(statistics_partition);
             return Ok(None);
@@ -1470,9 +1591,8 @@ pub(super) fn refresh_statistics(
             .iter()
             .map(|columns| columns.as_ref())
             .collect::<Vec<_>>();
-        let output_names: Arc<[String]> = semantic_operator
-            .output_names_from_child_refs(child_names.as_slice())
-            .into();
+        let output_names: Arc<[String]> =
+            local.output_names_from_child_refs(child_names.as_slice()).into();
         let layout_before =
             local.output_layout_from_child_refs(&layouts.iter().collect::<Vec<_>>());
         let (pre_output_columns, pre_scalar_roots, pre_operator_fingerprint, pre_operator_encoding) =
@@ -1488,13 +1608,11 @@ pub(super) fn refresh_statistics(
                     ColumnInternOrigin::Derived,
                     Some(output_names.as_ref()),
                 )?;
-                let scalar_roots = if super::settlement::operator_has_no_scalar_payload(
-                    &semantic_operator,
-                ) {
+                let scalar_roots = if super::settlement::operator_has_no_scalar_payload(&local) {
                     Box::new([])
                 } else {
                     intern_operator_scalars(
-                        &semantic_operator,
+                        &local,
                         &output_columns,
                         &child_column_refs,
                         identity.binding_ids,
@@ -1503,7 +1621,7 @@ pub(super) fn refresh_statistics(
                     )?
                 };
                 let (fingerprint, encoding) = query_operator_identity(
-                    &semantic_operator,
+                    &local,
                     &scalar_roots,
                     identity.scalars,
                 )?;
@@ -1519,6 +1637,12 @@ pub(super) fn refresh_statistics(
                 .native_relation_owned_assembly_skips = state
                 .settlement_cache
                 .native_relation_owned_assembly_skips
+                .saturating_add(1);
+            state
+                .settlement_cache
+                .native_relation_cached_evidence_reuses = state
+                .settlement_cache
+                .native_relation_cached_evidence_reuses
                 .saturating_add(1);
             node.operator = attach_native_operator(cached.operator.clone(), &links)?;
             node.stats = cached.stats.clone();
@@ -1548,7 +1672,9 @@ pub(super) fn refresh_statistics(
                 stats: cached.stats.clone(),
                 layout: cached.layout.clone(),
                 maximum: cached.maximum,
-                columns: cached_columns,
+                ordered_columns: Arc::clone(&cached.ordered_columns),
+                facts: Arc::clone(&cached.facts),
+                column_fingerprints: Arc::clone(&cached.column_fingerprints),
                 aliases,
                 output_columns: cached.output_columns.clone(),
                 names: output_names,
@@ -1581,29 +1707,26 @@ pub(super) fn refresh_statistics(
             };
             crate::statistics::gathering::merge_set_operation_column_statistics(
                 &layout,
-                left,
-                right,
+                left.as_ref(),
+                right.as_ref(),
                 &mut context,
             );
         }
+        // The positional views borrow completed native nodes.  Release those
+        // borrows before appending the current node to the completed state.
+        drop(positional_columns);
         drop(statistics_partition);
         let cached_operator = operator;
-        node.operator = attach_native_operator(cached_operator.clone(), &links)?;
         node.stats = stats.clone();
         let output_columns_stats = context.column_stats.clone();
         scopes.insert(node.id, output_columns_stats.clone());
-        let semantic_operator = node
-            .operator
-            .clone()
-            .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
-            .expect("native resident semantic operator cannot fail");
-        let output_names: Arc<[String]> = semantic_operator
+        let output_names: Arc<[String]> = cached_operator
             .output_names_from_child_refs(child_names.as_slice())
             .into();
         let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) =
             if layout == layout_before
                 && query_operator_identity(
-                    &semantic_operator,
+                    &cached_operator,
                     &pre_scalar_roots,
                     &state.scalars,
                 )
@@ -1628,12 +1751,12 @@ pub(super) fn refresh_statistics(
                     Some(output_names.as_ref()),
                 )?;
                 let scalar_roots = if super::settlement::operator_has_no_scalar_payload(
-                    &semantic_operator,
+                    &cached_operator,
                 ) {
                     Box::new([])
                 } else {
                     intern_operator_scalars(
-                        &semantic_operator,
+                        &cached_operator,
                         &output_columns,
                         &child_column_refs,
                         identity.binding_ids,
@@ -1642,15 +1765,21 @@ pub(super) fn refresh_statistics(
                     )?
                 };
                 let (operator_fingerprint, operator_encoding) =
-                    query_operator_identity(&semantic_operator, &scalar_roots, identity.scalars)?;
+                    query_operator_identity(&cached_operator, &scalar_roots, identity.scalars)?;
                 (
                     output_columns,
                     scalar_roots,
                     operator_fingerprint,
                     operator_encoding,
                 )
-            };
+        };
         let columns = output_columns_stats;
+        let (facts, ordered_columns, column_fingerprints) = completed_evidence(
+            &layout,
+            &stats,
+            maximum,
+            &columns,
+        )?;
         let cached = state.settlement_cache.native_insert(
             pre_operator_encoding.clone(),
             NativeRelationEntry {
@@ -1663,6 +1792,9 @@ pub(super) fn refresh_statistics(
                 layout: layout.clone(),
                 maximum,
                 columns: columns.clone(),
+                facts,
+                ordered_columns,
+                column_fingerprints,
                 inputs: native_inputs.into_boxed_slice(),
                 id: 0,
             },
@@ -1698,7 +1830,9 @@ pub(super) fn refresh_statistics(
             stats: cached.stats.clone(),
             layout: cached.layout.clone(),
             maximum: cached.maximum,
-            columns,
+            ordered_columns: Arc::clone(&cached.ordered_columns),
+            facts: Arc::clone(&cached.facts),
+            column_fingerprints: Arc::clone(&cached.column_fingerprints),
             aliases,
             output_columns: cached.output_columns.clone(),
             names: output_names,

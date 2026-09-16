@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 use std::collections::HashSet;
 
 use paro_common::runtime_value::Value;
-use paro_planner::operator::{Aggregate, Filter, Projection, SetOpType, SetOperation};
+use paro_planner::operator::{Aggregate, Filter, LogicalOutputLayout, Projection, SetOpType, SetOperation};
 
 pub(super) mod cte;
 mod join_region;
@@ -5423,6 +5423,42 @@ fn compact_native_shell(shell: NativeShell) -> Result<NativeShell> {
         nodes: compacted.into_boxed_slice(),
         root: remap[root],
     })
+}
+
+/// Compact a native shell while retaining the layouts produced by the
+/// producer's post-order construction. Native domain closure already has
+/// those layouts available; walking the shell again merely to recover them
+/// repeats the same child-layout work for every accepted binding.
+///
+/// The normal native producer order is already compact. In that case the
+/// supplied layouts are returned unchanged. If a rewrite leaves an
+/// unreachable node or changes the order, the ordinary compactor remains the
+/// authority and the compacted shell is laid out once as a conservative
+/// fallback.
+fn compact_native_shell_with_layouts(
+    shell: NativeShell,
+    layouts: Vec<LogicalOutputLayout>,
+) -> Result<(NativeShell, Vec<LogicalOutputLayout>)> {
+    if layouts.len() != shell.nodes.len() {
+        return Err(paro_error::internal(
+            "native shell layout count does not match node count",
+        ));
+    }
+    let original_root = shell.root;
+    let original_ids = shell.nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+    let compacted = compact_native_shell(shell)?;
+    let order_unchanged = compacted.root == original_root
+        && compacted.nodes.len() == original_ids.len()
+        && compacted
+            .nodes
+            .iter()
+            .zip(original_ids)
+            .all(|(node, id)| node.id == id);
+    if order_unchanged {
+        return Ok((compacted, layouts));
+    }
+    let compacted_layouts = compacted.layouts()?;
+    Ok((compacted, compacted_layouts))
 }
 
 /// Compact a native shell while returning the root layout computed during
