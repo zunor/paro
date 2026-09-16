@@ -439,6 +439,11 @@ struct PhysicalInterleave {
     root: GroupId,
     goals: Box<[OptimizationGoal]>,
     pending: BTreeSet<(GroupId, OptimizationGoal)>,
+    /// Direct consumers whose child response changed are ready before the
+    /// remaining readiness work. This is still the existing interleave (not a
+    /// second scheduler); it prevents an unrelated group-id ordering from
+    /// racing a just-published child response to the quality handoff.
+    response_ready: BTreeSet<(GroupId, OptimizationGoal)>,
 }
 
 impl PhysicalInterleave {
@@ -451,6 +456,25 @@ impl PhysicalInterleave {
             root,
             goals: goals.into_boxed_slice(),
             pending,
+            response_ready: BTreeSet::new(),
+        }
+    }
+
+    fn enqueue_response_ready(&mut self, key: (GroupId, OptimizationGoal)) -> bool {
+        let inserted = self.pending.insert(key);
+        self.response_ready.insert(key);
+        inserted
+    }
+
+    fn pop_next(&mut self) -> Option<(GroupId, OptimizationGoal)> {
+        loop {
+            if let Some(key) = self.response_ready.pop_first() {
+                if self.pending.remove(&key) {
+                    return Some(key);
+                }
+                continue;
+            }
+            return self.pending.pop_first();
         }
     }
 }
@@ -1147,6 +1171,15 @@ pub struct CascadesEngine {
     /// A parent may need to close an awaiting task or publish a completion
     /// certificate, while all already-priced recipes remain reusable.
     physical_completion_pending: BTreeSet<(GroupId, OptimizationGoal)>,
+    /// A recursive physical task can publish a child response before the
+    /// enclosing interleave task returns.  Keep the exact changed keys until
+    /// the drain boundary so direct consumers are still woken even when the
+    /// child was not itself the task popped by `PhysicalInterleave`.
+    ///
+    /// This is notification staging, not a second queue or a completeness
+    /// claim: the normal dirty/read-set protocol remains authoritative for
+    /// what the consumer must process.
+    physical_response_notifications: BTreeSet<(GroupId, OptimizationGoal)>,
     /// Cost frontiers cleared by a new search epoch need one complete rebuild
     /// per physical subproblem. Once that rebuild has run, an incomplete
     /// readiness cursor is an append-only prefix and must not force another
@@ -1369,6 +1402,7 @@ impl CascadesEngine {
             certified_group_pruning_enabled: false,
             physical_dirty_recipes: BTreeMap::new(),
             physical_completion_pending: BTreeSet::new(),
+            physical_response_notifications: BTreeSet::new(),
             physical_full_recost: BTreeSet::new(),
             physical_goals: BTreeMap::new(),
             physical_quality_demanded_groups: BTreeSet::new(),
@@ -1780,6 +1814,11 @@ impl CascadesEngine {
         let previous = std::mem::take(&mut self.physical_completion_pending);
         for (group, goal) in previous {
             self.physical_completion_pending
+                .insert((self.memo.canonical_group(group), goal));
+        }
+        let previous = std::mem::take(&mut self.physical_response_notifications);
+        for (group, goal) in previous {
+            self.physical_response_notifications
                 .insert((self.memo.canonical_group(group), goal));
         }
         let previous = std::mem::take(&mut self.physical_read_dependencies);
@@ -3123,6 +3162,8 @@ impl CascadesEngine {
     ) -> Result<bool> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
         self.mark_physical_parents_dirty((self.memo.canonical_group(group), goal));
+        self.physical_response_notifications
+            .insert((self.memo.canonical_group(group), goal));
         self.note_physical_candidate(group, goal, selected_changed)?;
         self.record_diagnostic_checkpoints();
         Ok(self.should_yield_physical_interleave_step())
@@ -3141,6 +3182,7 @@ impl CascadesEngine {
             .unwrap_or_default();
         for goal in goals {
             self.mark_physical_parents_dirty((group, goal));
+            self.physical_response_notifications.insert((group, goal));
         }
     }
 
@@ -3207,6 +3249,7 @@ impl CascadesEngine {
                 .saturating_add(1);
         }
         self.mark_physical_parents_completion_pending(key);
+        self.physical_response_notifications.insert(key);
     }
 
     fn physical_response_snapshot(
@@ -3632,6 +3675,7 @@ impl CascadesEngine {
         // valid lower-bound source after frontiers are cleared.
         self.physical_completion_proofs.clear();
         self.physical_completion_pending.clear();
+        self.physical_response_notifications.clear();
         self.task_registry.invalidate_physical_tasks()?;
         self.physical_full_recost = self.next_recipe_sequence.keys().copied().collect();
         self.physical_quality_demanded_groups = self
@@ -4464,7 +4508,7 @@ impl CascadesEngine {
             if !has_pending_work {
                 continue;
             }
-            if interleave.pending.insert(parent_key) {
+            if interleave.enqueue_response_ready(parent_key) {
                 self.physical_direct_consumer_enqueue_count = self
                     .physical_direct_consumer_enqueue_count
                     .saturating_add(1);
@@ -4479,7 +4523,7 @@ impl CascadesEngine {
 
     fn drain_physical_interleave(&mut self, interleave: &mut PhysicalInterleave) -> Result<()> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Subproblem);
-        while let Some((group, goal)) = interleave.pending.pop_first() {
+        while let Some((group, goal)) = interleave.pop_next() {
             if self
                 .active_optional_grant
                 .is_some_and(|class| match goal.grant {
@@ -4522,7 +4566,23 @@ impl CascadesEngine {
                     .physical_response_unchanged_count
                     .saturating_add(1);
             }
-            self.enqueue_physical_consumers(group, goal, response_changed, interleave);
+            // The outer snapshot catches changes made by this top-level task;
+            // the staged set also contains responses published by recursive
+            // child tasks.  Deduplication here is by the exact
+            // (group, goal) key, so a child is notified once even when both
+            // observations see the same revision change.
+            if response_changed {
+                self.physical_response_notifications.insert((group, goal));
+            }
+            let changed_responses = std::mem::take(&mut self.physical_response_notifications);
+            for (changed_group, changed_goal) in changed_responses {
+                self.enqueue_physical_consumers(
+                    changed_group,
+                    changed_goal,
+                    true,
+                    interleave,
+                );
+            }
             if yielded {
                 // Resume the exact task. Parent propagation above is driven by
                 // the response snapshot; it is intentionally independent of

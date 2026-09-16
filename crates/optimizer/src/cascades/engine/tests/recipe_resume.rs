@@ -188,6 +188,49 @@ fn redundant_dirty_notification_does_not_reopen_a_complete_read_context() {
 }
 
 #[test]
+fn completion_only_notification_does_not_reprocess_priced_recipes() {
+    let (mut engine, root, child, goal) = resume_engine(false);
+    // First complete the real parent/child task chain.  The later notification
+    // is deliberately isolated from the already-consumed frontier response.
+    engine.optimize_group(root, goal).unwrap();
+    assert!(engine.physical_task_cache[&(root, goal)].complete);
+
+    let synthesized = engine.child_combination_cost_synthesis_count;
+    let reprocessed = engine.physical_recipe_reprocess_count;
+    // The child frontier is unchanged. Remove any already-observed work so
+    // this assertion isolates the later completion-only notification.
+    engine.physical_dirty_recipes.remove(&(root, goal));
+    let child_cache = engine
+        .physical_task_cache
+        .get_mut(&(child, goal))
+        .expect("the parent task must have observed its child");
+    child_cache.complete = false;
+
+    // The child closes without changing its frontier.  This is a completion
+    // response, not a cost/frontier response: the parent must become pending
+    // without receiving a dirty recipe set.
+    engine.note_physical_completion_change(child, goal, true);
+    assert!(engine.physical_completion_pending.contains(&(root, goal)));
+    assert!(!engine.physical_dirty_recipes.contains_key(&(root, goal)));
+    engine
+        .physical_task_cache
+        .get_mut(&(child, goal))
+        .unwrap()
+        .complete = true;
+
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(
+        engine.child_combination_cost_synthesis_count, synthesized,
+        "completion-only progress must not re-synthesize priced combinations"
+    );
+    assert_eq!(
+        engine.physical_recipe_reprocess_count, reprocessed,
+        "completion-only progress must not reprocess old recipes"
+    );
+    assert!(engine.physical_task_cache[&(root, goal)].complete);
+}
+
+#[test]
 fn recipe_resume_completed_same_readset_accepts_appended_physical_recipe() {
     let (mut engine, root, child, goal) = resume_engine(false);
     engine.optimize_group(root, goal).unwrap();
