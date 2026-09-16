@@ -969,13 +969,19 @@ pub struct SearchMilestones {
     pub transformation_task_lifecycle_dropped: u64,
 }
 
-/// The last published physical response for one exact `(group, goal)` task.
-/// TaskRegistry remains the source of lifecycle/audit truth; this is only a
-/// read-only fast path for the overwhelmingly common recursive request that
-/// arrives before any observed input or local recipe has changed.
+/// Resident progress for one exact `(group, goal)` physical subproblem.
+///
+/// `TaskRegistry` remains the source of lifecycle/audit truth.  This state is
+/// the engine-side continuation: it keeps the exact task identity, the read
+/// snapshot that was actually consumed, the dependency tuple, and the recipe
+/// cursor together.  A response-driven resume can therefore validate and
+/// advance only the changed inputs instead of reconstructing the whole read
+/// set and predecessor state from the registry on every wake-up.
 #[derive(Debug, Clone)]
-struct PhysicalTaskCacheEntry {
+struct PhysicalTaskState {
+    task: TaskId,
     reads: ReadSet,
+    dependencies: Box<[(GroupId, OptimizationGoal)]>,
     recipe_cursor: u64,
     /// Readiness passes may cache an incomplete prefix so an unchanged queue
     /// wake-up does not re-enter TaskRegistry.  A normal completion pass may
@@ -1151,7 +1157,7 @@ pub struct CascadesEngine {
     /// recursive task captures its exact child ReadSet.
     physical_read_dependencies:
         BTreeMap<(GroupId, OptimizationGoal), BTreeSet<(GroupId, OptimizationGoal)>>,
-    physical_task_cache: BTreeMap<(GroupId, OptimizationGoal), PhysicalTaskCacheEntry>,
+    physical_task_cache: BTreeMap<(GroupId, OptimizationGoal), PhysicalTaskState>,
     /// A proof is retained only for the exact current physical domain. The
     /// TaskRegistry owns its lifecycle; this index avoids scanning all bound
     /// records when a parent asks whether a child may provide a lower bound.
@@ -7275,6 +7281,103 @@ impl CascadesEngine {
         Ok(ReadSet::new(reads))
     }
 
+    fn physical_dependency_snapshot(
+        &self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> Box<[(GroupId, OptimizationGoal)]> {
+        self.physical_read_dependencies
+            .get(&(self.memo.canonical_group(group), goal))
+            .map(|dependencies| dependencies.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Refresh a resident physical task's read cursor by delta.
+    ///
+    /// A task is invalidated for a reason, but that does not mean every input
+    /// it has ever observed changed.  Keep current `PatternRead` values and
+    /// rebuild only the owner or child-goal entries whose version is stale;
+    /// add/remove entries only when the recipe dependency set changed.  The
+    /// resulting ReadSet remains the existing TaskRegistry contract, so this
+    /// is an incremental producer for the same proof rather than a second
+    /// invalidation mechanism.
+    fn physical_read_set_incremental(
+        &self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        previous: Option<&PhysicalTaskState>,
+    ) -> Result<(ReadSet, bool)> {
+        let group = self.memo.canonical_group(group);
+        self.memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("unknown group during physical read capture"))?;
+        let dependencies = self.physical_dependency_snapshot(group, goal);
+        let Some(previous) = previous else {
+            return Ok((self.physical_read_set(group, goal)?, true));
+        };
+
+        let mut reads = Vec::with_capacity(1 + dependencies.len());
+        let mut changed = previous.dependencies.as_ref() != dependencies.as_ref();
+        let previous_reads = previous.reads.reads();
+
+        let current_owner = PatternRead::from_group(&self.memo, group)?;
+        if let Some(read) = previous_reads
+            .iter()
+            .find(|read| read.physical_goal.is_none() && self.memo.canonical_group(read.group) == group)
+            .copied()
+        {
+            if read.is_current(&self.memo)? {
+                reads.push(read);
+            } else {
+                reads.push(current_owner);
+                changed = true;
+            }
+        } else {
+            reads.push(current_owner);
+            changed = true;
+        }
+
+        for (child, child_goal) in dependencies.iter().copied() {
+            let child = self.memo.canonical_group(child);
+            let current = PatternRead::physical_from_group(&self.memo, child, child_goal)?;
+            if let Some(read) = previous_reads.iter().find(|read| {
+                read.physical_goal == Some(child_goal)
+                    && self.memo.canonical_group(read.group) == child
+            }) {
+                if read.is_current(&self.memo)? {
+                    reads.push(*read);
+                } else {
+                    reads.push(current);
+                    changed = true;
+                }
+            } else {
+                reads.push(current);
+                changed = true;
+            }
+        }
+
+        // A merge or recipe withdrawal can remove a dependency.  Do not carry
+        // its old physical cursor into the new task identity.
+        for read in previous_reads
+            .iter()
+            .filter_map(|read| read.physical_goal.map(|goal| (read, goal)))
+        {
+            let (read, read_goal) = read;
+            let key = (self.memo.canonical_group(read.group), read_goal);
+            if !dependencies.contains(&key) {
+                changed = true;
+            }
+        }
+
+        if !changed {
+            // The exact task domain and every cursor are still current.  Keep
+            // the resident normalized set; no sort, deduplication, or new
+            // read-set identity is needed for this wake-up.
+            return Ok((previous.reads.clone(), false));
+        }
+        Ok((ReadSet::new(reads), true))
+    }
+
     fn optimize_group(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Subproblem);
         if !self.memo.control().checkpoint()? {
@@ -7288,12 +7391,12 @@ impl CascadesEngine {
             .copied()
             .unwrap_or_default();
         let completion_pending = self.physical_completion_pending.remove(&cache_key);
+        let resident_state = self.physical_task_cache.get(&cache_key).cloned();
         let fast_reuse = !self.physical_full_recost.contains(&cache_key)
             && !self.physical_dirty_recipes.contains_key(&cache_key)
             && !completion_pending
-            && self
-                .physical_task_cache
-                .get(&cache_key)
+            && resident_state
+                .as_ref()
                 .is_some_and(|entry| {
                     next_recipe_sequence <= entry.recipe_cursor
                         && (entry.complete
@@ -7314,12 +7417,15 @@ impl CascadesEngine {
         // Child frontiers are part of the exact parent response. Capture them
         // before requesting the task so a changed child selects a new
         // evaluation, while an unchanged incomplete task remains reusable.
-        self.physical_readset_rebuild_count = self.physical_readset_rebuild_count.saturating_add(1);
         self.physical_readset_initial_capture_count = self
             .physical_readset_initial_capture_count
             .saturating_add(1);
-        let read_set = self.physical_read_set(group, goal)?;
-        let requested_read_set = read_set.clone();
+        let (requested_read_set, read_set_changed) =
+            self.physical_read_set_incremental(group, goal, resident_state.as_ref())?;
+        if read_set_changed {
+            self.physical_readset_rebuild_count = self.physical_readset_rebuild_count.saturating_add(1);
+        }
+        let read_set = requested_read_set.clone();
         let mut new_evaluation = false;
         // An incomplete result from the readiness queue is a reusable prefix,
         // not an instruction to reopen the task on every recursive visit. We
@@ -7397,14 +7503,30 @@ impl CascadesEngine {
             .task(task)
             .and_then(|record| self.task_registry.cursor(record.cursor))
             .unwrap_or_default();
-        let predecessor = self.task_registry.task_predecessor(task);
-        let predecessor_cursor = predecessor
-            .and_then(|task| self.task_registry.task(task))
-            .and_then(|record| self.task_registry.cursor(record.cursor));
-        let predecessor_reads = predecessor
-            .and_then(|task| self.task_registry.task_read_set(task))
-            .and_then(|read_set| self.task_registry.read_set(read_set))
-            .cloned();
+        let resident_task = resident_state.as_ref().map(|state| state.task);
+        let predecessor = (resident_task != Some(task))
+            .then(|| self.task_registry.task_predecessor(task))
+            .flatten();
+        let resident_is_current = resident_task == Some(task);
+        let resident_is_predecessor = resident_task.is_some() && predecessor == resident_task;
+        let predecessor_cursor = if resident_is_predecessor {
+            resident_state.as_ref().map(|state| Cursor {
+                position: state.recipe_cursor,
+                complete: state.complete,
+            })
+        } else {
+            predecessor
+                .and_then(|task| self.task_registry.task(task))
+                .and_then(|record| self.task_registry.cursor(record.cursor))
+        };
+        let predecessor_reads = if resident_is_current || resident_is_predecessor {
+            resident_state.as_ref().map(|state| state.reads.clone())
+        } else {
+            predecessor
+                .and_then(|task| self.task_registry.task_read_set(task))
+                .and_then(|read_set| self.task_registry.read_set(read_set))
+                .cloned()
+        };
         let previous_reads = if resume_candidate {
             Some(requested_read_set.clone())
         } else {
@@ -7456,6 +7578,11 @@ impl CascadesEngine {
             // prior read-set epoch and may still point at the beginning of
             // the recipe stream even when this task yielded mid-recipe.
             current_cursor.position
+        } else if resident_is_current {
+            resident_state
+                .as_ref()
+                .map(|state| state.recipe_cursor)
+                .unwrap_or(current_cursor.position)
         } else {
             predecessor_cursor
                 .or_else(|| (!new_evaluation).then_some(current_cursor))
@@ -7481,8 +7608,7 @@ impl CascadesEngine {
                 recipe_start,
                 recipe_cursor,
                 dirty_recipes.as_ref(),
-            )
-            || completion_pending;
+            );
         if completion_pending
             && !local_logical_frontier_changed
             && dirty_recipes.as_ref().is_none_or(BTreeSet::is_empty)
@@ -7500,7 +7626,7 @@ impl CascadesEngine {
                 .saturating_add(1);
         }
         if resume_candidate {
-            if !has_recipe_work {
+            if !has_recipe_work && !completion_pending {
                 // The readiness pass already consumed this task's current
                 // recipe prefix. A later logical publication will enqueue the
                 // task again when it appends a recipe; reopening it here would
@@ -7557,8 +7683,10 @@ impl CascadesEngine {
             self.note_physical_completion_change(group, goal, cache_complete);
             self.physical_task_cache.insert(
                 cache_key,
-                PhysicalTaskCacheEntry {
+                PhysicalTaskState {
+                    task,
                     reads: requested_read_set.clone(),
+                    dependencies: self.physical_dependency_snapshot(group, goal),
                     recipe_cursor: recipe_count,
                     complete: cache_complete,
                 },
@@ -7605,8 +7733,10 @@ impl CascadesEngine {
             self.note_physical_completion_change(group, goal, cache_complete);
             self.physical_task_cache.insert(
                 cache_key,
-                PhysicalTaskCacheEntry {
+                PhysicalTaskState {
+                    task,
                     reads: requested_read_set.clone(),
+                    dependencies: self.physical_dependency_snapshot(group, goal),
                     recipe_cursor: recipe_count,
                     complete: cache_complete,
                 },
@@ -7655,16 +7785,20 @@ impl CascadesEngine {
                 // exact post-child ReadSet before publication; otherwise a
                 // later parent could either miss a child change or retain a
                 // provisional pre-child snapshot.
-                self.physical_readset_rebuild_count = self.physical_readset_rebuild_count.saturating_add(1);
-                self.physical_readset_post_child_capture_count = self
-                    .physical_readset_post_child_capture_count
-                    .saturating_add(1);
-                let post_child_reads = self.physical_read_set(group, goal)?;
-                self.task_registry.replace_current_read_set(
-                    task,
-                    &self.memo,
-                    post_child_reads.clone(),
-                )?;
+                let (post_child_reads, _post_readset_changed) = self
+                    .physical_read_set_incremental(group, goal, resident_state.as_ref())?;
+                if post_child_reads != requested_read_set {
+                    self.physical_readset_rebuild_count =
+                        self.physical_readset_rebuild_count.saturating_add(1);
+                    self.physical_readset_post_child_capture_count = self
+                        .physical_readset_post_child_capture_count
+                        .saturating_add(1);
+                    self.task_registry.replace_current_read_set(
+                        task,
+                        &self.memo,
+                        post_child_reads.clone(),
+                    )?;
+                }
                 let recipe_count = self
                     .next_recipe_sequence
                     .get(&(self.memo.canonical_group(group), goal))
@@ -7740,8 +7874,10 @@ impl CascadesEngine {
                 self.note_physical_completion_change(group, goal, complete);
                 self.physical_task_cache.insert(
                     cache_key,
-                    PhysicalTaskCacheEntry {
+                    PhysicalTaskState {
+                        task,
                         reads: post_child_reads,
+                        dependencies: self.physical_dependency_snapshot(group, goal),
                         recipe_cursor: cursor_position,
                         complete,
                     },
