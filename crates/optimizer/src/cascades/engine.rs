@@ -960,6 +960,18 @@ struct PhysicalTaskCacheEntry {
     complete: bool,
 }
 
+/// The observable response of one exact physical subproblem.  ReadSet
+/// revisions describe why a task may need to run; this compact snapshot
+/// describes whether running it actually produced something a parent can
+/// consume.  Keeping the two notions separate prevents a completion check
+/// or a no-op retry from propagating through the whole ancestor chain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PhysicalResponseSnapshot {
+    implementation_revision: u64,
+    frontier_revision: u64,
+    complete: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalCompletionProof {
     proof: BoundProofId,
@@ -1131,6 +1143,10 @@ pub struct CascadesEngine {
     /// the complete local stream.
     physical_dirty_recipes:
         BTreeMap<(GroupId, OptimizationGoal), BTreeSet<(PhysicalExprId, Fingerprint)>>,
+    /// Completion-only notifications are not candidate/cost invalidations.
+    /// A parent may need to close an awaiting task or publish a completion
+    /// certificate, while all already-priced recipes remain reusable.
+    physical_completion_pending: BTreeSet<(GroupId, OptimizationGoal)>,
     /// Cost frontiers cleared by a new search epoch need one complete rebuild
     /// per physical subproblem. Once that rebuild has run, an incomplete
     /// readiness cursor is an append-only prefix and must not force another
@@ -1164,8 +1180,16 @@ pub struct CascadesEngine {
     physical_related_goal_notification_count: u64,
     physical_merged_notification_count: u64,
     physical_readset_rebuild_count: u64,
+    physical_readset_initial_capture_count: u64,
+    physical_readset_post_child_capture_count: u64,
     physical_recipe_reprocess_count: u64,
     physical_completion_invalidation_count: u64,
+    physical_completion_notification_count: u64,
+    physical_direct_consumer_enqueue_count: u64,
+    physical_response_unchanged_count: u64,
+    physical_recipe_first_process_count: u64,
+    physical_recipe_repeat_process_count: u64,
+    physical_completion_only_resume_count: u64,
     /// Logical frontier growth is append-only.  Keep the exact implementation
     /// visit identity so a later physical recost can discover only newly
     /// published logical expressions.  The mandatory/optional bit is part of
@@ -1344,6 +1368,7 @@ impl CascadesEngine {
             physical_completion_proofs: BTreeMap::new(),
             certified_group_pruning_enabled: false,
             physical_dirty_recipes: BTreeMap::new(),
+            physical_completion_pending: BTreeSet::new(),
             physical_full_recost: BTreeSet::new(),
             physical_goals: BTreeMap::new(),
             physical_quality_demanded_groups: BTreeSet::new(),
@@ -1358,8 +1383,16 @@ impl CascadesEngine {
             physical_related_goal_notification_count: 0,
             physical_merged_notification_count: 0,
             physical_readset_rebuild_count: 0,
+            physical_readset_initial_capture_count: 0,
+            physical_readset_post_child_capture_count: 0,
             physical_recipe_reprocess_count: 0,
             physical_completion_invalidation_count: 0,
+            physical_completion_notification_count: 0,
+            physical_direct_consumer_enqueue_count: 0,
+            physical_response_unchanged_count: 0,
+            physical_recipe_first_process_count: 0,
+            physical_recipe_repeat_process_count: 0,
+            physical_completion_only_resume_count: 0,
             physical_implementation_seen: BTreeSet::new(),
             physical_implementation_expression_evaluations: 0,
             physical_implementation_expression_skips: 0,
@@ -1743,6 +1776,11 @@ impl CascadesEngine {
                 .entry((self.memo.canonical_group(group), goal))
                 .or_default()
                 .extend(recipes);
+        }
+        let previous = std::mem::take(&mut self.physical_completion_pending);
+        for (group, goal) in previous {
+            self.physical_completion_pending
+                .insert((self.memo.canonical_group(group), goal));
         }
         let previous = std::mem::take(&mut self.physical_read_dependencies);
         for ((group, goal), children) in previous {
@@ -3127,6 +3165,24 @@ impl CascadesEngine {
         }
     }
 
+    fn mark_physical_parents_completion_pending(&mut self, key: (GroupId, OptimizationGoal)) {
+        let Some(parents) = self.physical_parents.get(&key).cloned() else {
+            return;
+        };
+        for (parent, parent_goal, _physical, _recipe) in parents {
+            let parent_key = (self.memo.canonical_group(parent), parent_goal);
+            if self.physical_completion_pending.insert(parent_key) {
+                self.physical_completion_notification_count = self
+                    .physical_completion_notification_count
+                    .saturating_add(1);
+            } else {
+                self.physical_merged_notification_count = self
+                    .physical_merged_notification_count
+                    .saturating_add(1);
+            }
+        }
+    }
+
     /// Completion is a separate response dimension from candidate cost. A
     /// parent which has registered this child goal may need to retry when the
     /// child closes its declared domain, but that transition must not be
@@ -3150,7 +3206,31 @@ impl CascadesEngine {
                 .physical_completion_invalidation_count
                 .saturating_add(1);
         }
-        self.mark_physical_parents_dirty(key);
+        self.mark_physical_parents_completion_pending(key);
+    }
+
+    fn physical_response_snapshot(
+        &self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> PhysicalResponseSnapshot {
+        let group = self.memo.canonical_group(group);
+        PhysicalResponseSnapshot {
+            implementation_revision: self
+                .memo
+                .group(group)
+                .map(|group| group.physical_implementation_version())
+                .unwrap_or_default(),
+            frontier_revision: self
+                .memo
+                .group(group)
+                .map(|group| group.physical_frontier_version(goal))
+                .unwrap_or_default(),
+            complete: self
+                .physical_task_cache
+                .get(&(group, goal))
+                .is_some_and(|entry| entry.complete),
+        }
     }
 
     fn try_quality_handoff_candidate(
@@ -3551,6 +3631,7 @@ impl CascadesEngine {
         // completion proof from the previous epoch is therefore never a
         // valid lower-bound source after frontiers are cleared.
         self.physical_completion_proofs.clear();
+        self.physical_completion_pending.clear();
         self.task_registry.invalidate_physical_tasks()?;
         self.physical_full_recost = self.next_recipe_sequence.keys().copied().collect();
         self.physical_quality_demanded_groups = self
@@ -4319,78 +4400,80 @@ impl CascadesEngine {
             .insert((parent, parent_goal, physical, recipe));
     }
 
-    /// Add changed physical subproblems and walk only the reverse recipe edges
-    /// already observed by this engine. The child goal is part of the walk;
-    /// a publication for another goal in the same group cannot wake a parent
-    /// which did not read it.
-    fn enqueue_physical_ancestors(
+    /// Enqueue only the exact physical subproblems whose inputs changed.
+    /// Parent propagation happens after the child task returns and its
+    /// observable response is compared.  This is intentionally not a
+    /// transitive ancestor walk: an intermediate task with no new response
+    /// must not wake or dirty the rest of the chain.
+    fn enqueue_physical_work(
         &mut self,
         changed_subproblems: impl IntoIterator<Item = (GroupId, OptimizationGoal)>,
         interleave: &mut PhysicalInterleave,
     ) {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
-        let mut subproblems = VecDeque::new();
-        let mut visited = BTreeSet::new();
         for (group, changed_goal) in changed_subproblems {
             let group = self.memo.canonical_group(group);
-            if self
+            if !self
                 .physical_parents
-                .keys()
-                .any(|(candidate_group, candidate_goal)| {
-                    *candidate_group == group && *candidate_goal != changed_goal
-                })
-                && !self
-                    .physical_parents
-                    .contains_key(&(group, changed_goal))
+                .contains_key(&(group, changed_goal))
+                && self
+                    .physical_goals
+                    .get(&group)
+                    .is_some_and(|goals| goals.iter().any(|goal| *goal != changed_goal))
             {
-                // This is the publication shape that used to be delivered
-                // through the group-wide revision. Keep it as an explicit
-                // avoided-work counter rather than pretending it was an
-                // actual invalidation after the goal-scoped fix.
+                // This local goal index replaces the old reverse-index-wide
+                // scan. It records that a sibling goal was known, while the
+                // exact child-goal lookup had no consumer to notify.
                 self.physical_unrelated_goal_notification_avoided_count = self
                     .physical_unrelated_goal_notification_avoided_count
                     .saturating_add(1);
             }
-            // A logical publication may be supplied as one observed goal per
-            // call by the caller. Do not infer a group-wide dependency here:
-            // physical frontier changes are keyed by the exact child goal.
             interleave.pending.insert((group, changed_goal));
             self.infeasible_goals.remove(&(group, changed_goal));
-            subproblems.push_back((group, changed_goal));
             if group == interleave.root {
                 let root_goals = interleave.goals.clone();
                 for goal in root_goals {
                     interleave.pending.insert((group, goal));
                     self.infeasible_goals.remove(&(group, goal));
-                    subproblems.push_back((group, goal));
                 }
             }
         }
-        while let Some((group, child_goal)) = subproblems.pop_front() {
-            if !visited.insert((group, child_goal)) {
+    }
+
+    /// Propagate a changed response to direct consumers only.  A response
+    /// can be an implementation/frontier delta or a completion transition;
+    /// the caller has already classified it by comparing snapshots.  The
+    /// dirty/pending sets remain the authority for what the parent must do.
+    fn enqueue_physical_consumers(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        response_changed: bool,
+        interleave: &mut PhysicalInterleave,
+    ) {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
+        let group = self.memo.canonical_group(group);
+        let Some(parents) = self.physical_parents.get(&(group, goal)).cloned() else {
+            return;
+        };
+        for (parent, parent_goal, _physical, _recipe) in parents {
+            let parent_key = (self.memo.canonical_group(parent), parent_goal);
+            let has_pending_work = response_changed
+                || self.physical_dirty_recipes.contains_key(&parent_key)
+                || self.physical_completion_pending.contains(&parent_key);
+            if !has_pending_work {
                 continue;
             }
-            let Some(parents) = self.physical_parents.get(&(group, child_goal)).cloned() else {
-                continue;
-            };
-            for (parent, goal, physical, recipe) in parents {
-                let parent = self.memo.canonical_group(parent);
-                if interleave.pending.insert((parent, goal)) {
-                    self.physical_related_goal_notification_count = self
-                        .physical_related_goal_notification_count
-                        .saturating_add(1);
-                } else {
-                    self.physical_merged_notification_count = self
-                        .physical_merged_notification_count
-                        .saturating_add(1);
-                }
-                self.physical_dirty_recipes
-                    .entry((parent, goal))
-                    .or_default()
-                    .insert((physical, recipe));
-                self.infeasible_goals.remove(&(parent, goal));
-                subproblems.push_back((parent, goal));
+            if interleave.pending.insert(parent_key) {
+                self.physical_direct_consumer_enqueue_count = self
+                    .physical_direct_consumer_enqueue_count
+                    .saturating_add(1);
+            } else {
+                self.physical_merged_notification_count = self
+                    .physical_merged_notification_count
+                    .saturating_add(1);
             }
+            self.infeasible_goals.remove(&parent_key);
         }
     }
 
@@ -4425,20 +4508,26 @@ impl CascadesEngine {
             self.physical_interleave_step_mode = true;
             self.physical_interleave_step_yielded = false;
             self.physical_interleave_step_publications = 0;
+            let response_before = self.physical_response_snapshot(group, goal);
             let result = self.optimize_group(group, goal);
             let yielded = self.physical_interleave_step_yielded;
             self.physical_interleave_step_mode = false;
             self.mandatory_only = previous_mandatory_only;
             self.preserve_incomplete_physical = previous_preserve_incomplete;
             result?;
+            let response_after = self.physical_response_snapshot(group, goal);
+            let response_changed = response_before != response_after;
+            if !response_changed {
+                self.physical_response_unchanged_count = self
+                    .physical_response_unchanged_count
+                    .saturating_add(1);
+            }
+            self.enqueue_physical_consumers(group, goal, response_changed, interleave);
             if yielded {
-                // A publication inside the task may have made a registered
-                // parent recipe consumable. Requeue the exact task and walk
-                // only its indexed physical ancestors; the next step resumes
-                // from the recipe/combination cursor rather than rescanning
-                // the whole child frontier.
+                // Resume the exact task. Parent propagation above is driven by
+                // the response snapshot; it is intentionally independent of
+                // this local continuation yield.
                 interleave.pending.insert((group, goal));
-                self.enqueue_physical_ancestors([(group, goal)], interleave);
             }
             self.record_diagnostic_checkpoints();
         }
@@ -5531,7 +5620,7 @@ impl CascadesEngine {
                             );
                         }
                     }
-                    self.enqueue_physical_ancestors(changed_subproblems, interleave);
+                    self.enqueue_physical_work(changed_subproblems, interleave);
                 }
                 for target in inserted_groups {
                     self.schedule_transformation_dependents(target, &mut agenda)?;
@@ -5728,12 +5817,44 @@ impl CascadesEngine {
                 self.physical_readset_rebuild_count,
             ),
             (
+                "physical_readset_initial_capture_count",
+                self.physical_readset_initial_capture_count,
+            ),
+            (
+                "physical_readset_post_child_capture_count",
+                self.physical_readset_post_child_capture_count,
+            ),
+            (
                 "physical_recipe_reprocess_count",
                 self.physical_recipe_reprocess_count,
             ),
             (
+                "physical_recipe_first_process_count",
+                self.physical_recipe_first_process_count,
+            ),
+            (
+                "physical_recipe_repeat_process_count",
+                self.physical_recipe_repeat_process_count,
+            ),
+            (
                 "physical_completion_invalidation_count",
                 self.physical_completion_invalidation_count,
+            ),
+            (
+                "physical_completion_notification_count",
+                self.physical_completion_notification_count,
+            ),
+            (
+                "physical_direct_consumer_enqueue_count",
+                self.physical_direct_consumer_enqueue_count,
+            ),
+            (
+                "physical_response_unchanged_count",
+                self.physical_response_unchanged_count,
+            ),
+            (
+                "physical_completion_only_resume_count",
+                self.physical_completion_only_resume_count,
             ),
             (
                 "optimization_context_count",
@@ -7106,8 +7227,10 @@ impl CascadesEngine {
             .get(&cache_key)
             .copied()
             .unwrap_or_default();
+        let completion_pending = self.physical_completion_pending.remove(&cache_key);
         let fast_reuse = !self.physical_full_recost.contains(&cache_key)
             && !self.physical_dirty_recipes.contains_key(&cache_key)
+            && !completion_pending
             && self
                 .physical_task_cache
                 .get(&cache_key)
@@ -7132,6 +7255,9 @@ impl CascadesEngine {
         // before requesting the task so a changed child selects a new
         // evaluation, while an unchanged incomplete task remains reusable.
         self.physical_readset_rebuild_count = self.physical_readset_rebuild_count.saturating_add(1);
+        self.physical_readset_initial_capture_count = self
+            .physical_readset_initial_capture_count
+            .saturating_add(1);
         let read_set = self.physical_read_set(group, goal)?;
         let requested_read_set = read_set.clone();
         let mut new_evaluation = false;
@@ -7295,7 +7421,24 @@ impl CascadesEngine {
                 recipe_start,
                 recipe_cursor,
                 dirty_recipes.as_ref(),
-            );
+            )
+            || completion_pending;
+        if completion_pending
+            && !local_logical_frontier_changed
+            && dirty_recipes.as_ref().is_none_or(BTreeSet::is_empty)
+            && recipe_start == recipe_cursor
+            && !self.has_physical_recipe_work(
+                group,
+                goal,
+                recipe_start,
+                recipe_cursor,
+                dirty_recipes.as_ref(),
+            )
+        {
+            self.physical_completion_only_resume_count = self
+                .physical_completion_only_resume_count
+                .saturating_add(1);
+        }
         if resume_candidate {
             if !has_recipe_work {
                 // The readiness pass already consumed this task's current
@@ -7453,6 +7596,9 @@ impl CascadesEngine {
                 // later parent could either miss a child change or retain a
                 // provisional pre-child snapshot.
                 self.physical_readset_rebuild_count = self.physical_readset_rebuild_count.saturating_add(1);
+                self.physical_readset_post_child_capture_count = self
+                    .physical_readset_post_child_capture_count
+                    .saturating_add(1);
                 let post_child_reads = self.physical_read_set(group, goal)?;
                 self.task_registry.replace_current_read_set(
                     task,
@@ -8448,6 +8594,15 @@ impl CascadesEngine {
             }
             self.physical_recipe_reprocess_count =
                 self.physical_recipe_reprocess_count.saturating_add(1);
+            if sequence < recipe_cursor {
+                self.physical_recipe_repeat_process_count = self
+                    .physical_recipe_repeat_process_count
+                    .saturating_add(1);
+            } else {
+                self.physical_recipe_first_process_count = self
+                    .physical_recipe_first_process_count
+                    .saturating_add(1);
+            }
             if !self.memo.control().checkpoint()? {
                 break;
             }
