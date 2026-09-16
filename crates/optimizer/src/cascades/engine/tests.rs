@@ -497,6 +497,7 @@ fn binding_preflight_skips_rule_construction_transaction() {
 struct QualityPreflightProbe {
     reads: crate::cascades::tasks::ReadSet,
     preflight_calls: Arc<AtomicUsize>,
+    domain_binding_calls: Arc<AtomicUsize>,
     evidence_calls: Arc<AtomicUsize>,
 }
 
@@ -537,9 +538,20 @@ impl crate::cascades::quality::QualityEvidenceProvider for QualityPreflightProbe
                     selected_rules: Box::new([]),
                     shape: crate::cascades::quality::NativeQualityShape::default(),
                 },
-                domain_bindings: Box::new([]),
             },
         ))
+    }
+
+    fn preflight_domain_bindings(
+        &self,
+        _: &Memo,
+        _: ChildWinnerRef,
+        _: &Winner,
+        _: &[crate::cascades::quality::QualityCandidateNode],
+        _: OptimizationGoal,
+    ) -> Result<Box<[crate::cascades::rules::PatternBinding]>> {
+        self.domain_binding_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::new([]))
     }
 
     fn evidence(
@@ -562,10 +574,12 @@ fn quality_preflight_avoids_freeze_and_reopens_only_after_fact_change() {
         PatternRead::facts_from_group(engine.memo(), group).unwrap(),
     );
     let preflight_calls = Arc::new(AtomicUsize::new(0));
+    let domain_binding_calls = Arc::new(AtomicUsize::new(0));
     let evidence_calls = Arc::new(AtomicUsize::new(0));
     engine.set_quality_evidence_provider(Arc::new(QualityPreflightProbe {
         reads,
         preflight_calls: Arc::clone(&preflight_calls),
+        domain_binding_calls: Arc::clone(&domain_binding_calls),
         evidence_calls: Arc::clone(&evidence_calls),
     }));
     engine.set_quality_policy_handoff_enabled(true);
@@ -578,6 +592,15 @@ fn quality_preflight_avoids_freeze_and_reopens_only_after_fact_change() {
     assert_eq!(evidence_calls.load(Ordering::Relaxed), 0);
     assert_eq!(engine.quality_freeze_avoided_count, 1);
     assert_eq!(engine.quality_production_requests.len(), 1);
+    assert_eq!(domain_binding_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        engine.quality_preflight_domain_binding_provider_call_count,
+        1
+    );
+    assert_eq!(
+        engine.quality_preflight_domain_binding_preference_skip_count,
+        0
+    );
 
     // A root wakeup with the same immutable candidate and current facts is a
     // cursor hit; it must not rebuild the local proof or freeze the tree.
@@ -587,6 +610,11 @@ fn quality_preflight_avoids_freeze_and_reopens_only_after_fact_change() {
     assert_eq!(preflight_calls.load(Ordering::Relaxed), 1);
     assert_eq!(engine.quality_preflight_count, 1);
     assert_eq!(engine.quality_frontier_candidate_skip_count, 1);
+    assert_eq!(domain_binding_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        engine.quality_preflight_domain_binding_provider_call_count,
+        1
+    );
 
     // A real fact change invalidates the cursor and reopens exactly this
     // candidate. It still follows the missing-evidence production path.
@@ -602,6 +630,11 @@ fn quality_preflight_avoids_freeze_and_reopens_only_after_fact_change() {
     assert_eq!(preflight_calls.load(Ordering::Relaxed), 2);
     assert_eq!(evidence_calls.load(Ordering::Relaxed), 0);
     assert_eq!(engine.quality_freeze_avoided_count, 2);
+    assert_eq!(domain_binding_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        engine.quality_preflight_domain_binding_provider_call_count,
+        2
+    );
 }
 
 struct QualityLaneRule;

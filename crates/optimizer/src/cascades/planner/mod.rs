@@ -1098,11 +1098,6 @@ fn planner_quality_preflight(
         proof.write_fingerprint(witness.fact_fingerprint);
         proof.write_u64(u64::from(witness.covered));
     }
-    let domain_bindings = if pending_domain_transfers.is_empty() {
-        Box::new([])
-    } else {
-        quality_domain::selected_transfer_bindings_for_refs(memo, reference, &nodes, state)
-    };
     Ok(Some(QualityCandidatePreflight {
         nodes,
         reads,
@@ -1121,7 +1116,6 @@ fn planner_quality_preflight(
             selected_rules: rules.into_iter().collect(),
             shape,
         },
-        domain_bindings,
     }))
 }
 
@@ -1437,6 +1431,26 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             .read()
             .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
         planner_quality_preflight(memo, reference, winner, goal, &state)
+    }
+
+    fn preflight_domain_bindings(
+        &self,
+        memo: &Memo,
+        reference: ChildWinnerRef,
+        winner: &super::memo::Winner,
+        nodes: &[QualityCandidateNode],
+        _: OptimizationGoal,
+    ) -> Result<Box<[PatternBinding]>> {
+        if !self.preflight_enabled || winner.candidate != reference.candidate {
+            return Ok(Box::new([]));
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+        Ok(quality_domain::selected_transfer_bindings_for_refs(
+            memo, reference, nodes, &state,
+        ))
     }
 
     fn evidence(

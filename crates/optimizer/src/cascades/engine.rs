@@ -1323,6 +1323,11 @@ pub struct CascadesEngine {
     quality_preflight_policy_rejection_count: u64,
     quality_preflight_ready_count: u64,
     quality_freeze_avoided_count: u64,
+    /// Selected-path binding construction is deferred until a preflight
+    /// request wins its preference check. These counters are deliberately
+    /// aggregate-only diagnostics; they do not participate in scheduling.
+    quality_preflight_domain_binding_provider_call_count: u64,
+    quality_preflight_domain_binding_preference_skip_count: u64,
     /// Number of root-frontier entries inspected by the quality policy. A
     /// quality handoff is allowed to select a published, non-leading frontier
     /// entry when it is the first exact candidate whose native contract is
@@ -1529,6 +1534,8 @@ impl CascadesEngine {
             quality_preflight_policy_rejection_count: 0,
             quality_preflight_ready_count: 0,
             quality_freeze_avoided_count: 0,
+            quality_preflight_domain_binding_provider_call_count: 0,
+            quality_preflight_domain_binding_preference_skip_count: 0,
             quality_frontier_candidate_count: 0,
             quality_frontier_candidate_skip_count: 0,
             quality_frontier_certified_count: 0,
@@ -2592,6 +2599,8 @@ impl CascadesEngine {
         self.quality_preflight_policy_rejection_count = 0;
         self.quality_preflight_ready_count = 0;
         self.quality_freeze_avoided_count = 0;
+        self.quality_preflight_domain_binding_provider_call_count = 0;
+        self.quality_preflight_domain_binding_preference_skip_count = 0;
         self.quality_frontier_candidate_count = 0;
         self.quality_frontier_candidate_skip_count = 0;
         self.quality_frontier_certified_count = 0;
@@ -3587,13 +3596,14 @@ impl CascadesEngine {
                 let missing = self.quality_last_evaluation.missing_fact_kinds.clone();
                 if let Some(preflight) = preflight {
                     self.record_quality_production_request_preflight(
+                        provider.as_ref(),
                         goal,
                         reference,
+                        &winner,
                         &preflight.nodes,
                         read_id,
                         &evidence_value,
                         &missing,
-                        preflight.domain_bindings,
                     )?;
                 } else if let Some(frozen_winner) = frozen_winner.as_ref() {
                     self.record_quality_production_request(
@@ -6202,6 +6212,14 @@ impl CascadesEngine {
             (
                 "quality_freeze_avoided_count",
                 self.quality_freeze_avoided_count,
+            ),
+            (
+                "quality_preflight_domain_binding_provider_call_count",
+                self.quality_preflight_domain_binding_provider_call_count,
+            ),
+            (
+                "quality_preflight_domain_binding_preference_skip_count",
+                self.quality_preflight_domain_binding_preference_skip_count,
             ),
             (
                 "quality_policy_frontier_candidate_count",

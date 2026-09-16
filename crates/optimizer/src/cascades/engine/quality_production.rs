@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::cascades::quality::{
-    BundleFact, NativeQualityEvidence, QualityCandidateNode,
+    BundleFact, NativeQualityEvidence, QualityCandidateNode, QualityEvidenceProvider,
 };
 use crate::cascades::rules::QualityDependency;
 use crate::cascades::tasks::ReadSetId;
@@ -353,27 +353,53 @@ impl CascadesEngine {
 
     pub(super) fn record_quality_production_request_preflight(
         &mut self,
+        provider: &dyn QualityEvidenceProvider,
         goal: OptimizationGoal,
         reference: ChildWinnerRef,
+        winner: &Winner,
         nodes: &[QualityCandidateNode],
         reads: ReadSetId,
         evidence: &NativeQualityEvidence,
         missing: &[BundleFact],
-        domain_bindings: Box<[PatternBinding]>,
     ) -> Result<()> {
         let _partition =
             crate::work_partition::enter(crate::work_partition::Bucket::QualityProduction);
-        let Some(request) = QualityProductionRequest::from_preflight(
+        let Some(mut request) = QualityProductionRequest::from_preflight(
             &self.memo,
             reference,
             nodes,
             reads,
             evidence,
             missing,
-            domain_bindings,
+            Box::new([]),
         ) else {
             return Ok(());
         };
+        // The preflight reference graph is cheap enough to decide whether a
+        // request is preferred, but selected-path bindings are a production
+        // payload.  Do not construct them for an obligation that will be
+        // rejected by the current request/goal ordering.
+        let needs_domain_bindings = missing.contains(&BundleFact::PredicateDomain);
+        if !self.quality_request_is_preferred(goal, &request) {
+            if needs_domain_bindings {
+                self.quality_preflight_domain_binding_preference_skip_count = self
+                    .quality_preflight_domain_binding_preference_skip_count
+                    .saturating_add(1);
+            }
+            return Ok(());
+        }
+        if needs_domain_bindings {
+            self.quality_preflight_domain_binding_provider_call_count = self
+                .quality_preflight_domain_binding_provider_call_count
+                .saturating_add(1);
+            request.domain_bindings = provider.preflight_domain_bindings(
+                &self.memo,
+                reference,
+                winner,
+                nodes,
+                goal,
+            )?;
+        }
         self.install_quality_production_request(goal, request)
     }
 

@@ -190,7 +190,7 @@ pub struct QualityCandidateNode {
 /// The cheap side of the quality handoff.  A producer may return this after
 /// inspecting only the exact Memo winner references.  Missing evidence is
 /// represented by facts omitted from the compact evidence.  The engine
-/// uses `nodes`, `reads`, and the selected bindings to request that work
+/// uses `nodes` and `reads` to request that work
 /// instead of freezing a candidate which cannot be handed off.  An absent
 /// reference graph is represented by the trait method returning `None`, which
 /// selects the complete validation/oracle path.
@@ -199,7 +199,6 @@ pub struct QualityCandidatePreflight {
     pub nodes: Box<[QualityCandidateNode]>,
     pub reads: ReadSet,
     pub evidence: NativeQualityEvidence,
-    pub domain_bindings: Box<[PatternBinding]>,
 }
 
 /// Production producers must inspect the exact frozen DAG they are asked to
@@ -216,6 +215,23 @@ pub trait QualityEvidenceProvider: std::fmt::Debug {
         _goal: OptimizationGoal,
     ) -> Result<Option<QualityCandidatePreflight>> {
         Ok(None)
+    }
+
+    /// Build exact selected-path bindings only after the corresponding
+    /// production request has won the preference check.  A preflight is
+    /// allowed to identify a missing predicate-domain obligation without
+    /// constructing all of its transport payloads.  The default keeps custom
+    /// providers on the ordinary task path; the planner provider overrides it
+    /// with the existing native binding implementation.
+    fn preflight_domain_bindings(
+        &self,
+        _memo: &Memo,
+        _reference: ChildWinnerRef,
+        _winner: &Winner,
+        _nodes: &[QualityCandidateNode],
+        _goal: OptimizationGoal,
+    ) -> Result<Box<[PatternBinding]>> {
+        Ok(Box::new([]))
     }
 
     fn evidence(
