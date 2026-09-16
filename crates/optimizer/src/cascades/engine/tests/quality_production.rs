@@ -381,6 +381,77 @@ fn quality_production_domain_request_targets_only_the_selected_pending_filter() 
 }
 
 #[test]
+fn quality_production_dispatches_a_group_hole_continuation_with_its_reads() {
+    let mut f = Fixture::new(false, [101, 102, 103]);
+    f.engine
+        .registry
+        .register_transformation(CountSelectedBindings(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )))
+        .unwrap();
+    let group = f.regions[0];
+    let expression = f.engine.memo().group(group).unwrap().logical_exprs()[0];
+    let binding = PatternBinding {
+        root: PatternOperand::Expression {
+            group,
+            expression,
+            children: Box::new([]),
+        },
+        fingerprint: Fingerprint(991),
+    };
+    let read = PatternRead::from_group(f.engine.memo(), group).unwrap();
+    let evidence = f.evidence([true, false]);
+    f.record(&evidence);
+    f.engine
+        .enqueue_quality_domain_continuations(
+            f.goal,
+            vec![DomainContinuation {
+                binding: binding.clone(),
+                hole: group,
+                predicates: Box::new([]),
+                reads: Box::new([read]),
+                occurrence: expression,
+                context: OptimizationContextId(0),
+            }],
+        )
+        .unwrap();
+    f.engine
+        .enqueue_quality_domain_continuations(
+            f.goal,
+            vec![DomainContinuation {
+                binding: binding.clone(),
+                hole: group,
+                predicates: Box::new([]),
+                reads: Box::new([read]),
+                occurrence: expression,
+                context: OptimizationContextId(0),
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        f.engine.quality_domain_continuation_enqueued_count,
+        1,
+        "same continuation is published once"
+    );
+    let mut agenda = f.agenda(&[(group, crate::cascades::rules::PREDICATE_TRANSFER_RULE.0, 0)]);
+    assert!(f.engine.pop_transformation_task(&mut agenda).unwrap().is_some());
+    assert_eq!(
+        f.engine
+            .quality_active_forced_transform_goal,
+        Some(f.goal)
+    );
+    let continuation = f
+        .engine
+        .quality_active_domain_continuation
+        .as_ref()
+        .expect("forced dispatch lost continuation metadata");
+    assert_eq!(continuation.binding, binding);
+    assert_eq!(continuation.hole, group);
+    assert_eq!(continuation.reads.as_ref(), &[read]);
+    assert_eq!(f.engine.quality_domain_continuation_dispatch_count, 1);
+}
+
+#[test]
 fn quality_production_aggregate_coverage_does_not_hide_missing_domain_work() {
     use crate::cascades::quality::BundleFact;
     let mut f = Fixture::new(false, [101, 102, 103]);

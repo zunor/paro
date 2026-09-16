@@ -11,6 +11,7 @@ use crate::cascades::planner::domain_transfer;
 use crate::expression::traversal::visit_expression;
 use paro_planner::operator::{BoundReference, BoundReferenceId, LogicalOutputLayout};
 use paro_planner::plan::PlanNodeId;
+use crate::cascades::memo::LogicalExpr;
 use super::staging::{
     intern_columns_into, ColumnInternOrigin, ResidentInputFact, ResidentInputFacts,
     ResidentNodeContract,
@@ -28,15 +29,29 @@ fn hole_layout(child: &NativeChild) -> Option<&LogicalOutputLayout> {
     }
 }
 
-/// Admit before constructing output. Inputs remain exact, immutable group
-/// references; unsupported shapes retain the semantic producer unchanged.
-pub(super) fn try_transfer(
+#[derive(Debug)]
+pub(super) struct NativeTransferResult {
+    pub(super) shell: NativeShell,
+    pub(super) continuations: Box<[DomainContinuation]>,
+    /// Reads which keep a group-hole continuation alive, including a negative
+    /// shell lookup.  A missing legal shell is not completion: a later Memo
+    /// publication must wake the exact producer again.
+    pub(super) reads: Box<[PatternRead]>,
+}
+
+/// Produce one exact native rewrite and, when explicitly enabled by the
+/// quality lane, retain resumable work for transparent operators hidden
+/// behind Memo group holes.  The continuation is an ordering hint: each
+/// binding is still run through the normal transaction, proof validation and
+/// Memo publication path.
+pub(super) fn try_transfer_with_continuations(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
     facts: &boundary::BoundarySnapshot,
     binding_fact_value: Fingerprint,
-) -> Result<Option<NativeShell>> {
+    enable_continuations: bool,
+) -> Result<Option<NativeTransferResult>> {
     let PatternOperand::Expression {
         children,
         expression,
@@ -205,7 +220,336 @@ pub(super) fn try_transfer(
     if columns.as_deref() != Some(metadata.output_columns.as_ref()) {
         return Ok(None);
     }
-    Ok(Some(shell))
+    let (continuations, reads) = if enable_continuations {
+        discover_group_hole_continuations(binding, memo, state)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Ok(Some(NativeTransferResult {
+        shell,
+        continuations: continuations.into_boxed_slice(),
+        reads: reads.into_boxed_slice(),
+    }))
+}
+
+/// Discover the next exact Memo choices after a native closure reaches a
+/// group hole.  This is deliberately a one-edge operation: it observes the
+/// current group's logical frontier, records the negative lookup, and emits
+/// only bindings whose immediate operator can consume the already-proven
+/// predicates.  The continuation is then run through the ordinary
+/// transformation transaction, so publication, budget accounting and
+/// verification remain single-sourced.
+fn discover_group_hole_continuations(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<(Vec<DomainContinuation>, Vec<PatternRead>)> {
+    struct Discovery<'a> {
+        memo: &'a Memo,
+        state: &'a PlannerTransformState,
+        continuations: Vec<DomainContinuation>,
+        seen_bindings: BTreeSet<PatternBinding>,
+        reads: BTreeMap<GroupId, PatternRead>,
+    }
+
+    impl Discovery<'_> {
+        fn operator(
+            &self,
+            expression: LogicalExprId,
+        ) -> Option<(&LogicalExpr, &PlannerOperatorMetadata, &LogicalOperator<()>)> {
+            let logical = self.memo.logical_expr(expression)?;
+            let payload = self.state.payloads.logical.get(logical.payload.index())?;
+            let metadata = self.state.metadata.get(&logical.payload)?;
+            Some((logical, metadata, &payload.semantic_template.operator))
+        }
+
+        fn read_group(&mut self, group: GroupId) -> Result<PatternRead> {
+            let group = self.memo.canonical_group(group);
+            if let Some(read) = self.reads.get(&group).copied() {
+                return Ok(read);
+            }
+            // `from_group` includes the logical frontier even when no
+            // supported shell is present.  That negative observation is what
+            // makes a later shell publication wake this continuation.
+            let read = PatternRead::from_group(self.memo, group)?;
+            self.reads.insert(group, read);
+            Ok(read)
+        }
+
+        fn inspect_hole(
+            &mut self,
+            group: GroupId,
+            predicates: &[Expression],
+            path: &[usize],
+            root: &PatternOperand,
+            parent_occurrence: LogicalExprId,
+            parent_context: OptimizationContextId,
+        ) -> Result<()> {
+            let group = self.memo.canonical_group(group);
+            let read = self.read_group(group)?;
+            let Some(group_ref) = self.memo.group(group) else {
+                return Ok(());
+            };
+            // Only inspect immediate logical alternatives.  In particular,
+            // do not recursively enumerate a child's frontier here: the
+            // emitted binding is the resumable unit for the next wake-up.
+            let candidates = group_ref
+                .logical_exprs()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            for candidate in candidates {
+                let Some((logical, metadata, operator)) = self.operator(candidate) else {
+                    continue;
+                };
+                if !continuation_operator_supported(operator) {
+                    continue;
+                }
+                if logical.key.children.len() != metadata.child_layouts.len() {
+                    continue;
+                }
+                let layouts = metadata
+                    .child_layouts
+                    .iter()
+                    .map(|layout| layout.as_ref())
+                    .collect::<Vec<_>>();
+                let Some(transfer) =
+                    domain_transfer::transfer_predicates(operator, &layouts, predicates)
+                else {
+                    continue;
+                };
+                if !transfer
+                    .child_predicates
+                    .iter()
+                    .any(|child| !child.is_empty())
+                {
+                    continue;
+                }
+                let child_operands = logical
+                    .key
+                    .children
+                    .iter()
+                    .copied()
+                    .map(|child| PatternOperand::Group(self.memo.canonical_group(child)))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let replacement = PatternOperand::Expression {
+                    group,
+                    expression: candidate,
+                    children: child_operands,
+                };
+                let Some(next_root) = replace_pattern_operand(root, path, &replacement) else {
+                    continue;
+                };
+                let next_binding = PatternBinding {
+                    fingerprint: continuation_binding_fingerprint(
+                        &next_root,
+                        parent_occurrence,
+                        parent_context,
+                    ),
+                    root: next_root,
+                };
+                if !self.seen_bindings.insert(next_binding.clone()) {
+                    continue;
+                }
+                let predicates = transfer
+                    .child_predicates
+                    .iter()
+                    .flat_map(|predicates| predicates.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                self.continuations.push(DomainContinuation {
+                    binding: next_binding,
+                    hole: group,
+                    predicates,
+                    reads: Box::new([read]),
+                    occurrence: parent_occurrence,
+                    context: parent_context,
+                });
+            }
+            Ok(())
+        }
+
+        fn walk(
+            &mut self,
+            operand: &PatternOperand,
+            predicates: &[Expression],
+            path: &[usize],
+            root: &PatternOperand,
+        ) -> Result<()> {
+            if predicates.is_empty() {
+                return Ok(());
+            }
+            let PatternOperand::Expression {
+                expression,
+                children,
+                ..
+            } = operand
+            else {
+                return Ok(());
+            };
+            let (routed, input_context) = {
+                let Some((logical, metadata, operator)) = self.operator(*expression) else {
+                    return Ok(());
+                };
+                if logical.key.children.len() != children.len()
+                    || logical.key.children.len() != metadata.child_layouts.len()
+                    || !continuation_operator_supported(operator)
+                {
+                    return Ok(());
+                }
+                let layouts = metadata
+                    .child_layouts
+                    .iter()
+                    .map(|layout| layout.as_ref())
+                    .collect::<Vec<_>>();
+                let Some(transfer) =
+                    domain_transfer::transfer_predicates(operator, &layouts, predicates)
+                else {
+                    return Ok(());
+                };
+                (
+                    IntoIterator::into_iter(transfer.child_predicates)
+                        .map(|predicates| predicates.to_vec())
+                        .collect::<Vec<_>>(),
+                    metadata.input_context,
+                )
+            };
+            for (index, child_predicates) in routed.iter().enumerate() {
+                if child_predicates.is_empty() {
+                    continue;
+                }
+                let Some(child) = children.get(index) else {
+                    continue;
+                };
+                let mut child_path = path.to_vec();
+                child_path.push(index);
+                match child {
+                    PatternOperand::Group(group) => self.inspect_hole(
+                        *group,
+                        child_predicates,
+                        &child_path,
+                        root,
+                        *expression,
+                        input_context,
+                    )?,
+                    PatternOperand::Expression { .. } => {
+                        self.walk(child, child_predicates, &child_path, root)?
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let PatternOperand::Expression { expression, .. } = binding else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let predicates = {
+        let discovery = Discovery {
+            memo,
+            state,
+            continuations: Vec::new(),
+            seen_bindings: BTreeSet::new(),
+            reads: BTreeMap::new(),
+        };
+        let Some((_, _, LogicalOperator::Filter(filter))) = discovery.operator(*expression) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        filter.expressions.clone()
+    };
+    let mut discovery = Discovery {
+        memo,
+        state,
+        continuations: Vec::new(),
+        seen_bindings: BTreeSet::new(),
+        reads: BTreeMap::new(),
+    };
+    discovery.walk(binding, &predicates, &[], binding)?;
+    Ok((
+        discovery.continuations,
+        discovery.reads.into_values().collect(),
+    ))
+}
+
+fn continuation_operator_supported(operator: &LogicalOperator<()>) -> bool {
+    match operator {
+        LogicalOperator::Filter(_)
+        | LogicalOperator::Projection(_)
+        | LogicalOperator::Aggregate(_)
+        | LogicalOperator::Join(Join::Comparison(_))
+        | LogicalOperator::Join(Join::Cross(_)) => true,
+        LogicalOperator::SetOperation(setop) => {
+            setop.setop_type == SetOpType::Union && setop.setop_all
+        }
+        _ => false,
+    }
+}
+
+fn replace_pattern_operand(
+    root: &PatternOperand,
+    path: &[usize],
+    replacement: &PatternOperand,
+) -> Option<PatternOperand> {
+    if path.is_empty() {
+        return Some(replacement.clone());
+    }
+    let PatternOperand::Expression {
+        group,
+        expression,
+        children,
+    } = root
+    else {
+        return None;
+    };
+    let index = *path.first()?;
+    let child = children.get(index)?;
+    let child = replace_pattern_operand(child, &path[1..], replacement)?;
+    let mut children = children.to_vec();
+    children[index] = child;
+    Some(PatternOperand::Expression {
+        group: *group,
+        expression: *expression,
+        children: children.into_boxed_slice(),
+    })
+}
+
+fn continuation_binding_fingerprint(
+    operand: &PatternOperand,
+    occurrence: LogicalExprId,
+    context: OptimizationContextId,
+) -> Fingerprint {
+    let mut fingerprint = StableFingerprintBuilder::default();
+    fn write(fingerprint: &mut StableFingerprintBuilder, operand: &PatternOperand) {
+        match operand {
+            PatternOperand::Group(group) => {
+                fingerprint.write_u64(0);
+                fingerprint.write_u64(group.0 as u64);
+            }
+            PatternOperand::Expression {
+                group,
+                expression,
+                children,
+            } => {
+                fingerprint.write_u64(1);
+                fingerprint.write_u64(group.0 as u64);
+                fingerprint.write_u64(expression.0 as u64);
+                fingerprint.write_u64(children.len() as u64);
+                for child in children {
+                    write(fingerprint, child);
+                }
+            }
+        }
+    }
+    fingerprint.write_bytes(b"paro.selected-domain-binding.v1");
+    // The same structural path can be requested by distinct CTE or quality
+    // occurrences. Keep those proof contexts in the task identity so a
+    // binding fingerprint cannot collapse different ownership/evaluation
+    // contexts merely because their Memo choices match.
+    fingerprint.write_u64(occurrence.0 as u64);
+    fingerprint.write_u64(context.0 as u64);
+    write(&mut fingerprint, operand);
+    fingerprint.finish()
 }
 
 /// Test-facing compatibility wrapper. Production callers should pass the

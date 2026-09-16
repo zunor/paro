@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use paro_common::error::{self as paro_error, Result};
+use paro_planner::expression::Expression;
 
 use super::budget::BudgetDimension;
 use super::calibration::ParallelWorkProfile;
@@ -264,6 +265,22 @@ impl PatternOperand {
 pub struct PatternBinding {
     pub root: PatternOperand,
     pub fingerprint: Fingerprint,
+}
+
+/// A resumable, exact continuation for a necessary-domain request which
+/// reached a Memo group hole.  The binding is the work that may be resumed;
+/// the remaining fields are the proof context that makes the resume safe.
+/// In particular, a continuation is not a selected-winner certificate: its
+/// reads are rechecked before it is scheduled and the normal transformation
+/// verifier still owns publication.
+#[derive(Debug, Clone)]
+pub(crate) struct DomainContinuation {
+    pub(crate) binding: PatternBinding,
+    pub(crate) hole: GroupId,
+    pub(crate) predicates: Box<[Expression]>,
+    pub(crate) reads: Box<[PatternRead]>,
+    pub(crate) occurrence: LogicalExprId,
+    pub(crate) context: super::ids::OptimizationContextId,
 }
 
 impl PatternBinding {
@@ -594,6 +611,8 @@ pub struct TransformContext<'a> {
     sidecar_rollbacks: Vec<TransformationRollback>,
     fact_reads: BTreeMap<GroupId, PatternRead>,
     fact_value_fingerprint: Option<Fingerprint>,
+    domain_continuations: Vec<DomainContinuation>,
+    domain_continuations_enabled: bool,
     pub(crate) rejection_reasons: Option<crate::transformation_rejection::RejectionReasons>,
 }
 
@@ -606,6 +625,8 @@ impl<'a> TransformContext<'a> {
             sidecar_rollbacks: Vec::new(),
             fact_reads: BTreeMap::new(),
             fact_value_fingerprint: None,
+            domain_continuations: Vec::new(),
+            domain_continuations_enabled: false,
             rejection_reasons: None,
         }
     }
@@ -666,6 +687,29 @@ impl<'a> TransformContext<'a> {
 
     pub(crate) fn take_fact_reads(&mut self) -> Vec<PatternRead> {
         std::mem::take(&mut self.fact_reads).into_values().collect()
+    }
+
+    /// Enable same-Memo demand continuations for an explicitly selected
+    /// quality binding.  Ordinary transformation tasks keep this disabled so
+    /// the accelerator cannot alter the complete search frontier or pay for
+    /// group-shell inspection on the normal matcher lane.
+    pub(crate) fn enable_domain_continuations(&mut self) {
+        self.domain_continuations_enabled = true;
+    }
+
+    pub(crate) fn domain_continuations_enabled(&self) -> bool {
+        self.domain_continuations_enabled
+    }
+
+    pub(crate) fn record_domain_continuations(
+        &mut self,
+        continuations: impl IntoIterator<Item = DomainContinuation>,
+    ) {
+        self.domain_continuations.extend(continuations);
+    }
+
+    pub(crate) fn take_domain_continuations(&mut self) -> Vec<DomainContinuation> {
+        std::mem::take(&mut self.domain_continuations)
     }
 
     /// Record the canonical value of the facts consumed by this binding.

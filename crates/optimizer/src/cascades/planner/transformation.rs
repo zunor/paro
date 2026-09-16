@@ -736,23 +736,25 @@ impl TransformationRule for PlannerTransformationRule {
                 .expect("planner transform state poisoned");
             match self.transformation {
                 PlannerTransformation::PredicateTransfer => {
-                    let shell = match native_domain::try_transfer(
+                    let native = native_domain::try_transfer_with_continuations(
                         &binding.root,
                         ctx.memo(),
                         &state,
                         &facts,
                         binding_fact_value,
+                        ctx.domain_continuations_enabled(),
                     )? {
-                        Some(shell) => Some(shell),
-                        None => None,
-                    };
-                    if let Some(shell) = shell {
+                    if let Some(native) = native {
+                        for read in native.reads.iter().copied() {
+                            ctx.record_fact_read(read);
+                        }
+                        ctx.record_domain_continuations(native.continuations.into_vec());
                         // Refreshing and resident-contract construction happen
                         // in the common staging transaction below. The native
                         // producer must not perform a second settlement before
                         // that transaction can consume its shell.
                         native_domain_scopes = Some(HashMap::new());
-                        vec![shell]
+                        vec![native.shell]
                     } else {
                         let native = try_native_predicate_transfer(
                             &binding.root,

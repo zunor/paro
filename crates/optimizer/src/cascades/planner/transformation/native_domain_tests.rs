@@ -588,6 +588,126 @@ fn production_selected_binding_drives_native_closure_through_projection_and_aggr
 }
 
 #[test]
+fn production_binding_records_a_resumable_continuation_at_a_memo_group_hole() {
+    let count = Expression::Aggregate(
+        AggregateExpression::new(
+            paro_function::aggregate::distributive::count::get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
+    let inner = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        20,
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+            paro_planner::operator::ExpressionGet::new(
+                0,
+                vec![],
+                vec!["key".into()],
+                vec![LogicalType::Integer],
+            ),
+        )),
+        vec![column(0, 0)],
+    )));
+    let aggregate = Aggregate::new(
+        10,
+        11,
+        12,
+        inner,
+        vec![column(20, 0)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate))),
+        vec![equal(10, 0)],
+    )));
+    let mut input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+    let state = input.planner_state.clone();
+    state.write().unwrap().session =
+        Some(paro_context::TestStatementContextBuilder::minimal().build());
+
+    let root_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let aggregate_group = input
+        .memo
+        .logical_expr(root_expression)
+        .unwrap()
+        .key
+        .children[0];
+    let aggregate_expression = input
+        .memo
+        .group(aggregate_group)
+        .unwrap()
+        .logical_exprs()[0];
+    let inner_group = input
+        .memo
+        .logical_expr(aggregate_expression)
+        .unwrap()
+        .key
+        .children[0];
+    // Deliberately leave the inner group opaque.  This is the actual
+    // production shape at the boundary: the native closure owns the Filter
+    // and outer Aggregate while the next operator must be discovered from
+    // Memo.
+    let root = PatternOperand::Expression {
+        group: input.root,
+        expression: root_expression,
+        children: Box::new([PatternOperand::Expression {
+            group: aggregate_group,
+            expression: aggregate_expression,
+            children: Box::new([PatternOperand::Group(inner_group)]),
+        }]),
+    };
+    let binding = PatternBinding {
+        fingerprint: continuation_binding_fingerprint(
+            &root,
+            root_expression,
+            OptimizationContextId(0),
+        ),
+        root,
+    };
+    let rule = PlannerTransformationRule {
+        transformation: PlannerTransformation::PredicateTransfer,
+        planner_state: state.clone(),
+    };
+    let mut context = TransformContext::new(&mut input.memo, input.root);
+    context.enable_domain_continuations();
+    let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+    assert_eq!(outputs.len(), 1, "the selected binding must still stage");
+
+    let continuations = context.take_domain_continuations();
+    assert_eq!(continuations.len(), 1);
+    let continuation = &continuations[0];
+    assert_eq!(continuation.hole, inner_group);
+    assert_eq!(continuation.occurrence, aggregate_expression);
+    assert!(!continuation.predicates.is_empty());
+    assert!(continuation.reads.iter().any(|read| {
+        read.group == inner_group && read.logical_frontier_revision.is_some()
+    }));
+    let PatternOperand::Expression {
+        children: aggregate_children,
+        ..
+    } = &continuation.binding.root
+    else {
+        panic!("continuation lost the root filter");
+    };
+    let PatternOperand::Expression {
+        children: inner_children,
+        expression: continued_expression,
+        ..
+    } = &aggregate_children[0]
+    else {
+        panic!("continuation did not preserve the projection path");
+    };
+    assert_eq!(*continued_expression, aggregate_expression);
+    assert!(matches!(
+        inner_children[0],
+        PatternOperand::Expression { .. }
+    ));
+}
+
+#[test]
 fn production_selected_binding_rebinds_each_union_all_branch_before_staging() {
     let left = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
         paro_planner::operator::ExpressionGet::new(

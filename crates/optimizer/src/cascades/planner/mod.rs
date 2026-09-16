@@ -79,7 +79,7 @@ use super::region::{
     RegionOwnedArtifact,
 };
 use super::rules::{
-    CostComposition, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
+    CostComposition, DomainContinuation, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
     ImplementationRegistry, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
     PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, QualityDependency,
     ReadScope,

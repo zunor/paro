@@ -71,7 +71,7 @@ use super::region::{
 #[cfg(test)]
 use super::rules::WorkSourceId;
 use super::rules::{
-    CostComposition, ImplementationContext, ImplementationRegistry, PatternBinding,
+    CostComposition, DomainContinuation, ImplementationContext, ImplementationRegistry, PatternBinding,
     PatternBindingSet, PatternEnumerationCompletion, PatternOperand, PatternRead, ReadScope,
     PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof, SourceWork,
     SourceWorkData, TaskSupplyContract, TransformContext, TransformationRule,
@@ -1145,6 +1145,13 @@ pub struct CascadesEngine {
     quality_forced_transform_bindings:
         BTreeMap<(OptimizationGoal, TransformationTaskId), VecDeque<PatternBinding>>,
     quality_active_forced_transform_binding: Option<(TransformationTaskId, PatternBinding)>,
+    /// Continuation metadata is kept beside, rather than inside, the legacy
+    /// binding queue.  The queue remains the existing quality lane; this map
+    /// supplies exact reads and context when a queued binding is dispatched.
+    quality_pending_domain_continuations:
+        BTreeMap<OptimizationGoal, Vec<DomainContinuation>>,
+    quality_active_forced_transform_goal: Option<OptimizationGoal>,
+    quality_active_domain_continuation: Option<DomainContinuation>,
     /// Reverse index for incrementally closing transformation dependencies.
     /// Subscribers are woken only after a Memo transaction commits.
     transformation_subscribers: BTreeMap<GroupId, BTreeSet<TransformationTaskId>>,
@@ -1310,6 +1317,10 @@ pub struct CascadesEngine {
     quality_direct_binding_first_us: Option<u64>,
     quality_direct_binding_last_us: Option<u64>,
     quality_direct_binding_work_units: u64,
+    quality_domain_continuation_enqueued_count: u64,
+    quality_domain_continuation_dispatch_count: u64,
+    quality_domain_continuation_first_us: Option<u64>,
+    quality_domain_continuation_last_us: Option<u64>,
     quality_candidate_evaluation_count: u64,
     quality_candidate_missing_evidence_count: u64,
     /// Low-overhead origin accounting for B11. Handoff checks are triggered
@@ -1425,6 +1436,9 @@ impl CascadesEngine {
             transformation_applications: BTreeMap::new(),
             quality_forced_transform_bindings: BTreeMap::new(),
             quality_active_forced_transform_binding: None,
+            quality_pending_domain_continuations: BTreeMap::new(),
+            quality_active_forced_transform_goal: None,
+            quality_active_domain_continuation: None,
             transformation_subscribers: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
             physical_parents: BTreeMap::new(),
@@ -1525,6 +1539,10 @@ impl CascadesEngine {
             quality_direct_binding_first_us: None,
             quality_direct_binding_last_us: None,
             quality_direct_binding_work_units: 0,
+            quality_domain_continuation_enqueued_count: 0,
+            quality_domain_continuation_dispatch_count: 0,
+            quality_domain_continuation_first_us: None,
+            quality_domain_continuation_last_us: None,
             quality_candidate_evaluation_count: 0,
             quality_candidate_missing_evidence_count: 0,
             quality_handoff_publication_call_count: 0,
@@ -1748,6 +1766,9 @@ impl CascadesEngine {
         self.quality_production_requests.clear();
         self.quality_forced_transform_bindings.clear();
         self.quality_active_forced_transform_binding = None;
+        self.quality_pending_domain_continuations.clear();
+        self.quality_active_forced_transform_goal = None;
+        self.quality_active_domain_continuation = None;
         // A group merge changes the declared physical search domain and
         // invalidates every completion certificate, even when a redirected
         // task happens to retain the same numeric winner.
@@ -2584,12 +2605,19 @@ impl CascadesEngine {
         self.quality_production_requests.clear();
         self.quality_forced_transform_bindings.clear();
         self.quality_active_forced_transform_binding = None;
+        self.quality_pending_domain_continuations.clear();
+        self.quality_active_forced_transform_goal = None;
+        self.quality_active_domain_continuation = None;
         self.quality_last_production_obligation = None;
         self.quality_producer_dispatch_count = 0;
         self.quality_direct_binding_dispatch_count = 0;
         self.quality_direct_binding_first_us = None;
         self.quality_direct_binding_last_us = None;
         self.quality_direct_binding_work_units = 0;
+        self.quality_domain_continuation_enqueued_count = 0;
+        self.quality_domain_continuation_dispatch_count = 0;
+        self.quality_domain_continuation_first_us = None;
+        self.quality_domain_continuation_last_us = None;
         self.quality_candidate_evaluation_count = 0;
         self.quality_candidate_missing_evidence_count = 0;
         self.quality_handoff_publication_call_count = 0;
@@ -3843,6 +3871,9 @@ impl CascadesEngine {
         self.quality_production_requests.clear();
         self.quality_forced_transform_bindings.clear();
         self.quality_active_forced_transform_binding = None;
+        self.quality_pending_domain_continuations.clear();
+        self.quality_active_forced_transform_goal = None;
+        self.quality_active_domain_continuation = None;
         self.protect_current_winners()?;
         self.memo.clear_cost_frontiers()?;
         // Physical recipes are immutable descriptions of already-admitted
@@ -4167,6 +4198,9 @@ impl CascadesEngine {
                 self.quality_production_requests.clear();
                 self.quality_forced_transform_bindings.clear();
                 self.quality_active_forced_transform_binding = None;
+                self.quality_pending_domain_continuations.clear();
+                self.quality_active_forced_transform_goal = None;
+                self.quality_active_domain_continuation = None;
             }
             return result.map(|mut result| {
                 if let Some(expected_class) = expected {
@@ -4825,6 +4859,8 @@ impl CascadesEngine {
                 rule,
                 binding: None,
             };
+            let quality_goal = self.quality_active_forced_transform_goal.take();
+            let active_domain_continuation = self.quality_active_domain_continuation.take();
             let forced_binding = self
                 .quality_active_forced_transform_binding
                 .take()
@@ -4932,14 +4968,18 @@ impl CascadesEngine {
             }
             let binding_started = Instant::now();
             let binding_allocated = paro_common::allocator::thread_allocated_bytes();
+            let forced_binding_present = forced_binding.is_some();
             let mut binding_set = if let Some(binding) = forced_binding {
-                let reads = pattern_binding_fact_reads(&self.memo, &binding)?;
+                let mut reads = pattern_binding_fact_reads(&self.memo, &binding)?.into_vec();
+                if let Some(continuation) = active_domain_continuation.as_ref() {
+                    reads.extend(continuation.reads.iter().copied());
+                }
                 self.quality_direct_binding_work_units = self
                     .quality_direct_binding_work_units
                     .saturating_add(pattern_operand_work_units(&binding.root) as u64);
                 PatternBindingSet {
                     bindings: Box::new([binding.clone()]),
-                    reads,
+                    reads: reads.into_boxed_slice(),
                     work_units: pattern_operand_work_units(&binding.root),
                     work_dimension,
                     completion: PatternEnumerationCompletion::Complete,
@@ -4986,9 +5026,23 @@ impl CascadesEngine {
                 binding_set.work_units = binding_set.work_units.saturating_add(previous.len());
                 binding_set.reads = reads.into_boxed_slice();
             }
-            let Some(read_version) =
+            let read_version = if forced_binding_present {
+                // A forced quality binding is an explicit delta produced by a
+                // committed selected-path publication.  It must be applied
+                // even when the same read cursor is still current: the cursor
+                // prevents ordinary discovery from repeating work, whereas
+                // this queue is the work that discovery already proved worth
+                // replaying.  Re-seeding keeps the usual dependency index and
+                // fact invalidation contract instead of creating a second
+                // continuation state machine.
+                let dependencies = binding_set.reads.to_vec();
+                let version = transformation_dependency_fingerprint(&dependencies);
+                self.seed_transformation_observation(task_id, &dependencies)?;
+                Some(version)
+            } else {
                 self.observe_transformation_inputs(task_id, &binding_set.reads)?
-            else {
+            };
+            let Some(read_version) = read_version else {
                 continue;
             };
             if binding_set.work_dimension != work_dimension {
@@ -5367,6 +5421,9 @@ impl CascadesEngine {
                 // domain before its first write.
                 let _b3_rule = crate::work_partition::rule(rule.0);
                 let mut context = TransformContext::new(&mut self.memo, group);
+                if quality_goal.is_some() {
+                    context.enable_domain_continuations();
+                }
                 context.rejection_reasons = self
                     .collect_rule_work_profile
                     .then(crate::transformation_rejection::RejectionReasons::default);
@@ -5708,6 +5765,7 @@ impl CascadesEngine {
                             Self::lifecycle_elapsed_from(task_lifecycle_started_at),
                         );
                     }
+                    let domain_continuations = context.take_domain_continuations();
                     let (appended_groups, locally_written_groups) = context.commit()?;
                     let locally_written_groups = locally_written_groups
                         .into_iter()
@@ -5763,6 +5821,12 @@ impl CascadesEngine {
                             .chain(changed_cte_readers.iter().copied())
                             .chain(fact_reads.iter().map(|read| read.group)),
                     )?;
+                    if let Some(goal) = quality_goal {
+                        self.enqueue_quality_domain_continuations(
+                            goal,
+                            domain_continuations,
+                        )?;
+                    }
                     release_transformation_output_reservations(
                         &mut self.memo,
                         group,
@@ -6175,6 +6239,22 @@ impl CascadesEngine {
             (
                 "quality_direct_binding_work_units",
                 self.quality_direct_binding_work_units,
+            ),
+            (
+                "quality_domain_continuation_enqueued_count",
+                self.quality_domain_continuation_enqueued_count,
+            ),
+            (
+                "quality_domain_continuation_dispatch_count",
+                self.quality_domain_continuation_dispatch_count,
+            ),
+            (
+                "quality_domain_continuation_first_us",
+                self.quality_domain_continuation_first_us.unwrap_or_default(),
+            ),
+            (
+                "quality_domain_continuation_last_us",
+                self.quality_domain_continuation_last_us.unwrap_or_default(),
             ),
             (
                 "quality_policy_candidate_evaluation_count",

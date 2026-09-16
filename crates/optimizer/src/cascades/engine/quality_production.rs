@@ -10,7 +10,7 @@ use super::*;
 use crate::cascades::quality::{
     BundleFact, NativeQualityEvidence, QualityCandidateNode, QualityEvidenceProvider,
 };
-use crate::cascades::rules::QualityDependency;
+use crate::cascades::rules::{DomainContinuation, QualityDependency};
 use crate::cascades::tasks::ReadSetId;
 
 type ProductionObligation = (BundleFact, GroupId);
@@ -303,6 +303,26 @@ impl StableAgenda {
 }
 
 impl CascadesEngine {
+    fn enqueue_quality_forced_binding(
+        &mut self,
+        goal: OptimizationGoal,
+        binding: PatternBinding,
+    ) {
+        let task = TransformationTaskId {
+            group: self.memo.canonical_group(binding.root_group()),
+            expression: binding.root_expression(),
+            rule: crate::cascades::rules::PREDICATE_TRANSFER_RULE,
+            binding: Some(binding.fingerprint),
+        };
+        let queue = self
+            .quality_forced_transform_bindings
+            .entry((goal, task))
+            .or_default();
+        if !queue.iter().any(|existing| existing == &binding) {
+            queue.push_back(binding);
+        }
+    }
+
     fn quality_request_is_preferred(
         &self,
         goal: OptimizationGoal,
@@ -331,22 +351,84 @@ impl CascadesEngine {
         if !self.quality_request_is_preferred(goal, &request) {
             return Ok(());
         }
+        // Continuations belong to the exact request whose selected path
+        // produced them.  Replacing that request must not let a stale path
+        // leak into a new candidate's quality lane.
+        self.quality_pending_domain_continuations.remove(&goal);
         self.quality_forced_transform_bindings
             .retain(|(entry_goal, _), _| *entry_goal != goal);
         self.quality_production_requests.insert(goal, request);
-        if let Some(request) = self.quality_production_requests.get(&goal) {
-            for binding in request.domain_bindings.iter().cloned() {
-                let task = TransformationTaskId {
-                    group: self.memo.canonical_group(binding.root_group()),
-                    expression: binding.root_expression(),
-                    rule: crate::cascades::rules::PREDICATE_TRANSFER_RULE,
-                    binding: Some(binding.fingerprint),
-                };
-                self.quality_forced_transform_bindings
-                    .entry((goal, task))
-                    .or_default()
-                    .push_back(binding);
+        let bindings = self
+            .quality_production_requests
+            .get(&goal)
+            .map(|request| request.domain_bindings.to_vec())
+            .unwrap_or_default();
+        for binding in bindings {
+            self.enqueue_quality_forced_binding(goal, binding);
+        }
+        Ok(())
+    }
+
+    /// Publish a continuation only after its producer transaction committed.
+    /// The pending sidecar keeps exact reads/context until the existing forced
+    /// transformation queue dispatches the binding; no second scheduler is
+    /// introduced and an ordinary matcher remains responsible for all other
+    /// legal alternatives.
+    pub(super) fn enqueue_quality_domain_continuations(
+        &mut self,
+        goal: OptimizationGoal,
+        continuations: Vec<DomainContinuation>,
+    ) -> Result<()> {
+        if continuations.is_empty()
+            || !self.quality_production_requests.contains_key(&goal)
+        {
+            return Ok(());
+        }
+        let (enqueued, bindings) = {
+            let pending = self
+                .quality_pending_domain_continuations
+                .entry(goal)
+                .or_default();
+            let mut enqueued = 0_u64;
+            for continuation in continuations {
+                if self
+                    .memo
+                    .group(self.memo.canonical_group(continuation.hole))
+                    .is_none()
+                {
+                    continue;
+                }
+                if !pending.iter().any(|existing| {
+                    existing.binding == continuation.binding
+                        && existing.context == continuation.context
+                        && existing.occurrence == continuation.occurrence
+                        && existing.predicates.len() == continuation.predicates.len()
+                        && existing
+                            .predicates
+                            .iter()
+                            .zip(continuation.predicates.iter())
+                            .all(|(left, right)| {
+                                crate::cascades::scalar_lowering::expression_fingerprint(left)
+                                    == crate::cascades::scalar_lowering::expression_fingerprint(
+                                        right,
+                                    )
+                            })
+                }) {
+                    pending.push(continuation);
+                    enqueued = enqueued.saturating_add(1);
+                }
             }
+            let bindings = pending
+                .iter()
+                .map(|continuation| continuation.binding.clone())
+                .collect::<Vec<_>>();
+            (enqueued, bindings)
+        };
+        self.quality_domain_continuation_enqueued_count = self
+            .quality_domain_continuation_enqueued_count
+            .saturating_add(enqueued);
+        for binding in bindings {
+            self.enqueue_quality_forced_binding(goal, binding);
         }
         Ok(())
     }
@@ -469,6 +551,7 @@ impl CascadesEngine {
         }
         for goal in stale {
             self.quality_production_requests.remove(&goal);
+            self.quality_pending_domain_continuations.remove(&goal);
             self.quality_forced_transform_bindings
                 .retain(|(entry_goal, _), _| *entry_goal != goal);
         }
@@ -533,7 +616,36 @@ impl CascadesEngine {
             {
                 self.quality_forced_transform_bindings.remove(&forced_key);
             }
+            let continuation = self
+                .quality_pending_domain_continuations
+                .get_mut(&goal)
+                .and_then(|pending| {
+                    pending
+                        .iter()
+                        .position(|candidate| candidate.binding == binding)
+                        .map(|index| pending.remove(index))
+                });
+            if self
+                .quality_pending_domain_continuations
+                .get(&goal)
+                .is_some_and(Vec::is_empty)
+            {
+                self.quality_pending_domain_continuations.remove(&goal);
+            }
             self.quality_active_forced_transform_binding = Some((task, binding));
+            self.quality_active_forced_transform_goal = Some(goal);
+            if continuation.is_some() {
+                self.quality_domain_continuation_dispatch_count = self
+                    .quality_domain_continuation_dispatch_count
+                    .saturating_add(1);
+                let elapsed = self
+                    .profile_elapsed_us()
+                    .unwrap_or_else(|| self.memo.control().elapsed_us());
+                self.quality_domain_continuation_first_us
+                    .get_or_insert(elapsed);
+                self.quality_domain_continuation_last_us = Some(elapsed);
+            }
+            self.quality_active_domain_continuation = continuation;
             self.quality_producer_dispatch_count += 1;
             self.quality_direct_binding_dispatch_count += 1;
             let elapsed = self
