@@ -1618,7 +1618,7 @@ fn physical_read_of_one_goal_is_not_invalidated_by_another_goal_publication() {
         .contains_key(&(root, goal_a)));
     let mut unrelated = PhysicalInterleave::new(root, [goal_a]);
     unrelated.pending.remove(&(root, goal_a));
-    engine.enqueue_physical_ancestors([(child, goal_b)], &mut unrelated);
+    engine.enqueue_physical_work([(child, goal_b)], &mut unrelated);
     assert!(!unrelated.pending.contains(&(root, goal_a)));
     engine
         .note_physical_frontier_change(child, goal_a, true)
@@ -1632,6 +1632,63 @@ fn physical_read_of_one_goal_is_not_invalidated_by_another_goal_publication() {
     assert_eq!(counters["physical_unrelated_goal_invalidation_count"], 0);
     assert!(counters["physical_unrelated_goal_notification_avoided_count"] > 0);
     assert!(counters["physical_related_goal_notification_count"] > 0);
+}
+
+#[test]
+fn physical_response_delta_wakes_direct_consumer_before_grandparent() {
+    let (mut engine, root, goal) = strong_tree_engine();
+    let root_expression = engine
+        .memo()
+        .group(root)
+        .and_then(|group| group.logical_exprs().first().copied())
+        .and_then(|logical| engine.memo().logical_expr(logical))
+        .expect("the tree fixture has a root expression");
+    let child = root_expression
+        .key
+        .children
+        .first()
+        .copied()
+        .expect("the tree fixture has one physical child");
+    let grandparent = engine.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let fingerprint = Fingerprint(9_900);
+    engine.register_physical_dependency(
+        child,
+        goal,
+        root,
+        goal,
+        PhysicalExprId(0),
+        fingerprint,
+    );
+    engine.register_physical_dependency(
+        root,
+        goal,
+        grandparent,
+        goal,
+        PhysicalExprId(1),
+        fingerprint,
+    );
+
+    // A real response change only enqueues the direct recipe consumer. The
+    // grandparent is reached after the root has produced its own changed
+    // response, not by a speculative transitive walk.
+    let mut unchanged = PhysicalInterleave::new(child, [goal]);
+    unchanged.pending.remove(&(child, goal));
+    engine.enqueue_physical_consumers(child, goal, false, &mut unchanged);
+    assert!(unchanged.pending.is_empty());
+    let mut interleave = PhysicalInterleave::new(child, [goal]);
+    engine.enqueue_physical_consumers(child, goal, true, &mut interleave);
+    assert!(interleave.pending.contains(&(root, goal)));
+    assert!(!interleave.pending.contains(&(grandparent, goal)));
+    engine.enqueue_physical_consumers(root, goal, true, &mut interleave);
+    assert!(interleave.pending.contains(&(grandparent, goal)));
+    assert_eq!(
+        engine.physical_direct_consumer_enqueue_count, 2,
+        "each changed response should wake one direct consumer"
+    );
 }
 
 fn engine(optional_rules: u32) -> (CascadesEngine, GroupId, OptimizationGoal) {
