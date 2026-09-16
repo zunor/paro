@@ -1154,32 +1154,6 @@ fn transfer_shell_closure_with_layouts(
     .map(Some)
 }
 
-/// Statistics use the existing one-operator propagation/gathering contracts.
-/// The temporary adapter contains only this shell and immutable input facts,
-/// never an owned descendant tree, and is never inserted as a Memo alternative.
-fn detach_bound_operator(
-    operator: LogicalOperator<Box<OwnedLogicalPlan>>,
-) -> Result<LogicalOperator<BoundReference>> {
-    let mut ordinal = 0;
-    operator.try_map_child_links(&mut |child| {
-        let reference = match &child.operator {
-            LogicalOperator::BoundReference(reference) => reference.clone(),
-            _ => {
-                return Err(paro_error::internal(
-                    "native relation cache input is not a bound reference",
-                ));
-            }
-        };
-        // The temporary reference may carry a group-hole or occurrence ID
-        // after demand lowering.  Cache storage is positional by construction
-        // and must not leak that transport identity into the reusable entry.
-        let mut reference = reference;
-        reference.reference_id = BoundReferenceId::input_ordinal(ordinal);
-        ordinal += 1;
-        Ok(reference)
-    })
-}
-
 fn attach_native_operator(
     operator: LogicalOperator<BoundReference>,
     links: &[NativeChild],
@@ -1215,7 +1189,6 @@ pub(super) fn refresh_statistics(
     let _refresh = crate::work_partition::native_refresh(shell.nodes.len());
     use super::settlement::demand;
     use paro_planner::operator::bound_reference::{BoundRelationFactValues, BoundRelationFacts};
-    use paro_planner::plan::arena::LogicalPlanNode;
     let Some(session) = state.session.clone() else {
         return Ok(None);
     };
@@ -1276,6 +1249,17 @@ pub(super) fn refresh_statistics(
     let mut scopes = HashMap::new();
     let mut resident_nodes = HashMap::new();
     let mut scan_bindings = demand::ScanBindings::new();
+    // Statistics propagation for native nodes uses this session context as a
+    // reusable property workspace.  The old path allocated a fresh context
+    // for every cache miss solely because the operator had been rebuilt as an
+    // OwnedLogicalPlan.  Its column map is replaced with the exact immutable
+    // input view for each node below; no facts are shared across unrelated
+    // native relations by accident.
+    let mut context = crate::context::OptimizationContext::new(
+        session.clone(),
+        state.bind_context.clone(),
+    );
+    context.cost_model = state.cost_model.clone();
     for (index, node) in shell.nodes.iter_mut().enumerate() {
         if !memo.control().checkpoint()? {
             return Ok(None);
@@ -1297,7 +1281,7 @@ pub(super) fn refresh_statistics(
         });
         let mut links = Vec::new();
         let operator = node.operator.clone().try_map_child_links(&mut |child| {
-            let (stats, layout, maximum, reference) = match &child {
+            let (_stats, layout, maximum, reference) = match &child {
                 NativeChild::MemoGroup {
                     stats,
                     layout,
@@ -1397,25 +1381,19 @@ pub(super) fn refresh_statistics(
                 NativeChild::Group { .. } => {
                     return Err(paro_error::internal(
                         "native domain received an owned group transport",
-                    ))
+                    ));
                 }
             };
             layouts.push(layout);
             maximums.push(maximum);
             links.push(child);
-            Ok::<_, paro_error::ParoError>(Box::new(OwnedLogicalPlan {
-                id: state.bind_context.next_plan_id(),
-                stats,
-                operator: LogicalOperator::BoundReference(reference),
-            }))
+            // This is already a native operator shell. Keep the immutable
+            // fact-backed reference in its child slot instead of wrapping it
+            // in an OwnedLogicalPlan only to detach it again below.
+            Ok::<_, paro_error::ParoError>(reference)
         })?;
-        let (local, inputs) = LogicalPlanNode::detach(OwnedLogicalPlan {
-            id: node.id,
-            stats: NodeStats::default(),
+        let (mut local, aliases) = demand::apply_operator(
             operator,
-        });
-        let (mut local, aliases) = demand::apply(
-            local,
             demand::Inputs {
                 old_carriers: &carriers[index],
                 before: &before,
@@ -1432,17 +1410,16 @@ pub(super) fn refresh_statistics(
         // re-derived.
         let statistics_partition =
             crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
-        crate::expression::scalar_normalizer().visit_operator_expressions(&mut local.operator);
+        crate::expression::scalar_normalizer().visit_operator_expressions(&mut local);
         let semantic_operator = local
-            .operator
             .clone()
             .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
             .expect("native relation semantic operator cannot fail");
-        if local.operator.op_type() != node.operator.op_type() {
+        if local.op_type() != node.operator.op_type() {
             drop(statistics_partition);
             return Ok(None);
         }
-        if matches!(&local.operator, LogicalOperator::Filter(filter)
+        if matches!(&local, LogicalOperator::Filter(filter)
             if filter.expressions.is_empty() && filter.projection_map.is_identity(layouts[0].len()))
         {
             // An input alias is a different settlement result, not an extra
@@ -1496,9 +1473,8 @@ pub(super) fn refresh_statistics(
         let output_names: Arc<[String]> = semantic_operator
             .output_names_from_child_refs(child_names.as_slice())
             .into();
-        let layout_before = local
-            .operator
-            .output_layout_from_child_refs(&layouts.iter().collect::<Vec<_>>());
+        let layout_before =
+            local.output_layout_from_child_refs(&layouts.iter().collect::<Vec<_>>());
         let (pre_output_columns, pre_scalar_roots, pre_operator_fingerprint, pre_operator_encoding) =
             {
                 let mut identity = PlannerResidentIdentity {
@@ -1579,29 +1555,25 @@ pub(super) fn refresh_statistics(
             });
             continue;
         }
-        // Only a cache miss needs the owned child assembly and the expensive
-        // statistics fold.  A hit above can attach the immutable relation
+        // Only a cache miss needs direct propagation and the expensive
+        // statistics fold. A hit above can attach the immutable relation
         // operator directly to the current NativeChild links.
         state.settlement_cache.native_relation_fact_evaluations = state
             .settlement_cache
             .native_relation_fact_evaluations
             .saturating_add(1);
-        let operator = local.assemble(inputs)?.into_operator();
-        let mut context =
-            crate::context::OptimizationContext::new(session.clone(), state.bind_context.clone());
-        context.cost_model = state.cost_model.clone();
-        let input = Arc::new(columns);
-        let mut propagator = StatisticsPropagator::with_statistics_map(input.as_ref().clone());
-        let operator = propagator.propagate_operator(session.as_ref(), operator);
+        let mut propagator = StatisticsPropagator::with_statistics_map(columns);
+        let operator = propagator.propagate_native_operator(session.as_ref(), local);
         context.column_stats = Arc::new(propagator.take_statistics_map());
-        let plan = OwnedLogicalPlan {
-            id: node.id,
-            stats: NodeStats::default(),
+        let (stats, operator, layout, maximum) = StatisticsGathering::new().gather_native_local(
             operator,
-        };
-        let (plan, layout, maximum) =
-            StatisticsGathering::new().gather_local(plan, &layouts, &maximums, input, &mut context);
-        if matches!(&plan.operator, LogicalOperator::SetOperation(_)) {
+            NodeStats::default(),
+            &layouts,
+            &maximums,
+            context.column_stats.clone(),
+            &mut context,
+        );
+        if matches!(&operator, LogicalOperator::SetOperation(_)) {
             let [left, right] = positional_columns.as_slice() else {
                 return Err(paro_error::internal(
                     "native set-operation statistics arity changed",
@@ -1615,8 +1587,7 @@ pub(super) fn refresh_statistics(
             );
         }
         drop(statistics_partition);
-        let (_, stats, operator) = plan.into_parts();
-        let cached_operator = detach_bound_operator(operator)?;
+        let cached_operator = operator;
         node.operator = attach_native_operator(cached_operator.clone(), &links)?;
         node.stats = stats.clone();
         let output_columns_stats = context.column_stats.clone();
@@ -1724,12 +1695,12 @@ pub(super) fn refresh_statistics(
         }
         completed.push(Completed {
             id: node.id,
-            stats,
-            layout,
-            maximum,
-            columns: context.column_stats,
+            stats: cached.stats.clone(),
+            layout: cached.layout.clone(),
+            maximum: cached.maximum,
+            columns,
             aliases,
-            output_columns,
+            output_columns: cached.output_columns.clone(),
             names: output_names,
         });
     }

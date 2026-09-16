@@ -238,6 +238,31 @@ pub(in super::super) fn apply(
     scan_bindings: &mut ScanBindings,
     bind: &BindContext,
 ) -> Result<(LogicalPlanNode<()>, BindingMap)> {
+    let (operator, bindings) = apply_operator(
+        shell.operator,
+        inputs,
+        wanted,
+        scan_bindings,
+        bind,
+    )?;
+    shell.operator = operator;
+    shell.stats.invalidate_structural_facts();
+    Ok((shell, bindings))
+}
+
+/// Apply demand and occurrence-local column rebinding directly to an
+/// operator shell.  The arena settlement path wraps this in a
+/// `LogicalPlanNode`, while native relation construction can keep its
+/// `BoundReference` children in place and avoid an OwnedLogicalPlan round
+/// trip.  Keeping the implementation generic is important: demand changes
+/// operator payloads, not child ownership.
+pub(in super::super) fn apply_operator<Child>(
+    mut operator: LogicalOperator<Child>,
+    inputs: Inputs<'_>,
+    wanted: &BTreeSet<ColumnBinding>,
+    scan_bindings: &mut ScanBindings,
+    bind: &BindContext,
+) -> Result<(LogicalOperator<Child>, BindingMap)> {
     let Inputs {
         old_carriers,
         before,
@@ -248,17 +273,17 @@ pub(in super::super) fn apply(
         .iter()
         .flat_map(|map| map.iter().map(|(a, b)| (*a, *b)))
         .collect::<BindingMap>();
-    if let LogicalOperator::MaterializedCTE(cte) = &mut shell.operator {
+    if let LogicalOperator::MaterializedCTE(cte) = &mut operator {
         for column in &mut cte.output_columns {
             if let Some(binding) = bindings.get(&column.binding) {
                 column.binding = *binding;
             }
         }
     }
-    let get_output = matches!(shell.operator, LogicalOperator::Get(_));
+    let get_output = matches!(operator, LogicalOperator::Get(_));
     // Get's output identities are positional today. Compact its aligned
     // arrays atomically, then explicitly rebind every parent-local use.
-    if let LogicalOperator::Get(get) = &mut shell.operator {
+    if let LogicalOperator::Get(get) = &mut operator {
         let mut retained = wanted.clone();
         for expression in &get.runtime_filter_expressions {
             crate::expression::traversal::visit_expression(expression, &mut |expression| {
@@ -317,7 +342,7 @@ pub(in super::super) fn apply(
     // payloads for an identity substitution; otherwise copy only changed paths.
     if bindings.iter().any(|(before, after)| before != after) {
         let mut failure = None;
-        paro_planner::visitor::enumerate_expressions(&mut shell.operator, |expression| {
+        paro_planner::visitor::enumerate_expressions(&mut operator, |expression| {
             if failure.is_none() {
                 match remap_expression(expression, &bindings) {
                     Ok(rewritten) => *expression = rewritten,
@@ -329,7 +354,7 @@ pub(in super::super) fn apply(
             return Err(error);
         }
     }
-    match &mut shell.operator {
+    match &mut operator {
         LogicalOperator::Filter(filter) => project(
             &mut filter.projection_map,
             &before[0],
@@ -385,7 +410,7 @@ pub(in super::super) fn apply(
         }
         _ => {}
     }
-    let output = shell.operator.output_layout_from_children(after);
+    let output = operator.output_layout_from_children(after);
     let map = old_carriers
         .bindings()
         .iter()
@@ -399,8 +424,7 @@ pub(in super::super) fn apply(
             output.bindings().contains(new).then_some((*old, *new))
         })
         .collect();
-    shell.stats.invalidate_structural_facts();
-    Ok((shell, map))
+    Ok((operator, map))
 }
 
 #[cfg(test)]

@@ -10,12 +10,13 @@ use paro_common::types::LogicalType;
 use paro_parser::ast::PathQuantifier;
 use paro_planner::expression::{ComparisonExpression, ComparisonType, ConjunctionType, Expression};
 use paro_planner::operator::{
-    ColumnBinding, Filter, FullTextFilterScan, Get, GraphExpand, GraphScan, Join,
+    BoundReference, ColumnBinding, Filter, FullTextFilterScan, Get, GraphExpand, GraphScan, Join,
     JoinComparisonType, JoinCondition, JoinType, LogicalOperator, LogicalOutputLayout, SearchScan,
     SetOpType,
 };
 use paro_planner::plan::{
-    CardinalityEstimate, CardinalityProvenance, LogicalPlanPostOrderFolder, OwnedLogicalPlan,
+    CardinalityEstimate, CardinalityProvenance, LogicalPlanPostOrderFolder, NodeStats,
+    OwnedLogicalPlan,
 };
 use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
@@ -23,8 +24,8 @@ use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 use crate::context::{GraphStatsCache, OptimizationContext, SharedColumnStatistics};
 use crate::statistics::aggregate_filter::estimate_grouped_sum_distribution;
 
-fn external_table_cardinality(
-    table: &paro_planner::operator::LogicalExternalTable,
+fn external_table_cardinality<Child: LocalChildFacts>(
+    table: &paro_planner::operator::LogicalExternalTable<Child>,
 ) -> Option<CardinalityEstimate> {
     let declared_rows = table.call.spec.as_ref().and_then(|spec| {
         let paro_external::routine::spec::RoutineExecutionContract::Table(contract) =
@@ -51,7 +52,7 @@ fn external_table_cardinality(
     let invocations = table
         .child
         .as_ref()
-        .and_then(|child| child.stats.estimated_cardinality)
+        .and_then(|child| child.estimated_cardinality())
         .unwrap_or_else(|| CardinalityEstimate::exact(1));
     Some(CardinalityEstimate {
         min: invocations.min.saturating_mul(per_invocation.min),
@@ -106,6 +107,51 @@ struct CardinalityInputs<'a> {
     cost_model: &'a crate::cost_model::CostModel,
     session: &'a paro_context::StatementContext,
     graph_stats: &'a mut GraphStatsCache,
+}
+
+/// Facts needed by local cardinality estimation.  The ordinary post-order
+/// path supplies owned child plans; native relation construction supplies
+/// immutable BoundReferences.  Keeping this small interface at the estimator
+/// boundary lets both paths use the same formulas without manufacturing an
+/// OwnedLogicalPlan solely to expose a child's row estimate.
+trait LocalChildFacts {
+    fn estimated_cardinality(&self) -> Option<CardinalityEstimate>;
+
+    fn unique_keys(&self) -> Vec<Vec<ColumnBinding>> {
+        Vec::new()
+    }
+
+    fn graph_name(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl LocalChildFacts for Box<OwnedLogicalPlan> {
+    fn estimated_cardinality(&self) -> Option<CardinalityEstimate> {
+        self.stats.estimated_cardinality
+    }
+
+    fn graph_name(&self) -> Option<&str> {
+        graph_name_for_plan(self.as_ref())
+    }
+
+    fn unique_keys(&self) -> Vec<Vec<ColumnBinding>> {
+        crate::statistics::unique_keys::proven_unique_keys(self.as_ref())
+    }
+}
+
+impl LocalChildFacts for BoundReference {
+    fn estimated_cardinality(&self) -> Option<CardinalityEstimate> {
+        self.facts.cardinality
+    }
+
+    fn unique_keys(&self) -> Vec<Vec<ColumnBinding>> {
+        self.facts
+            .unique_keys
+            .iter()
+            .map(|key| key.columns.iter().map(|column| column.binding).collect())
+            .collect()
+    }
 }
 
 impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFolder<'_> {
@@ -175,7 +221,12 @@ impl StatisticsGathering {
                 graph_stats: &mut ctx.graph_stats,
             };
             plan.stats.estimated_cardinality =
-                self.estimate_plan_cardinality(&plan, child_layouts, &mut inputs);
+                self.estimate_plan_cardinality(
+                    &plan.operator,
+                    &plan.stats,
+                    child_layouts,
+                    &mut inputs,
+                );
             plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
         }
         // The recursive baseline can use the current map as its input view.
@@ -192,8 +243,79 @@ impl StatisticsGathering {
             &output,
             child_layouts,
         );
-        self.update_output_column_stats(&plan, &output, child_layouts, maximum, ctx);
+        self.update_output_column_stats(
+            &plan.operator,
+            &plan.stats,
+            &output,
+            child_layouts,
+            maximum,
+            ctx,
+        );
         (plan, output, maximum)
+    }
+
+    /// Gather one native operator directly from immutable child references.
+    ///
+    /// Native transformation producers already have the exact child facts and
+    /// layouts that the ordinary arena folder would expose after detaching
+    /// and reassembling an OwnedLogicalPlan.  This entry point applies the
+    /// same relation-property equations in place, so that transient owned
+    /// plans, child adapters, and their second lowering pass never enter the
+    /// production lifetime.  It deliberately shares the estimator and output
+    /// statistic update below; this is not a second statistics algorithm.
+    pub(crate) fn gather_native_local(
+        &mut self,
+        operator: LogicalOperator<BoundReference>,
+        mut stats: NodeStats,
+        child_layouts: &[LogicalOutputLayout],
+        child_maximum_cardinalities: &[Option<u64>],
+        input_column_stats: SharedColumnStatistics,
+        ctx: &mut OptimizationContext,
+    ) -> (
+        NodeStats,
+        LogicalOperator<BoundReference>,
+        LogicalOutputLayout,
+        Option<u64>,
+    ) {
+        if stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
+            let mut inputs = CardinalityInputs {
+                column_stats: &input_column_stats,
+                cost_model: &ctx.cost_model,
+                session: &ctx.session,
+                graph_stats: &mut ctx.graph_stats,
+            };
+            stats.estimated_cardinality =
+                self.estimate_plan_cardinality(&operator, &stats, child_layouts, &mut inputs);
+            stats.cardinality_provenance = CardinalityProvenance::Statistics;
+        }
+        // `input_column_stats` is the immutable input view.  The estimator
+        // only reads it; output facts are published into the context's
+        // copy-on-write map below.
+        drop(input_column_stats);
+        let output = operator.output_layout_from_children(child_layouts);
+        let maximum = crate::statistics::cardinality_bound::derive_maximum_cardinality(
+            &operator,
+            child_maximum_cardinalities,
+        );
+        let mut child_keys = Vec::new();
+        operator.visit_child_links(&mut |child| {
+            child_keys.push(child.facts.unique_keys.as_slice());
+        });
+        stats.unique_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
+            &operator,
+            &output,
+            &child_layouts.iter().collect::<Vec<_>>(),
+            &child_keys,
+        );
+        self.update_output_column_stats(
+            &operator,
+            &stats,
+            &output,
+            child_layouts,
+            maximum,
+            ctx,
+        );
+        (stats, operator, output, maximum)
     }
 
     pub(crate) fn bind_cte_domain(
@@ -323,13 +445,14 @@ impl StatisticsGathering {
         }
     }
 
-    fn estimate_plan_cardinality(
+    fn estimate_plan_cardinality<Child: LocalChildFacts>(
         &mut self,
-        plan: &OwnedLogicalPlan,
+        operator: &LogicalOperator<Child>,
+        current_stats: &NodeStats,
         child_layouts: &[LogicalOutputLayout],
         ctx: &mut CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
-        match &plan.operator {
+        match operator {
             // DUMMY_SCAN is the one-row, zero-column identity relation. It is
             // not an unknown table: treating it as unknown inflates lateral
             // argument plans before an external table multiplies by its
@@ -348,14 +471,14 @@ impl StatisticsGathering {
                 .copied()
                 .or_else(|| Some(CardinalityEstimate::exact(1))),
             LogicalOperator::TableFunctionGet(_) => Some(CardinalityEstimate::exact(100)),
-            LogicalOperator::Projection(proj) => proj.child.stats.estimated_cardinality,
-            LogicalOperator::RowFetch(fetch) => fetch.child.stats.estimated_cardinality,
-            LogicalOperator::ExternalProject(project) => project.child.stats.estimated_cardinality,
+            LogicalOperator::Projection(proj) => proj.child.estimated_cardinality(),
+            LogicalOperator::RowFetch(fetch) => fetch.child.estimated_cardinality(),
+            LogicalOperator::ExternalProject(project) => project.child.estimated_cardinality(),
             LogicalOperator::ExternalTable(table) => external_table_cardinality(table),
-            LogicalOperator::Order(order) => order.child.stats.estimated_cardinality,
-            LogicalOperator::Window(window) => window.child.stats.estimated_cardinality,
+            LogicalOperator::Order(order) => order.child.estimated_cardinality(),
+            LogicalOperator::Window(window) => window.child.estimated_cardinality(),
             LogicalOperator::Distinct(distinct) => self.estimate_distinct_cardinality(
-                distinct.child.as_ref(),
+                &distinct.child,
                 child_layouts.first()?,
                 ctx,
             ),
@@ -363,7 +486,7 @@ impl StatisticsGathering {
                 self.estimate_filter_cardinality(filter, child_layouts.first()?, ctx)
             }
             LogicalOperator::Limit(limit) => {
-                let child = limit.child.stats.estimated_cardinality?;
+                let child = limit.child.estimated_cardinality()?;
                 Some(apply_limit_estimate(
                     child,
                     limit.limit.as_ref().and_then(extract_constant_usize),
@@ -375,11 +498,11 @@ impl StatisticsGathering {
                 ))
             }
             LogicalOperator::TopN(topn) => {
-                let child = topn.child.stats.estimated_cardinality?;
+                let child = topn.child.estimated_cardinality()?;
                 Some(apply_limit_estimate(child, Some(topn.limit), topn.offset))
             }
             LogicalOperator::Aggregate(agg) => {
-                let child = agg.child.stats.estimated_cardinality?;
+                let child = agg.child.estimated_cardinality()?;
                 if agg.groups.is_empty() {
                     // A scalar aggregate emits one row per grouping domain,
                     // including on empty input.  Plain aggregation has one
@@ -466,13 +589,13 @@ impl StatisticsGathering {
                 ctx,
             ),
             LogicalOperator::DependentJoin(join) => {
-                let left = join.left.stats.estimated_cardinality?;
-                let right = join.right.stats.estimated_cardinality?;
+                let left = join.left.estimated_cardinality()?;
+                let right = join.right.estimated_cardinality()?;
                 Some(product_estimate(left, right))
             }
             LogicalOperator::SetOperation(setop) => {
-                let left = setop.left.stats.estimated_cardinality?;
-                let right = setop.right.stats.estimated_cardinality?;
+                let left = setop.left.estimated_cardinality()?;
+                let right = setop.right.estimated_cardinality()?;
                 Some(match (setop.setop_type, setop.setop_all) {
                     (SetOpType::Union, true) => sum_estimate(left, right),
                     (SetOpType::Union, false) => CardinalityEstimate {
@@ -497,18 +620,18 @@ impl StatisticsGathering {
             }
             LogicalOperator::EmptyResult(_) => Some(CardinalityEstimate::exact(0)),
             LogicalOperator::MaterializedCTE(cte) => {
-                if let Some(cardinality) = cte.cte_query.stats.estimated_cardinality {
+                if let Some(cardinality) = cte.cte_query.estimated_cardinality() {
                     self.cte_cardinality.insert(cte.cte_index, cardinality);
                 }
                 self.cte_output_stats.insert(
                     cte.cte_index,
                     collect_output_stats_for_layout(child_layouts.first()?, ctx),
                 );
-                cte.child.stats.estimated_cardinality
+                cte.child.estimated_cardinality()
             }
             LogicalOperator::RecursiveCTE(cte) => {
-                let anchor = cte.anchor.stats.estimated_cardinality?;
-                let recursive = cte.recursive.stats.estimated_cardinality.unwrap_or(anchor);
+                let anchor = cte.anchor.estimated_cardinality()?;
+                let recursive = cte.recursive.estimated_cardinality().unwrap_or(anchor);
                 let estimate = CardinalityEstimate {
                     min: anchor.min,
                     expected: anchor.expected.max(recursive.expected),
@@ -531,7 +654,7 @@ impl StatisticsGathering {
                 self.cte_cardinality
                     .get(&cte_ref.cte_index)
                     .copied()
-                    .or(plan.stats.estimated_cardinality)
+                    .or(current_stats.estimated_cardinality)
             }
             LogicalOperator::SearchScan(search) => {
                 Some(self.estimate_search_scan_cardinality(search, ctx))
@@ -546,7 +669,7 @@ impl StatisticsGathering {
             LogicalOperator::GraphExpand(expand) => {
                 Some(self.estimate_graph_expand_cardinality(expand, ctx))
             }
-            LogicalOperator::Explain(explain) => explain.child.stats.estimated_cardinality,
+            LogicalOperator::Explain(explain) => explain.child.estimated_cardinality(),
             LogicalOperator::Insert(_)
             | LogicalOperator::Delete(_)
             | LogicalOperator::Update(_) => Some(CardinalityEstimate::exact(1)),
@@ -565,13 +688,13 @@ impl StatisticsGathering {
         }
     }
 
-    fn estimate_filter_cardinality(
+    fn estimate_filter_cardinality<Child: LocalChildFacts>(
         &self,
-        filter: &Filter,
+        filter: &Filter<Child>,
         child_layout: &LogicalOutputLayout,
         ctx: &CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
-        let child = filter.child.stats.estimated_cardinality?;
+        let child = filter.child.estimated_cardinality()?;
         Some(ctx.cost_model.estimate_filter_cardinality_with_positions(
             child.expected,
             &filter.expressions,
@@ -580,13 +703,13 @@ impl StatisticsGathering {
         ))
     }
 
-    fn estimate_distinct_cardinality(
+    fn estimate_distinct_cardinality<Child: LocalChildFacts>(
         &self,
-        child: &OwnedLogicalPlan,
+        child: &Child,
         child_layout: &LogicalOutputLayout,
         ctx: &CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
-        let child_est = child.stats.estimated_cardinality?;
+        let child_est = child.estimated_cardinality()?;
         let stats = collect_output_stats_for_layout(child_layout, ctx);
         let mut expected = 1u64;
         let mut saw_distinct = false;
@@ -607,21 +730,21 @@ impl StatisticsGathering {
         })
     }
 
-    fn estimate_join_cardinality(
+    fn estimate_join_cardinality<Child: LocalChildFacts>(
         &self,
-        join: &Join,
+        join: &Join<Child>,
         left_layout: &LogicalOutputLayout,
         right_layout: &LogicalOutputLayout,
         ctx: &CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
         match join {
             Join::Cross(cross) => Some(product_estimate(
-                cross.left.stats.estimated_cardinality?,
-                cross.right.stats.estimated_cardinality?,
+                cross.left.estimated_cardinality()?,
+                cross.right.estimated_cardinality()?,
             )),
             Join::Any(any) => {
-                let left = any.left.stats.estimated_cardinality?;
-                let right = any.right.stats.estimated_cardinality?;
+                let left = any.left.estimated_cardinality()?;
+                let right = any.right.estimated_cardinality()?;
                 let selectivity = ctx
                     .cost_model
                     .estimate_selectivity(&any.condition, ctx.column_stats);
@@ -633,8 +756,8 @@ impl StatisticsGathering {
                 ))
             }
             Join::Comparison(cmp) => {
-                let left = cmp.left.stats.estimated_cardinality?;
-                let right = cmp.right.stats.estimated_cardinality?;
+                let left = cmp.left.estimated_cardinality()?;
+                let right = cmp.right.estimated_cardinality()?;
                 if let Some(estimate) = estimate_same_domain_semi_join(
                     cmp,
                     left,
@@ -645,8 +768,14 @@ impl StatisticsGathering {
                 ) {
                     return Some(estimate);
                 }
-                if let Some(inner) =
-                    estimate_unique_dimension_join(cmp, left, right, left_layout, right_layout, ctx)
+                if let Some(inner) = estimate_unique_dimension_join(
+                    cmp,
+                    left,
+                    right,
+                    left_layout,
+                    right_layout,
+                    ctx,
+                )
                 {
                     return Some(adjust_join_estimate(inner, left, right, cmp.join_type));
                 }
@@ -728,17 +857,18 @@ impl StatisticsGathering {
         }
     }
 
-    fn estimate_graph_expand_cardinality(
+    fn estimate_graph_expand_cardinality<Child: LocalChildFacts>(
         &self,
-        expand: &GraphExpand,
+        expand: &GraphExpand<Child>,
         ctx: &mut CardinalityInputs<'_>,
     ) -> CardinalityEstimate {
         let child = expand
             .child
-            .stats
-            .estimated_cardinality
+            .estimated_cardinality()
             .unwrap_or(CardinalityEstimate::exact(1000));
-        let stats = graph_name_for_plan(expand.child.as_ref())
+        let stats = expand
+            .child
+            .graph_name()
             .and_then(|graph_name| ctx.graph_stats.get(graph_name));
         let (min_hops, max_hops) = quantifier_bounds(expand.quantifier.as_ref());
         let hop_multiplier = hop_multiplier(min_hops, max_hops);
@@ -763,15 +893,16 @@ impl StatisticsGathering {
         }
     }
 
-    fn update_output_column_stats(
+    fn update_output_column_stats<Child: LocalChildFacts>(
         &mut self,
-        plan: &OwnedLogicalPlan,
+        operator: &LogicalOperator<Child>,
+        node_stats: &NodeStats,
         output_layout: &LogicalOutputLayout,
         child_layouts: &[LogicalOutputLayout],
         guaranteed_output_rows: Option<u64>,
         ctx: &mut OptimizationContext,
     ) {
-        let output_stats = match &plan.operator {
+        let output_stats = match operator {
             LogicalOperator::Get(get) => self.get_output_stats(get, ctx),
             LogicalOperator::BoundReference(reference) => reference.column_statistics(),
             LogicalOperator::Projection(proj) => proj
@@ -816,9 +947,8 @@ impl StatisticsGathering {
                         && !agg.groups.is_empty()
                     {
                         agg.child
-                            .stats
-                            .estimated_cardinality
-                            .zip(plan.stats.estimated_cardinality)
+                            .estimated_cardinality()
+                            .zip(node_stats.estimated_cardinality)
                             .zip(child_layouts.first())
                             .and_then(|((input, groups), layout)| {
                                 estimate_grouped_sum_distribution(
@@ -891,7 +1021,7 @@ impl StatisticsGathering {
         // unconditional value distribution without an explicit conditioning
         // model. Value bounds and NDV remain separate and are not erased.
         let preserves_distribution = matches!(
-            plan.operator,
+            operator,
             LogicalOperator::Get(_)
                 | LogicalOperator::BoundReference(_)
                 | LogicalOperator::Projection(_)
@@ -959,8 +1089,8 @@ impl StatisticsGathering {
 /// sample of the preserved key distribution, and repeated demand keys do not
 /// multiply the output. The estimate remains deliberately uncertain; this is
 /// a costing interval, never a correctness bound.
-fn estimate_same_domain_semi_join(
-    join: &paro_planner::operator::ComparisonJoin,
+fn estimate_same_domain_semi_join<Child>(
+    join: &paro_planner::operator::ComparisonJoin<Child>,
     left: CardinalityEstimate,
     right: CardinalityEstimate,
     left_bindings: &[ColumnBinding],
@@ -1014,8 +1144,8 @@ fn estimate_same_domain_semi_join(
 /// NDV can underestimate a foreign-key-shaped join by orders of magnitude.
 /// Uniqueness proves at most one match per fact row; the expected match ratio
 /// is therefore `selected_dimension_rows / fact_key_domain`, capped at one.
-fn estimate_unique_dimension_join(
-    join: &paro_planner::operator::ComparisonJoin,
+fn estimate_unique_dimension_join<Child: LocalChildFacts>(
+    join: &paro_planner::operator::ComparisonJoin<Child>,
     left: CardinalityEstimate,
     right: CardinalityEstimate,
     left_layout: &LogicalOutputLayout,
@@ -1040,10 +1170,14 @@ fn estimate_unique_dimension_join(
     None
 }
 
-fn plan_has_single_column_unique_key(plan: &OwnedLogicalPlan, binding: ColumnBinding) -> bool {
-    crate::statistics::unique_keys::proven_unique_keys(plan)
+fn plan_has_single_column_unique_key<Child: LocalChildFacts>(
+    child: &Child,
+    binding: ColumnBinding,
+) -> bool {
+    child
+        .unique_keys()
         .iter()
-        .any(|key| key.as_slice() == [binding])
+        .any(|key| key.len() == 1 && key[0] == binding)
 }
 
 fn unique_lookup_estimate(
@@ -1181,8 +1315,8 @@ fn collect_output_stats_for_layout(
         .collect()
 }
 
-fn filter_output_stats(
-    filter: &Filter,
+fn filter_output_stats<Child>(
+    filter: &Filter<Child>,
     child_layout: &LogicalOutputLayout,
     ctx: &impl ColumnStatsView,
 ) -> Vec<Arc<ColumnStatistics>> {

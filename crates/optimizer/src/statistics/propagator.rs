@@ -20,7 +20,7 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::{
     aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Join,
-    JoinComparisonType, LogicalOperator, LogicalOutputLayout,
+    BoundReference, JoinComparisonType, LogicalOperator, LogicalOutputLayout,
 };
 use paro_planner::plan::{LogicalPlanPostOrderFolder, OwnedLogicalPlan};
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StatsInfo};
@@ -687,6 +687,194 @@ impl StatisticsPropagator {
                     // Window output ranges depend on partition cardinality and frame semantics.
                     // Until those estimates are available, publish type-correct unknown statistics
                     // so downstream projections and CTEs retain a complete statistics chain.
+                    let binding = ColumnBinding {
+                        table_index: window.window_index,
+                        column_index: i,
+                    };
+                    self.statistics_map.insert(
+                        binding,
+                        column_statistics_arc(window_output_statistics(expression)),
+                    );
+                }
+                LogicalOperator::Window(window)
+            }
+            other => other,
+        }
+    }
+
+    /// Propagate the same expression/statistics rules through a native shell
+    /// whose children are Memo-owned BoundReferences.  Unlike
+    /// `propagate_operator`, this entry point never needs to manufacture an
+    /// OwnedLogicalPlan for an empty-filter wrapper or for aggregate-child
+    /// inspection.  A false filter is intentionally retained: its semantic
+    /// shell (including its projection map) is part of the native contract;
+    /// the ordinary arena path may still lower it to EmptyResult later.
+    pub(crate) fn propagate_native_operator(
+        &mut self,
+        _ctx: &StatementContext,
+        op: LogicalOperator<BoundReference>,
+    ) -> LogicalOperator<BoundReference> {
+        match op {
+            LogicalOperator::BoundReference(reference) => {
+                for (binding, statistics) in reference
+                    .bindings
+                    .iter()
+                    .copied()
+                    .zip(reference.column_statistics())
+                {
+                    self.statistics_map.insert(binding, statistics);
+                }
+                LogicalOperator::BoundReference(reference)
+            }
+            LogicalOperator::Projection(proj) => {
+                for (i, expr) in proj.expressions.iter().enumerate() {
+                    if let Some(stats) = self.propagate_expression(expr) {
+                        self.statistics_map.insert(
+                            ColumnBinding {
+                                table_index: proj.table_index,
+                                column_index: i,
+                            },
+                            stats,
+                        );
+                    }
+                }
+                LogicalOperator::Projection(proj)
+            }
+            LogicalOperator::Filter(mut filter) => {
+                let mut i = 0;
+                while i < filter.expressions.len() {
+                    let result = self.handle_filter(&mut filter.expressions[i]);
+                    match result {
+                        FilterPropagateResult::FilterAlwaysTrue => {
+                            filter.expressions.remove(i);
+                        }
+                        // Keep the original shell and projection contract on
+                        // a false/unknown filter.  Replacing it with an
+                        // EmptyResult would require an owned child wrapper.
+                        FilterPropagateResult::FilterAlwaysFalse
+                        | FilterPropagateResult::FilterFalseOrNull => return LogicalOperator::Filter(filter),
+                        _ => i += 1,
+                    }
+                }
+                LogicalOperator::Filter(filter)
+            }
+            LogicalOperator::Aggregate(mut agg) => {
+                for (i, expr) in agg.groups.iter().enumerate() {
+                    if let Some(stats) = self.propagate_expression(expr) {
+                        agg.group_stats[i] = Some(aggregate_group_statistics(&stats));
+                        self.statistics_map.insert(
+                            ColumnBinding {
+                                table_index: agg.group_index,
+                                column_index: i,
+                            },
+                            stats,
+                        );
+                    }
+                }
+                for (i, expr) in agg.aggregates.iter().enumerate() {
+                    if let Some(stats) = self.propagate_expression(expr) {
+                        self.statistics_map.insert(
+                            ColumnBinding {
+                                table_index: agg.aggregate_index,
+                                column_index: i,
+                            },
+                            stats,
+                        );
+                    }
+                }
+                // The native shell carries the already proven dependency
+                // annotation. Its child facts are immutable and are consumed
+                // by the shared unique-key derivation during gathering.
+                LogicalOperator::Aggregate(agg)
+            }
+            LogicalOperator::Order(order) => {
+                for order_by in &order.orders {
+                    self.propagate_expression(&order_by.expression);
+                }
+                LogicalOperator::Order(order)
+            }
+            LogicalOperator::Limit(limit) => {
+                if let Some(limit_val) = &limit.limit {
+                    self.propagate_expression(limit_val);
+                }
+                if let Some(offset_val) = &limit.offset {
+                    self.propagate_expression(offset_val);
+                }
+                LogicalOperator::Limit(limit)
+            }
+            LogicalOperator::TopN(topn) => {
+                for order_by in &topn.orders {
+                    self.propagate_expression(&order_by.expression);
+                }
+                LogicalOperator::TopN(topn)
+            }
+            LogicalOperator::CTERef(cte_ref) => {
+                if let Some(stats) = self.cte_statistics.get(&cte_ref.cte_index).cloned() {
+                    for (column_index, stats) in stats.into_iter().enumerate() {
+                        self.statistics_map.insert(
+                            ColumnBinding {
+                                table_index: cte_ref.table_index,
+                                column_index,
+                            },
+                            stats,
+                        );
+                    }
+                }
+                LogicalOperator::CTERef(cte_ref)
+            }
+            LogicalOperator::Get(get) => {
+                if let Some(table) = &get.table {
+                    let _txn = _ctx.catalog_txn_view();
+                    if let Some(storage) = table.get_storage() {
+                        for out_idx in 0..get.column_sources.len() {
+                            if out_idx >= get.column_types.len() {
+                                break;
+                            }
+                            let Some(col_id) = get.stored_column(out_idx) else {
+                                continue;
+                            };
+                            if let Some(storage_stats) = storage.column_statistics(col_id) {
+                                self.statistics_map.insert(
+                                    ColumnBinding {
+                                        table_index: get.table_index,
+                                        column_index: out_idx,
+                                    },
+                                    Arc::new(storage_stats),
+                                );
+                            }
+                        }
+                    }
+                }
+                LogicalOperator::Get(get)
+            }
+            LogicalOperator::Join(join) => match join {
+                Join::Comparison(cj) => {
+                    let can_propagate = matches!(
+                        cj.join_type,
+                        paro_planner::operator::JoinType::Inner
+                            | paro_planner::operator::JoinType::Semi
+                    );
+                    for condition in &cj.conditions {
+                        self.propagate_expression(&condition.left);
+                        self.propagate_expression(&condition.right);
+                        if can_propagate {
+                            self.update_filter_statistics(
+                                &condition.left,
+                                &condition.right,
+                                Self::join_comparison_to_comparison(condition.comparison),
+                            );
+                        }
+                    }
+                    LogicalOperator::Join(Join::Comparison(cj))
+                }
+                Join::Any(aj) => {
+                    self.propagate_expression(&aj.condition);
+                    LogicalOperator::Join(Join::Any(aj))
+                }
+                Join::Cross(cross) => LogicalOperator::Join(Join::Cross(cross)),
+            },
+            LogicalOperator::Window(window) => {
+                for (i, expression) in window.expressions.iter().enumerate() {
                     let binding = ColumnBinding {
                         table_index: window.window_index,
                         column_index: i,
