@@ -70,7 +70,8 @@ use super::properties::{
 };
 use super::quality::{
     AggregateRegionWitness, BundleCapability, BundleFact, NativeQualityEvidence,
-    NativeQualityShape, QualityEvidenceProvider, QualityPolicyStatus,
+    NativeQualityShape, QualityCandidateNode, QualityCandidatePreflight,
+    QualityEvidenceProvider, QualityPolicyStatus,
 };
 use super::region::{
     FacetCriticality, RegionArtifactDependencyContract, RegionArtifactKind, RegionBoundaryEndpoint,
@@ -102,6 +103,7 @@ use crate::physical::{
     ExtractedEnforcerContract, ExtractedEnforcerContracts, ExtractedPhysicalEnforcer,
     PhysicalImplementationFlavor, WinnerPhysicalContract, WinnerPhysicalContracts,
 };
+use super::tasks::ReadSet;
 
 mod contracts;
 mod costing;
@@ -143,6 +145,11 @@ const COST_OPTIMIZED_SEARCH_POLICY: QualityPolicyId = QualityPolicyId(1);
 #[derive(Debug)]
 struct PlannerQualityEvidenceProvider {
     state: Arc<RwLock<PlannerTransformState>>,
+    /// Diagnostic-only escape hatch for a same-source control.  The default
+    /// production handoff uses the local preflight; setting this to false
+    /// selects the complete freeze/evidence path without changing the search
+    /// policy or the candidate frontier.
+    preflight_enabled: bool,
 }
 
 /// Return only proof-bearing rule identities for the expression selected by a
@@ -230,23 +237,28 @@ fn selected_physical_contract_is_exact(
     true
 }
 
-fn frozen_choice_fingerprint(frozen: &FrozenCandidate) -> Fingerprint {
+fn candidate_choice_fingerprint(
+    reference: ChildWinnerRef,
+    winner: &super::memo::Winner,
+    logical: &crate::cascades::memo::LogicalExpr,
+    physical: &crate::cascades::memo::PhysicalExpr,
+) -> Fingerprint {
     let mut choice = StableFingerprintBuilder::default();
     choice.write_bytes(b"paro.quality.frozen-choice.v1");
-    choice.write_u64(frozen.reference.group.0 as u64);
-    choice.write_u64(frozen.reference.candidate.index() as u64);
-    choice.write_u64(frozen.reference.goal.required.0 as u64);
-    choice.write_u64(frozen.reference.goal.grant.stable_tag());
-    choice.write_u64(frozen.reference.goal.row_goal.stable_tag());
-    choice.write_u64(frozen.reference.goal.objective.stable_tag());
-    choice.write_u64(frozen.reference.goal.context.0 as u64);
-    choice.write_fingerprint(frozen.logical.key.stable_fingerprint());
-    choice.write_fingerprint(frozen.physical.key.stable_fingerprint());
-    choice.write_fingerprint(frozen.winner.physical_fingerprint);
-    choice.write_u64(frozen.logical.payload.0 as u64);
-    choice.write_u64(frozen.physical.payload.0 as u64);
-    choice.write_u64(frozen.winner.children.len() as u64);
-    for child in frozen.winner.children.iter() {
+    choice.write_u64(reference.group.0 as u64);
+    choice.write_u64(reference.candidate.index() as u64);
+    choice.write_u64(reference.goal.required.0 as u64);
+    choice.write_u64(reference.goal.grant.stable_tag());
+    choice.write_u64(reference.goal.row_goal.stable_tag());
+    choice.write_u64(reference.goal.objective.stable_tag());
+    choice.write_u64(reference.goal.context.0 as u64);
+    choice.write_fingerprint(logical.key.stable_fingerprint());
+    choice.write_fingerprint(physical.key.stable_fingerprint());
+    choice.write_fingerprint(winner.physical_fingerprint);
+    choice.write_u64(logical.payload.0 as u64);
+    choice.write_u64(physical.payload.0 as u64);
+    choice.write_u64(winner.children.len() as u64);
+    for child in winner.children.iter() {
         choice.write_u64(child.group.0 as u64);
         choice.write_u64(child.candidate.index() as u64);
         choice.write_u64(child.goal.required.0 as u64);
@@ -254,6 +266,15 @@ fn frozen_choice_fingerprint(frozen: &FrozenCandidate) -> Fingerprint {
         choice.write_u64(child.goal.context.0 as u64);
     }
     choice.finish()
+}
+
+fn frozen_choice_fingerprint(frozen: &FrozenCandidate) -> Fingerprint {
+    candidate_choice_fingerprint(
+        frozen.reference,
+        &frozen.winner,
+        &frozen.logical,
+        &frozen.physical,
+    )
 }
 
 fn collect_frozen_choices(
@@ -268,6 +289,840 @@ fn collect_frozen_choices(
     for child in frozen.children.iter() {
         collect_frozen_choices(child, choices, visited);
     }
+}
+
+fn quality_node_map<'a>(
+    nodes: &'a [QualityCandidateNode],
+) -> BTreeMap<CandidateId, &'a QualityCandidateNode> {
+    nodes
+        .iter()
+        .map(|node| (node.reference.candidate, node))
+        .collect()
+}
+
+fn quality_node<'a>(
+    nodes: &'a BTreeMap<CandidateId, &'a QualityCandidateNode>,
+    reference: ChildWinnerRef,
+) -> Option<&'a QualityCandidateNode> {
+    let node = nodes.get(&reference.candidate).copied()?;
+    (node.reference.group == reference.group && node.reference.goal == reference.goal).then_some(node)
+}
+
+struct QualityCandidateInspection {
+    nodes: Box<[QualityCandidateNode]>,
+    rules: BTreeSet<RuleId>,
+    shape: NativeQualityShape,
+    cte_producers: BTreeSet<usize>,
+    cte_consumers: BTreeSet<usize>,
+    cte_producer_witnesses: BTreeSet<usize>,
+    has_filter: bool,
+    has_get: bool,
+    has_join: bool,
+    has_join_region: bool,
+    has_aggregate: bool,
+    has_cte_consumer: bool,
+    has_cte_producer: bool,
+    has_ordering: bool,
+    has_graph: bool,
+    has_dependent: bool,
+    groups: BTreeSet<GroupId>,
+}
+
+/// Inspect the selected candidate and build its immutable reference graph in
+/// one pass.  The old preflight first validated every node and then walked the
+/// same nodes again to derive capabilities, rules and shapes.  That made the
+/// purportedly cheap path pay two Memo/payload lookups before it even reached
+/// the local domain and aggregate checks.  This pass keeps the exact identity
+/// and contract checks, but records the inspection summary while each node is
+/// already hot.
+fn inspect_quality_candidate(
+    memo: &Memo,
+    root: ChildWinnerRef,
+    state: &PlannerTransformState,
+) -> Result<Option<QualityCandidateInspection>> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeMap::<CandidateId, (GroupId, OptimizationGoal)>::new();
+    let mut pending = vec![root];
+    let mut rules = BTreeSet::new();
+    let mut shape = NativeQualityShape::default();
+    let mut cte_producers = BTreeSet::new();
+    let mut cte_consumers = BTreeSet::new();
+    let mut cte_producer_witnesses = BTreeSet::new();
+    let mut has_filter = false;
+    let mut has_get = false;
+    let mut has_join = false;
+    let mut has_join_region = false;
+    let mut has_aggregate = false;
+    let mut has_cte_consumer = false;
+    let mut has_cte_producer = false;
+    let mut has_ordering = false;
+    let mut has_graph = false;
+    let mut has_dependent = false;
+    let mut groups = BTreeSet::new();
+    while let Some(reference) = pending.pop() {
+        if let Some(previous) = seen.get(&reference.candidate) {
+            if *previous != (reference.group, reference.goal) {
+                return Ok(None);
+            }
+            continue;
+        }
+        let Some(winner) = memo.resolve_child_winner(reference) else {
+            return Ok(None);
+        };
+        let Some(physical) = memo.physical_expr(winner.expression) else {
+            return Ok(None);
+        };
+        let Some(logical) = memo.logical_expr(physical.key.logical) else {
+            return Ok(None);
+        };
+        let Some(metadata) = state.metadata.get(&logical.payload) else {
+            return Ok(None);
+        };
+        let Some(physical_payload) = state.payloads.get_physical(physical.payload) else {
+            return Ok(None);
+        };
+        if physical.id != winner.expression
+            || physical.key.children != logical.key.children
+            || winner.children.len() != logical.key.children.len()
+            || !selected_physical_contract_is_exact(
+                logical,
+                physical,
+                metadata,
+                &physical_payload,
+            )
+        {
+            return Ok(None);
+        }
+        groups.insert(memo.canonical_group(reference.group));
+        shape.nodes = shape.nodes.saturating_add(1);
+        let selected_rules = selected_payload_rule_proofs(logical, metadata);
+        if metadata.origin_rule.is_some() && selected_rules.is_empty() {
+            return Ok(None);
+        }
+        rules.extend(selected_rules.iter().copied());
+        if winner.provided.result_guarantee != ResultGuarantee::Exact
+            || metadata.provided.result_guarantee != ResultGuarantee::Exact
+        {
+            return Ok(None);
+        }
+        match metadata.operator_type {
+            LogicalOperatorType::Filter | LogicalOperatorType::FullTextFilterScan => {
+                has_filter = true
+            }
+            LogicalOperatorType::Get
+            | LogicalOperatorType::SearchScan
+            | LogicalOperatorType::TableFunctionGet => has_get = true,
+            LogicalOperatorType::ComparisonJoin
+            | LogicalOperatorType::AnyJoin
+            | LogicalOperatorType::CrossProduct => {
+                has_join = true;
+                has_join_region |= winner.joint_cost_proof.is_some();
+                shape.joins = shape.joins.saturating_add(1);
+                if winner.joint_cost_proof.is_some() {
+                    shape.join_region_witness_nodes = shape.join_region_witness_nodes.saturating_add(1);
+                }
+            }
+            LogicalOperatorType::Aggregate => {
+                has_aggregate = true;
+                shape.aggregates = shape.aggregates.saturating_add(1);
+            }
+            LogicalOperatorType::CTERef => {
+                has_cte_consumer = true;
+                if let LogicalOperator::CTERef(cte) = &state.payloads.logical[logical.payload.index()]
+                    .semantic_template
+                    .operator
+                {
+                    cte_consumers.insert(cte.cte_index);
+                }
+            }
+            LogicalOperatorType::MaterializedCTE | LogicalOperatorType::RecursiveCTE => {
+                has_cte_producer = true;
+                let cte_index = match &state.payloads.logical[logical.payload.index()]
+                    .semantic_template
+                    .operator
+                {
+                    LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
+                    LogicalOperator::RecursiveCTE(cte) => Some(cte.cte_index),
+                    _ => None,
+                };
+                if let Some(cte_index) = cte_index {
+                    cte_producers.insert(cte_index);
+                    if selected_rules.iter().any(|rule| {
+                        matches!(
+                            *rule,
+                            CTE_DEMAND_PUSHDOWN_RULE
+                                | CTE_FILTER_PUSHDOWN_RULE
+                                | CTE_PARTITIONED_MATERIALIZATION_RULE
+                        )
+                    }) {
+                        cte_producer_witnesses.insert(cte_index);
+                    }
+                }
+            }
+            LogicalOperatorType::Order | LogicalOperatorType::TopN => has_ordering = true,
+            LogicalOperatorType::DependentJoin => has_dependent = true,
+            LogicalOperatorType::GraphMatch
+            | LogicalOperatorType::GraphScan
+            | LogicalOperatorType::GraphExpand
+            | LogicalOperatorType::CreatePropertyGraph => has_graph = true,
+            _ => {}
+        }
+        if matches!(
+            physical.key.implementation,
+            PLANNER_HASH_JOIN_RUNTIME_FILTER | PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER
+        ) {
+            shape.runtime_filter_joins = shape.runtime_filter_joins.saturating_add(1);
+        }
+        for (child, expected_group) in winner
+            .children
+            .iter()
+            .copied()
+            .zip(logical.key.children.iter().copied())
+        {
+            if memo.canonical_group(child.group) != memo.canonical_group(expected_group)
+                || memo.resolve_child_winner(child).is_none()
+            {
+                return Ok(None);
+            }
+            pending.push(child);
+        }
+        seen.insert(reference.candidate, (reference.group, reference.goal));
+        nodes.push(QualityCandidateNode {
+            reference,
+            logical: logical.id,
+            physical: physical.id,
+            children: winner.children.clone(),
+        });
+    }
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(QualityCandidateInspection {
+        nodes: nodes.into_boxed_slice(),
+        rules,
+        shape,
+        cte_producers,
+        cte_consumers,
+        cte_producer_witnesses,
+        has_filter,
+        has_get,
+        has_join,
+        has_join_region,
+        has_aggregate,
+        has_cte_consumer,
+        has_cte_producer,
+        has_ordering,
+        has_graph,
+        has_dependent,
+        groups,
+    }))
+}
+
+fn selected_aggregate_region_shape_refs(
+    memo: &Memo,
+    state: &PlannerTransformState,
+    reference: ChildWinnerRef,
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    visited: &mut BTreeSet<CandidateId>,
+) -> SelectedAggregateRegionShape {
+    if !visited.insert(reference.candidate) {
+        return SelectedAggregateRegionShape::default();
+    }
+    let Some(node) = quality_node(nodes, reference) else {
+        return SelectedAggregateRegionShape::default();
+    };
+    let Some(logical) = memo.logical_expr(node.logical) else {
+        return SelectedAggregateRegionShape::default();
+    };
+    let operator = state
+        .payloads
+        .logical
+        .get(logical.payload.index())
+        .map(|payload| &payload.semantic_template.operator);
+    let mut shape = SelectedAggregateRegionShape::default();
+    if matches!(operator, Some(LogicalOperator::Aggregate(_))) {
+        shape.aggregates = 1;
+        if let [join_reference] = node.children.as_ref() {
+            if let Some(join_node) = quality_node(nodes, *join_reference) {
+                if let Some(join_logical) = memo.logical_expr(join_node.logical) {
+                    if let Some(LogicalOperator::Join(Join::Comparison(join_operator))) = state
+                        .payloads
+                        .logical
+                        .get(join_logical.payload.index())
+                        .map(|payload| &payload.semantic_template.operator)
+                    {
+                        if !join_operator.conditions.is_empty()
+                            && join_node.children.len() == 2
+                        {
+                            let outer = match operator {
+                                Some(LogicalOperator::Aggregate(outer)) => outer,
+                                _ => unreachable!("aggregate operator disappeared during inspection"),
+                            };
+                            shape.decomposed = join_node.children.iter().any(|partial| {
+                                let Some(partial_node) = quality_node(nodes, *partial) else {
+                                    return false;
+                                };
+                                let Some(partial_logical) = memo.logical_expr(partial_node.logical)
+                                else {
+                                    return false;
+                                };
+                                matches!(
+                                    state
+                                        .payloads
+                                        .logical
+                                        .get(partial_logical.payload.index())
+                                        .map(|payload| &payload.semantic_template.operator),
+                                    Some(LogicalOperator::Aggregate(partial))
+                                        if aggregate_merge_contract_matches(outer, partial)
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if matches!(operator, Some(LogicalOperator::Join(_))) {
+        shape.joins = 1;
+    }
+    for child in node.children.iter().copied() {
+        let child_shape =
+            selected_aggregate_region_shape_refs(memo, state, child, nodes, visited);
+        shape.aggregates = shape.aggregates.saturating_add(child_shape.aggregates);
+        shape.joins = shape.joins.saturating_add(child_shape.joins);
+        shape.decomposed |= child_shape.decomposed;
+    }
+    shape
+}
+
+fn selected_subtree_contains_union_refs(
+    memo: &Memo,
+    state: &PlannerTransformState,
+    reference: ChildWinnerRef,
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    visited: &mut BTreeSet<CandidateId>,
+) -> bool {
+    if !visited.insert(reference.candidate) {
+        return false;
+    }
+    let Some(node) = quality_node(nodes, reference) else {
+        return false;
+    };
+    let Some(logical) = memo.logical_expr(node.logical) else {
+        return false;
+    };
+    let is_union = state
+        .payloads
+        .logical
+        .get(logical.payload.index())
+        .is_some_and(|payload| {
+            matches!(
+                &payload.semantic_template.operator,
+                LogicalOperator::SetOperation(setop)
+                    if setop.setop_type == paro_planner::operator::SetOpType::Union
+                        && setop.setop_all
+            )
+        });
+    is_union
+        || node.children.iter().copied().any(|child| {
+            selected_subtree_contains_union_refs(memo, state, child, nodes, visited)
+        })
+}
+
+fn collect_quality_node_choices(
+    memo: &Memo,
+    reference: ChildWinnerRef,
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    choices: &mut Vec<Fingerprint>,
+    visited: &mut BTreeSet<CandidateId>,
+) -> bool {
+    if !visited.insert(reference.candidate) {
+        return true;
+    }
+    let Some(node) = quality_node(nodes, reference) else {
+        return false;
+    };
+    let Some(winner) = memo.resolve_child_winner(reference) else {
+        return false;
+    };
+    let Some(logical) = memo.logical_expr(node.logical) else {
+        return false;
+    };
+    let Some(physical) = memo.physical_expr(node.physical) else {
+        return false;
+    };
+    choices.push(candidate_choice_fingerprint(reference, winner, logical, physical));
+    node.children.iter().copied().all(|child| {
+        collect_quality_node_choices(memo, child, nodes, choices, visited)
+    })
+}
+
+fn collect_quality_region_fact_fingerprint(
+    memo: &Memo,
+    root: ChildWinnerRef,
+    arm: ChildWinnerRef,
+    goal: OptimizationGoal,
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+) -> Option<Fingerprint> {
+    let mut facts = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    fn visit(
+        memo: &Memo,
+        reference: ChildWinnerRef,
+        nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+        facts: &mut BTreeMap<GroupId, (Fingerprint, Fingerprint)>,
+        visited: &mut BTreeSet<CandidateId>,
+    ) -> bool {
+        if !visited.insert(reference.candidate) {
+            return true;
+        }
+        let Some(node) = quality_node(nodes, reference) else {
+            return false;
+        };
+        let group = memo.canonical_group(reference.group);
+        let Some(group_ref) = memo.group(group) else {
+            return false;
+        };
+        facts.insert(
+            group,
+            (
+                group_ref.logical_fact_fingerprint(),
+                group_ref.statistics_snapshot_fingerprint(),
+            ),
+        );
+        node.children
+            .iter()
+            .copied()
+            .all(|child| visit(memo, child, nodes, facts, visited))
+    }
+    if !visit(memo, root, nodes, &mut facts, &mut visited)
+        || !visit(memo, arm, nodes, &mut facts, &mut visited)
+    {
+        return None;
+    }
+    let mut fingerprint = StableFingerprintBuilder::default();
+    fingerprint.write_bytes(b"paro.quality.aggregate-region-facts.v1");
+    fingerprint.write_u64(goal.required.0 as u64);
+    fingerprint.write_u64(goal.grant.stable_tag());
+    fingerprint.write_u64(goal.row_goal.stable_tag());
+    fingerprint.write_u64(goal.objective.stable_tag());
+    fingerprint.write_u64(goal.context.0 as u64);
+    fingerprint.write_u64(facts.len() as u64);
+    for (group, (logical, statistics)) in facts {
+        fingerprint.write_u64(group.0 as u64);
+        fingerprint.write_fingerprint(logical);
+        fingerprint.write_fingerprint(statistics);
+    }
+    Some(fingerprint.finish())
+}
+
+fn selected_aggregate_region_witnesses_refs(
+    memo: &Memo,
+    state: &PlannerTransformState,
+    root: ChildWinnerRef,
+    nodes: &[QualityCandidateNode],
+    goal: OptimizationGoal,
+) -> Option<Vec<AggregateRegionWitness>> {
+    let nodes = quality_node_map(nodes);
+    let mut witnesses = Vec::new();
+    let mut path = Vec::new();
+    fn visit_union(
+        memo: &Memo,
+        state: &PlannerTransformState,
+        reference: ChildWinnerRef,
+        root_candidate: CandidateId,
+        goal: OptimizationGoal,
+        nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+        path: &mut Vec<u32>,
+        witnesses: &mut Vec<AggregateRegionWitness>,
+    ) -> Option<()> {
+        let node = quality_node(nodes, reference)?;
+        let logical = memo.logical_expr(node.logical)?;
+        let operator = state
+            .payloads
+            .logical
+            .get(logical.payload.index())
+            .map(|payload| &payload.semantic_template.operator);
+        if let Some(LogicalOperator::SetOperation(setop)) = operator {
+            if setop.setop_type == paro_planner::operator::SetOpType::Union && setop.setop_all {
+                for (index, arm) in node.children.iter().copied().enumerate() {
+                    path.push(index as u32);
+                    let mut shape_visited = BTreeSet::new();
+                    let shape = selected_aggregate_region_shape_refs(
+                        memo,
+                        state,
+                        arm,
+                        nodes,
+                        &mut shape_visited,
+                    );
+                    let mut union_visited = BTreeSet::new();
+                    if shape.aggregates > 0
+                        && shape.joins > 0
+                        && !selected_subtree_contains_union_refs(
+                            memo,
+                            state,
+                            arm,
+                            nodes,
+                            &mut union_visited,
+                        )
+                    {
+                        let mut choices = Vec::new();
+                        let mut choice_visited = BTreeSet::new();
+                        if !collect_quality_node_choices(
+                            memo,
+                            arm,
+                            nodes,
+                            &mut choices,
+                            &mut choice_visited,
+                        ) {
+                            return None;
+                        }
+                        let fact_fingerprint = collect_quality_region_fact_fingerprint(
+                            memo,
+                            reference,
+                            arm,
+                            goal,
+                            nodes,
+                        )?;
+                        let union_winner = memo.resolve_child_winner(reference)?;
+                        let union_physical = memo.physical_expr(node.physical)?;
+                        let union_choice = candidate_choice_fingerprint(
+                            reference,
+                            union_winner,
+                            logical,
+                            union_physical,
+                        );
+                        let mut region = StableFingerprintBuilder::default();
+                        region.write_bytes(b"paro.quality.aggregate-region.v2");
+                        region.write_u64(root_candidate.index() as u64);
+                        region.write_u64(arm.candidate.index() as u64);
+                        region.write_fingerprint(union_choice);
+                        region.write_u64(path.len() as u64);
+                        for component in path.iter().copied() {
+                            region.write_u64(component as u64);
+                        }
+                        region.write_fingerprint(fact_fingerprint);
+                        for choice in choices.iter().copied() {
+                            region.write_fingerprint(choice);
+                        }
+                        witnesses.push(AggregateRegionWitness {
+                            region: region.finish(),
+                            candidate: root_candidate,
+                            anchor: arm.candidate,
+                            fact_fingerprint,
+                            choices: choices.into_boxed_slice(),
+                            covered: shape.decomposed,
+                        });
+                    }
+                    visit_union(
+                        memo,
+                        state,
+                        arm,
+                        root_candidate,
+                        goal,
+                        nodes,
+                        path,
+                        witnesses,
+                    )?;
+                    path.pop();
+                }
+                return Some(());
+            }
+        }
+        for child in node.children.iter().copied() {
+            visit_union(
+                memo,
+                state,
+                child,
+                root_candidate,
+                goal,
+                nodes,
+                path,
+                witnesses,
+            )?;
+        }
+        Some(())
+    }
+    visit_union(
+        memo,
+        state,
+        root,
+        root.candidate,
+        goal,
+        &nodes,
+        &mut path,
+        &mut witnesses,
+    )?;
+    if witnesses.is_empty() {
+        let mut shape_visited = BTreeSet::new();
+        let shape = selected_aggregate_region_shape_refs(
+            memo,
+            state,
+            root,
+            &nodes,
+            &mut shape_visited,
+        );
+        if shape.aggregates > 0 {
+            let mut choices = Vec::new();
+            let mut choice_visited = BTreeSet::new();
+            if !collect_quality_node_choices(
+                memo,
+                root,
+                &nodes,
+                &mut choices,
+                &mut choice_visited,
+            ) {
+                return None;
+            }
+            let fact_fingerprint = collect_quality_region_fact_fingerprint(
+                memo, root, root, goal, &nodes,
+            )?;
+            let mut region = StableFingerprintBuilder::default();
+            region.write_bytes(b"paro.quality.aggregate-region.root.v1");
+            region.write_u64(root.candidate.index() as u64);
+            region.write_fingerprint(fact_fingerprint);
+            for choice in choices.iter().copied() {
+                region.write_fingerprint(choice);
+            }
+            witnesses.push(AggregateRegionWitness {
+                region: region.finish(),
+                candidate: root.candidate,
+                anchor: root.candidate,
+                fact_fingerprint,
+                choices: choices.into_boxed_slice(),
+                covered: shape.decomposed,
+            });
+        }
+    }
+    Some(witnesses)
+}
+
+/// Inspect one exact Memo winner using only immutable references.  This is a
+/// conservative preflight: it derives the same candidate-bound evidence as
+/// the complete frozen-DAG provider, but it does not allocate a frozen tree,
+/// run the winner verifier, or clone logical/physical payloads.  The complete
+/// provider remains the final handoff oracle and is called only after this
+/// preflight reports that the quality policy can be satisfied.
+fn planner_quality_preflight(
+    memo: &Memo,
+    reference: ChildWinnerRef,
+    winner: &super::memo::Winner,
+    goal: OptimizationGoal,
+    state: &PlannerTransformState,
+) -> Result<Option<QualityCandidatePreflight>> {
+    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityEvidence);
+    if winner.candidate != reference.candidate || reference.goal != goal {
+        return Ok(None);
+    }
+    let Some(required) = memo.required(goal.required) else {
+        return Ok(None);
+    };
+    // An incomplete reference graph is not a quality answer. Returning `None`
+    // deliberately selects the complete legacy/oracle path, which preserves
+    // the old obligation generation and avoids treating an uninspectable
+    // candidate as a merely missing optional fact.
+    let Some(inspection) = inspect_quality_candidate(memo, reference, state)? else {
+        return Ok(None);
+    };
+    let QualityCandidateInspection {
+        nodes,
+        rules,
+        mut shape,
+        cte_producers,
+        cte_consumers,
+        cte_producer_witnesses,
+        has_filter,
+        has_get,
+        has_join,
+        has_join_region,
+        has_aggregate,
+        has_cte_consumer,
+        has_cte_producer,
+        has_ordering,
+        has_graph,
+        has_dependent,
+        groups,
+    } = inspection;
+    let mut capabilities = BTreeSet::new();
+    let mut facts = BTreeSet::new();
+    let reads = ReadSet::new(
+        groups
+            .into_iter()
+            .map(|group| PatternRead::facts_from_group(memo, group))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    // Domain and aggregate-region inspection is only meaningful for a bundle
+    // whose capability can actually make it applicable.  The previous
+    // preflight ran both selected-DAG walks for every frontier entry, even for
+    // plain scans, joins, and structural alternatives which could never enter
+    // the corresponding quality bundle.
+    let pending_domain_transfers = if has_filter && has_get {
+        let Some(pending) = quality_domain::pending_transfers_for_refs(
+            memo,
+            reference,
+            &nodes,
+            state,
+        ) else {
+            return Ok(None);
+        };
+        pending
+    } else {
+        Box::new([])
+    };
+    if winner.provided.satisfies(required) {
+        facts.insert(BundleFact::OutputDemand);
+    }
+    let has_any = |candidates: &[RuleId]| candidates.iter().any(|rule| rules.contains(rule));
+    if pending_domain_transfers.is_empty()
+        && has_filter
+        && has_get
+        && has_any(&[
+            PREDICATE_TRANSFER_RULE,
+            KEY_DOMAIN_TRANSFER_RULE,
+            CTE_FILTER_PUSHDOWN_RULE,
+        ])
+    {
+        facts.insert(BundleFact::PredicateDomain);
+    }
+    if has_join && has_join_region {
+        facts.insert(BundleFact::JoinRegion);
+    }
+    let aggregate_regions = if has_aggregate && has_cte_consumer && has_cte_producer {
+        let Some(regions) = selected_aggregate_region_witnesses_refs(
+            memo,
+            state,
+            reference,
+            &nodes,
+            goal,
+        ) else {
+            return Ok(None);
+        };
+        regions
+    } else {
+        Vec::new()
+    };
+    shape.aggregate_witness_nodes = aggregate_regions
+        .iter()
+        .filter(|witness| witness.covered)
+        .count() as u32;
+    if has_aggregate
+        && !aggregate_regions.is_empty()
+        && aggregate_regions.iter().all(|witness| witness.covered)
+    {
+        facts.insert(BundleFact::AggregateDecomposition);
+    }
+    if has_cte_consumer
+        && has_cte_producer
+        && !cte_consumers.is_empty()
+        && cte_consumers.is_subset(&cte_producers)
+        && cte_producers.is_subset(&cte_producer_witnesses)
+    {
+        facts.insert(BundleFact::CteConsumerDemand);
+    }
+    if has_aggregate || has_join {
+        facts.insert(BundleFact::NullSemantics);
+    }
+    facts.insert(BundleFact::ProviderCapability);
+    if matches!(winner.provided.ordering, ProvidedOrdering::Ordered { .. }) {
+        facts.insert(BundleFact::OrderingDemand);
+    }
+    if has_filter && has_get {
+        capabilities.insert(BundleCapability::ScanPredicate);
+    }
+    if has_join {
+        capabilities.insert(BundleCapability::SmallJoin);
+    }
+    if has_aggregate && has_cte_consumer && has_cte_producer {
+        capabilities.insert(BundleCapability::SharedAggregate);
+    }
+    if has_dependent {
+        capabilities.insert(BundleCapability::CorrelatedSubquery);
+    }
+    if has_ordering {
+        capabilities.insert(BundleCapability::Ordering);
+    }
+    if has_graph {
+        capabilities.insert(BundleCapability::GraphProvider);
+    }
+
+    // A preflight is useful only while a known applicable built-in bundle is
+    // missing evidence.  Once all of those facts are present, return `None`
+    // and let the legacy provider perform the one complete freeze/verification
+    // pass.  This avoids constructing a second full choice digest merely to
+    // discover that the candidate is ready; custom policies remain safe
+    // because the complete provider is still the fallback for them.
+    let built_in_bundle_has_missing_fact = capabilities.iter().any(|capability| match capability {
+        BundleCapability::ScanPredicate => {
+            !facts.contains(&BundleFact::OutputDemand)
+                || !facts.contains(&BundleFact::PredicateDomain)
+        }
+        BundleCapability::SmallJoin => {
+            !facts.contains(&BundleFact::OutputDemand)
+                || !facts.contains(&BundleFact::JoinRegion)
+        }
+        BundleCapability::SharedAggregate => {
+            !facts.contains(&BundleFact::AggregateDecomposition)
+                || !facts.contains(&BundleFact::CteConsumerDemand)
+                || !facts.contains(&BundleFact::NullSemantics)
+        }
+        BundleCapability::CorrelatedSubquery => {
+            !facts.contains(&BundleFact::PredicateDomain)
+                || !facts.contains(&BundleFact::NullSemantics)
+        }
+        // The current built-in policy has no ordering or graph bundle.  Keep
+        // the conservative fallback for a caller that installs such a policy.
+        BundleCapability::LargeJoin | BundleCapability::Ordering | BundleCapability::GraphProvider =>
+            false,
+    });
+    if capabilities.is_empty() || !built_in_bundle_has_missing_fact {
+        return Ok(None);
+    }
+    let mut region = StableFingerprintBuilder::default();
+    region.write_bytes(b"paro.quality.native-region.v1");
+    region.write_u64(reference.group.0 as u64);
+    region.write_u64(reference.candidate.index() as u64);
+    region.write_fingerprint(winner.physical_fingerprint);
+    let region = region.finish();
+    let mut proof = StableFingerprintBuilder::default();
+    proof.write_bytes(b"paro.quality.native-evidence.v1");
+    proof.write_fingerprint(region);
+    proof.write_u64(rules.len() as u64);
+    for rule in &rules {
+        proof.write_u64(rule.0 as u64);
+    }
+    proof.write_u64(capabilities.len() as u64);
+    proof.write_u64(facts.len() as u64);
+    proof.write_u64(aggregate_regions.len() as u64);
+    for witness in &aggregate_regions {
+        proof.write_fingerprint(witness.region);
+        proof.write_fingerprint(witness.fact_fingerprint);
+        proof.write_u64(u64::from(witness.covered));
+    }
+    let domain_bindings = if pending_domain_transfers.is_empty() {
+        Box::new([])
+    } else {
+        quality_domain::selected_transfer_bindings_for_refs(memo, reference, &nodes, state)
+    };
+    Ok(Some(QualityCandidatePreflight {
+        nodes,
+        reads,
+        evidence: NativeQualityEvidence {
+            pending_domain_transfers,
+            capabilities,
+            facts,
+            region,
+            applicability_proof: proof.finish(),
+            // A rejected preflight is never a certificate, so exact choice
+            // fingerprints are intentionally deferred to the final frozen
+            // provider.  The production request uses the immutable node refs
+            // and its own exact selected-path bindings.
+            choices: Box::new([]),
+            aggregate_regions: aggregate_regions.into_boxed_slice(),
+            selected_rules: rules.into_iter().collect(),
+            shape,
+        },
+        domain_bindings,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -567,6 +1422,23 @@ fn selected_aggregate_region_witnesses(
 }
 
 impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
+    fn preflight(
+        &self,
+        memo: &Memo,
+        reference: ChildWinnerRef,
+        winner: &super::memo::Winner,
+        goal: OptimizationGoal,
+    ) -> Result<Option<QualityCandidatePreflight>> {
+        if !self.preflight_enabled {
+            return Ok(None);
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+        planner_quality_preflight(memo, reference, winner, goal, &state)
+    }
+
     fn evidence(
         &self,
         memo: &Memo,
@@ -1566,6 +2438,8 @@ impl OptimizationInput {
             engine.set_quality_policy_handoff_enabled(true);
             engine.set_quality_evidence_provider(Arc::new(PlannerQualityEvidenceProvider {
                 state: self.planner_state.clone(),
+                preflight_enabled: std::env::var_os("PARO_QUALITY_PREFLIGHT")
+                    .is_none_or(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
             }));
         }
         engine.prime_grant_context(grant_classes.values().copied())?;

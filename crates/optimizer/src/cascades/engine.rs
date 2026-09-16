@@ -1003,6 +1003,12 @@ struct PhysicalResponseSnapshot {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum QualityCheckOrigin {
+    PhysicalPublication,
+    Checkpoint,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct PhysicalCompletionProof {
     proof: BoundProofId,
     domain: Fingerprint,
@@ -1306,6 +1312,17 @@ pub struct CascadesEngine {
     quality_direct_binding_work_units: u64,
     quality_candidate_evaluation_count: u64,
     quality_candidate_missing_evidence_count: u64,
+    /// Low-overhead origin accounting for B11. Handoff checks are triggered
+    /// either by a newly visible physical response or by an explicit
+    /// checkpoint; these are not interchangeable with ordinary incumbent or
+    /// diagnostic freeze work.
+    quality_handoff_publication_call_count: u64,
+    quality_handoff_checkpoint_call_count: u64,
+    quality_preflight_count: u64,
+    quality_preflight_missing_count: u64,
+    quality_preflight_policy_rejection_count: u64,
+    quality_preflight_ready_count: u64,
+    quality_freeze_avoided_count: u64,
     /// Number of root-frontier entries inspected by the quality policy. A
     /// quality handoff is allowed to select a published, non-leading frontier
     /// entry when it is the first exact candidate whose native contract is
@@ -1315,8 +1332,12 @@ pub struct CascadesEngine {
     quality_frontier_certified_count: u64,
     quality_frontier_policy_rejection_count: u64,
     quality_frontier_fact_signatures: BTreeMap<u16, u64>,
-    quality_evaluated_candidates:
-        BTreeSet<(OptimizationGoal, CandidateId, super::tasks::ReadSetId)>,
+    /// The last read cursor used to evaluate each immutable candidate. This
+    /// is an evaluation cursor, not a certificate cache: a current cursor
+    /// suppresses only another check with the same fact dependencies; a
+    /// stale cursor reopens the candidate and lets the provider rebuild its
+    /// exact local proof.
+    quality_evaluated_candidates: BTreeMap<(OptimizationGoal, CandidateId), super::tasks::ReadSetId>,
     quality_frontier_max_aggregates: u32,
     quality_frontier_max_runtime_filters: u32,
     quality_frontier_max_aggregate_regions: u32,
@@ -1501,12 +1522,19 @@ impl CascadesEngine {
             quality_direct_binding_work_units: 0,
             quality_candidate_evaluation_count: 0,
             quality_candidate_missing_evidence_count: 0,
+            quality_handoff_publication_call_count: 0,
+            quality_handoff_checkpoint_call_count: 0,
+            quality_preflight_count: 0,
+            quality_preflight_missing_count: 0,
+            quality_preflight_policy_rejection_count: 0,
+            quality_preflight_ready_count: 0,
+            quality_freeze_avoided_count: 0,
             quality_frontier_candidate_count: 0,
             quality_frontier_candidate_skip_count: 0,
             quality_frontier_certified_count: 0,
             quality_frontier_policy_rejection_count: 0,
             quality_frontier_fact_signatures: BTreeMap::new(),
-            quality_evaluated_candidates: BTreeSet::new(),
+            quality_evaluated_candidates: BTreeMap::new(),
             quality_frontier_max_aggregates: 0,
             quality_frontier_max_runtime_filters: 0,
             quality_frontier_max_aggregate_regions: 0,
@@ -1880,8 +1908,9 @@ impl CascadesEngine {
     }
 
     /// Install the planner-owned producer for the optional ready-to-execute
-    /// policy. The producer receives only an exact frozen candidate and may
-    /// return no evidence when a required dependency is not available.
+    /// policy. The producer may preflight exact Memo references, but a
+    /// certificate is accepted only after the final provider call receives an
+    /// exact frozen candidate and all required dependencies are current.
     pub fn set_quality_evidence_provider(&mut self, provider: Arc<dyn QualityEvidenceProvider>) {
         self.quality_evidence_provider = Some(provider);
     }
@@ -2556,6 +2585,13 @@ impl CascadesEngine {
         self.quality_direct_binding_work_units = 0;
         self.quality_candidate_evaluation_count = 0;
         self.quality_candidate_missing_evidence_count = 0;
+        self.quality_handoff_publication_call_count = 0;
+        self.quality_handoff_checkpoint_call_count = 0;
+        self.quality_preflight_count = 0;
+        self.quality_preflight_missing_count = 0;
+        self.quality_preflight_policy_rejection_count = 0;
+        self.quality_preflight_ready_count = 0;
+        self.quality_freeze_avoided_count = 0;
         self.quality_frontier_candidate_count = 0;
         self.quality_frontier_candidate_skip_count = 0;
         self.quality_frontier_certified_count = 0;
@@ -3114,7 +3150,11 @@ impl CascadesEngine {
         let is_root = self.milestone_root == Some(self.memo.canonical_group(group));
         if !self.collect_rule_work_profile || self.optional_search_started && !is_root {
             if self.quality_handoff_enabled && self.optional_search_started && is_root {
-                return self.try_quality_handoff_candidate(group, goal);
+                return self.try_quality_handoff_candidate(
+                    group,
+                    goal,
+                    QualityCheckOrigin::PhysicalPublication,
+                );
             }
             return Ok(());
         }
@@ -3137,7 +3177,11 @@ impl CascadesEngine {
             }
         }
         if self.quality_handoff_enabled && self.optional_search_started {
-            self.try_quality_handoff_candidate(group, goal)?;
+            self.try_quality_handoff_candidate(
+                group,
+                goal,
+                QualityCheckOrigin::PhysicalPublication,
+            )?;
         }
         Ok(())
     }
@@ -3286,8 +3330,21 @@ impl CascadesEngine {
         &mut self,
         group: GroupId,
         goal: OptimizationGoal,
+        origin: QualityCheckOrigin,
     ) -> Result<()> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
+        match origin {
+            QualityCheckOrigin::PhysicalPublication => {
+                self.quality_handoff_publication_call_count = self
+                    .quality_handoff_publication_call_count
+                    .saturating_add(1);
+            }
+            QualityCheckOrigin::Checkpoint => {
+                self.quality_handoff_checkpoint_call_count = self
+                    .quality_handoff_checkpoint_call_count
+                    .saturating_add(1);
+            }
+        }
         if !self.quality_handoff_enabled
             || self.quality_handoff_reached
             || !self.quality_required_goals.contains(&goal)
@@ -3311,56 +3368,152 @@ impl CascadesEngine {
         let leading_candidate = frontier.first().map(|winner| winner.candidate);
         let class = self.quality_class_for_goal(goal);
         for winner in frontier {
-            // The same immutable CandidateId can remain in a frontier while
-            // its group facts advance. Include the exact fact read-set in the
-            // evaluation cursor so a stale quality result cannot suppress a
-            // re-check after a branch/domain/statistics publication.
-            let reads = self.winner_fact_reads(root, &winner)?;
+            let reference = ChildWinnerRef {
+                group: root,
+                goal,
+                candidate: winner.candidate,
+            };
+            let candidate_identity = (goal, winner.candidate);
+            // Physical publication can call the quality lane repeatedly for
+            // the same immutable frontier entry.  ReadSet::is_current is a
+            // cheap version check and avoids rebuilding the selected path
+            // merely because an unrelated publication woke the root.  Facts
+            // changing underneath the candidate make the cursor stale and
+            // deliberately reopen the proof.
+            if self
+                .quality_evaluated_candidates
+                .get(&candidate_identity)
+                .copied()
+                .and_then(|read_id| self.task_registry.read_set(read_id))
+                .is_some_and(|reads| reads.is_current(&self.memo).is_ok_and(|current| current))
+            {
+                self.quality_frontier_candidate_skip_count = self
+                    .quality_frontier_candidate_skip_count
+                    .saturating_add(1);
+                continue;
+            }
+            // A planner provider may inspect the immutable selected path
+            // without freezing it. Providers which do not implement the
+            // accelerator use the complete path below as the compatibility
+            // oracle. The exact fact read set remains part of the candidate
+            // cursor in either case.
+            self.quality_preflight_count = self.quality_preflight_count.saturating_add(1);
+            let preflight = provider.preflight(&self.memo, reference, &winner, goal)?;
+            let (reads, preflight) = match preflight {
+                Some(preflight) => (preflight.reads.clone(), Some(preflight)),
+                None => (self.winner_fact_reads(root, &winner)?, None),
+            };
             let diagnostic_facts = self
                 .collect_rule_work_profile
                 .then(|| reads.reads().to_vec().into_boxed_slice());
             let read_id = self.task_registry.intern_read_set(reads);
-            let candidate_key = (goal, winner.candidate, read_id);
-            if !self.quality_evaluated_candidates.insert(candidate_key) {
-                self.quality_frontier_candidate_skip_count =
-                    self.quality_frontier_candidate_skip_count.saturating_add(1);
-                continue;
-            }
+            self.quality_evaluated_candidates
+                .insert(candidate_identity, read_id);
             self.quality_frontier_candidate_count =
                 self.quality_frontier_candidate_count.saturating_add(1);
-            let frozen_winner = self.freeze_grant_winner(root, class, goal, winner)?;
-            let reference = frozen_winner.frozen.reference;
             self.quality_last_evaluation_candidate = Some(reference.candidate);
             self.quality_last_evaluation_goal = Some(goal);
-            let Some(evidence) =
-                provider.evidence(&self.memo, reference, &frozen_winner.frozen, goal)?
-            else {
+            let mut frozen_winner = None;
+            let mut evidence = match preflight.as_ref() {
+                Some(preflight) => Some(preflight.evidence.clone()),
+                None => {
+                    let frozen = self.freeze_grant_winner(root, class, goal, winner.clone())?;
+                    let reference = frozen.frozen.reference;
+                    let evidence = provider.evidence(&self.memo, reference, &frozen.frozen, goal)?;
+                    frozen_winner = Some(frozen);
+                    evidence
+                }
+            };
+            let Some(mut evidence_value) = evidence.take() else {
                 self.quality_candidate_missing_evidence_count = self
                     .quality_candidate_missing_evidence_count
                     .saturating_add(1);
                 continue;
             };
+            self.quality_candidate_evaluation_count =
+                self.quality_candidate_evaluation_count.saturating_add(1);
+            let mut certificate = self.quality_bundles.evaluate_native_candidate(
+                QualityPolicyId::new(1),
+                reference.candidate,
+                read_id,
+                &evidence_value,
+                1,
+            )?;
+            if preflight.is_some() {
+                if certificate.is_some() {
+                    self.quality_preflight_ready_count = self
+                        .quality_preflight_ready_count
+                        .saturating_add(1);
+                } else {
+                    self.quality_preflight_policy_rejection_count = self
+                        .quality_preflight_policy_rejection_count
+                        .saturating_add(1);
+                    self.quality_freeze_avoided_count = self
+                        .quality_freeze_avoided_count
+                        .saturating_add(1);
+                }
+            }
+            // A cheap policy pass is only a precondition for freezing.  The
+            // exact provider and WinnerVerifier still run once for a
+            // candidate which might be handed off, and the final registry
+            // pass consumes that full evidence. Missing candidates never pay
+            // for this tree materialization.
+            if certificate.is_some() && preflight.is_some() {
+                let frozen = self.freeze_grant_winner(root, class, goal, winner.clone())?;
+                let reference = frozen.frozen.reference;
+                let Some(full_evidence) =
+                    provider.evidence(&self.memo, reference, &frozen.frozen, goal)?
+                else {
+                    self.quality_preflight_missing_count = self
+                        .quality_preflight_missing_count
+                        .saturating_add(1);
+                    self.quality_candidate_missing_evidence_count = self
+                        .quality_candidate_missing_evidence_count
+                        .saturating_add(1);
+                    continue;
+                };
+                evidence_value = full_evidence;
+                certificate = self.quality_bundles.evaluate_native_candidate(
+                    QualityPolicyId::new(1),
+                    reference.candidate,
+                    read_id,
+                    &evidence_value,
+                    1,
+                )?;
+                frozen_winner = Some(frozen);
+            }
+            let reference = frozen_winner
+                .as_ref()
+                .map_or(reference, |frozen| frozen.frozen.reference);
             tracing::debug!(
                 target: "paro::optimizer::quality_handoff",
                 candidate = reference.candidate.index(),
-                logical_payload = frozen_winner.frozen.logical.payload.0,
-                physical_payload = frozen_winner.frozen.physical.payload.0,
-                operator_tag = frozen_winner.frozen.logical.operator_tag,
-                child_count = frozen_winner.frozen.children.len(),
-                shape = ?evidence.shape,
-                facts = ?evidence.facts,
-                capabilities = ?evidence.capabilities,
-                aggregate_regions = ?evidence.aggregate_regions,
+                logical_payload = frozen_winner
+                    .as_ref()
+                    .map(|frozen| frozen.frozen.logical.payload.0),
+                physical_payload = frozen_winner
+                    .as_ref()
+                    .map(|frozen| frozen.frozen.physical.payload.0),
+                operator_tag = frozen_winner
+                    .as_ref()
+                    .map(|frozen| frozen.frozen.logical.operator_tag),
+                child_count = frozen_winner
+                    .as_ref()
+                    .map_or(winner.children.len(), |frozen| frozen.frozen.children.len()),
+                shape = ?evidence_value.shape,
+                facts = ?evidence_value.facts,
+                capabilities = ?evidence_value.capabilities,
+                aggregate_regions = ?evidence_value.aggregate_regions,
                 "evaluating exact quality handoff candidate"
             );
             self.quality_frontier_max_aggregates = self
                 .quality_frontier_max_aggregates
-                .max(evidence.shape.aggregates);
+                .max(evidence_value.shape.aggregates);
             self.quality_frontier_max_runtime_filters = self
                 .quality_frontier_max_runtime_filters
-                .max(evidence.shape.runtime_filter_joins);
-            let aggregate_region_count = evidence.aggregate_regions.len() as u32;
-            let covered_aggregate_region_count = evidence
+                .max(evidence_value.shape.runtime_filter_joins);
+            let aggregate_region_count = evidence_value.aggregate_regions.len() as u32;
+            let covered_aggregate_region_count = evidence_value
                 .aggregate_regions
                 .iter()
                 .filter(|witness| witness.covered)
@@ -3378,11 +3531,11 @@ impl CascadesEngine {
                         .quality_frontier_first_incomplete_aggregate_region_us
                         .is_none()
                     {
-                        let witness = evidence
+                        let witness = evidence_value
                             .aggregate_regions
                             .iter()
                             .find(|witness| !witness.covered)
-                            .or_else(|| evidence.aggregate_regions.first());
+                            .or_else(|| evidence_value.aggregate_regions.first());
                         self.quality_frontier_first_incomplete_aggregate_region_us =
                             Some(coverage_elapsed_us);
                         self.quality_frontier_first_incomplete_aggregate_candidate =
@@ -3411,43 +3564,46 @@ impl CascadesEngine {
                 .max(covered_aggregate_region_count);
             self.quality_frontier_max_aggregate_witnesses = self
                 .quality_frontier_max_aggregate_witnesses
-                .max(evidence.shape.aggregate_witness_nodes);
+                .max(evidence_value.shape.aggregate_witness_nodes);
             self.quality_frontier_max_join_witnesses = self
                 .quality_frontier_max_join_witnesses
-                .max(evidence.shape.join_region_witness_nodes);
+                .max(evidence_value.shape.join_region_witness_nodes);
             // This is the first point at which the exact selected proof-bearing
             // rules are consumed by the root-quality decision.  It is deliberately
             // fed by the provider's frozen-DAG evidence, never by Memo audit bits.
-            let fact_signature = evidence.facts.iter().fold(0_u16, |signature, fact| {
+            let fact_signature = evidence_value.facts.iter().fold(0_u16, |signature, fact| {
                 signature | (1_u16 << fact.stable_tag())
             });
             *self
                 .quality_frontier_fact_signatures
                 .entry(fact_signature)
                 .or_default() += 1;
-            self.note_rule_root_consumed(&evidence.selected_rules);
-            self.quality_candidate_evaluation_count =
-                self.quality_candidate_evaluation_count.saturating_add(1);
-            let Some(certificate) = self.quality_bundles.evaluate_native_candidate(
-                QualityPolicyId::new(1),
-                reference.candidate,
-                read_id,
-                &evidence,
-                1,
-            )?
-            else {
+            self.note_rule_root_consumed(&evidence_value.selected_rules);
+            let Some(certificate) = certificate else {
                 self.quality_frontier_policy_rejection_count = self
                     .quality_frontier_policy_rejection_count
                     .saturating_add(1);
                 self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
                 let missing = self.quality_last_evaluation.missing_fact_kinds.clone();
-                self.record_quality_production_request(
-                    goal,
-                    &frozen_winner.frozen,
-                    read_id,
-                    &evidence,
-                    &missing,
-                )?;
+                if let Some(preflight) = preflight {
+                    self.record_quality_production_request_preflight(
+                        goal,
+                        reference,
+                        &preflight.nodes,
+                        read_id,
+                        &evidence_value,
+                        &missing,
+                        preflight.domain_bindings,
+                    )?;
+                } else if let Some(frozen_winner) = frozen_winner.as_ref() {
+                    self.record_quality_production_request(
+                        goal,
+                        &frozen_winner.frozen,
+                        read_id,
+                        &evidence_value,
+                        &missing,
+                    )?;
+                }
                 continue;
             };
             self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
@@ -3455,10 +3611,10 @@ impl CascadesEngine {
                 self.quality_frontier_certified_count.saturating_add(1);
             self.quality_certified_max_aggregates = self
                 .quality_certified_max_aggregates
-                .max(evidence.shape.aggregates);
+                .max(evidence_value.shape.aggregates);
             self.quality_certified_max_runtime_filters = self
                 .quality_certified_max_runtime_filters
-                .max(evidence.shape.runtime_filter_joins);
+                .max(evidence_value.shape.runtime_filter_joins);
             self.quality_certified_max_aggregate_regions = self
                 .quality_certified_max_aggregate_regions
                 .max(aggregate_region_count);
@@ -3467,10 +3623,10 @@ impl CascadesEngine {
                 .max(covered_aggregate_region_count);
             self.quality_certified_max_aggregate_witnesses = self
                 .quality_certified_max_aggregate_witnesses
-                .max(evidence.shape.aggregate_witness_nodes);
+                .max(evidence_value.shape.aggregate_witness_nodes);
             self.quality_certified_max_join_witnesses = self
                 .quality_certified_max_join_witnesses
-                .max(evidence.shape.join_region_witness_nodes);
+                .max(evidence_value.shape.join_region_witness_nodes);
             if Some(reference.candidate) != leading_candidate {
                 // This is intentionally observable: selecting a quality-ready
                 // candidate from the Pareto frontier is not the same operation
@@ -3486,6 +3642,11 @@ impl CascadesEngine {
             }
             self.quality_certificates.insert(goal, certificate);
             if self.collect_rule_work_profile {
+                let Some(frozen_winner) = frozen_winner.as_ref() else {
+                    return Err(paro_error::internal(
+                        "quality certificate was produced without a frozen candidate",
+                    ));
+                };
                 let frozen = &frozen_winner.frozen;
                 self.note_candidate_lifecycle(CandidateLifecycleEvent {
                     stage: CandidateLifecycleStage::RootQualified,
@@ -3506,6 +3667,11 @@ impl CascadesEngine {
                     upper_cost_bits: Some(frozen.winner.cost.score.range.upper.to_bits()),
                 });
             }
+            let Some(frozen_winner) = frozen_winner else {
+                return Err(paro_error::internal(
+                    "quality certificate was produced without a frozen candidate",
+                ));
+            };
             self.quality_ready_winners.insert(goal, frozen_winner);
             if self
                 .quality_required_goals
@@ -3577,7 +3743,7 @@ impl CascadesEngine {
                 grant: sensitivity.goal_for(admissible_set, class),
                 ..base_goal
             };
-            self.try_quality_handoff_candidate(root, goal)?;
+            self.try_quality_handoff_candidate(root, goal, QualityCheckOrigin::Checkpoint)?;
             if self.quality_handoff_reached {
                 break;
             }
@@ -6011,6 +6177,31 @@ impl CascadesEngine {
             (
                 "quality_policy_missing_evidence_count",
                 self.quality_candidate_missing_evidence_count,
+            ),
+            (
+                "quality_handoff_publication_call_count",
+                self.quality_handoff_publication_call_count,
+            ),
+            (
+                "quality_handoff_checkpoint_call_count",
+                self.quality_handoff_checkpoint_call_count,
+            ),
+            ("quality_preflight_count", self.quality_preflight_count),
+            (
+                "quality_preflight_missing_count",
+                self.quality_preflight_missing_count,
+            ),
+            (
+                "quality_preflight_policy_rejection_count",
+                self.quality_preflight_policy_rejection_count,
+            ),
+            (
+                "quality_preflight_ready_count",
+                self.quality_preflight_ready_count,
+            ),
+            (
+                "quality_freeze_avoided_count",
+                self.quality_freeze_avoided_count,
             ),
             (
                 "quality_policy_frontier_candidate_count",

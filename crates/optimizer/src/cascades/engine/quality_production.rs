@@ -7,7 +7,9 @@
 //! legal alternative, or replace the model-cost frontier or quality policy.
 
 use super::*;
-use crate::cascades::quality::{BundleFact, NativeQualityEvidence};
+use crate::cascades::quality::{
+    BundleFact, NativeQualityEvidence, QualityCandidateNode,
+};
 use crate::cascades::rules::QualityDependency;
 use crate::cascades::tasks::ReadSetId;
 
@@ -28,6 +30,125 @@ pub(super) struct QualityProductionRequest {
 }
 
 impl QualityProductionRequest {
+    fn from_preflight(
+        memo: &Memo,
+        reference: ChildWinnerRef,
+        nodes: &[QualityCandidateNode],
+        reads: ReadSetId,
+        evidence: &NativeQualityEvidence,
+        missing: &[BundleFact],
+        domain_bindings: Box<[PatternBinding]>,
+    ) -> Option<Self> {
+        let candidate = reference.candidate;
+        let mut by_candidate = BTreeMap::new();
+        for node in nodes {
+            if node.reference.candidate == candidate
+                && (node.reference.group != reference.group
+                    || node.reference.goal != reference.goal)
+            {
+                return None;
+            }
+            if by_candidate
+                .insert(node.reference.candidate, node)
+                .is_some()
+            {
+                return None;
+            }
+        }
+        if !by_candidate.contains_key(&candidate) {
+            return None;
+        }
+        if evidence
+            .aggregate_regions
+            .iter()
+            .any(|region| region.candidate != candidate)
+            || evidence
+                .aggregate_regions
+                .iter()
+                .any(|region| !by_candidate.contains_key(&region.anchor))
+            || evidence
+                .pending_domain_transfers
+                .iter()
+                .any(|node| !by_candidate.contains_key(node))
+        {
+            return None;
+        }
+
+        let mut obligations = BTreeMap::new();
+        let mut uncovered = 0_usize;
+        for &fact in missing {
+            if fact == BundleFact::AggregateDecomposition {
+                for region in evidence
+                    .aggregate_regions
+                    .iter()
+                    .filter(|region| !region.covered)
+                {
+                    let arm = by_candidate.get(&region.anchor)?;
+                    let mut choices = BTreeSet::new();
+                    let mut pending = vec![arm.reference];
+                    let mut visited = BTreeSet::new();
+                    while let Some(node_reference) = pending.pop() {
+                        if !visited.insert(node_reference.candidate) {
+                            continue;
+                        }
+                        let node = *by_candidate.get(&node_reference.candidate)?;
+                        choices.insert((
+                            memo.canonical_group(node.reference.group),
+                            node.logical,
+                        ));
+                        pending.extend(node.children.iter().copied());
+                    }
+                    uncovered += 1;
+                    obligations.insert(
+                        (fact, memo.canonical_group(arm.reference.group)),
+                        choices,
+                    );
+                }
+            } else if fact == BundleFact::PredicateDomain
+                && !evidence.pending_domain_transfers.is_empty()
+            {
+                for candidate in &evidence.pending_domain_transfers {
+                    let node = *by_candidate.get(candidate)?;
+                    let group = memo.canonical_group(node.reference.group);
+                    obligations
+                        .entry((fact, group))
+                        .or_insert_with(BTreeSet::new)
+                        .insert((group, node.logical));
+                }
+            } else if matches!(
+                fact,
+                BundleFact::PredicateDomain
+                    | BundleFact::CteConsumerDemand
+                    | BundleFact::JoinRegion
+            ) {
+                obligations.insert(
+                    (fact, memo.canonical_group(reference.group)),
+                    by_candidate
+                        .values()
+                        .map(|node| {
+                            (memo.canonical_group(node.reference.group), node.logical)
+                        })
+                        .collect(),
+                );
+            }
+        }
+
+        let cost = memo
+            .resolve_child_winner(reference)?
+            .cost
+            .score
+            .range
+            .expected;
+        Some(Self {
+            candidate,
+            reads,
+            obligations,
+            domain_bindings,
+            deficit: missing.len().saturating_add(uncovered.saturating_sub(1)),
+            cost,
+        })
+    }
+
     fn from_candidate(
         memo: &Memo,
         frozen: &Arc<FrozenCandidate>,
@@ -182,47 +303,33 @@ impl StableAgenda {
 }
 
 impl CascadesEngine {
-    pub(super) fn record_quality_production_request(
+    fn quality_request_is_preferred(
+        &self,
+        goal: OptimizationGoal,
+        request: &QualityProductionRequest,
+    ) -> bool {
+        let Some(previous) = self.quality_production_requests.get(&goal) else {
+            return true;
+        };
+        let current = self
+            .task_registry
+            .read_set(previous.reads)
+            .is_some_and(|reads| reads.is_current(&self.memo).is_ok_and(|current| current));
+        !current || request.prefers(previous)
+    }
+
+    fn install_quality_production_request(
         &mut self,
         goal: OptimizationGoal,
-        frozen: &Arc<FrozenCandidate>,
-        reads: ReadSetId,
-        evidence: &NativeQualityEvidence,
-        missing: &[BundleFact],
+        request: QualityProductionRequest,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityProduction);
-        let Some(mut request) =
-            QualityProductionRequest::from_candidate(&self.memo, frozen, reads, evidence, missing)
-        else {
-            return Ok(());
-        };
-        // Request preference depends on its obligations/cost/identity, not on
+        // Request preference depends on obligations/cost/identity, not on
         // the selected-path binding payload. Keep the existing validated
-        // request before constructing bindings that would immediately be
-        // discarded. A stale read set still requires a replacement, even if
-        // the new request ranks worse; this is not a quality certificate cache.
-        if let Some(previous) = self.quality_production_requests.get(&goal) {
-            let current = self
-                .task_registry
-                .read_set(previous.reads)
-                .is_some_and(|reads| reads.is_current(&self.memo).is_ok_and(|current| current));
-            if current && !request.prefers(previous) {
-                return Ok(());
-            }
-        }
-        if missing.contains(&BundleFact::PredicateDomain)
-            && self
-                .memo
-                .budget()
-                .transformation_enabled(crate::cascades::rules::PREDICATE_TRANSFER_RULE)
-        {
-            request.domain_bindings = self
-                .registry
-                .transformations()
-                .find(|rule| rule.id() == crate::cascades::rules::PREDICATE_TRANSFER_RULE)
-                .map(|rule| rule.selected_quality_bindings(&self.memo, frozen))
-                .transpose()?
-                .unwrap_or_default();
+        // request before replacing it with work that ranks worse. A stale
+        // read set still requires a replacement; this is not a certificate
+        // cache.
+        if !self.quality_request_is_preferred(goal, &request) {
+            return Ok(());
         }
         self.quality_forced_transform_bindings
             .retain(|(entry_goal, _), _| *entry_goal != goal);
@@ -242,6 +349,70 @@ impl CascadesEngine {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn record_quality_production_request_preflight(
+        &mut self,
+        goal: OptimizationGoal,
+        reference: ChildWinnerRef,
+        nodes: &[QualityCandidateNode],
+        reads: ReadSetId,
+        evidence: &NativeQualityEvidence,
+        missing: &[BundleFact],
+        domain_bindings: Box<[PatternBinding]>,
+    ) -> Result<()> {
+        let _partition =
+            crate::work_partition::enter(crate::work_partition::Bucket::QualityProduction);
+        let Some(request) = QualityProductionRequest::from_preflight(
+            &self.memo,
+            reference,
+            nodes,
+            reads,
+            evidence,
+            missing,
+            domain_bindings,
+        ) else {
+            return Ok(());
+        };
+        self.install_quality_production_request(goal, request)
+    }
+
+    pub(super) fn record_quality_production_request(
+        &mut self,
+        goal: OptimizationGoal,
+        frozen: &Arc<FrozenCandidate>,
+        reads: ReadSetId,
+        evidence: &NativeQualityEvidence,
+        missing: &[BundleFact],
+    ) -> Result<()> {
+        let _partition =
+            crate::work_partition::enter(crate::work_partition::Bucket::QualityProduction);
+        let Some(mut request) =
+            QualityProductionRequest::from_candidate(&self.memo, frozen, reads, evidence, missing)
+        else {
+            return Ok(());
+        };
+        // Keep this check before selected binding construction. The binding
+        // is an ordering hint and must not be built for a request which is
+        // already superseded by an equally current, better obligation.
+        if !self.quality_request_is_preferred(goal, &request) {
+            return Ok(());
+        }
+        if missing.contains(&BundleFact::PredicateDomain)
+            && self
+                .memo
+                .budget()
+                .transformation_enabled(crate::cascades::rules::PREDICATE_TRANSFER_RULE)
+        {
+            request.domain_bindings = self
+                .registry
+                .transformations()
+                .find(|rule| rule.id() == crate::cascades::rules::PREDICATE_TRANSFER_RULE)
+                .map(|rule| rule.selected_quality_bindings(&self.memo, frozen))
+                .transpose()?
+                .unwrap_or_default();
+        }
+        self.install_quality_production_request(goal, request)
     }
 
     pub(super) fn pop_transformation_task(

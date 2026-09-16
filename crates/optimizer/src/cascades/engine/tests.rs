@@ -493,6 +493,117 @@ fn binding_preflight_skips_rule_construction_transaction() {
     );
 }
 
+#[derive(Debug)]
+struct QualityPreflightProbe {
+    reads: crate::cascades::tasks::ReadSet,
+    preflight_calls: Arc<AtomicUsize>,
+    evidence_calls: Arc<AtomicUsize>,
+}
+
+impl crate::cascades::quality::QualityEvidenceProvider for QualityPreflightProbe {
+    fn preflight(
+        &self,
+        memo: &Memo,
+        reference: ChildWinnerRef,
+        winner: &Winner,
+        _: OptimizationGoal,
+    ) -> Result<Option<crate::cascades::quality::QualityCandidatePreflight>> {
+        self.preflight_calls.fetch_add(1, Ordering::Relaxed);
+        let physical = memo
+            .physical_expr(winner.expression)
+            .expect("probe winner has a physical expression");
+        let logical = memo
+            .logical_expr(physical.key.logical)
+            .expect("probe physical expression has a logical expression");
+        Ok(Some(
+            crate::cascades::quality::QualityCandidatePreflight {
+                nodes: Box::new([crate::cascades::quality::QualityCandidateNode {
+                    reference,
+                    logical: logical.id,
+                    physical: physical.id,
+                    children: winner.children.clone(),
+                }]),
+                reads: self.reads.clone(),
+                evidence: crate::cascades::quality::NativeQualityEvidence {
+                    capabilities: BTreeSet::from([
+                        crate::cascades::quality::BundleCapability::ScanPredicate,
+                    ]),
+                    facts: BTreeSet::from([crate::cascades::quality::BundleFact::OutputDemand]),
+                    region: Fingerprint(1),
+                    applicability_proof: Fingerprint(2),
+                    choices: Box::new([Fingerprint(3)]),
+                    aggregate_regions: Box::new([]),
+                    pending_domain_transfers: Box::new([reference.candidate]),
+                    selected_rules: Box::new([]),
+                    shape: crate::cascades::quality::NativeQualityShape::default(),
+                },
+                domain_bindings: Box::new([]),
+            },
+        ))
+    }
+
+    fn evidence(
+        &self,
+        _: &Memo,
+        _: ChildWinnerRef,
+        _: &FrozenCandidate,
+        _: OptimizationGoal,
+    ) -> Result<Option<crate::cascades::quality::NativeQualityEvidence>> {
+        self.evidence_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(None)
+    }
+}
+
+#[test]
+fn quality_preflight_avoids_freeze_and_reopens_only_after_fact_change() {
+    let (mut engine, group, goal) = engine(0);
+    engine.optimize_group(group, goal).unwrap();
+    let reads = crate::cascades::tasks::ReadSet::single(
+        PatternRead::facts_from_group(engine.memo(), group).unwrap(),
+    );
+    let preflight_calls = Arc::new(AtomicUsize::new(0));
+    let evidence_calls = Arc::new(AtomicUsize::new(0));
+    engine.set_quality_evidence_provider(Arc::new(QualityPreflightProbe {
+        reads,
+        preflight_calls: Arc::clone(&preflight_calls),
+        evidence_calls: Arc::clone(&evidence_calls),
+    }));
+    engine.set_quality_policy_handoff_enabled(true);
+    engine.quality_required_goals.insert(goal);
+
+    engine
+        .try_quality_handoff_candidate(group, goal, QualityCheckOrigin::Checkpoint)
+        .unwrap();
+    assert_eq!(preflight_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(evidence_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(engine.quality_freeze_avoided_count, 1);
+    assert_eq!(engine.quality_production_requests.len(), 1);
+
+    // A root wakeup with the same immutable candidate and current facts is a
+    // cursor hit; it must not rebuild the local proof or freeze the tree.
+    engine
+        .try_quality_handoff_candidate(group, goal, QualityCheckOrigin::PhysicalPublication)
+        .unwrap();
+    assert_eq!(preflight_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(engine.quality_preflight_count, 1);
+    assert_eq!(engine.quality_frontier_candidate_skip_count, 1);
+
+    // A real fact change invalidates the cursor and reopens exactly this
+    // candidate. It still follows the missing-evidence production path.
+    engine
+        .memo_mut()
+        .group_mut(group)
+        .unwrap()
+        .logical_properties
+        .maximum_cardinality = Some(1);
+    engine
+        .try_quality_handoff_candidate(group, goal, QualityCheckOrigin::Checkpoint)
+        .unwrap();
+    assert_eq!(preflight_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(evidence_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(engine.quality_freeze_avoided_count, 2);
+}
+
 struct QualityLaneRule;
 
 impl TransformationRule for QualityLaneRule {

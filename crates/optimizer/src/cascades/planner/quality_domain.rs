@@ -314,6 +314,437 @@ pub(super) fn selected_transfer_bindings(
     bindings.into_boxed_slice()
 }
 
+/// The preflight path uses the same transfer contract as the frozen path but
+/// resolves only immutable Memo identities.  No `FrozenCandidate`, logical
+/// payload clone, or child tree allocation is created here.  The returned
+/// bindings are still only scheduling hints; the ordinary matcher remains the
+/// semantic owner of the complete transformation search.
+pub(super) fn pending_transfers_for_refs(
+    memo: &Memo,
+    root: ChildWinnerRef,
+    nodes: &[QualityCandidateNode],
+    state: &PlannerTransformState,
+) -> Option<Box<[CandidateId]>> {
+    let nodes = nodes
+        .iter()
+        .map(|node| (node.reference.candidate, node))
+        .collect::<BTreeMap<_, _>>();
+    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityDomain);
+    let mut pending = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(reference) = stack.pop() {
+        if !visited.insert(reference.candidate) {
+            continue;
+        }
+        let node = ref_node(&nodes, reference)?;
+        let logical = memo.logical_expr(node.logical)?;
+        let operator = &state
+            .payloads
+            .logical
+            .get(logical.payload.index())?
+            .semantic_template
+            .operator;
+        if let LogicalOperator::Filter(filter) = operator {
+            let [child] = node.children.as_ref() else {
+                return None;
+            };
+            let child_node = ref_node(&nodes, *child)?;
+            let child_logical = memo.logical_expr(child_node.logical)?;
+            let child_operator = &state
+                .payloads
+                .logical
+                .get(child_logical.payload.index())?
+                .semantic_template
+                .operator;
+            let metadata = state.metadata.get(&child_logical.payload)?;
+            if metadata.child_layouts.len() != child_node.children.len() {
+                return None;
+            }
+            let projection_is_graph_chain = if matches!(
+                child_operator,
+                LogicalOperator::Projection(_)
+            ) {
+                let [input] = child_node.children.as_ref() else {
+                    return None;
+                };
+                selected_is_graph_chain_ref(&nodes, *input, memo, state)?
+            } else {
+                false
+            };
+            let owner_fenced = filter
+                .expressions
+                .iter()
+                .any(|expression| expression.evaluation_properties().is_reorder_fence());
+            let mut advances = false;
+            for predicate in &filter.expressions {
+                let transferable = can_advance(
+                    predicate,
+                    child_operator,
+                    &metadata.child_layouts,
+                    projection_is_graph_chain,
+                )?;
+                advances |= !owner_fenced
+                    && transferable
+                    && !selected_transfer_consumed_ref(
+                        &nodes,
+                        *child,
+                        memo,
+                        predicate,
+                        state,
+                    );
+            }
+            if advances {
+                pending.push(reference.candidate);
+            }
+        }
+        stack.extend(node.children.iter().copied());
+    }
+    pending.sort_unstable();
+    Some(pending.into_boxed_slice())
+}
+
+pub(super) fn selected_transfer_bindings_for_refs(
+    memo: &Memo,
+    root: ChildWinnerRef,
+    nodes: &[QualityCandidateNode],
+    state: &PlannerTransformState,
+) -> Box<[PatternBinding]> {
+    let nodes = nodes
+        .iter()
+        .map(|node| (node.reference.candidate, node))
+        .collect::<BTreeMap<_, _>>();
+    let mut bindings = Vec::new();
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(reference) = pending.pop() {
+        if !visited.insert(reference.candidate) {
+            continue;
+        }
+        if let Some(binding) = selected_transfer_binding_ref(&nodes, reference, memo, state) {
+            bindings.push(binding);
+        }
+        let Some(node) = ref_node(&nodes, reference) else {
+            continue;
+        };
+        pending.extend(node.children.iter().copied());
+    }
+    bindings.sort_unstable_by_key(|binding| binding.fingerprint);
+    bindings.dedup_by(|left, right| left == right);
+    bindings.into_boxed_slice()
+}
+
+fn ref_node<'a>(
+    nodes: &'a BTreeMap<CandidateId, &'a QualityCandidateNode>,
+    reference: ChildWinnerRef,
+) -> Option<&'a QualityCandidateNode> {
+    let node = nodes.get(&reference.candidate).copied()?;
+    (node.reference.group == reference.group && node.reference.goal == reference.goal).then_some(node)
+}
+
+fn selected_is_graph_chain_ref(
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    mut reference: ChildWinnerRef,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Option<bool> {
+    loop {
+        let node = ref_node(nodes, reference)?;
+        let logical = memo.logical_expr(node.logical)?;
+        let operator = &state
+            .payloads
+            .logical
+            .get(logical.payload.index())?
+            .semantic_template
+            .operator;
+        match operator {
+            LogicalOperator::GraphScan(_) | LogicalOperator::GraphExpand(_) => return Some(true),
+            LogicalOperator::Filter(_) | LogicalOperator::EmptyResult(_) => {
+                let [child] = node.children.as_ref() else {
+                    return None;
+                };
+                reference = *child;
+            }
+            _ => return Some(false),
+        }
+    }
+}
+
+fn selected_routes_consumed_ref(
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    reference: ChildWinnerRef,
+    memo: &Memo,
+    routed: &domain_transfer::OperatorDomainTransfer,
+    state: &PlannerTransformState,
+) -> bool {
+    let Some(node) = ref_node(nodes, reference) else {
+        return false;
+    };
+    let Some(logical) = memo.logical_expr(node.logical) else {
+        return false;
+    };
+    !routed.unsupported
+        && routed.has_moved()
+        && logical.key.children.len() == node.children.len()
+        && routed.child_predicates.len() == node.children.len()
+        && routed
+            .child_predicates
+            .iter()
+            .zip(node.children.iter())
+            .all(|(predicates, child)| {
+                predicates.is_empty()
+                    || selected_consumes_ref(nodes, *child, memo, predicates, state)
+            })
+}
+
+fn selected_consumes_ref(
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    reference: ChildWinnerRef,
+    memo: &Memo,
+    predicates: &[Expression],
+    state: &PlannerTransformState,
+) -> bool {
+    use crate::expression::traversal::into_associative_terms;
+    use paro_planner::expression::ConjunctionType;
+
+    let normalized_terms = |expression: &Expression| {
+        let mut expression = expression.clone();
+        crate::expression::scalar_normalizer()
+            .rewrite_expression(&mut expression, &LogicalOperator::DummyScan);
+        into_associative_terms(expression, ConjunctionType::And)
+    };
+    let Some(node) = ref_node(nodes, reference) else {
+        return false;
+    };
+    let Some(logical) = memo.logical_expr(node.logical) else {
+        return false;
+    };
+    let Some(payload) = state.payloads.logical.get(logical.payload.index()) else {
+        return false;
+    };
+    let Some(metadata) = state.metadata.get(&logical.payload) else {
+        return false;
+    };
+    if metadata.child_layouts.len() != node.children.len()
+        || logical.key.children.len() != node.children.len()
+    {
+        return false;
+    }
+    let operator = &payload.semantic_template.operator;
+    let layouts = metadata
+        .child_layouts
+        .iter()
+        .map(|layout| layout.as_ref())
+        .collect::<Vec<_>>();
+    let mut uncovered = predicates
+        .iter()
+        .flat_map(&normalized_terms)
+        .collect::<Vec<_>>();
+    if let LogicalOperator::Filter(filter) = operator {
+        let [layout] = layouts.as_slice() else {
+            return false;
+        };
+        if !filter.projection_map.is_identity(layout.len())
+            || filter
+                .expressions
+                .iter()
+                .any(|expression| expression.evaluation_properties().is_reorder_fence())
+        {
+            return false;
+        }
+        let enforced = filter
+            .expressions
+            .iter()
+            .filter(|expression| domain_transfer::predicate_is_local_to_layout(expression, layout))
+            .flat_map(&normalized_terms)
+            .collect::<Vec<_>>();
+        uncovered.retain(|predicate| {
+            !enforced
+                .iter()
+                .any(|expression| expression.equals(predicate))
+        });
+        if uncovered.is_empty() {
+            return true;
+        }
+    }
+    if matches!(operator, LogicalOperator::Projection(_)) {
+        let [child] = node.children.as_ref() else {
+            return false;
+        };
+        if selected_is_graph_chain_ref(nodes, *child, memo, state) != Some(false) {
+            return false;
+        }
+    }
+    let Some(routed) = domain_transfer::transfer_predicates(operator, &layouts, &uncovered) else {
+        return false;
+    };
+    routed.remaining.is_empty()
+        && selected_routes_consumed_ref(nodes, reference, memo, &routed, state)
+}
+
+fn selected_transfer_consumed_ref(
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    reference: ChildWinnerRef,
+    memo: &Memo,
+    predicate: &Expression,
+    state: &PlannerTransformState,
+) -> bool {
+    let Some(node) = ref_node(nodes, reference) else {
+        return false;
+    };
+    let Some(logical) = memo.logical_expr(node.logical) else {
+        return false;
+    };
+    let Some(payload) = state.payloads.logical.get(logical.payload.index()) else {
+        return false;
+    };
+    let Some(metadata) = state.metadata.get(&logical.payload) else {
+        return false;
+    };
+    if metadata.child_layouts.len() != node.children.len() {
+        return false;
+    }
+    let layouts = metadata
+        .child_layouts
+        .iter()
+        .map(|layout| layout.as_ref())
+        .collect::<Vec<_>>();
+    domain_transfer::transfer_predicates(
+        &payload.semantic_template.operator,
+        &layouts,
+        std::slice::from_ref(predicate),
+    )
+    .is_some_and(|routed| selected_routes_consumed_ref(nodes, reference, memo, &routed, state))
+}
+
+fn selected_transfer_binding_ref(
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    reference: ChildWinnerRef,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Option<PatternBinding> {
+    let node = ref_node(nodes, reference)?;
+    let logical = memo.logical_expr(node.logical)?;
+    let payload = state.payloads.logical.get(logical.payload.index())?;
+    let LogicalOperator::Filter(filter) = &payload.semantic_template.operator else {
+        return None;
+    };
+    if filter.expressions.is_empty()
+        || filter
+            .expressions
+            .iter()
+            .any(|expression| !is_column_domain(expression))
+        || filter
+            .expressions
+            .iter()
+            .any(|expression| expression.evaluation_properties().is_reorder_fence())
+        || logical.key.children.len() != node.children.len()
+    {
+        return None;
+    }
+    let group = memo.canonical_group(node.reference.group);
+    let child_group = memo.canonical_group(*logical.key.children.first()?);
+    let child = *node.children.first()?;
+    if memo.canonical_group(child.group) != child_group {
+        return None;
+    }
+    let child = selected_transfer_path_operand_ref(nodes, child, memo, &filter.expressions, state)?;
+    let root = PatternOperand::Expression {
+        group,
+        expression: logical.id,
+        children: Box::new([child]),
+    };
+    Some(PatternBinding {
+        fingerprint: selected_binding_fingerprint(&root),
+        root,
+    })
+}
+
+fn selected_transfer_path_operand_ref(
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    reference: ChildWinnerRef,
+    memo: &Memo,
+    predicates: &[Expression],
+    state: &PlannerTransformState,
+) -> Option<PatternOperand> {
+    if predicates.is_empty() {
+        return None;
+    }
+    let node = ref_node(nodes, reference)?;
+    let logical = memo.logical_expr(node.logical)?;
+    if logical.key.children.len() != node.children.len() {
+        return None;
+    }
+    let payload = state.payloads.logical.get(logical.payload.index())?;
+    let metadata = state.metadata.get(&logical.payload)?;
+    let projection_is_graph_chain = if matches!(
+        payload.semantic_template.operator,
+        LogicalOperator::Projection(_)
+    ) {
+        let child = *node.children.first()?;
+        selected_is_graph_chain_ref(nodes, child, memo, state)?
+    } else {
+        false
+    };
+    let movable = predicates
+        .iter()
+        .filter(|predicate| {
+            can_advance(
+                predicate,
+                &payload.semantic_template.operator,
+                &metadata.child_layouts,
+                projection_is_graph_chain,
+            ) == Some(true)
+                && !selected_transfer_consumed_ref(nodes, reference, memo, predicate, state)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if movable.is_empty() {
+        return None;
+    }
+    let layouts = metadata
+        .child_layouts
+        .iter()
+        .map(|layout| layout.as_ref())
+        .collect::<Vec<_>>();
+    let routed = domain_transfer::transfer_predicates(
+        &payload.semantic_template.operator,
+        &layouts,
+        &movable,
+    )?;
+    let children = logical
+        .key
+        .children
+        .iter()
+        .copied()
+        .zip(node.children.iter().copied())
+        .enumerate()
+        .map(|(ordinal, (group, child))| {
+            let group = memo.canonical_group(group);
+            if memo.canonical_group(child.group) != group {
+                return PatternOperand::Group(group);
+            }
+            let child_predicates = routed
+                .child_predicates
+                .get(ordinal)
+                .map(|predicates| predicates.to_vec())
+                .unwrap_or_default();
+            if child_predicates.is_empty() {
+                PatternOperand::Group(group)
+            } else {
+                selected_transfer_path_operand_ref(nodes, child, memo, &child_predicates, state)
+                    .unwrap_or(PatternOperand::Group(group))
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Some(PatternOperand::Expression {
+        group: memo.canonical_group(node.reference.group),
+        expression: logical.id,
+        children,
+    })
+}
+
 fn selected_transfer_binding(
     memo: &Memo,
     node: &FrozenCandidate,

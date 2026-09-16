@@ -13,9 +13,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use paro_common::error::{self as paro_error, Result};
 
-use super::ids::{CandidateId, Fingerprint, QualityPolicyId, RuleId};
-use super::memo::{ChildWinnerRef, FrozenCandidate, Memo, OptimizationGoal};
-use super::tasks::ReadSetId;
+use super::ids::{
+    CandidateId, Fingerprint, LogicalExprId, PhysicalExprId, QualityPolicyId, RuleId,
+};
+use super::memo::{ChildWinnerRef, FrozenCandidate, Memo, OptimizationGoal, Winner};
+use super::rules::PatternBinding;
+use super::tasks::{ReadSet, ReadSetId};
 
 macro_rules! quality_id_type {
     ($name:ident) => {
@@ -173,9 +176,48 @@ pub struct NativeQualityShape {
     pub join_region_witness_nodes: u32,
 }
 
+/// A borrowed-candidate inspection result.  It contains only immutable Memo
+/// identities and exact child references; it deliberately does not own
+/// logical/physical payloads or a cloned candidate tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityCandidateNode {
+    pub reference: ChildWinnerRef,
+    pub logical: LogicalExprId,
+    pub physical: PhysicalExprId,
+    pub children: Box<[ChildWinnerRef]>,
+}
+
+/// The cheap side of the quality handoff.  A producer may return this after
+/// inspecting only the exact Memo winner references.  Missing evidence is
+/// represented by facts omitted from the compact evidence.  The engine
+/// uses `nodes`, `reads`, and the selected bindings to request that work
+/// instead of freezing a candidate which cannot be handed off.  An absent
+/// reference graph is represented by the trait method returning `None`, which
+/// selects the complete validation/oracle path.
+#[derive(Debug, Clone)]
+pub struct QualityCandidatePreflight {
+    pub nodes: Box<[QualityCandidateNode]>,
+    pub reads: ReadSet,
+    pub evidence: NativeQualityEvidence,
+    pub domain_bindings: Box<[PatternBinding]>,
+}
+
 /// Production producers must inspect the exact frozen DAG they are asked to
 /// certify. They may not discover a replacement plan or read a stale frontier.
 pub trait QualityEvidenceProvider: std::fmt::Debug {
+    /// Inspect an exact frontier winner without freezing its complete DAG.
+    /// `None` means that the provider does not implement the accelerator and
+    /// the caller must use the complete legacy/oracle path below.
+    fn preflight(
+        &self,
+        _memo: &Memo,
+        _reference: ChildWinnerRef,
+        _winner: &Winner,
+        _goal: OptimizationGoal,
+    ) -> Result<Option<QualityCandidatePreflight>> {
+        Ok(None)
+    }
+
     fn evidence(
         &self,
         memo: &Memo,
