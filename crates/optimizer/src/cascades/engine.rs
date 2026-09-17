@@ -109,9 +109,18 @@ pub enum SearchStopReason {
     QualityPolicySatisfied,
 }
 
+/// A diagnostic-only reason for stopping the optional quality lane.  The
+/// public search status remains `SearchIncomplete`; this marker explains why
+/// an opt-in experiment did not fall through to the ordinary global agenda.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticStopReason {
+    ObligationLaneExhausted,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchStop {
     pub reason: SearchStopReason,
+    pub diagnostic_reason: Option<DiagnosticStopReason>,
     /// A deadline can coincide with deterministic budget exhaustion. Keep
     /// both facts visible instead of collapsing them into one label.
     pub budget_limited: bool,
@@ -382,6 +391,14 @@ impl TransformationTaskLifecycle {
     }
 }
 
+fn diagnostic_obligation_only_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PARO_DIAGNOSTIC_OBLIGATION_ONLY")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SearchTask {
     Transform {
@@ -427,6 +444,17 @@ impl StableAgenda {
         let (_, task) = self.tasks.pop_first()?;
         self.keys.remove(&task);
         Some(task)
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn pending_transform_rules(&self) -> impl Iterator<Item = RuleId> + '_ {
+        self.tasks.values().filter_map(|task| match task {
+            SearchTask::Transform { rule, .. } => Some(*rule),
+            SearchTask::Implement { .. } => None,
+        })
     }
 }
 
@@ -798,6 +826,10 @@ pub struct RuleWorkProfile {
     /// Bindings rejected by an error, empty result, output-contract violation,
     /// or invalid/duplicate publication attempt.
     pub rejected: u64,
+    /// Transformation tasks deliberately left on the ordinary agenda by the
+    /// opt-in obligation-lane experiment. This is diagnostic accounting only;
+    /// it is zero on the default path.
+    pub deferred: u64,
     /// Valid rule applications which produced no new expression because the
     /// result was already present.
     pub ineffective: u64,
@@ -1305,6 +1337,16 @@ pub struct CascadesEngine {
     /// Opt-in production handoff. The default path never evaluates quality
     /// packages, so trace-off normal C1 pays no policy-discovery cost.
     quality_handoff_enabled: bool,
+    /// Diagnostic-only lane restriction. When enabled, quality work may run
+    /// through existing forced/obligation and promoted-quality agenda entries,
+    /// but unrelated optional transformations remain pending instead of
+    /// falling through to the global agenda. It is frozen from the process
+    /// environment when the first engine is constructed and is never enabled
+    /// by the normal production path.
+    diagnostic_obligation_only: bool,
+    diagnostic_obligation_lane_exhausted: bool,
+    diagnostic_obligation_deferred_task_count: u64,
+    diagnostic_obligation_non_root_physical_groups: BTreeSet<GroupId>,
     quality_evidence_provider: Option<Arc<dyn QualityEvidenceProvider>>,
     quality_required_goals: BTreeSet<OptimizationGoal>,
     quality_ready_winners: BTreeMap<OptimizationGoal, GrantWinner>,
@@ -1527,6 +1569,10 @@ impl CascadesEngine {
                 .expect("default planning policy must be valid"),
             quality_bundles,
             quality_handoff_enabled: false,
+            diagnostic_obligation_only: diagnostic_obligation_only_enabled(),
+            diagnostic_obligation_lane_exhausted: false,
+            diagnostic_obligation_deferred_task_count: 0,
+            diagnostic_obligation_non_root_physical_groups: BTreeSet::new(),
             quality_evidence_provider: None,
             quality_required_goals: BTreeSet::new(),
             quality_ready_winners: BTreeMap::new(),
@@ -2622,6 +2668,9 @@ impl CascadesEngine {
         self.quality_candidate_missing_evidence_count = 0;
         self.quality_handoff_publication_call_count = 0;
         self.quality_handoff_checkpoint_call_count = 0;
+        self.diagnostic_obligation_lane_exhausted = false;
+        self.diagnostic_obligation_deferred_task_count = 0;
+        self.diagnostic_obligation_non_root_physical_groups.clear();
         self.quality_preflight_count = 0;
         self.quality_preflight_missing_count = 0;
         self.quality_preflight_policy_rejection_count = 0;
@@ -2690,8 +2739,16 @@ impl CascadesEngine {
                 super::budget::SearchIncompleteReason::Budget(_)
             )
         });
+        let diagnostic_reason = self
+            .diagnostic_obligation_lane_exhausted
+            .then_some(DiagnosticStopReason::ObligationLaneExhausted);
         let reason = if self.quality_handoff_reached {
             SearchStopReason::QualityPolicySatisfied
+        } else if diagnostic_reason.is_some() {
+            // This is an intentionally incomplete diagnostic stop. Keep the
+            // public search status separate from the explanation of why the
+            // ordinary agenda was not entered.
+            SearchStopReason::SearchIncomplete
         } else if self.memo.control().deadline_reached() {
             SearchStopReason::Deadline
         } else if budget_limited {
@@ -2710,6 +2767,7 @@ impl CascadesEngine {
         };
         SearchStop {
             reason,
+            diagnostic_reason,
             budget_limited,
             configured_deadline_us: self.memo.control().optional_time_limit_us(),
             actual_stop_us: match reason {
@@ -3854,6 +3912,21 @@ impl CascadesEngine {
                     return Ok(winner.winner.as_ref().clone());
                 }
             }
+            if self.diagnostic_obligation_lane_exhausted {
+                // Keep the mandatory executable winner when the diagnostic
+                // lane cannot advance. This is deliberately not a complete
+                // search and must not fall through to the ordinary agenda.
+                super::verifier::MemoVerifier::verify(&self.memo, None)?;
+                let stop = self.search_stop();
+                self.note_search_stop(stop);
+                return self
+                    .memo
+                    .group(root)
+                    .and_then(|group| group.winner(goal))
+                    .cloned()
+                    .or(incumbent)
+                    .ok_or_else(|| self.infeasible_goal_error(root, goal));
+            }
         }
         self.optimize_group(root, goal)?;
         super::verifier::MemoVerifier::verify(&self.memo, None)?;
@@ -4303,6 +4376,16 @@ impl CascadesEngine {
                 return Ok(snapshot);
             }
         }
+        if self.diagnostic_obligation_lane_exhausted {
+            self.diagnostic_search_complete = false;
+            return self.stop_with_snapshot_or_fallback(
+                root,
+                base_goal,
+                admissible_set,
+                classes,
+                incumbent,
+            );
+        }
         if !self.memo.control().checkpoint()? {
             self.record_search_checkpoints(root);
             return self.stop_with_snapshot_or_fallback(
@@ -4740,6 +4823,10 @@ impl CascadesEngine {
     fn drain_physical_interleave(&mut self, interleave: &mut PhysicalInterleave) -> Result<()> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Subproblem);
         while let Some((group, goal)) = interleave.pop_next() {
+            if self.diagnostic_obligation_only && group != interleave.root {
+                self.diagnostic_obligation_non_root_physical_groups
+                    .insert(self.memo.canonical_group(group));
+            }
             if self
                 .active_optional_grant
                 .is_some_and(|class| match goal.grant {
@@ -6219,6 +6306,22 @@ impl CascadesEngine {
             (
                 "quality_policy_handoff_enabled",
                 u64::from(self.quality_handoff_enabled),
+            ),
+            (
+                "diagnostic_obligation_only",
+                u64::from(self.diagnostic_obligation_only),
+            ),
+            (
+                "diagnostic_obligation_lane_exhausted",
+                u64::from(self.diagnostic_obligation_lane_exhausted),
+            ),
+            (
+                "diagnostic_obligation_deferred_task_count",
+                self.diagnostic_obligation_deferred_task_count,
+            ),
+            (
+                "diagnostic_obligation_non_root_physical_group_count",
+                self.diagnostic_obligation_non_root_physical_groups.len() as u64,
             ),
             (
                 "quality_producer_dispatch_count",

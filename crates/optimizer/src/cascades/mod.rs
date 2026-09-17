@@ -46,8 +46,8 @@ pub use column::{
 };
 pub use cost::{CompactRange, SearchCost};
 pub use engine::{
-    CascadesEngine, CostContext, GrantOptimization, GrantWinner, PricedIncumbent, SearchMode,
-    SearchStop, SearchStopReason, SeedPlan,
+    CascadesEngine, CostContext, DiagnosticStopReason, GrantOptimization, GrantWinner,
+    PricedIncumbent, SearchMode, SearchStop, SearchStopReason, SeedPlan,
 };
 pub use governor::{
     CalibrationScope, EconomicDecision, EconomicSignal, Governor, GovernorSnapshot, GovernorStop,

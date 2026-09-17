@@ -682,6 +682,24 @@ impl CascadesEngine {
                 return Ok(Some(task));
             }
         }
+        if self.diagnostic_obligation_only {
+            // Do not treat the broad quality bootstrap lane as an obligation:
+            // only an exact forced binding or a producer indexed by a current
+            // missing choice may run here. Once those directed tasks are
+            // exhausted, leave the ordinary agenda untouched and return an
+            // explicitly incomplete diagnostic stop. This is the experiment
+            // that distinguishes a real obligation dependency from the old
+            // global quality-priority queue.
+            if !self.diagnostic_obligation_lane_exhausted {
+                self.diagnostic_obligation_lane_exhausted = true;
+                self.diagnostic_obligation_deferred_task_count = agenda.len() as u64;
+                for rule in agenda.pending_transform_rules() {
+                    let profile = self.rule_work_profile.entry(rule).or_default();
+                    profile.deferred = profile.deferred.saturating_add(1);
+                }
+            }
+            return Ok(None);
+        }
         Ok(agenda.pop())
     }
 }

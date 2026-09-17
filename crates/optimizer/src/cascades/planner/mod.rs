@@ -2738,6 +2738,9 @@ impl OptimizationInput {
                 SearchStopReason::QualityPolicySatisfied => "quality_policy_satisfied",
             };
             trace.record_event("optimizer", stop_event);
+            if stop.diagnostic_reason.is_some() {
+                trace.record_event("optimizer", "obligation_lane_exhausted");
+            }
             if stop.budget_limited {
                 trace.record_event("optimizer", "search_budget_limited");
             }
