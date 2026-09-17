@@ -121,10 +121,11 @@ contains pre-existing stale fixture/API mismatches (`settle_arena_in` arity and 
 `StagingInput::Native`/`StagingRequest` fields); these were not silently blessed or
 changed in this task. A release `parod` build passes.
 
-No five-pair fresh C1 campaign is reported: the only probe run in this investigation was
-the diagnostic EXPLAIN cohort and failed the harness's exact-target-trace C1 precondition.
-The subsequent five-block normal control/probe pilot is recorded above; it is a
-directional pilot, not a formal parity/power gate. Current Q11 status remains
+No formal five-pair parity/power gate is claimed. The initial probe run in this
+investigation was the diagnostic EXPLAIN cohort and failed the harness's
+exact-target-trace C1 precondition. The subsequent five-block normal
+control/probe pilot is recorded above; it is directional evidence, not a formal
+parity/power gate. Current Q11 status remains
 `QualityPolicySatisfied + SearchIncomplete`, not
 `ProofComplete`; compiler `<=30 ms`, `<10 ms`, M1/M2 and DuckDB parity remain unmet.
 
