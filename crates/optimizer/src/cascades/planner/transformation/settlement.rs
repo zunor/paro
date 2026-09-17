@@ -897,6 +897,41 @@ impl SettlementCache {
         })
     }
 
+    /// Reconcile the root contract after semantic output freezing.
+    ///
+    /// Settlement records the contract for the operator before the final
+    /// occurrence projection is restored.  Freezing changes only the root
+    /// output layout/projection, but staging must still see a contract for
+    /// that exact root.  Reuse the already-settled input facts and the
+    /// session identity catalogs; do not re-settle or rebuild the whole
+    /// arena.
+    pub(super) fn rebind_resident_contract<Child>(
+        &self,
+        contract: ResidentNodeContract,
+        operator: &LogicalOperator<Child>,
+        output_layout: &LogicalOutputLayout,
+        identity: &mut PlannerResidentIdentity<'_>,
+    ) -> Result<ResidentNodeContract> {
+        let inputs = match &contract.input_facts {
+            ResidentInputFacts::Settlement(inputs) => inputs.as_ref(),
+            ResidentInputFacts::Native(_) => {
+                return Err(paro_error::internal(
+                    "cannot rebind a native resident contract through settlement",
+                ));
+            }
+        };
+        let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) =
+            self.relower_resident_contract(operator, output_layout, inputs, identity)?;
+        Ok(ResidentNodeContract {
+            operator_fingerprint,
+            operator_encoding,
+            scalar_roots,
+            output_columns,
+            output_layout: output_layout.clone(),
+            input_facts: contract.input_facts,
+        })
+    }
+
     fn relower_resident_contract<Child>(
         &self,
         operator: &LogicalOperator<Child>,

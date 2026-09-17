@@ -64,6 +64,40 @@ fn settle_with_session_arena(
     settlement_cache.settle_arena_in(plan, environment, staging_arena, &mut identity)
 }
 
+fn rebind_settled_root_contract(
+    state: &mut PlannerTransformState,
+    plan: paro_planner::plan::arena::PlanIndex,
+    resident_nodes: &mut HashMap<paro_planner::plan::PlanNodeId, ResidentNodeContract>,
+) -> Result<()> {
+    let root = state.staging_arena.get(plan)?.clone();
+    let output_layout = state.staging_arena.output_layout(plan)?.clone();
+    let Some(contract) = resident_nodes.remove(&root.id) else {
+        return Ok(());
+    };
+    let rebound = {
+        let PlannerTransformState {
+            settlement_cache,
+            columns,
+            scalars,
+            binding_ids,
+            ..
+        } = state;
+        let mut identity = PlannerResidentIdentity {
+            columns,
+            scalars,
+            binding_ids,
+        };
+        settlement_cache.rebind_resident_contract(
+            contract,
+            &root.operator,
+            &output_layout,
+            &mut identity,
+        )?
+    };
+    resident_nodes.insert(root.id, rebound);
+    Ok(())
+}
+
 pub(super) fn register_transformations(
     registry: &mut ImplementationRegistry,
     planner_state: Arc<RwLock<PlannerTransformState>>,
@@ -1250,7 +1284,7 @@ impl TransformationRule for PlannerTransformationRule {
                             plan,
                             statistics,
                             scopes,
-                            resident_nodes,
+                            mut resident_nodes,
                         } = expression;
                         if environment.verify_enabled {
                             crate::verify::verify_arena_plan(&state.staging_arena.plan(plan)?, || {
@@ -1260,6 +1294,7 @@ impl TransformationRule for PlannerTransformationRule {
                         let plan = semantic_plan::freeze_arena_output_layout(
                             plan, &source_output_columns, &mut state,
                         )?;
+                        rebind_settled_root_contract(&mut state, plan, &mut resident_nodes)?;
                         let root_operator = state.staging_arena.get(plan)?.operator.op_type();
                         let output_layout = state.staging_arena.output_layout(plan)?.clone();
                         (
@@ -1359,7 +1394,7 @@ impl TransformationRule for PlannerTransformationRule {
                                 plan,
                                 statistics: column_stats,
                                 scopes,
-                                resident_nodes,
+                                mut resident_nodes,
                             }) = settled
                             else {
                                 return Ok(Box::new([]));
@@ -1384,6 +1419,7 @@ impl TransformationRule for PlannerTransformationRule {
                                 &source_output_columns,
                                 &mut state,
                             )?;
+                            rebind_settled_root_contract(&mut state, plan, &mut resident_nodes)?;
                             let root_operator = state.staging_arena.get(plan)?.operator.op_type();
                             let output_layout = state.staging_arena.output_layout(plan)?.clone();
                             (
