@@ -51,6 +51,13 @@ The repository worktree was intentionally not used as the clean source: it conta
 pre-existing staged, unstaged and untracked user changes. No user change was reset,
 cleaned, or included in the isolated commit.
 
+The quoted historical starting tuple from the task (`2246` syntheses, `1312`
+published winners, `227` groups) was not reproduced by the isolated clean OFF run
+(`2262`, `1311`, `215`). The normal pilot has four OFF blocks, but the strict
+historical OFF reproducibility gate is therefore not passed. All treatment claims
+below are within the same isolated binary and data/envelope, not a causal comparison
+against that historical dirty/partially mixed tuple.
+
 ## Diagnostic control and treatments
 
 | arm | optimizer wall (trace-on, us) | search stop (us) | quality satisfied (us) | groups / logical / physical | syntheses | recompute | published winners | quality evaluations | status |
