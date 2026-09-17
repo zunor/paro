@@ -743,7 +743,7 @@ impl TransformationRule for PlannerTransformationRule {
                         &facts,
                         binding_fact_value,
                         ctx.domain_continuations_enabled(),
-                    )? {
+                    )?;
                     if let Some(native) = native {
                         for read in native.reads.iter().copied() {
                             ctx.record_fact_read(read);
