@@ -33,10 +33,10 @@ evidence, data seed, worktree, build directory or Git history has been deleted.
 
 | Task | Status / next evidence |
 | --- | --- |
-| C0-a preservation and isolation | Restore verified; clean integration baseline created; baseline tests in progress |
+| C0-a preservation and isolation | Restore verified; clean integration baseline created; fixture-repaired baseline 1319 pass / 15 fail |
 | C0-b F2 attribution | Q39 original binary reproduced; clean parent/probe attribution in progress; F2 isolated from integration |
 | C2-1 Q39 | Full rows captured; independent integer-moment/80-digit oracle under investigation |
-| C2-2 partial feasible grants | Pending; current test explicitly demands all mandatory classes and conflicts with the new contract |
+| C2-2 partial feasible grants | Engine/admission slice committed; [contract and tests](c2-partial-grants.md); SQL coverage outstanding |
 | C2-3 facet ownership | Pending |
 | C2-4 failure adjudication | Baseline test compilation restored first; assertions unchanged |
 | C1 Trace Matrix | Pending; existing evidence interfaces suffice for C0/C2 |
@@ -80,10 +80,23 @@ Raw files are retained in the private archive as `q39-original-binary-r1.json`,
 `q39-integer-moments.json` and their server logs. The generator SQL is
 [q39-integer-moments.sql](c0/q39-integer-moments.sql).
 
-Clean parent `22d39fda` also returns 243 rows and an exact-float mismatch
-(57 rows in this repeat). Clean-probe measurement and complete comparison
-remain pending. A clean pair alone cannot repair missing historical source
-attestation; it is separately identified evidence.
+Clean parent `22d39fda` repeats return 243 rows and exact-float mismatches
+of 57 and 62 rows. Clean probe `d3097038` repeats return 243 rows and mismatches
+of 50 and 57 rows. They are not byte-identical failures: all per-value differences
+and their source binary hashes are retained in [independent analysis](c0/q39-oracle-analysis.json).
+All five captures (including original binary) have identical ordered integer
+keys and the same 90,000-group integer-moment reference. In each capture the
+selected Paro mean/CV values are at most 2 ULP from that reference; DuckDB at
+most 1 ULP. Thus bit-exact equality is not a stable oracle for this floating
+aggregate across these engines. This does **not** bless Q39: the benchmark
+still rejects the results; a separately justified numerical result contract
+and its integration tests remain required. No blanket tolerance is added.
+
+The reproducible analyzer has four self-tests: independent duplicate-bag
+sample variance, explicit 1-ULP reporting, integer/key/multiplicity loss, and
+unsupported zero/NULL cases. It refuses incomplete column-role mappings.
+A clean pair alone cannot repair missing historical source attestation; it is
+separately identified evidence, and F2 remains isolated.
 
 ## Baseline failures and policy conflicts
 
