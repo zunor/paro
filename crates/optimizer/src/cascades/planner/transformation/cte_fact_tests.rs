@@ -204,7 +204,7 @@ fn production_cte_filter_transport_preserves_producer_scoped_facts() {
         let mut cache = settlement::SettlementCache::default();
         let mut arena = LogicalPlanArena::default();
         let settled = cache
-            .settle_arena_in(restricted, &environment, &mut arena)
+            .settle_arena_test_in(restricted, &environment, &mut arena)
             .unwrap()
             .unwrap();
         (native, arena.export(settled.plan).unwrap(), settled.scopes)

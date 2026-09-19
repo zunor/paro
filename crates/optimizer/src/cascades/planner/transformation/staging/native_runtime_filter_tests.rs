@@ -238,7 +238,14 @@ mod native_staging_rf_oracle {
                             };
                             check_boundary(layout, reference, scan_probe);
                         }
-                        (StagingInput::Native(shell), BTreeMap::new(), HashMap::new())
+                        (
+                            StagingInput::Native {
+                                shell,
+                                resident_nodes: HashMap::new(),
+                            },
+                            BTreeMap::new(),
+                            HashMap::new(),
+                        )
                     } else {
                         // Independent production materializer, not NativeShell::from_owned.
                         let owned = semantic_plan::instantiate_bound_plan_with_group_holes(
@@ -273,6 +280,7 @@ mod native_staging_rf_oracle {
                             input_facts: facts,
                             column_stats,
                             column_stat_scopes: HashMap::new(),
+                            resident_nodes: HashMap::new(),
                             target: StagingTarget {
                                 group: target,
                                 rule: ORACLE_RULE,

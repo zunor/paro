@@ -458,7 +458,7 @@ fn production_deferral_preserves_partial_group_facts_across_transport() {
             verify_enabled: false,
         };
         let mut arena = paro_planner::plan::arena::LogicalPlanArena::default();
-        let settled = settlement::SettlementCache::default().settle_arena_in(rewritten, &environment, &mut arena)
+        let settled = settlement::SettlementCache::default().settle_arena_test_in(rewritten, &environment, &mut arena)
             .unwrap().unwrap();
         let mut partial = None;
         for index in arena.post_order(settled.plan).unwrap() {
