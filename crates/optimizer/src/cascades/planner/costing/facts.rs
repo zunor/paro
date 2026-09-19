@@ -595,33 +595,6 @@ fn join_key_identity(keys: &[&Expression], bindings: &[ColumnBinding]) -> Option
     Some(identity.finish())
 }
 
-#[cfg(test)]
-mod key_identity_tests {
-    use super::*;
-    use paro_common::types::LogicalType;
-    use paro_planner::expression::ReferenceExpression;
-
-    #[test]
-    fn compound_keys_preserve_tuple_order_and_input_layout() {
-        let key = |index| {
-            Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into())
-        };
-        let a = key(0);
-        let b = key(1);
-        let bindings = [ColumnBinding::new(7, 0), ColumnBinding::new(7, 1)];
-        let both = join_key_identity(&[&a, &b], &bindings).unwrap();
-        assert_eq!(Some(both), join_key_identity(&[&a, &b], &bindings));
-        assert_ne!(Some(both), join_key_identity(&[&b, &a], &bindings));
-        assert_ne!(Some(both), join_key_identity(&[&a, &b, &a], &bindings));
-        assert_ne!(Some(both), join_key_identity(&[&a], &bindings));
-        assert_ne!(
-            Some(both),
-            join_key_identity(&[&a, &b], &[bindings[1], bindings[0]])
-        );
-        assert_eq!(join_key_identity(&[], &bindings), None);
-    }
-}
-
 /// Return the identity of a logical runtime-filter build domain.
 ///
 /// A physical implementation is intentionally absent: all implementations
@@ -719,5 +692,32 @@ fn group_cardinality_work_range(cardinality: Option<CardinalityEnvelope>) -> Res
             range.upper as f64,
         ),
         None => CompactRange::new(0.0, 1.0, 4.0),
+    }
+}
+
+#[cfg(test)]
+mod key_identity_tests {
+    use super::*;
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::ReferenceExpression;
+
+    #[test]
+    fn compound_keys_preserve_tuple_order_and_input_layout() {
+        let key = |index| {
+            Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into())
+        };
+        let a = key(0);
+        let b = key(1);
+        let bindings = [ColumnBinding::new(7, 0), ColumnBinding::new(7, 1)];
+        let both = join_key_identity(&[&a, &b], &bindings).unwrap();
+        assert_eq!(Some(both), join_key_identity(&[&a, &b], &bindings));
+        assert_ne!(Some(both), join_key_identity(&[&b, &a], &bindings));
+        assert_ne!(Some(both), join_key_identity(&[&a, &b, &a], &bindings));
+        assert_ne!(Some(both), join_key_identity(&[&a], &bindings));
+        assert_ne!(
+            Some(both),
+            join_key_identity(&[&a, &b], &[bindings[1], bindings[0]])
+        );
+        assert_eq!(join_key_identity(&[], &bindings), None);
     }
 }
