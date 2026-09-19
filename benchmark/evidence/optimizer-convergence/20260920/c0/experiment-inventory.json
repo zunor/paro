@@ -1,0 +1,469 @@
+{
+  "schema_version": 1,
+  "repository": "/private/tmp/paro-struct-clean",
+  "head": "d30970380f3a6a8e991bd4973fb59f2fce724486",
+  "staged_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "unstaged_sha256": "01d108afdd6d481429e5355f0bc366700398ca494d3bc0badcaf5fd7d9d69d17",
+  "untracked_archive_sha256": "3f0b932d47c4a0550c1811bcdb302b53c16d0631288b481a14ffcd85c9901acd",
+  "index_sha256": "7af3b33fd987829501f9903b22883a852209f54b83b5d45dab5885a79f6d3f38",
+  "restore_verified": true,
+  "apple_metadata_members": 0,
+  "files": [
+    {
+      "path": "crates/common/src/cold_work.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "e490290107235031145aed708cc17ca80311c4e47809ddc589c2885bb748e57a",
+      "bytes": 14281,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/common/src/lib.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "60cb7742155cdf515e22f5545a4ad5095b092c893bdcc8325babcb33dc249c4e",
+      "bytes": 1640,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/context/src/lib.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "520028303027b8f9b62a42493ae4846261f9b6322307b710031178b59649a114",
+      "bytes": 3679,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/context/src/session_diagnostics.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "e8f706d761f863f358ebbfbf905be8c5f4de81d3bc8580795a436d5bdc752f45",
+      "bytes": 6762,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/explain/analyze_render.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "a40daa0b4adc59c940bb555ec47541efc5fe047d9022cf143315e062fc7e9b80",
+      "bytes": 41078,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/operators/scan/table_function.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "7b54fcefac455ee7df48ffee2799768c1c0df89573a6b0fd4d38d0e4bbac7f7e",
+      "bytes": 118771,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/pipeline/lowerer/aggregate_sort.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "adc773530be40803134399ec71875c7eddbb2c34f9d621bba7c79ea8e3ad34e7",
+      "bytes": 5908,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/pipeline/lowerer/basic_tests.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "5d9d9f29fcab94925f6a63e421a342c34dac685eb9f7601818d502008dabb178",
+      "bytes": 27529,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/pipeline/lowerer/dispatch.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "09d79dc360ca06669a8df08af9d89d60b7ece1f25301eefdfad77c9d52644f5e",
+      "bytes": 7933,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/pipeline/lowerer/join_breakers.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "f27f50dcd7fb6b09fc7054faf0da7b40e2bc12f352ba43ca9d48a0c96bb9396c",
+      "bytes": 7222,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/pipeline/lowerer/join_probes.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "44ca7a6d073341918c2e13f1b6cdfbac8ae9613ac240c010e597f8fea15e1efe",
+      "bytes": 52081,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/pipeline/lowerer/mod.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "ae83fdb2079557f947714b6956937c1dadb1bb69316f2aa44062e816abfbfe8d",
+      "bytes": 10404,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/pipeline/program.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "d3480866e79ed821b4d83ed794e4d162171a13f01650477dbd04de46d586c534",
+      "bytes": 67189,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/runtime/ids.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "4295bd5bbcf9be5bbac5a96a6b38ec1bb88e0ced5fd23eec38e54c7036bbefbf",
+      "bytes": 2424,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/execution/src/runtime/pipeline_runtime.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "4fcbce8c7c5a17b34e9a4d61002463735716ffa55d748fbd826fe4106b56856c",
+      "bytes": 12937,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/aggregate/late_payload.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "fb094509fd8e265c9f7d11ff0c42130720839ccac412e95e554005eb90d3d950",
+      "bytes": 89133,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/aggregate/late_payload_tests.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "955d03c6e90923b416f1a1fd579ce2d689604de4d6267c2c5fbd92e1e8cf20b0",
+      "bytes": 29302,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/budget.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "80fc271b5918e87ae5c4e46b1f38690ababc284a25697f5f3c1e8a2fc4e406cf",
+      "bytes": 46863,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/engine.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "3ad154323af1b9a8ce67d43a3dfd9e8ea080c1080be9707551ebddf2daac4f89",
+      "bytes": 533580,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/engine/quality_production.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "e6329cc0e6ac6a25afa8dadc9e11a1a0b0bbaf3ea632654387ccefcbb66e23ac",
+      "bytes": 28169,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/engine/tests.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "d9a744c70b03ed0ded00317e239848ede4c650ed46ba7b4ca207b74510fcea0b",
+      "bytes": 186836,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/engine/tests/quality_production.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "f1a5f6e78eab60d28d653c65ff8bc69b6e7c34709ae0ff66464729c3025a0e6d",
+      "bytes": 31684,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/memo.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "462d1d3a25679040f87894c976f8ad6372ee568ae69683a1c2ce53f6ffd2fd2d",
+      "bytes": 144474,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/memo/diagnostic_snapshot.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "3a19639b844f0684ff89ccb9cb3dc5c719d2518128088d158f5e067c196a955a",
+      "bytes": 5600,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/memo/tests.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "8002e8317b06c020f45f2bd1f1d6a1ca3cc8a88ed4e64c8650478f6712fcd656",
+      "bytes": 89899,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/domain_transfer.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "48804bd72786850ef668b4fb24ec8ec7dd6db36a70769ea2519d3915bdec3035",
+      "bytes": 22228,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/mod.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "a41e19fd5da36f17b3dedc4896e4427194e0a03edbd2fa7244ead553f696da28",
+      "bytes": 216104,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/quality_domain.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "560b6b410d4737e4fb0cebad88552af302f06382f83e9bd05a1f9e8725cdcc0b",
+      "bytes": 65078,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "2216d63a81c23e86586c858d6aece9c8215ef725783acdda51a4671bc8d46ac7",
+      "bytes": 258415,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/cte.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "055f8bdd816e77dd421e01d61b3d0646d959780cbaa5db23d127665c7ff23845",
+      "bytes": 128386,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/join_region.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "7f663144a1fe2b6cce4fd8e804e0b32b91274f144e3f467dde5d3e8a1860a44c",
+      "bytes": 52167,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/matching.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "91ebb69a526a74cfb038539404a7003fa57ccffcaa8f5a0925dd158981159d5a",
+      "bytes": 136759,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/matching_failure_tests.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "693ccf4d1aca5a7f01c6060f5bd9eb7d6140c663672e4687362cb25cd7a6455a",
+      "bytes": 10764,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/native_deferral_tests.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "4c8de755b7013cd31c3aab3b66c06425a6a6e568abcfdc3490338efa1d6b48d1",
+      "bytes": 39234,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/native_domain.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "5afa18be1b0d3e18f68a2972e7c316ebf5e46671038d97d27172452065a0a9d8",
+      "bytes": 86332,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/native_domain_tests.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "9d3f2c0a23b513f8e04a8bf4ea8ab12efd6d2c8fb459732cd174dea4eaa6dddb",
+      "bytes": 64791,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/native_late_payload.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "20dce34899a51963eb0b168a41cbe241ab2020c0d87f67d2da70e8f502e0a502",
+      "bytes": 44107,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/settlement.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "874e94fdc11897e9e1dad514c8491d6505d1613fe10172d3e0b5cfe7de01d086",
+      "bytes": 94015,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/settlement/demand.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "9e48c0caff4fffae622401b5977216deb12f5c1542c3ea09247825d7b7daeb21",
+      "bytes": 16951,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/settlement/native.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "a0e0c30ba1270e3c63756e6be2dccb4ef9b7e29c29c1fd362b7ecfa13ff93c94",
+      "bytes": 12011,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/planner/transformation/staging.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "f0c41b29e64c0f8500ec80362c2ae5bbd40da80326c03c77078830e1c62940e7",
+      "bytes": 138091,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cascades/rules.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "8ce72429f67b23b25f7a9b8331480e6dfb20bf3fadb76760f25e9c83c2b71fab",
+      "bytes": 55206,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/context.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "33c7ce48d203b1eddd6b702faa62569be915211c57265e5dd48c782ccd3e5954",
+      "bytes": 7977,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/cte/predicate_domain.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "f6572c44acfd5bdcc676a70eeac06071c7e2250bf12aa9e606481dc7324f1ec7",
+      "bytes": 26979,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/join_order/optimizer.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "990de92ddf0d1f2944a62e090196798db83e8e120eb282003a8a5888b9564daa",
+      "bytes": 110025,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/optimizer.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "c728206cbd1833a7409754d36f184e6891c860b8c79f7622ca3aff09d82336c2",
+      "bytes": 136000,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/statistics/gathering.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "eeecc2feed20960815ce180e77b8aa7866d1c225f9bf72d943a75296f9a0ffd0",
+      "bytes": 109601,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/statistics/propagator.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "5fca8fc9ebf5a61e068893c76c8ddaf01579edf0f93d00976a188212cb8ce35a",
+      "bytes": 72122,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/optimizer/src/work_partition/b3.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "721b6907e4fb387702140245a869adf19767f2a206969405709b863beab9f91b",
+      "bytes": 8423,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/planner/src/plan/arena.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "23b08a6d47c6b500ac49d653352a1cbef72030d049f8a40ef53ed3d17ad0dfb2",
+      "bytes": 24209,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/session/src/execute.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "cb2af6fb81b64c7f458dbae41f3de1b6f092688fd59936e1a573f888ab92ffc5",
+      "bytes": 70486,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/session/src/prepared/extended_query.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "0adffff7c60cc25930495fd83b6063131201b7968d9e646fc458a25545590770",
+      "bytes": 108156,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/session/src/session.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "5b3b63cbe46294d639ab4edf97de7befdf40e42ffcbeff9b2326c067f13647ab",
+      "bytes": 94564,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/storage/src/buffer/page_cache.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "80d2f0bcf33ac0808c9f9796d46d694733fdf964764272d95c6c197bed78f929",
+      "bytes": 54341,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/storage/src/buffer/prefetch.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "88adc55663ba90ece5a6f99fd1f0ea552e201124f438ea65a5624aae9ae83459",
+      "bytes": 12764,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/storage/src/rowset/column/column_reader.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "ed5778ccb0529d2d3b8fc23aa26593868652ab64b7c2f1ca62c4327ec2b29610",
+      "bytes": 22039,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "crates/storage/src/rowset/page/page_io.rs",
+      "tracked": true,
+      "exists": true,
+      "sha256": "f2728aced32f0e53767c389a0565883b98c75c639f6779c6a777f6e958293b56",
+      "bytes": 30412,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    }
+  ]
+}

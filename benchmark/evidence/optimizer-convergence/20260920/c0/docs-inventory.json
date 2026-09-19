@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "repository": "/Users/linjunhong/workspace/paro-docs-design",
+  "head": "93e87982a754aee835d87514e46a0e3322d40b49",
+  "staged_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "unstaged_sha256": "57e505bd0b1f4088a8ed70b153019178d8f7533ec8b0136ce0d567055f921007",
+  "untracked_archive_sha256": "06e65c8ecb39774f64e6063aaeee1fbe88b6090b5141e032408f37b2e0756d0d",
+  "index_sha256": "fb997ef68eca865e8bec630e172b6040ec37c2db72cb0a28ceff4a1c0bb0072e",
+  "restore_verified": true,
+  "apple_metadata_members": 3,
+  "files": [
+    {
+      "path": "operator/operator-runtime-ci-performance-gate-design.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "cdcfe77de78603be41fd12b22931f87859ae4fc97a6fd9686f9510dddc00df2e",
+      "bytes": 47471,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "operator/operator-runtime-followup-tasks.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "e015b3fb848b825660d7f8a0fd5ac86e9a3590d3b2a4ff131a018d06a3378898",
+      "bytes": 72596,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "operator/operator-runtime-long-term-performance-refactor.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "4e9423d43218fac8c7ab78107b43968b70774f1d4ec707258dbe41bad1739d09",
+      "bytes": 109353,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "operator/operator-runtime-memory-spill-runtime-filter-subrfcs.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "e184bf629c041cc5c30435896e1cc49e1c0e7c9de021af171e1148291b262813",
+      "bytes": 18426,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "operator/operator-runtime-regress-benchmark-recovery-tasks.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "5b651d7efaa2b5c411e3c27e84718ed30309f1a359274b4bd872da26c9ff3e72",
+      "bytes": 42306,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "operator/operator-runtime-scheduler-subrfcs.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "f041ccfa3bc35c7a6f01ab436dbf9bcab69fbb71a83e2fbbb821aaebde11be9d",
+      "bytes": 5884,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "operator/physical-operator-runtime-design.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "e7350dabd00f28ef60e837125d7c2aa254fc564738e4a5cc0337eccb4fe8811c",
+      "bytes": 139129,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "operator/physical-operator-runtime-tasks.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "dd637ea05ca439769322c04d0724351c1106d09cf943ae7d7cbec6a4eaedf180",
+      "bytes": 68209,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "optimizer/first-statement-latency-implementation-tasks.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "104795243f13e328e4705db61f2de581020b3af12a3b138601ec4920e0b7abaf",
+      "bytes": 202858,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "optimizer/first-statement-latency-optimizer-design.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "a6cab6cf59b950498f0ebfe9a0f7b46c5071cea721d591e3e1637c3230902609",
+      "bytes": 216489,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "search/search-query-execution-design.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "cff54b61679f52b709a49cfd8be73bc8f9ded001f51723e460142d7eaf577454",
+      "bytes": 34194,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "search/search-subsystem-long-term-refactor-design.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "7e327557527e24c20d3822009cc824f11ab59b0b6b496bee1f3000e4542550ab",
+      "bytes": 59702,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "storage/search-generation-storage-design.md",
+      "tracked": true,
+      "exists": true,
+      "sha256": "4ecc9bba851590d7a6078334c548f4c5dddc6227087533e48416931256de0de9",
+      "bytes": 56796,
+      "owner": "pre-existing/unresolved; preserved, not integrated"
+    },
+    {
+      "path": "architecture/paro-cloud-native-distributed-architecture.md",
+      "tracked": false,
+      "sha256": "1fa1cd93eb26b1a17e80beca92602ec6dcab4f3ca3cd1726d6ad54b3b5f48017",
+      "bytes": 64425,
+      "owner": "pre-existing/unresolved; preserved"
+    },
+    {
+      "path": "optimizer/cascades-onboarding.md",
+      "tracked": false,
+      "sha256": "3548996370391ce9cb0c4b1a08b33eff8334379e37857bab3027685a0676e298",
+      "bytes": 68457,
+      "owner": "pre-existing/unresolved; preserved"
+    },
+    {
+      "path": "optimizer/compile-work-closure-task.md",
+      "tracked": false,
+      "sha256": "c3d9be670c82e1f9687a5d321a2c5eafaf4d830a1a43daf03197e79c7b3b97f5",
+      "bytes": 17854,
+      "owner": "pre-existing/unresolved; preserved"
+    },
+    {
+      "path": "optimizer/optimizer-design-v3.md",
+      "tracked": false,
+      "sha256": "1b7bd9eec4e9f116b018c19ca06bc31f62136a0dd661c61ceef253cddaf4f1d8",
+      "bytes": 103930,
+      "owner": "pre-existing/unresolved; preserved"
+    }
+  ]
+}
