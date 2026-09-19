@@ -1625,6 +1625,7 @@ pub(super) fn stage_transformed_expression(
                         FacetCriticality::Optional,
                         logical_identity,
                         operator_fingerprint,
+                        group,
                         BTreeSet::new(),
                     );
                     facet.priority = 2_000 + RegionFacetKind::RuntimeFilter as u16;
@@ -1666,6 +1667,7 @@ pub(super) fn stage_transformed_expression(
                     FacetCriticality::Optional,
                     logical_identity,
                     operator_fingerprint,
+                    group,
                     runtime_filter_scope.expect("candidate scope"),
                 );
                 facet.priority = 2_000 + RegionFacetKind::RuntimeFilter as u16;

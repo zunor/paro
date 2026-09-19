@@ -3447,6 +3447,7 @@ impl MemoBuilder {
                             FacetCriticality::Required,
                             key.stable_fingerprint(),
                             operator_fingerprint,
+                            group,
                             scope,
                         );
                         pending.required = Some(facet.fingerprint);
@@ -3467,6 +3468,7 @@ impl MemoBuilder {
                             FacetCriticality::Optional,
                             key.stable_fingerprint(),
                             operator_fingerprint,
+                            group,
                             scope,
                         );
                         pending.runtime_filter = Some(facet.fingerprint);

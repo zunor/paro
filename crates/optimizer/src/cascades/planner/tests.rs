@@ -1255,6 +1255,21 @@ fn composite_equality_runtime_filter_has_identity_without_single_column_ndv() {
     assert!(!output.variants.is_empty());
 }
 
+#[test]
+fn runtime_filter_facet_does_not_alias_distinct_relation_owners() {
+    let facet = |owner| planner_region_facet(
+        RegionFacetKind::RuntimeFilter, FacetCriticality::Optional,
+        Fingerprint(77), Fingerprint(78), owner,
+        std::iter::once(owner).collect());
+    let a = facet(GroupId(0));
+    let b = facet(GroupId(1));
+    assert_ne!(a.fingerprint, b.fingerprint);
+    assert_eq!(a.fingerprint, facet(GroupId(0)).fingerprint);
+    let forest = RegionForest::normalize([a.clone(), b.clone()], 1, 8).unwrap();
+    assert!(forest.deferred_facets.is_empty());
+    assert_ne!(forest.region_for_facet(a.fingerprint), forest.region_for_facet(b.fingerprint));
+}
+
 pub(super) fn test_base_get(
     table_index: usize,
     oid: u64,

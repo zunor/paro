@@ -1927,6 +1927,7 @@ pub(super) fn planner_region_facet(
     criticality: FacetCriticality,
     logical_identity: Fingerprint,
     operator: Fingerprint,
+    owner: GroupId,
     scope: BTreeSet<GroupId>,
 ) -> RegionFacet {
     let mut fingerprint = StableFingerprintBuilder::default();
@@ -1940,6 +1941,14 @@ pub(super) fn planner_region_facet(
     // same physical-property search without an insertion-order dependency.
     fingerprint.write_fingerprint(logical_identity);
     fingerprint.write_fingerprint(operator);
+    // RF is a capability of this join occurrence's relation, not of an
+    // operator shape shared by unrelated contextual groups. Unioning those
+    // anchors turns independent alternatives into one oversized region.
+    // The owning group is already canonical at construction; later merges
+    // recanonicalize the declaration without renaming archived artifacts.
+    if kind == RegionFacetKind::RuntimeFilter {
+        fingerprint.write_u64(owner.0 as u64);
+    }
     RegionFacet {
         fingerprint: fingerprint.finish(),
         kind,
