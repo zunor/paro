@@ -1158,7 +1158,10 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
         )
     }
 
-    fn optimize(budget: SearchBudget) -> OptimizationOutput {
+    fn optimize(mut budget: SearchBudget) -> OptimizationOutput {
+        // test_grant_classes declares only class zero; do not derive class
+        // two from a different session-side class domain.
+        budget.max_grant_classes = 1;
         let session = crate::subquery::partition_aggregate_tests::setup_session();
         let binder = Binder::new(session.clone());
         let context =

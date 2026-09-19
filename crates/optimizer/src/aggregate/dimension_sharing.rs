@@ -1174,6 +1174,9 @@ mod tests {
             let mut budget = SearchBudget::default();
             budget.max_optional_groups_per_initial_group = group_factor;
             budget.max_optional_composition_groups_per_initial_group = group_factor;
+            // This fixture explicitly supplies one class below. Freeze the
+            // same class domain for expected-grant selection in its session.
+            budget.max_grant_classes = 1;
             let context = crate::context::OptimizationContext::new(
                 session,
                 planner.binder.bind_context.clone(),
