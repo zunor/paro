@@ -37,11 +37,11 @@ evidence, data seed, worktree, build directory or Git history has been deleted.
 | C0-b F2 attribution | Original binary and clean parent/probe Q39 repeated; historical dirty build inputs still missing; F2 isolated, not admitted |
 | C2-1 Q39 | Full rows captured; independent integer-moment/80-digit oracle under investigation |
 | C2-2 partial feasible grants | Engine/admission slice committed; [contract and tests](c2-partial-grants.md); SQL coverage outstanding |
-| C2-3 facet ownership | Declaration deduplication/rollback fixed; current forest admission vs surviving candidate lifetime remains a SQL blocker |
-| C2-4 failure adjudication | Four fixture cases adjudicated; implementation-phase omission fixed; optimizer suite now 1344 pass / 0 fail |
+| C2-3 facet ownership | Declaration deduplication/rollback and RF owner identity fixed; Q01/Q23 exact SQL match; Q02 internal error gone but derived-name schema mismatch remains |
+| C2-4 failure adjudication | Four fixture cases adjudicated; implementation-phase omission fixed; optimizer suite now 1345 pass / 0 fail |
 | C1 Trace Matrix | Pending; existing evidence interfaces suffice for C0/C2 |
 | C3 + C3-M | Pending C2 and registered joint admission experiment |
-| C4 | Not run; correctness and joint gates outstanding |
+| C4 | Workspace check and tests pass; strict clippy, SQL/harness and joint/performance certification outstanding |
 | C5 | Inventory started; no deletion approved by a verified recovery package yet |
 
 ## C0-b: original F2 evidence qualification
@@ -121,10 +121,10 @@ the old “16 retained” list nor runner `new=0` is a baseline-pass certificate
   and surfaces original implementation errors instead of claiming all classes
   must have mandatory winners.
 - [Facet declarations](c2-facet-declarations.md) have one canonical contract,
-  including full deferred declarations and rollback. Q01 and Q23 now expose
-  a later failure: an already priced candidate's facet becomes deferred in a
-  newer forest, while the recipe/candidate still references it. The verifier
-  is not weakened to accept this silently; lifecycle repair remains open.
+  including full deferred declarations and rollback. The later Q01/Q23
+  candidate-lifetime failure was traced to [RF owner identity](c2-rf-facet-owner.md):
+  independent relation anchors were incorrectly combined into one facet.
+  Owner isolation fixes these SQL cases without weakening the verifier.
 - [Composite RF key identity](c2-composite-rf-identity.md) is independent of a
   single-column NDV lookup. Release Q05 on committed source `5d39d0b5`, with
   verifier enabled and observed-server configuration validated, returns 100
@@ -138,9 +138,38 @@ the old “16 retained” list nor runner `new=0` is a baseline-pass certificate
   **1344 optimizer tests passed, zero failed**. Restored legal work can alter
   plans and counts; this is not advertised as a speedup.
 
-Whole-workspace check/test/clippy, SQL regress, 99-query certification and
-normal performance gates have not been completed. Q39 still needs an admitted
-numerical oracle contract; Q01/Q23 still block facet lifetime certification.
+### Current clean release SQL retest
+
+Source `2aabc2ede3538bcc9e4ae255b9ff411ec8a2b468`, release binary SHA-256
+`521bb4c29d4fcd67686d45a58a1fda9e109971898bee5024327fdbb3d1dcfbe3`;
+capture helper SHA-256
+`fd42fd306741fc6a97d134087f8cb55910a4bb83c14c85ccac6ded44434b8a83`.
+Seed, SQL, oracle and per-file harness hashes are in every raw capture.
+Runs are serial, verifier on, four threads / 2 GB and server-observed settings
+validated. These are correctness diagnostics, never compiler/C1 samples.
+
+| Query | Rows | Original oracle result |
+| --- | ---: | --- |
+| Q01 | 100 | exact typed multiset match |
+| Q05 | 100 | exact typed multiset match |
+| Q23 | 4 | exact typed multiset match |
+| Q02 | 2513 | still fails schema: `round(sat_sales1 / sat_sales2, 2)` versus `round((sat_sales1 / sat_sales2), 2)`; separately checked raw typed bag has zero missing/unexpected rows |
+| Q39 | 243 | exact float comparator still fails, 54 missing/unexpected rows |
+
+Raw archive names: `c0/q{01,02,05,23}-owner-r1.json` and
+`c0/q39-integration-owner-r1.json`. The updated independent 80-digit integer
+moment analysis is `c0/q39-integration-oracle.json`: 90,000 exact integer
+groups, identical selected ordered keys; Paro 0/1/2-ULP counts 844/127/1 and
+DuckDB 0/1-ULP counts 840/132. No comparator tolerance or schema exception is
+introduced by this diagnostic. Q02 and Q39 remain failed gates.
+
+Workspace `cargo check --workspace --locked` passes. The full workspace test
+run reports 87 result summaries: **6843 passed, zero failed, 85 ignored**.
+Logs: `c0/workspace-check.log`, `c0/workspace-tests.log`. The strict Clippy
+gate uses the repository's `-- -D warnings`, not a warning-tolerant exit code.
+SQL regress, 99-query certification and normal performance gates have not
+been completed. Q39 still needs an admitted numerical oracle contract;
+fixing three original internal errors does not certify the whole corpus.
 
 F2 is not admitted to the integration baseline. The known historical failure
 and its incomplete attribution remain open. No default policy, estimator,
