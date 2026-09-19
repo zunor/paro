@@ -94,9 +94,13 @@ already satisfies it.
   archived choices still referenced by a parent or frozen candidate.
 - Parent runtime filters, shared producers and phase composition can change
   child ordering. A local scalar winner is not always sufficient.
-- Expected score is not the complete objective ordering. Validate the actual
-  comparator, feasibility and handoff policy against exact admitted plans;
-  scalar correlation alone cannot certify selection quality.
+- Continuation pruning is a partial order, while ObjectiveProfile provides
+  an ordering for selection. Incomparability must not become a tie or a proof
+  that either candidate can be discarded. Budget truncation is a separate,
+  explicitly incomplete decision.
+- Expected score is not the complete objective ordering. Validate pruning,
+  selection, feasibility and handoff separately against exact admitted plans;
+  scalar correlation alone cannot certify their quality.
 - A candidate estimate is not a lower bound for every legal completion.
   Bound proofs require a matching context and a valid composition law.
 - Cancellation, rollback and budget rejection must leave no partial published
@@ -139,11 +143,23 @@ certify production latency.
 ## Diagnostics and Trace Matrix
 
 The current profiler, exclusive work ledger and Memo snapshots are separate
-sources. The proposed
-[Trace Matrix contract](../../../paro-docs-design/optimizer/optimizer-trace-matrix.md)
-unifies their identities, units, causal links, bounds and lifecycle. That link
-assumes a sibling checkout of the design repository; the unified interface is
-not claimed to be implemented by this README.
+sources. Trace Matrix convergence targets common identities, units, causal
+links, bounds and lifecycle. This README does not claim the unified interface
+is implemented. The contributor contracts below are usable in a standalone
+clone; a separate design checkout is optional.
+
+The production decisions have different contracts:
+
+| Decision | Source | Meaning |
+| --- | --- | --- |
+| Continuation pruning | [cost.rs](src/physical/cost.rs) and [memo.rs](src/cascades/memo.rs) | Pareto comparison plus goal-dependent source-response equivalence; it can return no order |
+| Frontier selection | [objective.rs](src/physical/objective.rs) and [memo.rs](src/cascades/memo.rs) | Objective ordering among retained candidates, with caller tie-breaks |
+| Runtime admission | [portfolio.rs](src/physical/portfolio.rs) | Actual-resource and dependency checks, then objective selection among admissible operating points |
+
+Different task supplies block continuation dominance; they do not prohibit
+all comparisons across grant classes. Goal isolation and admission are
+distinct layers. Do not infer a production failure from a diagnostic script
+that mixed uncalibrated raw costs across classes.
 
 Attribution has both scope definitions and call-site owners. When integrating
 the finer F1/F3 ledger, map the compiler, optimizer, engine and planner emitters
@@ -155,6 +171,9 @@ When extending diagnostics:
 - Observe existing decisions; do not re-run transformations, costing or
   quality evaluation to explain them.
 - Distinguish cumulative publications from live frontier membership.
+- Label comparison events by decision layer. Track incomparability separately
+  from equality, rejection, budget truncation and actual selection; bounded
+  logging must not freeze rejected proposals just to give them CandidateIds.
 - Use scoped integer identities internally. A cross-run fingerprint is not
   a semantic equivalence proof.
 - Keep exclusive wall time, CPU time, allocation traffic, live memory and RSS
@@ -193,23 +212,50 @@ These commands are validation entry points, not a statement that the current
 worktree passes them. Integration changes also need the affected workspace,
 session/execution and SQL regression checks.
 
-For performance work, first read the repository
-[benchmark skill](../../.agents/skills/paro-benchmark/SKILL.md) and
-[benchmark README](../../benchmark/README.md).
+For performance work, first read the
+[benchmark README](../../benchmark/README.md). When installed, also follow the
+local paro-benchmark skill; that tooling is not a tracked-clone prerequisite.
 Use the established first-statement harness, fixed source/binary/data/SQL
 identities, actual resource envelopes and complete result validation. Do not
 run concurrent benchmark runners or compare a diagnostic cohort with a normal
 one. Pin the competitor build, extensions and settings as well; a parity claim
-does not transfer to a new competitor version. Apply the
-[comparison validity contract](../../../paro-docs-design/optimizer/optimizer-convergence-design.md#25-比较合法性先验证判据再用判据裁决)
-before drawing conclusions from ratios, cost ranks or q-error.
+does not transfer to a new competitor version. Apply the following comparison
+rules before drawing conclusions.
+
+### Comparison validity
+
+- Declare the claim, intervention, fixed context, measurement boundary and
+  independent sample unit. Unidentified comparisons are inconclusive.
+- Use paired cohorts or another justified design. Do not treat a ratio of
+  medians from unrelated reports as a causal speedup.
+- Keep continuation dominance, objective ranking and admission decisions
+  separate. Incomparable pairs have no rank; expected score is not the full
+  objective. Uncalibrated costs from different facts or resource contexts
+  cannot be pooled into a model-quality claim.
+- Validate pruning laws with an independent continuation oracle. Measured
+  dominance violations, retained work and selection regret assess model
+  quality; a favorable success percentage is not a pruning proof.
+- Match estimates and actuals by node, port, phase, occurrence and unit.
+  Match replay requests to the actual admitted image and resources.
+- Treat fingerprints as locators, not semantic equivalence proofs. Keep full
+  typed results, errors and regression diffs; unchanged failing filenames are
+  not evidence of unchanged failures.
+- Report candidate coverage, ties, noise and repeat counts. Repeated blocks
+  do not create new independent plans. Rank correlation is descriptive, not
+  a substitute for pruning validity or selection regret.
+- Commit a versioned preregistration record with EvidenceId before collecting
+  confirmatory samples. Include numeric thresholds, exclusions, sampling,
+  uncertainty and held-out rules; cite its commit/hash in the report. Known
+  pilots are exploratory, and post-result amendments need new confirmation.
 
 ## Design and evidence maintenance
 
-The current closeout plan is
-[Optimizer Convergence](../../../paro-docs-design/optimizer/optimizer-convergence-design.md).
-It separates workspace preparation, observability, contract fixes, default-path
-admission and historical cleanup.
+Supplementary proposals live in the separate paro-docs-design repository:
+optimizer/optimizer-convergence-design.md and
+optimizer/optimizer-trace-matrix.md. They cover closeout sequencing and the
+target diagnostic schema, and are not required to resolve any normative link
+in this README. This repository neither vendors nor automatically tracks that
+checkout; consult an explicit design revision when using those proposals.
 
 Keep this README short-lived-data free:
 
