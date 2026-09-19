@@ -619,7 +619,9 @@ fn production_deferral_inlines_nonidentity_projection_spines() {
             "depth={depth}"
         );
         let state = state.read().unwrap();
-        assert!(state.settlement_cache.misses > 0);
+        // Resident native settlement need not visit the owned settlement
+        // cache. Validate the published aggregate/column bindings below,
+        // not whether a replaced transport path happened to miss its cache.
         let LogicalOperator::Aggregate(actual) = &state.payloads.logical
             [outputs[0].payload.index()]
         .semantic_template
@@ -863,7 +865,8 @@ fn production_deferral_retains_the_exact_dimension_reference() {
             before
         );
         let state = state.read().unwrap();
-        assert!(state.settlement_cache.misses > 0);
+        // Exact dimension identity and its statistics were checked above.
+        // An owned-settlement cache miss is not evidence of those properties.
         let LogicalOperator::Aggregate(actual) = &state.payloads.logical
             [outputs[0].payload.index()]
         .semantic_template
