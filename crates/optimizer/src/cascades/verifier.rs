@@ -386,7 +386,14 @@ fn verify_joint_cost_proof(
     let current_region_id = memo
         .regions()
         .region_for_facet(first_facet)
-        .ok_or_else(|| paro_error::internal("JointCostProof facet is no longer active"))?;
+        .ok_or_else(|| {
+            let deferred = memo.regions().deferred_facets.iter()
+                .find(|facet| facet.fingerprint == first_facet);
+            paro_error::internal(format!(
+                "JointCostProof facet is no longer active: facet={first_facet:?}, owner={owner_group:?}, physical={:?}, deferred={deferred:?}",
+                winner.expression,
+            ))
+        })?;
     let region = memo
         .regions()
         .node(current_region_id)
