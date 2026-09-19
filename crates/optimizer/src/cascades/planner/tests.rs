@@ -1347,7 +1347,7 @@ fn oversized_runtime_filter_candidate_span_yields_to_the_baseline() {
 
     let input = MemoBuilder::build(plan, BindContext::new(), budget).unwrap();
     assert_eq!(input.memo.regions().nodes.len(), 1);
-    assert!(input.memo.regions().dropped_optional_facets.is_empty());
+    assert!(input.memo.regions().deferred_facets.is_empty());
     let optimized = input.optimize(&test_grant_classes()).unwrap();
     let variant = &optimized.variants[0];
     let contract = variant.contracts.get(&variant.plan.id).unwrap();

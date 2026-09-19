@@ -238,7 +238,19 @@ impl WinnerVerifier {
 fn verify_region_forest(memo: &Memo) -> Result<()> {
     let forest = memo.regions();
     let mut facets = BTreeSet::new();
-    let dropped: BTreeSet<_> = forest.dropped_optional_facets.iter().copied().collect();
+    let dropped: BTreeSet<_> = forest.dropped_optional_facets().collect();
+    for facet in &forest.deferred_facets {
+        facet.validate_contract()?;
+        if facet.criticality != FacetCriticality::Optional
+            || facet.scope.iter().any(|group| memo.group(*group).is_none()
+                || memo.canonical_group(*group) != *group)
+        {
+            return Err(paro_error::internal("deferred facet has invalid contract or scope"));
+        }
+    }
+    if dropped.len() != forest.deferred_facets.len() {
+        return Err(paro_error::internal("deferred facet has duplicate declarations"));
+    }
     for node in forest.nodes.iter() {
         if node.scope.is_empty()
             || node

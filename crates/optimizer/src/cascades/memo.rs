@@ -1979,9 +1979,8 @@ impl Memo {
     ) -> Result<Box<[super::ids::Fingerprint]>> {
         let mut facets = self
             .regions
-            .nodes
-            .iter()
-            .flat_map(|region| region.facets.iter().cloned())
+            .declarations()
+            .cloned()
             .map(|mut facet| {
                 facet.scope = facet
                     .scope
@@ -2001,24 +2000,11 @@ impl Memo {
                 .collect();
             match facets.get_mut(&facet.fingerprint) {
                 Some(existing) => {
-                    if existing.kind != facet.kind
-                        || existing.criticality != facet.criticality
-                        || existing.scope_contract != facet.scope_contract
-                    {
-                        return Err(paro_error::internal(
-                            "planning facet fingerprint changed its contract",
-                        ));
-                    }
                     // Priority is a scheduling hint, not facet identity. The
                     // fingerprint intentionally excludes it, so equivalent
                     // expressions that rediscover the same capability merge
                     // at the strongest priority.
-                    if existing.priority > facet.priority || !facet.scope.is_subset(&existing.scope)
-                    {
-                        existing.priority = existing.priority.min(facet.priority);
-                        existing.scope.extend(facet.scope);
-                        changed = true;
-                    }
+                    changed |= existing.merge_declaration(facet)?;
                 }
                 None => {
                     facets.insert(facet.fingerprint, facet);
@@ -2027,27 +2013,14 @@ impl Memo {
             }
         }
         if !changed {
-            return Ok(self.regions.dropped_optional_facets.clone());
+            return Ok(self.regions.dropped_optional_facets().collect());
         }
-        let previously_dropped = self
-            .regions
-            .dropped_optional_facets
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let mut regions = RegionForest::normalize(
+        let regions = RegionForest::normalize(
             facets.into_values(),
             usize::from(self.budget.max_composite_region_groups),
             self.budget.max_mandatory_region_groups as usize,
         )?;
-        let dropped = previously_dropped
-            .into_iter()
-            .chain(regions.dropped_optional_facets.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        regions.dropped_optional_facets = dropped.clone();
+        let dropped = regions.dropped_optional_facets().collect();
         self.regions = Arc::new(regions);
         Ok(dropped)
     }

@@ -3654,7 +3654,7 @@ impl MemoBuilder {
             memo.budget().max_mandatory_region_groups as usize,
         )?;
         let dropped_optional: BTreeSet<_> =
-            regions.dropped_optional_facets.iter().copied().collect();
+            regions.dropped_optional_facets().collect();
         for (payload, pending) in pending_region_facets {
             let operator = metadata.get_mut(&payload).ok_or_else(|| {
                 paro_error::internal("planning-region binding lost operator metadata")

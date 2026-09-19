@@ -57,7 +57,10 @@ fn region_delta_matches_manual_reduction_across_three_orders() {
             .upsert_region_facets(order.map(|index| updates[index].clone()))
             .unwrap();
         assert_eq!(memo.regions(), &expected, "update order {order:?}");
-        assert_eq!(dropped, expected.dropped_optional_facets);
+        assert_eq!(
+            dropped,
+            expected.dropped_optional_facets().collect::<Box<[_]>>()
+        );
 
         // Replaying equal/subset scopes with equal/weaker priorities must
         // remain a no-op, including a duplicate of the pre-update facet.
@@ -187,6 +190,87 @@ fn no_change_and_new_delta_both_retain_previously_dropped_facets() {
         memo.upsert_region_facet(rf(1, 10, &groups[..1])).unwrap(),
         dropped
     );
-    assert_eq!(memo.regions.dropped_optional_facets, dropped);
+    assert_eq!(
+        memo.regions.dropped_optional_facets().collect::<Box<[_]>>(),
+        dropped
+    );
     assert_eq!(memo.regions.nodes[0].facets[0].priority, 10);
+}
+
+#[test]
+fn rediscovered_subset_cannot_forget_a_deferred_facets_scope() {
+    let (mut memo, groups) = memo_groups_with_budget::<3>(SearchBudget {
+        max_composite_region_groups: 2,
+        ..SearchBudget::default()
+    });
+    memo.upsert_region_facet(rf(2, 20, &groups)).unwrap();
+    let before = memo.regions.clone();
+    // Same capability rediscovers a subset, not a new semantic facet. Losing
+    // its previously declared scope must not make it spuriously admissible.
+    memo.upsert_region_facet(rf(2, 20, &groups[..1])).unwrap();
+    assert!(memo.regions.region_for_facet(Fingerprint(2)).is_none());
+    assert_eq!(memo.regions, before);
+}
+
+#[test]
+fn initial_region_construction_and_incremental_upsert_merge_identical_facets() {
+    let (mut memo, groups) = memo_groups::<3>();
+    let declarations = [rf(3, 20, &groups[..2]), rf(3, 10, &groups[2..])];
+    memo.upsert_region_facets(declarations.clone()).unwrap();
+    let initial = RegionForest::normalize(
+        declarations,
+        usize::from(memo.budget.max_composite_region_groups),
+        memo.budget.max_mandatory_region_groups as usize,
+    )
+    .unwrap();
+    assert_eq!(&initial, memo.regions());
+    let owners = initial
+        .nodes
+        .iter()
+        .flat_map(|node| &node.facets)
+        .filter(|facet| facet.fingerprint == Fingerprint(3))
+        .count();
+    assert_eq!(owners, 1);
+}
+
+#[test]
+fn deferred_declarations_follow_merge_and_rollback_before_readmission() {
+    let (mut memo, [a, b, c]) = memo_groups_with_budget(SearchBudget {
+        max_composite_region_groups: 2,
+        ..SearchBudget::default()
+    });
+    memo.upsert_region_facet(rf(4, 20, &[a, b, c])).unwrap();
+    let saved = memo.transformation_savepoint();
+    let before = memo.regions.clone();
+    let merged = memo.merge_groups(a, b).unwrap();
+    assert_eq!(
+        memo.regions.deferred_facets[0].scope,
+        BTreeSet::from([merged, c])
+    );
+    memo.upsert_region_facet(rf(4, 10, &[b, c])).unwrap();
+    assert!(memo.regions.deferred_facets.is_empty());
+    assert!(memo.regions.region_for_facet(Fingerprint(4)).is_some());
+    memo.rollback_transformation(saved).unwrap();
+    assert!(Arc::ptr_eq(&before, &memo.regions));
+    assert_eq!(
+        memo.regions.deferred_facets[0].scope,
+        BTreeSet::from([a, b, c])
+    );
+}
+
+#[test]
+fn initial_conflicting_identity_is_rejected_instead_of_picking_an_owner() {
+    let (memo, [group]) = memo_groups();
+    let good = rf(5, 20, &[group]);
+    let mut bad = good.clone();
+    bad.kind = RegionFacetKind::Sharing;
+    bad.scope_contract = RegionScopeContract::Exact;
+    for declarations in [[good.clone(), bad.clone()], [bad, good]] {
+        assert!(RegionForest::normalize(
+            declarations,
+            usize::from(memo.budget.max_composite_region_groups),
+            memo.budget.max_mandatory_region_groups as usize
+        )
+        .is_err());
+    }
 }

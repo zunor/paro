@@ -53,6 +53,26 @@ pub struct RegionFacet {
 }
 
 impl RegionFacet {
+    /// One fingerprint names one capability, not one observation of its scope.
+    pub(crate) fn merge_declaration(&mut self, other: Self) -> Result<bool> {
+        if self.fingerprint != other.fingerprint
+            || self.kind != other.kind
+            || self.criticality != other.criticality
+            || self.scope_contract != other.scope_contract
+        {
+            return Err(paro_error::internal(
+                "planning facet fingerprint changed its contract",
+            ));
+        }
+        other.validate_contract()?;
+        let changed = self.priority > other.priority || !other.scope.is_subset(&self.scope);
+        if changed {
+            self.priority = self.priority.min(other.priority);
+            self.scope.extend(other.scope);
+        }
+        Ok(changed)
+    }
+
     /// Validate the invariant carried by the facet itself, independently of
     /// the forest node that eventually owns it.
     ///
@@ -108,7 +128,9 @@ impl RegionNode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegionForest {
     pub nodes: Box<[RegionNode]>,
-    pub dropped_optional_facets: Box<[Fingerprint]>,
+    /// Admission must retain the full deferred declaration. Id-only storage
+    /// loses scope facts when a later publication rediscovers a subset.
+    pub deferred_facets: Box<[RegionFacet]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -200,6 +222,17 @@ pub struct JointCostProof {
 }
 
 impl RegionForest {
+    pub fn declarations(&self) -> impl Iterator<Item = &RegionFacet> {
+        self.nodes
+            .iter()
+            .flat_map(|node| node.facets.iter())
+            .chain(self.deferred_facets.iter())
+    }
+
+    pub fn dropped_optional_facets(&self) -> impl Iterator<Item = Fingerprint> + '_ {
+        self.deferred_facets.iter().map(|facet| facet.fingerprint)
+    }
+
     pub fn normalize(
         facets: impl IntoIterator<Item = RegionFacet>,
         max_composite_region_groups: usize,
@@ -210,6 +243,15 @@ impl RegionForest {
                 "region group ceilings must be greater than zero",
             ));
         }
+        let mut unique = BTreeMap::<Fingerprint, RegionFacet>::new();
+        for facet in facets {
+            facet.validate_contract()?;
+            if let Some(existing) = unique.get_mut(&facet.fingerprint) {
+                existing.merge_declaration(facet)?;
+            } else {
+                unique.insert(facet.fingerprint, facet);
+            }
+        }
         let mut required = Vec::new();
         let mut optional = Vec::new();
         // A singleton cannot partially overlap any set. Its only closure
@@ -218,8 +260,7 @@ impl RegionForest {
         // runtime-filter anchors are numerous, but do not make the search
         // space of composite ownership any larger.
         let mut singletons = BTreeMap::<GroupId, WorkingRegion>::new();
-        for facet in facets {
-            facet.validate_contract()?;
+        for facet in unique.into_values() {
             if facet.scope.len() == 1 {
                 let group = *facet.scope.first().expect("validated nonempty scope");
                 match singletons.entry(group) {
@@ -258,10 +299,9 @@ impl RegionForest {
 
         let mut dropped = Vec::new();
         for facet in optional {
-            let fingerprint = facet.fingerprint;
-            let candidate = overlap_closure(&working, WorkingRegion::from_facet(facet));
+            let candidate = overlap_closure(&working, WorkingRegion::from_facet(facet.clone()));
             if candidate.region.scope.len() > max_composite_region_groups {
-                dropped.push(fingerprint);
+                dropped.push(facet);
             } else {
                 commit_overlap_closure(&mut working, candidate);
             }
@@ -292,10 +332,10 @@ impl RegionForest {
                 parent: parents[index],
             })
             .collect::<Vec<_>>();
-        dropped.sort_unstable();
+        dropped.sort_by_key(|facet| facet.fingerprint);
         Ok(Self {
             nodes: nodes.into_boxed_slice(),
-            dropped_optional_facets: dropped.into_boxed_slice(),
+            deferred_facets: dropped.into_boxed_slice(),
         })
     }
 
@@ -338,6 +378,9 @@ impl RegionForest {
             for facet in &mut node.facets {
                 facet.scope = facet.scope.iter().map(|group| canonical(*group)).collect();
             }
+        }
+        for facet in &mut self.deferred_facets {
+            facet.scope = facet.scope.iter().map(|group| canonical(*group)).collect();
         }
     }
 }
@@ -504,7 +547,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(forest.nodes.len(), 2);
-        assert_eq!(forest.dropped_optional_facets.as_ref(), &[Fingerprint(9)]);
+        assert_eq!(
+            forest.dropped_optional_facets().collect::<Vec<_>>(),
+            vec![Fingerprint(9)]
+        );
     }
 
     #[test]
@@ -580,7 +626,7 @@ mod tests {
                 let optional = facet.criticality == FacetCriticality::Optional;
                 let fingerprint = facet.fingerprint;
                 let mut trial = regions.clone();
-                trial.push(WorkingRegion::from_facet(facet));
+                trial.push(WorkingRegion::from_facet(facet.clone()));
                 close(&mut trial);
                 let own = trial
                     .iter()
@@ -592,7 +638,7 @@ mod tests {
                     })
                     .unwrap();
                 if optional && own.scope.len() > limit {
-                    dropped.push(fingerprint);
+                    dropped.push(facet);
                 } else {
                     regions = trial;
                 }
@@ -627,10 +673,10 @@ mod tests {
                     }
                 })
                 .collect();
-            dropped.sort_unstable();
+            dropped.sort_by_key(|facet| facet.fingerprint);
             RegionForest {
                 nodes,
-                dropped_optional_facets: dropped.into_boxed_slice(),
+                deferred_facets: dropped.into_boxed_slice(),
             }
         }
         // Includes nested, disjoint, equal and partially overlapping scopes;
@@ -683,7 +729,7 @@ mod tests {
         }));
         let forest = RegionForest::normalize(facets, 1, groups.len()).unwrap();
         assert_eq!(forest.nodes.len(), groups.len() + 1);
-        assert!(forest.dropped_optional_facets.is_empty());
+        assert!(forest.deferred_facets.is_empty());
         for node in &forest.nodes[..groups.len()] {
             assert_eq!(node.parent, Some(RegionId::new(groups.len())));
         }
