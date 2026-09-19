@@ -346,24 +346,165 @@ fn lazy_grants_pre_optional_stop_does_not_claim_an_optional_search() {
 }
 
 #[test]
-fn lazy_grants_cannot_publish_a_partial_mandatory_portfolio() {
-    let (mut engine, root, goal, _) = fixture(false, false);
-    let mut grants = classes();
-    grants[0].hard_memory_bytes = 1;
-    let error = engine
-        .optimize_for_expected_grant(
-            root,
-            goal,
-            AdmissibleGrantSetId(9),
-            grants,
-            SearchMode::Memo,
-            Some(ResourceGrantClassId(2)),
-        )
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("mandatory winner for every class"));
-    assert!(engine.active_optional_grant.is_none());
+fn partial_grants_publish_only_verified_images_and_do_not_invent_fallbacks() {
+    // Missing the expected class is not the same as missing every class.
+    // Cover both paths and both search modes through the real engine.
+    for missing in [0, 2] {
+        for mode in [SearchMode::Direct, SearchMode::Memo] {
+            let (mut engine, root, goal, _) = fixture(false, false);
+            let mut grants = classes();
+            grants[missing].hard_memory_bytes = 1;
+            let output = engine
+                .optimize_for_expected_grant(
+                    root,
+                    goal,
+                    AdmissibleGrantSetId(9),
+                    grants,
+                    mode,
+                    Some(ResourceGrantClassId(2)),
+                )
+                .unwrap();
+            let missing = ResourceGrantClassId(missing as u32);
+            assert_eq!(output.winners.len(), 2);
+            assert_eq!(output.safe_winners.len(), 2);
+            assert!(output.winners.iter().all(|winner| winner.class != missing));
+            assert_eq!(
+                output.grant_search.as_ref().unwrap().unresolved_classes,
+                BTreeSet::from([missing])
+            );
+            let portfolio = PhysicalPlanPortfolio::build(
+                ObjectiveProfile::Latency,
+                grants,
+                output.winners.iter().map(|winner| {
+                    (
+                        winner.class,
+                        winner.frozen.clone(),
+                        winner.winner.physical_fingerprint,
+                        winner.winner.cost,
+                    )
+                }),
+            )
+            .unwrap()
+            .with_grant_search(output.grant_search)
+            .unwrap();
+            let admitted = portfolio.admit(4 << 20, 1, 0, |_| true).unwrap();
+            assert_ne!(admitted.resources.class, missing);
+            assert!(output
+                .winners
+                .iter()
+                .any(|winner| Arc::ptr_eq(&winner.frozen, &admitted.plan)));
+            // Shrinking actual resources cannot admit the absent one-byte class.
+            assert!(portfolio
+                .admit(1, 1, 0, |_| true)
+                .unwrap_err()
+                .sqlstate()
+                .is_resource_error());
+            assert!(engine.active_optional_grant.is_none());
+        }
+    }
+}
+
+#[test]
+fn no_verified_grant_is_a_resource_error_not_a_false_infeasibility_proof() {
+    for mode in [SearchMode::Direct, SearchMode::Memo] {
+        let (mut engine, root, goal, _) = fixture(false, false);
+        let grants = classes().map(|mut class| {
+            class.hard_memory_bytes = 1;
+            class
+        });
+        let error = engine
+            .optimize_for_expected_grant(
+                root,
+                goal,
+                AdmissibleGrantSetId(9),
+                grants,
+                mode,
+                Some(ResourceGrantClassId(2)),
+            )
+            .unwrap_err();
+        assert!(error.sqlstate().is_resource_error(), "{error}");
+        assert!(error.to_string().contains("infeasibility is not proven"));
+        assert!(engine.active_optional_grant.is_none());
+    }
+}
+
+struct FailingGrantLeaf {
+    optional: bool,
+    error: paro_error::ParoError,
+}
+
+impl PhysicalImplementation for FailingGrantLeaf {
+    fn id(&self) -> ImplementationId {
+        LeafImplementation.id()
+    }
+
+    fn grant_dependency_for(
+        &self,
+        _: &crate::cascades::memo::LogicalExpr,
+        _: &ImplementationContext<'_>,
+    ) -> GrantDependencyDescriptor {
+        GrantDependencyDescriptor::Sensitive
+    }
+
+    fn matches(
+        &self,
+        _: &crate::cascades::memo::LogicalExpr,
+        _: OptimizationGoal,
+        _: &ImplementationContext<'_>,
+    ) -> bool {
+        true
+    }
+
+    fn candidates(
+        &self,
+        expr: LogicalExprId,
+        goal: OptimizationGoal,
+        ctx: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let op = ctx.memo.logical_expr(expr).unwrap().key.operator;
+        // Class zero already has an executable winner when mandatory fails.
+        if (self.optional && op == Fingerprint(11))
+            || (!self.optional && goal.grant == GrantGoalKey::Class(ResourceGrantClassId(1)))
+        {
+            return Err(self.error.clone());
+        }
+        LeafImplementation.candidates(expr, goal, ctx)
+    }
+}
+
+#[test]
+fn grant_failures_are_not_swallowed_as_missing_candidates_or_safe_fallbacks() {
+    for optional in [false, true] {
+        for error in [
+            paro_error::internal("injected broken grant contract"),
+            paro_error::configuration_limit_exceeded("injected producer resource failure"),
+        ] {
+            let (mut engine, root, goal, _) = fixture(false, false);
+            let mut registry = ImplementationRegistry::default();
+            registry.register_transformation(AddEquivalent).unwrap();
+            registry
+                .register_implementation(FailingGrantLeaf {
+                    optional,
+                    error: error.clone(),
+                })
+                .unwrap();
+            engine.registry = registry;
+            let observed = engine
+                .optimize_for_expected_grant(
+                    root,
+                    goal,
+                    AdmissibleGrantSetId(9),
+                    classes(),
+                    SearchMode::Memo,
+                    Some(ResourceGrantClassId(2)),
+                )
+                .unwrap_err();
+            assert_eq!(observed.sqlstate(), error.sqlstate());
+            assert_eq!(observed.to_string(), error.to_string());
+            assert!(engine.active_optional_grant.is_none());
+            assert!(!engine.mandatory_only);
+        }
+    }
 }
 
 #[test]

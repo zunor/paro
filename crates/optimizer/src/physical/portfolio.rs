@@ -53,6 +53,10 @@ pub struct GrantSearchCoverage {
     /// An attempted optional search, not a proof of exhaustive completion.
     pub optional_classes: BTreeSet<ResourceGrantClassId>,
     pub mandatory_only_classes: BTreeSet<ResourceGrantClassId>,
+    /// Declared classes for which no verified executable image was obtained.
+    /// This is absence of evidence, not a proof of infeasibility. Admission
+    /// must never invent a fallback for a member of this set.
+    pub unresolved_classes: BTreeSet<ResourceGrantClassId>,
 }
 
 impl GrantSearchCoverage {
@@ -73,7 +77,22 @@ impl GrantSearchCoverage {
             expected_class,
             optional_classes,
             mandatory_only_classes,
+            unresolved_classes: BTreeSet::new(),
         }
+    }
+
+    pub fn with_available_classes(
+        mut self,
+        available: impl IntoIterator<Item = ResourceGrantClassId>,
+    ) -> Self {
+        let available: BTreeSet<_> = available.into_iter().collect();
+        self.unresolved_classes = self
+            .optional_classes
+            .union(&self.mandatory_only_classes)
+            .filter(|class| !available.contains(class))
+            .copied()
+            .collect();
+        self
     }
 }
 
@@ -223,11 +242,13 @@ impl<P> PhysicalPlanPortfolio<P> {
                     .copied()
                     .collect::<BTreeSet<_>>()
                     != classes
+                || !coverage.unresolved_classes.is_subset(&classes)
                 || classes.iter().any(|class| {
-                    !self
+                    let available = self
                         .variants
                         .iter()
-                        .any(|v| v.admissible_classes.contains(class))
+                        .any(|v| v.admissible_classes.contains(class));
+                    available == coverage.unresolved_classes.contains(class)
                 })
             {
                 return Err(paro_error::internal(
@@ -323,7 +344,9 @@ impl<P> PhysicalPlanPortfolio<P> {
                     .then_with(|| left_class.id.cmp(&right_class.id))
             })
             .ok_or_else(|| {
-                paro_error::internal("no physical portfolio variant is currently admissible")
+                paro_error::configuration_limit_exceeded(
+                    "no verified physical portfolio variant fits the current resources and dependencies",
+                )
             })?;
         let (selected_index, selected_class) = selected;
         let selected = variants
@@ -556,6 +579,46 @@ mod tests {
         let mut invalid = coverage;
         invalid.mandatory_only_classes.insert(classes[1].id);
         assert!(portfolio.with_grant_search(Some(invalid)).is_err());
+    }
+
+    #[test]
+    fn unresolved_class_metadata_must_match_executable_images_exactly() {
+        let classes = [1, 2].map(|id| ResourceGrantClass {
+            id: ResourceGrantClassId(id),
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Forbidden,
+            max_parallel_tasks: 1,
+        });
+        let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
+            classes,
+            [(classes[0].id, "verified", Fingerprint(7), cost(2.0, 10))],
+        )
+        .unwrap();
+        let coverage =
+            GrantSearchCoverage::new(Some(classes[1].id), classes.map(|class| class.id), true)
+                .with_available_classes([classes[0].id]);
+        assert!(portfolio
+            .clone()
+            .with_grant_search(Some(coverage.clone()))
+            .is_ok());
+        let mut false_available = coverage.clone();
+        false_available.unresolved_classes.clear();
+        assert!(portfolio
+            .clone()
+            .with_grant_search(Some(false_available))
+            .is_err());
+        let mut hides_verified = coverage.clone();
+        hides_verified.unresolved_classes.insert(classes[0].id);
+        assert!(portfolio
+            .clone()
+            .with_grant_search(Some(hides_verified))
+            .is_err());
+        let mut foreign_class = coverage;
+        foreign_class
+            .unresolved_classes
+            .insert(ResourceGrantClassId(3));
+        assert!(portfolio.with_grant_search(Some(foreign_class)).is_err());
     }
 
     #[test]

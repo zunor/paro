@@ -4185,39 +4185,27 @@ impl CascadesEngine {
             self.mandatory_only = false;
             drop(phase);
             self.record_search_checkpoints(root);
-            if incumbent
-                .as_ref()
-                .is_err_and(|error| error.is_query_canceled())
-            {
-                return incumbent;
-            }
+            // Missing candidates are represented by an empty/partial result,
+            // never an error. Every implementation, verifier and cancellation
+            // error retains its original cause and escapes unchanged.
+            let incumbent = incumbent?;
             // An infeasible initial implementation may become feasible under
             // an optional rewrite. Do not report a fabricated incumbent in
             // that case, but still permit the requested bounded search.
-            if incumbent.is_ok() {
-                super::verifier::MemoVerifier::verify(&self.memo, None)?;
-                if let Some(optimization) = incumbent.as_ref().ok() {
-                    for winner in &optimization.winners {
-                        self.protect_incumbent(root, winner.goal, winner.winner.as_ref().clone())?;
-                    }
-                    if let Some(winner) = optimization.winners.first() {
-                        self.governor.mark_safe(winner.winner.candidate);
-                        self.note_safe_candidate(winner.winner.candidate);
-                    }
-                }
+            super::verifier::MemoVerifier::verify(&self.memo, None)?;
+            for winner in &incumbent.winners {
+                self.protect_incumbent(root, winner.goal, winner.winner.as_ref().clone())?;
             }
-            let safe = incumbent.as_ref().ok().cloned();
-            if expected.is_some()
-                && safe
-                    .as_ref()
-                    .is_none_or(|safe| safe.winners.len() != classes.len())
-            {
-                return Err(paro_error::internal(
-                    "lazy grant portfolio requires an exact mandatory winner for every class",
-                ));
+            if let Some(winner) = incumbent.winners.first() {
+                self.governor.mark_safe(winner.winner.candidate);
+                self.note_safe_candidate(winner.winner.candidate);
             }
+            let safe = incumbent.clone();
             if expected == Some(None) {
-                let mut safe = incumbent?;
+                let mut safe = incumbent;
+                if safe.winners.is_empty() {
+                    return Err(self.infeasible_goal_error(root, base_goal));
+                }
                 for class in classes.keys().copied() {
                     self.memo.record_deferred_grant(class);
                 }
@@ -4226,11 +4214,10 @@ impl CascadesEngine {
                 self.note_search_stop(safe.stop);
                 self.record_search_checkpoints(root);
                 safe.safe_winners = safe.winners.clone();
-                safe.grant_search = Some(crate::physical::GrantSearchCoverage::new(
-                    None,
-                    classes.keys().copied(),
-                    false,
-                ));
+                safe.grant_search = Some(
+                    crate::physical::GrantSearchCoverage::new(None, classes.keys().copied(), false)
+                        .with_available_classes(safe.winners.iter().map(|winner| winner.class)),
+                );
                 return Ok(safe);
             }
             let active_classes = classes
@@ -4258,7 +4245,7 @@ impl CascadesEngine {
                 base_goal,
                 admissible_set,
                 &active_classes,
-                incumbent,
+                Ok(incumbent),
                 &mut optional_started,
             );
             self.active_optional_grant = None;
@@ -4275,12 +4262,12 @@ impl CascadesEngine {
                 self.quality_active_forced_transform_goal = None;
                 self.quality_active_domain_continuation = None;
             }
-            return result.map(|mut result| {
+            return result.and_then(|mut result| {
                 if let Some(expected_class) = expected {
-                    let safe = safe.expect("complete mandatory portfolio checked above");
                     let mut winners = result.winners.into_vec();
                     winners.retain(|winner| Some(winner.class) == expected_class);
-                    for winner in &safe.winners {
+                    let safe_winners = safe.winners;
+                    for winner in &safe_winners {
                         if !winners
                             .iter()
                             .any(|selected| selected.class == winner.class)
@@ -4290,12 +4277,15 @@ impl CascadesEngine {
                     }
                     winners.sort_by_key(|winner| winner.class);
                     result.winners = winners.into_boxed_slice();
-                    result.safe_winners = safe.winners;
-                    result.grant_search = Some(crate::physical::GrantSearchCoverage::new(
-                        expected_class,
-                        classes.keys().copied(),
-                        optional_started,
-                    ));
+                    result.safe_winners = safe_winners;
+                    result.grant_search = Some(
+                        crate::physical::GrantSearchCoverage::new(
+                            expected_class,
+                            classes.keys().copied(),
+                            optional_started,
+                        )
+                        .with_available_classes(result.winners.iter().map(|winner| winner.class)),
+                    );
                     // Active-goal closure is not closure of the declared
                     // portfolio. Retaining a shared mandatory goal alone is
                     // not a proof that every class completed optional work.
@@ -4307,22 +4297,27 @@ impl CascadesEngine {
                     self.note_search_stop(result.stop);
                     self.record_search_checkpoints(root);
                 }
-                result
+                if result.winners.is_empty() {
+                    Err(self.infeasible_goal_error(root, base_goal))
+                } else {
+                    Ok(result)
+                }
             });
         }
         let mut result = self.optimize_grant_classes(root, base_goal, admissible_set, &classes)?;
+        if result.winners.is_empty() {
+            return Err(self.infeasible_goal_error(root, base_goal));
+        }
         if let Some(expected_class) = expected {
-            if result.winners.len() != classes.len() {
-                return Err(paro_error::internal(
-                    "lazy grant portfolio requires all mandatory classes",
-                ));
-            }
             result.safe_winners = result.winners.clone();
-            result.grant_search = Some(crate::physical::GrantSearchCoverage::new(
-                expected_class,
-                classes.keys().copied(),
-                false,
-            ));
+            result.grant_search = Some(
+                crate::physical::GrantSearchCoverage::new(
+                    expected_class,
+                    classes.keys().copied(),
+                    false,
+                )
+                .with_available_classes(result.winners.iter().map(|winner| winner.class)),
+            );
             for class in classes.keys().copied() {
                 self.memo.record_deferred_grant(class);
             }
@@ -4396,16 +4391,14 @@ impl CascadesEngine {
                 incumbent,
             );
         }
-        let result = self.optimize_grant_classes(root, base_goal, admissible_set, classes);
-        if result
-            .as_ref()
-            .is_err_and(|error| error.is_query_canceled())
-        {
-            return result;
-        }
-        if self.memo.control().deadline_reached() {
+        let result = self.optimize_grant_classes(root, base_goal, admissible_set, classes)?;
+        if self.memo.control().deadline_reached() || result.winners.is_empty() {
             self.record_search_checkpoints(root);
-            let fallback = result.or_else(|_| incumbent);
+            let fallback = if result.winners.is_empty() {
+                incumbent
+            } else {
+                Ok(result)
+            };
             return self.stop_with_snapshot_or_fallback(
                 root,
                 base_goal,
@@ -4414,12 +4407,10 @@ impl CascadesEngine {
                 fallback,
             );
         }
-        if result.is_ok() {
-            self.diagnostic_search_complete = self.memo.search_obligations_empty();
-            self.note_search_stop(self.search_stop());
-        }
+        self.diagnostic_search_complete = self.memo.search_obligations_empty();
+        self.note_search_stop(self.search_stop());
         self.record_search_checkpoints(root);
-        result
+        Ok(result)
     }
 
     fn quality_grant_snapshot(
@@ -4476,7 +4467,6 @@ impl CascadesEngine {
         let root = self.memo.canonical_group(root);
         let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
         let mut winners = Vec::with_capacity(classes.len());
-        let mut last_infeasible = None;
         for class in classes.values().copied() {
             let goal = OptimizationGoal {
                 grant: sensitivity.goal_for(admissible_set, class),
@@ -4500,16 +4490,11 @@ impl CascadesEngine {
                 .cloned()
             {
                 winners.push(self.freeze_grant_winner(root, class.id, goal, winner)?);
-            } else {
-                last_infeasible = Some(goal);
             }
         }
         super::verifier::MemoVerifier::verify(&self.memo, None)?;
         if let GrantSensitivitySummary::Shared(proof) = &sensitivity {
             verify_grant_sharing(&self.memo, &self.registry, proof)?;
-        }
-        if winners.is_empty() {
-            return Err(self.infeasible_goal_error(root, last_infeasible.unwrap_or(base_goal)));
         }
         Ok(GrantOptimization {
             grant_search: None,
@@ -9881,8 +9866,8 @@ impl CascadesEngine {
             })
             .unwrap_or_default();
         let required = self.memo.required(goal.required);
-        paro_error::internal(format!(
-            "no feasible physical plan exists for Memo group {group:?} with goal {goal:?}; required={required:?}, logical={logical:?}, physical={physical:?}"
+        paro_error::configuration_limit_exceeded(format!(
+            "no verified executable physical plan obtained for Memo group {group:?} with goal {goal:?}; infeasibility is not proven; required={required:?}, logical={logical:?}, physical={physical:?}"
         ))
     }
 }
