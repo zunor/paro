@@ -14,6 +14,7 @@ manual-slice-fill = "allow"
 
 [dependencies]
 paro-common = { workspace = true }
+paro-context = { workspace = true }
 paro-catalog = { workspace = true }
 paro-session = { workspace = true }
 paro-instance = { workspace = true }

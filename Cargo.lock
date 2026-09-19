@@ -1840,6 +1840,7 @@ dependencies = [
  "itoa",
  "paro-catalog",
  "paro-common",
+ "paro-context",
  "paro-execution",
  "paro-function",
  "paro-instance",
