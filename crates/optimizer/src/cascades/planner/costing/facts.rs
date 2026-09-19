@@ -136,8 +136,10 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
         runtime_filter_build_domain_column: None,
+        runtime_filter_build_key: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_build_left_domain_column: None,
+        runtime_filter_build_left_key: None,
         runtime_filter_key_types,
     };
     if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
@@ -261,8 +263,10 @@ pub(in crate::cascades::planner) fn planner_native_cost_facts<Child>(
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
         runtime_filter_build_domain_column: None,
+        runtime_filter_build_key: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_build_left_domain_column: None,
+        runtime_filter_build_left_key: None,
         runtime_filter_key_types,
     };
     if let (LogicalOperator::Join(Join::Comparison(join)), [left, right]) = (operator, inputs) {
@@ -311,6 +315,8 @@ fn fill_runtime_filter_cost_facts<Child>(
         join_key_domain_column(join, binding_ids, JoinKeySide::Right, &right_bindings);
     result.runtime_filter_build_left_domain_column =
         join_key_domain_column(join, binding_ids, JoinKeySide::Left, &left_bindings);
+    result.runtime_filter_build_key = join_key_identity(&right_keys, &right_bindings);
+    result.runtime_filter_build_left_key = join_key_identity(&left_keys, &left_bindings);
 }
 
 pub(in crate::cascades::planner) fn planner_row_width_from_layout(
@@ -474,15 +480,15 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
             .or(template.runtime_filter_build_distinct_expected),
         runtime_filter_build_domain_identity: children
             .get(1)
-            .zip(template.runtime_filter_build_domain_column)
-            .and_then(|(group, column)| {
-                runtime_filter_domain_identity(memo, *group, column, JoinKeySide::Right)
+            .zip(template.runtime_filter_build_key)
+            .and_then(|(group, key)| {
+                runtime_filter_domain_identity(memo, *group, key, JoinKeySide::Right)
             }),
         runtime_filter_build_left_domain_identity: children
             .first()
-            .zip(template.runtime_filter_build_left_domain_column)
-            .and_then(|(group, column)| {
-                runtime_filter_domain_identity(memo, *group, column, JoinKeySide::Left)
+            .zip(template.runtime_filter_build_left_key)
+            .and_then(|(group, key)| {
+                runtime_filter_domain_identity(memo, *group, key, JoinKeySide::Left)
             }),
         runtime_filter_build_left_distinct_expected: children
             .first()
@@ -566,10 +572,60 @@ fn join_key_domain_column<Child>(
         .copied()
 }
 
+/// The key has a semantic identity even when no single-column statistic can
+/// estimate its joint NDV. Reuse the expression encoder; include the input
+/// layout so positional references cannot alias a different column binding.
+fn join_key_identity(keys: &[&Expression], bindings: &[ColumnBinding]) -> Option<Fingerprint> {
+    if keys.is_empty() {
+        return None;
+    }
+    let mut identity = StableFingerprintBuilder::default();
+    identity.write_bytes(b"paro.runtime-filter-key.v1");
+    identity.write_u64(bindings.len() as u64);
+    for binding in bindings {
+        identity.write_fingerprint(binding_fingerprint(*binding));
+    }
+    identity.write_u64(keys.len() as u64);
+    // Keep the executable tuple order and multiplicity. Reordering an equality
+    // conjunction is logically harmless, but does not prove the same encoded
+    // runtime-filter key. A conservative distinct identity is safe here.
+    for key in keys {
+        identity.write_fingerprint(expression_fingerprint(key));
+    }
+    Some(identity.finish())
+}
+
+#[cfg(test)]
+mod key_identity_tests {
+    use super::*;
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::ReferenceExpression;
+
+    #[test]
+    fn compound_keys_preserve_tuple_order_and_input_layout() {
+        let key = |index| {
+            Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into())
+        };
+        let a = key(0);
+        let b = key(1);
+        let bindings = [ColumnBinding::new(7, 0), ColumnBinding::new(7, 1)];
+        let both = join_key_identity(&[&a, &b], &bindings).unwrap();
+        assert_eq!(Some(both), join_key_identity(&[&a, &b], &bindings));
+        assert_ne!(Some(both), join_key_identity(&[&b, &a], &bindings));
+        assert_ne!(Some(both), join_key_identity(&[&a, &b, &a], &bindings));
+        assert_ne!(Some(both), join_key_identity(&[&a], &bindings));
+        assert_ne!(
+            Some(both),
+            join_key_identity(&[&a, &b], &[bindings[1], bindings[0]])
+        );
+        assert_eq!(join_key_identity(&[], &bindings), None);
+    }
+}
+
 /// Return the identity of a logical runtime-filter build domain.
 ///
 /// A physical implementation is intentionally absent: all implementations
-/// of the same canonical Memo group and key column may reuse the semantic
+/// of the same canonical Memo group and complete key may reuse the semantic
 /// proof.  The group identity prevents two nested, same-shaped relations from
 /// being deduplicated merely because they have the same operator fingerprint;
 /// fact/statistics snapshots make a proof stale when the relation's evidence
@@ -578,15 +634,15 @@ fn join_key_domain_column<Child>(
 fn runtime_filter_domain_identity(
     memo: &Memo,
     group: GroupId,
-    column: ColumnId,
+    key: Fingerprint,
     side: JoinKeySide,
 ) -> Option<Fingerprint> {
     let group = memo.canonical_group(group);
     let group_ref = memo.group(group)?;
     let mut identity = StableFingerprintBuilder::default();
-    identity.write_bytes(b"paro.runtime-filter-build-domain.v2");
+    identity.write_bytes(b"paro.runtime-filter-build-domain.v3");
     identity.write_u64(group.0 as u64);
-    identity.write_u64(column.0 as u64);
+    identity.write_fingerprint(key);
     identity.write_u64(match side {
         JoinKeySide::Left => 0,
         JoinKeySide::Right => 1,

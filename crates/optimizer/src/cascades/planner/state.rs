@@ -662,10 +662,14 @@ pub(super) struct PlannerCostFacts {
     /// Stable output identity used to resolve the current build domain from
     /// the right child group at cost-composition time.
     pub(super) runtime_filter_build_domain_column: Option<ColumnId>,
+    /// Identity of all equality-key expressions and their input layout.
+    /// Unlike a single-column NDV lookup this exists for composite keys.
+    pub(super) runtime_filter_build_key: Option<Fingerprint>,
     /// Snapshot estimate for the logical-left key domain when a physical
     /// implementation inverts build and probe.
     pub(super) runtime_filter_build_left_distinct_expected: Option<u64>,
     pub(super) runtime_filter_build_left_domain_column: Option<ColumnId>,
+    pub(super) runtime_filter_build_left_key: Option<Fingerprint>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }
 

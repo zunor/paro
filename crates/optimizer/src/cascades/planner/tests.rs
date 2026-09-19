@@ -554,8 +554,10 @@ fn expression_cost_facts_read_current_group_cardinality() {
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
         runtime_filter_build_domain_column: None,
+        runtime_filter_build_key: None,
         runtime_filter_build_left_distinct_expected: Some(100),
         runtime_filter_build_left_domain_column: Some(ColumnId::new(0)),
+        runtime_filter_build_left_key: Some(Fingerprint(42)),
         runtime_filter_key_types: Box::new([]),
     };
 
@@ -1224,6 +1226,33 @@ fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
                 .collect()
         })
         .collect()
+}
+
+#[test]
+fn composite_equality_runtime_filter_has_identity_without_single_column_ndv() {
+    let bind_context = BindContext::new();
+    let reference = |index| Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into());
+    let two_columns = |index, oid, name, rows| OwnedLogicalPlan::synthetic(
+        LogicalOperator::Projection(Projection::new(index + 2,
+            test_base_get(index, oid, name, rows), vec![reference(0), reference(0)])));
+    let mut plan = OwnedLogicalPlan::new(&bind_context,
+        LogicalOperator::Join(Join::comparison(JoinType::Inner,
+            two_columns(0, 991, "composite_build", 16),
+            two_columns(1, 992, "composite_probe", 128),
+            vec![JoinCondition::equality(reference(0), reference(0)),
+                 JoinCondition::equality(reference(1), reference(1))])));
+    plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(16));
+    let facts = planner_cost_facts(&plan, &HashMap::new(), &BindingCatalog::default(),
+        paro_storage::rowset::scan_cost::ScanAccessCostModel::default()).unwrap();
+    assert!(facts.runtime_filter_build_domain_column.is_none());
+    assert!(facts.runtime_filter_build_left_domain_column.is_none());
+    assert!(facts.runtime_filter_build_key.is_some());
+    assert!(facts.runtime_filter_build_left_key.is_some());
+    let input = MemoBuilder::build(plan, bind_context, SearchBudget::default()).unwrap();
+    // The optional build-left and build-right implementations must both be
+    // constructible even though a joint NDV is deliberately not guessed.
+    let output = input.optimize(&test_grant_classes()).unwrap();
+    assert!(!output.variants.is_empty());
 }
 
 pub(super) fn test_base_get(
