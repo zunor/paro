@@ -1878,6 +1878,32 @@ fn engine_with_budget(
 }
 
 #[test]
+fn optional_phase_enumerates_implementations_without_a_logical_publication() {
+    let (mut engine, root, goal) = engine_with_budget(Default::default());
+    let mut registry = ImplementationRegistry::default();
+    for (id, score, mandatory) in [(40, 100.0, true), (41, 1.0, false)] {
+        registry.register_implementation(FixedLeafImplementation {
+            id: ImplementationId(id), score, mandatory,
+        }).unwrap();
+    }
+    // No transformations: the logical ReadSet remains exactly the same when
+    // optional physical implementations become eligible.
+    engine.registry = registry;
+    let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
+    assert_eq!(engine.memo.group(root).unwrap().logical_exprs().len(), 1);
+    assert_eq!(engine.memo.group(root).unwrap().physical_exprs().len(), 2);
+    assert_eq!(engine.memo.physical_expr(winner.expression).unwrap().key.implementation,
+        ImplementationId(41));
+    assert_eq!(winner.cost.score.range.expected, 1.0);
+    assert!(engine.memo.search_obligations_empty());
+    let evaluations = engine.physical_implementation_expression_evaluations;
+    let publications = engine.memo.published_winner_count();
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(engine.physical_implementation_expression_evaluations, evaluations);
+    assert_eq!(engine.memo.published_winner_count(), publications);
+}
+
+#[test]
 fn engine_group_merge_redirects_tasks_and_discards_stale_transform_state() {
     let (mut engine, canonical_source, goal) = engine(0);
     let secondary = engine.memo_mut().create_group(

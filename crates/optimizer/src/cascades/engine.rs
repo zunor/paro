@@ -1012,6 +1012,9 @@ pub struct SearchMilestones {
 #[derive(Debug, Clone)]
 struct PhysicalTaskState {
     task: TaskId,
+    /// A completed mandatory implementation prefix does not cover optional
+    /// implementations, even when the logical/fact ReadSet is unchanged.
+    mandatory_only: bool,
     reads: ReadSet,
     dependencies: Box<[(GroupId, OptimizationGoal)]>,
     recipe_cursor: u64,
@@ -7769,7 +7772,11 @@ impl CascadesEngine {
             .unwrap_or_default();
         let completion_pending = self.physical_completion_pending.remove(&cache_key);
         let resident_state = self.physical_task_cache.get(&cache_key).cloned();
+        let implementation_phase_changed = resident_state
+            .as_ref()
+            .is_some_and(|entry| entry.mandatory_only != self.mandatory_only);
         let fast_reuse = !self.physical_full_recost.contains(&cache_key)
+            && !implementation_phase_changed
             && !self.physical_dirty_recipes.contains_key(&cache_key)
             && !completion_pending
             && resident_state
@@ -7827,7 +7834,8 @@ impl CascadesEngine {
                     .physical_task_cache
                     .get(&cache_key)
                     .is_some_and(|cached| next_recipe_sequence > cached.recipe_cursor)
-                    || force_full_recost;
+                    || force_full_recost
+                    || implementation_phase_changed;
                 let incomplete = outcome.as_ref().is_some_and(|outcome| {
                     matches!(
                         outcome,
@@ -7967,18 +7975,19 @@ impl CascadesEngine {
                 .unwrap_or_default()
         };
         let recipe_start = if full_recost { 0 } else { recipe_cursor };
-        let local_logical_frontier_changed = physical_local_logical_frontier_changed(
-            group,
-            previous_reads.as_ref(),
-            &requested_read_set,
-        );
-        let enumerate_local_implementations = local_logical_frontier_changed;
+        let local_implementation_domain_changed = implementation_phase_changed
+            || physical_local_logical_frontier_changed(
+                group,
+                previous_reads.as_ref(),
+                &requested_read_set,
+            );
+        let enumerate_local_implementations = local_implementation_domain_changed;
         let task_has_incomplete_cursor = self
             .task_registry
             .task(task)
             .and_then(|record| self.task_registry.cursor(record.cursor))
             .is_some_and(|cursor| !cursor.complete);
-        let has_recipe_work = local_logical_frontier_changed
+        let has_recipe_work = local_implementation_domain_changed
             || self.has_physical_recipe_work(
                 group,
                 goal,
@@ -7987,7 +7996,7 @@ impl CascadesEngine {
                 dirty_recipes.as_ref(),
             );
         if completion_pending
-            && !local_logical_frontier_changed
+            && !local_implementation_domain_changed
             && dirty_recipes.as_ref().is_none_or(BTreeSet::is_empty)
             && recipe_start == recipe_cursor
             && !self.has_physical_recipe_work(
@@ -8062,6 +8071,7 @@ impl CascadesEngine {
                 cache_key,
                 PhysicalTaskState {
                     task,
+                    mandatory_only: self.mandatory_only,
                     reads: requested_read_set.clone(),
                     dependencies: self.physical_dependency_snapshot(group, goal),
                     recipe_cursor: recipe_count,
@@ -8112,6 +8122,7 @@ impl CascadesEngine {
                 cache_key,
                 PhysicalTaskState {
                     task,
+                    mandatory_only: self.mandatory_only,
                     reads: requested_read_set.clone(),
                     dependencies: self.physical_dependency_snapshot(group, goal),
                     recipe_cursor: recipe_count,
@@ -8253,6 +8264,7 @@ impl CascadesEngine {
                     cache_key,
                     PhysicalTaskState {
                         task,
+                        mandatory_only: self.mandatory_only,
                         reads: post_child_reads,
                         dependencies: self.physical_dependency_snapshot(group, goal),
                         recipe_cursor: cursor_position,
