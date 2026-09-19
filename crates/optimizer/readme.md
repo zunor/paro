@@ -49,10 +49,10 @@ Paths below are relative to this crate.
 | Quality policy | [cascades/quality.rs](src/cascades/quality.rs), [quality_production.rs](src/cascades/engine/quality_production.rs) | Candidate coverage, missing requirements and policy-driven handoff |
 | Specialized search | [join_order/](src/join_order/), [cte/](src/cte/), [graph/](src/graph/), [search/](src/search/) | Domain-specific normalization and candidate generation |
 | Statistics | [statistics/](src/statistics/), [cost_model.rs](src/cost_model.rs) | Evidence propagation and estimation |
-| Physical contracts | [physical/requirements.rs](src/physical/requirements.rs), [physical/cost.rs](src/physical/cost.rs), [physical/resources.rs](src/physical/resources.rs) | Properties, work/cost composition and resource feasibility |
+| Physical contracts | [physical/requirements.rs](src/physical/requirements.rs), [physical/cost.rs](src/physical/cost.rs), [physical/objective.rs](src/physical/objective.rs), [physical/resources.rs](src/physical/resources.rs) | Properties, work/cost composition, actual objective ordering and resource feasibility |
 | Portfolio / extraction | [physical/portfolio.rs](src/physical/portfolio.rs), [physical/extraction/](src/physical/extraction/) | Grant variants and physical construction |
 | Verification | [cascades/verifier.rs](src/cascades/verifier.rs), [physical/verifier.rs](src/physical/verifier.rs), [verify.rs](src/verify.rs) | Memo, physical and logical invariants |
-| Observability | [profiler.rs](src/profiler.rs), [work_partition.rs](src/work_partition.rs), [diagnostic_snapshot.rs](src/cascades/memo/diagnostic_snapshot.rs) | Existing profiling and bounded snapshots; inputs to the Trace Matrix convergence work |
+| Observability | [profiler.rs](src/profiler.rs), [work_partition.rs](src/work_partition.rs), [b3.rs](src/work_partition/b3.rs), [diagnostic_snapshot.rs](src/cascades/memo/diagnostic_snapshot.rs), [compiler boundary](../compiler/src/compile.rs) | Profiling scopes, detailed attribution and bounded snapshots; actual emitters also live in optimizer.rs, cascades/engine.rs and cascades/planner/mod.rs |
 
 Names and tables here are navigation, not a second implementation registry.
 Update links when moving code; keep operator/rule registration authoritative
@@ -75,6 +75,11 @@ already satisfies it.
   cardinality using arrival order or a smaller fingerprint.
 - Observed evidence, estimated points, proven bounds and unknown values are
   different. Missing information must not silently become one row.
+- Cardinality measurements must match the estimate's node, port, occurrence,
+  phase and unit. Join output estimates are not estimates of build input rows.
+  Estimator changes and cost/selection quality share a release gate; improving
+  one scalar does not establish query-level improvement. Do not delay a
+  correctness fix until full calibration, or restore wrong semantics for speed.
 - Domain proofs and evaluation occurrences have different identities.
   Runtime-filter bypass requires actual coverage of all relevant input paths,
   not just an eligible join specification.
@@ -89,6 +94,9 @@ already satisfies it.
   archived choices still referenced by a parent or frozen candidate.
 - Parent runtime filters, shared producers and phase composition can change
   child ordering. A local scalar winner is not always sufficient.
+- Expected score is not the complete objective ordering. Validate the actual
+  comparator, feasibility and handoff policy against exact admitted plans;
+  scalar correlation alone cannot certify selection quality.
 - A candidate estimate is not a lower bound for every legal completion.
   Bound proofs require a matching context and a valid composition law.
 - Cancellation, rollback and budget rejection must leave no partial published
@@ -106,8 +114,9 @@ already satisfies it.
   An unsearched class is not an executable fallback.
 - Frozen candidates and eventual execution images must preserve exact
   dependencies, properties, choices and resource contracts.
-- Deferring construction moves work; it does not make that work free.
-  Admission and first-statement accounting must include deferred work.
+- Deferred construction is not free if it is eventually requested.
+  Distinguish unused variants never built from work moved to admission; count
+  actual materializations in admission and first-statement accounting.
 
 ## Completion vocabulary
 
@@ -135,6 +144,11 @@ sources. The proposed
 unifies their identities, units, causal links, bounds and lifecycle. That link
 assumes a sibling checkout of the design repository; the unified interface is
 not claimed to be implemented by this README.
+
+Attribution has both scope definitions and call-site owners. When integrating
+the finer F1/F3 ledger, map the compiler, optimizer, engine and planner emitters
+along with their registered scopes; do not drop a breakdown because another
+branch lacks its field name. Historical bucket labels are not permanent APIs.
 
 When extending diagnostics:
 
@@ -185,7 +199,10 @@ For performance work, first read the repository
 Use the established first-statement harness, fixed source/binary/data/SQL
 identities, actual resource envelopes and complete result validation. Do not
 run concurrent benchmark runners or compare a diagnostic cohort with a normal
-one.
+one. Pin the competitor build, extensions and settings as well; a parity claim
+does not transfer to a new competitor version. Apply the
+[comparison validity contract](../../../paro-docs-design/optimizer/optimizer-convergence-design.md#25-比较合法性先验证判据再用判据裁决)
+before drawing conclusions from ratios, cost ranks or q-error.
 
 ## Design and evidence maintenance
 
