@@ -165,8 +165,14 @@ introduced by this diagnostic. Q02 and Q39 remain failed gates.
 
 Workspace `cargo check --workspace --locked` passes. The full workspace test
 run reports 87 result summaries: **6843 passed, zero failed, 85 ignored**.
-Logs: `c0/workspace-check.log`, `c0/workspace-tests.log`. The strict Clippy
-gate uses the repository's `-- -D warnings`, not a warning-tolerant exit code.
+Logs: `c0/workspace-check.log`, `c0/workspace-tests.log`. Strict Clippy
+(`cargo clippy --workspace --all-targets --locked -- -D warnings`) fails on
+`context/statement_context.rs::capture` (too many arguments) and the
+`storage/rowset/column/column_iterator.rs` test fixture (field reassignment
+after Default). Log: `c0/workspace-clippy-strict.log`. The warning-tolerant
+Clippy pass is not counted as passing this gate. Its remaining optimizer
+warnings are also retained in `c0/workspace-clippy.log`; no lint suppression
+or blanket automatic fix was applied.
 SQL regress, 99-query certification and normal performance gates have not
 been completed. Q39 still needs an admitted numerical oracle contract;
 fixing three original internal errors does not certify the whole corpus.
