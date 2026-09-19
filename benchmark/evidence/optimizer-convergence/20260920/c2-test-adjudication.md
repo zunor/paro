@@ -22,5 +22,17 @@ The seven RF/build cases are: `nested_filters_do_not_merge_distinct_build_domain
 
 Logs are retained in the private archive: `single-class-fixture-sharing.log`,
 `single-class-fixture-mark.log`, `native-deferral-contract-tests.log`.
-These corrections do not prove all 99 queries or SQL regress. Eleven original
-failures remain unresolved blockers, not accepted permanent exclusions.
+These fixture corrections did not prove all 99 queries or SQL regress.
+
+## Subsequent root-cause closure
+
+The eleven assertions kept above now pass **unchanged** after the
+[implementation-phase coverage repair](c2-implementation-phase.md).
+They were not obsolete expectations: resident progress omitted the
+mandatory-to-optional domain transition and skipped legal implementations
+when logical membership did not change. Full suite with the dedicated
+no-logical-publication regression: 1344 pass / 0 fail. The table preserves
+the earlier triage rather than rewriting it as if this cause was known then.
+
+This closes the recorded optimizer unit failures, not the separate SQL facet
+lifetime and Q39 result-contract gates.

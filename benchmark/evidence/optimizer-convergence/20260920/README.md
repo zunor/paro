@@ -34,11 +34,11 @@ evidence, data seed, worktree, build directory or Git history has been deleted.
 | Task | Status / next evidence |
 | --- | --- |
 | C0-a preservation and isolation | Restore verified; clean integration baseline created; fixture-repaired baseline 1319 pass / 15 fail |
-| C0-b F2 attribution | Q39 original binary reproduced; clean parent/probe attribution in progress; F2 isolated from integration |
+| C0-b F2 attribution | Original binary and clean parent/probe Q39 repeated; historical dirty build inputs still missing; F2 isolated, not admitted |
 | C2-1 Q39 | Full rows captured; independent integer-moment/80-digit oracle under investigation |
 | C2-2 partial feasible grants | Engine/admission slice committed; [contract and tests](c2-partial-grants.md); SQL coverage outstanding |
-| C2-3 facet ownership | Pending |
-| C2-4 failure adjudication | Baseline test compilation restored first; assertions unchanged |
+| C2-3 facet ownership | Declaration deduplication/rollback fixed; current forest admission vs surviving candidate lifetime remains a SQL blocker |
+| C2-4 failure adjudication | Four fixture cases adjudicated; implementation-phase omission fixed; optimizer suite now 1344 pass / 0 fail |
 | C1 Trace Matrix | Pending; existing evidence interfaces suffice for C0/C2 |
 | C3 + C3-M | Pending C2 and registered joint admission experiment |
 | C4 | Not run; correctness and joint gates outstanding |
@@ -114,6 +114,33 @@ mandatory. Historical red tests require current causal adjudication; neither
 the old “16 retained” list nor runner `new=0` is a baseline-pass certificate.
 
 ## Current release status
+
+### C2 implemented slices and unresolved SQL gates
+
+- [Partial grant coverage](c2-partial-grants.md) preserves feasible candidates
+  and surfaces original implementation errors instead of claiming all classes
+  must have mandatory winners.
+- [Facet declarations](c2-facet-declarations.md) have one canonical contract,
+  including full deferred declarations and rollback. Q01 and Q23 now expose
+  a later failure: an already priced candidate's facet becomes deferred in a
+  newer forest, while the recipe/candidate still references it. The verifier
+  is not weakened to accept this silently; lifecycle repair remains open.
+- [Composite RF key identity](c2-composite-rf-identity.md) is independent of a
+  single-column NDV lookup. Release Q05 on committed source `5d39d0b5`, with
+  verifier enabled and observed-server configuration validated, returns 100
+  rows with exact typed multiset equality. Full raw capture is retained as
+  `c0/q05-composite-key-r1.json` in the private archive. This is correctness
+  evidence, not a normal performance sample or a 20-query pass claim.
+- [Implementation phase coverage](c2-implementation-phase.md) restores optional
+  physical enumeration when no logical expression changed. The previous
+  mandatory-only recipe prefix was incorrectly reused as completed optional
+  search. The new regression and all original remaining assertions pass:
+  **1344 optimizer tests passed, zero failed**. Restored legal work can alter
+  plans and counts; this is not advertised as a speedup.
+
+Whole-workspace check/test/clippy, SQL regress, 99-query certification and
+normal performance gates have not been completed. Q39 still needs an admitted
+numerical oracle contract; Q01/Q23 still block facet lifetime certification.
 
 F2 is not admitted to the integration baseline. The known historical failure
 and its incomplete attribution remain open. No default policy, estimator,
