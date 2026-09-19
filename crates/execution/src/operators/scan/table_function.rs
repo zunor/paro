@@ -372,9 +372,7 @@ fn populate_paro_pg_settings(
         .as_any_mut()
         .downcast_mut::<ParoPgSettingsGlobalState>()
     {
-        populate_settings_data(
-            state,
-            provider
+        let mut rows: Vec<SettingRowData> = provider
                 .current_settings()
                 .into_iter()
                 .map(|row| SettingRowData {
@@ -387,8 +385,18 @@ fn populate_paro_pg_settings(
                     vartype: row.vartype,
                     context: row.context,
                 })
-                .collect(),
-        );
+                .collect();
+        rows.extend(paro_context::diagnostic_environment().iter().map(|setting| SettingRowData {
+            name: format!("paro_diagnostic/{}", setting.name),
+            setting: setting.value.as_deref().unwrap_or("<unset>").to_string(),
+            unit: None,
+            category: "Server Diagnostics".to_string(),
+            short_desc: Some("Effective process-start diagnostic environment (read-only)".to_string()),
+            source: "server_startup".to_string(),
+            vartype: "string".to_string(),
+            context: "internal".to_string(),
+        }));
+        populate_settings_data(state, rows);
     }
 }
 

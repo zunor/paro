@@ -5,6 +5,7 @@
 
 mod attached_databases;
 mod ddl;
+mod diagnostic_environment;
 mod effective_settings;
 mod execution_resources;
 mod memory_governance;
@@ -36,6 +37,9 @@ pub use attached_databases::{
     DatabaseSnapshotIdentity,
 };
 pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
+pub use diagnostic_environment::{
+    initialize_diagnostic_environment, snapshot as diagnostic_environment,
+};
 pub use effective_settings::EffectiveSettings;
 pub use execution_resources::ExecutionResources;
 pub use memory_governance::{

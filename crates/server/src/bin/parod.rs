@@ -56,6 +56,9 @@ async fn async_main() -> anyhow::Result<()> {
 
     args.apply_to(&mut config);
 
+    // Freeze what the server observed before any session can query it.
+    paro_context::initialize_diagnostic_environment();
+
     let log_manager = LogManager::init(config.logging.clone())
         .map_err(|e| anyhow::anyhow!("Failed to initialize logging: {}", e))?;
 
