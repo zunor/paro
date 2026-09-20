@@ -1,0 +1,76 @@
+CREATE TABLE score_identity(id INT, content VARCHAR);
+CREATE TABLE
+
+INSERT INTO score_identity VALUES
+    (1, 'vector database vector'), (2, 'vector database'),
+    (3, 'database vector'), (4, 'vector'), (5, 'noise');
+INSERT 0 5
+
+SELECT id, ts_rank(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+id	score
+1	2.375000
+2	2.000000
+3	2.000000
+
+CREATE INDEX score_identity_index ON score_identity USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+SELECT id, ts_rank(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+id	score
+1	2.375000
+2	2.000000
+3	2.000000
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+id
+1
+
+INSERT INTO score_identity VALUES (6, 'unrelated document');
+INSERT 0 1
+
+SELECT id, ts_rank(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+id	score
+1	2.375000
+2	2.000000
+3	2.000000
+
+BEGIN;
+BEGIN
+
+INSERT INTO score_identity VALUES (7, 'vector vector database database');
+INSERT 0 1
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+id
+7
+
+ROLLBACK;
+ROLLBACK
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+id
+1
+
+DROP TABLE score_identity;
+DROP TABLE
