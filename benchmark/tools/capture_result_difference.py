@@ -115,12 +115,15 @@ def main():
                     # psycopg extended protocol accepts one statement at a time.
                     for ordinal, statement in enumerate(statements):
                         sql = statement.query
+                        report["active_stage"] = {"ordinal": ordinal, "engine": "duckdb", "operation": "execute"}
                         oracle.execute(sql)
                         expected_rows = oracle.fetchall()
                         expected_schema = duckdb_schema(oracle.description)
+                        report["active_stage"] = {"ordinal": ordinal, "engine": "paro", "operation": "execute"}
                         cursor.execute(sql)
                         actual_rows = cursor.fetchall()
                         actual_schema = paro_schema(cursor.description)
+                        report["active_stage"]["operation"] = "compare"
                         item = {
                             "ordinal": ordinal,
                             "actual_schema": [asdict(c) for c in actual_schema],
@@ -156,6 +159,7 @@ def main():
                         report["result_sets"].append(item)
     except Exception as error:
         report["execution_error"] = f"{type(error).__name__}: {error}"
+        report["sqlstate"] = getattr(error, "sqlstate", None)
         raise
     finally:
         args.output.write_text(json.dumps(report, indent=2) + "\n")
