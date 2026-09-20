@@ -97,6 +97,34 @@ errors even at capacity, retained-result capacity, cache bypass, cancellation,
 artifact neutrality and bounded encoding. Raw logs are retained under the T0
 private recovery/evidence root recorded in `compile-observation-baseline.md`.
 
-Final clean workspace, wire/backpressure and regress gates must be recorded
-before claiming SummaryReady. T2–T5, legacy output retirement, C2's remaining
-regress contracts and F2 admission are separate and remain unclaimed.
+T0 is integrated into re-op with the user's mixed delta retained; see
+`compile-integration-review.json`. T1's non-executing Summary implementation is
+delivered. It is not TraceMatrixReady or a complete cross-run receipt protocol.
+
+Final clean source `d996be77` and its dev server binary are recorded in
+[`compile-summary-validation.json`](compile-summary-validation.json):
+
+| Gate | Result |
+| --- | --- |
+| workspace check / strict all-target Clippy | pass |
+| workspace tests | 6859 pass, 0 fail, 85 pre-existing ignored |
+| benchmark tests | 187 pass; one pre-existing pytest warning |
+| regress harness tests | 101 pass, one pre-existing skipped |
+| real pgwire query/CTE TEXT/JSON golden + schema reader | pass |
+| cancellation, failed writer, dropped/backpressured request, retained capacity | pass |
+| target non-execution, original errors, cache bypass, physical artifact neutrality | pass |
+| full SQL regress, fresh test directory, verify on | 177 pass, eight existing failures |
+
+All eight final `.actual` files are byte-identical to the preserved pre-T1 run
+(25 unresolved EXPLAIN blocks). They remain failures, not blessed expectations.
+A rerun in the already-used regression data directory produced a ninth failure:
+`prepared_cursor_t` contained each fixture value twice and EXECUTE reported six
+rows instead of three. That run/data/actual is retained; the final fresh-directory
+run of the same binary has no such failure. Initial Python import-context and
+server-readiness failures are also retained, not counted as passing attempts.
+
+No performance/observer-overhead campaign was run. Functional artifact
+neutrality is not timing neutrality near a deadline. No latency, parity, C2/F2
+admission or complete Matrix claim is made. The full 99-query corpus was not
+rerun for this request-observation change. T2–T5 and legacy output retirement
+remain separate; no legacy DiagnosticOutput or BehaviorExperiment was removed.

@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "scope": "T0 / non-executing T1 Summary only",
+  "source": "d996be77efa58e8f035b734f56cfb5ce6c2150fa",
+  "crates_tree": "56681a4d3aef353b6e05e09c47ce640c3e945e17",
+  "source_clean": true,
+  "build_profile": "dev; not performance evidence",
+  "binary_sha256": "34aced3b72e2d98926a85fa03043fb9f9737cb6cf359c4b818481c3ae68efca1",
+  "cargo_lock_sha256": "26d5f1f12ea0a418d78523cb1645f6cb8501109f9bc8a0c07a073e150a81c23e",
+  "harness_sha256": "6715978b9ec02bbc0aaff78533790b4240fff44b0b0d03f19b123c542ceea92c",
+  "json_golden_sha256": "5d6d6bf63073f1ff5bb5ebdb14651187c0f27ae92792fd1b7b94833c19774f11",
+  "text_golden_sha256": "db9d884821ab3ecb89edcff4c34724a87b0b8e5f8c5b1a2b837aaf0593e4d5f5",
+  "archive": "/Users/linjunhong/paro-convergence-archive/20260920/trace-t0-A1tvuO",
+  "logs": {
+    "t1-workspace-test-d996be77.log": "54416a184c9677ddee479cb876e9a0748e45991b77a043c6eda806f163006a42",
+    "t1-workspace-check-d996be77.log": "587135969deacfe6b57656d1cba07d63f6020e27f840e9f91996e045c4470325",
+    "t1-workspace-clippy-d996be77.log": "c54d0a07fa515909ed750f6e430b849856104147acaeb7ac78609c5c899a6eb1",
+    "t1-benchmark-tests-root.log": "a90176e3e49ae1ab9e82b4e60d12e301fcbd3d3fe21aee025d6a6628d409ef42",
+    "t1-regress-unit.log": "4819f9b37656943b434f7ad053372c56fac06b1733024c5bfe8da8477dbe572a",
+    "t1-wire-d996be77-ready.log": "275ccd9e3c24326e79158863f0379b3f0e0e56a4847c39a87cbedbe6fa8cbbd2",
+    "t1-transport-tests.log": "f0fcf0aaf1bc9e27f2ee4e0fe77ecc5e29fd5cec8a25a965ab8501331c2bbd1c",
+    "t1-validator-wire.log": "85161937bc8ad62014607656a0545e76c0e5d13a2f021f7dd36f95693d3e72cc",
+    "main-integration-check.log": "1855e3dacde8242bd030a8efc2cc0f7617a8e7a2323c5da151bcd69f7436bef1",
+    "main-preintegration-audit.json": "d0503b62bb9e2101b5e83b958de4b64b27c9aa6948aa4df4983612d8300e6504",
+    "t1-regress-final-fresh.log": "6f25e188e333b61d7ae15ed4b9642194561798f41c8cd28d8c7cf5ad5c2ae327",
+    "t1-regress-final-comparison.json": "7dacc2a52878e583b830c26a7a837d60735c1d0e4263c9de23cebcbe65a88c6e"
+  },
+  "gates": {
+    "workspace_check": "pass",
+    "strict_clippy_all_targets": "pass",
+    "workspace_test": {
+      "passed": 6859,
+      "failed": 0,
+      "existing_ignored": 85
+    },
+    "benchmark_tests": {
+      "passed": 187,
+      "warnings": 1
+    },
+    "regress_unit": {
+      "passed": 101,
+      "existing_skipped": 1
+    },
+    "full_regress": {
+      "passed": 177,
+      "failed": 8,
+      "new_failed": 0,
+      "actuals_byte_identical": true,
+      "unresolved_explain_blocks": 25
+    },
+    "wire_text_json_golden": "pass",
+    "schema_validator": "pass",
+    "capacity_owner_release": "pass",
+    "cancel_and_backpressure": "pass",
+    "artifact_cache_neutrality_unit": "pass",
+    "main_mixed_check": "pass with retained build_with_search dead_code warning"
+  },
+  "not_run": {
+    "performance_campaign": "T0/T1 does not claim latency or observer overhead certification",
+    "99_query_corpus": "not rerun; T0/T1 request observation and no optimizer semantic changes",
+    "T2_T5": "out of authorized scope"
+  },
+  "limits": {
+    "retained_bytes": 1048576,
+    "encoded_bytes": 200000,
+    "process_ceiling": 67108864,
+    "combined_captures_and_retained_results": 8,
+    "reserved_bytes_per_capture": 2097152,
+    "rules": 64,
+    "variants": 16,
+    "events": 0
+  },
+  "open": [
+    "source-build/catalog/cross-run receipt association Uncovered",
+    "actual admission / ANALYZE / extended protocol belongs to T2",
+    "Detail belongs to T3; harness/old-output migration belongs to T4",
+    "C2 eight regress contracts unresolved; F2 not admitted"
+  ],
+  "retained_invalid_attempts": [
+    "t1-python-tests.log: combined harness import collision",
+    "t1-benchmark-tests.log: cwd import-path error",
+    "t1-wire-d996be77.log and t1-regress-d996be77.log: server not ready",
+    "t1-regress-d996be77-ready.log: reused directory, prepared_cursor values each duplicated; final fresh-directory run removes this failure"
+  ]
+}
