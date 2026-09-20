@@ -30,8 +30,9 @@ Thumbs.db
 # Local CI
 /.ci/
 
-# AI workflow
-.agents/
+# Shared agent guidance is tracked by default; local drafts opt out here.
+.agents/local/
+# Tool-specific local configuration is not shared.
 .kiro/
 .gemini/
 .cursor/

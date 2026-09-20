@@ -120,6 +120,10 @@ More focused docs live here:
 
 Contributions are welcome. Please open an issue to discuss significant changes before starting work.
 
+The [repository contributor guide](AGENTS.md) maps crate ownership, dependency
+boundaries and development workflows for both humans and coding agents.
+Shared, versioned task guidance lives in [.agents/skills](.agents/skills/).
+
 Before submitting a pull request:
 
 1. Run the static checks — `make static`

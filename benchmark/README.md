@@ -44,6 +44,27 @@ make -C benchmark ping
 
 ## Quick Start
 
+Use the selected checkout, not a hard-coded main-worktree path. Before builds,
+fixture setup or writes, inspect its HEAD/status and the ownership of the
+server, data directory and outputs. Preserve unrelated user changes. Controlled
+code comparisons need identified, isolated sources; a dirty-tree pilot is not
+automatically clean control/probe evidence. Reuse agreed worktrees rather than
+creating another large build/data copy by default.
+
+There are two workflows in this framework, not two benchmark implementations:
+
+- Engineering gates, policies, calibration and archive maintenance:
+  [paro-benchmark](../.agents/skills/paro-benchmark/SKILL.md).
+- Controlled cold/warm, cross-engine and model-quality experiments:
+  [paro-evidence](../.agents/skills/paro-evidence/SKILL.md) and `corpora/`.
+
+Skills are optional contributor guidance; the CLI and contracts in this
+repository remain usable without an agent installation. Discover commands with
+`make -C benchmark help`, the selected Python's `runner.py --help` and the
+intended subcommand's `--help`. Check Make expansion with `make -n`; a copied
+skill option list is not the CLI schema. Install declared dependencies only
+when needed for the authorized run, without silently upgrading pinned tools.
+
 For the external optimizer-correctness repositories and the mandatory JOB →
 CEB → TPC-DS → TPC-H → LDBC SNB BI sequence, see
 [`CORPORA.md`](CORPORA.md).
@@ -114,6 +135,14 @@ Suite manifests keep their explicit `[[include]]` order. Keep tight-memory
 workloads early there as well.
 
 ## Baseline Workflow
+
+Checking a gate does not authorize changing its reference or policy. The bless
+examples below are for explicitly authorized baseline maintenance only, after
+the selected policy's correctness, plan, environment and calibration guards.
+Missing references or failing results are not an instruction to bless. Policy
+evolution requires its own reviewed version change; do not use it to disguise a
+regression. SQL `.result` updates, archive publication and data/history cleanup
+are separate actions, not implied by a benchmark request.
 
 Current project policy:
 - Generic median-latency baseline comparison has been removed.
@@ -347,10 +376,35 @@ or `PARO_PID` / `.ci/parod.pid` when `--pid auto` is used.
 
 ## Output Files
 
-After each run:
+Current implementation (shared defaults, not run-isolated):
+
 - `benchmark/report/result.json`: full structured report
 - `benchmark/report/summary.md`: compact human-readable report
 - `benchmark/report/gate.json`: performance gate outcome and archive health
+
+Mixed/Divan source adapters also write under `report/<source>/`; SQL suites use
+the default result path. Retries and repeated bless measurements can overwrite
+earlier artifacts there. Until run/source/attempt
+isolation is implemented, serialize gate invocations sharing the output tree
+and disclose missing raw attempt evidence. Ad-hoc `runner.py run --output`
+can use a fresh parent directory, but changing just the JSON filename is not
+enough: `summary.md` is a sibling file. Do not create more worktrees just to
+obtain different report directories. The planned migration must retain all
+attempts, including initial failures, and explicitly pass output ownership
+through the runner, gate, source adapters, reporter and archive integration;
+it is not implemented merely by documenting `report/<run-id>/`.
+
+Filesystem isolation does not imply measurement isolation. Competing CPU,
+memory, I/O or shared fixture state can invalidate a comparison even with
+different report paths. Serialize performance runs on shared resources unless
+the registered experiment explicitly controls that interference. Declared
+mixed-concurrency workloads are distinct from accidental concurrent runners.
+
+For controlled experiments, retain all normal samples and explicit exclusions,
+keep diagnostic cohorts separate, and apply the repository's
+[comparison and evidence contracts](../crates/optimizer/readme.md#comparison-validity).
+The compact campaign/EXPLAIN contract described there is a migration target;
+current collectors must not be assumed to implement its bounds or receipts.
 
 If a query opts into explain sidecars, the JSON report also includes `explain_profile` with flattened operator rows.
 If memory collection is enabled, the JSON report additionally includes `memory_tags` and `spill_metrics`, and the Markdown summary adds explain / tag-delta / spill-delta sections.

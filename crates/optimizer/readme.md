@@ -149,13 +149,47 @@ search policy is not a proof over every possible SQL plan. A correct query
 result does not by itself certify plan quality, and a fast pilot does not
 certify production latency.
 
-## Diagnostics and Trace Matrix
+## Compile diagnostics
 
 The current profiler, exclusive work ledger and Memo snapshots are separate
-sources. Trace Matrix convergence targets common identities, units, causal
-links, bounds and lifecycle. This README does not claim the unified interface
-is implemented. The contributor contracts below are usable in a standalone
-clone; a separate design checkout is optional.
+sources. Diagnostics converge on one typed compile record with common
+identities, units, causal links, bounds and lifecycle. This README does not
+claim the unified interface is implemented. The contributor contracts below
+are usable in a standalone clone.
+
+The target public entry point is `EXPLAIN (COMPILE, FORMAT JSON)`, with TEXT
+rendered from the same typed record. This syntax is a planned deliverable, not
+a claim that the current parser accepts it. Earlier OPTIMIZER and bare COMPILE
+proposals are superseded, not retained as aliases. Ordinary EXPLAIN shows a
+plan; COMPILE observes its construction; ANALYZE measures actual execution.
+The optimizer is one producer in a compiler-wide record, not the owner of
+session or execution instrumentation.
+
+Summary is the default; `EXPLAIN (COMPILE, DETAIL, FORMAT JSON)` adds bounded
+records, not different search semantics. Without ANALYZE, the target is not
+executed: runtime/admission measurements are NotExecuted, not zero. COMPILE
+invokes the real target compiler exactly once, without an Explain wrapper in
+its Memo and without consuming or populating its statement-plan cache. Record
+ForcedCompile rather than claiming a normal SELECT cache miss. A subsequent
+`EXPLAIN (COMPILE, ANALYZE, FORMAT JSON)` integration must reuse that same
+compiled artifact and the existing runtime profiler, never compile twice.
+Unsupported syntax or statement/protocol combinations must fail explicitly.
+
+Keep the established compiler timer boundary. Parsing may precede that timer;
+a compiled portfolio may still need execution-time admission and lowering.
+CompiledArtifactReady is not ExecutionImageReady. Report expected and actual
+resource classes separately, without constructing unused images to fill a
+table. Sealed compile records can be linked to later execution records but
+must not be rewritten to hide deferred work. The output cannot measure its
+own future encoding, network drain or commit.
+
+Capacity must be enforced before capture allocation, candidate copying and
+serialization, not by compressing an unbounded report afterward. Bound retained
+ownership, variable-length payloads, row/event counts, encoded bytes and total
+process diagnostic memory. Reserve terminal status and omission counters.
+Truncation must preserve valid JSON and label incomplete references/coverage;
+it must never change the query result or masquerade as search completion.
+Do not retain a large Memo graph indirectly through an apparently small Arc.
 
 The production decisions have different contracts:
 
@@ -192,6 +226,21 @@ When extending diagnostics:
 - Do not use raw SQL or parameter values by default.
 - Keep diagnostic runs separate from trace-off performance samples. Export
   outside an optimizer timer can still be inside compiler or client latency.
+- Encode a capture once and select it by invocation/occurrence identity;
+  never embed both all statement traces and an overlapping target subset.
+  SQL fingerprints alone do not identify repeated executions.
+- Converge benchmark consumers on the EXPLAIN schema. Do not add temporary
+  environment exporters, server-log parsers or per-experiment JSON extractors.
+- Classify controls by their effects, not their names. Retire replaced
+  diagnostic outputs only; preserve behavior experiments, normal measurement
+  receipts and unclassified/mixed controls until their owning workstream
+  migrates them. A DIAGNOSTIC prefix does not imply an output-only setting.
+- Associate normal samples with diagnostic outputs by input context and
+  versioned compile-artifact receipts, then actual admission where available.
+  Non-executing COMPILE has no actual admitted image. Different compatible
+  fingerprints reject that association; equal hashes still need shape and
+  contract checks. Missing or mismatched evidence blocks the joint explanation,
+  not preservation of valid timing samples. Never select only matching runs.
 
 ## Making a change
 
@@ -223,13 +272,15 @@ session/execution and SQL regression checks.
 
 For performance work, first read the
 [benchmark README](../../benchmark/README.md). When installed, also follow the
-local paro-benchmark skill; that tooling is not a tracked-clone prerequisite.
+repository paro-benchmark skill, or paro-evidence for controlled comparisons;
+that tooling is not a prerequisite for using the framework directly.
 Use the established first-statement harness, fixed source/binary/data/SQL
 identities, actual resource envelopes and complete result validation. Do not
-run concurrent benchmark runners or compare a diagnostic cohort with a normal
-one. Pin the competitor build, extensions and settings as well; a parity claim
-does not transfer to a new competitor version. Apply the following comparison
-rules before drawing conclusions.
+mix competing runs on shared resources or compare a diagnostic cohort with a
+normal one. Isolated output paths alone do not remove CPU/I/O or fixture
+interference. Pin the competitor build, extensions and settings as well; a
+parity claim does not transfer to a new competitor version. Apply the following
+comparison rules before drawing conclusions.
 
 ### Comparison validity
 
@@ -259,20 +310,39 @@ rules before drawing conclusions.
 
 ## Design and evidence maintenance
 
-Supplementary proposals live in the separate paro-docs-design repository:
-optimizer/optimizer-convergence-design.md and
-optimizer/optimizer-trace-matrix.md. They cover closeout sequencing and the
-target diagnostic schema, and are not required to resolve any normative link
-in this README. This repository neither vendors nor automatically tracks that
-checkout; consult an explicit design revision when using those proposals.
-
 Keep this README short-lived-data free:
 
 - Architecture and contract changes belong here or in a focused design.
 - Decisions and important negative results belong in small indexed records.
-- Benchmark samples and large traces belong in attested evidence packages,
-  not in an ever-growing README.
-- Archive and restore-test necessary evidence before deleting raw data.
-  Never delete the only reproduction of an unresolved correctness failure.
+- A campaign shares one manifest.json and README.md. An arm is a declared
+  intervention/configuration, not a query, candidate or retry. A cell is a
+  fixed query case and arm: store its samples/receipts in timings.json and
+  refer to independently captured compile records by CaptureId. Store each
+  capture once; do not duplicate common identities or conclusions per cell.
+- Register finite volume limits before collection. For A arms, Q query cases,
+  N cells and D Summary captures, manifest budget M is
+  32,000 + 1,024*(A+Q+N+D) bytes. Per-cell budget T_i is
+  4,096 + 1,024*S_i + 2,048*P_i + 512*R_i: S_i counts scheduled timing/error
+  rows including warm/retries, P_i bounds artifact/candidate receipts, and R_i
+  bounds registered scalar calibration rows, never events. README is bounded
+  at 20,000 bytes; each Summary at 200,000. Total registered budget
+  M + 20,000 + sum(T_i) + 200,000*D must fit 64 MiB. Validate both individual
+  and total uncompressed UTF-8 sizes; runtime capture limits also apply.
+- Keep all sampled observations and explicit exclusions. Quota or diagnostic
+  association failure cannot delete slow samples; stop further collection and
+  report incomplete evidence rather than silently growing the budget. Ordinary
+  99-query and candidate-calibration campaigns use the volume-based profile,
+  not repeated manifests or automatic extensions. Diagnostic timings are not
+  normal performance samples; raw events are not calibration rows.
+- Truly larger campaigns, exact replay fixtures and correctness inputs need a
+  registered bounded extension with an explicit total budget, not artificial
+  arms or unlimited storage. Raw Detail traces are short-lived, quota-bound
+  debugging data. Server .parod.log files do not belong in ordinary evidence
+  packages; operational log retention is a separate responsibility.
+- Compact history once, validate retained identities/samples/conclusions, and
+  restore-test necessary evidence before deleting redundant raw data. Record
+  what was deleted and cannot be reconstructed; a hash is not a backup. Do not
+  move every obsolete trace into another permanent archive. Never delete the
+  only reproduction of an unresolved correctness failure.
 - Deleting a tracked log does not remove its Git history. History rewriting
   and destructive workspace cleanup require separate, explicit scope.

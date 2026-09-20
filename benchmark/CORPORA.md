@@ -1,11 +1,11 @@
 # Optimizer correctness corpora
 
-The optimizer correctness sequence uses source repositories kept as siblings of
-the Paro checkout. Set the workspace root once when running the corpora:
-
-```sh
-export PARO_WORKSPACE=/Users/linjunhong/workspace
-```
+The optimizer correctness sequence uses external source repositories. Resolve
+the selected Paro checkout from the user's task, not a fixed main-worktree
+path. Set `PARO_WORKSPACE` to the verified directory containing the corpus
+repositories below; an isolated Paro worktree need not share their parent.
+Inspect source/status and use an owned test instance before building or loading
+data. Preserve user changes and reuse agreed isolated checkouts.
 
 | Corpus | Source repository | Query location |
 | --- | --- | --- |
@@ -31,9 +31,11 @@ Run the correctness suites strictly in this order:
 4. TPC-H
 5. LDBC SNB BI
 
-Every Paro connection used by this gate enables `optimizer_verify`. A suite is
-complete only after each query executes and its decoded row multiset matches
-the authoritative result. `EXPLAIN`-only success is not a correctness result.
+Every Paro connection used by this gate enables `optimizer_verify`; record the
+effective setting, rather than assuming a trace-off run has verification off.
+A suite is complete only after each query executes and its decoded row multiset
+matches the authoritative result. `EXPLAIN`-only success is not a correctness
+result.
 
 For a paired TPC-DS SF1 correctness and latency comparison, use
 `corpora/tpcds_compare.py`. The harness builds the tested Paro image itself and
@@ -51,6 +53,55 @@ Pass `--metadata-track none` for a qualifying engine comparison. The
 but it is marked non-qualifying unless DuckDB exposes the same live key
 inventory. Generated SF1 database and CSV files belong under the workspace data
 root, outside source repositories.
+
+For a controlled performance claim, first read the repository's
+[paro-evidence workflow](../.agents/skills/paro-evidence/SKILL.md) and
+[comparison/evidence contract](../crates/optimizer/readme.md#comparison-validity).
+Read the collector's live `--help` from the selected Python environment instead
+of copying options from another worktree. Pin DuckDB's actual build and extension
+identities as well as its version, and preregister the sample unit, thresholds
+and resource envelope before confirmatory collection. Retain all valid slow
+samples and explicit failures/exclusions. Target occurrence zero, cache state,
+normal versus diagnostic cohorts and receipt association are distinct facts.
+Current collectors do not yet implement the complete bounded
+`EXPLAIN (COMPILE)` campaign contract; do not claim that capability from this
+document or infer missing normal receipts from legacy trace data. Archiving,
+baseline updates and cleanup are not automatic parts of a comparison run.
+
+## Declared competitor baseline
+
+The declaration and the observation are separate evidence:
+
+1. Read **this checkout's** [requirements.txt](requirements.txt), any actual
+   referenced runtime/lock manifest, and the campaign's versioned registration.
+   Record their source revision, content hashes and dirty state. A broad range
+   such as `duckdb>=1.4,<2` is not an exact comparison baseline: resolve and
+   approve an exact baseline before confirmatory sampling. An uncommitted pin
+   is not automatically part of the committed source identity.
+2. The package declaration constrains the DuckDB version. Binary/wheel, native
+   `_duckdb` module, loaded DuckDB extensions, platform and settings need their
+   own expected identities in the referenced runtime manifest/registration.
+   Do not claim requirements alone specifies these hashes. Where no runtime
+   manifest exists, register the approved artifacts before collection and mark
+   absent evidence explicitly; do not cite an invented manifest filename.
+3. Using the **selected interpreter and actual worker environment**, compare
+   distribution/imported-package and native-engine versions, module paths and
+   hashes, and the loaded extension set/configuration with that declaration.
+   A controller's `pip show` or an observed hash by itself is not proof of what
+   a worker loaded or of conformity to an approved baseline. Resolve differing
+   declarations before running; do not simply choose the one matching the venv.
+4. On mismatch or missing required identity, stop confirmatory collection and
+   report the discrepancy. Do not silently update requirements, a venv, an
+   extension or the registration to legitimize the installed version. An
+   authorized baseline upgrade or explicit competitor-version experiment gets
+   a new declared comparison; previous parity does not transfer to it.
+
+The existing `tpcds_compare.py` report records an observed DuckDB version and
+native Python-extension hash. Those fields are observations, **not** an already
+implemented declaration-versus-runtime or loaded-extension-set gate. This
+workflow requires the preflight; do not claim the current harness enforces it.
+
+## Oracle-specific semantics
 
 CEB targets PostgreSQL semantics. In particular, PostgreSQL widens
 `REAL`/`NUMERIC` comparisons to double precision, while DuckDB narrows the
