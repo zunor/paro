@@ -18,7 +18,7 @@ projection expansion has no implicit ordinal mapping. Same-engine schema
 repeats remain wire-exact. This is an oracle display contract, not a change
 to Paro's production protocol or printer.
 
-## Numerical acceptance: scope and pending admission
+## Numerical acceptance: bounded scope
 
 Integers, Decimal, NULL, keys, multiplicities, row membership and order remain
 strict. The default floating comparator remains exact. No universal 2-ULP,
@@ -50,12 +50,33 @@ large-offset small variance, permutations, parallel merges, non-finite
 rejection, signed-zero/subnormal ULP distance, and adversarial overlapping
 numeric matches. The default harness does not automatically apply this
 oracle to SQL: an explicit input/role and relational-boundary proof is still
-required. Admission of Q39 remains pending that complete evidence.
+required. The registration is [q39-numeric-relation.json](c0/q39-numeric-relation.json),
+with [complete joined input SQL](c0/q39-integer-input-bags.sql).
 
 Outputs must be matched bijectively while preserving exact non-approximate
 columns; an approximate Counter comparison is invalid. Predicates and
 ORDER BY/LIMIT must independently establish the exact selected bag and order.
-An interval touching a filter/rank boundary is Uncovered, not evidence that
-nearby outputs may hide missing rows or changed duplicates. Q39 remains
-uncertified until this relational check is complete for all input groups,
-including groups absent from the returned rows.
+An interval crossing a filter/rank boundary is Uncovered, not evidence that
+nearby outputs may hide missing rows or changed duplicates. An exact singleton
+at the threshold is decidable: `CV > 1` excludes `CV == 1`. General approximate
+ORDER BY/LIMIT remains Uncovered. A registered unique exact ordering prefix
+can prove the order without comparing an approximate suffix.
+
+### Q39 evidence, not a universal tolerance
+
+Both engines agree on all 360,000 joined integer input rows, including NULL
+and duplicate multiplicity. The independent oracle evaluates all 90,000
+groups, not just groups in the output. Their non-NULL cardinalities are 1–4,
+inside the preregistered exhaustive domain. It derives 6,250 eligible groups
+and exactly 243 self-join rows, with a unique exact ordering prefix. One group
+has CV exactly one in every enumerated schedule and is correctly excluded.
+All 972 approximate returned values in both engines fit their independently
+derived arithmetic enclosures. The 100-digit reference and individual errors
+are retained, along with the failing raw exact comparison.
+
+These findings certify the captured Q39 relation under this narrow contract;
+they do not repair F2's missing historical source attestation or certify the
+remaining corpus. Input/result seed and oracle identities must match, output
+schema must independently pass, and unsupported additional result sets,
+floating ordering or LIMIT boundaries fail closed. No production aggregate,
+planner printer, or SQL expected-result file is changed.

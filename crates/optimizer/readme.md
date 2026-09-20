@@ -116,6 +116,15 @@ already satisfies it.
   and an internal failure.
 - Admission may execute only a verified variant that fits the actual grant.
   An unsearched class is not an executable fallback.
+- A task's `NoCandidate { cursor }` response is not an infeasibility proof.
+  Its existing goal, phase, ReadSet and resumable cursor govern reuse; an
+  exhausted mandatory prefix does not cover optional implementations.
+  `GrantSearchCoverage` retains unresolved classes, while the verified image
+  remains the sole admission authority. There is currently no production
+  certificate constructor for proven infeasibility or unsupported capability;
+  absence must remain unknown rather than acquiring either label.
+- Failed task metadata retains its supplied cause. The original `Result`
+  carries SQLSTATE and cancellation; metadata must not invent a resource stop.
 - Frozen candidates and eventual execution images must preserve exact
   dependencies, properties, choices and resource contracts.
 - Deferred construction is not free if it is eventually requested.
