@@ -148,14 +148,31 @@ links, bounds and lifecycle. This README does not claim the unified interface
 is implemented. The contributor contracts below are usable in a standalone
 clone; a separate design checkout is optional.
 
-The target public entry point is `EXPLAIN (OPTIMIZER, FORMAT JSON)`, with TEXT
+The target public entry point is `EXPLAIN COMPILE (FORMAT JSON)`, with TEXT
 rendered from the same typed record. This syntax is a planned deliverable, not
-a claim that the current parser accepts it. Summary is the default; explicit
-Detail adds bounded records, not different search semantics. Without ANALYZE,
-the target is not executed: runtime/admission measurements are NotExecuted,
-not zero. Optimizer diagnostics force a target compilation without consuming
-or populating its statement-plan cache; this is not proof of a normal SELECT
-cache miss. The output cannot measure its own future network drain or commit.
+a claim that the current parser accepts it. The unimplemented OPTIMIZER syntax
+proposal is superseded, not retained as an alias. Ordinary EXPLAIN shows a
+plan; COMPILE observes its construction; ANALYZE measures actual execution.
+The optimizer is one producer in a compiler-wide record, not the owner of
+session or execution instrumentation.
+
+Summary is the default; `EXPLAIN COMPILE (DETAIL, FORMAT JSON)` adds bounded
+records, not different search semantics. Without ANALYZE, the target is not
+executed: runtime/admission measurements are NotExecuted, not zero. COMPILE
+invokes the real target compiler exactly once, without an Explain wrapper in
+its Memo and without consuming or populating its statement-plan cache. Record
+ForcedCompile rather than claiming a normal SELECT cache miss. A subsequent
+`EXPLAIN ANALYZE (COMPILE, FORMAT JSON)` integration must reuse that same
+compiled artifact and the existing runtime profiler, never compile twice.
+Unsupported syntax or statement/protocol combinations must fail explicitly.
+
+Keep the established compiler timer boundary. Parsing may precede that timer;
+a compiled portfolio may still need execution-time admission and lowering.
+CompiledArtifactReady is not ExecutionImageReady. Report expected and actual
+resource classes separately, without constructing unused images to fill a
+table. Sealed compile records can be linked to later execution records but
+must not be rewritten to hide deferred work. The output cannot measure its
+own future encoding, network drain or commit.
 
 Capacity must be enforced before capture allocation, candidate copying and
 serialization, not by compressing an unbounded report afterward. Bound retained
@@ -284,7 +301,7 @@ Keep this README short-lived-data free:
 - Architecture and contract changes belong here or in a focused design.
 - Decisions and important negative results belong in small indexed records.
 - Ordinary evidence is four files: manifest.json, timings.json,
-  explain-optimizer.json and README.md, at most 250,000 uncompressed UTF-8
+  explain-compile.json and README.md, at most 250,000 uncompressed UTF-8
   bytes per arm. Keep every valid normal timing sample and explicit exclusions;
   derived medians alone are not sufficient evidence. Diagnostic timings are
   not normal performance samples.
