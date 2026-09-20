@@ -151,8 +151,23 @@ All artifacts below are in
   pre-existing files verified unchanged. No user files or unique evidence were
   removed.
 
-Final workspace/corpus summaries and the clean-source manifest are recorded
-in the validation manifest accompanying this document. The interrupted
+Final clean binary corpus: all 99 queries executed with verification enabled,
+handoff off, four threads and 2GB. **98 exact typed/identity/bag/order contracts
+pass**. Q39 retains its raw exact difference; the unchanged
+`integer-welford-schedules-v1` independent oracle verifies 360,000 exact input
+rows, 90,000 groups and 243 output rows for both engines, including relational
+bag/order and numeric schedule enclosure. Its one exact-threshold excluded
+group remains explicitly recorded; this is bounded certification, not a general
+floating-point exemption. No execution errors or uncovered queries remain in
+this corpus run.
+
+All 99 captures have matching final binary, seed, runtime, result protocol and
+server-observed settings; SQL hashes were checked against each corpus file.
+The [validation manifest](search-validation-manifest.json) records those hashes,
+per-query raw verdicts, independent Q39 certificate, final gate logs and remaining
+regress actuals. Binary `aada875264b4df7361a71d1816315ed9293dbc0d5d8819cf66b60c6ebe44d910`
+was built from clean `ec2ae9cc` (last production change `4b1d5714`);
+subsequent commits only record evidence. The interrupted
 `c2-search-corpus/` batch and the 198 historical captures cannot certify this
 binary. Normal performance was not run. C2 remains blocked by unresolved
 regress contracts; F2 remains separately unadmitted. Search completion is not
