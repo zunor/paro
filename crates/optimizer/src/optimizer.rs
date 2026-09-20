@@ -1032,6 +1032,31 @@ impl Optimizer {
                 )
             };
         let _finish_partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
+        if let Some(capture) = &self.ctx.session.options.compile_capture {
+            use paro_context::compile_diagnostics::{Observation::Observed, RuleSummary, SearchStop};
+            capture.update(|record| {
+                record.groups = Observed(extraction.search_summary.groups);
+                record.logical_expressions = Observed(extraction.search_summary.logical_expressions);
+                record.physical_expressions = Observed(extraction.search_summary.physical_expressions);
+                record.obligations = Observed(extraction.search_summary.obligations.len() as u64);
+                record.search_complete = Observed(extraction.search_summary.is_complete());
+                record.quality_policy_satisfied = Observed(matches!(extraction.quality_policy_status, crate::cascades::quality::QualityPolicyStatus::Satisfied(_)));
+                record.budget_limited = Observed(extraction.search_stop.budget_limited);
+                record.search_stop = Observed(match extraction.search_stop.reason {
+                    crate::cascades::engine::SearchStopReason::Complete => SearchStop::Complete,
+                    crate::cascades::engine::SearchStopReason::SearchIncomplete => SearchStop::Incomplete,
+                    crate::cascades::engine::SearchStopReason::Deadline => SearchStop::Deadline,
+                    crate::cascades::engine::SearchStopReason::BudgetLimited => SearchStop::BudgetLimited,
+                    crate::cascades::engine::SearchStopReason::RuleFailure => SearchStop::RuleFailure,
+                    crate::cascades::engine::SearchStopReason::QualityPolicySatisfied => SearchStop::QualityPolicySatisfied,
+                });
+            });
+            for (id, attempts) in &extraction.rule_attempts {
+                capture.rule(RuleSummary { id: id.0, attempts: *attempts,
+                    inserted: extraction.rule_insertions.get(id).copied().unwrap_or(0),
+                    elapsed_ns: extraction.rule_elapsed.get(id).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) });
+            }
+        }
         if paro_context::compile_work_evidence_enabled() {
             self.compile_work.rule_elapsed_us = extraction.rule_elapsed.values()
                 .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))

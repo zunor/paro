@@ -69,6 +69,12 @@ impl<'a> ProtocolSink<'a> {
 
 #[async_trait]
 impl ResultSink for ProtocolSink<'_> {
+    async fn push_diagnostic_chunk(
+        &mut self, chunk: &Chunk,
+        owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> Result<()> {
+        self.result_sink.push_diagnostic_chunk(chunk, owner).await
+    }
     async fn start_result(&mut self, names: &[String], types: &[LogicalType]) -> Result<()> {
         self.ensure_transport_available()?;
         let result = self.result_sink.start_result(names, types).await;

@@ -1647,6 +1647,7 @@ dependencies = [
  "paro-scheduler",
  "paro-storage",
  "paro-transaction",
+ "serde",
  "tokio-util",
 ]
 

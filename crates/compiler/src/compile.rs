@@ -23,6 +23,15 @@ pub fn compile_statement_with_parameter_types(
 ) -> Result<CompiledStatement> {
     let statement_tag = stmt.to_string();
     let started_at = Instant::now();
+    if let Some(capture) = &ctx.options.compile_capture {
+        use paro_context::compile_diagnostics::Observation::Observed;
+        capture.update(|r| {
+            r.input_fingerprint = Observed(paro_context::statement_fingerprint(&statement_tag));
+            r.planning_settings = Observed(ctx.settings.planning_fingerprint());
+            r.available_memory_bytes = Observed(ctx.compile_resources.available_memory_bytes);
+            r.available_parallel_tasks = Observed(ctx.compile_resources.available_parallel_tasks);
+        });
+    }
     let statement_trace = ctx.statement_trace();
     if let Some(trace) = &statement_trace {
         trace.record_event("compile", "compiler_entry");
@@ -57,6 +66,9 @@ pub fn compile_statement_with_parameter_types(
         trace.record_span("compile", "bind_and_plan", bind_and_plan_started);
     }
     let result_names = planner.names.clone();
+    if let Some(capture) = &ctx.options.compile_capture {
+        capture.update(|r| r.bind_ns = paro_context::compile_diagnostics::Observation::Observed(bind_and_plan_started.elapsed().as_nanos() as u64));
+    }
     let result_types = planner.types.clone();
 
     let logical_plan = planner
@@ -95,6 +107,9 @@ pub fn compile_statement_with_parameter_types(
         }
     };
     let optimizer_finished = Instant::now();
+    if let Some(capture) = &ctx.options.compile_capture {
+        capture.update(|r| r.optimizer_ns = paro_context::compile_diagnostics::Observation::Observed(optimizer_finished.duration_since(optimizer_started).as_nanos() as u64));
+    }
     let partition_report = partition.finish(optimizer_finished);
     let compile_work = paro_context::compile_work_evidence_enabled().then(|| {
         let mut work = optimizer.compile_work();
@@ -137,6 +152,37 @@ pub fn compile_statement_with_parameter_types(
     }
 
     let runtime_image_started = Instant::now();
+    if let Some(capture) = &ctx.options.compile_capture {
+        use paro_context::compile_diagnostics::Observation::Observed;
+        capture.update(|r| {
+            r.verify_ns = Observed(runtime_image_started.duration_since(verify_started).as_nanos() as u64);
+            r.safety_verified = Observed(true);
+            r.output_columns = Observed(result_names.len());
+            if let paro_optimizer::OptimizedStatement::Physical(portfolio) = &optimized {
+                r.variant_count = Observed(portfolio.variants.len());
+                use paro_context::compile_diagnostics::{VariantSummary, MAX_VARIANTS};
+                for (ordinal, variant) in portfolio.variants.iter().take(MAX_VARIANTS).enumerate() {
+                    let mask = variant.admissible_classes.iter().try_fold(0u64, |mask, class| {
+                        1u64.checked_shl(class.0).map(|bit| mask | bit)
+                    });
+                    if let Some(admissible_classes) = mask {
+                        r.variants.push(VariantSummary { ordinal: ordinal as u16,
+                            physical_fingerprint: [(variant.physical_fingerprint.0 >> 64) as u64, variant.physical_fingerprint.0 as u64], admissible_classes });
+                    }
+                }
+                r.omitted_variants = portfolio.variants.len().saturating_sub(r.variants.len()) as u64;
+                if let Some(class) = portfolio.grant_search.as_ref().and_then(|s| s.expected_class) {
+                    r.expected_class = Observed(class.0);
+                    let mut matches = portfolio.variants.iter().filter(|v| v.admissible_classes.contains(&class));
+                    if let Some(variant) = matches.next() {
+                        if matches.next().is_none() {
+                            r.selected_fingerprint = Observed([(variant.physical_fingerprint.0 >> 64) as u64, variant.physical_fingerprint.0 as u64]);
+                        }
+                    }
+                }
+            }
+        });
+    }
     let executable = match optimized {
         paro_optimizer::OptimizedStatement::Physical(plan) => {
             paro_execution::pipeline::StatementProgram::deferred_physical_portfolio(plan)?
@@ -170,6 +216,15 @@ pub fn compile_statement_with_parameter_types(
         parameter_types.to_vec(),
         ctx.compile_environment_key(),
     );
+    if let Some(capture) = &ctx.options.compile_capture {
+        use std::hash::{Hash, Hasher};
+        let mut identity = std::collections::hash_map::DefaultHasher::new();
+        for column in compiled.result_schema() {
+            column.name.hash(&mut identity);
+            column.logical_type.hash(&mut identity);
+        }
+        capture.update(|r| r.output_identity = paro_context::compile_diagnostics::Observation::Observed(identity.finish()));
+    }
 
     // The optimizer and planner state are no longer needed once the deferred
     // executable image has been materialized.  Keep this release boundary in
@@ -192,6 +247,18 @@ pub fn compile_statement_with_parameter_types(
         trace.record_event("compile", "compiler_return");
     }
 
+    if let Some(capture) = &ctx.options.compile_capture {
+        use paro_context::compile_diagnostics::Observation::Observed;
+        capture.update(|r| {
+            r.finish_ns = Observed(runtime_image_started.elapsed().as_nanos() as u64);
+            r.compiler_ns = Observed(started_at.elapsed().as_nanos() as u64);
+            if let (Observed(total), Observed(bind), Observed(opt), Observed(verify), Observed(finish)) = (r.compiler_ns, r.bind_ns, r.optimizer_ns, r.verify_ns, r.finish_ns) {
+                r.compiler_other_ns = Observed(total.saturating_sub(bind + opt + verify + finish));
+            }
+            r.artifact = paro_context::compile_diagnostics::ArtifactStatus::CompiledArtifactReady;
+            r.outcome = paro_context::compile_diagnostics::CompileOutcome::Success;
+        });
+    }
     Ok(match compile_work {
         Some(mut work) => {
             work.compiler_elapsed_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);

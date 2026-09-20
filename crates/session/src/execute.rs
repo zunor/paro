@@ -256,6 +256,11 @@ impl Session {
     ) -> Result<()> {
         match route {
             FrontendRoute::Query(stmt) => {
+                if let Statement::Explain { options: (_, options), query, .. } = stmt.as_ref() {
+                    if options.contains(&paro_parser::ast::ExplainOption::Compile) {
+                        return self.execute_compile_explain(query.as_ref().clone(), options, statement_format, sink).await;
+                    }
+                }
                 self.execute_query_statement(*stmt, statement_format, None, sink)
                     .await
             }

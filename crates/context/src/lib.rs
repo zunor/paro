@@ -4,6 +4,7 @@
 //! Statement-time context model shared by planning, optimization, and execution.
 
 mod attached_databases;
+pub mod compile_diagnostics;
 mod ddl;
 mod diagnostic_environment;
 mod effective_settings;

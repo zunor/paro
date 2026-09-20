@@ -22,6 +22,16 @@ pub(crate) fn explain(i: Input) -> IResult<Statement> {
             EXPLAIN ~ ( "(" ~ #comma_separated_list1(explain_option) ~ ")" )? ~ ( AST | SYNTAX | PIPELINE | JOIN | GRAPH | FRAGMENTS | RAW | OPTIMIZED | MEMO | DECORRELATED | PERF)? ~ #statement_body
         },
         |(_, options, opt_kind, statement)| {
+            if let Some((_, opts, _)) = &options {
+                let compile = opts.contains(&ExplainOption::Compile);
+                let new_option = opts.iter().any(|o| matches!(o, ExplainOption::Analyze | ExplainOption::Detail | ExplainOption::FormatText | ExplainOption::FormatJson));
+                let duplicate = opts.iter().enumerate().any(|(n, o)| opts[..n].contains(o));
+                if (new_option && !compile) || (compile && (duplicate || opt_kind.is_some()
+                    || opts.iter().any(|o| matches!(o, ExplainOption::Verbose | ExplainOption::Logical | ExplainOption::Optimized | ExplainOption::Decorrelated))
+                    || (opts.contains(&ExplainOption::FormatText) && opts.contains(&ExplainOption::FormatJson)))) {
+                    return Err(nom::Err::Failure(crate::parser::error::ErrorKind::Other("invalid or conflicting EXPLAIN COMPILE options")));
+                }
+            }
             Ok(Statement::Explain {
                 kind: match opt_kind.map(|token| token.kind) {
                     Some(TokenKind::SYNTAX) | Some(TokenKind::AST) => {
@@ -78,6 +88,24 @@ pub(crate) fn explain_analyze(i: Input) -> IResult<Statement> {
 }
 
 pub(crate) fn explain_option(i: Input) -> IResult<ExplainOption> {
+    alt((
+        value(ExplainOption::Compile, compile_keyword("COMPILE")),
+        value(ExplainOption::Analyze, compile_keyword("ANALYZE")),
+        value(ExplainOption::Detail, compile_keyword("DETAIL")),
+        value(
+            ExplainOption::FormatText,
+            rule! { FORMAT ~ #compile_keyword("TEXT") },
+        ),
+        value(
+            ExplainOption::FormatJson,
+            rule! { FORMAT ~ #compile_keyword("JSON") },
+        ),
+        legacy_explain_option,
+    ))
+    .parse(i)
+}
+
+fn legacy_explain_option(i: Input) -> IResult<ExplainOption> {
     map(
         rule! {
             VERBOSE | LOGICAL | OPTIMIZED | DECORRELATED
@@ -91,4 +119,18 @@ pub(crate) fn explain_option(i: Input) -> IResult<ExplainOption> {
         },
     )
     .parse(i)
+}
+
+fn compile_keyword(text: &'static str) -> impl FnMut(Input) -> IResult<&Token> {
+    move |i| {
+        if let Some(token) = i
+            .tokens
+            .first()
+            .filter(|t| t.text().eq_ignore_ascii_case(text))
+        {
+            Ok((i.slice(1..), token))
+        } else {
+            match_text(text)(i)
+        }
+    }
 }

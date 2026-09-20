@@ -4,6 +4,7 @@
 //! EXPLAIN / EXPLAIN ANALYZE rendering and runtime statistics.
 
 pub mod analyze_render;
+pub mod compile_render;
 pub mod explain_state;
 pub mod profiler;
 pub mod types {

@@ -6,6 +6,7 @@
 mod active_query;
 mod auth_policy;
 mod completion;
+mod compile_explain;
 mod completion_infer;
 mod config;
 mod copy_protocol;

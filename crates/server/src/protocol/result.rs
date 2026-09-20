@@ -76,6 +76,15 @@ impl<'a> ResultSink for PgWireResultSink<'a> {
         send_text_chunk_rows(self.socket, chunk, self.col_count).await
     }
 
+    async fn push_diagnostic_chunk(
+        &mut self, chunk: &Chunk,
+        _owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> Result<()> {
+        send_text_chunk_rows(self.socket, chunk, self.col_count).await?;
+        // Keep the diagnostic reservation until the transport drains this payload.
+        self.socket.flush().await.map_err(|e| paro_common::error::internal(e.to_string()))
+    }
+
     async fn finish_result(&mut self, completion: &StatementCompletion) -> Result<()> {
         self.socket
             .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(

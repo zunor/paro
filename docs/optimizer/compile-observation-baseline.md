@@ -74,6 +74,8 @@ Process behavior controls are not independently included in the current plan
 cache key; changing them within a live process is not certified. COMPILE does
 not change them. The inventory is not a deletion allowlist.
 
-T0 status: recoverable isolated baseline and per-entry classification complete;
-main-tree hunk integration is not performed without an ownership decision.
+T0 status: recoverable isolated baseline and per-entry classification complete.
+The user subsequently authorized per-hunk integration into re-op in this round.
+Integration is pending review/validation; this authorization is not permission
+to commit, discard or replace unrelated main-tree mixed hunks.
 C2's eight regress contracts and F2's independent evidence gaps remain open.
