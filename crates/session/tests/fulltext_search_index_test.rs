@@ -294,6 +294,59 @@ fn exact_vector_provider_applies_overlay_visibility_before_topk() {
     });
 }
 
+#[test]
+fn vector_replacement_preserves_null_rows_and_projected_casts() {
+    run_async_test_with_large_stack("vector-score-domain", async {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        for sql in [
+            "CREATE TABLE vector_domain (id INT, v VECTOR(2))",
+            "INSERT INTO vector_domain VALUES (1, '[0.25,0]'), (2, '[1.25,0]'), (3, NULL)",
+        ] {
+            exec_ok(&mut session, &mut sink, sql).await;
+        }
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT id FROM vector_domain ORDER BY v <-> '[0,0]' NULLS LAST LIMIT 3",
+        )
+        .await;
+        // Dense scalar distance currently treats a NULL vector as a zero
+        // vector. A physical replacement must preserve that logical contract.
+        assert_eq!(query_i64_col(&sink, 0), vec![3, 1, 2]);
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "CREATE VECTOR INDEX vector_domain_index ON vector_domain(v) distance=l2",
+        )
+        .await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "REFRESH VECTOR INDEX vector_domain_index ON vector_domain",
+        )
+        .await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT id FROM vector_domain ORDER BY v <-> '[0,0]' NULLS LAST LIMIT 3",
+        )
+        .await;
+        assert_eq!(query_i64_col(&sink, 0), vec![3, 1, 2]);
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT id FROM vector_domain ORDER BY v <-> '[0,0]' NULLS LAST LIMIT 1",
+        )
+        .await;
+        assert_eq!(query_i64_col(&sink, 0), vec![3]);
+        exec_ok(&mut session, &mut sink,
+            "SELECT CAST(v <-> '[0,0]' AS INT) AS distance FROM vector_domain WHERE v IS NOT NULL ORDER BY distance LIMIT 2").await;
+        assert_eq!(query_i64_col(&sink, 0), vec![0, 1]);
+    });
+}
+
 async fn run_restart_recovery_keeps_fulltext_index_usable() {
     let base_dir = create_unique_test_dir("fulltext_search", "restart");
     let mut sink = CollectingSink::new();

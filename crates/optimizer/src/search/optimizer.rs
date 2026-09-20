@@ -919,7 +919,6 @@ fn extract_vector_intent(
     if !ascending {
         return Ok(None);
     }
-    let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
         _ => return Ok(None),
@@ -1107,7 +1106,6 @@ fn parse_vector_literal(input: &str) -> Result<Vec<f32>> {
 }
 
 fn extract_sparse_intent(expr: &Expression, get: &Get) -> Result<Option<SparseIntent>> {
-    let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
         _ => return Ok(None),
