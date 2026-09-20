@@ -64,6 +64,12 @@ ERROR: savepoint "rel2" does not exist (SQLSTATE=25000)
 ROLLBACK;
 ROLLBACK
 
+SET memory_limit = '1GB';
+SET
+
+SET optimizer_verify = true;
+SET
+
 SELECT name, setting, short_desc AS description
 FROM pg_settings
 WHERE name NOT IN ('threads', 'temp_directory')
@@ -77,9 +83,37 @@ default_transaction_isolation	serializable	Default isolation level for new trans
 disabled_optimizer_rules	(empty)	Comma-separated optimizer transformation names to isolate
 force_external	false	Force spill-capable operators onto external paths
 max_temp_directory_size	unlimited	Maximum size of the temporary spill directory
-memory_limit	1073741824	Maximum memory available to the current session
-optimizer_verify	false	Enable optimizer verification outside debug builds
+memory_limit	1GB	Maximum memory available to the current session
+optimizer_verify	true	Enable optimizer verification outside debug builds
 parallel_scheduler	true	Enable the worker-pool pipeline scheduler for morsel-capable pipelines
+paro_diagnostic/PARO_CERTIFIED_GROUP_PRUNING	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_COLD_WORK_EVIDENCE	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_COMPILE_WORK_EVIDENCE	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_CARDINALITY_AUDIT	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_COST_PHASE_TIMES	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_FRONTIER_SNAPSHOT	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_FRONTIER_WIDTH	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_NORMALIZE_CTE_DOMAIN	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_OBLIGATION_ONLY	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_REPLAY_CANDIDATE	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_REPLAY_GRANT_CLASS	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_SEARCH_STOP_MS	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_SHADOW_STRUCTURAL_QUALITY	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_SKIP_MEMO_VERIFIERS	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_STREAM_SEQUENTIAL	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_STRUCTURAL_QUALITY_EVIDENCE	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DIAGNOSTIC_WORK_PARTITION	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_DISABLE_PROTECTED_INCUMBENT	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_EXPORT_STRONG_INCUMBENT	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_QUALITY_POLICY_HANDOFF	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_QUALITY_PREFLIGHT	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_STATEMENT_CACHE_EVIDENCE	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_STATEMENT_TRACE	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_STATEMENT_TRACE_SAMPLE	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_STRONG_INCUMBENT_EXPERIMENT	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_STRONG_INCUMBENT_EXPORT_CANDIDATE	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_STRONG_INCUMBENT_INJECT_LOGICAL	<unset>	Effective process-start diagnostic environment (read-only)
+paro_diagnostic/PARO_STRONG_INCUMBENT_PROVIDE_BOUND	<unset>	Effective process-start diagnostic environment (read-only)
 rowset_scan_pushdown	true	Enable rowset predicate pushdown and late materialization
 search_path	"$user", public	Sets the schema search order for names
 statement_timeout	0	Maximum execution time for a single statement
