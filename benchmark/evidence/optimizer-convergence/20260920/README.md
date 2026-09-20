@@ -4,6 +4,17 @@ This record implements the dependency order of `optimizer-convergence-design.md`
 and `optimizer-trace-matrix.md` r3 (2026-09-20). It is an in-progress record,
 not ArchitectureReady, CompilerTargetMet or FirstStatementParity certification.
 
+## Latest C2 continuation
+
+The current authoritative status is [C2 integration gates](c2-integration-gates.md),
+with the [clean source/oracle/corpus manifest](c2-source-manifest.json) and
+[versioned result contract](result-comparison-contract.md). Earlier sections
+below are retained as dated evidence, not silently retroactively marked green.
+Q02's generated-label mismatch and the captured Q39 numerical relation now
+have explicit independent contracts. The broad comparison gate still has
+Uncovered schema/order cases; **C2 is not certified complete** and no new
+normal performance baseline is admitted. F2 remains separately unadmitted.
+
 ## Source and preservation
 
 The main repository starts at `801cada4144a37645dfd44c5fe8c557579f7077b`,
@@ -35,13 +46,13 @@ evidence, data seed, worktree, build directory or Git history has been deleted.
 | --- | --- |
 | C0-a preservation and isolation | Restore verified; clean integration baseline created; fixture-repaired baseline 1319 pass / 15 fail |
 | C0-b F2 attribution | Original binary and clean parent/probe Q39 repeated; historical dirty build inputs still missing; F2 isolated, not admitted |
-| C2-1 Q39 | Full rows captured; independent integer-moment/80-digit oracle under investigation |
-| C2-2 partial feasible grants | Engine/admission slice committed; [contract and tests](c2-partial-grants.md); SQL coverage outstanding |
-| C2-3 facet ownership | Declaration deduplication/rollback and RF owner identity fixed; Q01/Q23 exact SQL match; Q02 internal error gone but derived-name schema mismatch remains |
-| C2-4 failure adjudication | Four fixture cases adjudicated; implementation-phase omission fixed; optimizer suite now 1345 pass / 0 fail |
+| C2-1 Q39 | Captured complete relation certified by bounded exhaustive arithmetic + 100-digit oracle; raw exact failures retained; not a general floating tolerance |
+| C2-2 partial feasible grants | [Task outcome authority](c2-task-outcomes.md), engine/planner/portfolio recovery and error tests committed; no invented infeasibility/unsupported proof |
+| C2-3 facet ownership | Declaration/rollback and RF owner fixes retained; Q01/Q02/Q05/Q23 pass current SQL screen; remaining corpus schema/order gaps are separate |
+| C2-4 failure adjudication | Implementation-phase omission fixed; optimizer suite now 1348 pass / 0 fail; full gate status linked above |
 | C1 Trace Matrix | Pending; existing evidence interfaces suffice for C0/C2 |
 | C3 + C3-M | Pending C2 and registered joint admission experiment |
-| C4 | Workspace check and tests pass; strict clippy, SQL/harness and joint/performance certification outstanding |
+| C4 | Workspace check/test, strict Clippy and benchmark/harness unit gates pass; broad result certification still open; joint/performance certification not run |
 | C5 | Inventory started; no deletion approved by a verified recovery package yet |
 
 ## C0-b: original F2 evidence qualification
@@ -113,7 +124,7 @@ SQL safety, exact child choices, unknown facts and resource feasibility remain
 mandatory. Historical red tests require current causal adjudication; neither
 the old “16 retained” list nor runner `new=0` is a baseline-pass certificate.
 
-## Current release status
+## Historical release checkpoint (before this C2 continuation)
 
 ### C2 implemented slices and unresolved SQL gates
 

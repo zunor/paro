@@ -1,0 +1,651 @@
+{
+  "schema_version": 1,
+  "control_result": {
+    "passed": 157,
+    "failed": 27,
+    "skipped": 0
+  },
+  "probe_result": {
+    "passed": 157,
+    "failed": 27,
+    "skipped": 0
+  },
+  "all_27_actuals_byte_identical": true,
+  "unexpected_actuals": {
+    "control": [],
+    "probe": []
+  },
+  "counts": {
+    "control:explain_snapshot": 68,
+    "probe:explain_snapshot": 68,
+    "control:non_explain_result": 2,
+    "probe:non_explain_result": 2
+  },
+  "full_audit": {
+    "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-regress-paired-audit-r2.json",
+    "sha256": "185a336098d38a96d52392b899f8a4e490981b979e0728bda0b317e103dae15f"
+  },
+  "adjudication": "68 EXPLAIN snapshot differences and 2 declared configuration-display differences per arm; no new observed SQL result or error difference against the clean control; original snapshots remain failed and unblessed",
+  "cases": [
+    {
+      "case": "cases/fulltext/fulltext_exec_mode_split.sql",
+      "expected_sha256": "661841c65499780ae0f7ca8acd9a57a5612f7d4d46f24e7225ae2d1811729d59",
+      "control_actual_sha256": "d8f99f66f0a96e521e7daea454e9dc267d2a566e4d745f57bcbc69bca8cbd29e",
+      "probe_actual_sha256": "d8f99f66f0a96e521e7daea454e9dc267d2a566e4d745f57bcbc69bca8cbd29e",
+      "byte_identical": true,
+      "parsed_blocks": 8,
+      "differences": [
+        {
+          "block": 5,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT id\nFROM ft_exec_mode_split\nWHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')\nORDER BY ts_rank(\n    to_tsvector('simple', content),\n    plainto_tsquery('simple', 'vector database')\n) DESC\nLIMIT 2;"
+        }
+      ]
+    },
+    {
+      "case": "cases/fulltext/fulltext_index_coverage_guard.sql",
+      "expected_sha256": "3b78f597080f8737d963b6b9344ad00829d09991c15c66864ef8ca4452b8abf9",
+      "control_actual_sha256": "4a267fded6c9a264f2ac812bcc42e64ca072e9c1ad1299084e686918bd39e37b",
+      "probe_actual_sha256": "4a267fded6c9a264f2ac812bcc42e64ca072e9c1ad1299084e686918bd39e37b",
+      "byte_identical": true,
+      "parsed_blocks": 8,
+      "differences": [
+        {
+          "block": 5,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT id\nFROM ft_coverage_guard\nWHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')\nORDER BY ts_rank(\n    to_tsvector('simple', content),\n    plainto_tsquery('simple', 'vector')\n) DESC\nLIMIT 5;"
+        }
+      ]
+    },
+    {
+      "case": "cases/fulltext/fulltext_pg.sql",
+      "expected_sha256": "17a475a69820ce85d7b558d558f1604f032626fb7f0e49fa1c5fd773a88802b3",
+      "control_actual_sha256": "098e9bfa132ced0ea0d0fcf21e38d4fec1f5f216ac35f5d6e50adebbf32fdb2f",
+      "probe_actual_sha256": "098e9bfa132ced0ea0d0fcf21e38d4fec1f5f216ac35f5d6e50adebbf32fdb2f",
+      "byte_identical": true,
+      "parsed_blocks": 16,
+      "differences": [
+        {
+          "block": 10,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT id\nFROM ft_docs\nWHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')\nORDER BY ts_rank(\n    to_tsvector('simple', content),\n    plainto_tsquery('simple', 'vector database')\n) DESC\nLIMIT 2;"
+        }
+      ]
+    },
+    {
+      "case": "cases/fulltext/fulltext_rank_cd.sql",
+      "expected_sha256": "787254c1d32c4168cf529679d93f9c33f5fed4d3370a3643ccf79ac4224d1333",
+      "control_actual_sha256": "122db199607170f803b16551a28c9cf35d9bb9de940da06008aecd1a18ac9354",
+      "probe_actual_sha256": "122db199607170f803b16551a28c9cf35d9bb9de940da06008aecd1a18ac9354",
+      "byte_identical": true,
+      "parsed_blocks": 7,
+      "differences": [
+        {
+          "block": 5,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT id\nFROM ft_t024_rank_cd\nWHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'alpha beta')\nORDER BY ts_rank_cd(\n    to_tsvector('simple', content),\n    plainto_tsquery('simple', 'alpha beta')\n) DESC,\nid\nLIMIT 2;"
+        }
+      ]
+    },
+    {
+      "case": "cases/graph/graph_explain.sql",
+      "expected_sha256": "e0c2bc6b9225fc145b4e83eb8190b57e519d6cc34a731823a2f233f7877964d5",
+      "control_actual_sha256": "b7e46cb21ba14529c7cbe67a4388e2d676ab26438e912926374cc632c957f1e3",
+      "probe_actual_sha256": "b7e46cb21ba14529c7cbe67a4388e2d676ab26438e912926374cc632c957f1e3",
+      "byte_identical": true,
+      "parsed_blocks": 32,
+      "differences": [
+        {
+          "block": 17,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network\n    MATCH (a:Person)-[k:Knows]->(b:Person)\n    COLUMNS (a.name AS from_name, b.name AS to_name)\n) gt;"
+        },
+        {
+          "block": 18,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network\n    MATCH ANY SHORTEST (a:Person)-[k:Knows]->{1,3}(b:Person)\n    COLUMNS (a.name AS from_name, b.name AS to_name)\n) gt;"
+        },
+        {
+          "block": 21,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network\n    MATCH (a:Person)-[k:Knows]->{1,3}(b:Person)\n    COLUMNS (a.name AS from_name, b.name AS to_name)\n) gt;"
+        },
+        {
+          "block": 22,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network\n    MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->{1,3}(b:Person)\n    COLUMNS (a.name AS from_name, b.name AS to_name, path_length(p) AS hops)\n) gt;"
+        }
+      ]
+    },
+    {
+      "case": "cases/python_udf/explain/runtime_bridge.sql",
+      "expected_sha256": "b9c7f2fa4f6c930ab34c4c91c91ec430e611bee89f2bc8924f4cced3b35a2589",
+      "control_actual_sha256": "2ce11c5547d741ae647f558322091102d828305996088b391b01f237d369779c",
+      "probe_actual_sha256": "2ce11c5547d741ae647f558322091102d828305996088b391b01f237d369779c",
+      "byte_identical": true,
+      "parsed_blocks": 5,
+      "differences": [
+        {
+          "block": 4,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT py_explain(v)\nFROM (VALUES (1), (2)) AS t(v)\nORDER BY 1;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/aggregate/agg_join_subsumption.sql",
+      "expected_sha256": "996c88f52a172e85644dca82b100734cb1ad5109149241a2b58217e7869ca9fd",
+      "control_actual_sha256": "4e7da0defb684fe67e9404881a3025709f2104fd4ab941373db62e76e0dc3a10",
+      "probe_actual_sha256": "4e7da0defb684fe67e9404881a3025709f2104fd4ab941373db62e76e0dc3a10",
+      "byte_identical": true,
+      "parsed_blocks": 8,
+      "differences": [
+        {
+          "block": 6,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT\n    p.order_key,\n    p.label,\n    sum(d.quantity) AS total_quantity\nFROM agg_sub_preserved AS p\nJOIN agg_sub_detail AS d\n  ON d.order_key = p.order_key\nWHERE p.order_key IN (\n    SELECT order_key\n    FROM agg_sub_detail\n    GROUP BY order_key\n    HAVING sum(quantity) > 100.00\n)\nGROUP BY p.order_key, p.label\nORDER BY p.order_key;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/aggregate/agg_singleton_groups.sql",
+      "expected_sha256": "371259136489e34ceecdb3526bd30515b465aa33d0ad28cd308f2fc73c76eae1",
+      "control_actual_sha256": "21771e78627869b6d1db321e8703451536b470f816971aecf64042b999152087",
+      "probe_actual_sha256": "21771e78627869b6d1db321e8703451536b470f816971aecf64042b999152087",
+      "byte_identical": true,
+      "parsed_blocks": 30,
+      "differences": [
+        {
+          "block": 15,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT c_count, count(*) AS customer_distribution\nFROM (\n    SELECT c.customer_key, count(o.order_key) AS c_count\n    FROM singleton_customer AS c\n    LEFT JOIN singleton_orders_large AS o\n      ON c.customer_key = o.customer_key\n     AND o.comment NOT LIKE '%special%requests%'\n    GROUP BY c.customer_key\n) AS counts\nGROUP BY c_count\nORDER BY c_count;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/aggregate/select_aggregate_spill.sql",
+      "expected_sha256": "cb13735bbabc5286982d5845dd29102d2bff6864aadfcadebcbc3190f0e5f267",
+      "control_actual_sha256": "cd1af05b8a3d0fd3c452802a97f1e78ef42cd27c9eca1c2aae12912e21f8c940",
+      "probe_actual_sha256": "cd1af05b8a3d0fd3c452802a97f1e78ef42cd27c9eca1c2aae12912e21f8c940",
+      "byte_identical": true,
+      "parsed_blocks": 17,
+      "differences": [
+        {
+          "block": 9,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT k1, k2, SUM(v) AS sum_v\nFROM agg_phasee_spill\nGROUP BY k1, k2;"
+        },
+        {
+          "block": 12,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT k1, k2, SUM(v) AS sum_v\nFROM agg_phasee_spill\nGROUP BY k1, k2;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/cte/cte_explain.sql",
+      "expected_sha256": "1cb941990182ff873f269ffd7dc7ff3bebae344e3552f9eed64f69afc295393c",
+      "control_actual_sha256": "3d3c84ea7c8e2bb02277ccf2f6c6f4d562995398fd6eb95a632e0ce1b41454a4",
+      "probe_actual_sha256": "3d3c84ea7c8e2bb02277ccf2f6c6f4d562995398fd6eb95a632e0ce1b41454a4",
+      "byte_identical": true,
+      "parsed_blocks": 4,
+      "differences": [
+        {
+          "block": 2,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nWITH base(id, grp, amount) AS MATERIALIZED (\n    VALUES\n        (1, 'east', 10),\n        (2, 'east', 20),\n        (3, 'west', 15),\n        (4, 'west', 30),\n        (5, 'north', 5)\n),\nagg AS (\n    SELECT grp, SUM(amount) AS total\n    FROM base\n    GROUP BY grp\n),\npeers AS (\n    SELECT l.id, r.id AS peer_id, l.grp\n    FROM base AS l\n    JOIN base AS r ON l.grp = r.grp AND l.id < r.id\n)\nSELECT p.id, p.peer_id, a.total\nFROM peers AS p\nJOIN agg AS a ON a.grp = p.grp\nORDER BY p.id, p.peer_id;"
+        },
+        {
+          "block": 4,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nWITH RECURSIVE\nedges(src, dst) AS (\n    VALUES (1, 2), (1, 3), (2, 4), (3, 5), (5, 6)\n),\nwalk(node, depth) AS (\n    VALUES (1, 0)\n    UNION ALL\n    SELECT e.dst, w.depth + 1\n    FROM walk AS w\n    JOIN edges AS e ON e.src = w.node\n    WHERE w.depth < 2\n)\nSELECT node, depth FROM walk ORDER BY depth, node;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/explain/explain_analyze.sql",
+      "expected_sha256": "cdab4d66a8c8fc1003a8ab5a3e802927dc2ea326c088af3732eec6ae7ecf72e0",
+      "control_actual_sha256": "7d7b119f801693469bf2e9d242b0de989ba6bd5432ea7b7ccb9e6b26946ada72",
+      "probe_actual_sha256": "7d7b119f801693469bf2e9d242b0de989ba6bd5432ea7b7ccb9e6b26946ada72",
+      "byte_identical": true,
+      "parsed_blocks": 17,
+      "differences": [
+        {
+          "block": 1,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT 1;"
+        },
+        {
+          "block": 5,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM explain_analyze_rt\nWHERE score >= 20\nORDER BY score DESC;"
+        },
+        {
+          "block": 6,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM explain_analyze_rt\nWHERE score >= 20\nORDER BY score DESC\nFORMAT JSON;"
+        },
+        {
+          "block": 11,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM explain_analyze_topn_rt\nORDER BY score DESC\nLIMIT 3;"
+        },
+        {
+          "block": 14,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM explain_analyze_topn_rt\nORDER BY score DESC\nLIMIT 3;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/explain/explain_basic.sql",
+      "expected_sha256": "2bfc7014bbb584c70693e005d228d2ea332775dbef8e9cedc18a703a57dd5e7c",
+      "control_actual_sha256": "6200243080ef14da555e7d0bc2b2815b9e5264a60b2fa75a7c2b2b9751531d59",
+      "probe_actual_sha256": "6200243080ef14da555e7d0bc2b2815b9e5264a60b2fa75a7c2b2b9751531d59",
+      "byte_identical": true,
+      "parsed_blocks": 31,
+      "differences": [
+        {
+          "block": 7,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT id\nFROM explain_topn_rt\nORDER BY score DESC\nLIMIT 2;"
+        },
+        {
+          "block": 18,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT *\nFROM explain_piecewise_left AS l\nJOIN explain_piecewise_right AS r ON l.id < r.id\nFORMAT JSON;"
+        },
+        {
+          "block": 29,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT *\nFROM explain_sort_range_left AS l\nLEFT JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi\nFORMAT JSON;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/explain/explain_cardinality.sql",
+      "expected_sha256": "c94bc560ed300788dc0e2cbbb1595a644178a0f15b21cecdf845d4ce0d17c720",
+      "control_actual_sha256": "7009042487b11bb0cee0da1d5dca52b0df45fb1cde23f5d0bff81bf065f3652c",
+      "probe_actual_sha256": "7009042487b11bb0cee0da1d5dca52b0df45fb1cde23f5d0bff81bf065f3652c",
+      "byte_identical": true,
+      "parsed_blocks": 7,
+      "differences": [
+        {
+          "block": 4,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN (VERBOSE)\nSELECT id\nFROM explain_cardinality_case\nWHERE score >= 20\nORDER BY score DESC, id\nLIMIT 2;"
+        },
+        {
+          "block": 5,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT id\nFROM explain_cardinality_case\nWHERE score >= 20\nORDER BY score DESC, id\nLIMIT 2\nFORMAT JSON;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/join/join_explain_advanced.sql",
+      "expected_sha256": "e57637cf5c3df41f88764061b701ee041b69d5ceed5331b2b8f720d523b13343",
+      "control_actual_sha256": "edb1b8bbdba653e1e38a33f17415d83bfc43130b2642fc72e6711fc4c5cd924d",
+      "probe_actual_sha256": "edb1b8bbdba653e1e38a33f17415d83bfc43130b2642fc72e6711fc4c5cd924d",
+      "byte_identical": true,
+      "parsed_blocks": 33,
+      "differences": [
+        {
+          "block": 5,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT l.id, r.id\nFROM join_explain_piecewise_l AS l\nJOIN join_explain_piecewise_r AS r ON l.id < r.id\nFORMAT JSON;"
+        },
+        {
+          "block": 6,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.id, r.id\nFROM join_explain_piecewise_l AS l\nJOIN join_explain_piecewise_r AS r ON l.id < r.id;"
+        },
+        {
+          "block": 7,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.id, r.id\nFROM join_explain_piecewise_l AS l\nJOIN join_explain_piecewise_r AS r ON l.id < r.id\nFORMAT JSON;"
+        },
+        {
+          "block": 12,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT l.x, r.lo, r.hi\nFROM join_explain_sort_range_l AS l\nLEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi\nFORMAT JSON;"
+        },
+        {
+          "block": 13,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.x, r.lo, r.hi\nFROM join_explain_sort_range_l AS l\nLEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi;"
+        },
+        {
+          "block": 14,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.x, r.lo, r.hi\nFROM join_explain_sort_range_l AS l\nLEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi\nFORMAT JSON;"
+        },
+        {
+          "block": 18,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.k, r.payload\nFROM join_explain_hash_l AS l\nLEFT JOIN join_explain_hash_r AS r ON l.k = r.k;"
+        },
+        {
+          "block": 19,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.k, r.payload\nFROM join_explain_hash_l AS l\nLEFT JOIN join_explain_hash_r AS r ON l.k = r.k\nFORMAT JSON;"
+        },
+        {
+          "block": 20,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.k\nFROM join_explain_hash_l AS l\nSEMI JOIN join_explain_hash_r AS r ON l.k IS NOT DISTINCT FROM r.k;"
+        },
+        {
+          "block": 21,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.k\nFROM join_explain_hash_l AS l\nSEMI JOIN join_explain_hash_r AS r ON l.k IS NOT DISTINCT FROM r.k\nFORMAT JSON;"
+        },
+        {
+          "block": 28,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.k\nFROM join_explain_spill_l AS l\nLEFT JOIN join_explain_spill_r AS r ON l.k = r.k;"
+        },
+        {
+          "block": 29,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.k\nFROM join_explain_spill_l AS l\nLEFT JOIN join_explain_spill_r AS r ON l.k = r.k\nFORMAT JSON;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/join/join_spill_external.sql",
+      "expected_sha256": "5e560bfced371694e50d562650c6b322d500468992e31307fae2c34a98602a47",
+      "control_actual_sha256": "169fa6b29604fe864c66254b3f742ac0a9e797ba68994c3197d5d411b87fb50c",
+      "probe_actual_sha256": "169fa6b29604fe864c66254b3f742ac0a9e797ba68994c3197d5d411b87fb50c",
+      "byte_identical": true,
+      "parsed_blocks": 25,
+      "differences": [
+        {
+          "block": 21,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT count(r.v)\nFROM join_spill_skew_l l\nLEFT JOIN join_spill_skew_r r\n  ON l.k = r.k;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/property_repair_runtime.sql",
+      "expected_sha256": "bb51be07f84aca56ea03ffcfe7e52bc31b3ececba351c3e45a155c21e969ab33",
+      "control_actual_sha256": "30e86634e43790d03594f9b36780a62013e160ccdf9e0523eda08b14f6817795",
+      "probe_actual_sha256": "30e86634e43790d03594f9b36780a62013e160ccdf9e0523eda08b14f6817795",
+      "byte_identical": true,
+      "parsed_blocks": 2,
+      "differences": [
+        {
+          "block": 1,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT l.label, r.payload\nFROM property_repair_left AS l\nLEFT JOIN property_repair_right AS r ON l.id = r.id\nORDER BY l.sort_key;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/select/rowset_scan_pushdown.sql",
+      "expected_sha256": "8f86b285f21ac36fdf84b8e3c0af0b4f82eece23308130eac2d64999552cd18f",
+      "control_actual_sha256": "515265e29f5af2843c4582735cd16b1a41a5953604d23981af15bf5545d6f511",
+      "probe_actual_sha256": "515265e29f5af2843c4582735cd16b1a41a5953604d23981af15bf5545d6f511",
+      "byte_identical": true,
+      "parsed_blocks": 37,
+      "differences": [
+        {
+          "block": 17,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN (VERBOSE)\nSELECT COUNT(*)\nFROM rowset_pushdown_case c\nJOIN rowset_pushdown_dim d ON c.k = d.k;"
+        },
+        {
+          "block": 18,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN (VERBOSE)\nSELECT id FROM rowset_pushdown_case ORDER BY score ASC LIMIT 5;"
+        },
+        {
+          "block": 33,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN (VERBOSE)\nSELECT phone, wide\nFROM matched_prefix_late_payload_case\nWHERE phone IN ('13x', '31y')\nORDER BY id\nLIMIT 3;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/select/select_order_by_spill.sql",
+      "expected_sha256": "014d6b99b5ce6664dd3f69b513e8ed564a1fba91f11fd85431b910d36650bad0",
+      "control_actual_sha256": "842c0d78d441a21d5951c8231b7364fce7fd32e0ee83b5954c8b038b7730b9bb",
+      "probe_actual_sha256": "842c0d78d441a21d5951c8231b7364fce7fd32e0ee83b5954c8b038b7730b9bb",
+      "byte_identical": true,
+      "parsed_blocks": 22,
+      "differences": [
+        {
+          "block": 11,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT id FROM order_spill_test ORDER BY id DESC, k1 ASC;"
+        },
+        {
+          "block": 16,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT id FROM order_spill_smallmem_test ORDER BY id ASC, k1 DESC;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/select/select_topn_fallback_spill.sql",
+      "expected_sha256": "152c459b23a01b91d78c8227b9ad6d656ff2fb2076e0558e285739cd0efa81c9",
+      "control_actual_sha256": "262120cccf80cd6b74e0621ecb2d490b0abc407d9b3929059da6e4dac9cfa3ee",
+      "probe_actual_sha256": "262120cccf80cd6b74e0621ecb2d490b0abc407d9b3929059da6e4dac9cfa3ee",
+      "byte_identical": true,
+      "parsed_blocks": 11,
+      "differences": [
+        {
+          "block": 2,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN\nSELECT id\nFROM topn_fallback_spill_case\nORDER BY score DESC\nLIMIT 3;"
+        },
+        {
+          "block": 8,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM topn_fallback_spill_case\nORDER BY score DESC\nLIMIT 3;"
+        }
+      ]
+    },
+    {
+      "case": "cases/query/vector/vector_search.sql",
+      "expected_sha256": "2c62d887dc483bad8367ed77be688e72ac75d2cad3babab5e591e0b8386ec92d",
+      "control_actual_sha256": "a4a399d53260694cd04fd36c32aa6d3fdeaeb5c0637ed9cb42367c856dc66afb",
+      "probe_actual_sha256": "a4a399d53260694cd04fd36c32aa6d3fdeaeb5c0637ed9cb42367c856dc66afb",
+      "byte_identical": true,
+      "parsed_blocks": 45,
+      "differences": [
+        {
+          "block": 9,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;"
+        },
+        {
+          "block": 19,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM indexed_items\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;"
+        },
+        {
+          "block": 21,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM indexed_items\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;"
+        },
+        {
+          "block": 22,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM indexed_items\nWHERE bucket = 3\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;"
+        },
+        {
+          "block": 23,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM indexed_items\nWHERE id = 1\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;"
+        },
+        {
+          "block": 24,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM indexed_items\nWHERE id <= 1024\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;"
+        },
+        {
+          "block": 26,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM indexed_items\nORDER BY emb <=> '[1.0, 0.0, 0.0]' LIMIT 2;"
+        },
+        {
+          "block": 36,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');"
+        },
+        {
+          "block": 38,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT /*+ HNSW_EF(37) */ id\nFROM indexed_items\nORDER BY emb <-> '[1.0, 1.0, 1.0]'\nLIMIT 2;"
+        },
+        {
+          "block": 39,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT /*+ HNSW_EF(37) HNSW_RERANK(7) */ id\nFROM indexed_items\nORDER BY emb <-> '[1.0, 1.0, 1.0]'\nLIMIT 2;"
+        },
+        {
+          "block": 40,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id\nFROM indexed_items\nWHERE id <= 1024\nORDER BY emb <-> '[1.0, 1.0, 1.0]'\nLIMIT 2;"
+        }
+      ]
+    },
+    {
+      "case": "cases/system/memory.sql",
+      "expected_sha256": "f4bd166030663c7f51dc3308b889e77e561167f0c95b6268f88345b8cabab252",
+      "control_actual_sha256": "03f15a99b2f7fb615dbe59cdd152181f43c5d3cbb99fa9811ebe79ec46daeaf5",
+      "probe_actual_sha256": "03f15a99b2f7fb615dbe59cdd152181f43c5d3cbb99fa9811ebe79ec46daeaf5",
+      "byte_identical": true,
+      "parsed_blocks": 19,
+      "differences": [
+        {
+          "block": 15,
+          "category": "non_explain_result",
+          "sql": "SELECT current_setting('memory_limit') FROM memory_dummy;"
+        }
+      ]
+    },
+    {
+      "case": "cases/system/optimizer_observability.sql",
+      "expected_sha256": "cfe6102045d3047fed9f0c1462b79f38e5ce9a3a601ddc56561d431ca36bbefb",
+      "control_actual_sha256": "b079d77bb1af5121b3a59d92f45313a7b8f28607be0bf0ee732d773906118c0f",
+      "probe_actual_sha256": "b079d77bb1af5121b3a59d92f45313a7b8f28607be0bf0ee732d773906118c0f",
+      "byte_identical": true,
+      "parsed_blocks": 10,
+      "differences": [
+        {
+          "block": 9,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN (VERBOSE)\nSELECT id\nFROM obs_docs\nWHERE fulltext_match(title, 'graph')\nORDER BY bm25(title, 'graph') DESC, id\nLIMIT 2;"
+        }
+      ]
+    },
+    {
+      "case": "cases/system/search_optimization.sql",
+      "expected_sha256": "104949f03d3e7ef389afaaa79e93652f95a05ae40ad5b58697ea7039884f866f",
+      "control_actual_sha256": "435083f7ff8d81d1ea6d25dda9279529b31a6116845335c930b651a57c18a459",
+      "probe_actual_sha256": "435083f7ff8d81d1ea6d25dda9279529b31a6116845335c930b651a57c18a459",
+      "byte_identical": true,
+      "parsed_blocks": 8,
+      "differences": [
+        {
+          "block": 5,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN (VERBOSE)\nSELECT id\nFROM search_opt_docs\nWHERE fulltext_match(content, 'graph database')\nORDER BY bm25(content, 'graph database') DESC, id\nLIMIT 2;"
+        }
+      ]
+    },
+    {
+      "case": "cases/system/spill_observability_guardrails.sql",
+      "expected_sha256": "cc870067e0fa5f1cb46b63889d5fcd6fb979c540cb801f1ee18f1da8d12ba843",
+      "control_actual_sha256": "787d961911e36c3f80d4ad5eb81f87d18dd1e4c1f18e0b6b364e5577e4805a02",
+      "probe_actual_sha256": "787d961911e36c3f80d4ad5eb81f87d18dd1e4c1f18e0b6b364e5577e4805a02",
+      "byte_identical": true,
+      "parsed_blocks": 19,
+      "differences": [
+        {
+          "block": 8,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;"
+        },
+        {
+          "block": 9,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE\nSELECT k1, k2, SUM(v)\nFROM spill_h_agg\nGROUP BY k1, k2;"
+        },
+        {
+          "block": 13,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;"
+        },
+        {
+          "block": 15,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;"
+        }
+      ]
+    },
+    {
+      "case": "cases/system/statistics_query.sql",
+      "expected_sha256": "7586d78279c1e0596b22cfc482eaea725001b2e72a98cf0af47cae28344fb60b",
+      "control_actual_sha256": "626652eccd2aee2c4497986d651e0cc261878542a09af407402016bc776b1e25",
+      "probe_actual_sha256": "626652eccd2aee2c4497986d651e0cc261878542a09af407402016bc776b1e25",
+      "byte_identical": true,
+      "parsed_blocks": 11,
+      "differences": [
+        {
+          "block": 8,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN (VERBOSE)\nSELECT s.id, b.payload\nFROM stats_small AS s\nJOIN stats_big AS b ON s.id = b.id;"
+        }
+      ]
+    },
+    {
+      "case": "cases/txn/transaction_settings_savepoint.sql",
+      "expected_sha256": "57e90fbc6e52526a6ba20d627e8ed1bc21800ad97145f5681cbd471c0548758c",
+      "control_actual_sha256": "c06aa4ac033fc4a2fa3e13ca7f4a7be85fd126324929282c31bf6805d9030e66",
+      "probe_actual_sha256": "c06aa4ac033fc4a2fa3e13ca7f4a7be85fd126324929282c31bf6805d9030e66",
+      "byte_identical": true,
+      "parsed_blocks": 24,
+      "differences": [
+        {
+          "block": 21,
+          "category": "non_explain_result",
+          "sql": "SELECT name, setting, short_desc AS description\nFROM pg_settings\nWHERE name NOT IN ('threads', 'temp_directory')\nORDER BY name;"
+        }
+      ]
+    },
+    {
+      "case": "cases/vector/pgvector_topn_filter_flow.sql",
+      "expected_sha256": "f80d79560049cf7244d5e7b2901915a7324ccaa5e19abc3ec51ac03fdffebfac",
+      "control_actual_sha256": "9b53bab6bd878b23856aa934d05c7a5761b32a7374e45d67b4f29767628f93b3",
+      "probe_actual_sha256": "9b53bab6bd878b23856aa934d05c7a5761b32a7374e45d67b4f29767628f93b3",
+      "byte_identical": true,
+      "parsed_blocks": 12,
+      "differences": [
+        {
+          "block": 4,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <-> '[1,0,0]' LIMIT 3;"
+        },
+        {
+          "block": 6,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]' LIMIT 2;"
+        },
+        {
+          "block": 8,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <=> '[1,0,0]' LIMIT 3;"
+        },
+        {
+          "block": 10,
+          "category": "explain_snapshot",
+          "sql": "EXPLAIN SELECT id FROM vector_topn_case ORDER BY emb <#> '[1,0,0]' LIMIT 3;"
+        }
+      ]
+    }
+  ]
+}
