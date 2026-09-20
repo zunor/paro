@@ -36,6 +36,19 @@ ORDER BY ts_rank(to_tsvector('simple', content),
                  plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
 
 -- Unrelated corpus growth must not change any original document's score.
+-- Cover density has its own document-local identity and executable provider.
+-- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank_cd(to_tsvector('simple', content),
+                    plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank_cd(to_tsvector('simple', content),
+                    plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+
 INSERT INTO score_identity VALUES (6, 'unrelated document');
 SELECT id, ts_rank(to_tsvector('simple', content),
                   plainto_tsquery('simple', 'vector database')) AS score
