@@ -726,6 +726,48 @@ fn memo_round_trip_derives_layout_after_winner_selection() {
 }
 
 #[test]
+fn planner_cross_product_keeps_verified_grant_when_another_is_unresolved() {
+    // Exercise the production implementation registry, cost composition,
+    // freeze and extraction, not a test-only Leaf implementation.
+    let bind_context = BindContext::new();
+    let input = |index| {
+        let mut plan = OwnedLogicalPlan::new(
+            &bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                index,
+                vec![],
+                vec!["value".to_owned()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10));
+        plan
+    };
+    let plan = OwnedLogicalPlan::new(
+        &bind_context,
+        LogicalOperator::Join(Join::cross(input(0), input(1))),
+    );
+    let grants = [0, 2].map(|id| ResourceGrantClass {
+        id: ResourceGrantClassId(id),
+        hard_memory_bytes: if id == 2 { 1 } else { 16 << 20 },
+        spill_policy: SpillPolicy::Forbidden,
+        max_parallel_tasks: 1,
+    });
+    let input = MemoBuilder::build(plan, bind_context, SearchBudget::default()).unwrap();
+    // A frozen statement snapshot selects the production expected-grant
+    // boundary; standalone Memo clients intentionally use eager coverage.
+    input.planner_state.write().unwrap().session =
+        Some(paro_context::TestStatementContextBuilder::minimal().build());
+    let output = input.optimize(&grants).unwrap();
+    assert_eq!(output.variants.len(), 1);
+    assert_eq!(output.variants[0].class, ResourceGrantClassId(0));
+    assert!(output.variants[0].contracts.get(&output.variants[0].plan.id).is_some());
+    let coverage = output.grant_search.unwrap();
+    assert_eq!(coverage.expected_class, Some(ResourceGrantClassId(2)));
+    assert_eq!(coverage.unresolved_classes, BTreeSet::from([ResourceGrantClassId(2)]));
+}
+
+#[test]
 fn memo_winner_names_the_hash_join_implementation() {
     let bind_context = BindContext::new();
     let left = OwnedLogicalPlan::new(

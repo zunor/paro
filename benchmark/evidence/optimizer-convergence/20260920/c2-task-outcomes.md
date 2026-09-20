@@ -32,3 +32,12 @@ Log: private archive `c0/c2-task-outcomes-test-r2.log`.
 
 This is not yet the C2 integrated SQL or performance gate. F2 remains
 isolated; no missing historical build evidence is repaired by these tests.
+
+The additional planner regression uses real cross-product implementation,
+costing, freeze and extraction with a frozen statement context. Expected
+class 2 has no verified image; class 0 remains executable and class 2 is
+explicitly unresolved. This is not a custom Leaf registry. The first new
+fixture accidentally selected the standalone eager API (which has no lazy
+coverage metadata); adding the statement context selects the intended
+production boundary without weakening any assertion. Both attempt logs are
+retained as `c2-real-planner-partial-grant{,-r2}.log`.
