@@ -2,8 +2,9 @@
 
 This is compile observation, not C2/F2 admission or a latency claim. Existing
 search, grant, verification and behavior-experiment defaults are unchanged.
-The authoritative schema is `context::compile_diagnostics::CompileRecord`;
-the renderer and validator share that Rust type and schema version 1.
+The authoritative wire document is `context::compile_diagnostics::CompileDocument`;
+the renderer and validator share its Summary/Unavailable variants and schema
+version 2. Version 1 artifacts remain historical evidence, not current input.
 
 ## SQL and support boundary
 
@@ -22,7 +23,7 @@ target execution image, admit a grant or execute the target.
 | --- | --- |
 | simple query/CTE Summary, TEXT/JSON | implemented |
 | binding/compilation error | original SQLSTATE and primary error preserved |
-| cancellation | existing compiler cancellation, not a successful document |
+| cancellation | compiler and backpressured Summary delivery observe statement cancellation |
 | DETAIL / ANALYZE | parsed, explicitly Unsupported (T3/T2) |
 | extended/prepared COMPILE | explicitly Unsupported at binder boundary (T2) |
 | DML/DDL/utility/nested EXPLAIN | explicitly Unsupported |
@@ -66,12 +67,28 @@ diagnostic delivery explicitly. Dropping a result, compilation error or canceled
 request returns its reservation; no fallback file or unaccounted queue is used.
 The snapshot is sealed before rendering.
 
+Producers can mutate only fixed-size `CompileFields`; bounded methods own rule
+and variant storage and the capacity profile is not exposed to mutation. The
+renderer accepts only `SealedCompileCapture`. Its shared lease pins the small
+record/reservation, never Memo or a plan. An automatic transaction started by
+the request has a scoped rollback guard: errors, cancellation, unwinding and
+future drop cannot attach it to the next statement. Explicit caller-owned
+transactions remain under the ordinary statement/transaction error contract.
+ProtocolSink records diagnostic write/flush failure through the same terminal
+transport state as ordinary rows; no diagnostic-only retry/error-response path.
+
 ## Accounting and machine reading
 
 Bind, optimize, verify, finish and compiler-other are disjoint intervals within
 ParsedAstCompilerEntryToReturnV1. Their integer nanosecond sum must equal compiler
 wall time. Parse is outside that boundary. Rule time is a separate projection
 of optimizer time and MUST NOT be added to compiler phases.
+
+Rule rows cover the union of binding time, apply attempts and publications.
+`binding_calls`/`binding_ns` distinguish matching-only work; `attempts` counts
+apply admission. Apply time is total `elapsed_ns` minus `binding_ns`. A no-match
+or pre-apply budget refusal can legitimately have a row with zero attempts.
+Additional binding counters are collected only for a compile capture.
 
 Search completion, unresolved obligations, quality satisfaction and budget
 status are independent fields copied from existing authorities. A verified
@@ -88,7 +105,12 @@ invalid capacity profiles, fabricated execution, unsupported completion claims
 and non-closing phase sums. It validates a record, not cross-run association or
 the correctness of an external arbitrary fingerprint.
 
-## Validation status
+## Historical validation status (before independent review)
+
+The following e1a04282-era results did not test transaction state after a
+dropped request, unavailable-document reading, contradictory terminal states,
+or the public mutation capacity bypass. They must not be read as certification
+of those contracts. See `compile-summary-review.md` for the repair and new gates.
 
 Tests: `session/tests/explain_compile_test.rs`, session's compile-request unit
 test, context capacity/ownership/seal test, execution renderer/validator tests.
