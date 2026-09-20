@@ -473,7 +473,7 @@ mod tests {
     use pgwire::messages::PgWireFrontendMessage;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpSocket, TcpStream};
     use tokio::task::JoinHandle;
     use tokio_util::bytes::Bytes;
 
@@ -595,6 +595,26 @@ mod tests {
         panic!("backend emitted more than {MAX_MESSAGES} messages before ReadyForQuery");
     }
 
+    async fn read_many_messages_until_ready(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+        const MAX_MESSAGES: usize = 100_000;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut messages = Vec::new();
+        for _ in 0..MAX_MESSAGES {
+            let mut message = tokio::time::timeout_at(deadline, read_backend_message(stream))
+                .await
+                .expect("backend terminal message");
+            let terminal = message.0 == b'Z';
+            if message.0 == b'd' {
+                message.1.clear();
+            }
+            messages.push(message);
+            if terminal {
+                return messages;
+            }
+        }
+        panic!("backend emitted more than {MAX_MESSAGES} messages before ReadyForQuery");
+    }
+
     async fn read_available_messages(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
         let mut messages = Vec::new();
         while let Some(message) = read_backend_message_timeout(stream, Duration::from_secs(1)).await
@@ -610,6 +630,21 @@ mod tests {
             .await
             .expect("write startup packet");
         read_messages_until_ready(stream).await
+    }
+
+    async fn connect_with_small_receive_buffer(addr: SocketAddr) -> TcpStream {
+        let socket = TcpSocket::new_v4().expect("create test client socket");
+        socket
+            .set_recv_buffer_size(4 * 1024)
+            .expect("set a small receive buffer");
+        socket.connect(addr).await.expect("connect test client")
+    }
+
+    fn backpressured_query() -> &'static str {
+        // One result row larger than the deliberately small client receive
+        // buffer keeps the real ResultSink in Framed::flush while the
+        // statement cancellation is delivered.
+        "SELECT * FROM range(0, 1000000000)"
     }
 
     async fn run_simple_query_roundtrip(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
@@ -1872,6 +1907,145 @@ mod tests {
             !probe.iter().any(|(tag, _)| *tag == b'E'),
             "connection should remain usable after COPY TO STDOUT cancel"
         );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_query_flushes_prefix_then_one_error_and_ready() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = connect_with_small_receive_buffer(addr).await;
+        let startup_messages = complete_startup(&mut client).await;
+        let (pid, secret) = startup_messages
+            .iter()
+            .find(|(tag, _)| *tag == b'K')
+            .and_then(|(_, payload)| backend_key_data(payload))
+            .expect("startup should include backend key data");
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(backpressured_query().to_string()),
+            )))
+            .await
+            .expect("write backpressured query");
+        sleep(Duration::from_millis(20)).await;
+
+        let mut cancel = TcpStream::connect(addr).await.expect("cancel connection");
+        cancel
+            .write_all(&encode_cancel_request(pid, secret))
+            .await
+            .expect("write cancel request");
+        let mut eof = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), cancel.read(&mut eof))
+                .await
+                .expect("cancel connection should close")
+                .expect("read cancel EOF"),
+            0
+        );
+
+        // Resume reading on the original socket.  The transport must finish
+        // any already queued RowDescription/DataRow prefix before the original
+        // query-canceled ErrorResponse, then emit exactly one ReadyForQuery.
+        let messages = read_many_messages_until_ready(&mut client).await;
+        let errors = messages.iter().filter(|(tag, _)| *tag == b'E').count();
+        let ready = messages.iter().filter(|(tag, _)| *tag == b'Z').count();
+        assert_eq!(errors, 1, "cancellation must emit one ErrorResponse");
+        assert_eq!(ready, 1, "cancellation must emit one ReadyForQuery");
+        let error_index = messages
+            .iter()
+            .position(|(tag, _)| *tag == b'E')
+            .expect("query cancellation error");
+        assert!(
+            messages[..error_index]
+                .iter()
+                .any(|(tag, _)| *tag == b'T' || *tag == b'D'),
+            "the queued result prefix must precede ErrorResponse"
+        );
+        let error = &messages[error_index];
+        assert_eq!(error_field(&error.1, b'C').as_deref(), Some("57014"));
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('I')
+        );
+        assert!(
+            error_index < messages.iter().position(|(tag, _)| *tag == b'Z').unwrap(),
+            "ErrorResponse must precede ReadyForQuery"
+        );
+
+        let probe = run_simple_query_roundtrip(&mut client, "SELECT 1").await;
+        assert!(!probe.iter().any(|(tag, _)| *tag == b'E'));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_close_during_cancelled_query_terminal_send_drops_connection() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = connect_with_small_receive_buffer(addr).await;
+        let startup_messages = complete_startup(&mut client).await;
+        let (pid, secret) = startup_messages
+            .iter()
+            .find(|(tag, _)| *tag == b'K')
+            .and_then(|(_, payload)| backend_key_data(payload))
+            .expect("startup should include backend key data");
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(backpressured_query().to_string()),
+            )))
+            .await
+            .expect("write backpressured query");
+        sleep(Duration::from_millis(20)).await;
+
+        let mut cancel = TcpStream::connect(addr).await.expect("cancel connection");
+        cancel
+            .write_all(&encode_cancel_request(pid, secret))
+            .await
+            .expect("write cancel request");
+        let mut eof = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), cancel.read(&mut eof))
+                .await
+                .expect("cancel connection should close")
+                .expect("read cancel EOF"),
+            0
+        );
+
+        // Do not consume the original socket.  Force-close must win even if
+        // the terminal ErrorResponse is waiting behind a backpressured
+        // diagnostic prefix.
+        sleep(Duration::from_millis(20)).await;
+        server.broadcast_force_close();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut total = 0usize;
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
+                .await
+                .expect("force-close must resolve the client read")
+                .expect("read after force-close");
+            if read == 0 {
+                break;
+            }
+            total += read;
+            assert!(total < 8 * 1024 * 1024, "connection did not close promptly");
+        }
 
         server
             .shutdown(Duration::from_secs(5))

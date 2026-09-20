@@ -7,7 +7,7 @@
 //! session crate owns COPY routing and execution decisions.
 
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, ParoError, Result};
 use paro_common::types::LogicalType;
@@ -26,14 +26,13 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::PgCodec;
-use crate::protocol::result::{observe_pending_output, PgWireResultSink};
+use crate::protocol::result::PgWireResultSink;
+use crate::protocol::transport::{self, DrainOutcome, CANCELLED_OUTPUT_STALL_TIMEOUT};
 use crate::protocol::value_format::TextVectorEncoder;
 
 const COPY_TEXT_FORMAT_CODE: i8 = 0;
 const COPY_DATA_TARGET_BYTES: usize = 64 * 1024;
 const COPY_DATA_BUFFER_BYTES: usize = COPY_DATA_TARGET_BYTES * 2;
-const COPY_CANCEL_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
 #[derive(Debug, Clone, Copy)]
 struct CopyFlushPolicy {
     stalled_write_timeout: std::time::Duration,
@@ -42,7 +41,7 @@ struct CopyFlushPolicy {
 impl Default for CopyFlushPolicy {
     fn default() -> Self {
         Self {
-            stalled_write_timeout: COPY_CANCEL_STALL_TIMEOUT,
+            stalled_write_timeout: CANCELLED_OUTPUT_STALL_TIMEOUT,
         }
     }
 }
@@ -360,7 +359,7 @@ impl<'a> PgWireCopyOutSink<'a> {
         // terminates this sink. Therefore `feed` never inherits a buffer above
         // Framed's backpressure boundary and cannot park in `poll_ready`.
         debug_assert!(self.socket.write_buffer().is_empty());
-        if let Err(error) = self.socket.feed(message).await {
+        if let Err(error) = transport::feed(self.socket, message).await {
             self.force_close_token.cancel();
             return Err(paro_error::connection_failure(error.to_string()));
         }
@@ -375,9 +374,8 @@ impl<'a> PgWireCopyOutSink<'a> {
             biased;
             _ = self.force_close_token.cancelled() => FlushOutcome::ForceClosed,
             _ = self.cancellation.cancelled() => FlushOutcome::StatementCancelled,
-            result = self.socket.flush() => FlushOutcome::Flushed(result),
+            result = transport::flush(self.socket) => FlushOutcome::Flushed(result),
         };
-        observe_pending_output(self.socket);
 
         match outcome {
             FlushOutcome::Flushed(Ok(())) => Ok(()),
@@ -393,27 +391,23 @@ impl<'a> PgWireCopyOutSink<'a> {
     }
 
     async fn flush_cancelled_frame(&mut self) -> Result<()> {
-        let mut remaining = self.socket.write_buffer().len();
-        loop {
-            let outcome =
-                tokio::time::timeout(self.flush_policy.stalled_write_timeout, self.socket.flush())
-                    .await;
-            observe_pending_output(self.socket);
-            match outcome {
-                Ok(Ok(())) => return self.cancellation.check(),
-                Ok(Err(error)) => {
-                    self.force_close_token.cancel();
-                    return Err(paro_error::connection_failure(error.to_string()));
-                }
-                Err(_) => {
-                    let current = self.socket.write_buffer().len();
-                    if current < remaining {
-                        remaining = current;
-                        continue;
-                    }
-                    return Err(self
-                        .abandon_connection("statement cancelled while flushing COPY TO STDOUT"));
-                }
+        match transport::drain_pending_output(
+            self.socket,
+            &self.force_close_token,
+            self.flush_policy.stalled_write_timeout,
+        )
+        .await
+        {
+            Ok(DrainOutcome::Drained) => self.cancellation.check(),
+            Ok(DrainOutcome::ForceClosed) => {
+                Err(self.abandon_connection("connection force-closed during COPY TO STDOUT"))
+            }
+            Ok(DrainOutcome::Stalled) => {
+                Err(self.abandon_connection("statement cancelled while flushing COPY TO STDOUT"))
+            }
+            Err(error) => {
+                self.force_close_token.cancel();
+                Err(paro_error::connection_failure(error.to_string()))
             }
         }
     }
@@ -543,17 +537,16 @@ impl<'a> PgWireCopyInSink<'a> {
     }
 
     async fn send_copy_in_response(&mut self, spec: &CopyInSpec) -> Result<()> {
-        let result = self
-            .sink
-            .socket_mut()
-            .send(PgWireBackendMessage::CopyInResponse(CopyInResponse::new(
+        let result = transport::send(
+            self.sink.socket_mut(),
+            PgWireBackendMessage::CopyInResponse(CopyInResponse::new(
                 spec.overall_format,
                 spec.column_formats.len() as i16,
                 spec.column_formats.clone(),
-            )))
-            .await
-            .map_err(|e| paro_error::internal(e.to_string()));
-        observe_pending_output(self.sink.socket_mut());
+            )),
+        )
+        .await
+        .map_err(|e| paro_error::internal(e.to_string()));
         result
     }
 }

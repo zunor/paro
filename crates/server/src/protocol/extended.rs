@@ -4,7 +4,6 @@
 //! Extended-query protocol responder implementations.
 
 use async_trait::async_trait;
-use futures::SinkExt;
 use paro_common::chunk::Chunk;
 use paro_common::error::{ParoError, Result};
 use paro_common::types::LogicalType;
@@ -29,9 +28,8 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::PgCodec;
 
 use super::copy::{create_copy_in_source, create_copy_out_sink, CopyFrontendMode};
-use super::result::{
-    build_error_response, field_description_with_format, observe_pending_output, send_chunk_rows,
-};
+use super::result::{build_error_response, field_description_with_format, send_chunk_rows};
+use super::transport;
 
 pub struct PgWireExtendedQueryResponder<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
@@ -59,18 +57,22 @@ impl<'a> PgWireExtendedQueryResponder<'a> {
 #[async_trait]
 impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
     async fn send_parse_complete(&mut self) -> Result<()> {
-        self.socket
-            .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+        transport::feed(
+            self.socket,
+            PgWireBackendMessage::ParseComplete(ParseComplete::new()),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
     async fn send_bind_complete(&mut self) -> Result<()> {
-        self.socket
-            .feed(PgWireBackendMessage::BindComplete(BindComplete::new()))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+        transport::feed(
+            self.socket,
+            PgWireBackendMessage::BindComplete(BindComplete::new()),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
@@ -82,12 +84,12 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
             .iter()
             .map(|ty| ty.as_ref().map(|ty| ty.pg_descriptor().oid).unwrap_or(0))
             .collect::<Vec<_>>();
-        self.socket
-            .feed(PgWireBackendMessage::ParameterDescription(
-                ParameterDescription::new(type_oids),
-            ))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+        transport::feed(
+            self.socket,
+            PgWireBackendMessage::ParameterDescription(ParameterDescription::new(type_oids)),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
@@ -112,12 +114,12 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
             })
             .collect::<Vec<_>>();
 
-        self.socket
-            .feed(PgWireBackendMessage::RowDescription(RowDescription::new(
-                fields,
-            )))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+        transport::feed(
+            self.socket,
+            PgWireBackendMessage::RowDescription(RowDescription::new(fields)),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
@@ -131,69 +133,69 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
     }
 
     async fn send_command_complete(&mut self, completion: &StatementCompletion) -> Result<()> {
-        self.socket
-            .feed(PgWireBackendMessage::CommandComplete(
+        transport::feed(
+            self.socket,
+            PgWireBackendMessage::CommandComplete(
                 pgwire::messages::response::CommandComplete::new(completion.to_command_complete()),
-            ))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+            ),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
     async fn send_close_complete(&mut self) -> Result<()> {
-        self.socket
-            .feed(PgWireBackendMessage::CloseComplete(CloseComplete::new()))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+        transport::feed(
+            self.socket,
+            PgWireBackendMessage::CloseComplete(CloseComplete::new()),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
     async fn send_no_data(&mut self) -> Result<()> {
-        self.socket
-            .feed(PgWireBackendMessage::NoData(NoData::new()))
+        transport::feed(self.socket, PgWireBackendMessage::NoData(NoData::new()))
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
     async fn send_empty_query_response(&mut self) -> Result<()> {
-        self.socket
-            .feed(PgWireBackendMessage::EmptyQueryResponse(
-                EmptyQueryResponse::new(),
-            ))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+        transport::feed(
+            self.socket,
+            PgWireBackendMessage::EmptyQueryResponse(EmptyQueryResponse::new()),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
     async fn send_portal_suspended(&mut self) -> Result<()> {
-        self.socket
-            .feed(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+        transport::feed(
+            self.socket,
+            PgWireBackendMessage::PortalSuspended(PortalSuspended::new()),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
     }
 
     async fn send_error(&mut self, err: &ParoError) -> Result<()> {
-        let result = self
-            .socket
-            .send(PgWireBackendMessage::ErrorResponse(build_error_response(
-                err,
-            )))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()));
-        observe_pending_output(self.socket);
+        let result = transport::send(
+            self.socket,
+            PgWireBackendMessage::ErrorResponse(build_error_response(err)),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()));
         result?;
         Ok(())
     }
 
     async fn flush(&mut self) -> Result<()> {
-        let result = self
-            .socket
-            .flush()
+        let result = transport::flush(self.socket)
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()));
-        observe_pending_output(self.socket);
         result
     }
 

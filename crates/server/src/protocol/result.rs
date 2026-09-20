@@ -4,7 +4,6 @@
 //! Result sinks and shared row/error encoding helpers for PostgreSQL wire messages.
 
 use async_trait::async_trait;
-use futures::SinkExt;
 use paro_common::chunk::Chunk;
 use paro_common::error::{ParoError, Result};
 use paro_common::types::LogicalType;
@@ -17,6 +16,8 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use crate::connection::PgCodec;
+
+use super::transport;
 
 use super::data_row::{encode_chunk_rows, encode_text_chunk_rows};
 
@@ -62,14 +63,12 @@ impl<'a> ResultSink for PgWireResultSink<'a> {
             .map(|(name, logical_type)| field_description(name.clone(), logical_type))
             .collect::<Vec<_>>();
 
-        let result = self
-            .socket
-            .send(PgWireBackendMessage::RowDescription(RowDescription::new(
-                fields,
-            )))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()));
-        observe_pending_output(self.socket);
+        let result = transport::send(
+            self.socket,
+            PgWireBackendMessage::RowDescription(RowDescription::new(fields)),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()));
         result?;
 
         Ok(())
@@ -90,24 +89,21 @@ impl<'a> ResultSink for PgWireResultSink<'a> {
         self.socket
             .codec_mut()
             .retain_pending_output_owner(bytes, owner);
-        let result = self
-            .socket
-            .flush()
+        let result = transport::flush(self.socket)
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()));
-        observe_pending_output(self.socket);
         result
     }
 
     async fn finish_result(&mut self, completion: &StatementCompletion) -> Result<()> {
-        let result = self
-            .socket
-            .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+        let result = transport::send(
+            self.socket,
+            PgWireBackendMessage::CommandComplete(CommandComplete::new(
                 completion.to_command_complete(),
-            )))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()));
-        observe_pending_output(self.socket);
+            )),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()));
         result?;
 
         self.col_count = 0;
@@ -115,14 +111,12 @@ impl<'a> ResultSink for PgWireResultSink<'a> {
     }
 
     async fn error(&mut self, err: &ParoError) -> Result<()> {
-        let result = self
-            .socket
-            .send(PgWireBackendMessage::ErrorResponse(build_error_response(
-                err,
-            )))
-            .await
-            .map_err(|e| paro_common::error::internal(e.to_string()));
-        observe_pending_output(self.socket);
+        let result = transport::send(
+            self.socket,
+            PgWireBackendMessage::ErrorResponse(build_error_response(err)),
+        )
+        .await
+        .map_err(|e| paro_common::error::internal(e.to_string()));
         result?;
         Ok(())
     }
@@ -186,19 +180,12 @@ fn append_text_chunk_rows(
 
 async fn flush_result_buffer_if_needed(socket: &mut Framed<TcpStream, PgCodec>) -> Result<()> {
     if should_flush_result_buffer(socket.write_buffer().len()) {
-        let result = socket
-            .flush()
+        let result = transport::flush(socket)
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()));
-        observe_pending_output(socket);
         result?;
     }
     Ok(())
-}
-
-pub(crate) fn observe_pending_output(socket: &mut Framed<TcpStream, PgCodec>) {
-    let buffered_bytes = socket.write_buffer().len();
-    socket.codec_mut().observe_pending_output(buffered_bytes);
 }
 
 pub(crate) fn build_error_response(err: &ParoError) -> pgwire::messages::response::ErrorResponse {
@@ -435,8 +422,7 @@ mod tests {
                 }
             }
         });
-        socket.flush().await.unwrap();
-        observe_pending_output(&mut socket);
+        transport::flush(&mut socket).await.unwrap();
         assert_eq!(socket.codec().pending_output_bytes(), 0);
         assert!(weak.upgrade().is_none());
         drop(socket);

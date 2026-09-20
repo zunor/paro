@@ -365,6 +365,31 @@ impl Session {
         options: QueryPipelineOptions,
         sink: &mut S,
     ) -> Result<()> {
+        // Most execution failures already roll back at their source, but
+        // result/transport errors can escape through `?` while a sink is
+        // writing a row.  Keep the automatic transaction contract at the
+        // pipeline boundary as well, so cancellation during protocol output
+        // cannot leave the session in an implicit InTransaction state.
+        let auto_transaction =
+            self.transaction.is_auto_commit() && !self.transaction.has_active_transaction();
+        let result = self
+            .execute_query_pipeline_with_parameters_inner(stmt, parameter_env, options, sink)
+            .await;
+        if auto_transaction && result.is_err() && self.has_active_transaction() {
+            if let Err(error) = &result {
+                let _ = self.rollback_auto_transaction(Some(error));
+            }
+        }
+        result
+    }
+
+    async fn execute_query_pipeline_with_parameters_inner<S: ProtocolResultSink>(
+        &mut self,
+        stmt: Statement,
+        parameter_env: Option<&TypedParameterEnv>,
+        options: QueryPipelineOptions,
+        sink: &mut S,
+    ) -> Result<()> {
         let QueryPipelineOptions {
             statement_format,
             source,
