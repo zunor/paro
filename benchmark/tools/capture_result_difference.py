@@ -55,9 +55,9 @@ def main():
     contract = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = contract
     spec.loader.exec_module(contract)
-    assert_compatible_schema = contract.assert_compatible_schema
-    assert_same_multiset = contract.assert_same_multiset
-    canonicalize_rows = contract.canonicalize_rows
+    # BoundResult's lazy imports must use this contract too, even when the
+    # independently pinned lifecycle harness imported an older module first.
+    sys.modules["tpcds_result_contract"] = contract
     duckdb_schema, paro_schema = contract.duckdb_schema, contract.paro_schema
     import duckdb
     import _duckdb

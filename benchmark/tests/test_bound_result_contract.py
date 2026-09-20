@@ -5,7 +5,7 @@ import unittest
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corpora"))
-from bound_result_contract import BoundResult, Uncovered, order_values
+from bound_result_contract import BoundResult, Uncovered, order_values, evaluate
 from exact_result_value import exact_number
 from tpcds_result_contract import ColumnContract as C
 
@@ -93,3 +93,8 @@ class BoundResultContractTests(unittest.TestCase):
                       '(a+b)*b HAVING true', '(a+b)*b AS wrong']:
             with self.assertRaises(ValueError):
                 b.check_identity([C(label,"int64","20")],"paro")
+
+    def test_mixed_order_arithmetic_does_not_round_exact_values_to_float(self):
+        with self.assertRaises(Uncovered):
+            evaluate(("+", ("column", 0), ("column", 1)),
+                     (exact_number(10**38-1), 0.0))

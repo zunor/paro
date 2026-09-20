@@ -395,10 +395,8 @@ def evaluate(expr, row):
     if exact:
         a, b = a.value, b.value
     else:
-        a = float(a.value) if isinstance(a, ExactNumber) else a
-        b = float(b.value) if isinstance(b, ExactNumber) else b
         if type(a) is not float or type(b) is not float:
-            raise Uncovered("arithmetic ORDER operand types")
+            raise Uncovered("mixed arithmetic ORDER requires an explicit coercion contract")
     value = {"+": lambda: a+b, "-": lambda: a-b, "*": lambda: a*b}[op]()
     return ExactNumber(value) if exact else value
 
