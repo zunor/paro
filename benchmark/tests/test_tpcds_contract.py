@@ -35,7 +35,33 @@ class TpcdsResultContractTests(unittest.TestCase):
         )
         duckdb = duckdb_schema([("d_year", "BIGINT")])
 
-        assert_compatible_schema(paro, duckdb)
+        assert_compatible_schema(paro, duckdb, query="SELECT dt.d_year FROM dt")
+
+    def test_derived_label_requires_the_same_parsed_expression(self) -> None:
+        a = (ColumnContract("round(x / y, 2)", "float64", "701"),)
+        b = (ColumnContract("round((x / y), 2)", "float64", "DOUBLE"),)
+        assert_compatible_schema(a, b, query="SELECT round(x/y,2) FROM t")
+        with self.assertRaises(ResultContractError):
+            assert_compatible_schema(a, b)  # wire identity remains strict
+        for query in ["SELECT round(y/x,2) FROM t", 'SELECT round(x/y,2) AS "Identity" FROM t']:
+            with self.assertRaises(ResultContractError):
+                assert_compatible_schema(a, b, query=query)
+
+    def test_explicit_alias_case_dots_order_and_type_are_strict(self) -> None:
+        a = (ColumnContract("A.b", "float64", "701"),)
+        assert_compatible_schema(a, a, query='SELECT x AS "A.b" FROM t')
+        for name, kind in [("b", "float64"), ("a.b", "float64"), ("A.b", "float32")]:
+            with self.assertRaises(ResultContractError):
+                assert_compatible_schema(a, (ColumnContract(name, kind, "other"),),
+                                         query='SELECT x AS "A.b" FROM t')
+        with self.assertRaises(ResultContractError):
+            assert_compatible_schema(a, a, query='SELECT x AS "Other" FROM t')
+
+    def test_parentheses_are_not_erased_algebraically(self) -> None:
+        a = (ColumnContract("(x+y)*z", "float64", "701"),)
+        b = (ColumnContract("x+(y*z)", "float64", "DOUBLE"),)
+        with self.assertRaises(ResultContractError):
+            assert_compatible_schema(a, b, query="SELECT (x+y)*z FROM t")
 
     def test_q03_order_contract_uses_result_columns_and_default_null_order(self) -> None:
         schema = (

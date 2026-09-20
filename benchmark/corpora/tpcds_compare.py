@@ -36,6 +36,7 @@ from benchmark_evidence import (
     validate_statement_trace,
 )
 from tpcds_result_contract import (
+    RESULT_CONTRACT_VERSION,
     ColumnContract,
     assert_compatible_schema,
     assert_peer_order,
@@ -207,7 +208,7 @@ def collect_pre_touch(paro: Any, duck: Any, spec: dict[str, Any] | None,
                 records[engine]["second_execution"]["cache_evidence"] = (
                     collect_statement_cache_evidence(paro, spec["sql"], expected_occurrence=1))
     if duck is not None:
-        assert_compatible_schema(schemas["paro"], schemas["duckdb"])
+        assert_compatible_schema(schemas["paro"], schemas["duckdb"], query=spec["sql"])
         assert_same_multiset(normalized["paro"], normalized["duckdb"])
     return {"query_fingerprint": spec["query_fingerprint"], "engines": records,
             "preparation_wall_ms": (time.perf_counter_ns()-started)/1e6,
@@ -672,6 +673,7 @@ def main() -> int:
             ]
         },
         "configuration": {
+            "result_contract_version": RESULT_CONTRACT_VERSION,
             "threads": args.threads,
             "memory_limit": args.memory_limit,
             "statement_timeout_seconds": args.statement_timeout_seconds,
@@ -886,7 +888,7 @@ def main() -> int:
                 try:
                     duck_rows, duck_schema, _ = oracle_duck.execute(query)
                     paro_rows, actual_schema = run_paro(oracle_paro, query, binary_result)
-                    assert_compatible_schema(actual_schema, duck_schema)
+                    assert_compatible_schema(actual_schema, duck_schema, query=query)
                     expected = canonicalize_rows(duck_rows, duck_schema)
                     actual = canonicalize_rows(paro_rows, actual_schema)
                     assert_same_multiset(actual, expected)
@@ -913,7 +915,7 @@ def main() -> int:
                 rows: list[tuple[Any, ...]],
                 sample_schema: tuple[ColumnContract, ...],
             ) -> tuple[str, str | None]:
-                assert_compatible_schema(sample_schema, duck_schema)
+                assert_compatible_schema(sample_schema, duck_schema, query=query)
                 normalized = canonicalize_rows(rows, sample_schema)
                 digest = multiset_digest(normalized)
                 if digest != oracle_digest:

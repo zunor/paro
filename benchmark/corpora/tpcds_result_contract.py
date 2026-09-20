@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections import Counter
@@ -18,6 +19,58 @@ from typing import Any, Sequence
 
 class ResultContractError(AssertionError):
     pass
+
+
+RESULT_CONTRACT_VERSION = "typed-result-v2"
+
+
+def _select_expressions(sql: str, *, label_only: bool = False) -> list[dict[str, Any]]:
+    """Parse, never execute, SQL using the pinned oracle's syntax reader.
+
+    Parser locations are not output identity. No algebraic rewriting, name
+    erasure or type conversion is performed. Unsupported projections fail
+    closed; callers retain the raw wire schemas in evidence.
+    """
+    import duckdb
+
+    if duckdb.__version__ != "1.5.5":
+        raise ResultContractError("output identity parser requires DuckDB 1.5.5")
+    with duckdb.connect() as parser:
+        document = json.loads(parser.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0])
+    if document.get("error") or len(document.get("statements", [])) != 1:
+        raise ResultContractError("output identity requires one parseable SELECT")
+    node = document["statements"][0]["node"]
+    if node.get("type") != "SELECT_NODE":
+        raise ResultContractError("output identity for this query shape is Uncovered")
+    if label_only and (node.get("from_table", {}).get("type") != "EMPTY"
+            or node.get("modifiers") or node.get("cte_map", {}).get("map")
+            or any(node.get(key) for key in ["where_clause", "group_expressions", "having", "qualify"])):
+        raise ResultContractError("display label contains query clauses")
+    return node["select_list"]
+
+
+def _expression_identity(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _expression_identity(item) for key, item in value.items()
+                if key != "query_location"}
+    if isinstance(value, list):
+        return [_expression_identity(item) for item in value]
+    return value
+
+
+def _matches_output_identity(label: str, expression: dict[str, Any]) -> bool:
+    if expression.get("alias"):
+        return label == expression["alias"]
+    if expression.get("class") == "COLUMN_REF":
+        # A projected column has SQL identity; an engine may display its
+        # source qualifier. Quoted identifiers with dots remain intact.
+        if label == expression["column_names"][-1]:
+            return True
+    try:
+        parsed = _select_expressions("SELECT " + label, label_only=True)
+    except (ResultContractError, ValueError):
+        return False
+    return len(parsed) == 1 and _expression_identity(parsed[0]) == _expression_identity(expression)
 
 
 @dataclass(frozen=True)
@@ -142,17 +195,28 @@ def duckdb_schema(description: Sequence[Any]) -> tuple[ColumnContract, ...]:
 
 
 def _result_column_name(name: Any) -> str:
-    """Compare result identity independently of an engine's qualifier display."""
-    return str(name).rsplit(".", 1)[-1].strip('"').lower()
+    """Preserve wire identity, including case, dots and explicit aliases."""
+    return str(name)
 
 
 def assert_compatible_schema(
-    paro: Sequence[ColumnContract], duckdb: Sequence[ColumnContract]
+    paro: Sequence[ColumnContract], duckdb: Sequence[ColumnContract],
+    *, query: str | None = None,
 ) -> None:
     if len(paro) != len(duckdb):
         raise ResultContractError(f"schema arity mismatch: Paro={len(paro)}, DuckDB={len(duckdb)}")
+    expressions = _select_expressions(query) if query is not None else None
+    if expressions is not None and (len(expressions) != len(paro)
+            or any(expr.get("class") == "STAR" for expr in expressions)):
+        # No ordinal guessing for star expansion. Equal raw schemas remain
+        # valid; unequal labels need an explicit supported projection.
+        expressions = None
     for index, (actual, expected) in enumerate(zip(paro, duckdb)):
-        if actual.name != expected.name or actual.logical_type != expected.logical_type:
+        names_match = actual.name == expected.name
+        if expressions is not None:
+            names_match = (_matches_output_identity(actual.name, expressions[index])
+                           and _matches_output_identity(expected.name, expressions[index]))
+        if not names_match or actual.logical_type != expected.logical_type:
             raise ResultContractError(
                 "schema mismatch at column "
                 f"{index}: Paro=({actual.name},{actual.logical_type},{actual.engine_type}) "
