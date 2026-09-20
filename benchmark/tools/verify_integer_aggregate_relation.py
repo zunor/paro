@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corpora"))
 from numeric_result_contract import (
-    VERSION, assert_numeric_bijection, sample_moments, schedule_envelope,
+    VERSION, Uncovered, assert_numeric_bijection, sample_moments, schedule_envelope,
 )
 from analyze_integer_moment_oracle import ulps
 
@@ -35,15 +35,22 @@ def decode(cell):
 
 
 def verify(inputs, output, spec):
+    if spec.get("contract") != VERSION:
+        raise ValueError("unregistered numerical contract version")
+    if "limit" in spec or "approximate_order" in spec:
+        raise Uncovered("approximate ORDER BY/LIMIT boundary requires a separate proof")
     decoded = {side: [tuple(map(decode, row)) for row in inputs[side]]
                for side in ["actual", "expected"]}
     if Counter(decoded["actual"]) != Counter(decoded["expected"]):
         raise ValueError("input bags differ")
     keys, value = spec["input_keys"], spec["input_value"]
-    if set(keys + [value]) != set(range(len(decoded["actual"][0]))):
+    input_width = len(keys) + 1
+    if sorted(keys + [value]) != list(range(input_width)):
         raise ValueError("every input column must have a role")
     bags = defaultdict(list)
     for row in decoded["actual"]:
+        if len(row) != input_width:
+            raise ValueError("input row width differs from registered roles")
         bags[tuple(row[k] for k in keys)].append(row[value])
     selected, mathematical, numerical = {}, {}, {}
     boundary_count = 0
@@ -66,7 +73,6 @@ def verify(inputs, output, spec):
         if key[selector] == spec["right_value"]:
             right[identity].append(key)
     reference = []
-    pairs = []
     width = spec["output_width"]
     occupied = [c for role in spec["roles"] for c in role["keys"] + [role["mean"], role["cv"]]]
     if sorted(occupied) != list(range(width)) or len(spec["roles"]) != 2:
@@ -79,7 +85,6 @@ def verify(inputs, output, spec):
                     row[column] = key_value
                 row[role["mean"]], row[role["cv"]] = selected[key]
             reference.append(tuple(row))
-            pairs.append((lkey, rkey))
     # A unique exact ORDER BY prefix certifies the full order, independently
     # of approximate suffixes. Ties / floating LIMIT boundaries are uncovered.
     prefix = spec["unique_order_prefix"]
