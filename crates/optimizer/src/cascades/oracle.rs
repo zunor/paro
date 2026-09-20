@@ -536,7 +536,7 @@ mod tests {
             Some(child)
         );
         assert_eq!(reference.published_owner.get(&child_object), Some(&1));
-        production.complete(child, TaskOutcome::Infeasible).unwrap();
+        production.complete(child, TaskOutcome::NoCandidate { cursor: production.task(child).unwrap().cursor }).unwrap();
         production.start(parent).unwrap();
         production
             .publish_current(

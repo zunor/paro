@@ -1126,7 +1126,6 @@ pub struct CascadesEngine {
     registry: ImplementationRegistry,
     enforcement: EnforcementPlanner,
     recipes: BTreeMap<(PhysicalExprId, OptimizationGoal, Fingerprint), Arc<CostRecipe>>,
-    infeasible_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     /// Mandatory winners survive a cost-epoch reset in the immutable winner
     /// archive, but their frontier is intentionally cleared. Keep this small
     /// exact map so optional recipe bounds can compare against the protected
@@ -1451,7 +1450,6 @@ impl CascadesEngine {
                 budget.max_optional_enforcer_chains_per_goal,
             ),
             recipes: BTreeMap::new(),
-            infeasible_goals: BTreeSet::new(),
             protected_incumbents: BTreeMap::new(),
             strong_incumbents: BTreeMap::new(),
             protected_incumbent_enabled: true,
@@ -3957,7 +3955,6 @@ impl CascadesEngine {
         // affected winner frontiers are recomposed; rebuilding every recipe
         // made a grant or logical refresh pay the same construction cost
         // again. New logical expressions still add recipes incrementally.
-        self.infeasible_goals.clear();
         self.grant_sensitivity.clear();
         // The cost epoch is part of every child-combination context. A
         // completion proof from the previous epoch is therefore never a
@@ -4760,12 +4757,10 @@ impl CascadesEngine {
                     .saturating_add(1);
             }
             interleave.pending.insert((group, changed_goal));
-            self.infeasible_goals.remove(&(group, changed_goal));
             if group == interleave.root {
                 let root_goals = interleave.goals.clone();
                 for goal in root_goals {
                     interleave.pending.insert((group, goal));
-                    self.infeasible_goals.remove(&(group, goal));
                 }
             }
         }
@@ -4804,7 +4799,6 @@ impl CascadesEngine {
                     .physical_merged_notification_count
                     .saturating_add(1);
             }
-            self.infeasible_goals.remove(&parent_key);
         }
     }
 
@@ -7839,7 +7833,7 @@ impl CascadesEngine {
                 let incomplete = outcome.as_ref().is_some_and(|outcome| {
                     matches!(
                         outcome,
-                        TaskOutcome::Progress { cursor }
+                        TaskOutcome::Progress { cursor } | TaskOutcome::NoCandidate { cursor }
                             if self
                                 .task_registry
                                 .cursor(*cursor)
@@ -8033,7 +8027,9 @@ impl CascadesEngine {
                 .group(group)
                 .and_then(|group| group.winner(goal))
                 .is_some()
-                || self.infeasible_goals.contains(&(group, goal))
+                || self.task_registry.task(task).is_some_and(|record| {
+                    matches!(record.outcome, Some(TaskOutcome::NoCandidate { .. }))
+                })
                 || self.preserve_incomplete_physical)
         {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
@@ -8060,7 +8056,7 @@ impl CascadesEngine {
             {
                 TaskOutcome::Progress { cursor }
             } else {
-                TaskOutcome::Infeasible
+                TaskOutcome::NoCandidate { cursor }
             };
             self.task_registry
                 .complete_current(task, &self.memo, outcome)?;
@@ -8088,7 +8084,9 @@ impl CascadesEngine {
                 .group(group)
                 .and_then(|group| group.winner(goal))
                 .is_some()
-                || self.infeasible_goals.contains(&(group, goal)))
+                || self.task_registry.task(task).is_some_and(|record| {
+                    matches!(record.outcome, Some(TaskOutcome::NoCandidate { .. }))
+                }))
         {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
             let canonical_group = self.memo.canonical_group(group);
@@ -8112,7 +8110,7 @@ impl CascadesEngine {
             {
                 TaskOutcome::Progress { cursor }
             } else {
-                TaskOutcome::Infeasible
+                TaskOutcome::NoCandidate { cursor }
             };
             self.task_registry
                 .complete_current(task, &self.memo, outcome)?;
@@ -8157,9 +8155,6 @@ impl CascadesEngine {
                     .group(group)
                     .and_then(|group| group.winner(goal))
                     .is_some();
-                if !has_winner && !self.preserve_incomplete_physical {
-                    self.infeasible_goals.insert((group, goal));
-                }
                 // A readiness pass may leave the query-wide logical search
                 // open while this exact physical domain is already closed.
                 // Keep that distinction explicit: the local task can publish
@@ -8242,15 +8237,10 @@ impl CascadesEngine {
                     },
                     (true, None) => TaskOutcome::Progress { cursor },
                     // A readiness step is allowed to stop before the first
-                    // feasible response is assembled (for example while a
-                    // child is publishing the first frontier delta).  Keep
-                    // that task resumable; marking it Infeasible would make
-                    // TaskRegistry treat the partial prefix as a proof and
-                    // the final full pass could never reopen it.
-                    (false, _) if self.preserve_incomplete_physical => {
-                        TaskOutcome::Progress { cursor }
-                    }
-                    (false, _) => TaskOutcome::Infeasible,
+                    // feasible response is assembled. The cursor, including
+                    // yield and budget state, remains authoritative. An empty
+                    // prefix is not a proof of impossibility in any phase.
+                    (false, _) => TaskOutcome::NoCandidate { cursor },
                 };
                 self.task_registry.publish_current_after_local_mutation(
                     task,
@@ -8271,9 +8261,6 @@ impl CascadesEngine {
                         complete,
                     },
                 );
-                if !has_winner && !self.preserve_incomplete_physical {
-                    self.infeasible_goals.insert((group, goal));
-                }
                 Ok(())
             }
             Err(error) => {
@@ -8505,7 +8492,8 @@ impl CascadesEngine {
             .group(group)
             .ok_or_else(|| paro_error::internal("unknown group in physical search domain"))?;
         let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.physical-search-domain.v1");
+        builder.write_bytes(b"paro.physical-search-domain.v2");
+        builder.write_u64(u64::from(self.mandatory_only));
         builder.write_u64(group.0 as u64);
         write_optimization_goal_fingerprint(&mut builder, goal);
         builder.write_u64(group_ref.logical_expression_version());

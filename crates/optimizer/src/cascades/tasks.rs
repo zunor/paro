@@ -283,7 +283,15 @@ pub enum TaskOutcome {
         threshold: u64,
         certificate: BoundProofId,
     },
-    Infeasible,
+    /// No candidate in the consumed prefix. Even a complete local cursor
+    /// does not prove infeasibility of future logical/implementation domains.
+    /// The owning evaluation's goal, ReadSet and cursor delimit this result.
+    NoCandidate {
+        cursor: CursorId,
+    },
+    Failed {
+        detail: String,
+    },
     Suspended {
         cursor: CursorId,
         reason: StopReason,
@@ -680,7 +688,8 @@ impl TaskRegistry {
                         .task(task)
                         .and_then(|record| record.outcome.as_ref())
                         .and_then(|outcome| match outcome {
-                            TaskOutcome::Progress { cursor } => self.cursor(*cursor),
+                            TaskOutcome::Progress { cursor }
+                            | TaskOutcome::NoCandidate { cursor } => self.cursor(*cursor),
                             _ => None,
                         })
                         .is_some_and(|cursor| !cursor.complete);
@@ -1247,6 +1256,11 @@ impl TaskRegistry {
         if !matches!(state, TaskState::Runnable | TaskState::Running) {
             return Err(paro_error::internal("task is not runnable for completion"));
         }
+        if let TaskOutcome::Progress { cursor } | TaskOutcome::NoCandidate { cursor } = &outcome {
+            if self.task(task).is_none_or(|record| record.cursor != *cursor) {
+                return Err(paro_error::internal("task completion references a foreign cursor"));
+            }
+        }
         if self.segments.contains_key(&task) {
             self.commit_segment(task)?;
         }
@@ -1412,20 +1426,10 @@ impl TaskRegistry {
         self.finish(
             task,
             TaskState::Failed,
-            Some(TaskOutcome::Suspended {
-                cursor: self
-                    .task(task)
-                    .map(|record| record.cursor)
-                    .unwrap_or(CursorId::INVALID),
-                reason: StopReason::ResourceStop {
-                    dimension: BudgetDimension::SearchCandidate,
-                },
+            Some(TaskOutcome::Failed {
+                detail: detail.into(),
             }),
         )
-        .map(|wakeups| {
-            let _ = detail.into();
-            wakeups
-        })
     }
 
     pub fn invalidate(&mut self, task: TaskId) -> Result<Vec<TaskWakeup>> {
@@ -1779,6 +1783,25 @@ fn canonicalize_read_set(memo: &Memo, reads: ReadSet) -> ReadSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_task_keeps_its_cause_instead_of_inventing_resource_exhaustion() {
+        let mut registry = TaskRegistry::default();
+        let intent = TaskIntent::Discover {
+            expression: LogicalExprId(0), rule: RuleId(1),
+        };
+        let TaskRequest::Leader(task) = registry.request(intent.clone(), ReadSet::empty()).unwrap() else {
+            panic!("new task must lead")
+        };
+        registry.start(task).unwrap();
+        registry.fail(task, "native contract failure: missing column").unwrap();
+        assert_eq!(registry.state(task), Some(TaskState::Failed));
+        assert_eq!(registry.request(intent, ReadSet::empty()).unwrap(), TaskRequest::Reused {
+            task, outcome: Some(TaskOutcome::Failed {
+                detail: "native contract failure: missing column".into(),
+            }),
+        });
+    }
     use crate::cascades::column::GroupSchema;
     use crate::cascades::ids::{LogicalPayloadId, PropertySetId};
     use crate::cascades::memo::{
@@ -2199,7 +2222,7 @@ mod tests {
         registry.start(physical).unwrap();
         registry.start(logical).unwrap();
         registry
-            .complete(physical, TaskOutcome::Infeasible)
+            .complete(physical, TaskOutcome::NoCandidate { cursor: registry.task(physical).unwrap().cursor })
             .unwrap();
         registry
             .complete(
@@ -2401,7 +2424,7 @@ mod tests {
             _ => unreachable!(),
         };
         registry.start(child).unwrap();
-        registry.complete(child, TaskOutcome::Infeasible).unwrap();
+        registry.complete(child, TaskOutcome::NoCandidate { cursor: registry.task(child).unwrap().cursor }).unwrap();
         registry.start(parent).unwrap();
         assert!(registry.await_dependencies(parent, [child]).unwrap());
         assert_eq!(registry.state(parent), Some(TaskState::Runnable));
@@ -2457,7 +2480,7 @@ mod tests {
         assert_eq!(registry.reserved_units(), 0);
         assert_eq!(registry.committed_units(), 4);
 
-        let wakeups = registry.complete(child, TaskOutcome::Infeasible).unwrap();
+        let wakeups = registry.complete(child, TaskOutcome::NoCandidate { cursor: registry.task(child).unwrap().cursor }).unwrap();
         assert!(wakeups.iter().any(|wakeup| wakeup.task == parent));
         assert_eq!(registry.state(parent), Some(TaskState::Runnable));
         registry.start(parent).unwrap();

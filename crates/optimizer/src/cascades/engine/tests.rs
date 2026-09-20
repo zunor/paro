@@ -1878,6 +1878,31 @@ fn engine_with_budget(
 }
 
 #[test]
+fn empty_mandatory_prefix_is_not_infeasible_and_optional_resumes() {
+    let (mut engine, root, goal) = engine_with_budget(Default::default());
+    let mut registry = ImplementationRegistry::default();
+    registry.register_implementation(FixedLeafImplementation {
+        id: ImplementationId(41), score: 1.0, mandatory: false,
+    }).unwrap();
+    engine.registry = registry;
+    engine.mandatory_only = true;
+    engine.optimize_group(root, goal).unwrap();
+    let state = engine.physical_task_cache[&(root, goal)].clone();
+    assert!(engine.memo.group(root).unwrap().winner(goal).is_none());
+    assert!(matches!(engine.task_registry.task(state.task).unwrap().outcome,
+        Some(TaskOutcome::NoCandidate { .. })));
+    assert!(engine.physical_completion_proofs.is_empty());
+    let mandatory_domain = engine.physical_search_domain(root, goal).unwrap();
+    engine.mandatory_only = false;
+    assert_ne!(mandatory_domain, engine.physical_search_domain(root, goal).unwrap());
+    engine.optimize_group(root, goal).unwrap();
+    assert!(engine.memo.group(root).unwrap().winner(goal).is_some());
+    let evaluations = engine.physical_implementation_expression_evaluations;
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(evaluations, engine.physical_implementation_expression_evaluations);
+}
+
+#[test]
 fn optional_phase_enumerates_implementations_without_a_logical_publication() {
     let (mut engine, root, goal) = engine_with_budget(Default::default());
     let mut registry = ImplementationRegistry::default();
