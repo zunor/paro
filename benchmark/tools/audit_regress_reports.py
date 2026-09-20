@@ -61,9 +61,23 @@ def audit(repository, control, probe):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["repository", "control", "probe"]:
-        parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--repository", type=Path, required=True)
+    parser.add_argument("--single", type=Path)
+    for name in ["control", "probe"]:
+        parser.add_argument("--" + name, type=Path)
     args = parser.parse_args()
+    if args.single:
+        if args.control or args.probe:
+            parser.error("single report is not a paired experiment")
+        report = audit(args.repository, args.single, args.single)
+        print(json.dumps({"schema_version": 1, "mode": "single_run_expected_comparison",
+            "report": str(args.single), "unexpected_actuals": report["unexpected_actuals"]["probe"],
+            "cases": [{"case": c["case"], "expected_sha256": c["expected_sha256"],
+                       "actual": c["arms"]["probe"]} for c in report["cases"]],
+            "acceptance": report["acceptance"]}, indent=2))
+        return
+    if not args.control or not args.probe:
+        parser.error("provide --single or both --control and --probe")
     print(json.dumps(audit(args.repository, args.control, args.probe), indent=2))
 
 
