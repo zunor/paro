@@ -258,8 +258,8 @@ impl FullTextScanCostModel {
             * term_selectivity.powi(query_terms.max(1.0).ceil() as i32);
         let match_count = total_docs * combined_selectivity * branch_factor;
         let score_mode_factor = match score_mode {
-            FullTextScoreMode::Bm25 => 1.0,
-            FullTextScoreMode::CoverDensity => 1.25,
+            FullTextScoreMode::CorpusBm25V1 | FullTextScoreMode::DocumentRankV1 => 1.0,
+            FullTextScoreMode::CoverDensityV1 => 1.25,
         };
         match_count * query_terms.max(1.0) * score_mode_factor
     }

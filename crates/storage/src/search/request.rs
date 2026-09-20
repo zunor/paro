@@ -218,7 +218,15 @@ pub struct FullTextIntent {
     pub query: String,
     pub query_kind: FullTextQueryKind,
     pub query_stats: FullTextQueryStats,
+    /// Canonical tokenizer/stemmer/stopword configuration. The versioned
+    /// provider definition binds its normalization implementation; the query
+    /// kind distinguishes already-normalized serialized queries.
     pub config: String,
+    /// Immutable algorithm identity. DocumentRankV1 and CoverDensityV1 depend
+    /// only on document/query. CorpusBm25V1 uses fixed BM25 v1 parameters and
+    /// the non-NULL documents visible in this table's execution read lease,
+    /// including its transaction overlay, BEFORE the search predicate. Its
+    /// statistics are built from that lease, not supplied by a chosen index.
     pub score_mode: FullTextScoreMode,
 }
 
@@ -314,7 +322,7 @@ mod tests {
                 query_kind: FullTextQueryKind::Legacy,
                 query_stats: FullTextQueryStats::new(1),
                 config: "simple".to_string(),
-                score_mode: FullTextScoreMode::Bm25,
+                score_mode: FullTextScoreMode::CorpusBm25V1,
             })],
             fusion: None,
         };
@@ -331,7 +339,7 @@ mod tests {
                 query_kind: FullTextQueryKind::Legacy,
                 query_stats: FullTextQueryStats::new(1),
                 config: "simple".to_string(),
-                score_mode: FullTextScoreMode::Bm25,
+                score_mode: FullTextScoreMode::CorpusBm25V1,
             })],
             fusion: Some(FusionStrategy::ReciprocalRankFusion {
                 window_size: 20,
@@ -352,7 +360,7 @@ mod tests {
                     query_kind: FullTextQueryKind::Legacy,
                     query_stats: FullTextQueryStats::new(1),
                     config: "simple".to_string(),
-                    score_mode: FullTextScoreMode::Bm25,
+                    score_mode: FullTextScoreMode::CorpusBm25V1,
                 }),
                 SearchIntent::FullText(FullTextIntent {
                     column_id: 1,
@@ -360,7 +368,7 @@ mod tests {
                     query_kind: FullTextQueryKind::Legacy,
                     query_stats: FullTextQueryStats::new(1),
                     config: "simple".to_string(),
-                    score_mode: FullTextScoreMode::Bm25,
+                    score_mode: FullTextScoreMode::CorpusBm25V1,
                 }),
             ],
             fusion: Some(FusionStrategy::WeightedBlend {
@@ -386,7 +394,7 @@ mod tests {
                 query_kind: FullTextQueryKind::Legacy,
                 query_stats: FullTextQueryStats::new(1),
                 config: "simple".to_string(),
-                score_mode: FullTextScoreMode::Bm25,
+                score_mode: FullTextScoreMode::CorpusBm25V1,
             })],
             fusion: None,
         };

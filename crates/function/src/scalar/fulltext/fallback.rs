@@ -9,7 +9,7 @@ use paro_storage::index::fulltext::tokenizer::DefaultTokenizer;
 use paro_storage::index::fulltext::ts_serde::{iter_serialized_tsvector, SerializedTerm};
 
 pub(crate) use paro_storage::index::fulltext::query_eval::{collect_match_extents, MatchExtent};
-pub(crate) use paro_storage::index::fulltext::scoring::FullTextScoreMode;
+pub(crate) use paro_storage::index::fulltext::scoring::DocumentScoreMode;
 pub(crate) use paro_storage::index::fulltext::ts_serde::parse_serialized_tsquery;
 
 const MIN_TOKEN_LEN: usize = 1;
@@ -31,7 +31,7 @@ pub(crate) fn query_matches_text<T: TokenLike>(query: &ParsedQuery, tokens: &[T]
 pub(crate) fn score_query<T: TokenLike>(
     tokens: &[T],
     query: &ParsedQuery,
-    mode: FullTextScoreMode,
+    mode: DocumentScoreMode,
 ) -> f32 {
     score_document_from_tokens(mode, tokens, query)
 }
@@ -66,8 +66,8 @@ mod tests {
         ];
         let query = ParsedQuery::Phrase(vec!["alpha".to_string(), "beta".to_string()]);
 
-        let bm25 = score_query(&tokens, &query, FullTextScoreMode::Bm25);
-        let cover_density = score_query(&tokens, &query, FullTextScoreMode::CoverDensity);
+        let bm25 = score_query(&tokens, &query, DocumentScoreMode::RankV1);
+        let cover_density = score_query(&tokens, &query, DocumentScoreMode::CoverDensityV1);
         assert!(bm25 > 0.0);
         assert!(cover_density > 0.0);
     }

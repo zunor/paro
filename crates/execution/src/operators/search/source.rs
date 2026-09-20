@@ -231,7 +231,6 @@ fn create_search_driver(
                                 *limit,
                                 &spec.config,
                                 predicate.clone(),
-                                None,
                                 spec.score_mode,
                                 &ctx.query.transaction,
                                 &read_options,

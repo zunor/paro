@@ -377,6 +377,20 @@ impl PhysicalPlanExtractor {
                 paro_error::internal("Get missing table reference for search scan")
             })?;
         let candidate = selected_search_candidate(&scan.decision)?;
+        if let SearchIntent::FullText(intent) = &candidate.intent {
+            let logical_intent = crate::search::optimizer::extract_fulltext_score_intent(
+                &scan.score_expression,
+                &scan.get,
+            )?;
+            if logical_intent.as_ref() != Some(intent)
+                || !scan.request.intents.contains(&candidate.intent)
+                || scan.order_ascending
+            {
+                return Err(paro_error::internal(
+                    "fulltext provider does not implement its logical scoring contract",
+                ));
+            }
+        }
         let (predicate, residual) = search_scan_predicate(scan)?;
         if !residual.is_empty() {
             return Err(paro_error::internal(

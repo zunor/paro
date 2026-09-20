@@ -1540,7 +1540,7 @@ fn arena_extractor_lowers_search_scan_with_planned_token() {
         query_kind: FullTextQueryKind::Legacy,
         query_stats: FullTextQueryStats::new(1),
         config: "simple".to_string(),
-        score_mode: FullTextScoreMode::Bm25,
+        score_mode: FullTextScoreMode::DocumentRankV1,
     });
     let token = CapabilityToken {
         definition_id: 42,
@@ -1548,9 +1548,7 @@ fn arena_extractor_lowers_search_scan_with_planned_token() {
         root_version: 11,
         capability_state: SearchCapabilityState::Queryable,
     };
-    let score_expr = Expression::Constant(
-        ConstantExpression::new(Value::Float(0.75), LogicalType::Float).into(),
-    );
+    let score_expr = document_rank_expression();
     let search = LogicalSearchScan::new(
         get,
         NormalizedSearchRequest {
@@ -1584,7 +1582,24 @@ fn arena_extractor_lowers_search_scan_with_planned_token() {
         5,
     )
     .with_output_names(vec!["c".to_string(), "score".to_string()]);
+    let mut wrong =
+        OwnedLogicalPlan::new(&ctx, LogicalOperator::SearchScan(Box::new(search.clone())));
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::SearchScan(Box::new(search)));
+    let LogicalOperator::SearchScan(scan) = &mut wrong.operator else {
+        unreachable!()
+    };
+    let SearchDecision::IndexScan { candidate, .. } = &mut scan.decision else {
+        unreachable!()
+    };
+    let SearchIntent::FullText(intent) = &mut candidate.intent else {
+        unreachable!()
+    };
+    intent.score_mode = FullTextScoreMode::CorpusBm25V1;
+    assert!(PhysicalPlanExtractor::new(ExtractionContext::default())
+        .extract(&wrong)
+        .unwrap_err()
+        .to_string()
+        .contains("logical scoring contract"));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let physical = extractor.extract(&plan).expect("search scan should lower");
@@ -1609,11 +1624,9 @@ fn arena_extractor_projects_derived_values_from_the_canonical_search_score() {
         query_kind: FullTextQueryKind::Legacy,
         query_stats: FullTextQueryStats::new(1),
         config: "simple".to_string(),
-        score_mode: FullTextScoreMode::Bm25,
+        score_mode: FullTextScoreMode::DocumentRankV1,
     });
-    let score_expr = Expression::Constant(
-        ConstantExpression::new(Value::Float(0.75), LogicalType::Float).into(),
-    );
+    let score_expr = document_rank_expression();
     let derived_score = Expression::Operator(
         OperatorExpression::new(
             OperatorType::Coalesce,
@@ -1703,6 +1716,26 @@ fn arena_extractor_projects_derived_values_from_the_canonical_search_score() {
         source.output_types.as_ref(),
         [LogicalType::Varchar, LogicalType::Float]
     );
+}
+
+fn document_rank_expression() -> Expression {
+    let function = paro_function::scalar::fulltext::get_bm25_functions()
+        .functions
+        .remove(0);
+    Expression::Function(
+        paro_planner::expression::FunctionExpression::new(
+            function,
+            vec![
+                ref_expr(2, LogicalType::Varchar),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Varchar("graph".into()), LogicalType::Varchar)
+                        .into(),
+                ),
+            ],
+            LogicalType::Float,
+        )
+        .into(),
+    )
 }
 
 pub(super) fn test_get() -> Get {

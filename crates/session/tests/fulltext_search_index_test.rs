@@ -172,6 +172,117 @@ fn bm25_ranking_is_stable_across_segments() {
     );
 }
 
+#[test]
+fn document_rank_executes_index_tail_overlay_and_compacted_sources() {
+    run_async_test_with_large_stack("document-rank-sources", async {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        for sql in [
+            "CREATE TABLE rank_sources (id INT, content VARCHAR)",
+            "INSERT INTO rank_sources VALUES (1, 'vector database vector'), (2, 'vector database')",
+            "INSERT INTO rank_sources VALUES (3, 'database vector'), (4, 'vector'), (5, 'noise')",
+        ] {
+            exec_ok(&mut session, &mut sink, sql).await;
+        }
+        let ranking = "SELECT id FROM rank_sources
+            WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+            ORDER BY ts_rank(to_tsvector('simple', content),
+                plainto_tsquery('simple', 'vector database')) DESC LIMIT 1";
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+        exec_ok(&mut session, &mut sink,
+            "CREATE INDEX rank_sources_index ON rank_sources USING GIN (to_tsvector('simple', content))").await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+        exec_ok(
+            &mut session,
+            &mut sink,
+            &format!("EXPLAIN ANALYZE {ranking}"),
+        )
+        .await;
+        assert!(
+            explain_lines(&sink)
+                .iter()
+                .any(|line| line.contains("FULLTEXT_SCAN")),
+            "the score oracle must also exercise the executable index provider"
+        );
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "OPTIMIZE TABLE rank_sources COMPACT",
+        )
+        .await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+        exec_ok(&mut session, &mut sink, "BEGIN").await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "INSERT INTO rank_sources VALUES (6, 'vector vector database database')",
+        )
+        .await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![6]);
+        exec_ok(&mut session, &mut sink, "ROLLBACK").await;
+        exec_ok(&mut session, &mut sink, "BEGIN").await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "DELETE FROM rank_sources WHERE id IN (1, 2)",
+        )
+        .await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(
+            query_i64_col(&sink, 0),
+            vec![3],
+            "overlay visibility must be applied before index truncation"
+        );
+        exec_ok(&mut session, &mut sink, "ROLLBACK").await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+    });
+}
+
+#[test]
+fn exact_vector_provider_applies_overlay_visibility_before_topk() {
+    run_async_test_with_large_stack("vector-overlay-topk", async {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        for sql in [
+            "CREATE TABLE vector_visibility (id INT, v VECTOR(2))",
+            "CREATE VECTOR INDEX vector_visibility_index ON vector_visibility(v) distance=l2",
+            "INSERT INTO vector_visibility VALUES (1, '[0,0]'), (2, '[1,0]'), (3, '[2,0]')",
+            "REFRESH VECTOR INDEX vector_visibility_index ON vector_visibility",
+        ] {
+            exec_ok(&mut session, &mut sink, sql).await;
+        }
+        let ranking = "SELECT id FROM vector_visibility ORDER BY v <-> '[0,0]' LIMIT 1";
+        exec_ok(
+            &mut session,
+            &mut sink,
+            &format!("EXPLAIN ANALYZE {ranking}"),
+        )
+        .await;
+        assert!(explain_lines(&sink)
+            .iter()
+            .any(|line| line.contains("VECTOR_SEARCH")));
+        exec_ok(&mut session, &mut sink, "BEGIN").await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "DELETE FROM vector_visibility WHERE id=1",
+        )
+        .await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![2]);
+        exec_ok(&mut session, &mut sink, "ROLLBACK").await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+    });
+}
+
 async fn run_restart_recovery_keeps_fulltext_index_usable() {
     let base_dir = create_unique_test_dir("fulltext_search", "restart");
     let mut sink = CollectingSink::new();

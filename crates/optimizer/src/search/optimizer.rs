@@ -14,7 +14,7 @@ use paro_planner::operator::{
     FullTextQueryKind, FullTextScoreMode, Get, LogicalOperator, Projection, SearchCandidate,
     SearchDecision, SearchScan, TopN,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::plan::{NodeStats, OwnedLogicalPlan, PlanNodeId};
 use paro_storage::search::{
     DenseVectorQuery, ExactFilterMaterialization, FullTextIntent, HnswIntent,
     NormalizedSearchRequest, ProjectionSpec, SearchCostEstimate as PlannedSearchCostEstimate,
@@ -28,9 +28,92 @@ const SIMPLE_CONFIG: &str = "simple";
 
 pub struct SearchOptimizer;
 
+/// A borrowed operator occurrence. Child links remain in the owner's identity
+/// space; `None` from the reader means an opaque group boundary, not a request
+/// to choose a representative. No owned subtree is constructed by this API.
+pub(crate) struct SearchNodeRef<'a, C> {
+    pub id: PlanNodeId,
+    pub stats: &'a NodeStats,
+    pub operator: &'a LogicalOperator<C>,
+}
+
 impl SearchOptimizer {
     pub fn new() -> Self {
         Self
+    }
+
+    pub(crate) fn physical_candidate_for_window<'a, C: 'a>(
+        &self,
+        root: SearchNodeRef<'a, C>,
+        node_bound: usize,
+        mut read: impl FnMut(&C) -> Result<Option<SearchNodeRef<'a, C>>>,
+        ctx: &OptimizationContext,
+    ) -> Result<Option<OwnedLogicalPlan>> {
+        match root.operator {
+            LogicalOperator::Filter(filter) => {
+                let Some(child) = read(&filter.child)? else {
+                    return Ok(None);
+                };
+                let LogicalOperator::Get(get) = child.operator else {
+                    return Ok(None);
+                };
+                self.try_rewrite_fulltext_filter(root.id, root.stats, filter, get, child.stats, ctx)
+            }
+            LogicalOperator::TopN(topn) if topn.offset == 0 && topn.orders.len() == 1 => {
+                let Some(child) = read(&topn.child)? else {
+                    return Ok(None);
+                };
+                let LogicalOperator::Projection(projection) = child.operator else {
+                    return Ok(None);
+                };
+                let Some(order_expr_idx) = order_expression_index(&topn.orders[0].expression)
+                else {
+                    return Ok(None);
+                };
+                let Some(order_expr) = projection.expressions.get(order_expr_idx) else {
+                    return Ok(None);
+                };
+                let mut link = &projection.child;
+                let mut filters = Vec::new();
+                // The input is a finite local shell/arena, not the Memo. A
+                // malformed cycle is an internal error, never "unsupported".
+                for _ in 0..node_bound {
+                    let Some(child) = read(link)? else {
+                        return Ok(None);
+                    };
+                    match child.operator {
+                        LogicalOperator::Filter(filter) => {
+                            if !filter.projection_map.is_all() {
+                                return Ok(None);
+                            }
+                            filters.extend(filter.expressions.iter().cloned());
+                            link = &filter.child;
+                        }
+                        LogicalOperator::Get(get) => {
+                            return self.try_rewrite_topn(
+                                root.id,
+                                root.stats,
+                                TopNPattern {
+                                    topn,
+                                    projection,
+                                    get_stats: child.stats,
+                                    filters,
+                                    get,
+                                    order_expr_idx,
+                                    order_expr,
+                                },
+                                ctx,
+                            );
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                Err(paro_error::internal(
+                    "search window exceeded its local node domain",
+                ))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Derive a physical search payload for exactly this logical root.  It is
@@ -44,10 +127,20 @@ impl SearchOptimizer {
     ) -> Result<Option<OwnedLogicalPlan>> {
         let candidate = match &plan.operator {
             LogicalOperator::TopN(topn) => match extract_topn_pattern(topn) {
-                Some(pattern) => self.try_rewrite_topn(plan, pattern, ctx),
+                Some(pattern) => self.try_rewrite_topn(plan.id, &plan.stats, pattern, ctx),
                 None => Ok(None),
             },
-            LogicalOperator::Filter(filter) => self.try_rewrite_fulltext_filter(plan, filter, ctx),
+            LogicalOperator::Filter(filter) => match &filter.child.operator {
+                LogicalOperator::Get(get) => self.try_rewrite_fulltext_filter(
+                    plan.id,
+                    &plan.stats,
+                    filter,
+                    get,
+                    &filter.child.stats,
+                    ctx,
+                ),
+                _ => Ok(None),
+            },
             _ => Ok(None),
         }?;
         if candidate.as_ref().is_some_and(|candidate| {
@@ -153,10 +246,11 @@ impl SearchOptimizer {
         Ok(tables.into_values().collect())
     }
 
-    fn try_rewrite_topn(
+    fn try_rewrite_topn<C>(
         &self,
-        plan: &OwnedLogicalPlan,
-        pattern: TopNPattern<'_>,
+        id: PlanNodeId,
+        root_stats: &NodeStats,
+        pattern: TopNPattern<'_, C>,
         ctx: &OptimizationContext,
     ) -> Result<Option<OwnedLogicalPlan>> {
         let topn = pattern.topn;
@@ -175,9 +269,8 @@ impl SearchOptimizer {
             return Ok(None);
         };
 
-        let filters = collect_filters(pattern.projection.child.as_ref());
-        let candidate_filters = candidate_filters(&filters, pattern.get);
-        let base_rows = base_rows(pattern.get_plan, pattern.get);
+        let candidate_filters = candidate_filters(&pattern.filters, pattern.get);
+        let base_rows = base_rows(pattern.get_stats, pattern.get);
         let filtered = ctx.cost_model.estimate_filter_cardinality(
             base_rows,
             &candidate_filters,
@@ -232,7 +325,8 @@ impl SearchOptimizer {
                 return Ok(None);
             };
             return Ok(Some(build_search_scan(
-                plan,
+                id,
+                root_stats,
                 pattern,
                 request,
                 decision,
@@ -273,7 +367,8 @@ impl SearchOptimizer {
                 return Ok(None);
             };
             return Ok(Some(build_search_scan(
-                plan,
+                id,
+                root_stats,
                 pattern,
                 request,
                 decision,
@@ -282,6 +377,21 @@ impl SearchOptimizer {
         }
 
         if let Some(intent) = extract_fulltext_score_intent(pattern.order_expr, pattern.get)? {
+            // This provider enumerates matching documents only and ranks high
+            // scores first. Without the exact matching predicate, SQL may need
+            // zero-score nonmatches (or NULLs); truncating that domain is not an
+            // exact replacement, irrespective of the index's Exact capability.
+            if topn.orders[0].ascending
+                || !candidate_filters
+                    .iter()
+                    .try_fold(false, |matched, filter| {
+                        Ok::<_, paro_common::error::ParoError>(
+                            matched || fulltext_filter_matches_score(filter, pattern.get, &intent)?,
+                        )
+                    })?
+            {
+                return Ok(None);
+            }
             // A matching full-text predicate is the admission semantics of
             // this ranked provider, not a residual scalar predicate. Keeping
             // it in `absorbed_predicates` asks the physical predicate builder
@@ -331,7 +441,8 @@ impl SearchOptimizer {
                 return Ok(None);
             };
             return Ok(Some(build_search_scan(
-                plan,
+                id,
+                root_stats,
                 pattern,
                 request,
                 decision,
@@ -342,15 +453,15 @@ impl SearchOptimizer {
         Ok(None)
     }
 
-    fn try_rewrite_fulltext_filter(
+    fn try_rewrite_fulltext_filter<C>(
         &self,
-        plan: &OwnedLogicalPlan,
-        filter: &Filter,
+        id: PlanNodeId,
+        root_stats: &NodeStats,
+        filter: &Filter<C>,
+        get: &Get,
+        get_stats: &NodeStats,
         ctx: &OptimizationContext,
     ) -> Result<Option<OwnedLogicalPlan>> {
-        let LogicalOperator::Get(get) = &filter.child.operator else {
-            return Ok(None);
-        };
         let Some((table_id, storage)) = get_search_storage(get) else {
             return Ok(None);
         };
@@ -370,7 +481,7 @@ impl SearchOptimizer {
                 continue;
             };
 
-            let base_rows = base_rows(filter.child.as_ref(), get);
+            let base_rows = base_rows(get_stats, get);
             let candidate_filters = candidate_filters(&filter.expressions, get);
             let filter_materialization =
                 exact_filter_materialization(&candidate_filters, get, storage.as_ref());
@@ -403,7 +514,7 @@ impl SearchOptimizer {
             let mut other_predicates = filter.expressions.clone();
             let match_expression = other_predicates.remove(match_idx);
             let operator = LogicalOperator::FullTextFilterScan(Box::new(FullTextFilterScan {
-                get: *get.clone(),
+                get: get.clone(),
                 projection_map: filter.projection_map.clone(),
                 request,
                 match_expression,
@@ -411,8 +522,7 @@ impl SearchOptimizer {
                 residual_predicates: Vec::new(),
                 decision,
             }));
-            let id = plan.id;
-            let stats = plan.stats.clone();
+            let stats = root_stats.clone();
             return Ok(Some(OwnedLogicalPlan {
                 id,
                 stats,
@@ -431,13 +541,7 @@ fn residual_fulltext_filters(
 ) -> Result<Vec<Expression>> {
     let mut residual = Vec::with_capacity(filters.len());
     for filter in filters {
-        let represented =
-            extract_fulltext_match_intent(&filter, get)?.is_some_and(|predicate_intent| {
-                predicate_intent.column_id == score_intent.column_id
-                    && predicate_intent.query == score_intent.query
-                    && predicate_intent.query_kind == score_intent.query_kind
-                    && predicate_intent.config == score_intent.config
-            });
+        let represented = fulltext_filter_matches_score(&filter, get, score_intent)?;
         if !represented {
             residual.push(filter);
         }
@@ -445,9 +549,25 @@ fn residual_fulltext_filters(
     Ok(residual)
 }
 
-fn build_search_scan(
-    plan: &OwnedLogicalPlan,
-    pattern: TopNPattern<'_>,
+fn fulltext_filter_matches_score(
+    filter: &Expression,
+    get: &Get,
+    score_intent: &FullTextIntent,
+) -> Result<bool> {
+    Ok(
+        extract_fulltext_match_intent(filter, get)?.is_some_and(|predicate_intent| {
+            predicate_intent.column_id == score_intent.column_id
+                && predicate_intent.query == score_intent.query
+                && predicate_intent.query_kind == score_intent.query_kind
+                && predicate_intent.config == score_intent.config
+        }),
+    )
+}
+
+fn build_search_scan<C>(
+    id: PlanNodeId,
+    root_stats: &NodeStats,
+    pattern: TopNPattern<'_, C>,
     request: NormalizedSearchRequest,
     decision: SearchDecision,
     candidate_filters: Vec<Expression>,
@@ -468,7 +588,17 @@ fn build_search_scan(
     let score_output_index = output_indices
         .iter()
         .position(|&index| index == pattern.order_expr_idx);
-    let output_names = plan.output_names();
+    let output_names = output_indices
+        .iter()
+        .map(|&index| {
+            pattern
+                .projection
+                .visible_names
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| format!("__paro_hidden_{index}"))
+        })
+        .collect();
     let operator = LogicalOperator::SearchScan(Box::new(
         SearchScan::new(
             pattern.get.clone(),
@@ -485,8 +615,7 @@ fn build_search_scan(
         )
         .with_output_names(output_names),
     ));
-    let id = plan.id;
-    let stats = plan.stats.clone();
+    let stats = root_stats.clone();
     Ok(OwnedLogicalPlan {
         id,
         stats,
@@ -622,9 +751,8 @@ fn estimate_selectivity(base_rows: u64, filtered_rows: u64) -> f64 {
     }
 }
 
-fn base_rows(get_plan: &OwnedLogicalPlan, get: &Get) -> u64 {
-    get_plan
-        .stats
+fn base_rows(stats: &NodeStats, get: &Get) -> u64 {
+    stats
         .estimated_cardinality
         .map(|estimate| estimate.expected)
         .or_else(|| {
@@ -692,10 +820,11 @@ fn exact_filter_materialization(
     })
 }
 
-struct TopNPattern<'a> {
-    topn: &'a TopN,
-    projection: &'a Projection,
-    get_plan: &'a OwnedLogicalPlan,
+struct TopNPattern<'a, C = Box<OwnedLogicalPlan>> {
+    topn: &'a TopN<C>,
+    projection: &'a Projection<C>,
+    get_stats: &'a NodeStats,
+    filters: Vec<Expression>,
     get: &'a Get,
     order_expr_idx: usize,
     order_expr: &'a Expression,
@@ -718,7 +847,8 @@ fn extract_topn_pattern(topn: &TopN) -> Option<TopNPattern<'_>> {
     Some(TopNPattern {
         topn,
         projection,
-        get_plan,
+        get_stats: &get_plan.stats,
+        filters: collect_filters(projection.child.as_ref()),
         get,
         order_expr_idx,
         order_expr,
@@ -737,6 +867,9 @@ fn find_get_plan(mut plan: &OwnedLogicalPlan) -> Option<&OwnedLogicalPlan> {
     loop {
         match &plan.operator {
             LogicalOperator::Filter(filter) => {
+                if !filter.projection_map.is_all() {
+                    return None;
+                }
                 plan = filter.child.as_ref();
             }
             LogicalOperator::Get(_) => return Some(plan),
@@ -789,7 +922,7 @@ fn extract_vector_intent(
     }
 
     let (left, right) = (&func.children[0], &func.children[1]);
-    if let Some(column_idx) = extract_scan_col_idx(left) {
+    if let Some(column_idx) = extract_scan_col_idx(left, get) {
         if let Some(query_vector) = extract_query_vector(right)? {
             return Ok(
                 resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
@@ -801,7 +934,7 @@ fn extract_vector_intent(
             );
         }
     }
-    if let Some(column_idx) = extract_scan_col_idx(right) {
+    if let Some(column_idx) = extract_scan_col_idx(right, get) {
         if let Some(query_vector) = extract_query_vector(left)? {
             return Ok(
                 resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
@@ -965,7 +1098,7 @@ fn extract_sparse_intent(expr: &Expression, get: &Get) -> Result<Option<SparseIn
         return Ok(None);
     }
     let (left, right) = (&func.children[0], &func.children[1]);
-    if let Some(column_idx) = extract_scan_col_idx(left) {
+    if let Some(column_idx) = extract_scan_col_idx(left, get) {
         if let Some(query_vector) = extract_query_sparse_vector(right)? {
             return Ok(
                 resolve_sparse_column(get, column_idx).map(|column_id| SparseIntent {
@@ -975,7 +1108,7 @@ fn extract_sparse_intent(expr: &Expression, get: &Get) -> Result<Option<SparseIn
             );
         }
     }
-    if let Some(column_idx) = extract_scan_col_idx(right) {
+    if let Some(column_idx) = extract_scan_col_idx(right, get) {
         if let Some(query_vector) = extract_query_sparse_vector(left)? {
             return Ok(
                 resolve_sparse_column(get, column_idx).map(|column_id| SparseIntent {
@@ -1015,8 +1148,13 @@ fn extract_query_sparse_vector(
     }
 }
 
-fn extract_fulltext_score_intent(expr: &Expression, get: &Get) -> Result<Option<FullTextIntent>> {
-    let expr = strip_casts(expr);
+pub(crate) fn extract_fulltext_score_intent(
+    expr: &Expression,
+    get: &Get,
+) -> Result<Option<FullTextIntent>> {
+    // A cast is part of the projected score contract. In particular narrowing
+    // casts can create peers; the provider must not silently replace them with
+    // its uncast score. Unsupported score expressions retain ordinary TopN.
     let func = match expr {
         Expression::Function(function) => function,
         _ => return Ok(None),
@@ -1026,13 +1164,13 @@ fn extract_fulltext_score_intent(expr: &Expression, get: &Get) -> Result<Option<
             func,
             get,
             FullTextQueryKind::Legacy,
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::DocumentRankV1,
         ),
         Some(BuiltinIntrinsicId::Bm25ScoreInternal | BuiltinIntrinsicId::TsRank) => {
-            extract_internal_fulltext_query(func, get, FullTextScoreMode::Bm25)
+            extract_internal_fulltext_query(func, get, FullTextScoreMode::DocumentRankV1)
         }
         Some(BuiltinIntrinsicId::TsRankCd) => {
-            extract_internal_fulltext_query(func, get, FullTextScoreMode::CoverDensity)
+            extract_internal_fulltext_query(func, get, FullTextScoreMode::CoverDensityV1)
         }
         _ => Ok(None),
     }
@@ -1049,10 +1187,10 @@ fn extract_fulltext_match_intent(expr: &Expression, get: &Get) -> Result<Option<
             func,
             get,
             FullTextQueryKind::Legacy,
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         ),
         Some(BuiltinIntrinsicId::FullTextMatchInternal) => {
-            extract_internal_fulltext_query(func, get, FullTextScoreMode::Bm25)
+            extract_internal_fulltext_query(func, get, FullTextScoreMode::CorpusBm25V1)
         }
         _ => Ok(None),
     }
@@ -1068,21 +1206,8 @@ fn extract_fulltext_query_from_column_and_string(
         return Ok(None);
     }
     let (left, right) = (&func.children[0], &func.children[1]);
-    if let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(left)) {
+    if let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(left, get)) {
         if let Some(query_text) = extract_query_string(right)? {
-            let query_stats = build_fulltext_query_stats(&query_text, SIMPLE_CONFIG, query_kind)?;
-            return Ok(Some(FullTextIntent {
-                column_id,
-                query: query_text,
-                query_kind,
-                query_stats,
-                config: SIMPLE_CONFIG.to_string(),
-                score_mode,
-            }));
-        }
-    }
-    if let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(right)) {
-        if let Some(query_text) = extract_query_string(left)? {
             let query_stats = build_fulltext_query_stats(&query_text, SIMPLE_CONFIG, query_kind)?;
             return Ok(Some(FullTextIntent {
                 column_id,
@@ -1162,7 +1287,7 @@ fn extract_tsvector_source(expr: &Expression, get: &Get) -> Result<Option<(usize
         None => SIMPLE_CONFIG.to_string(),
     };
 
-    let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(text_expr)) else {
+    let Some(column_id) = resolve_fulltext_column(get, extract_scan_col_idx(text_expr, get)) else {
         return Ok(None);
     };
     Ok(Some((column_id as usize, config)))
@@ -1225,10 +1350,14 @@ fn resolve_fulltext_column(get: &Get, column_idx: Option<usize>) -> Option<u32> 
         .flatten()
 }
 
-fn extract_scan_col_idx(expr: &Expression) -> Option<usize> {
-    match strip_casts(expr) {
+fn extract_scan_col_idx(expr: &Expression, get: &Get) -> Option<usize> {
+    match expr {
         Expression::Reference(reference) => Some(reference.index),
-        Expression::ColumnRef(column) => Some(column.binding.column_index),
+        Expression::ColumnRef(column)
+            if column.depth == 0 && column.binding.table_index == get.table_index =>
+        {
+            Some(column.binding.column_index)
+        }
         _ => None,
     }
 }
@@ -1273,6 +1402,52 @@ mod tests {
         return_type: LogicalType,
     ) -> ScalarFunction {
         ScalarFunction::new(name.to_string(), arguments, return_type, noop_scalar)
+    }
+
+    #[test]
+    fn borrowed_provider_window_preserves_holes_and_reader_errors() {
+        let context = OptimizationContext::new(
+            paro_context::TestStatementContextBuilder::minimal().build(),
+            paro_planner::binder::context::BindContext::new(),
+        );
+        let stats = NodeStats::default();
+        let operator = LogicalOperator::Filter(Filter {
+            child: 7usize,
+            expressions: Vec::new(),
+            projection_map: paro_planner::operator::ProjectionMap::all(),
+        });
+        let root = || SearchNodeRef {
+            id: PlanNodeId(1),
+            stats: &stats,
+            operator: &operator,
+        };
+        let mut reads = 0;
+        let result = SearchOptimizer::new()
+            .physical_candidate_for_window(
+                root(),
+                1,
+                |child| {
+                    assert_eq!(*child, 7);
+                    reads += 1;
+                    Ok(None)
+                },
+                &context,
+            )
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(
+            reads, 1,
+            "a group hole must not trigger representative expansion"
+        );
+        let error = SearchOptimizer::new()
+            .physical_candidate_for_window(
+                root(),
+                1,
+                |_| Err(paro_error::internal("reader failure sentinel")),
+                &context,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("reader failure sentinel"));
     }
 
     #[test]
@@ -1330,7 +1505,7 @@ mod tests {
 
         let intent = extract_fulltext_match_intent(&expr, &get).unwrap().unwrap();
         assert_eq!(intent.column_id, 0);
-        assert_eq!(intent.score_mode, FullTextScoreMode::Bm25);
+        assert_eq!(intent.score_mode, FullTextScoreMode::CorpusBm25V1);
         assert_eq!(intent.query, "hello world");
         assert_eq!(intent.query_stats.term_count, 2);
         assert_eq!(intent.query_stats.effective_query_terms(), 2);
@@ -1395,6 +1570,54 @@ mod tests {
     }
 
     #[test]
+    fn document_score_requires_the_exact_document_binding_and_argument_order() {
+        let get = Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
+        let column = |table| {
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table, 0), LogicalType::Varchar).into(),
+            )
+        };
+        let query = || {
+            Expression::Constant(
+                ConstantExpression::new(Value::Varchar("needle".to_string()), LogicalType::Varchar)
+                    .into(),
+            )
+        };
+        let score = |args| {
+            Expression::Function(
+                FunctionExpression::new(
+                    scalar_function(
+                        "bm25",
+                        vec![LogicalType::Varchar, LogicalType::Varchar],
+                        LogicalType::Float,
+                    ),
+                    args,
+                    LogicalType::Float,
+                )
+                .into(),
+            )
+        };
+        let valid = score(vec![column(1), query()]);
+        assert_eq!(
+            extract_fulltext_score_intent(&valid, &get)
+                .unwrap()
+                .unwrap()
+                .score_mode,
+            FullTextScoreMode::DocumentRankV1
+        );
+        assert!(
+            extract_fulltext_score_intent(&score(vec![column(2), query()]), &get)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            extract_fulltext_score_intent(&score(vec![query(), column(1)]), &get)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn derived_scan_output_declines_stored_search_projection() {
         let mut get =
             Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
@@ -1410,7 +1633,7 @@ mod tests {
             query_kind: FullTextQueryKind::Legacy,
             query_stats: FullTextQueryStats::new(1),
             config: "simple".to_string(),
-            score_mode: FullTextScoreMode::Bm25,
+            score_mode: FullTextScoreMode::CorpusBm25V1,
         };
         let scan = FullTextFilterScan {
             get: Get::new_without_table(

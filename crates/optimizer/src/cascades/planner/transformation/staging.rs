@@ -587,8 +587,7 @@ pub(super) struct StagingRequest {
     /// preparation in the same planner-session catalogs. Each occurrence is
     /// consumed exactly once; an empty map intentionally selects the ordinary
     /// lowering path.
-    pub(super) resident_nodes:
-        HashMap<paro_planner::plan::PlanNodeId, ResidentNodeContract>,
+    pub(super) resident_nodes: HashMap<paro_planner::plan::PlanNodeId, ResidentNodeContract>,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
     /// Opaque Memo inputs retained by the transformed expression. Inputs
@@ -957,7 +956,7 @@ pub(super) fn stage_transformed_expression(
             (Some(layout), Some(contract)) => {
                 if layout.as_ref() != &contract.output_layout {
                     return Err(paro_error::internal(
-                    "resident contract disagrees with arena output layout",
+                        "resident contract disagrees with arena output layout",
                     ));
                 }
                 layout
@@ -1197,8 +1196,8 @@ pub(super) fn stage_transformed_expression(
                 // estimate.
                 memo.update_group_facts(group, |existing, existing_cardinality| {
                     existing.merge_equivalent_facts(&logical_properties)?;
-                    *existing_cardinality = std::mem::take(existing_cardinality)
-                        .canonical_with(cardinality.clone());
+                    *existing_cardinality =
+                        std::mem::take(existing_cardinality).canonical_with(cardinality.clone());
                     Ok(())
                 })?;
                 return Ok(Some((
@@ -1731,56 +1730,114 @@ pub(super) fn stage_transformed_expression(
         )))
     }
 
-    let provider_roots = match &input {
+    use crate::search::optimizer::{SearchNodeRef, SearchOptimizer};
+    let arena_roots = match &input {
         StagingInput::Arena(plan) => {
-            let plan_view = state.staging_arena.plan(*plan)?;
-            crate::search::optimizer::SearchOptimizer::candidate_arena_roots(&plan_view)?
+            SearchOptimizer::candidate_arena_roots(&state.staging_arena.plan(*plan)?)?
         }
-        // A native shell has no real Get/scan leaf. Search providers require
-        // an owned scan occurrence and therefore cannot be produced from this
-        // direct GroupRef path; such rules remain on the settled path.
         StagingInput::Native { .. } => Vec::new(),
     };
-    let search_context = if !provider_roots.is_empty() {
+    let has_native_roots = matches!(&input, StagingInput::Native { shell, .. }
+        if shell.nodes.iter().any(|node| matches!(node.operator,
+            LogicalOperator::TopN(_) | LogicalOperator::Filter(_))));
+    let mut search_candidates = HashMap::new();
+    if !arena_roots.is_empty() || has_native_roots {
         let session_context = state
             .session
             .clone()
             .ok_or_else(|| paro_error::internal("search planning has no statement context"))?;
-        let mut search_context =
+        let mut context =
             crate::context::OptimizationContext::new(session_context, state.bind_context.clone());
-        search_context.column_stats = column_stats.clone();
-        search_context.cost_model = state.cost_model.clone();
-        search_context.verify_enabled = state.verify_enabled;
-        Some(search_context)
-    } else {
-        None
-    };
-
-    // Search providers consume an explicit bounded Filter/TopN pattern. Read
-    // that window before detaching its children; the rest of staging operates
-    // on scalar shells and immutable group facts, never rebuilt descendants.
-    let mut search_candidates = HashMap::new();
-    if let Some(context) = &search_context {
-        for index in provider_roots {
-            if !memo.control().checkpoint()? {
-                return Ok(None);
+        context.column_stats = column_stats.clone();
+        context.cost_model = state.cost_model.clone();
+        context.verify_enabled = state.verify_enabled;
+        let optimizer = SearchOptimizer::new();
+        let mut candidates = Vec::new();
+        match &input {
+            StagingInput::Arena(_) => {
+                for index in arena_roots {
+                    if !memo.control().checkpoint()? {
+                        return Ok(None);
+                    }
+                    let node = state.staging_arena.get(index)?;
+                    let candidate = optimizer.physical_candidate_for_window(
+                        SearchNodeRef {
+                            id: node.id,
+                            stats: &node.stats,
+                            operator: &node.operator,
+                        },
+                        state.staging_arena.len(),
+                        |child| {
+                            context.session.cancellation.check()?;
+                            if !memo.control().checkpoint()? {
+                                return Ok(None);
+                            }
+                            let node = state.staging_arena.get(*child)?;
+                            Ok(Some(SearchNodeRef {
+                                id: node.id,
+                                stats: &node.stats,
+                                operator: &node.operator,
+                            }))
+                        },
+                        &context,
+                    )?;
+                    if let Some(candidate) = candidate {
+                        candidates.push(candidate);
+                    }
+                }
             }
-            let node = state
-                .staging_arena
-                .export_checked(index, || context.session.cancellation.check())?;
-            if let Some(candidate) = crate::search::optimizer::SearchOptimizer::new()
-                .physical_candidate_for_root(&node, context)?
-            {
-                if node.id.is_synthetic() {
-                    return Err(paro_error::internal(
-                        "synthetic plan id cannot identify a search candidate",
-                    ));
+            StagingInput::Native { shell, .. } => {
+                for node in shell.nodes.iter().filter(|node| {
+                    matches!(
+                        node.operator,
+                        LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
+                    )
+                }) {
+                    if !memo.control().checkpoint()? {
+                        return Ok(None);
+                    }
+                    let candidate = optimizer.physical_candidate_for_window(
+                        SearchNodeRef {
+                            id: node.id,
+                            stats: &node.stats,
+                            operator: &node.operator,
+                        },
+                        shell.nodes.len(),
+                        |child| {
+                            context.session.cancellation.check()?;
+                            if !memo.control().checkpoint()? {
+                                return Ok(None);
+                            }
+                            let NativeChild::Node(index) = child else {
+                                return Ok(None);
+                            };
+                            let node = shell.nodes.get(*index).ok_or_else(|| {
+                                paro_error::internal("search window has invalid native child")
+                            })?;
+                            Ok(Some(SearchNodeRef {
+                                id: node.id,
+                                stats: &node.stats,
+                                operator: &node.operator,
+                            }))
+                        },
+                        &context,
+                    )?;
+                    if let Some(candidate) = candidate {
+                        candidates.push(candidate);
+                    }
                 }
-                if search_candidates.insert(node.id, candidate).is_some() {
-                    return Err(paro_error::internal(
-                        "search provider has ambiguous occurrence identity",
-                    ));
-                }
+            }
+        }
+        for candidate in candidates {
+            if candidate.id.is_synthetic() {
+                return Err(paro_error::internal(
+                    "synthetic plan id cannot identify a search candidate",
+                ));
+            }
+            if search_candidates.insert(candidate.id, candidate).is_some() {
+                return Err(paro_error::internal(
+                    "search provider has ambiguous occurrence identity",
+                ));
             }
         }
     }

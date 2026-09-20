@@ -13,10 +13,8 @@ use crate::index::fulltext::text_index::{
     FullTextIndex, FullTextScoringStats, GlobalFullTextStats,
 };
 use crate::index::fulltext::tokenizer::tokenizer_from_config;
-use crate::index::fulltext::tokenizer::Token;
 use crate::index::hnsw::ScoredPoint;
 use crate::index::PredicateTree;
-use crate::metrics::storage_metrics;
 use crate::search::artifact::ArtifactLocation;
 use crate::search::capability::SearchIndexKind;
 use crate::search::cursor::{
@@ -44,6 +42,21 @@ use paro_common::runtime_value::Value;
 use crate::search::budget::{ResourceBudget, SearchBatchConfig};
 use crate::search::cursor::PhysicalRowRef;
 
+fn validate_fulltext_snapshot(snapshot: &SearchReadSnapshot, config: &str) -> Result<()> {
+    let provider = crate::search::FullTextProviderConfig::from_value(
+        snapshot.generation.provider_config.as_ref(),
+    )?;
+    if snapshot.provider_kind != SearchIndexKind::FullText
+        || crate::search::normalize_fulltext_config(&provider.config)
+            != crate::search::normalize_fulltext_config(config)
+    {
+        return Err(paro_error::invalid_input(
+            "fulltext scoring/tokenization contract does not match the pinned generation",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) struct FullTextTopKProvider {
     tablet: TabletRef,
     column_id: usize,
@@ -51,7 +64,6 @@ pub(crate) struct FullTextTopKProvider {
     k: usize,
     config: String,
     predicate: Option<PredicateTree>,
-    global_stats: Option<GlobalFullTextStats>,
     score_mode: FullTextScoreMode,
     telemetry: Arc<dyn SearchTelemetryCollector>,
 }
@@ -64,7 +76,6 @@ impl FullTextTopKProvider {
         k: usize,
         config: &str,
         predicate: Option<PredicateTree>,
-        global_stats: Option<GlobalFullTextStats>,
         score_mode: FullTextScoreMode,
     ) -> Self {
         Self {
@@ -74,13 +85,13 @@ impl FullTextTopKProvider {
             k,
             config: config.to_string(),
             predicate,
-            global_stats,
             score_mode,
             telemetry: Arc::new(NoopSearchTelemetryCollector),
         }
     }
 
     pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> Result<OpenedSearchCursor> {
+        validate_fulltext_snapshot(&snapshot, &self.config)?;
         if self.k == 0 {
             return Ok(OpenedSearchCursor {
                 snapshot,
@@ -111,7 +122,6 @@ impl FullTextTopKProvider {
                 k: self.k,
                 config: self.config,
                 predicate: self.predicate,
-                global_stats: self.global_stats,
                 score_mode: self.score_mode,
                 telemetry: self.telemetry,
                 state: FullTextTopKState::Pending,
@@ -148,6 +158,7 @@ impl FullTextFilterProvider {
     }
 
     pub(crate) fn open(self, snapshot: SearchReadSnapshot) -> Result<OpenedSearchCursor> {
+        validate_fulltext_snapshot(&snapshot, &self.config)?;
         let query_terms = analyze_fulltext_query_stats(&self.query).effective_query_terms();
         ensure_tail_exact_merge_budget(
             &snapshot,
@@ -211,7 +222,6 @@ struct FullTextTopKCursor {
     k: usize,
     config: String,
     predicate: Option<PredicateTree>,
-    global_stats: Option<GlobalFullTextStats>,
     score_mode: FullTextScoreMode,
     telemetry: Arc<dyn SearchTelemetryCollector>,
     state: FullTextTopKState,
@@ -267,87 +277,27 @@ impl FullTextQueryScoringTerms {
     }
 }
 
-#[derive(Debug)]
-struct FullTextScoringStatsBuilder {
-    global: GlobalFullTextStats,
-    include_index_totals: bool,
-    term_doc_freqs: BTreeMap<String, u32>,
-    degraded_reasons: BTreeSet<&'static str>,
-}
-
-impl FullTextScoringStatsBuilder {
-    fn new(base_global_stats: Option<GlobalFullTextStats>) -> Self {
-        let mut degraded_reasons = BTreeSet::new();
-        if base_global_stats.is_none() {
-            degraded_reasons.insert("missing_generation_stats");
-        }
-        Self {
-            global: base_global_stats.unwrap_or_else(|| GlobalFullTextStats::from_totals(0, 0)),
-            include_index_totals: base_global_stats.is_none(),
-            term_doc_freqs: BTreeMap::new(),
-            degraded_reasons,
-        }
-    }
-
-    fn add_index(&mut self, index: &FullTextIndex, query_terms: &FullTextQueryScoringTerms) {
-        let inverted = index.inverted_index();
-        if self.include_index_totals {
-            self.global = self
-                .global
-                .with_added_totals(inverted.total_docs(), inverted.total_terms());
-        }
-
-        let mut local_doc_freqs = BTreeMap::<String, u32>::new();
-        for term in &query_terms.terms {
-            if let Some(list) = inverted.get_posting_list(term) {
-                local_doc_freqs.insert(term.clone(), list.len() as u32);
-            }
-        }
-        for prefix in &query_terms.prefixes {
-            for (term, list) in inverted.postings().range(prefix.clone()..) {
-                if !term.starts_with(prefix) {
-                    break;
-                }
-                local_doc_freqs.insert(term.clone(), list.len() as u32);
-            }
-        }
-        for (term, doc_freq) in local_doc_freqs {
-            self.add_doc_freq(term, doc_freq);
-        }
-    }
-
-    fn add_tail_document(&mut self, tokens: &[Token], query_terms: &FullTextQueryScoringTerms) {
-        self.global = self
-            .global
-            .with_added_totals(1, u64::try_from(tokens.len()).unwrap_or(u64::MAX));
-        let mut seen = BTreeSet::<&str>::new();
-        for token in tokens {
-            if query_terms.matches_term(&token.term) {
-                seen.insert(token.term.as_str());
-            }
-        }
-        for term in seen {
-            self.add_doc_freq(term.to_string(), 1);
-        }
-    }
-
-    fn add_doc_freq(&mut self, term: String, doc_freq: u32) {
-        let entry = self.term_doc_freqs.entry(term).or_default();
-        *entry = entry.saturating_add(doc_freq);
-    }
-
-    fn finish(self) -> FullTextScoringSnapshot {
-        FullTextScoringSnapshot {
-            stats: FullTextScoringStats::with_term_doc_freqs(self.global, self.term_doc_freqs),
-            degraded_reasons: self.degraded_reasons.into_iter().collect(),
-        }
-    }
-}
-
+/// A corpus frame belongs to the exact MVCC/overlay lease, never an index
+/// generation's physical row counts. This frame cannot be accepted by another
+/// cursor merely because its generation id or table timestamp happens to match.
 #[derive(Debug)]
 struct FullTextScoringSnapshot {
+    source: SearchReadSnapshot,
     stats: FullTextScoringStats,
-    degraded_reasons: Vec<&'static str>,
+}
+
+impl FullTextScoringSnapshot {
+    fn validate_for(&self, target: &SearchReadSnapshot) -> Result<()> {
+        if self.source.table != target.table
+            || !Arc::ptr_eq(&self.source.table_lease, &target.table_lease)
+            || !Arc::ptr_eq(&self.source.generation_lease, &target.generation_lease)
+        {
+            return Err(paro_error::internal(
+                "fulltext scoring snapshot does not match search visibility",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn open_sidecar_fulltext_index(
@@ -449,11 +399,8 @@ fn fulltext_rows_from_bitmap(
 impl FullTextTopKCursor {
     fn build_ranked_rows(&self, budget: &ResourceBudget) -> Result<Vec<RankedRow>> {
         let started_at = Instant::now();
-        let scoring_snapshot = self.build_scoring_stats()?;
-        for reason in &scoring_snapshot.degraded_reasons {
-            storage_metrics()
-                .record_search_fulltext_degraded_score(self.snapshot.table.table_id, reason);
-        }
+        let scoring_snapshot = self.build_scoring_stats(budget)?;
+        scoring_snapshot.validate_for(&self.snapshot)?;
         self.telemetry.record_generation(GenerationTelemetryEvent {
             kind: SearchIndexKind::FullText,
             definition_id: self.snapshot.generation.definition_id,
@@ -468,7 +415,9 @@ impl FullTextTopKCursor {
             budget.parallelism_slots.max(1),
             self.telemetry.as_ref(),
             |_, segment| {
-                let (rows, degraded) = self.search_segment(segment, &scoring_snapshot.stats)?;
+                budget.work.check_and_consume(1)?;
+                let (rows, degraded) =
+                    self.search_segment(segment, &scoring_snapshot.stats, budget)?;
                 Ok(SegmentDispatchResult {
                     candidates_produced: rows.len(),
                     degraded,
@@ -494,35 +443,25 @@ impl FullTextTopKCursor {
             rows_returned: ranked_rows.len(),
             peak_heap_items,
             degraded_segments,
-            degraded_score_reasons: scoring_snapshot
-                .degraded_reasons
-                .iter()
-                .map(|reason| (*reason).to_string())
-                .collect(),
+            degraded_score_reasons: Vec::new(),
             elapsed: started_at.elapsed(),
         });
         Ok(ranked_rows)
     }
 
-    fn build_scoring_stats(&self) -> Result<FullTextScoringSnapshot> {
+    fn build_scoring_stats(&self, budget: &ResourceBudget) -> Result<FullTextScoringSnapshot> {
         let query_terms = FullTextQueryScoringTerms::from_query(&self.query);
-        let mut builder = FullTextScoringStatsBuilder::new(self.global_stats);
+        let mut global = GlobalFullTextStats::from_totals(0, 0);
+        let mut term_doc_freqs = BTreeMap::<String, u32>::new();
         let (_kind, tokenizer) = tokenizer_from_config(&self.config)?;
-        for visible_segment in self.snapshot.table_lease.visible_segments() {
-            if let Some(index) = visible_segment.segment.fulltext_index(self.storage_col_id) {
-                builder.add_index(index.as_ref(), &query_terms);
-                continue;
-            }
-            if let Some(index) = open_sidecar_fulltext_index(
-                &self.snapshot,
-                self.reader_runtime.as_ref(),
-                visible_segment,
-                self.storage_col_id,
-            )? {
-                builder.add_index(&index, &query_terms);
-                continue;
-            }
-
+        // Document-local algorithms have no corpus dependency at all.
+        let segments = if self.score_mode == FullTextScoreMode::CorpusBm25V1 {
+            self.snapshot.table_lease.visible_segments()
+        } else {
+            &[]
+        };
+        for visible_segment in segments {
+            budget.work.check_and_consume(1)?;
             let row_ids = visible_row_ids(&self.snapshot, visible_segment, None)?;
             if row_ids.is_empty() {
                 continue;
@@ -538,26 +477,45 @@ impl FullTextTopKCursor {
                 paro_error::internal("resolved fulltext tail stats chunk missing column")
             })?;
             for offset in 0..row_ids.len() {
+                budget.work.check_and_consume(1)?;
                 let Value::Varchar(text) = column.get_value(offset) else {
                     continue;
                 };
                 let tokens = tokenizer.tokenize_to_vec(&text);
-                builder.add_tail_document(&tokens, &query_terms);
+                global = global.with_added_totals(1, tokens.len() as u64);
+                let mut seen = BTreeSet::new();
+                for token in &tokens {
+                    if query_terms.matches_term(&token.term) {
+                        seen.insert(&token.term);
+                    }
+                }
+                for term in seen {
+                    *term_doc_freqs.entry(term.clone()).or_default() += 1;
+                }
             }
         }
-        Ok(builder.finish())
+        Ok(FullTextScoringSnapshot {
+            source: self.snapshot.clone(),
+            stats: FullTextScoringStats::with_term_doc_freqs(global, term_doc_freqs),
+        })
     }
 
     fn search_segment(
         &self,
         visible_segment: &VisibleSegment,
         scoring_stats: &FullTextScoringStats,
+        budget: &ResourceBudget,
     ) -> Result<(Vec<RankedRow>, bool)> {
         let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
-        if visible_segment
-            .segment
-            .fulltext_index(self.storage_col_id)
-            .is_some()
+        // Overlay visibility must be applied BEFORE segment-local TopK. The
+        // final row-reference filter cannot refill a heap whose best entry was
+        // deleted in this transaction. Resolve visible rows and score them
+        // exactly below when the storage bitmap lacks that overlay.
+        if !self.snapshot.has_overlay_delete_vectors()
+            && visible_segment
+                .segment
+                .fulltext_index(self.storage_col_id)
+                .is_some()
         {
             return visible_segment
                 .segment
@@ -576,12 +534,16 @@ impl FullTextTopKCursor {
                     (ranked_rows, false)
                 });
         }
-        if let Some(index) = open_sidecar_fulltext_index(
-            &self.snapshot,
-            self.reader_runtime.as_ref(),
-            visible_segment,
-            self.storage_col_id,
-        )? {
+        if let Some(index) = if self.snapshot.has_overlay_delete_vectors() {
+            None
+        } else {
+            open_sidecar_fulltext_index(
+                &self.snapshot,
+                self.reader_runtime.as_ref(),
+                visible_segment,
+                self.storage_col_id,
+            )?
+        } {
             let filter_bitmap = visible_segment
                 .segment
                 .build_filter_bitmap_with_epoch(snapshot_version, self.predicate.as_ref())?;
@@ -622,6 +584,7 @@ impl FullTextTopKCursor {
         let mut collector = TopKCollector::new(self.k);
         let bm25 = scoring_stats.bm25();
         for (offset, row_id) in row_ids.iter().copied().enumerate() {
+            budget.work.check_and_consume(1)?;
             let Value::Varchar(text) = column.get_value(offset) else {
                 continue;
             };
@@ -904,6 +867,7 @@ mod tests {
     use super::*;
     use crate::index::fulltext::text_index::FullTextIndexConfig;
     use crate::index::fulltext::tokenizer::TokenizerKind;
+    use crate::metrics::storage_metrics;
     use crate::search::capability::{ArtifactSegmentRef, SearchArtifactRef};
     use crate::search::cursor::{
         GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot, TableReadLease,
@@ -989,7 +953,7 @@ mod tests {
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
-            provider_config: Arc::new(serde_json::Value::Null),
+            provider_config: Arc::new(serde_json::json!({"version": 1, "config": "simple"})),
             hnsw_provider_config: None,
             hnsw_query_activity: None,
             artifacts: Arc::new(GenerationArtifactSet {
@@ -1009,6 +973,23 @@ mod tests {
             ))),
         );
 
+        let scoring_frame = FullTextScoringSnapshot {
+            source: snapshot.clone(),
+            stats: FullTextScoringStats::from_global_stats(GlobalFullTextStats::from_totals(2, 3)),
+        };
+        scoring_frame.validate_for(&snapshot).unwrap();
+        assert!(validate_fulltext_snapshot(&snapshot, "english")
+            .unwrap_err()
+            .to_string()
+            .contains("does not match the pinned generation"));
+        let mut wrong_snapshot = snapshot.clone();
+        wrong_snapshot.table.visible_version += 1;
+        assert!(scoring_frame
+            .validate_for(&wrong_snapshot)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match search visibility"));
+
         let opened = FullTextTopKProvider::new(
             table.tablet(),
             0,
@@ -1016,8 +997,7 @@ mod tests {
             10,
             "simple",
             None,
-            Some(GlobalFullTextStats::from_totals(2, 3)),
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         )
         .open(snapshot)
         .unwrap();

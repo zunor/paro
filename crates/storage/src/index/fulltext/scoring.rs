@@ -14,24 +14,40 @@ use super::query_parser::ParsedQuery;
 use super::text_index::FullTextScoringStats;
 use super::tokenizer::{Token, TokenPosition};
 
-/// Score mode for full-text ranking.
+/// Versioned scoring algorithm, not an index-selection hint.
+///
+/// DocumentRankV1 fixes k1=1.2, b=0.75 and avgdl=the document's own length;
+/// it has no IDF/corpus input. CorpusBm25V1 instead consumes the parameters and
+/// corpus statistics of the pinned search read snapshot. They are NOT SQL
+/// replacements for one another. Tokenization is bound separately by the
+/// FullTextIntent config and query kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FullTextScoreMode {
-    Bm25,
-    CoverDensity,
+    CorpusBm25V1,
+    CoverDensityV1,
+    DocumentRankV1,
+}
+
+/// Only these algorithms can implement a function of document/query alone.
+/// Corpus BM25 is deliberately unrepresentable in the scalar scoring API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentScoreMode {
+    RankV1,
+    CoverDensityV1,
 }
 
 impl Default for FullTextScoreMode {
     fn default() -> Self {
-        Self::Bm25
+        Self::CorpusBm25V1
     }
 }
 
 impl FullTextScoreMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Bm25 => "bm25",
-            Self::CoverDensity => "cover_density",
+            Self::CorpusBm25V1 => "corpus_bm25_v1",
+            Self::CoverDensityV1 => "cover_density_v1",
+            Self::DocumentRankV1 => "document_rank_v1",
         }
     }
 }
@@ -46,20 +62,32 @@ pub fn score_document_from_index(
     stats: &FullTextScoringStats,
 ) -> f32 {
     match score_mode {
-        FullTextScoreMode::Bm25 => score_bm25(index, bm25, query, doc_id, stats),
-        FullTextScoreMode::CoverDensity => score_cover_density(index, query, doc_id),
+        FullTextScoreMode::CorpusBm25V1 => score_bm25(index, bm25, query, doc_id, stats),
+        FullTextScoreMode::CoverDensityV1 => score_cover_density(index, query, doc_id),
+        FullTextScoreMode::DocumentRankV1 => {
+            let tokens = collect_tokens(index, query, doc_id);
+            let mut term_freqs = BTreeMap::new();
+            for token in &tokens {
+                *term_freqs.entry(token.term.as_str()).or_default() += 1;
+            }
+            score_bm25_tokens_query(
+                query,
+                index.doc_length(doc_id).unwrap_or(0) as f32,
+                &term_freqs,
+            )
+        }
     }
 }
 
 /// Score a tokenized document without consulting index-global statistics.
 pub fn score_document_from_tokens<T: TokenLike>(
-    score_mode: FullTextScoreMode,
+    score_mode: DocumentScoreMode,
     tokens: &[T],
     query: &ParsedQuery,
 ) -> f32 {
     match score_mode {
-        FullTextScoreMode::Bm25 => score_bm25_tokens(tokens, query),
-        FullTextScoreMode::CoverDensity => score_cover_density_tokens(tokens, query),
+        DocumentScoreMode::RankV1 => score_bm25_tokens(tokens, query),
+        DocumentScoreMode::CoverDensityV1 => score_cover_density_tokens(tokens, query),
     }
 }
 
@@ -72,8 +100,9 @@ pub fn score_document_from_tokens_with_stats<T: TokenLike>(
     stats: &FullTextScoringStats,
 ) -> f32 {
     match score_mode {
-        FullTextScoreMode::Bm25 => score_bm25_tokens_with_stats(tokens, query, bm25, stats),
-        FullTextScoreMode::CoverDensity => score_cover_density_tokens(tokens, query),
+        FullTextScoreMode::CorpusBm25V1 => score_bm25_tokens_with_stats(tokens, query, bm25, stats),
+        FullTextScoreMode::CoverDensityV1 => score_cover_density_tokens(tokens, query),
+        FullTextScoreMode::DocumentRankV1 => score_bm25_tokens(tokens, query),
     }
 }
 
@@ -645,7 +674,7 @@ mod tests {
             super::super::text_index::GlobalFullTextStats::from_totals(1, 3),
         );
         let term = score_document_from_index(
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
             &index,
             &bm25,
             &ParsedQuery::Term("vector".to_string()),
@@ -681,13 +710,19 @@ mod tests {
         );
         let bm25 = Bm25::default();
         let query = ParsedQuery::Term("vector".to_string());
-        let artifact_score =
-            score_document_from_index(FullTextScoreMode::Bm25, &index, &bm25, &query, 1, &stats);
+        let artifact_score = score_document_from_index(
+            FullTextScoreMode::CorpusBm25V1,
+            &index,
+            &bm25,
+            &query,
+            1,
+            &stats,
+        );
 
         let mut tail_tokens = Vec::new();
         tokenizer.tokenize("vector database", &mut tail_tokens);
         let tail_score = score_document_from_tokens_with_stats(
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
             &tail_tokens,
             &query,
             &bm25,
@@ -713,8 +748,9 @@ mod tests {
         ];
         let query = ParsedQuery::Term("vector".to_string());
 
-        let short_score = score_document_from_tokens(FullTextScoreMode::Bm25, &short, &query);
-        let repeated_score = score_document_from_tokens(FullTextScoreMode::Bm25, &repeated, &query);
+        let short_score = score_document_from_tokens(DocumentScoreMode::RankV1, &short, &query);
+        let repeated_score =
+            score_document_from_tokens(DocumentScoreMode::RankV1, &repeated, &query);
         assert!(repeated_score > short_score);
     }
 
@@ -730,9 +766,9 @@ mod tests {
             ParsedQuery::Term("gamma".to_string()),
         ]);
 
-        let score = score_document_from_tokens(FullTextScoreMode::CoverDensity, &tokens, &query);
+        let score = score_document_from_tokens(DocumentScoreMode::CoverDensityV1, &tokens, &query);
         let branch = score_document_from_tokens(
-            FullTextScoreMode::CoverDensity,
+            DocumentScoreMode::CoverDensityV1,
             &tokens,
             &ParsedQuery::Phrase(vec!["alpha".to_string(), "beta".to_string()]),
         );
@@ -751,7 +787,7 @@ mod tests {
             ParsedQuery::Term("beta".to_string()),
         ]);
 
-        let score = score_document_from_tokens(FullTextScoreMode::CoverDensity, &tokens, &query);
+        let score = score_document_from_tokens(DocumentScoreMode::CoverDensityV1, &tokens, &query);
         assert!(
             (score - 1.0).abs() < 1e-6,
             "unexpected cover-density score: {score}"

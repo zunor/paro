@@ -4,7 +4,6 @@
 use super::table_handle::TableHandle;
 use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
-use crate::index::fulltext::text_index::GlobalFullTextStats;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::DistanceMetric;
 use crate::index::PredicateTree;
@@ -402,7 +401,6 @@ impl TableHandle {
         k: usize,
         config: &str,
         predicate: Option<PredicateTree>,
-        global_stats: Option<GlobalFullTextStats>,
         score_mode: FullTextScoreMode,
         visible_version: i64,
         read_options: &SearchReadOptions,
@@ -410,8 +408,6 @@ impl TableHandle {
         let capability = self
             .fulltext_capability(column_id as u32, config)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "fulltext"))?;
-        let global_stats =
-            global_stats.or_else(|| capability.generation_stats.fulltext_global_stats());
         let snapshot = self.open_search_snapshot(&capability, visible_version, read_options)?;
         FullTextTopKProvider::new(
             self.tablet(),
@@ -420,7 +416,6 @@ impl TableHandle {
             k,
             config,
             predicate,
-            global_stats,
             score_mode,
         )
         .open(snapshot)
@@ -434,7 +429,6 @@ impl TableHandle {
         k: usize,
         config: &str,
         predicate: Option<PredicateTree>,
-        global_stats: Option<GlobalFullTextStats>,
         score_mode: FullTextScoreMode,
         view: &TransactionView,
         read_options: &SearchReadOptions,
@@ -455,8 +449,6 @@ impl TableHandle {
                 return Ok(OpenSearchCursorResult::NotQueryable);
             }
         };
-        let global_stats =
-            global_stats.or_else(|| snapshot.generation.generation_stats.fulltext_global_stats());
         FullTextTopKProvider::new(
             self.tablet(),
             column_id,
@@ -464,7 +456,6 @@ impl TableHandle {
             k,
             config,
             predicate,
-            global_stats,
             score_mode,
         )
         .open(snapshot)
@@ -478,7 +469,6 @@ impl TableHandle {
         k: usize,
         config: &str,
         predicate: Option<PredicateTree>,
-        global_stats: Option<GlobalFullTextStats>,
         score_mode: FullTextScoreMode,
         view: &TransactionView,
         read_options: &SearchReadOptions,
@@ -486,8 +476,6 @@ impl TableHandle {
         let capability = self
             .fulltext_capability(column_id as u32, config)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "fulltext"))?;
-        let global_stats =
-            global_stats.or_else(|| capability.generation_stats.fulltext_global_stats());
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = self.open_search_snapshot_with_overlay(
             &capability,
@@ -502,7 +490,6 @@ impl TableHandle {
             k,
             config,
             predicate,
-            global_stats,
             score_mode,
         )
         .open(snapshot)
