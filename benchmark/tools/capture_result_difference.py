@@ -44,7 +44,7 @@ def main():
     )
     from tpcds_compare import (
         expected_server_diagnostic_environment, open_paro_connection,
-        optimizer_evidence_environment,
+        optimizer_evidence_environment, load_duckdb_runtime_manifest,
     )
     # Server lifecycle stays frozen independently, but result acceptance is
     # explicitly versioned by this checkout. Do not accidentally consume an
@@ -60,6 +60,7 @@ def main():
     duckdb_schema, paro_schema = contract.duckdb_schema, contract.paro_schema
     import duckdb
     import _duckdb
+    duckdb_runtime = load_duckdb_runtime_manifest(args.harness.resolve().parent)
 
     for name in list(os.environ):
         if name.startswith("PARO_"):
@@ -81,6 +82,7 @@ def main():
         "binary_sha256": content_digest(args.binary),
         "seed_sha256": seed.sha256, "sql_sha256": content_digest(args.sql),
         "duckdb_version": duckdb.__version__,
+        "duckdb_runtime_contract": duckdb_runtime,
         "duckdb_extension_sha256": content_digest(Path(_duckdb.__file__)),
         "duckdb_database_sha256": content_digest(args.duckdb),
         "optimizer_verify": args.verify, "handoff": args.handoff,
