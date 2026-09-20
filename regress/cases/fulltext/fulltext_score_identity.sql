@@ -13,6 +13,12 @@ FROM score_identity
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
 ORDER BY score DESC, id;
 
+SELECT id, ts_rank_cd(to_tsvector('simple', content),
+                     plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+
 CREATE INDEX score_identity_index ON score_identity USING GIN (to_tsvector('simple', content));
 
 -- Execution coverage is separate from scores and selected result membership.
@@ -35,7 +41,6 @@ WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector databa
 ORDER BY ts_rank(to_tsvector('simple', content),
                  plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
 
--- Unrelated corpus growth must not change any original document's score.
 -- Cover density has its own document-local identity and executable provider.
 -- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE
@@ -44,11 +49,14 @@ WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector databa
 ORDER BY ts_rank_cd(to_tsvector('simple', content),
                     plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
 
-SELECT id FROM score_identity
+SELECT ts_rank_cd(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
 ORDER BY ts_rank_cd(to_tsvector('simple', content),
                     plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
 
+-- Unrelated corpus growth must not change any original document's score.
 INSERT INTO score_identity VALUES (6, 'unrelated document');
 SELECT id, ts_rank(to_tsvector('simple', content),
                   plainto_tsquery('simple', 'vector database')) AS score

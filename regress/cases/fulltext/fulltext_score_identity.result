@@ -16,6 +16,16 @@ id	score
 2	2.000000
 3	2.000000
 
+SELECT id, ts_rank_cd(to_tsvector('simple', content),
+                     plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+id	score
+1	2.000000
+2	2.000000
+3	2.000000
+
 CREATE INDEX score_identity_index ON score_identity USING GIN (to_tsvector('simple', content));
 CREATE INDEX
 
@@ -68,12 +78,14 @@ MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes>
 Execution Time: <time-ms>
 Rows Returned: 1
 
-SELECT id FROM score_identity
+SELECT ts_rank_cd(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
 ORDER BY ts_rank_cd(to_tsvector('simple', content),
                     plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
-id
-1
+score
+2.000000
 
 INSERT INTO score_identity VALUES (6, 'unrelated document');
 INSERT 0 1
