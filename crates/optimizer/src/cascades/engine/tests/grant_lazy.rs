@@ -477,6 +477,8 @@ fn grant_failures_are_not_swallowed_as_missing_candidates_or_safe_fallbacks() {
         for error in [
             paro_error::internal("injected broken grant contract"),
             paro_error::configuration_limit_exceeded("injected producer resource failure"),
+            paro_error::not_supported("injected missing implementation capability"),
+            paro_error::query_canceled_message("injected original cancellation cause"),
         ] {
             let (mut engine, root, goal, _) = fixture(false, false);
             let mut registry = ImplementationRegistry::default();
