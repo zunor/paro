@@ -47,6 +47,24 @@ the existing result guarantee and search objective are not upgraded by reranking
 
 ## Validation status
 
+The first current-binary regress run (`edd872e9`, raw report retained as
+`c2-search-regress-report`) is 176 pass / 9 fail. The three historical fulltext
+TopK failures are closed without changing their expected plans. Vector-search
+blocks 22, 23 and 36 select the existing adaptive provider instead of a forced
+index-source wrapper: request, distance, exact objective, predicate row-set,
+query parameters and all result blocks agree. Only the wrapper and its explicit
+`Strategy: adaptive` line are revised; no exact/ANN or filter guarantee is
+removed. The fallback scan's retained `category` column in
+`pgvector_topn_filter_flow` remains a separate late-materialization review,
+not a reason to force an old plan or bless that file.
+
+Integration also exposed unsupported scalar residuals at two provider roots.
+Both TopK and bitmap-filter publication now use the existing predicate-template
+contract to decline unsupported replacement **before selection**. The real SQL
+`length(content)` counterexample remains a required passing execution test.
+The initial failing workspace log and binary remain archived; a final clean
+rebuild and gate rerun are required after these fixes.
+
 Preflight (not final clean-binary certification): 91 storage fulltext tests and
 11 session fulltext/search tests pass. The latter execute the real SQL planner,
 provider, compaction, transaction insert/delete and rollback paths. The new SQL

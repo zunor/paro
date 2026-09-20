@@ -134,7 +134,8 @@ ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
-  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+  ->  ADAPTIVE_SEARCH on public.indexed_items  (rows=2)
+    Strategy: adaptive
     Search Definition: <search-definition-id>
     Search Generation: <search-generation-id>
     Search Root: <search-root-id>
@@ -158,7 +159,8 @@ ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
-  ->  VECTOR_SEARCH on public.indexed_items  (rows=1)
+  ->  ADAPTIVE_SEARCH on public.indexed_items  (rows=1)
+    Strategy: adaptive
     Search Definition: <search-definition-id>
     Search Generation: <search-generation-id>
     Search Root: <search-root-id>
@@ -272,7 +274,8 @@ EXPLAIN EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');
 QUERY PLAN
 PROJECTION  (rows=2)
   Output: bucket
-  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+  ->  ADAPTIVE_SEARCH on public.indexed_items  (rows=2)
+    Strategy: adaptive
     Search Definition: <search-definition-id>
     Search Generation: <search-generation-id>
     Search Root: <search-root-id>
