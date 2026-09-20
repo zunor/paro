@@ -353,12 +353,13 @@ fn scan_work_evidence_does_not_require_analyze_catalog_statistics() {
     let LogicalOperator::Get(get) = &scan.operator else {
         unreachable!()
     };
-    assert!(get
-        .table
-        .as_ref()
-        .unwrap()
-        .statistics()
-        .is_none_or(|statistics| statistics.row_count == 0));
+    assert!(
+        get.table
+            .as_ref()
+            .unwrap()
+            .statistics()
+            .is_none_or(|statistics| statistics.row_count == 0)
+    );
     let facts = planner_cost_facts(
         &scan,
         &HashMap::new(),
@@ -1307,23 +1308,29 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
 
     let enabled = optimize(SearchBudget::default());
     assert_eq!(selected_join_type(&enabled), JoinType::Semi);
-    assert!(enabled
-        .rule_attempts
-        .get(&MARK_JOIN_TO_SEMI_RULE)
-        .is_some_and(|attempts| *attempts > 0));
-    assert!(enabled
-        .rule_insertions
-        .get(&MARK_JOIN_TO_SEMI_RULE)
-        .is_some_and(|insertions| *insertions > 0));
+    assert!(
+        enabled
+            .rule_attempts
+            .get(&MARK_JOIN_TO_SEMI_RULE)
+            .is_some_and(|attempts| *attempts > 0)
+    );
+    assert!(
+        enabled
+            .rule_insertions
+            .get(&MARK_JOIN_TO_SEMI_RULE)
+            .is_some_and(|insertions| *insertions > 0)
+    );
 
     let mut disabled_budget = SearchBudget::default();
     disabled_budget.disable_transformation(MARK_JOIN_TO_SEMI_RULE);
     let disabled = optimize(disabled_budget);
     assert_eq!(selected_join_type(&disabled), JoinType::Mark);
     assert!(!disabled.rule_attempts.contains_key(&MARK_JOIN_TO_SEMI_RULE));
-    assert!(!disabled
-        .rule_insertions
-        .contains_key(&MARK_JOIN_TO_SEMI_RULE));
+    assert!(
+        !disabled
+            .rule_insertions
+            .contains_key(&MARK_JOIN_TO_SEMI_RULE)
+    );
 }
 
 fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
@@ -2004,10 +2011,12 @@ fn nested_filters_share_one_ordered_source_work_lane() {
     assert_eq!(lane.source_rows, 20_000);
     assert_eq!(lane.retentions.len(), 2);
     assert_eq!(lane.filters.len(), 2);
-    assert!(lanes
-        .iter()
-        .filter(|lane| lane.source != WorkSourceId(0))
-        .all(|lane| lane.filters.is_empty()));
+    assert!(
+        lanes
+            .iter()
+            .filter(|lane| lane.source != WorkSourceId(0))
+            .all(|lane| lane.filters.is_empty())
+    );
     let inner_lane = inner
         .winner
         .source_work

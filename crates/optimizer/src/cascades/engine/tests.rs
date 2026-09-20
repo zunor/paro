@@ -4,8 +4,8 @@
 //! Cascades engine scheduling, transaction, and costing tests.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use paro_common::types::LogicalType;
 
@@ -1570,11 +1570,13 @@ fn physical_interleave_step_resumes_a_partial_child_recipe() {
         .expect("a yielded physical task must resume to a feasible root");
     assert_eq!(winner.cost.score.range.expected, 1.0);
     assert!(engine.task_registry().profile().reopened_evaluations > 0);
-    assert!(engine
-        .memo()
-        .group(child)
-        .and_then(|group| group.winner_frontier(winner.children[0].goal))
-        .is_some_and(|frontier| !frontier.candidates().is_empty()));
+    assert!(
+        engine
+            .memo()
+            .group(child)
+            .and_then(|group| group.winner_frontier(winner.children[0].goal))
+            .is_some_and(|frontier| !frontier.candidates().is_empty())
+    );
 }
 
 #[test]
@@ -1979,10 +1981,12 @@ fn engine_group_merge_redirects_tasks_and_discards_stale_transform_state() {
         Some(TaskState::Invalidated)
     );
     assert!(engine.transformation_observations.is_empty());
-    assert!(!engine
-        .transformation_subscribers
-        .values()
-        .any(|tasks| tasks.contains(&transform_task)));
+    assert!(
+        !engine
+            .transformation_subscribers
+            .values()
+            .any(|tasks| tasks.contains(&transform_task))
+    );
 }
 
 fn transformation_chain_engine(
@@ -2415,20 +2419,24 @@ fn rule_work_profile_is_opt_in_for_diagnostic_cohorts() {
     diagnostic.set_rule_work_profile_enabled(true);
     diagnostic.optimize(group, goal, SearchMode::Memo).unwrap();
     assert!(!diagnostic.rule_work_profile().is_empty());
-    assert!(diagnostic
-        .rule_work_profile()
-        .values()
-        .any(|profile| profile.first_discovered_us.is_some()));
+    assert!(
+        diagnostic
+            .rule_work_profile()
+            .values()
+            .any(|profile| profile.first_discovered_us.is_some())
+    );
     assert!(diagnostic.search_milestones().first_safe_us.is_some());
-    assert!(diagnostic
-        .search_milestones()
-        .first_optional_ready_us
-        .is_some());
+    assert!(
+        diagnostic
+            .search_milestones()
+            .first_optional_ready_us
+            .is_some()
+    );
 }
 
 #[test]
 fn rejection_guards_are_diagnostic_only_and_exclude_successful_proof_branches() {
-    use crate::transformation_rejection::{reject, TransformationRejectionGuard as Guard};
+    use crate::transformation_rejection::{TransformationRejectionGuard as Guard, reject};
     struct WitnessRule {
         emit: bool,
     }
@@ -2657,14 +2665,16 @@ fn statement_cancellation_is_not_an_advisory_rule_failure() {
     let error = engine.optimize(group, goal, SearchMode::Memo).unwrap_err();
     assert!(error.is_query_canceled());
     assert_eq!(engine.memo.group_count(), 1);
-    assert!(!engine
-        .memo
-        .search_obligations()
-        .iter()
-        .any(|obligation| matches!(
-            obligation.reason,
-            crate::cascades::budget::SearchIncompleteReason::RuleFailure { .. }
-        )));
+    assert!(
+        !engine
+            .memo
+            .search_obligations()
+            .iter()
+            .any(|obligation| matches!(
+                obligation.reason,
+                crate::cascades::budget::SearchIncompleteReason::RuleFailure { .. }
+            ))
+    );
 }
 
 #[test]
@@ -2680,10 +2690,12 @@ fn engine_seals_context_catalog_before_optional_search() {
     let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
 
     assert_eq!(winner.physical_fingerprint, Fingerprint(10));
-    assert!(engine
-        .memo()
-        .optimization_context(OptimizationContextId(1))
-        .is_none());
+    assert!(
+        engine
+            .memo()
+            .optimization_context(OptimizationContextId(1))
+            .is_none()
+    );
 }
 
 #[test]
@@ -2788,9 +2800,11 @@ fn shared_child_product_is_lazy_and_uses_immutable_candidate_references() {
             .sum::<usize>(),
         128
     );
-    assert!(batch
-        .combinations
-        .all(|combination| combination.len() == 64));
+    assert!(
+        batch
+            .combinations
+            .all(|combination| combination.len() == 64)
+    );
     assert_eq!(
         engine.memo().group_count(),
         1,
@@ -2871,9 +2885,11 @@ fn incremental_child_combination_oracle_covers_only_the_frontier_delta() {
     state.observe_frontiers(grown.clone());
     let right_delta = drain(&mut state).into_iter().collect::<BTreeSet<_>>();
     assert_eq!(right_delta.len(), 3);
-    assert!(right_delta
-        .iter()
-        .all(|children| children[1] == CandidateId::new(12)));
+    assert!(
+        right_delta
+            .iter()
+            .all(|children| children[1] == CandidateId::new(12))
+    );
     assert!(seen.is_disjoint(&right_delta));
     seen.extend(right_delta);
     assert_eq!(seen.len(), 9, "the full 3-by-3 product is covered once");
@@ -3960,15 +3976,17 @@ fn blocking_enforcers_participate_in_grant_feasibility() {
         spill_policy: SpillPolicy::Forbidden,
         max_parallel_tasks: 1,
     };
-    assert!(enforcer_cost(
-        &[EnforcerStep::MutationInputSpool {
-            barrier: super::super::ids::MutationBarrierId(0),
-        }],
-        too_small,
-        &MachineCalibrationBundle::default(),
-    )
-    .unwrap()
-    .is_none());
+    assert!(
+        enforcer_cost(
+            &[EnforcerStep::MutationInputSpool {
+                barrier: super::super::ids::MutationBarrierId(0),
+            }],
+            too_small,
+            &MachineCalibrationBundle::default(),
+        )
+        .unwrap()
+        .is_none()
+    );
 
     let spillable = EnforcerCostInput {
         spill_policy: SpillPolicy::Allowed,
@@ -4675,8 +4693,8 @@ fn exact_survivor_bounds_are_absolute_and_proof_idempotent() {
     let correlated = apply(
         &first,
         SidewaysFilterSource {
-            domain: DomainProofId(Fingerprint(first_proof.domain.0 .0 + 1)),
-            evaluation: EvaluationOccurrenceId(Fingerprint(first_proof.evaluation.0 .0 + 1)),
+            domain: DomainProofId(Fingerprint(first_proof.domain.0.0 + 1)),
+            evaluation: EvaluationOccurrenceId(Fingerprint(first_proof.evaluation.0.0 + 1)),
             ..first_proof
         },
     );
@@ -5168,7 +5186,12 @@ fn parent_costs_every_source_sensitive_child_frontier_candidate() {
     engine.diagnostic_cost_phase_times = Some(Arc::clone(&phase_times));
 
     let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
-    assert!(phase_times.0.iter().all(|n| n.load(std::sync::atomic::Ordering::Relaxed) > 0));
+    assert!(
+        phase_times
+            .0
+            .iter()
+            .all(|n| n.load(std::sync::atomic::Ordering::Relaxed) > 0)
+    );
 
     // Independent exhaustive oracle: remove each candidate's source phase
     // from its complete cost, apply the proven absolute survivor ratio once,

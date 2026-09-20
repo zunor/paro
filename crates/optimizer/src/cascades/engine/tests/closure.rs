@@ -30,11 +30,7 @@ impl TransformationRule for Rewrite {
     }
 
     fn output_bound(&self, _: &PatternBinding, _: &RuleContext<'_>) -> usize {
-        if self.from == 50 {
-            9
-        } else {
-            1
-        }
+        if self.from == 50 { 9 } else { 1 }
     }
 
     fn apply(

@@ -266,10 +266,12 @@ mod tests {
         environment.control.begin_optional();
         let mut arena = LogicalPlanArena::default();
         let mut cache = SettlementCache::default();
-        assert!(cache
-            .settle_native_test_in(values(&environment, 4), &environment, &mut arena)
-            .unwrap()
-            .is_none());
+        assert!(
+            cache
+                .settle_native_test_in(values(&environment, 4), &environment, &mut arena)
+                .unwrap()
+                .is_none()
+        );
         assert!(arena.is_empty());
         assert!(cache.locals.is_empty());
         environment.control = Arc::new(crate::cascades::control::SearchControl::new(None));
@@ -278,21 +280,24 @@ mod tests {
             id: environment.bind_context.next_plan_id(),
             stats: NodeStats::default(),
             operator: LogicalOperator::Filter(Filter {
-                child: NativeChild::Node(2), expressions: vec![],
+                child: NativeChild::Node(2),
+                expressions: vec![],
                 projection_map: paro_planner::operator::ProjectionMap::all(),
             }),
             source_proofs: Box::new([]),
         });
-        assert!(cache
-            .settle_native_test_in(
-                NativeShell {
-                    nodes: invalid.into_boxed_slice(),
-                    root: 1
-                },
-                &environment,
-                &mut arena
-            )
-            .is_err());
+        assert!(
+            cache
+                .settle_native_test_in(
+                    NativeShell {
+                        nodes: invalid.into_boxed_slice(),
+                        root: 1
+                    },
+                    &environment,
+                    &mut arena
+                )
+                .is_err()
+        );
         assert!(arena.is_empty());
         assert!(cache.locals.is_empty());
     }

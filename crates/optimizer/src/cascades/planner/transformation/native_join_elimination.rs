@@ -26,7 +26,7 @@ use paro_planner::operator::{
 };
 
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use super::{boundary, Memo, PatternOperand, PlannerTransformState};
+use super::{Memo, PatternOperand, PlannerTransformState, boundary};
 
 /// Completion of this selected rewrite, independent of global search state.
 pub(super) enum EliminationResult {
@@ -809,19 +809,25 @@ mod tests {
                         .unwrap()
                         .expect("both selected branches should be covered natively");
                 assert_eq!(native.root_layout().unwrap(), reference.output_layout());
-                assert!(!native
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(node.operator, LogicalOperator::Join(_))));
+                assert!(
+                    !native
+                        .nodes
+                        .iter()
+                        .any(|node| matches!(node.operator, LogicalOperator::Join(_)))
+                );
                 let LogicalOperator::SetOperation(setop) = native.root_operator() else {
                     panic!("set operation disappeared")
                 };
                 assert_eq!((setop.setop_type, setop.setop_all), (kind, all));
                 let layouts = native.layouts().unwrap();
-                assert!(output_bindings_for_child(&layouts, &setop.left)
-                    .contains(&ColumnBinding::new(10, 0)));
-                assert!(output_bindings_for_child(&layouts, &setop.right)
-                    .contains(&ColumnBinding::new(20, 0)));
+                assert!(
+                    output_bindings_for_child(&layouts, &setop.left)
+                        .contains(&ColumnBinding::new(10, 0))
+                );
+                assert!(
+                    output_bindings_for_child(&layouts, &setop.right)
+                        .contains(&ColumnBinding::new(20, 0))
+                );
             }
         }
     }
@@ -859,10 +865,12 @@ mod tests {
                 native.root_operator().op_type(),
                 reference.operator.op_type()
             );
-            assert!(!native
-                .nodes
-                .iter()
-                .any(|node| matches!(node.operator, LogicalOperator::Join(_))));
+            assert!(
+                !native
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node.operator, LogicalOperator::Join(_)))
+            );
         }
     }
 
@@ -1033,10 +1041,10 @@ mod tests {
     #[test]
     fn production_binding_uses_memo_unique_key_boundary() {
         use crate::cascades::budget::{BudgetDimension, SearchBudget};
-        use crate::cascades::planner::transformation::{
-            matching, PlannerTransformation, TransformContext,
-        };
         use crate::cascades::planner::MemoBuilder;
+        use crate::cascades::planner::transformation::{
+            PlannerTransformation, TransformContext, matching,
+        };
         use paro_planner::binder::context::BindContext;
 
         let mut input = MemoBuilder::build(
@@ -1112,10 +1120,10 @@ mod tests {
     #[test]
     fn production_apply_stages_native_elimination_candidate() {
         use crate::cascades::budget::{BudgetDimension, SearchBudget};
-        use crate::cascades::planner::transformation::{
-            matching, PlannerTransformation, PlannerTransformationRule, TransformContext,
-        };
         use crate::cascades::planner::MemoBuilder;
+        use crate::cascades::planner::transformation::{
+            PlannerTransformation, PlannerTransformationRule, TransformContext, matching,
+        };
         use crate::cascades::rules::TransformationRule;
         use paro_context::TestStatementContextBuilder;
         use paro_planner::binder::context::BindContext;
@@ -1386,9 +1394,11 @@ mod tests {
                         .logical_properties
                         .unique_keys
                         .insert(vec![column].into_boxed_slice());
-                    assert!(reads
-                        .iter()
-                        .any(|read| !read.is_current(&input.memo).unwrap()));
+                    assert!(
+                        reads
+                            .iter()
+                            .any(|read| !read.is_current(&input.memo).unwrap())
+                    );
                     let mut context = TransformContext::new(&mut input.memo, input.root);
                     assert_eq!(
                         rule.apply_binding(&binding, &mut context).unwrap().len(),

@@ -4,13 +4,13 @@
 //! Aggregate TopN construction over the exact selected shell. Admission is
 //! shared with the owned rule; this adapter supplies evidence, not new policy.
 
+use super::PlannerTransformState;
 use super::native_topn_payload::{
     append_rowid, column, node, occurrences, projection, push, source_get,
 };
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use super::PlannerTransformState;
 use crate::aggregate::late_payload::{
-    prove_aggregate_topn_inputs, prove_rowid_operator, RowIdPathPolicy,
+    RowIdPathPolicy, prove_aggregate_topn_inputs, prove_rowid_operator,
 };
 use crate::expression::traversal::visit_expression;
 use paro_common::error::{self as error, Result};
@@ -93,7 +93,7 @@ pub(super) fn rewrite(
         _ => {
             return Err(error::internal(
                 "aggregate TopN projection ordinal out of bounds",
-            ))
+            ));
         }
     };
     let visible_count = projected

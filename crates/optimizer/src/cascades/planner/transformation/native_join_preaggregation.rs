@@ -22,7 +22,7 @@ use paro_planner::operator::{
 };
 
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use super::{boundary, Memo, PatternOperand, PlannerTransformState};
+use super::{Memo, PatternOperand, PlannerTransformState, boundary};
 
 /// Try the exact native subset of `AggregateJoinPreaggregation`.
 ///
@@ -330,7 +330,7 @@ mod tests {
     use super::*;
 
     use super::super::{
-        matching, PlannerTransformation, PlannerTransformationRule, TransformContext,
+        PlannerTransformation, PlannerTransformationRule, TransformContext, matching,
     };
     use crate::cascades::budget::{BudgetDimension, SearchBudget};
     use crate::cascades::planner::MemoBuilder;

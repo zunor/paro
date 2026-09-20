@@ -407,10 +407,12 @@ fn domain_closure_reaches_an_exact_aggregate_behind_projection() {
         rebound_columns(&result),
         vec![vec![ColumnBinding::new(0, 7)]]
     );
-    assert!(result
-        .nodes
-        .iter()
-        .any(|node| { matches!(node.operator, LogicalOperator::Aggregate(_)) }));
+    assert!(
+        result
+            .nodes
+            .iter()
+            .any(|node| { matches!(node.operator, LogicalOperator::Aggregate(_)) })
+    );
 }
 
 #[test]
@@ -1641,8 +1643,7 @@ fn production_input_materialization_uses_native_shell_without_owned_settlement()
         vec![],
         vec![
             Expression::Aggregate(
-                AggregateExpression::new(sum.clone(), vec![difference], LogicalType::BigInt)
-                    .into(),
+                AggregateExpression::new(sum.clone(), vec![difference], LogicalType::BigInt).into(),
             ),
             Expression::Aggregate(
                 AggregateExpression::new(sum, vec![right_difference], LogicalType::BigInt).into(),

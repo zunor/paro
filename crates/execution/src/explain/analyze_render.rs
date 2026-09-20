@@ -9,12 +9,12 @@ use std::fmt::Write;
 use paro_planner::operator::{ExplainFormat, ExplainSpec};
 
 use crate::explain::profiler::{
-    ExplainProfileEvent, ExplainProfileSnapshot, ExplainProfiler, PROFILE_SCHEMA_VERSION,
-    ProfileMorselRange,
+    ExplainProfileEvent, ExplainProfileSnapshot, ExplainProfiler, ProfileMorselRange,
+    PROFILE_SCHEMA_VERSION,
 };
 use crate::explain::types::{
-    EXPLAIN_FORMAT_VERSION, ExplainActualStats, ExplainControlRegionStats, ExplainNodeId,
-    ExplainRecursiveCteStats, ExplainRuntimeStats,
+    ExplainActualStats, ExplainControlRegionStats, ExplainNodeId, ExplainRecursiveCteStats,
+    ExplainRuntimeStats, EXPLAIN_FORMAT_VERSION,
 };
 use crate::memory_runtime::MemoryRuntimeStats;
 use crate::pipeline::StatementProgram;

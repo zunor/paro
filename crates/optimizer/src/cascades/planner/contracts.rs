@@ -622,12 +622,14 @@ mod tests {
             selected_node_grant_contract(GrantDependencyDescriptor::Sensitive, goal, 4).unwrap(),
             PhysicalGrantContract::Class(ResourceGrantClassId(7)),
         );
-        assert!(selected_node_grant_contract(
-            GrantDependencyDescriptor::Sensitive,
-            GrantGoalKey::Invariant(AdmissibleGrantSetId(1)),
-            4,
-        )
-        .is_err());
+        assert!(
+            selected_node_grant_contract(
+                GrantDependencyDescriptor::Sensitive,
+                GrantGoalKey::Invariant(AdmissibleGrantSetId(1)),
+                4,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1007,16 +1009,18 @@ mod resource_contract_tests {
         let spill = class(SpillPolicy::Allowed);
         let grant = GrantGoalKey::Class(no_spill.id);
 
-        assert!(cost_for_grant(
-            cost(u64::MAX, 800 * 1024),
-            GrantDependencyDescriptor::Sensitive,
-            true,
-            grant,
-            &BTreeMap::from([(no_spill.id, no_spill)]),
-            false,
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            cost_for_grant(
+                cost(u64::MAX, 800 * 1024),
+                GrantDependencyDescriptor::Sensitive,
+                true,
+                grant,
+                &BTreeMap::from([(no_spill.id, no_spill)]),
+                false,
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(
             cost_for_grant(
                 cost(u64::MAX, 800 * 1024),
@@ -1082,24 +1086,28 @@ mod resource_contract_tests {
         )
         .expect_err("runtime-capped cost must participate in grant optimization");
 
-        assert!(error
-            .to_string()
-            .contains("runtime-capped memory makes an implementation grant-sensitive"));
+        assert!(
+            error
+                .to_string()
+                .contains("runtime-capped memory makes an implementation grant-sensitive")
+        );
     }
 
     #[test]
     fn forced_external_representation_is_not_faked_in_a_no_spill_class() {
         let no_spill = class(SpillPolicy::Forbidden);
-        assert!(cost_for_grant(
-            cost(900 * 1024, 800 * 1024),
-            GrantDependencyDescriptor::Sensitive,
-            true,
-            GrantGoalKey::Class(no_spill.id),
-            &BTreeMap::from([(no_spill.id, no_spill)]),
-            true,
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            cost_for_grant(
+                cost(900 * 1024, 800 * 1024),
+                GrantDependencyDescriptor::Sensitive,
+                true,
+                GrantGoalKey::Class(no_spill.id),
+                &BTreeMap::from([(no_spill.id, no_spill)]),
+                true,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

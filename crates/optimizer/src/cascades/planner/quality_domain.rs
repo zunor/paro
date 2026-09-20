@@ -1163,9 +1163,11 @@ mod tests {
 
     #[test]
     fn fenced_owner_and_adjacent_filter_do_not_hide_descendant_transfers() {
-        assert!(volatile_predicate()
-            .evaluation_properties()
-            .is_reorder_fence());
+        assert!(
+            volatile_predicate()
+                .evaluation_properties()
+                .is_reorder_fence()
+        );
         for adjacent in [false, true] {
             let child = branch(0, false, false);
             let plan = if adjacent {
@@ -1216,9 +1218,11 @@ mod tests {
         let leaf = &inner.children[0];
         let mut state = state.write().unwrap();
         assert_eq!(selected_is_graph_chain(outer, &state), Some(false));
-        assert!(pending_transfers(&root, &state)
-            .unwrap()
-            .contains(&root.reference.candidate));
+        assert!(
+            pending_transfers(&root, &state)
+                .unwrap()
+                .contains(&root.reference.candidate)
+        );
 
         state.payloads.logical[leaf.logical.payload.index()]
             .semantic_template
@@ -1239,17 +1243,21 @@ mod tests {
         )));
         assert_eq!(selected_is_graph_chain(leaf, &state), Some(true));
         assert_eq!(selected_is_graph_chain(outer, &state), Some(true));
-        assert!(!pending_transfers(&root, &state)
-            .unwrap()
-            .contains(&root.reference.candidate));
+        assert!(
+            !pending_transfers(&root, &state)
+                .unwrap()
+                .contains(&root.reference.candidate)
+        );
 
         state.payloads.logical[outer.logical.payload.index()]
             .semantic_template
             .operator = LogicalOperator::EmptyResult(EmptyResult { child: () });
         assert_eq!(selected_is_graph_chain(outer, &state), Some(true));
-        assert!(!pending_transfers(&root, &state)
-            .unwrap()
-            .contains(&root.reference.candidate));
+        assert!(
+            !pending_transfers(&root, &state)
+                .unwrap()
+                .contains(&root.reference.candidate)
+        );
         let mut broken = outer.as_ref().clone();
         broken.children = Box::new([]);
         assert_eq!(selected_is_graph_chain(&broken, &state), None);
@@ -1286,17 +1294,21 @@ mod tests {
         )));
         assert_eq!(selected_is_graph_chain(inner, &state), Some(true));
         assert_eq!(selected_is_graph_chain(outer, &state), Some(true));
-        assert!(!pending_transfers(&root, &state)
-            .unwrap()
-            .contains(&root.reference.candidate));
+        assert!(
+            !pending_transfers(&root, &state)
+                .unwrap()
+                .contains(&root.reference.candidate)
+        );
 
         state.payloads.logical[outer.logical.payload.index()]
             .semantic_template
             .operator = detached(projected(input(0, 1), 0, column(0, 0)));
         assert_eq!(selected_is_graph_chain(outer, &state), Some(false));
-        assert!(pending_transfers(&root, &state)
-            .unwrap()
-            .contains(&root.reference.candidate));
+        assert!(
+            pending_transfers(&root, &state)
+                .unwrap()
+                .contains(&root.reference.candidate)
+        );
     }
 
     #[test]
@@ -1426,9 +1438,11 @@ mod tests {
             )));
         let (_, state, root) = frozen(filtered(union, vec![equal(30, 0)]));
         let mut state = state.write().unwrap();
-        assert!(pending_transfers(&root, &state)
-            .unwrap()
-            .contains(&root.reference.candidate));
+        assert!(
+            pending_transfers(&root, &state)
+                .unwrap()
+                .contains(&root.reference.candidate)
+        );
         let child_payload = root.children[0].logical.payload;
         let metadata = state.metadata.remove(&child_payload).unwrap();
         assert!(pending_transfers(&root, &state).is_none());

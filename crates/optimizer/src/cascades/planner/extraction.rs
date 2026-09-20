@@ -68,7 +68,11 @@ pub(super) fn materialize_seed_logical_plan(
             return Err(paro_error::internal(format!(
                 "strong seed logical template changed identity: source={:?}/{:?}, materialized={:?}/{:?}",
                 frozen.logical.key.operator,
-                frozen.logical.operator_encoding.as_deref().map(|bytes| bytes.len()),
+                frozen
+                    .logical
+                    .operator_encoding
+                    .as_deref()
+                    .map(|bytes| bytes.len()),
                 operator_fingerprint,
                 operator_encoding.len(),
             )));

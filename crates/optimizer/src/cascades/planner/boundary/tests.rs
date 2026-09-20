@@ -85,9 +85,11 @@ fn native_predicate_statistics_follow_observed_input_facts_not_payload_snapshots
             .column_domains
             .insert(column, GroupColumnDomain::new(Some(point), None).unwrap());
         if !previous_reads.is_empty() {
-            assert!(previous_reads
-                .iter()
-                .any(|read| !read.is_current(&input.memo).unwrap()));
+            assert!(
+                previous_reads
+                    .iter()
+                    .any(|read| !read.is_current(&input.memo).unwrap())
+            );
         }
         let mut context = TransformContext::new(&mut input.memo, input.root);
         let snapshot = BoundarySnapshot::read(
@@ -486,9 +488,11 @@ fn native_boundary_retains_alias_lineage_and_records_inherited_statistics() {
         20,
     );
     assert!(root_read.is_current(&input.memo).unwrap());
-    assert!(reads
-        .iter()
-        .any(|read| !read.is_current(&input.memo).unwrap()));
+    assert!(
+        reads
+            .iter()
+            .any(|read| !read.is_current(&input.memo).unwrap())
+    );
     let mut context = TransformContext::new(&mut input.memo, input.root);
     let refreshed = BoundarySnapshot::read(
         &mut context,
@@ -801,11 +805,13 @@ fn native_group_hole_does_not_publish_null_extended_grouping_keys() {
         transported.grouping_unique_keys[0].columns[0].binding,
         ColumnBinding::new(1, 0)
     );
-    assert!(transported
-        .unique_keys
-        .iter()
-        .any(|key| key.columns[0].binding == ColumnBinding::new(11, 0)
-            && key.null_semantics == UniqueKeyNullSemantics::NullsDistinct));
+    assert!(
+        transported
+            .unique_keys
+            .iter()
+            .any(|key| key.columns[0].binding == ColumnBinding::new(11, 0)
+                && key.null_semantics == UniqueKeyNullSemantics::NullsDistinct)
+    );
 }
 
 #[test]
@@ -839,10 +845,12 @@ fn group_boundary_never_unions_coverage_from_different_alternatives() {
     )
     .unwrap()
     .unwrap();
-    assert!(snapshot.groups[&input.root]
-        .lineage
-        .values()
-        .all(Option::is_none));
+    assert!(
+        snapshot.groups[&input.root]
+            .lineage
+            .values()
+            .all(Option::is_none)
+    );
 }
 
 #[test]
@@ -866,10 +874,12 @@ fn repeated_union_occurrences_cannot_claim_one_source_work_identity() {
     )
     .unwrap()
     .unwrap();
-    assert!(snapshot.groups[&input.root]
-        .lineage
-        .values()
-        .all(Option::is_none));
+    assert!(
+        snapshot.groups[&input.root]
+            .lineage
+            .values()
+            .all(Option::is_none)
+    );
 }
 
 #[test]
@@ -894,12 +904,16 @@ fn disjoint_finite_grouping_domains_make_union_all_key_composable() {
     .unwrap()
     .unwrap();
     let output = input.memo.group(input.root).unwrap().schema.columns();
-    assert!(snapshot.groups[&input.root]
-        .unique_keys
-        .contains(&Box::from([output[0].id, output[1].id])));
-    assert!(snapshot.groups[&input.root]
-        .grouping_unique_keys
-        .contains(&Box::from([output[0].id, output[1].id])));
+    assert!(
+        snapshot.groups[&input.root]
+            .unique_keys
+            .contains(&Box::from([output[0].id, output[1].id]))
+    );
+    assert!(
+        snapshot.groups[&input.root]
+            .grouping_unique_keys
+            .contains(&Box::from([output[0].id, output[1].id]))
+    );
 }
 
 #[test]
@@ -910,22 +924,26 @@ fn exhausted_fact_read_preserves_baseline_and_reports_incomplete_work() {
     let before = input.memo.logical_expr_count();
     let state = input.planner_state.read().unwrap();
     let mut context = TransformContext::new(&mut input.memo, input.root);
-    assert!(BoundarySnapshot::read(
-        &mut context,
-        &state,
-        &PatternOperand::Group(input.root),
-        BudgetDimension::RuleWorkPerGroup
-    )
-    .unwrap()
-    .is_none());
-    assert_eq!(context.memo().logical_expr_count(), before);
-    assert!(context
-        .memo()
-        .group(input.root)
+    assert!(
+        BoundarySnapshot::read(
+            &mut context,
+            &state,
+            &PatternOperand::Group(input.root),
+            BudgetDimension::RuleWorkPerGroup
+        )
         .unwrap()
-        .ledger
-        .exhaustion_events()
-        .any(|(dimension, _)| *dimension == BudgetDimension::RuleWorkPerGroup));
+        .is_none()
+    );
+    assert_eq!(context.memo().logical_expr_count(), before);
+    assert!(
+        context
+            .memo()
+            .group(input.root)
+            .unwrap()
+            .ledger
+            .exhaustion_events()
+            .any(|(dimension, _)| *dimension == BudgetDimension::RuleWorkPerGroup)
+    );
 }
 
 #[test]

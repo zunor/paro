@@ -15,7 +15,7 @@ use paro_planner::expression::{AggregateType, Expression};
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
 
 use super::staging::{NativeChild, NativeShell};
-use super::{boundary, Memo, PatternOperand, PlannerTransformState};
+use super::{Memo, PatternOperand, PlannerTransformState, boundary};
 
 pub(super) fn try_native_aggregate_non_null_input(
     root_binding: &PatternOperand,
@@ -184,10 +184,10 @@ fn aggregate_input_binding(expression: &Expression) -> Option<ColumnBinding> {
 mod tests {
     use super::*;
     use crate::cascades::budget::{BudgetDimension, SearchBudget};
-    use crate::cascades::planner::transformation::{
-        matching, PlannerTransformation, PlannerTransformationRule, TransformContext,
-    };
     use crate::cascades::planner::MemoBuilder;
+    use crate::cascades::planner::transformation::{
+        PlannerTransformation, PlannerTransformationRule, TransformContext, matching,
+    };
     use crate::cascades::rules::TransformationRule;
     use paro_function::aggregate::distributive::count::get_count_function;
     use paro_planner::binder::context::BindContext;
@@ -344,10 +344,11 @@ mod tests {
         };
         let mut context = TransformContext::new(&mut memo_input.memo, root);
         let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
-        assert!(rule
-            .apply_binding(&binding, &mut context)
-            .unwrap()
-            .is_empty());
+        assert!(
+            rule.apply_binding(&binding, &mut context)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             super::super::semantic_plan::owned_binding_instantiation_count(),
             bridges,
