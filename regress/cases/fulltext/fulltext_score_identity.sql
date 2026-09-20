@@ -15,6 +15,14 @@ ORDER BY score DESC, id;
 
 CREATE INDEX score_identity_index ON score_identity USING GIN (to_tsvector('simple', content));
 
+-- Execution coverage is separate from scores and selected result membership.
+-- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes
+EXPLAIN ANALYZE
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+
 SELECT id, ts_rank(to_tsvector('simple', content),
                   plainto_tsquery('simple', 'vector database')) AS score
 FROM score_identity
@@ -48,4 +56,32 @@ SELECT id FROM score_identity
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
 ORDER BY ts_rank(to_tsvector('simple', content),
                  plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+
+BEGIN;
+DELETE FROM score_identity WHERE id = 1;
+SELECT ts_rank(to_tsvector('simple', content),
+               plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC LIMIT 1;
+ROLLBACK;
+
+SELECT ts_rank(to_tsvector('simple', content),
+               plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE id <> 1 AND to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC LIMIT 1;
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC, id LIMIT 2 OFFSET 1;
+
+-- Without @@ the score domain includes zero-score documents. NULL ordering
+-- and ascending rank are not provided by the matching-documents TopK source.
+INSERT INTO score_identity VALUES (8, NULL);
+SELECT id, ts_rank(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity ORDER BY score ASC NULLS LAST, id LIMIT 8;
+
 DROP TABLE score_identity;
