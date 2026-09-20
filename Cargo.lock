@@ -1852,6 +1852,7 @@ dependencies = [
  "rand 0.8.5",
  "ryu",
  "serde",
+ "serial_test",
  "tempfile",
  "tokio",
  "tokio-util",

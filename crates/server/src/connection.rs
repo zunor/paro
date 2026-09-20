@@ -5,6 +5,7 @@
 
 use crate::cancel::backend_key::BackendCancelKey;
 use paro_common::logging::targets;
+use paro_common::vector::VectorLifetimeOwner;
 use paro_instance::{
     ConnectionHandle, CopyStdinMetrics, CopyStdinRejectReason, Instance, SessionExecutionHandle,
     StatementCancelReason,
@@ -372,6 +373,7 @@ impl Connection {
                     self.socket
                         .send(PgWireBackendMessage::Authentication(Authentication::Ok))
                         .await?;
+                    self.observe_pending_output();
 
                     for (name, value) in self
                         .session
@@ -394,6 +396,7 @@ impl Connection {
                                 SecretKey::I32(backend_key.secret().value()),
                             )))
                             .await?;
+                        self.observe_pending_output();
                     }
 
                     // Send ReadyForQuery to complete the handshake
@@ -466,6 +469,7 @@ impl Connection {
         // client does not send Sync/Flush next.
         if !self.socket.write_buffer().is_empty() {
             self.socket.flush().await?;
+            self.observe_pending_output();
         }
 
         tokio::select! {
@@ -683,6 +687,7 @@ impl Connection {
         match msg {
             PgWireFrontendMessage::Flush(_) => {
                 self.socket.flush().await?;
+                self.observe_pending_output();
                 Ok(DispatchResult::Continue {
                     send_ready_for_query: false,
                 })
@@ -835,6 +840,7 @@ impl Connection {
                 status,
             )))
             .await?;
+        self.observe_pending_output();
         Ok(())
     }
 
@@ -844,6 +850,7 @@ impl Connection {
                 build_error_response_message("ERROR", sqlstate, message),
             ))
             .await?;
+        self.observe_pending_output();
         Ok(())
     }
 
@@ -856,7 +863,15 @@ impl Connection {
                 err,
             )))
             .await?;
+        self.observe_pending_output();
         Ok(())
+    }
+
+    fn observe_pending_output(&mut self) {
+        let buffered_bytes = self.socket.write_buffer().len();
+        self.socket
+            .codec_mut()
+            .observe_pending_output(buffered_bytes);
     }
 
     async fn handle_frontend_decode_error(&mut self, error: &PgWireError) -> anyhow::Result<()> {
@@ -1012,6 +1027,17 @@ pub struct PgCodec {
     limits: PgFrontendMessageLimits,
     copy_data_mode: bool,
     copy_stdin_metrics: Arc<CopyStdinMetrics>,
+    /// Owners transferred to bytes currently retained by Framed's write
+    /// buffer.  The codec lives exactly as long as that buffer, so dropping a
+    /// connection also drops any still-pending diagnostic reservation.
+    pending_output_owners: Vec<PendingOutputOwner>,
+    pending_output_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PendingOutputOwner {
+    bytes: usize,
+    _owner: Arc<dyn VectorLifetimeOwner>,
 }
 
 impl PgCodec {
@@ -1022,7 +1048,50 @@ impl PgCodec {
             limits,
             copy_data_mode: false,
             copy_stdin_metrics,
+            pending_output_owners: Vec::new(),
+            pending_output_bytes: 0,
         }
+    }
+
+    /// Transfer a diagnostic lease to the connection transport after its
+    /// encoded bytes have been appended to Framed's write buffer.
+    pub(crate) fn retain_pending_output_owner(
+        &mut self,
+        bytes: usize,
+        owner: Arc<dyn VectorLifetimeOwner>,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        self.pending_output_bytes = self.pending_output_bytes.saturating_add(bytes);
+        self.pending_output_owners.push(PendingOutputOwner {
+            bytes,
+            _owner: owner,
+        });
+    }
+
+    /// Observe the aggregate Framed write buffer after a transport operation.
+    /// Framed exposes no per-segment drain callback, so leases are released
+    /// only once the whole buffer is empty.  This is conservative for mixed
+    /// output, and never releases a lease while any owned or trailing bytes
+    /// can still be pending.
+    pub(crate) fn observe_pending_output(&mut self, buffered_bytes: usize) {
+        debug_assert_eq!(
+            self.pending_output_owners
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<usize>(),
+            self.pending_output_bytes
+        );
+        if buffered_bytes == 0 {
+            self.pending_output_owners.clear();
+            self.pending_output_bytes = 0;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_output_bytes(&self) -> usize {
+        self.pending_output_bytes
     }
 
     pub fn enter_copy_data_mode(&mut self) {

@@ -26,7 +26,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::PgCodec;
-use crate::protocol::result::PgWireResultSink;
+use crate::protocol::result::{observe_pending_output, PgWireResultSink};
 use crate::protocol::value_format::TextVectorEncoder;
 
 const COPY_TEXT_FORMAT_CODE: i8 = 0;
@@ -377,6 +377,7 @@ impl<'a> PgWireCopyOutSink<'a> {
             _ = self.cancellation.cancelled() => FlushOutcome::StatementCancelled,
             result = self.socket.flush() => FlushOutcome::Flushed(result),
         };
+        observe_pending_output(self.socket);
 
         match outcome {
             FlushOutcome::Flushed(Ok(())) => Ok(()),
@@ -394,9 +395,11 @@ impl<'a> PgWireCopyOutSink<'a> {
     async fn flush_cancelled_frame(&mut self) -> Result<()> {
         let mut remaining = self.socket.write_buffer().len();
         loop {
-            match tokio::time::timeout(self.flush_policy.stalled_write_timeout, self.socket.flush())
-                .await
-            {
+            let outcome =
+                tokio::time::timeout(self.flush_policy.stalled_write_timeout, self.socket.flush())
+                    .await;
+            observe_pending_output(self.socket);
+            match outcome {
                 Ok(Ok(())) => return self.cancellation.check(),
                 Ok(Err(error)) => {
                     self.force_close_token.cancel();
@@ -540,7 +543,8 @@ impl<'a> PgWireCopyInSink<'a> {
     }
 
     async fn send_copy_in_response(&mut self, spec: &CopyInSpec) -> Result<()> {
-        self.sink
+        let result = self
+            .sink
             .socket_mut()
             .send(PgWireBackendMessage::CopyInResponse(CopyInResponse::new(
                 spec.overall_format,
@@ -548,7 +552,9 @@ impl<'a> PgWireCopyInSink<'a> {
                 spec.column_formats.clone(),
             )))
             .await
-            .map_err(|e| paro_error::internal(e.to_string()))
+            .map_err(|e| paro_error::internal(e.to_string()));
+        observe_pending_output(self.sink.socket_mut());
+        result
     }
 }
 

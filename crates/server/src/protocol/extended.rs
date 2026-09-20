@@ -29,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::PgCodec;
 
 use super::copy::{create_copy_in_source, create_copy_out_sink, CopyFrontendMode};
-use super::result::{build_error_response, field_description_with_format, send_chunk_rows};
+use super::result::{
+    build_error_response, field_description_with_format, observe_pending_output, send_chunk_rows,
+};
 
 pub struct PgWireExtendedQueryResponder<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
@@ -173,20 +175,26 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
     }
 
     async fn send_error(&mut self, err: &ParoError) -> Result<()> {
-        self.socket
+        let result = self
+            .socket
             .send(PgWireBackendMessage::ErrorResponse(build_error_response(
                 err,
             )))
             .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+            .map_err(|e| paro_common::error::internal(e.to_string()));
+        observe_pending_output(self.socket);
+        result?;
         Ok(())
     }
 
     async fn flush(&mut self) -> Result<()> {
-        self.socket
+        let result = self
+            .socket
             .flush()
             .await
-            .map_err(|e| paro_common::error::internal(e.to_string()))
+            .map_err(|e| paro_common::error::internal(e.to_string()));
+        observe_pending_output(self.socket);
+        result
     }
 
     fn create_copy_out_sink(

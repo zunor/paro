@@ -61,11 +61,16 @@ its original error wins; a successful target is reported as such in a bounded
 diagnostic-capacity error detail, without allocating another retained document.
 This is diagnostic request failure, not target compilation failure.
 
-CollectingSink preserves the reservation across its copy. Pgwire holds it until
-the diagnostic chunk is flushed. Sinks without this ownership contract reject
-diagnostic delivery explicitly. Dropping a result, compilation error or canceled
-request returns its reservation; no fallback file or unaccounted queue is used.
-The snapshot is sealed before rendering.
+CollectingSink preserves the reservation across its copy. Pgwire transfers the
+reservation to the `PgCodec` that owns the Framed connection as soon as the
+encoded diagnostic bytes enter its write buffer. The codec releases it only
+after that buffer is empty, or when the connection/codec is actually dropped;
+canceling the send future alone cannot make pending bytes look free. A failed
+flush therefore keeps the lease until the failed connection is discarded, and
+does not require an unbounded retry flush. Sinks without this ownership
+contract reject diagnostic delivery explicitly. Dropping a result, compilation
+error or canceled request returns its reservation; no fallback file or
+unaccounted queue is used. The snapshot is sealed before rendering.
 
 Producers can mutate only fixed-size `CompileFields`; bounded methods own rule
 and variant storage and the capacity profile is not exposed to mutation. The

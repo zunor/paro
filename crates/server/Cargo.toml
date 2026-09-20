@@ -39,3 +39,4 @@ rand = "0.8"
 [dev-dependencies]
 paro-common = { workspace = true, features = ["test-support"] }
 tempfile = "3.8"
+serial_test = { workspace = true }
