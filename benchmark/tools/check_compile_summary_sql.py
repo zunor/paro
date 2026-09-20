@@ -12,8 +12,8 @@ def main():
     parser.add_argument("--dsn", required=True)
     args = parser.parse_args()
     fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "compile-summary"
-    expected = json.loads((fixtures / "query-summary-v1.json").read_text())
-    text_expected = (fixtures / "query-summary-v1.txt").read_text().splitlines()
+    expected = json.loads((fixtures / "query-summary-v2.json").read_text())
+    text_expected = (fixtures / "query-summary-v2.txt").read_text().splitlines()
     with psycopg.connect(args.dsn, autocommit=True) as conn:
         for target in ("SELECT 42", "WITH t AS (SELECT 3 AS x) SELECT x FROM t"):
             with conn.cursor() as cursor:

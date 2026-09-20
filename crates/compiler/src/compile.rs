@@ -162,18 +162,6 @@ pub fn compile_statement_with_parameter_types(
             r.safety_verified = Observed(true);
             r.output_columns = Observed(result_names.len());
             if let paro_optimizer::OptimizedStatement::Physical(portfolio) = &optimized {
-                r.variant_count = Observed(portfolio.variants.len());
-                use paro_context::compile_diagnostics::{VariantSummary, MAX_VARIANTS};
-                for (ordinal, variant) in portfolio.variants.iter().take(MAX_VARIANTS).enumerate() {
-                    let mask = variant.admissible_classes.iter().try_fold(0u64, |mask, class| {
-                        1u64.checked_shl(class.0).map(|bit| mask | bit)
-                    });
-                    if let Some(admissible_classes) = mask {
-                        r.variants.push(VariantSummary { ordinal: ordinal as u16,
-                            physical_fingerprint: [(variant.physical_fingerprint.0 >> 64) as u64, variant.physical_fingerprint.0 as u64], admissible_classes });
-                    }
-                }
-                r.omitted_variants = portfolio.variants.len().saturating_sub(r.variants.len()) as u64;
                 if let Some(class) = portfolio.grant_search.as_ref().and_then(|s| s.expected_class) {
                     r.expected_class = Observed(class.0);
                     let mut matches = portfolio.variants.iter().filter(|v| v.admissible_classes.contains(&class));
@@ -185,6 +173,16 @@ pub fn compile_statement_with_parameter_types(
                 }
             }
         });
+        if let paro_optimizer::OptimizedStatement::Physical(portfolio) = &optimized {
+            use paro_context::compile_diagnostics::{VariantSummary, MAX_VARIANTS};
+            capture.variants(portfolio.variants.len(), portfolio.variants.iter().take(MAX_VARIANTS).enumerate().filter_map(|(ordinal, variant)| {
+                let admissible_classes = variant.admissible_classes.iter().try_fold(0u64, |mask, class| {
+                    1u64.checked_shl(class.0).map(|bit| mask | bit)
+                })?;
+                Some(VariantSummary { ordinal: ordinal as u16,
+                    physical_fingerprint: [(variant.physical_fingerprint.0 >> 64) as u64, variant.physical_fingerprint.0 as u64], admissible_classes })
+            }));
+        }
     }
     let executable = match optimized {
         paro_optimizer::OptimizedStatement::Physical(plan) => {

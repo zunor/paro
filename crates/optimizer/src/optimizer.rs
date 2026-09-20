@@ -1051,10 +1051,17 @@ impl Optimizer {
                     crate::cascades::engine::SearchStopReason::QualityPolicySatisfied => SearchStop::QualityPolicySatisfied,
                 });
             });
-            for (id, attempts) in &extraction.rule_attempts {
-                capture.rule(RuleSummary { id: id.0, attempts: *attempts,
-                    inserted: extraction.rule_insertions.get(id).copied().unwrap_or(0),
-                    elapsed_ns: extraction.rule_elapsed.get(id).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) });
+            let active_rules: std::collections::BTreeSet<_> = extraction.rule_attempts.keys()
+                .chain(extraction.rule_elapsed.keys())
+                .chain(extraction.rule_insertions.keys()).copied().collect();
+            for id in active_rules {
+                let binding = extraction.rule_binding_work.get(&id).copied().unwrap_or_default();
+                capture.rule(RuleSummary { id: id.0,
+                    binding_calls: binding.calls,
+                    binding_ns: u64::try_from(binding.elapsed.as_nanos()).unwrap_or(u64::MAX),
+                    attempts: extraction.rule_attempts.get(&id).copied().unwrap_or(0),
+                    inserted: extraction.rule_insertions.get(&id).copied().unwrap_or(0),
+                    elapsed_ns: extraction.rule_elapsed.get(&id).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) });
             }
         }
         if paro_context::compile_work_evidence_enabled() {

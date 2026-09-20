@@ -1,2 +1,0 @@
-EXPLAIN (COMPILE) / schema 1 / ForcedCompile
-admission=NotExecuted execution=NotExecuted

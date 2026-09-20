@@ -849,6 +849,12 @@ pub struct RuleWorkProfile {
     pub first_published_us: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuleBindingWork {
+    pub calls: u64,
+    pub elapsed: Duration,
+}
+
 /// Exact selected-DAG evidence captured at a diagnostic search checkpoint.
 /// Candidate IDs alone are not sufficient because they do not identify the
 /// child choices, payloads, or rule products that made a plan executable.
@@ -1150,6 +1156,8 @@ pub struct CascadesEngine {
     rule_attempts: BTreeMap<RuleId, u64>,
     effective_rule_insertions: BTreeMap<RuleId, u64>,
     rule_elapsed: BTreeMap<RuleId, Duration>,
+    rule_binding_work: BTreeMap<RuleId, RuleBindingWork>,
+    collect_compile_rule_work: bool,
     rule_allocated_bytes: BTreeMap<RuleId, u64>,
     rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     rule_work_profile: BTreeMap<RuleId, RuleWorkProfile>,
@@ -1460,6 +1468,8 @@ impl CascadesEngine {
             rule_attempts: BTreeMap::new(),
             effective_rule_insertions: BTreeMap::new(),
             rule_elapsed: BTreeMap::new(),
+            rule_binding_work: BTreeMap::new(),
+            collect_compile_rule_work: false,
             rule_allocated_bytes: BTreeMap::new(),
             rule_budget_exhaustions: BTreeMap::new(),
             rule_work_profile: BTreeMap::new(),
@@ -5052,7 +5062,13 @@ impl CascadesEngine {
                 };
                 rule_impl.bindings(expression, &context)?
             };
-            *self.rule_elapsed.entry(rule).or_default() += binding_started.elapsed();
+            let binding_elapsed = binding_started.elapsed();
+            *self.rule_elapsed.entry(rule).or_default() += binding_elapsed;
+            if self.collect_compile_rule_work {
+                let binding_work = self.rule_binding_work.entry(rule).or_default();
+                binding_work.calls = binding_work.calls.saturating_add(1);
+                binding_work.elapsed += binding_elapsed;
+            }
             let allocated = paro_common::allocator::allocated_bytes_since(binding_allocated);
             let accumulated = self.rule_allocated_bytes.entry(rule).or_default();
             *accumulated = accumulated.saturating_add(allocated);
@@ -6068,6 +6084,12 @@ impl CascadesEngine {
     pub fn rule_elapsed(&self) -> &BTreeMap<RuleId, Duration> {
         &self.rule_elapsed
     }
+
+    pub fn rule_binding_work(&self) -> &BTreeMap<RuleId, RuleBindingWork> {
+        &self.rule_binding_work
+    }
+
+    pub fn observe_compile_rule_work(&mut self) { self.collect_compile_rule_work = true; }
 
     pub fn rule_allocated_bytes(&self) -> &BTreeMap<RuleId, u64> {
         &self.rule_allocated_bytes

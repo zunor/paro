@@ -9,8 +9,23 @@ use paro_common::{
     types::LogicalType,
     vector::Vector,
 };
-use paro_context::{compile_diagnostics::CompileCapture, StatementOptions};
+use paro_context::{StatementOptions, compile_diagnostics::CompileCapture};
 use paro_parser::ast::{ExplainOption, Statement};
+
+/// Own only the implicit transaction started by this request. Dropping a
+/// backpressured request must not leave it attached to the next statement.
+struct CompileTransaction<'a> {
+    session: &'a mut Session,
+    auto: bool,
+}
+
+impl Drop for CompileTransaction<'_> {
+    fn drop(&mut self) {
+        if self.auto {
+            let _ = self.session.rollback_auto_transaction(None);
+        }
+    }
+}
 
 impl Session {
     pub(crate) async fn execute_compile_explain<S: ProtocolResultSink>(
@@ -40,14 +55,21 @@ impl Session {
         if auto {
             self.begin_transaction_internal()?;
         }
+        let mut transaction = CompileTransaction {
+            session: self,
+            auto,
+        };
+        let session = &mut *transaction.session;
         let capture = CompileCapture::try_start();
-        let ctx = self.freeze_statement_context(
+        let cancellation = session
+            .current_statement_cancellation()
+            .expect("compile request scope");
+        let ctx = session.freeze_statement_context(
             StatementOptions {
                 compile_capture: capture.clone(),
                 ..StatementOptions::default()
             },
-            self.current_statement_cancellation()
-                .expect("compile request scope"),
+            cancellation.clone(),
         );
         // Calling the production compiler exactly once preserves binding, settings,
         // verifier, budgets and cancellation. Never admit/lower/execute this artifact.
@@ -56,7 +78,7 @@ impl Session {
             Ok(compiled) => compiled,
             Err(e) => {
                 if auto {
-                    let _ = self.rollback_auto_transaction(Some(&e));
+                    let _ = session.rollback_auto_transaction(Some(&e));
                 }
                 return Err(e);
             }
@@ -66,36 +88,49 @@ impl Session {
             // No unaccounted fallback result buffer. The target has compiled;
             // the diagnostic request cannot retain another document. A fixed
             // terminal envelope is carried by the ordinary error protocol.
+            use paro_context::compile_diagnostics::{CompileDocument, UnavailableReason};
+            let detail = serde_json::to_string(&CompileDocument::unavailable(
+                UnavailableReason::ProcessCapacity,
+            ))
+            .expect("fixed-size unavailable document");
             let e = error::configuration_limit_exceeded("compile diagnostic capacity unavailable")
-                .detail(r#"{"schema_version":1,"diagnostic":"Unavailable","target_compile":"Success","target_execution":"NotExecuted","reason":"ProcessCapacity"}"#);
+                .detail(detail);
             if auto {
-                self.commit_auto_transaction()?;
+                session.commit_auto_transaction()?;
             }
+            transaction.auto = false;
             return Err(e);
         };
-        capture.seal();
+        let capture = capture.seal();
         let document = paro_execution::explain::compile_render::render(&capture, json);
-        let result = async {
+        let send = async {
             sink.start_result(&["QUERY PLAN".into()], &[LogicalType::Varchar])
                 .await?;
-            let allocator = self.buffer_allocator();
+            let allocator = session.buffer_allocator();
             let mut vector = Vector::try_from_strings(&[document.as_str()], allocator.clone())?;
             vector = vector.reference_with_lifetime_owner(capture.clone());
             let chunk = Chunk::from_vectors(vec![vector], allocator);
             sink.push_diagnostic_chunk(&chunk, capture).await?;
             sink.finish_result(&StatementCompletion::Explain).await
-        }
-        .await;
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                cancellation.check().and_then(|()| Err(error::query_canceled()))
+            }
+            result = send => result,
+        };
         match result {
             Ok(()) => {
                 if auto {
-                    self.commit_auto_transaction()?;
+                    session.commit_auto_transaction()?;
                 }
+                transaction.auto = false;
                 Ok(())
             }
             Err(e) => {
                 if auto {
-                    let _ = self.rollback_auto_transaction(Some(&e));
+                    let _ = session.rollback_auto_transaction(Some(&e));
                 }
                 Err(e)
             }
@@ -149,9 +184,11 @@ mod tests {
                             assert_eq!(a.cost, b.cost);
                             assert_eq!(a.admissible_classes, b.admissible_classes);
                         }
-                        assert!(session
-                            .reusable_instance_query_plan(&stmt, &[], &ctx)
-                            .is_none());
+                        assert!(
+                            session
+                                .reusable_instance_query_plan(&stmt, &[], &ctx)
+                                .is_none()
+                        );
                         let mut sink = crate::CollectingSink::new();
                         session
                             .execute_simple_query(
@@ -160,9 +197,11 @@ mod tests {
                             )
                             .await
                             .unwrap();
-                        assert!(session
-                            .reusable_instance_query_plan(&stmt, &[], &ctx)
-                            .is_none());
+                        assert!(
+                            session
+                                .reusable_instance_query_plan(&stmt, &[], &ctx)
+                                .is_none()
+                        );
                         let token = CancellationToken::new();
                         token.cancel();
                         let mut cancelled = ctx.as_ref().clone();

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::PgCodec;
 
-use super::copy::{create_copy_in_source, create_copy_out_sink, CopyFrontendMode};
+use super::copy::{CopyFrontendMode, create_copy_in_source, create_copy_out_sink};
 use super::result::PgWireResultSink;
 
 pub struct ProtocolSink<'a> {
@@ -70,10 +70,13 @@ impl<'a> ProtocolSink<'a> {
 #[async_trait]
 impl ResultSink for ProtocolSink<'_> {
     async fn push_diagnostic_chunk(
-        &mut self, chunk: &Chunk,
+        &mut self,
+        chunk: &Chunk,
         owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
     ) -> Result<()> {
-        self.result_sink.push_diagnostic_chunk(chunk, owner).await
+        self.ensure_transport_available()?;
+        let result = self.result_sink.push_diagnostic_chunk(chunk, owner).await;
+        self.remember_transport_failure(result)
     }
     async fn start_result(&mut self, names: &[String], types: &[LogicalType]) -> Result<()> {
         self.ensure_transport_available()?;
@@ -130,5 +133,65 @@ impl ProtocolResultSink for ProtocolSink<'_> {
             Arc::clone(&self.pending_frontend_messages),
             CopyFrontendMode::SimpleQuery,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn diagnostic_flush_failure_is_terminal_for_protocol_sink() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let codec = PgCodec::new(
+            crate::connection::PgFrontendMessageLimits::new(1 << 20),
+            Arc::new(paro_instance::CopyStdinMetrics::default()),
+        );
+        let mut socket = Framed::new(socket, codec);
+        // A locally closed writer deterministically exercises the real framed
+        // socket flush error, without depending on when a remote RST arrives.
+        socket.get_mut().shutdown().await.unwrap();
+        let mut sink = ProtocolSink::new(
+            &mut socket,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        let instance = paro_instance::Instance::new_in_memory();
+        let session = paro_session::Session::new(99, instance);
+        let allocator = session.buffer_allocator();
+        let vector =
+            paro_common::vector::Vector::try_from_strings(&["diagnostic"], allocator.clone())
+                .unwrap();
+        let chunk = Chunk::from_vectors(vec![vector], allocator);
+        let owner = paro_context::compile_diagnostics::CompileCapture::try_start().unwrap();
+        // Feed a frame before sending the diagnostic so even a zero-column
+        // chunk cannot turn this into a no-op flush.
+        sink.result_sink
+            .socket_mut()
+            .write_buffer_mut()
+            .extend_from_slice(b"pending");
+        let first = sink.push_diagnostic_chunk(&chunk, owner).await.unwrap_err();
+        assert_eq!(
+            sink.transport_failure().unwrap().to_string(),
+            first.to_string()
+        );
+        assert_eq!(
+            sink.error(&first).await.unwrap_err().to_string(),
+            first.to_string()
+        );
+        assert_eq!(
+            sink.finish_result(&StatementCompletion::Explain)
+                .await
+                .unwrap_err()
+                .to_string(),
+            first.to_string()
+        );
+        drop(peer);
     }
 }

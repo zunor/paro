@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const ENCODED_LIMIT: usize = 200_000;
 pub const RETAINED_LIMIT: usize = 1 << 20;
 pub const PROCESS_LIMIT: usize = 64 << 20;
@@ -48,6 +48,8 @@ pub enum SearchStop {
 #[serde(deny_unknown_fields)]
 pub struct RuleSummary {
     pub id: u32,
+    pub binding_calls: u64,
+    pub binding_ns: u64,
     pub attempts: u64,
     pub inserted: u64,
     /// A different projection of optimizer time; never add to phases.
@@ -86,9 +88,79 @@ pub enum CompileOutcome {
     Success,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UnavailableReason {
+    Capacity,
+    ProcessCapacity,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UnavailableStatus {
+    Unavailable,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnavailableDocument {
+    pub schema_version: u32,
+    pub diagnostic: UnavailableStatus,
+    pub reason: UnavailableReason,
+    pub target_compile: CompileOutcome,
+    pub target_execution: Observation<u64>,
+}
+
+/// Both normal output and capacity refusal use this single wire document.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CompileDocument {
+    Summary(Box<CompileRecord>),
+    Unavailable(UnavailableDocument),
+}
+
+impl CompileDocument {
+    pub fn unavailable(reason: UnavailableReason) -> Self {
+        Self::Unavailable(UnavailableDocument {
+            schema_version: SCHEMA_VERSION,
+            diagnostic: UnavailableStatus::Unavailable,
+            reason,
+            target_compile: CompileOutcome::Success,
+            target_execution: Observation::NotExecuted,
+        })
+    }
+    pub fn summary(&self) -> Option<&CompileRecord> {
+        match self {
+            Self::Summary(r) => Some(r),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompileRecord {
+    #[serde(flatten)]
+    fields: CompileFields,
+    pub rules: Vec<RuleSummary>,
+    pub omitted_rules: u64,
+    pub variants: Vec<VariantSummary>,
+    pub omitted_variants: u64,
+    pub retained_limit: usize,
+    pub encoded_limit: usize,
+    pub process_limit: usize,
+    pub process_reservation: usize,
+}
+
+impl std::ops::Deref for CompileRecord {
+    type Target = CompileFields;
+    fn deref(&self) -> &CompileFields {
+        &self.fields
+    }
+}
+
+/// Fixed-size observations only. Producers cannot replace collections or the
+/// capacity profile through this interface.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CompileFields {
     pub schema_version: u32,
     pub invocation: u64,
     pub process: u32,
@@ -119,22 +191,14 @@ pub struct CompileRecord {
     pub groups: Observation<u64>,
     pub logical_expressions: Observation<u64>,
     pub physical_expressions: Observation<u64>,
-    pub rules: Vec<RuleSummary>,
-    pub omitted_rules: u64,
     pub output_columns: Observation<usize>,
     pub artifact: ArtifactStatus,
     pub expected_class: Observation<u32>,
     pub variant_count: Observation<usize>,
-    pub variants: Vec<VariantSummary>,
-    pub omitted_variants: u64,
     pub selected_fingerprint: Observation<[u64; 2]>,
     pub admission: Observation<u64>,
     pub execution: Observation<u64>,
     pub response_terminal: Observation<u64>,
-    pub retained_limit: usize,
-    pub encoded_limit: usize,
-    pub process_limit: usize,
-    pub process_reservation: usize,
     pub outcome: CompileOutcome,
 }
 
@@ -142,6 +206,17 @@ pub struct CompileRecord {
 pub struct CompileCapture {
     record: Mutex<CompileRecord>,
     sealed: AtomicBool,
+}
+
+/// Immutable transport view. Its lease keeps the reservation alive after the
+/// request returns, including while a collector retains the output vector.
+#[derive(Debug)]
+pub struct SealedCompileCapture(Arc<CompileCapture>);
+
+impl SealedCompileCapture {
+    pub fn read<T>(&self, f: impl FnOnce(&CompileRecord) -> T) -> T {
+        self.0.read(f)
+    }
 }
 
 impl CompileCapture {
@@ -165,68 +240,75 @@ impl CompileCapture {
         Some(Arc::new(Self {
             sealed: AtomicBool::new(false),
             record: Mutex::new(CompileRecord {
-                schema_version: SCHEMA_VERSION,
-                invocation,
-                process: std::process::id(),
-                cache: CacheObservation::ForcedCompile,
-                measurement_mode: MeasurementMode::Diagnostic,
-                input_fingerprint: unknown,
-                output_identity: unknown,
-                planning_settings: unknown,
-                identity_encoding: 1,
-                source_build: unknown,
-                catalog_facts: unknown,
-                available_memory_bytes: unknown,
-                available_parallel_tasks: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                timer_boundary: TimerBoundary::ParsedAstCompilerEntryToReturnV1,
-                parse: unknown,
-                bind_ns: unknown,
-                optimizer_ns: unknown,
-                verify_ns: unknown,
-                finish_ns: unknown,
-                compiler_ns: unknown,
-                compiler_other_ns: unknown,
-                safety_verified: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                search_stop: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                search_complete: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                quality_policy_satisfied: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                budget_limited: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                obligations: unknown,
-                groups: unknown,
-                logical_expressions: unknown,
-                physical_expressions: unknown,
+                fields: CompileFields {
+                    schema_version: SCHEMA_VERSION,
+                    invocation,
+                    process: std::process::id(),
+                    cache: CacheObservation::ForcedCompile,
+                    measurement_mode: MeasurementMode::Diagnostic,
+                    input_fingerprint: unknown,
+                    output_identity: unknown,
+                    planning_settings: unknown,
+                    identity_encoding: 1,
+                    source_build: unknown,
+                    catalog_facts: unknown,
+                    available_memory_bytes: unknown,
+                    available_parallel_tasks: Observation::Uncovered(
+                        UncoveredReason::NotInstrumented,
+                    ),
+                    timer_boundary: TimerBoundary::ParsedAstCompilerEntryToReturnV1,
+                    parse: unknown,
+                    bind_ns: unknown,
+                    optimizer_ns: unknown,
+                    verify_ns: unknown,
+                    finish_ns: unknown,
+                    compiler_ns: unknown,
+                    compiler_other_ns: unknown,
+                    safety_verified: Observation::Uncovered(UncoveredReason::NotInstrumented),
+                    search_stop: Observation::Uncovered(UncoveredReason::NotInstrumented),
+                    search_complete: Observation::Uncovered(UncoveredReason::NotInstrumented),
+                    quality_policy_satisfied: Observation::Uncovered(
+                        UncoveredReason::NotInstrumented,
+                    ),
+                    budget_limited: Observation::Uncovered(UncoveredReason::NotInstrumented),
+                    obligations: unknown,
+                    groups: unknown,
+                    logical_expressions: unknown,
+                    physical_expressions: unknown,
+                    output_columns: Observation::Uncovered(UncoveredReason::NotInstrumented),
+                    artifact: ArtifactStatus::NotReady,
+                    expected_class: Observation::Uncovered(UncoveredReason::NotInstrumented),
+                    variant_count: Observation::Uncovered(UncoveredReason::NotInstrumented),
+                    selected_fingerprint: Observation::Uncovered(UncoveredReason::NotInstrumented),
+                    admission: Observation::NotExecuted,
+                    execution: Observation::NotExecuted,
+                    response_terminal: Observation::Uncovered(UncoveredReason::FutureBoundary),
+                    outcome: CompileOutcome::Incomplete,
+                },
                 rules: Vec::new(),
                 omitted_rules: 0,
-                output_columns: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                artifact: ArtifactStatus::NotReady,
-                expected_class: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                variant_count: Observation::Uncovered(UncoveredReason::NotInstrumented),
                 variants: Vec::new(),
                 omitted_variants: 0,
-                selected_fingerprint: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                admission: Observation::NotExecuted,
-                execution: Observation::NotExecuted,
-                response_terminal: Observation::Uncovered(UncoveredReason::FutureBoundary),
                 retained_limit: RETAINED_LIMIT,
                 encoded_limit: ENCODED_LIMIT,
                 process_limit: PROCESS_LIMIT,
                 process_reservation: RESERVATION,
-                outcome: CompileOutcome::Incomplete,
             }),
         }))
     }
 
-    pub fn update(&self, f: impl FnOnce(&mut CompileRecord)) {
+    pub fn update(&self, f: impl FnOnce(&mut CompileFields)) {
         let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
         if !self.sealed.load(Ordering::Acquire) {
-            f(&mut record);
+            f(&mut record.fields);
         }
     }
 
     /// After compilation no producer may alter the transported snapshot.
-    pub fn seal(&self) {
+    pub fn seal(self: &Arc<Self>) -> Arc<SealedCompileCapture> {
         let _record = self.record.lock().unwrap_or_else(|e| e.into_inner());
         self.sealed.store(true, Ordering::Release);
+        Arc::new(SealedCompileCapture(self.clone()))
     }
 
     pub fn read<T>(&self, f: impl FnOnce(&CompileRecord) -> T) -> T {
@@ -234,7 +316,8 @@ impl CompileCapture {
     }
 
     pub fn rule(&self, rule: RuleSummary) {
-        self.update(|r| {
+        let mut r = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.sealed.load(Ordering::Acquire) {
             if r.rules.len() < MAX_RULES {
                 let at = r.rules.partition_point(|existing| existing.id < rule.id);
                 r.rules.insert(at, rule);
@@ -247,7 +330,18 @@ impl CompileCapture {
                     r.rules.insert(at, rule);
                 }
             }
-        });
+        }
+    }
+
+    pub fn variants(&self, count: usize, variants: impl Iterator<Item = VariantSummary>) {
+        let mut r = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        if self.sealed.load(Ordering::Acquire) {
+            return;
+        }
+        r.fields.variant_count = Observation::Observed(count);
+        r.variants.clear();
+        r.variants.extend(variants.take(MAX_VARIANTS));
+        r.omitted_variants = count.saturating_sub(r.variants.len()) as u64;
     }
 }
 
@@ -270,6 +364,8 @@ mod tests {
         for id in 0..809_720 {
             retained.rule(RuleSummary {
                 id,
+                binding_calls: 0,
+                binding_ns: 0,
                 attempts: 1,
                 inserted: 0,
                 elapsed_ns: 0,
@@ -285,12 +381,32 @@ mod tests {
             );
             assert_eq!(r.execution, Observation::NotExecuted);
         });
-        retained.seal();
+        retained.variants(
+            70_000,
+            (0..70_000).map(|ordinal| VariantSummary {
+                ordinal: ordinal as u16,
+                physical_fingerprint: [0, 0],
+                admissible_classes: 1,
+            }),
+        );
+        retained.read(|r| {
+            assert_eq!(r.variants.len(), MAX_VARIANTS);
+            assert_eq!(r.omitted_variants, 70_000 - MAX_VARIANTS as u64);
+            assert!(
+                std::mem::size_of::<CompileRecord>()
+                    + r.rules.capacity() * std::mem::size_of::<RuleSummary>()
+                    + r.variants.capacity() * std::mem::size_of::<VariantSummary>()
+                    < RETAINED_LIMIT
+            );
+        });
+        let sealed = retained.seal();
         retained.update(|r| r.execution = Observation::Observed(99));
         assert_eq!(retained.read(|r| r.execution), Observation::NotExecuted);
         drop(captures);
         assert_eq!(ACTIVE.load(Ordering::Acquire), 1);
         drop(retained);
+        assert_eq!(ACTIVE.load(Ordering::Acquire), 1);
+        drop(sealed);
         assert_eq!(ACTIVE.load(Ordering::Acquire), 0);
     }
 }

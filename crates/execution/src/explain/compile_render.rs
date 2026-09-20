@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Render only the sealed target observation; never invoke planning or admission.
-use paro_context::compile_diagnostics::{CompileCapture, ENCODED_LIMIT};
+use paro_context::compile_diagnostics::{ENCODED_LIMIT, SealedCompileCapture};
 use std::io::{self, Write};
 
 struct LimitedWriter(Vec<u8>);
@@ -19,7 +19,7 @@ impl Write for LimitedWriter {
     }
 }
 
-pub fn render(capture: &CompileCapture, json: bool) -> String {
+pub fn render(capture: &SealedCompileCapture, json: bool) -> String {
     let mut writer = LimitedWriter(Vec::new());
     if writer.0.try_reserve_exact(ENCODED_LIMIT).is_err() {
         return unavailable(json);
@@ -37,7 +37,7 @@ pub fn render(capture: &CompileCapture, json: bool) -> String {
             writeln!(writer, "expected_class={:?} variants={:?} selected_fingerprint={:?}", record.expected_class, record.variant_count, record.selected_fingerprint)?;
             for v in &record.variants { writeln!(writer, "variant {} fingerprint={:?} admissible_classes={}", v.ordinal,v.physical_fingerprint,v.admissible_classes)?; }
             writeln!(writer, "admission={:?} execution={:?}", record.admission, record.execution)?;
-            for r in &record.rules { writeln!(writer, "rule {} attempts={} inserted={} elapsed_ns={}",r.id,r.attempts,r.inserted,r.elapsed_ns)?; }
+            for r in &record.rules { writeln!(writer, "rule {} binding_calls={} binding_ns={} apply_attempts={} apply_ns={} inserted={} elapsed_ns={}",r.id,r.binding_calls,r.binding_ns,r.attempts,r.elapsed_ns.saturating_sub(r.binding_ns),r.inserted,r.elapsed_ns)?; }
             writeln!(writer, "omitted_rules={} omitted_variants={} retained_limit={} encoded_limit={} response_terminal={:?}",record.omitted_rules,record.omitted_variants,record.retained_limit,record.encoded_limit,record.response_terminal)
         }
     });
@@ -48,8 +48,10 @@ pub fn render(capture: &CompileCapture, json: bool) -> String {
 }
 
 pub fn unavailable(json: bool) -> String {
+    use paro_context::compile_diagnostics::{CompileDocument, UnavailableReason};
     if json {
-        r#"{"schema_version":1,"diagnostic":"Unavailable","reason":"Capacity"}"#.into()
+        serde_json::to_string(&CompileDocument::unavailable(UnavailableReason::Capacity))
+            .expect("fixed-size unavailable document")
     } else {
         "EXPLAIN (COMPILE): DiagnosticUnavailable(Capacity)".into()
     }
@@ -58,12 +60,24 @@ pub fn unavailable(json: bool) -> String {
 /// Current schema only. Size is checked before deserializing untrusted input.
 pub fn validate_json(
     bytes: &[u8],
-) -> Result<paro_context::compile_diagnostics::CompileRecord, String> {
+) -> Result<paro_context::compile_diagnostics::CompileDocument, String> {
     use paro_context::compile_diagnostics::*;
     if bytes.len() > ENCODED_LIMIT {
         return Err("encoded capacity exceeded".into());
     }
-    let r: CompileRecord = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let document: CompileDocument = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let r = match &document {
+        CompileDocument::Summary(r) => r,
+        CompileDocument::Unavailable(r) => {
+            if r.schema_version != SCHEMA_VERSION
+                || r.target_compile != CompileOutcome::Success
+                || r.target_execution != Observation::NotExecuted
+            {
+                return Err("inconsistent unavailable document".into());
+            }
+            return Ok(document);
+        }
+    };
     if r.schema_version != SCHEMA_VERSION
         || r.encoded_limit != ENCODED_LIMIT
         || r.retained_limit != RETAINED_LIMIT
@@ -110,6 +124,28 @@ pub fn validate_json(
     {
         return Err("complete search has unresolved or uncovered obligations".into());
     }
+    if r.search_stop == Observation::Observed(SearchStop::Complete)
+        && (r.search_complete != Observation::Observed(true)
+            || r.budget_limited != Observation::Observed(false))
+    {
+        return Err("Complete requires complete non-budget-limited search".into());
+    }
+    if r.search_complete == Observation::Observed(true)
+        && (r.search_stop != Observation::Observed(SearchStop::Complete)
+            || r.budget_limited != Observation::Observed(false))
+    {
+        return Err("complete search contradicts stop or resource status".into());
+    }
+    if r.search_stop == Observation::Observed(SearchStop::QualityPolicySatisfied)
+        && r.quality_policy_satisfied != Observation::Observed(true)
+    {
+        return Err("quality stop requires satisfied policy".into());
+    }
+    if r.search_stop == Observation::Observed(SearchStop::BudgetLimited)
+        && r.budget_limited != Observation::Observed(true)
+    {
+        return Err("budget stop requires budget-limited status".into());
+    }
     if r.outcome == CompileOutcome::Success
         && (r.artifact != ArtifactStatus::CompiledArtifactReady
             || r.safety_verified != Observation::Observed(true))
@@ -138,33 +174,71 @@ pub fn validate_json(
         {
             return Err("compiler phase accounting does not close".into());
         }
+    } else if r.outcome == CompileOutcome::Success {
+        return Err("successful compiler record lacks phase accounting".into());
     }
-    Ok(r)
+    Ok(document)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_context::compile_diagnostics::CompileCapture;
     #[test]
     fn schema_and_capacity_rejects_fabricated_execution() {
         let capture = CompileCapture::try_start().unwrap();
-        let json = render(&capture, true);
+        let json = render(&capture.seal(), true);
         validate_json(json.as_bytes()).unwrap();
         assert!(validate_json(json.replace("NotExecuted", "NotApplicable").as_bytes()).is_err());
-        assert!(validate_json(
-            json.replace("\"schema_version\":1", "\"schema_version\":2")
-                .as_bytes()
-        )
-        .is_err());
+        assert!(
+            validate_json(
+                json.replace("\"schema_version\":2", "\"schema_version\":1")
+                    .as_bytes()
+            )
+            .is_err()
+        );
         assert!(validate_json(&vec![b' '; ENCODED_LIMIT + 1]).is_err());
         assert!(json.len() < 4096);
         let mut writer = LimitedWriter(Vec::new());
         writer.write_all(&vec![b'x'; ENCODED_LIMIT]).unwrap();
         assert!(writer.write_all(b"x").is_err());
         assert_eq!(writer.0.len(), ENCODED_LIMIT);
-        capture.update(|r| {
+        let invalid = CompileCapture::try_start().unwrap();
+        invalid.update(|r| {
             r.variant_count = paro_context::compile_diagnostics::Observation::Observed(1)
         });
-        assert!(validate_json(render(&capture, true).as_bytes()).is_err());
+        assert!(validate_json(render(&invalid.seal(), true).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn unavailable_and_terminal_consistency_share_the_reader() {
+        use paro_context::compile_diagnostics::*;
+        assert!(matches!(
+            validate_json(unavailable(true).as_bytes()).unwrap(),
+            CompileDocument::Unavailable(_)
+        ));
+        let process = serde_json::to_vec(&CompileDocument::unavailable(
+            UnavailableReason::ProcessCapacity,
+        ))
+        .unwrap();
+        assert!(matches!(
+            validate_json(&process).unwrap(),
+            CompileDocument::Unavailable(_)
+        ));
+        let capture = CompileCapture::try_start().unwrap();
+        capture.update(|r| {
+            r.search_stop = Observation::Observed(SearchStop::Complete);
+            r.search_complete = Observation::Observed(false);
+            r.obligations = Observation::Observed(5);
+            r.budget_limited = Observation::Observed(true);
+        });
+        assert!(validate_json(render(&capture.seal(), true).as_bytes()).is_err());
+        let capture = CompileCapture::try_start().unwrap();
+        capture.update(|r| {
+            r.outcome = CompileOutcome::Success;
+            r.safety_verified = Observation::Observed(true);
+            r.artifact = ArtifactStatus::CompiledArtifactReady;
+        });
+        assert!(validate_json(render(&capture.seal(), true).as_bytes()).is_err());
     }
 }

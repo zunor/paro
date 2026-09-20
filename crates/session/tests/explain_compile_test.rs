@@ -14,15 +14,39 @@ struct TransportSink {
 
 #[async_trait::async_trait]
 impl paro_session::ResultSink for TransportSink {
-    async fn start_result(&mut self, _: &[String], _: &[paro_common::types::LogicalType]) -> paro_common::error::Result<()> { Ok(()) }
-    async fn push_chunk(&mut self, _: &paro_common::chunk::Chunk) -> paro_common::error::Result<()> { panic!("diagnostic must use owned transport") }
-    async fn push_diagnostic_chunk(&mut self, _: &paro_common::chunk::Chunk, owner: Arc<dyn paro_common::vector::VectorLifetimeOwner>) -> paro_common::error::Result<()> {
-        *self.owner.lock().unwrap() = Some(Arc::downgrade(&owner));
-        if self.blocked { std::future::pending::<()>().await; }
-        drop(owner);
-        Err(paro_common::error::internal("injected diagnostic writer failure"))
+    async fn start_result(
+        &mut self,
+        _: &[String],
+        _: &[paro_common::types::LogicalType],
+    ) -> paro_common::error::Result<()> {
+        Ok(())
     }
-    async fn finish_result(&mut self, _: &paro_session::StatementCompletion) -> paro_common::error::Result<()> { Ok(()) }
+    async fn push_chunk(
+        &mut self,
+        _: &paro_common::chunk::Chunk,
+    ) -> paro_common::error::Result<()> {
+        panic!("diagnostic must use owned transport")
+    }
+    async fn push_diagnostic_chunk(
+        &mut self,
+        _: &paro_common::chunk::Chunk,
+        owner: Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> paro_common::error::Result<()> {
+        *self.owner.lock().unwrap() = Some(Arc::downgrade(&owner));
+        if self.blocked {
+            std::future::pending::<()>().await;
+        }
+        drop(owner);
+        Err(paro_common::error::internal(
+            "injected diagnostic writer failure",
+        ))
+    }
+    async fn finish_result(
+        &mut self,
+        _: &paro_session::StatementCompletion,
+    ) -> paro_common::error::Result<()> {
+        Ok(())
+    }
 }
 impl paro_session::ProtocolResultSink for TransportSink {}
 
@@ -77,7 +101,7 @@ fn compile_query_cte_and_reject_unimplemented_options() {
             let wide = (0..600).map(|i| format!("{i} AS c{i}")).collect::<Vec<_>>().join(",");
             let text = document(&mut session, &format!("EXPLAIN (COMPILE, FORMAT JSON) SELECT {wide}")).await;
             let record = paro_execution::explain::compile_render::validate_json(text.as_bytes()).unwrap();
-            assert_eq!(record.output_columns, paro_context::compile_diagnostics::Observation::Observed(600));
+            assert_eq!(record.summary().unwrap().output_columns, paro_context::compile_diagnostics::Observation::Observed(600));
             assert!(text.len() < paro_context::compile_diagnostics::ENCODED_LIMIT);
             // Deep supported expressions exercise the real binder without a trace tree.
             let deep = (0..48).fold("1".to_owned(), |sql, _| format!("CASE WHEN TRUE THEN ({sql}) ELSE 0 END"));
@@ -99,6 +123,7 @@ fn compile_query_cte_and_reject_unimplemented_options() {
             drop(retained);
             assert!(!document(&mut session, "EXPLAIN (COMPILE, FORMAT JSON) SELECT 7").await.contains("Unavailable"));
             for blocked in [false, true] {
+                let mut session = Session::new(2, Instance::new_in_memory());
                 let owner: ObservedOwner = Arc::new(Mutex::new(None));
                 let mut sink = TransportSink { blocked, owner: owner.clone() };
                 let result = tokio::time::timeout(std::time::Duration::from_millis(50), session.execute_simple_query("EXPLAIN (COMPILE) SELECT 7", &mut sink)).await;
@@ -107,10 +132,88 @@ fn compile_query_cte_and_reject_unimplemented_options() {
                 // A failed writer and a dropped/backpressured request both return
                 // their reservation; no disconnected-client history remains.
                 assert!(owner.lock().unwrap().as_ref().unwrap().upgrade().is_none());
+                assert_eq!(session.transaction_state(), paro_session::TransactionState::Idle);
+                session.execute_simple_query("SELECT 8", &mut CollectingSink::new()).await.unwrap();
+                assert_eq!(session.transaction_state(), paro_session::TransactionState::Idle);
                 assert!(!document(&mut session, "EXPLAIN (COMPILE, FORMAT JSON) SELECT 7").await.contains("Unavailable"));
             }
         });
     }).unwrap().join().unwrap();
+}
+
+#[test]
+fn compile_cancellation_closes_only_its_own_transaction() {
+    std::thread::Builder::new()
+        .stack_size(32 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    for explicit in [false, true] {
+                        let mut session = Session::new(3, Instance::new_in_memory());
+                        if explicit {
+                            session.begin_explicit_transaction().unwrap();
+                        }
+                        let owner: ObservedOwner = Arc::new(Mutex::new(None));
+                        let mut sink = TransportSink {
+                            blocked: true,
+                            owner: owner.clone(),
+                        };
+                        let control = session.execution_control().clone();
+                        let observed = owner.clone();
+                        let cancel = async move {
+                            while observed.lock().unwrap().is_none() {
+                                tokio::task::yield_now().await;
+                            }
+                            assert!(control.cancel_active_statement(
+                                paro_context::StatementCancelReason::UserRequest
+                            ));
+                        };
+                        let (result, ()) =
+                            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                                tokio::join!(
+                                    session.execute_simple_query(
+                                        "EXPLAIN (COMPILE) SELECT 7",
+                                        &mut sink
+                                    ),
+                                    cancel
+                                )
+                            })
+                            .await
+                            .expect("accepted cancellation must unblock transport");
+                        assert!(result.unwrap_err().is_query_canceled());
+                        assert!(owner.lock().unwrap().as_ref().unwrap().upgrade().is_none());
+                        assert!(session.execution_control().active_statement().is_none());
+                        if explicit {
+                            // The ordinary statement error handler marks the caller's
+                            // transaction failed; the compile request must not end it.
+                            assert_eq!(
+                                session.transaction_state(),
+                                paro_session::TransactionState::Failed
+                            );
+                            session.rollback_transaction().unwrap();
+                        } else {
+                            assert_eq!(
+                                session.transaction_state(),
+                                paro_session::TransactionState::Idle
+                            );
+                            session
+                                .execute_simple_query("SELECT 8", &mut CollectingSink::new())
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                session.transaction_state(),
+                                paro_session::TransactionState::Idle
+                            );
+                        }
+                    }
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]

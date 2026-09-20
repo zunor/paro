@@ -2516,6 +2516,10 @@ impl OptimizationInput {
         let seed_reprice_us = (seed_reprice_count > 0)
             .then(|| u64::try_from(seed_reprice_started.elapsed().as_micros()).unwrap_or(u64::MAX));
         engine.set_rule_work_profile_enabled(paro_context::StatementTrace::enabled());
+        if self.planner_state.read().expect("planner transform state poisoned")
+            .session.as_ref().is_some_and(|context| context.options.compile_capture.is_some()) {
+            engine.observe_compile_rule_work();
+        }
         let env_certified_group_pruning = std::env::var_os("PARO_CERTIFIED_GROUP_PRUNING")
             .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         engine.set_certified_group_pruning_enabled(
@@ -2686,6 +2690,7 @@ impl OptimizationInput {
         let rule_insertions = engine.effective_rule_insertions().clone();
         let rule_attempts = engine.rule_attempts().clone();
         let rule_elapsed = engine.rule_elapsed().clone();
+        let rule_binding_work = engine.rule_binding_work().clone();
         let rule_allocated_bytes = engine.rule_allocated_bytes().clone();
         let rule_budget_exhaustions = engine.rule_budget_exhaustions().clone();
         let rule_work_profile = engine.rule_work_profile().clone();
@@ -2897,6 +2902,7 @@ impl OptimizationInput {
             rule_attempts,
             rule_insertions,
             rule_elapsed,
+            rule_binding_work,
             rule_allocated_bytes,
             rule_budget_exhaustions,
             rule_work_profile,
@@ -2927,6 +2933,7 @@ pub struct OptimizationOutput {
     pub rule_insertions: BTreeMap<RuleId, u64>,
     /// Binding construction plus rule application time, aggregated by rule.
     pub rule_elapsed: BTreeMap<RuleId, std::time::Duration>,
+    pub rule_binding_work: BTreeMap<RuleId, super::engine::RuleBindingWork>,
     pub rule_allocated_bytes: BTreeMap<RuleId, u64>,
     pub rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     pub rule_work_profile: BTreeMap<RuleId, super::engine::RuleWorkProfile>,

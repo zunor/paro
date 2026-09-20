@@ -90,6 +90,17 @@ impl TransformationRule for Rewrite {
 
 struct Implementation;
 
+struct NoBinding;
+
+impl TransformationRule for NoBinding {
+    fn id(&self) -> RuleId { RuleId(800) }
+    fn matches_root(&self, _: &crate::cascades::memo::LogicalExpr) -> bool { true }
+    fn matches(&self, _: &crate::cascades::memo::LogicalExpr, _: &RuleContext<'_>) -> bool { false }
+    fn apply(&self, _: LogicalExprId, _: &mut TransformContext<'_>) -> Result<Box<[EquivalentExpression]>> {
+        panic!("a no-match must never reach apply")
+    }
+}
+
 impl PhysicalImplementation for Implementation {
     fn id(&self) -> ImplementationId {
         ImplementationId(500)
@@ -156,6 +167,7 @@ fn search(
     reverse_groups: bool,
     reverse_seeds: bool,
     limited: bool,
+    output_limited: bool,
 ) -> (
     BTreeSet<u32>,
     f64,
@@ -165,6 +177,7 @@ fn search(
     if limited {
         budget.max_rule_firings_per_group = 0;
     }
+    if output_limited { budget.max_optional_logical_exprs_per_group = 0; }
     let mut memo = Memo::new(budget);
     let mut groups = (0..3)
         .map(|_| {
@@ -236,8 +249,22 @@ fn search(
             .unwrap();
     }
     registry.register_implementation(Implementation).unwrap();
+    registry.register_transformation(NoBinding).unwrap();
     let mut engine = CascadesEngine::new(memo, registry);
+    engine.observe_compile_rule_work();
     let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
+    if !limited {
+        assert!(!engine.rule_binding_work().is_empty());
+        assert!(engine.rule_binding_work().get(&RuleId(800)).is_some_and(|work| work.calls > 0));
+    }
+    assert!(!engine.rule_attempts().contains_key(&RuleId(800)));
+    if limited || output_limited {
+        assert!(engine.rule_attempts().is_empty());
+    }
+    if output_limited {
+        assert!(engine.rule_binding_work().values().any(|work| work.calls > 0));
+        assert!(engine.rule_budget_exhaustions().values().any(|count| *count > 0));
+    }
     let closure = engine
         .memo()
         .group(root)
@@ -268,7 +295,7 @@ fn complete_closure_and_optimum_ignore_schedule_ids_and_fingerprints() {
             for reverse_groups in [false, true] {
                 for reverse_seeds in [false, true] {
                     let (closure, cost, obligations) =
-                        search(salt, reverse_rules, reverse_groups, reverse_seeds, false);
+                        search(salt, reverse_rules, reverse_groups, reverse_seeds, false, false);
                     assert_eq!(closure, expected);
                     assert_eq!(cost, oracle);
                     assert!(obligations.is_empty(), "{obligations:?}");
@@ -280,7 +307,7 @@ fn complete_closure_and_optimum_ignore_schedule_ids_and_fingerprints() {
 
 #[test]
 fn limited_closure_keeps_baseline_and_names_unexplored_candidate_class() {
-    let (closure, work, obligations) = search(97, true, true, true, true);
+    let (closure, work, obligations) = search(97, true, true, true, true, false);
     assert_eq!(closure, BTreeSet::from([50]));
     assert_eq!(work, 50.0);
     assert!(!obligations.is_empty());
@@ -289,4 +316,11 @@ fn limited_closure_keeps_baseline_and_names_unexplored_candidate_class() {
             BudgetDimension::RuleFirePerGroup
         )
         && obligation.group.is_some()));
+}
+
+#[test]
+fn binding_before_output_budget_rejection_remains_observed() {
+    let (closure, _, obligations) = search(0, false, false, false, false, true);
+    assert_eq!(closure, BTreeSet::from([50]));
+    assert!(!obligations.is_empty());
 }
