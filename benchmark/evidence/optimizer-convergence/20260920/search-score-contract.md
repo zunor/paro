@@ -173,3 +173,12 @@ binary. Normal performance was not run. C2 remains blocked by unresolved
 regress contracts; F2 remains separately unadmitted. Search completion is not
 inferred from a successful quality handoff, and no ProofComplete or parity
 claim is made.
+
+Delivery-time preservation recheck: the other isolated tree still verifies all
+57 original mixed files. The main source and main design repositories acquired
+new external commits (`da719135` and `c23575b`) after the earlier successful
+133/17-file preservation audits. The strict snapshot checker correctly refuses
+to certify those changed HEADs against the old snapshot. This task did not write
+to either repository or restore their state; the delivery recheck is not claimed
+as a fresh byte-exact preservation certificate. Both task-owned worktrees remain
+clean, and the prior preservation certificates remain intact.
