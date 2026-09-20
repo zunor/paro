@@ -6,6 +6,13 @@ not ArchitectureReady, CompilerTargetMet or FirstStatementParity certification.
 
 ## Latest C2 continuation
 
+The latest continuation is [v3 gates](c2-v3-gates.md): lossless exact numeric
+identity and unified output binding are implemented. Both immutable screens
+now certify 95 exact + 1 independently bounded query, with 3 mixed-numeric
+ORDER contracts still Uncovered. Selective lineage and RESET updates reduce
+full regress to 166 pass / 18 fail. **C2 remains open**; the older 30-Uncovered
+ledger below is preserved as historical evidence, not current status.
+
 The current authoritative status is [C2 integration gates](c2-integration-gates.md),
 with the [clean source/oracle/corpus manifest](c2-source-manifest.json) and
 [versioned result contract](result-comparison-contract.md). Earlier sections

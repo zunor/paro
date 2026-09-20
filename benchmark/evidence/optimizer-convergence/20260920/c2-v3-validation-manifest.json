@@ -1,0 +1,80 @@
+{
+  "source_commit": "196f91f57edf7259079beb928c02a60f920f4848",
+  "docs_commit": "2ff34aa",
+  "rust_tree_unchanged_since": "0aebb217",
+  "capture_source_manifest": "c2-source-manifest.json",
+  "logs_and_replays": [
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-regress-unit-final.log",
+      "sha256": "a9859f67917bb1e48751f89c63430a6c4ecf49bce28511554ea2b15a5b99dac0"
+    },
+    {
+      "path": "/private/tmp/paro-convergence-20260920/benchmark/evidence/optimizer-convergence/20260920/c2-source-manifest.json",
+      "sha256": "6f540e9aba3933ab634394a99c982993651c5d72265cdf723638fa452af1d009"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-workspace-check.log",
+      "sha256": "edb388eb5db6dd30f07777a23a773c0988856c1d1e1e3607aba3703497c12698"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-strict-clippy.log",
+      "sha256": "06910ed965468c5f7ff0b5efcf71f16ec64c8204bfd28da10f6391c274d4315f"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-workspace-tests.log",
+      "sha256": "72439deff78a7dd3481175b36c676597e240900c641f9c8d4b186d75f50880f6"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-benchmark-final.log",
+      "sha256": "ba95cb400b1120208b8901de5b60770b8d0862807666bc9cea5ccb1ea06bc502"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-full-regress.log",
+      "sha256": "9067063fd00225f809d132b2f1bd0373a2f7cdf5f85cd852829bbc8220c2ab3c"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-final-regress.log",
+      "sha256": "7078936ac53224822f53a03107f1b5b18106c082090621fb3e09d0d17a834bb2"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-memory-2gb.log",
+      "sha256": "32437323cbcde7278dd6cbbddd8a7ed5b7eec87a2c12ddea0e0ab8b6290cf120"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-control-93720834.json",
+      "sha256": "5601a1687f2a0eaf520b459d2675627b1bd2659bd4b55b7b61c06ba56f185bd2"
+    },
+    {
+      "path": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v3-probe-93720834.json",
+      "sha256": "0ecd870a230263e0d337b055b8e6181e0f0a3d5732cc448a59ba2368d27314e8"
+    }
+  ],
+  "preservation": [
+    {
+      "repository": "/Users/linjunhong/workspace/paro",
+      "files_verified": 133,
+      "staged_unstaged_and_content_unchanged": true
+    },
+    {
+      "repository": "/Users/linjunhong/workspace/paro-docs-design",
+      "files_verified": 17,
+      "staged_unstaged_and_content_unchanged": true
+    },
+    {
+      "repository": "/private/tmp/paro-struct-clean",
+      "files_verified": 57,
+      "staged_unstaged_and_content_unchanged": true
+    }
+  ],
+  "performance": "NOT RUN: C2 open",
+  "f2": "not admitted",
+  "regress_final": {
+    "passed": 166,
+    "failed": 18
+  },
+  "corpus_each_arm": {
+    "exact": 95,
+    "independently_bounded": 1,
+    "Uncovered": 3
+  }
+}
