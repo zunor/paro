@@ -44,3 +44,29 @@ The repair changes only transport ownership and observation. It does not alter
 compiler search, grant selection, handoff, result comparison, SQL regress
 expectations or execution semantics. Existing regress failures remain
 unblessed and must be reported separately.
+
+## 2026-09-21 validation
+
+On clean source `7f0f5251`, the real Framed backpressure tests passed (three
+new lease tests plus the existing result tests), the full `paro-server` test
+target passed (51 library tests and 3 binary tests), the context capacity test
+passed, the session compile lifecycle target passed (3 tests), and the
+execution compile-render tests passed (2 tests). Workspace check and strict
+all-target Clippy passed.
+
+The required no-bless SQL regression run used a fresh data directory and
+`ulimit -n 65536`: 177 passed, 8 failed, 0 skipped, and 0 new failures. The
+unresolved files are:
+
+- `cases/query/aggregate/agg_join_subsumption.sql`
+- `cases/query/aggregate/agg_singleton_groups.sql`
+- `cases/query/explain/explain_analyze.sql`
+- `cases/query/explain/explain_basic.sql`
+- `cases/query/join/join_explain_advanced.sql`
+- `cases/query/select/rowset_scan_pushdown.sql`
+- `cases/system/statistics_query.sql`
+- `cases/vector/pgvector_topn_filter_flow.sql`
+
+Their current `.actual` files are byte-identical to the preserved post-review
+baseline under `/private/tmp/paro-t1-review-DcAkmW/`; no expected result was
+updated or blessed.
