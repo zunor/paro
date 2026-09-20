@@ -122,13 +122,13 @@ LIMIT 1. The original rank counterexample still has a **unique** best row 1.
 All artifacts below are in
 `/Users/linjunhong/paro-convergence-archive/20260920/c0/`.
 
-- `c2-search-full-regress-r4.log`: **177 pass / 8 fail**, all 185 cases run,
+- `c2-search-full-regress-final.log`: **177 pass / 8 fail**, all 185 cases run,
   optimizer verification enabled, FD limit 65536, serial server experiments.
   DocumentRank and CoverDensity execute FULLTEXT_SCAN; hidden TopN ordering and
   spill/fallback cases pass. The three old fulltext failures close without
   changing their expected files.
-- `c2-search-regress-final-comparison.json`: the eight remaining actuals are
-  byte-identical to r2. This establishes attribution, **not acceptance**.
+- `c2-search-regress-final2-comparison.json`: the eight remaining actuals are
+  byte-identical to r4 (and r2). This establishes attribution, **not acceptance**.
   Their 25 differing blocks remain unadjudicated EXPLAIN contracts:
   `agg_join_subsumption`, `agg_singleton_groups`, `explain_analyze`,
   `explain_basic`, `join_explain_advanced`, `rowset_scan_pushdown`,
@@ -137,7 +137,7 @@ All artifacts below are in
   `vector_search.result`: the selected adaptive exact source replaces the
   index wrapper; request, distance, filtering, result guarantee, and rows are
   retained. The separate fallback `category` layout is **not** blessed.
-- `c2-search-session-r4.log`: 13 real SQL tests pass, including dense overlay
+- `c2-search-session-r6.log`: 13 real SQL tests pass, including dense overlay
   deletion before truncation, score casts, sparse fallback, fulltext tail,
   compaction and transaction rollback. This does not substitute for corpus.
 - Benchmark Python tests: 187 pass plus 9 independent-oracle tests; regress
