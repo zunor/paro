@@ -3367,6 +3367,47 @@ fn try_native_limit_pushdown(
     .map(Some)
 }
 
+fn freeze_native_topn_output(
+    mut result: NativeShell,
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Result<Option<NativeShell>> {
+    // Memo templates deliberately erase occurrence output demand. ORDER's
+    // projection map in the template is therefore not the target contract:
+    // a hidden sort key may be needed by TopN but must not escape its output.
+    // Restore the exact target layout before structural admission, just as
+    // settlement does for owned rewrites. Keep the child and sort operands
+    // intact; only the output carrier is projected.
+    if let LogicalOperator::TopN(topn) = result.root_operator() {
+        let layouts = result.layouts()?;
+        let input = match &topn.child {
+            NativeChild::Node(index) => &layouts[*index],
+            NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => layout,
+        };
+        let PatternOperand::Expression { expression, .. } = binding else {
+            return Err(paro_error::internal("native TopN has no source occurrence"));
+        };
+        let logical = memo.logical_expr(*expression).ok_or_else(|| {
+            paro_error::internal("native TopN lost its source expression")
+        })?;
+        let metadata = state.metadata.get(&logical.payload).ok_or_else(|| {
+            paro_error::internal("native TopN lost its source output contract")
+        })?;
+        let projection = semantic_plan::projection_for_bindings(
+            input.bindings(),
+            input.types(),
+            &metadata.output_columns,
+            &state.binding_ids,
+        )?;
+        let LogicalOperator::TopN(topn) = &mut result.nodes[result.root].operator else {
+            unreachable!()
+        };
+        topn.projection_map = projection;
+    }
+    Ok(Some(result))
+}
+
 /// Fuse an ORDER + constant LIMIT chain into TopN while retaining every
 /// transparent projection layer.  Only the shell and its exact native child
 /// edges are copied; the rule never constructs an owned descendant.
@@ -3465,11 +3506,11 @@ fn try_native_topn_introduction(
         nodes[new_root].id = root_node.id;
         nodes[new_root].stats = root_node.stats;
     }
-    compact_native_shell(NativeShell {
+    let result = compact_native_shell(NativeShell {
         nodes: nodes.into_boxed_slice(),
         root: new_root,
-    })
-    .map(Some)
+    })?;
+    freeze_native_topn_output(result, binding, memo, state)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

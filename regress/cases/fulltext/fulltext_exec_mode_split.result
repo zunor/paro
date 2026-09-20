@@ -57,6 +57,17 @@ PROJECTION  (rows=1)
 SELECT id
 FROM ft_exec_mode_split
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(
+    to_tsvector('simple', content),
+    plainto_tsquery('simple', 'vector database')
+) DESC
+LIMIT 1;
+id
+1
+
+SELECT id
+FROM ft_exec_mode_split
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
 ORDER BY id;
 id
 1

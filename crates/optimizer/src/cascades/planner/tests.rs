@@ -726,6 +726,76 @@ fn memo_round_trip_derives_layout_after_winner_selection() {
 }
 
 #[test]
+fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
+    // Production Memo -> mandatory/optional -> frozen winner -> extraction.
+    // The semantic ORDER template erases its projection map, but the target
+    // group has only `id`. A direct native rewrite must restore that contract.
+    for offset in [0, 3] {
+        let session = crate::subquery::partition_aggregate_tests::setup_session();
+        let binder = Binder::new(session.clone());
+        let bind_context = binder.bind_context.clone();
+        let constant = |n| Expression::Constant(ConstantExpression::new(
+            Value::Integer(n), LogicalType::Integer,
+        ).into());
+        let leaf = OwnedLogicalPlan::new(
+            &bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                0, (0..128).map(|n| vec![constant(n), constant(128 - n)]).collect(),
+                vec!["id".into(), "hidden_score".into()],
+                vec![LogicalType::Integer, LogicalType::Integer],
+            )),
+        );
+        let mut order = paro_planner::operator::Order::new(leaf, vec![
+            paro_planner::binder::ir::OrderByNode {
+                expression: Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 1), LogicalType::Integer,
+                ).into()),
+                ascending: false, nulls_first: false,
+            },
+        ]);
+        order.projection_map = paro_planner::operator::ProjectionMap::new(vec![0]);
+        let ordered = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Order(order));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Limit(Box::new(
+            paro_planner::operator::Limit::new(ordered, Some(constant(3)), Some(constant(offset))),
+        )));
+        let context = crate::context::OptimizationContext::new(session, bind_context);
+        let input = MemoBuilder::build_with_search(
+            vec![LogicalAlternative {
+                plan,
+                source: AlternativeOrigin::Baseline,
+                column_stats: Arc::new(HashMap::new()),
+            }],
+            &binder, SearchBudget::default(), &context,
+        ).unwrap();
+        let grants = [0, 1, 2].map(|id| ResourceGrantClass {
+            id: ResourceGrantClassId(id),
+            hard_memory_bytes: 16 << 20,
+            spill_policy: SpillPolicy::Allowed,
+            max_parallel_tasks: 1,
+        });
+        let optimized = input.optimize(&grants).unwrap();
+        assert!(optimized.rule_insertions.get(&TOP_N_INTRODUCTION_RULE)
+            .copied().unwrap_or(0) > 0, "{:#?}", optimized.rule_work_profile);
+        let variant = optimized.variants.iter().find(|v| v.class == ResourceGrantClassId(2)).unwrap();
+        let winner = &variant.plan;
+        assert_eq!(winner.get_column_bindings(), vec![ColumnBinding::new(0, 0)]);
+        // Generation and selection are separate contracts. This VALUES
+        // fixture can legitimately prefer sort; the server spill/search
+        // regressions independently require actual TopN/TopK execution.
+        if let LogicalOperator::TopN(topn) = &winner.operator {
+            assert_eq!(topn.limit, 3);
+            assert_eq!(topn.offset, offset as usize);
+            assert_eq!(topn.child.types().len(), 2);
+            assert!(!topn.orders[0].ascending);
+            assert!(!topn.orders[0].nulls_first);
+        } else {
+            assert!(matches!(winner.operator, LogicalOperator::Limit(_)));
+        }
+        assert!(variant.contracts.contains_key(&winner.id));
+    }
+}
+
+#[test]
 fn planner_cross_product_keeps_verified_grant_when_another_is_unresolved() {
     // Exercise the production implementation registry, cost composition,
     // freeze and extraction, not a test-only Leaf implementation.

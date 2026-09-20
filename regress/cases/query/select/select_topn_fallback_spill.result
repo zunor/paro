@@ -69,8 +69,8 @@ ORDER BY score DESC
 LIMIT 3;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=<rows> loops=<loops>)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=<rows> loops=<loops>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=<rows> loops=<loops>) logical_node_id=41
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=<rows> loops=<loops>) logical_node_id=42
   SINK #2 TOP_N_BUILD (actual time=<time-range> rows=<rows> loops=<loops>)
 PIPELINE 1
   SOURCE #3 TOP_N_EMIT (actual time=<time-range> rows=<rows> loops=<loops>)
