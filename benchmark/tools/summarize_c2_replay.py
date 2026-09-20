@@ -38,9 +38,12 @@ def main():
             raise ValueError("unsupported/incomplete numerical certificate")
         certificates[cert["manifest"]["result"]["sha256"]] = {
             "path": str(path), "sha256": digest(path), "contract": cert["contract"]}
-    ledger = {"contract": "typed-result-v3", "performance_admitted": False, "replays": []}
+    ledger = {"contract": None, "performance_admitted": False, "replays": []}
     for path in args.replay:
         report = json.loads(path.read_text())
+        if ledger["contract"] not in {None, report["contract"]}:
+            raise ValueError("cannot combine different result contracts")
+        ledger["contract"] = report["contract"]
         counts = Counter()
         for result in report["queries"].values():
             failures = [(name, value["status"]) for checks in result["checks"]

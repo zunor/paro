@@ -18,7 +18,7 @@ from typing import Any, Sequence
 from exact_result_value import ResultContractError, evidence_bytes, validate_exact
 
 
-RESULT_CONTRACT_VERSION = "typed-result-v3"
+RESULT_CONTRACT_VERSION = "typed-result-v4"
 
 
 @dataclass(frozen=True)

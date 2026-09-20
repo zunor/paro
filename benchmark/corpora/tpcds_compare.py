@@ -899,8 +899,9 @@ def main() -> int:
                     expected = bound_result.canonical_rows(duck_rows, duck_schema, "duckdb")
                     actual = bound_result.canonical_rows(paro_rows, actual_schema, "paro")
                     assert_same_multiset(actual, expected)
-                    order_keys = bound_result.bind_order()
-                    expected_order = order_values(expected, order_keys)
+                    order_keys = bound_result.bind_order(actual_schema, "paro")
+                    duck_order_keys = bound_result.bind_order(duck_schema, "duckdb")
+                    expected_order = order_values(expected, duck_order_keys)
                     actual_order = order_values(actual, order_keys)
                     if actual_order != expected_order:
                         raise AssertionError("ordered key sequence differs across engines")
@@ -926,7 +927,7 @@ def main() -> int:
                 normalized = bound_result.canonical_rows(rows, sample_schema, engine)
                 assert_same_multiset(normalized, expected)
                 digest = multiset_digest(normalized)
-                actual_keys = order_values(normalized, order_keys)
+                actual_keys = order_values(normalized, order_keys if engine == "paro" else duck_order_keys)
                 if actual_keys != expected_order:
                     raise AssertionError(
                         f"{engine} sample ordered-key sequence differs from the oracle"

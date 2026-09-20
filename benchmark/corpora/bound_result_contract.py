@@ -314,8 +314,17 @@ class BoundResult:
             return tuple(map(self.expression_key, expr))
         return expr
 
-    def bind_order(self):
-        return [(self._bind_scalar(o["expression"], ordinal=True),
+    def bind_order(self, schema=None, engine=None):
+        def bind(expr):
+            value = self._bind_scalar(expr, ordinal=True)
+            if schema is not None:
+                from order_numeric_contract import bind_numeric_order
+                try:
+                    value, _ = bind_numeric_order(value, schema, engine)
+                except ValueError as error:
+                    raise Uncovered(str(error)) from error
+            return value
+        return [(bind(o["expression"]),
                  o["type"] == "DESCENDING",
                  ("first" if o["type"] == "DESCENDING" else "last")
                  if o["null_order"] == "ORDER_DEFAULT" else
@@ -376,6 +385,14 @@ class BoundResult:
 
 def evaluate(expr, row):
     op = expr[0]
+    if op == "to_double":
+        from order_numeric_contract import to_double
+        try:
+            return to_double(evaluate(expr[1], row), expr[2], expr[3])
+        except ValueError as error:
+            if isinstance(error, ResultContractError):
+                raise
+            raise Uncovered(str(error)) from error
     if op == "column":
         return row[expr[1]]
     if op == "literal":
@@ -398,7 +415,10 @@ def evaluate(expr, row):
         if type(a) is not float or type(b) is not float:
             raise Uncovered("mixed arithmetic ORDER requires an explicit coercion contract")
     value = {"+": lambda: a+b, "-": lambda: a-b, "*": lambda: a*b}[op]()
-    return ExactNumber(value) if exact else value
+    if exact:
+        return ExactNumber(value)
+    from order_numeric_contract import finite
+    return finite(value)
 
 
 def order_values(rows, orders):
@@ -449,11 +469,13 @@ def result_verdicts(bound, actual_rows, actual_schema, expected_rows, expected_s
     if len(normalized) == 2:
         check("bag", lambda: assert_same_multiset(normalized["paro"], normalized["duckdb"]))
         def order():
-            keys = bound.bind_order()
-            a, b = [order_values(normalized[engine], keys) for engine in ("paro", "duckdb")]
+            orders = {engine: bound.bind_order(schema, engine) for engine, schema in
+                      (("paro", actual_schema), ("duckdb", expected_schema))}
+            a, b = [order_values(normalized[engine], orders[engine]) for engine in ("paro", "duckdb")]
             if a != b:
                 raise ResultContractError("ordered peer-key sequences differ semantically")
-            return {"keys": len(keys), "limit_contract": "exact selected bag plus ordered peer keys; no approximate boundary waiver"}
+            return {"keys": len(orders["paro"]), "numeric_contract": "typed-order-binary64-v1",
+                    "limit_contract": "exact selected bag plus ordered peer keys; no approximate boundary waiver"}
         check("order", order)
     else:
         checks.update({name:{"status":"Uncovered","error":"invalid wire values"} for name in ("bag","order")})

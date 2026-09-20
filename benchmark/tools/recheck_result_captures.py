@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corpora"))
 import duckdb
 import _duckdb
 from bound_result_contract import BoundResult, Uncovered, result_verdicts, catalog_from_rows, CATALOG_SQL
-from tpcds_result_contract import ColumnContract
+from tpcds_result_contract import ColumnContract, RESULT_CONTRACT_VERSION
 
 
 def decode(value):
@@ -62,9 +62,9 @@ def main():
     with duckdb.connect(str(args.database), read_only=True) as parser:
         metadata = parser.execute(CATALOG_SQL).fetchall()
         catalog = catalog_from_rows(metadata)
-        report = {"contract": "typed-result-v3", "source_manifest_sha256": digest(args.source_manifest),
+        report = {"contract": RESULT_CONTRACT_VERSION, "source_manifest_sha256": digest(args.source_manifest),
                   "comparator_files": {p.name: digest(p) for p in [Path(__file__), *[Path(__file__).parents[1]/"corpora"/name
-                    for name in ("bound_result_contract.py", "exact_result_value.py", "tpcds_result_contract.py")]]},
+                    for name in ("bound_result_contract.py", "exact_result_value.py", "order_numeric_contract.py", "tpcds_result_contract.py")]]},
                   "catalog": metadata, "catalog_sha256": hashlib.sha256(json.dumps(metadata).encode()).hexdigest(), "queries": {}}
         for path in sorted(args.captures.glob("[0-9][0-9].json")):
             capture = json.loads(path.read_text())
