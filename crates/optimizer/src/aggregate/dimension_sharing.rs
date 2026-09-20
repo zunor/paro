@@ -76,14 +76,6 @@ pub fn optimize_plan(
     Ok((apply(plan, witness, bind_context)?, true))
 }
 
-/// Exact semantic predicate used by the native Memo matcher before it spends
-/// the bounded transformation-output frontier. The rewrite calls the same
-/// recognizer again at apply time, keeping matching advisory and the
-/// equivalence proof self-validating.
-pub(crate) fn recognizes_plan(plan: &OwnedLogicalPlan) -> bool {
-    recognize(plan).is_some()
-}
-
 fn recognize(plan: &OwnedLogicalPlan) -> Option<SharedDimensionWitness> {
     let LogicalOperator::SetOperation(setop) = &plan.operator else {
         return None;

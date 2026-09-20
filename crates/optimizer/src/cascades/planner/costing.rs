@@ -562,19 +562,6 @@ pub(super) fn runtime_filter_probe_sources(
     )
 }
 
-#[cfg(test)]
-pub(super) fn runtime_filter_build_left_probe_sources(
-    join: &paro_planner::operator::ComparisonJoin,
-) -> Option<Box<[PlannerRuntimeFilterSource]>> {
-    runtime_filter_input_source_facts(
-        RuntimeFilterInput::Owned(&join.right),
-        join.conditions
-            .iter()
-            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-            .map(|condition| &condition.right),
-    )
-}
-
 fn runtime_filter_probe_lineages(
     plan: &OwnedLogicalPlan,
     output_index: usize,
@@ -2093,11 +2080,10 @@ pub(super) fn planner_native_operator_cost<Child>(
     stats: &NodeStats,
     child_count: usize,
     output_rows_hard_upper: Option<u64>,
-    child_rows_hard_upper: &[Option<u64>],
-    child_expected_rows: &[f64],
-    child_row_widths: &[u64],
+    child_sizes: (&[Option<u64>], &[f64], &[u64]),
     output_row_width: u64,
 ) -> Result<SearchCost> {
+    let (child_rows_hard_upper, child_expected_rows, child_row_widths) = child_sizes;
     if child_count != child_rows_hard_upper.len()
         || child_count != child_expected_rows.len()
         || child_count != child_row_widths.len()

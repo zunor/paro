@@ -230,19 +230,21 @@ fn native_detail_topn_shared_admission_keeps_missing_facts_and_guard_reasons() {
             let source_reads = Cell::new(0);
             let mut reasons = Some(RejectionReasons::default());
             let result = prove_row_preserving_inputs(
-                if case == 0 {
-                    0
-                } else {
-                    topn.limit + topn.offset
-                },
-                &topn.orders,
-                &topn.projection_map,
-                output,
-                case == 1,
-                if case == 2 {
-                    None
-                } else {
-                    shell.nodes[input].stats.estimated_cardinality
+                crate::aggregate::late_payload::RowPreservingInputs {
+                    total_rows: if case == 0 {
+                        0
+                    } else {
+                        topn.limit + topn.offset
+                    },
+                    orders: &topn.orders,
+                    projection_map: &topn.projection_map,
+                    output,
+                    child_is_fetch: case == 1,
+                    child_cardinality: if case == 2 {
+                        None
+                    } else {
+                        shell.nodes[input].stats.estimated_cardinality
+                    },
                 },
                 |table| {
                     assert_eq!(table, 7);

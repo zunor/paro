@@ -92,17 +92,11 @@ impl QualityProductionRequest {
                             continue;
                         }
                         let node = *by_candidate.get(&node_reference.candidate)?;
-                        choices.insert((
-                            memo.canonical_group(node.reference.group),
-                            node.logical,
-                        ));
+                        choices.insert((memo.canonical_group(node.reference.group), node.logical));
                         pending.extend(node.children.iter().copied());
                     }
                     uncovered += 1;
-                    obligations.insert(
-                        (fact, memo.canonical_group(arm.reference.group)),
-                        choices,
-                    );
+                    obligations.insert((fact, memo.canonical_group(arm.reference.group)), choices);
                 }
             } else if fact == BundleFact::PredicateDomain
                 && !evidence.pending_domain_transfers.is_empty()
@@ -125,9 +119,7 @@ impl QualityProductionRequest {
                     (fact, memo.canonical_group(reference.group)),
                     by_candidate
                         .values()
-                        .map(|node| {
-                            (memo.canonical_group(node.reference.group), node.logical)
-                        })
+                        .map(|node| (memo.canonical_group(node.reference.group), node.logical))
                         .collect(),
                 );
             }
@@ -303,11 +295,7 @@ impl StableAgenda {
 }
 
 impl CascadesEngine {
-    fn enqueue_quality_forced_binding(
-        &mut self,
-        goal: OptimizationGoal,
-        binding: PatternBinding,
-    ) {
+    fn enqueue_quality_forced_binding(&mut self, goal: OptimizationGoal, binding: PatternBinding) {
         let task = TransformationTaskId {
             group: self.memo.canonical_group(binding.root_group()),
             expression: binding.root_expression(),
@@ -436,14 +424,13 @@ impl CascadesEngine {
     pub(super) fn record_quality_production_request_preflight(
         &mut self,
         provider: &dyn QualityEvidenceProvider,
-        goal: OptimizationGoal,
-        reference: ChildWinnerRef,
-        winner: &Winner,
+        selected: (OptimizationGoal, ChildWinnerRef, &Winner),
         nodes: &[QualityCandidateNode],
         reads: ReadSetId,
         evidence: &NativeQualityEvidence,
         missing: &[BundleFact],
     ) -> Result<()> {
+        let (goal, reference, winner) = selected;
         let _partition =
             crate::work_partition::enter(crate::work_partition::Bucket::QualityProduction);
         let Some(mut request) = QualityProductionRequest::from_preflight(
@@ -474,13 +461,8 @@ impl CascadesEngine {
             self.quality_preflight_domain_binding_provider_call_count = self
                 .quality_preflight_domain_binding_provider_call_count
                 .saturating_add(1);
-            request.domain_bindings = provider.preflight_domain_bindings(
-                &self.memo,
-                reference,
-                winner,
-                nodes,
-                goal,
-            )?;
+            request.domain_bindings =
+                provider.preflight_domain_bindings(&self.memo, reference, winner, nodes, goal)?;
         }
         self.install_quality_production_request(goal, request)
     }

@@ -206,8 +206,7 @@ fn corresponding_cost_facts(plan: &OwnedLogicalPlan, id_offset: usize) -> Planne
         .unwrap();
     let native = planner_native_cost_facts(
         &shell,
-        &rows,
-        &widths,
+        (&rows, &widths),
         planner_row_width_from_layout(&plan.output_layout(), scan_cost),
         scan_cost,
         &inputs,

@@ -485,8 +485,7 @@ fn native_domain_fixed_point_does_not_reinstall_an_exact_landing_filter() {
     let predicate = equal(10, 0);
 
     let first = push_domain(
-        &mut nodes,
-        &mut layouts,
+        (&mut nodes, &mut layouts),
         input.clone(),
         vec![predicate.clone()],
         &state,
@@ -499,8 +498,7 @@ fn native_domain_fixed_point_does_not_reinstall_an_exact_landing_filter() {
     let node_count = nodes.len();
 
     let second = push_domain(
-        &mut nodes,
-        &mut layouts,
+        (&mut nodes, &mut layouts),
         input,
         vec![predicate],
         &state,

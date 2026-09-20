@@ -20,7 +20,7 @@ use super::ids::{
     PhysicalExprId, RuleId,
 };
 use super::memo::{Memo, OptimizationGoal};
-use super::rules::{PatternBinding, PatternOperand, PatternRead, ReadScope};
+use super::rules::{PatternBinding, PatternOperand, PatternRead};
 
 macro_rules! task_id_type {
     ($name:ident) => {
@@ -440,10 +440,10 @@ impl BoundProof {
             return Ok(false);
         }
 
-        Ok(registry
+        registry
             .read_set(self.context.reads)
             .ok_or_else(|| paro_error::internal("bound proof references unknown read set"))?
-            .is_current(memo)?)
+            .is_current(memo)
     }
 }
 
@@ -1257,8 +1257,13 @@ impl TaskRegistry {
             return Err(paro_error::internal("task is not runnable for completion"));
         }
         if let TaskOutcome::Progress { cursor } | TaskOutcome::NoCandidate { cursor } = &outcome {
-            if self.task(task).is_none_or(|record| record.cursor != *cursor) {
-                return Err(paro_error::internal("task completion references a foreign cursor"));
+            if self
+                .task(task)
+                .is_none_or(|record| record.cursor != *cursor)
+            {
+                return Err(paro_error::internal(
+                    "task completion references a foreign cursor",
+                ));
             }
         }
         if self.segments.contains_key(&task) {
@@ -1720,15 +1725,14 @@ impl TaskRegistry {
     }
 
     pub fn tasks_with_current_reads(&self, memo: &Memo) -> Result<usize> {
-        self.tasks
+        Ok(self
+            .tasks
             .iter()
             .filter(|task| {
                 self.read_set(task.read_set)
                     .is_some_and(|reads| reads.is_current(memo).unwrap_or(false))
             })
-            .count()
-            .try_into()
-            .map_err(|_| paro_error::internal("task count overflow"))
+            .count())
     }
 }
 
@@ -1782,25 +1786,34 @@ fn canonicalize_read_set(memo: &Memo, reads: ReadSet) -> ReadSet {
 
 #[cfg(test)]
 mod tests {
+    use crate::cascades::rules::ReadScope;
     use super::*;
 
     #[test]
     fn failed_task_keeps_its_cause_instead_of_inventing_resource_exhaustion() {
         let mut registry = TaskRegistry::default();
         let intent = TaskIntent::Discover {
-            expression: LogicalExprId(0), rule: RuleId(1),
+            expression: LogicalExprId(0),
+            rule: RuleId(1),
         };
-        let TaskRequest::Leader(task) = registry.request(intent.clone(), ReadSet::empty()).unwrap() else {
+        let TaskRequest::Leader(task) = registry.request(intent.clone(), ReadSet::empty()).unwrap()
+        else {
             panic!("new task must lead")
         };
         registry.start(task).unwrap();
-        registry.fail(task, "native contract failure: missing column").unwrap();
+        registry
+            .fail(task, "native contract failure: missing column")
+            .unwrap();
         assert_eq!(registry.state(task), Some(TaskState::Failed));
-        assert_eq!(registry.request(intent, ReadSet::empty()).unwrap(), TaskRequest::Reused {
-            task, outcome: Some(TaskOutcome::Failed {
-                detail: "native contract failure: missing column".into(),
-            }),
-        });
+        assert_eq!(
+            registry.request(intent, ReadSet::empty()).unwrap(),
+            TaskRequest::Reused {
+                task,
+                outcome: Some(TaskOutcome::Failed {
+                    detail: "native contract failure: missing column".into(),
+                }),
+            }
+        );
     }
     use crate::cascades::column::GroupSchema;
     use crate::cascades::ids::{LogicalPayloadId, PropertySetId};
@@ -2222,7 +2235,12 @@ mod tests {
         registry.start(physical).unwrap();
         registry.start(logical).unwrap();
         registry
-            .complete(physical, TaskOutcome::NoCandidate { cursor: registry.task(physical).unwrap().cursor })
+            .complete(
+                physical,
+                TaskOutcome::NoCandidate {
+                    cursor: registry.task(physical).unwrap().cursor,
+                },
+            )
             .unwrap();
         registry
             .complete(
@@ -2424,7 +2442,14 @@ mod tests {
             _ => unreachable!(),
         };
         registry.start(child).unwrap();
-        registry.complete(child, TaskOutcome::NoCandidate { cursor: registry.task(child).unwrap().cursor }).unwrap();
+        registry
+            .complete(
+                child,
+                TaskOutcome::NoCandidate {
+                    cursor: registry.task(child).unwrap().cursor,
+                },
+            )
+            .unwrap();
         registry.start(parent).unwrap();
         assert!(registry.await_dependencies(parent, [child]).unwrap());
         assert_eq!(registry.state(parent), Some(TaskState::Runnable));
@@ -2480,7 +2505,14 @@ mod tests {
         assert_eq!(registry.reserved_units(), 0);
         assert_eq!(registry.committed_units(), 4);
 
-        let wakeups = registry.complete(child, TaskOutcome::NoCandidate { cursor: registry.task(child).unwrap().cursor }).unwrap();
+        let wakeups = registry
+            .complete(
+                child,
+                TaskOutcome::NoCandidate {
+                    cursor: registry.task(child).unwrap().cursor,
+                },
+            )
+            .unwrap();
         assert!(wakeups.iter().any(|wakeup| wakeup.task == parent));
         assert_eq!(registry.state(parent), Some(TaskState::Runnable));
         registry.start(parent).unwrap();

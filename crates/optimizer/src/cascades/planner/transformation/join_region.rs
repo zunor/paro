@@ -353,7 +353,7 @@ pub(super) fn try_native_enumeration_with_cache_key(
         let mut nodes = shell.nodes.to_vec();
         let mut used_filters = HashSet::new();
         let root_child =
-            rebuild_native_join(&plan, &input.atoms, &mut used_filters, &mut nodes, state)?;
+            rebuild_native_join(plan, &input.atoms, &mut used_filters, &mut nodes, state)?;
         let mut root = match root_child {
             NativeChild::Node(index) => index,
             NativeChild::MemoGroup { .. } | NativeChild::Group { .. } => {

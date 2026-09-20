@@ -71,11 +71,11 @@ use super::region::{
 #[cfg(test)]
 use super::rules::WorkSourceId;
 use super::rules::{
-    CostComposition, DomainContinuation, ImplementationContext, ImplementationRegistry, PatternBinding,
-    PatternBindingSet, PatternEnumerationCompletion, PatternOperand, PatternRead, ReadScope,
+    CostComposition, DomainContinuation, ImplementationContext, ImplementationRegistry,
+    PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PatternOperand, PatternRead,
     PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof, SourceWork,
-    SourceWorkData, TaskSupplyContract, TransformContext, TransformationRule,
-    TransformationPreflight,
+    SourceWorkData, TaskSupplyContract, TransformContext, TransformationPreflight,
+    TransformationRule,
 };
 use super::tasks::{
     BoundContext, BoundProofId, BoundProofKind, Cursor, ReadSet, StopReason, TaskId, TaskIntent,
@@ -1025,6 +1025,9 @@ struct PhysicalTaskState {
     complete: bool,
 }
 
+type PhysicalConsumer = (GroupId, OptimizationGoal, PhysicalExprId, Fingerprint);
+type CheckpointCandidateEvidence = (Box<[FrozenChoice]>, Box<[PatternRead]>, bool);
+
 /// The observable response of one exact physical subproblem.  ReadSet
 /// revisions describe why a task may need to run; this compact snapshot
 /// describes whether running it actually produced something a parent can
@@ -1194,10 +1197,7 @@ pub struct CascadesEngine {
     /// only the parent goals whose recipes consumed that child, then walks the
     /// already registered ancestor chain. This index is query-local and is
     /// rebuilt lazily as new native/settled recipes are admitted.
-    physical_parents: BTreeMap<
-        (GroupId, OptimizationGoal),
-        BTreeSet<(GroupId, OptimizationGoal, PhysicalExprId, Fingerprint)>,
-    >,
+    physical_parents: BTreeMap<(GroupId, OptimizationGoal), BTreeSet<PhysicalConsumer>>,
     /// Child groups observed by each physical subproblem.  Recipes are
     /// published incrementally, so maintaining this small deduplicated index
     /// at publication avoids rescanning the global recipe table every time a
@@ -1905,12 +1905,7 @@ impl CascadesEngine {
                 self.physical_parents
                     .entry((child, child_goal))
                     .or_default()
-                    .insert((
-                    self.memo.canonical_group(parent),
-                    goal,
-                    physical,
-                    recipe,
-                ));
+                    .insert((self.memo.canonical_group(parent), goal, physical, recipe));
             }
         }
         let previous = std::mem::take(&mut self.physical_dirty_recipes);
@@ -2642,10 +2637,11 @@ impl CascadesEngine {
         self.search_milestones = SearchMilestones::default();
         self.milestone_root = (self.collect_rule_work_profile || self.quality_handoff_enabled)
             .then_some(self.memo.canonical_group(root));
-        self.quality_required_goals = self
-            .quality_handoff_enabled
-            .then(|| checkpoint_goals.iter().copied().collect())
-            .unwrap_or_default();
+        self.quality_required_goals = if self.quality_handoff_enabled {
+            checkpoint_goals.iter().copied().collect()
+        } else {
+            Default::default()
+        };
         self.quality_ready_winners.clear();
         self.quality_certificates.clear();
         self.quality_handoff_reached = false;
@@ -2916,7 +2912,7 @@ impl CascadesEngine {
         root: GroupId,
         goal: OptimizationGoal,
         winner: &Winner,
-    ) -> Result<(Box<[FrozenChoice]>, Box<[PatternRead]>, bool)> {
+    ) -> Result<CheckpointCandidateEvidence> {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         let reference = ChildWinnerRef {
             group: self.memo.canonical_group(root),
@@ -3191,20 +3187,19 @@ impl CascadesEngine {
 
     fn note_parent_publication(
         &mut self,
-        group: GroupId,
-        goal: OptimizationGoal,
+        subproblem: (GroupId, OptimizationGoal),
         physical: PhysicalExprId,
-        recipe: Fingerprint,
+        recipe: &CostRecipe,
         candidate: CandidateId,
         children: &[CandidateId],
-        child_goals: &[(GroupId, OptimizationGoal)],
         cost: SearchCost,
     ) -> Result<()> {
+        let (group, goal) = subproblem;
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
         if !self.collect_rule_work_profile {
             return Ok(());
         }
-        let children = child_combination_refs(children, child_goals)?;
+        let children = child_combination_refs(children, &recipe.child_goals)?;
         self.note_candidate_lifecycle(CandidateLifecycleEvent {
             stage: CandidateLifecycleStage::ParentPublished,
             elapsed_us: self.lifecycle_elapsed_us(),
@@ -3219,7 +3214,7 @@ impl CascadesEngine {
                 .physical_expr(physical)
                 .map(|expression| expression.key.logical),
             physical: Some(physical),
-            recipe: Some(recipe),
+            recipe: Some(recipe.physical_fingerprint),
             rule: None,
             children,
             facts: Box::new([]),
@@ -3684,9 +3679,7 @@ impl CascadesEngine {
                 if let Some(preflight) = preflight {
                     self.record_quality_production_request_preflight(
                         provider.as_ref(),
-                        goal,
-                        reference,
-                        &winner,
+                        (goal, reference, &winner),
                         &preflight.nodes,
                         read_id,
                         &evidence_value,
@@ -4861,12 +4854,7 @@ impl CascadesEngine {
             }
             let changed_responses = std::mem::take(&mut self.physical_response_notifications);
             for (changed_group, changed_goal) in changed_responses {
-                self.enqueue_physical_consumers(
-                    changed_group,
-                    changed_goal,
-                    true,
-                    interleave,
-                );
+                self.enqueue_physical_consumers(changed_group, changed_goal, true, interleave);
             }
             if yielded {
                 // Resume the exact task. Parent propagation above is driven by
@@ -5891,10 +5879,7 @@ impl CascadesEngine {
                             .chain(fact_reads.iter().map(|read| read.group)),
                     )?;
                     if let Some(goal) = quality_goal {
-                        self.enqueue_quality_domain_continuations(
-                            goal,
-                            domain_continuations,
-                        )?;
+                        self.enqueue_quality_domain_continuations(goal, domain_continuations)?;
                     }
                     release_transformation_output_reservations(
                         &mut self.memo,
@@ -5985,14 +5970,12 @@ impl CascadesEngine {
                     for group in inserted_groups.iter().copied() {
                         let group = self.memo.canonical_group(group);
                         if let Some(goals) = self.physical_goals.get(&group) {
-                            changed_subproblems.extend(
-                                goals.iter().copied().map(|goal| (group, goal)),
-                            );
+                            changed_subproblems
+                                .extend(goals.iter().copied().map(|goal| (group, goal)));
                         }
                         if group == interleave.root {
-                            changed_subproblems.extend(
-                                interleave.goals.iter().copied().map(|goal| (group, goal)),
-                            );
+                            changed_subproblems
+                                .extend(interleave.goals.iter().copied().map(|goal| (group, goal)));
                         }
                     }
                     self.enqueue_physical_work(changed_subproblems, interleave);
@@ -6275,8 +6258,18 @@ impl CascadesEngine {
                 "child_combination_cost_synthesis_count",
                 self.child_combination_cost_synthesis_count,
             ),
-            ("diagnostic_cost_kernel_ns", self.diagnostic_cost_phase_times.as_ref().map_or(0, |t| t.0[0].load(std::sync::atomic::Ordering::Relaxed))),
-            ("diagnostic_candidate_admission_ns", self.diagnostic_cost_phase_times.as_ref().map_or(0, |t| t.0[1].load(std::sync::atomic::Ordering::Relaxed))),
+            (
+                "diagnostic_cost_kernel_ns",
+                self.diagnostic_cost_phase_times
+                    .as_ref()
+                    .map_or(0, |t| t.0[0].load(std::sync::atomic::Ordering::Relaxed)),
+            ),
+            (
+                "diagnostic_candidate_admission_ns",
+                self.diagnostic_cost_phase_times
+                    .as_ref()
+                    .map_or(0, |t| t.0[1].load(std::sync::atomic::Ordering::Relaxed)),
+            ),
             (
                 "child_combination_frontier_recheck_count",
                 self.child_combination_frontier_recheck_count,
@@ -7697,7 +7690,9 @@ impl CascadesEngine {
         let current_owner = PatternRead::from_group(&self.memo, group)?;
         if let Some(read) = previous_reads
             .iter()
-            .find(|read| read.physical_goal.is_none() && self.memo.canonical_group(read.group) == group)
+            .find(|read| {
+                read.physical_goal.is_none() && self.memo.canonical_group(read.group) == group
+            })
             .copied()
         {
             if read.is_current(&self.memo)? {
@@ -8138,8 +8133,7 @@ impl CascadesEngine {
             ));
         }
         let result = self.optimize_group_inner(
-            group,
-            goal,
+            (group, goal),
             task,
             recipe_start,
             recipe_cursor,
@@ -9007,15 +9001,14 @@ impl CascadesEngine {
 
     fn admit_cached_child_combination(
         &mut self,
-        group: GroupId,
-        goal: OptimizationGoal,
-        physical: PhysicalExprId,
+        subproblem: (GroupId, OptimizationGoal, PhysicalExprId),
         recipe: &CostRecipe,
         enforced: &super::enforcer::EnforcedPlan,
         state: &mut ChildCombinationState,
         children: &[CandidateId],
         count_recheck: bool,
     ) -> Result<(bool, bool, Option<CandidateId>)> {
+        let (group, goal, physical) = subproblem;
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Admission);
         let _admission_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 1);
         let Some(cached) = state.priced.get_mut(children) else {
@@ -9107,14 +9100,14 @@ impl CascadesEngine {
 
     fn optimize_group_inner(
         &mut self,
-        group: GroupId,
-        goal: OptimizationGoal,
+        subproblem: (GroupId, OptimizationGoal),
         task: TaskId,
         recipe_start: u64,
         recipe_cursor: u64,
         enumerate_local_implementations: bool,
         dirty_recipes: Option<&BTreeSet<(PhysicalExprId, Fingerprint)>>,
     ) -> Result<Option<u64>> {
+        let (group, goal) = subproblem;
         if enumerate_local_implementations {
             self.enumerate_implementations(group, goal)?;
         }
@@ -9158,7 +9151,7 @@ impl CascadesEngine {
         for (sequence, physical, recipe_fingerprint, recipe) in recipes {
             let recipe_is_dirty =
                 dirty_recipes.is_some_and(|dirty| dirty.contains(&(physical, recipe_fingerprint)));
-            if let Some(_) = dirty_recipes {
+            if dirty_recipes.is_some() {
                 if sequence < recipe_cursor && !recipe_is_dirty {
                     continue;
                 }
@@ -9439,15 +9432,13 @@ impl CascadesEngine {
                     yielded_response_attempted = true;
                     let (frontier_changed, selected_changed, published_candidate) = self
                         .admit_cached_child_combination(
-                            group,
-                            goal,
-                            physical,
+                            (group, goal, physical),
                             &recipe,
                             &enforced,
                             &mut combination_state,
                             &children,
                             true,
-                    )?;
+                        )?;
                     if let Some(candidate) = published_candidate {
                         let cost = combination_state
                             .priced
@@ -9459,13 +9450,11 @@ impl CascadesEngine {
                                 )
                             })?;
                         self.note_parent_publication(
-                            group,
-                            goal,
+                            (group, goal),
                             physical,
-                            recipe.physical_fingerprint,
+                            &recipe,
                             candidate,
                             &children,
-                            &recipe.child_goals,
                             cost,
                         )?;
                     }
@@ -9517,15 +9506,13 @@ impl CascadesEngine {
                 if combination_state.priced.contains_key(&child_ids) {
                     let (frontier_changed, selected_changed, published_candidate) = self
                         .admit_cached_child_combination(
-                            group,
-                            goal,
-                            physical,
+                            (group, goal, physical),
                             &recipe,
                             &enforced,
                             &mut combination_state,
                             &child_ids,
                             false,
-                    )?;
+                        )?;
                     if let Some(candidate) = published_candidate {
                         let cost = combination_state
                             .priced
@@ -9537,13 +9524,11 @@ impl CascadesEngine {
                                 )
                             })?;
                         self.note_parent_publication(
-                            group,
-                            goal,
+                            (group, goal),
                             physical,
-                            recipe.physical_fingerprint,
+                            &recipe,
                             candidate,
                             &child_ids,
-                            &recipe.child_goals,
                             cost,
                         )?;
                     }
@@ -9721,15 +9706,13 @@ impl CascadesEngine {
                 );
                 let (frontier_changed, selected_changed, published_candidate) = self
                     .admit_cached_child_combination(
-                        group,
-                        goal,
-                        physical,
+                        (group, goal, physical),
                         &recipe,
                         &enforced,
                         &mut combination_state,
                         &child_ids,
                         false,
-                )?;
+                    )?;
                 if let Some(candidate) = published_candidate {
                     let cost = combination_state
                         .priced
@@ -9741,13 +9724,11 @@ impl CascadesEngine {
                             )
                         })?;
                     self.note_parent_publication(
-                        group,
-                        goal,
+                        (group, goal),
                         physical,
-                        recipe.physical_fingerprint,
+                        &recipe,
                         candidate,
                         &child_ids,
-                        &recipe.child_goals,
                         cost,
                     )?;
                 }
@@ -9789,15 +9770,13 @@ impl CascadesEngine {
                 for children in rechecks {
                     let (frontier_changed, selected_changed, published_candidate) = self
                         .admit_cached_child_combination(
-                            group,
-                            goal,
-                            physical,
+                            (group, goal, physical),
                             &recipe,
                             &enforced,
                             &mut combination_state,
                             &children,
                             true,
-                    )?;
+                        )?;
                     if let Some(candidate) = published_candidate {
                         let cost = combination_state
                             .priced
@@ -9809,13 +9788,11 @@ impl CascadesEngine {
                                 )
                             })?;
                         self.note_parent_publication(
-                            group,
-                            goal,
+                            (group, goal),
                             physical,
-                            recipe.physical_fingerprint,
+                            &recipe,
                             candidate,
                             &children,
-                            &recipe.child_goals,
                             cost,
                         )?;
                     }

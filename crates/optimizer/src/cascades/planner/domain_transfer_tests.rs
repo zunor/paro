@@ -270,19 +270,19 @@ fn projection_channel_constants_and_cross_ordinal_renames_preserve_3vl_bags() {
             assert!(transfer.remaining.is_empty());
             assert_eq!(transfer.child_predicates.len(), 1);
             for row in &rows {
-                let original = truth(eval(&predicate, &project(&projection, row)));
+                let original = truth(eval(&predicate, &project(projection, row)));
                 if original == Some(true) {
                     assert!(accepts(&transfer.child_predicates[0], row));
                 }
             }
             let expected = bag(rows
                 .iter()
-                .map(|row| project(&projection, row))
+                .map(|row| project(projection, row))
                 .filter(|row| accepts(&[predicate.clone()], row)));
             let actual = bag(rows
                 .iter()
                 .filter(|row| accepts(&transfer.child_predicates[0], row))
-                .map(|row| project(&projection, row))
+                .map(|row| project(projection, row))
                 .filter(|row| accepts(&transfer.remaining, row)));
             assert_eq!(
                 actual, expected,

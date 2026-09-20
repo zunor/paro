@@ -8,39 +8,41 @@ use smallvec::SmallVec;
 use std::collections::HashSet;
 
 use paro_common::runtime_value::Value;
-use paro_planner::operator::{Aggregate, Filter, LogicalOutputLayout, Projection, SetOpType, SetOperation};
+use paro_planner::operator::{
+    Aggregate, Filter, LogicalOutputLayout, Projection, SetOpType, SetOperation,
+};
 
 pub(super) mod cte;
 mod join_region;
 mod matching;
+mod native_aggregate_topn_payload;
+mod native_deferral_region;
+#[cfg(test)]
+mod native_deferral_tests;
 mod native_domain;
 mod native_join_elimination;
-mod native_late_payload;
-mod native_selective_payload;
-mod native_topn_payload;
-mod native_aggregate_topn_payload;
-mod native_post_reduction;
-mod native_scalar_aggregate_window;
 mod native_join_preaggregation;
 mod native_join_subsumption;
-mod native_deferral_region;
-mod native_non_null_inputs;
+#[cfg(test)]
+mod native_key_domain_tests;
+mod native_late_payload;
 #[cfg(test)]
 mod native_limit_tests;
 #[cfg(test)]
 mod native_mark_tests;
 #[cfg(test)]
-mod native_key_domain_tests;
-#[cfg(test)]
 mod native_materialization_tests;
-#[cfg(test)]
-mod native_deferral_tests;
+mod native_non_null_inputs;
+mod native_post_reduction;
+mod native_scalar_aggregate_window;
+mod native_selective_payload;
+mod native_topn_payload;
 pub(super) mod settlement;
 mod staging;
 
 use staging::{
-    NativeChild, NativeNode, NativeShell, ResidentNodeContract, StagingInput,
-    StagingRegionRequirements, StagingRequest, StagingTarget, stage_transformed_expression,
+    stage_transformed_expression, NativeChild, NativeNode, NativeShell, ResidentNodeContract,
+    StagingInput, StagingRegionRequirements, StagingRequest, StagingTarget,
 };
 
 fn settle_with_session_arena(
@@ -675,263 +677,261 @@ impl TransformationRule for PlannerTransformationRule {
             None
         };
         let direct_native = {
-        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::NativeConstruct);
-        if matches!(
-            self.transformation,
-            PlannerTransformation::CteInline
-                | PlannerTransformation::CtePartitionedMaterialization
-                | PlannerTransformation::CteDemandPushdown
-                | PlannerTransformation::CteFilterPushdown
-        ) {
-            let mut state = self
-                .planner_state
-                .write()
-                .expect("planner transform state poisoned");
-            let requirement = cte::CteRequirement::from_binding(binding, ctx.memo(), &state)?;
-            if requirement.owner != ctx.memo().canonical_group(target_group) {
-                return Err(paro_error::internal("CTE inline changed sharing ownership"));
-            }
-            match NativeShell::from_pattern_with_layouts(
-                ctx.memo(),
-                &state,
-                &binding.root,
-                &facts,
-            )? {
-                Some((shell, layouts)) => {
-                    if matches!(
-                        self.transformation,
-                        PlannerTransformation::CtePartitionedMaterialization
-                    ) {
-                        requirement.native_partitions(shell, &layouts, &mut state)?
-                    } else if matches!(
-                        self.transformation,
-                        PlannerTransformation::CteDemandPushdown
-                    ) {
-                        match requirement.native_key_domain(
-                            shell,
-                            &layouts,
-                            ctx.memo(),
-                            &mut state,
-                            &facts,
-                        )? {
-                            Some((shell, proof)) => {
-                                cte_restriction = Some((requirement.producer, proof));
-                                vec![shell]
+            let _b3 =
+                crate::work_partition::enter_b3(crate::work_partition::Bucket::NativeConstruct);
+            if matches!(
+                self.transformation,
+                PlannerTransformation::CteInline
+                    | PlannerTransformation::CtePartitionedMaterialization
+                    | PlannerTransformation::CteDemandPushdown
+                    | PlannerTransformation::CteFilterPushdown
+            ) {
+                let mut state = self
+                    .planner_state
+                    .write()
+                    .expect("planner transform state poisoned");
+                let requirement = cte::CteRequirement::from_binding(binding, ctx.memo(), &state)?;
+                if requirement.owner != ctx.memo().canonical_group(target_group) {
+                    return Err(paro_error::internal("CTE inline changed sharing ownership"));
+                }
+                match NativeShell::from_pattern_with_layouts(
+                    ctx.memo(),
+                    &state,
+                    &binding.root,
+                    &facts,
+                )? {
+                    Some((shell, layouts)) => {
+                        if matches!(
+                            self.transformation,
+                            PlannerTransformation::CtePartitionedMaterialization
+                        ) {
+                            requirement.native_partitions(shell, &layouts, &mut state)?
+                        } else if matches!(
+                            self.transformation,
+                            PlannerTransformation::CteDemandPushdown
+                        ) {
+                            match requirement.native_key_domain(
+                                shell,
+                                &layouts,
+                                ctx.memo(),
+                                &mut state,
+                                &facts,
+                            )? {
+                                Some((shell, proof)) => {
+                                    cte_restriction = Some((requirement.producer, proof));
+                                    vec![shell]
+                                }
+                                None => Vec::new(),
                             }
-                            None => Vec::new(),
-                        }
-                    } else if matches!(
-                        self.transformation,
-                        PlannerTransformation::CteFilterPushdown
-                    ) {
-                        match requirement.native_filter_domain(
-                            shell,
-                            &layouts,
-                            ctx.memo(),
-                            &mut state,
-                        )? {
-                            Some((shell, proof)) => {
-                                cte_restriction = Some((requirement.producer, proof));
-                                vec![shell]
+                        } else if matches!(
+                            self.transformation,
+                            PlannerTransformation::CteFilterPushdown
+                        ) {
+                            match requirement.native_filter_domain(
+                                shell,
+                                &layouts,
+                                ctx.memo(),
+                                &mut state,
+                            )? {
+                                Some((shell, proof)) => {
+                                    cte_restriction = Some((requirement.producer, proof));
+                                    vec![shell]
+                                }
+                                None => Vec::new(),
                             }
-                            None => Vec::new(),
-                        }
-                    } else {
-                        match requirement.native_inline(shell, &layouts, &state)? {
-                            Some(shell) => vec![shell],
-                            None => Vec::new(),
+                        } else {
+                            match requirement.native_inline(shell, &layouts, &state)? {
+                                Some(shell) => vec![shell],
+                                None => Vec::new(),
+                            }
                         }
                     }
+                    None => Vec::new(),
                 }
-                None => Vec::new(),
-            }
-        } else if matches!(
-            self.transformation,
-            PlannerTransformation::PredicateTransfer
-                | PlannerTransformation::KeyDomainTransfer
-                | PlannerTransformation::MarkJoinToSemi
-                | PlannerTransformation::LimitPushdown
-                | PlannerTransformation::TopNIntroduction
-                | PlannerTransformation::JoinRegionEnumeration
-                | PlannerTransformation::AggregateJoinPreaggregation
-                | PlannerTransformation::AggregateJoinSubsumption
-                | PlannerTransformation::AggregateNonNullInput
-                | PlannerTransformation::JoinElimination
-                | PlannerTransformation::AggregateDimensionDeferral
-                | PlannerTransformation::AggregateInputMaterialization
-                | PlannerTransformation::AggregateDimensionSharing
-                | PlannerTransformation::LatePayloadFetch
-                | PlannerTransformation::AggregatePostReduction
-                | PlannerTransformation::ScalarAggregateWindow
-        ) {
-            let state = self
-                .planner_state
-                .read()
-                .expect("planner transform state poisoned");
-            match self.transformation {
-                PlannerTransformation::PredicateTransfer => {
-                    let native = native_domain::try_transfer_with_continuations(
-                        &binding.root,
-                        ctx.memo(),
-                        &state,
-                        &facts,
-                        binding_fact_value,
-                        ctx.domain_continuations_enabled(),
-                    )?;
-                    if let Some(native) = native {
-                        for read in native.reads.iter().copied() {
-                            ctx.record_fact_read(read);
-                        }
-                        ctx.record_domain_continuations(native.continuations.into_vec());
-                        // Refreshing and resident-contract construction happen
-                        // in the common staging transaction below. The native
-                        // producer must not perform a second settlement before
-                        // that transaction can consume its shell.
-                        native_domain_scopes = Some(HashMap::new());
-                        vec![native.shell]
-                    } else {
-                        let native = try_native_predicate_transfer(
+            } else if matches!(
+                self.transformation,
+                PlannerTransformation::PredicateTransfer
+                    | PlannerTransformation::KeyDomainTransfer
+                    | PlannerTransformation::MarkJoinToSemi
+                    | PlannerTransformation::LimitPushdown
+                    | PlannerTransformation::TopNIntroduction
+                    | PlannerTransformation::JoinRegionEnumeration
+                    | PlannerTransformation::AggregateJoinPreaggregation
+                    | PlannerTransformation::AggregateJoinSubsumption
+                    | PlannerTransformation::AggregateNonNullInput
+                    | PlannerTransformation::JoinElimination
+                    | PlannerTransformation::AggregateDimensionDeferral
+                    | PlannerTransformation::AggregateInputMaterialization
+                    | PlannerTransformation::AggregateDimensionSharing
+                    | PlannerTransformation::LatePayloadFetch
+                    | PlannerTransformation::AggregatePostReduction
+                    | PlannerTransformation::ScalarAggregateWindow
+            ) {
+                let state = self
+                    .planner_state
+                    .read()
+                    .expect("planner transform state poisoned");
+                match self.transformation {
+                    PlannerTransformation::PredicateTransfer => {
+                        let native = native_domain::try_transfer_with_continuations(
                             &binding.root,
                             ctx.memo(),
                             &state,
                             &facts,
+                            binding_fact_value,
+                            ctx.domain_continuations_enabled(),
                         )?;
-                        native_predicate_transfer_complete = native
-                            .as_ref()
-                            .is_some_and(|native| native.complete);
-                        native
-                            .map(|native| native.shell)
+                        if let Some(native) = native {
+                            for read in native.reads.iter().copied() {
+                                ctx.record_fact_read(read);
+                            }
+                            ctx.record_domain_continuations(native.continuations.into_vec());
+                            // Refreshing and resident-contract construction happen
+                            // in the common staging transaction below. The native
+                            // producer must not perform a second settlement before
+                            // that transaction can consume its shell.
+                            native_domain_scopes = Some(HashMap::new());
+                            vec![native.shell]
+                        } else {
+                            let native = try_native_predicate_transfer(
+                                &binding.root,
+                                ctx.memo(),
+                                &state,
+                                &facts,
+                            )?;
+                            native_predicate_transfer_complete =
+                                native.as_ref().is_some_and(|native| native.complete);
+                            native.map(|native| native.shell).into_iter().collect()
+                        }
+                    }
+                    PlannerTransformation::JoinRegionEnumeration => {
+                        join_region::try_native_enumeration_with_cache_key(
+                            &binding.root,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                            region_identity.as_ref(),
+                        )?
+                    }
+                    PlannerTransformation::AggregateJoinPreaggregation => {
+                        native_join_preaggregation::try_native_aggregate_join_preaggregation(
+                            &binding.root,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                        )?
+                        .into_iter()
+                        .collect()
+                    }
+                    PlannerTransformation::AggregateJoinSubsumption => {
+                        native_join_subsumption::try_native_aggregate_join_subsumption(
+                            &binding.root,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                        )?
+                        .into_iter()
+                        .collect()
+                    }
+                    PlannerTransformation::JoinElimination => {
+                        use native_join_elimination::EliminationResult;
+                        match native_join_elimination::apply_native_join_elimination(
+                            &binding.root,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                        )? {
+                            EliminationResult::Unsupported => Vec::new(),
+                            EliminationResult::NoRewrite => {
+                                native_elimination_checked = true;
+                                Vec::new()
+                            }
+                            EliminationResult::Rewritten(shell) => {
+                                native_elimination_checked = true;
+                                vec![shell]
+                            }
+                        }
+                    }
+                    PlannerTransformation::AggregateNonNullInput => {
+                        native_non_null_inputs::try_native_aggregate_non_null_input(
+                            &binding.root,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                        )?
+                        .into_iter()
+                        .collect()
+                    }
+                    PlannerTransformation::KeyDomainTransfer => {
+                        try_native_key_domain_transfer(&binding.root, ctx.memo(), &state, &facts)?
                             .into_iter()
                             .collect()
                     }
-                }
-                PlannerTransformation::JoinRegionEnumeration => {
-                    join_region::try_native_enumeration_with_cache_key(
-                        &binding.root,
-                        ctx.memo(),
-                        &state,
-                        &facts,
-                        region_identity.as_ref(),
-                    )?
-                }
-                PlannerTransformation::AggregateJoinPreaggregation => {
-                    native_join_preaggregation::try_native_aggregate_join_preaggregation(
-                        &binding.root,
-                        ctx.memo(),
-                        &state,
-                        &facts,
-                    )?
-                    .into_iter()
-                    .collect()
-                }
-                PlannerTransformation::AggregateJoinSubsumption => {
-                    native_join_subsumption::try_native_aggregate_join_subsumption(
-                        &binding.root,
-                        ctx.memo(),
-                        &state,
-                        &facts,
-                    )?
-                    .into_iter()
-                    .collect()
-                }
-                PlannerTransformation::JoinElimination => {
-                    use native_join_elimination::EliminationResult;
-                    match native_join_elimination::apply_native_join_elimination(
-                        &binding.root,
-                        ctx.memo(),
-                        &state,
-                        &facts,
-                    )? {
-                        EliminationResult::Unsupported => Vec::new(),
-                        EliminationResult::NoRewrite => {
-                            native_elimination_checked = true;
-                            Vec::new()
-                        }
-                        EliminationResult::Rewritten(shell) => {
-                            native_elimination_checked = true;
-                            vec![shell]
-                        }
+                    PlannerTransformation::MarkJoinToSemi => {
+                        try_native_mark_join_to_semi(&binding.root, ctx.memo(), &state, &facts)?
+                            .into_iter()
+                            .collect()
                     }
-                }
-                PlannerTransformation::AggregateNonNullInput => {
-                    native_non_null_inputs::try_native_aggregate_non_null_input(
-                        &binding.root,
-                        ctx.memo(),
-                        &state,
-                        &facts,
-                    )?
-                    .into_iter()
-                    .collect()
-                }
-                PlannerTransformation::KeyDomainTransfer => {
-                    try_native_key_domain_transfer(&binding.root, ctx.memo(), &state, &facts)?
+                    PlannerTransformation::LimitPushdown => {
+                        try_native_limit_pushdown(&binding.root, ctx.memo(), &state, &facts)?
+                            .into_iter()
+                            .collect()
+                    }
+                    PlannerTransformation::TopNIntroduction => {
+                        try_native_topn_introduction(&binding.root, ctx.memo(), &state, &facts)?
+                            .into_iter()
+                            .collect()
+                    }
+                    PlannerTransformation::AggregateDimensionDeferral => {
+                        try_native_dimension_deferral(&binding.root, ctx.memo(), &state, &facts)?
+                            .into_iter()
+                            .collect()
+                    }
+                    PlannerTransformation::AggregateInputMaterialization => {
+                        try_native_input_materialization(&binding.root, ctx.memo(), &state, &facts)?
+                            .into_iter()
+                            .collect()
+                    }
+                    PlannerTransformation::AggregateDimensionSharing => {
+                        try_native_dimension_sharing(&binding.root, ctx.memo(), &state, &facts)?
+                            .into_iter()
+                            .collect()
+                    }
+                    PlannerTransformation::LatePayloadFetch => {
+                        native_late_payload::try_native_late_payload_prefix(
+                            &binding.root,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                        )?
                         .into_iter()
                         .collect()
-                }
-                PlannerTransformation::MarkJoinToSemi => {
-                    try_native_mark_join_to_semi(&binding.root, ctx.memo(), &state, &facts)?
+                    }
+                    PlannerTransformation::AggregatePostReduction => {
+                        native_post_reduction::try_native_aggregate_post_reduction(
+                            &binding.root,
+                            ctx.memo(),
+                            &state,
+                            &facts,
+                        )?
                         .into_iter()
                         .collect()
-                }
-                PlannerTransformation::LimitPushdown => {
-                    try_native_limit_pushdown(&binding.root, ctx.memo(), &state, &facts)?
+                    }
+                    PlannerTransformation::ScalarAggregateWindow => {
+                        native_scalar_aggregate_window::try_native_scalar_aggregate_window(
+                            &binding.root,
+                            ctx,
+                            &state,
+                        )?
                         .into_iter()
                         .collect()
+                    }
+                    _ => unreachable!("native dispatch guard changed"),
                 }
-                PlannerTransformation::TopNIntroduction => {
-                    try_native_topn_introduction(&binding.root, ctx.memo(), &state, &facts)?
-                        .into_iter()
-                        .collect()
-                }
-                PlannerTransformation::AggregateDimensionDeferral => {
-                    try_native_dimension_deferral(&binding.root, ctx.memo(), &state, &facts)?
-                        .into_iter()
-                        .collect()
-                }
-                PlannerTransformation::AggregateInputMaterialization => {
-                    try_native_input_materialization(&binding.root, ctx.memo(), &state, &facts)?
-                        .into_iter()
-                        .collect()
-                }
-                PlannerTransformation::AggregateDimensionSharing => {
-                    try_native_dimension_sharing(&binding.root, ctx.memo(), &state, &facts)?
-                        .into_iter()
-                        .collect()
-                }
-                PlannerTransformation::LatePayloadFetch => {
-                    native_late_payload::try_native_late_payload_prefix(
-                        &binding.root,
-                        ctx.memo(),
-                        &state,
-                        &facts,
-                    )?
-                    .into_iter()
-                    .collect()
-                }
-                PlannerTransformation::AggregatePostReduction => {
-                    native_post_reduction::try_native_aggregate_post_reduction(
-                        &binding.root,
-                        ctx.memo(),
-                        &state,
-                        &facts,
-                    )?
-                    .into_iter()
-                    .collect()
-                }
-                PlannerTransformation::ScalarAggregateWindow => {
-                    native_scalar_aggregate_window::try_native_scalar_aggregate_window(
-                        &binding.root,
-                        ctx,
-                        &state,
-                    )?
-                    .into_iter()
-                    .collect()
-                }
-                _ => unreachable!("native dispatch guard changed"),
+            } else {
+                Vec::new()
             }
-        } else {
-            Vec::new()
-        }};
+        };
         if native_elimination_checked && direct_native.is_empty() {
             return Ok(Box::new([]));
         }
@@ -1211,7 +1211,7 @@ impl TransformationRule for PlannerTransformationRule {
         enum PlanCandidate {
             Native(NativeShell),
             Owned {
-                plan: OwnedLogicalPlan,
+                plan: Box<OwnedLogicalPlan>,
                 selected_proofs: HashMap<paro_planner::plan::PlanNodeId, Box<[EquivalenceProof]>>,
             },
         }
@@ -1219,7 +1219,7 @@ impl TransformationRule for PlannerTransformationRule {
         let mut candidates = Vec::with_capacity(plans.len() + direct_native.len());
         candidates.extend(direct_native.into_iter().map(PlanCandidate::Native));
         candidates.extend(plans.into_iter().map(|plan| PlanCandidate::Owned {
-            plan,
+            plan: Box::new(plan),
             selected_proofs: selected_proofs.clone(),
         }));
 
@@ -1275,11 +1275,16 @@ impl TransformationRule for PlannerTransformationRule {
                                 staging_arena,
                                 &mut identity,
                             );
-                            drop(identity);
                             result?
                         };
-                        let Some(settlement::SettledNative { expression, holes, proofs }) = settled
-                        else { return Ok(Box::new([])); };
+                        let Some(settlement::SettledNative {
+                            expression,
+                            holes,
+                            proofs,
+                        }) = settled
+                        else {
+                            return Ok(Box::new([]));
+                        };
                         let settlement::SettledExpression {
                             plan,
                             statistics,
@@ -1287,12 +1292,15 @@ impl TransformationRule for PlannerTransformationRule {
                             mut resident_nodes,
                         } = expression;
                         if environment.verify_enabled {
-                            crate::verify::verify_arena_plan(&state.staging_arena.plan(plan)?, || {
-                                environment.session.cancellation.check()
-                            })?;
+                            crate::verify::verify_arena_plan(
+                                &state.staging_arena.plan(plan)?,
+                                || environment.session.cancellation.check(),
+                            )?;
                         }
                         let plan = semantic_plan::freeze_arena_output_layout(
-                            plan, &source_output_columns, &mut state,
+                            plan,
+                            &source_output_columns,
+                            &mut state,
                         )?;
                         rebind_settled_root_contract(&mut state, plan, &mut resident_nodes)?;
                         let root_operator = state.staging_arena.get(plan)?.operator.op_type();
@@ -1329,6 +1337,7 @@ impl TransformationRule for PlannerTransformationRule {
                         plan,
                         selected_proofs,
                     } => {
+                        let plan = *plan;
                         let retained_group_holes =
                             retained_group_holes(&plan, &nested_group_holes)?;
                         let group_hole_guard = GroupHoleTransportGuard::capture(
@@ -1540,21 +1549,20 @@ impl TransformationRule for PlannerTransformationRule {
                                 scopes,
                                 resident_nodes,
                             } => {
-                                let (shell, scopes, resident_nodes) =
-                                    if matches!(
-                                        self.transformation,
-                                        PlannerTransformation::PredicateTransfer
-                                            | PlannerTransformation::AggregateDimensionDeferral
-                                    ) {
-                                        let Some((shell, scopes, resident_nodes)) =
-                                            native_domain::refresh_statistics(shell, state, memo)?
-                                        else {
-                                            return Ok(None);
-                                        };
-                                        (shell, scopes, resident_nodes)
-                                    } else {
-                                        (shell, scopes, resident_nodes)
+                                let (shell, scopes, resident_nodes) = if matches!(
+                                    self.transformation,
+                                    PlannerTransformation::PredicateTransfer
+                                        | PlannerTransformation::AggregateDimensionDeferral
+                                ) {
+                                    let Some((shell, scopes, resident_nodes)) =
+                                        native_domain::refresh_statistics(shell, state, memo)?
+                                    else {
+                                        return Ok(None);
                                     };
+                                    (shell, scopes, resident_nodes)
+                                } else {
+                                    (shell, scopes, resident_nodes)
+                                };
                                 (
                                     StagingInput::Native {
                                         shell,
@@ -1659,7 +1667,6 @@ impl TransformationRule for PlannerTransformationRule {
             })
             .collect())
     }
-
 }
 
 /// Return whether this exact binding cannot produce an output without
@@ -1680,13 +1687,17 @@ fn binding_is_structurally_impossible(
             let state = planner_state
                 .read()
                 .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
-            Ok(!binding_has_dimension_deferral_shape(binding, memo, &state)?)
+            Ok(!binding_has_dimension_deferral_shape(
+                binding, memo, &state,
+            )?)
         }
         PlannerTransformation::AggregateInputMaterialization => {
             let state = planner_state
                 .read()
                 .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
-            Ok(!binding_has_input_materialization_shape(binding, memo, &state)?)
+            Ok(!binding_has_input_materialization_shape(
+                binding, memo, &state,
+            )?)
         }
         PlannerTransformation::PredicateTransfer => {
             let state = planner_state
@@ -1749,10 +1760,9 @@ fn binding_is_structurally_impossible_for_subsumption(
         state: &PlannerTransformState,
         detail_table: Option<usize>,
         aggregate_count: &mut usize,
-        has_clean_inner: &mut bool,
-        has_reduction: &mut bool,
-        has_detail_get: &mut bool,
+        shape: (&mut bool, &mut bool, &mut bool),
     ) -> Result<()> {
+        let (has_clean_inner, has_reduction, has_detail_get) = shape;
         let PatternOperand::Expression {
             expression,
             children,
@@ -1798,9 +1808,7 @@ fn binding_is_structurally_impossible_for_subsumption(
                 state,
                 detail_table,
                 aggregate_count,
-                has_clean_inner,
-                has_reduction,
-                has_detail_get,
+                (has_clean_inner, has_reduction, has_detail_get),
             )?;
         }
         Ok(())
@@ -1811,9 +1819,11 @@ fn binding_is_structurally_impossible_for_subsumption(
         &state,
         detail_table,
         &mut aggregate_count,
-        &mut has_clean_inner,
-        &mut has_reduction,
-        &mut has_detail_get,
+        (
+            &mut has_clean_inner,
+            &mut has_reduction,
+            &mut has_detail_get,
+        ),
     )?;
 
     Ok(aggregate_count < 2 || !has_clean_inner || !has_reduction || !has_detail_get)
@@ -1887,9 +1897,10 @@ fn binding_has_dimension_deferral_shape(
                     && join.mark_index.is_none()
                     && join.duplicate_eliminated_columns.is_empty()
                     && !join.delim_flipped
-                    && join.conditions.iter().all(|condition| {
-                        condition.comparison == JoinComparisonType::Equal
-                    })
+                    && join
+                        .conditions
+                        .iter()
+                        .all(|condition| condition.comparison == JoinComparisonType::Equal)
                     && children.len() == 2 =>
             {
                 let left = region_shape(&children[0], memo, state)?;
@@ -2363,10 +2374,7 @@ fn try_native_predicate_transfer(
         nodes: nodes.into_boxed_slice(),
         root,
     })?;
-    Ok(Some(NativePredicateTransfer {
-        complete,
-        shell,
-    }))
+    Ok(Some(NativePredicateTransfer { complete, shell }))
 }
 
 /// The side-local native shell is complete only when the existing
@@ -2508,10 +2516,7 @@ fn native_shell_child_stats(nodes: &[NativeNode], child: &NativeChild) -> NodeSt
     }
 }
 
-fn native_shell_child_names(
-    nodes: &[NativeNode],
-    child: &NativeChild,
-) -> Result<Arc<[String]>> {
+fn native_shell_child_names(nodes: &[NativeNode], child: &NativeChild) -> Result<Arc<[String]>> {
     match child {
         NativeChild::MemoGroup { names, .. } | NativeChild::Group { names, .. } => {
             Ok(names.clone())
@@ -2635,12 +2640,18 @@ fn native_materialization_side(
     if join.conditions.iter().any(|condition| {
         native_expression_uses_any_binding(&condition.left, &bindings)
             || native_expression_uses_any_binding(&condition.right, &bindings)
-    }) || join.duplicate_eliminated_columns.iter().any(|expression| {
-        native_expression_uses_any_binding(expression, &bindings)
-    }) {
+    }) || join
+        .duplicate_eliminated_columns
+        .iter()
+        .any(|expression| native_expression_uses_any_binding(expression, &bindings))
+    {
         return None;
     }
-    let left = left_layout.bindings().iter().copied().collect::<HashSet<_>>();
+    let left = left_layout
+        .bindings()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
     if bindings.is_subset(&left) {
         return Some(true);
     }
@@ -2769,25 +2780,24 @@ fn native_materialize_candidate(
         .iter()
         .copied()
         .enumerate()
-        .map(|(ordinal, binding)| {
-            (
-                binding,
-                ColumnBinding::new(projection_index, ordinal),
-            )
-        })
+        .map(|(ordinal, binding)| (binding, ColumnBinding::new(projection_index, ordinal)))
         .collect::<HashMap<_, _>>();
     let mut rewritten_child = NativeChild::Node(projection_index_in_shell);
     for (join_index, left_side) in path.into_iter().rev() {
         let LogicalOperator::Join(Join::Comparison(mut rewritten_join)) =
             nodes[join_index].operator.clone()
         else {
-            return Err(paro_error::internal("native materialization lost its ancestor"));
+            return Err(paro_error::internal(
+                "native materialization lost its ancestor",
+            ));
         };
         let output_ordinal = native_shell_child_layout(&rewritten_child, layouts)?
             .bindings()
             .iter()
             .position(|binding| *binding == materialized_binding)
-            .ok_or_else(|| paro_error::internal("native materialized binding lost in ancestor input"))?;
+            .ok_or_else(|| {
+                paro_error::internal("native materialized binding lost in ancestor input")
+            })?;
         if left_side {
             rewritten_join.left = rewritten_child;
             rewritten_join.left_projection_map.include(output_ordinal);
@@ -2930,20 +2940,16 @@ fn try_native_input_materialization(
         let Some(candidate) = candidate else {
             break;
         };
-        let LogicalOperator::Join(Join::Comparison(current_join)) = nodes[join_index]
-            .operator
-            .clone()
+        let LogicalOperator::Join(Join::Comparison(current_join)) =
+            nodes[join_index].operator.clone()
         else {
             return Ok(None);
         };
         let left_layout = native_shell_child_layout(&current_join.left, &layouts)?;
         let right_layout = native_shell_child_layout(&current_join.right, &layouts)?;
-        let Some(left_side) = native_materialization_side(
-            &current_join,
-            &candidate,
-            &left_layout,
-            &right_layout,
-        ) else {
+        let Some(left_side) =
+            native_materialization_side(&current_join, &candidate, &left_layout, &right_layout)
+        else {
             rejected.push(candidate);
             continue;
         };
@@ -3010,23 +3016,34 @@ fn try_native_key_domain_transfer(
     // We retain those inputs, including control regions, and move only across
     // the explicitly checked local operator, never into the opaque region.
     let root = shell.root;
-    let logical = memo.logical_expr(*expression)
+    let logical = memo
+        .logical_expr(*expression)
         .ok_or_else(|| paro_error::internal("key-domain target expression missing"))?;
-    let target_columns = &state.metadata.get(&logical.payload)
+    let target_columns = &state
+        .metadata
+        .get(&logical.payload)
         .ok_or_else(|| paro_error::internal("key-domain target metadata missing"))?
         .output_columns;
     // Canonical templates omit lifetime projection maps. Restore the target
     // ColumnId set, not the previous physical ordinal map. Final presentation
     // remains responsible for ordering those identities.
-    let output_projection = layouts[root].bindings().iter()
-        .zip(layouts[root].types()).enumerate()
+    let output_projection = layouts[root]
+        .bindings()
+        .iter()
+        .zip(layouts[root].types())
+        .enumerate()
         .filter_map(|(index, (binding, ty))| {
-            state.binding_ids.get(binding.table_index, binding.column_index, ty)
-                .filter(|column| target_columns.contains(column)).map(|_| index)
+            state
+                .binding_ids
+                .get(binding.table_index, binding.column_index, ty)
+                .filter(|column| target_columns.contains(column))
+                .map(|_| index)
         })
         .collect::<Vec<_>>();
     if output_projection.len() != target_columns.len() {
-        return Err(paro_error::internal("key-domain target columns are absent from its semantic layout"));
+        return Err(paro_error::internal(
+            "key-domain target columns are absent from its semantic layout",
+        ));
     }
     let project_output = output_projection.len() != layouts[root].len();
     let LogicalOperator::Join(Join::Comparison(domain)) = shell.nodes[root].operator.clone() else {
@@ -3523,21 +3540,29 @@ fn try_native_dimension_deferral(
             _ => break *index,
         }
     };
-    let Some(groups) = aggregate.groups.iter()
+    let Some(groups) = aggregate
+        .groups
+        .iter()
         .map(|expression| dimension_deferral::inline_projections(expression, &projections))
-        .collect::<Option<Vec<_>>>() else {
-            return Ok(None);
-        };
-    let Some(aggregates) = aggregate.aggregates.iter()
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let Some(aggregates) = aggregate
+        .aggregates
+        .iter()
         .map(|expression| dimension_deferral::inline_projections(expression, &projections))
-        .collect::<Option<Vec<_>>>() else {
-            return Ok(None);
-        };
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
     aggregate.groups = groups;
     aggregate.aggregates = aggregates;
-    let Some(join_index) = native_deferral_region::isolate(
-        &mut shell, &mut layouts, join_index, &aggregate, state,
-    )? else { return Ok(None); };
+    let Some(join_index) =
+        native_deferral_region::isolate(&mut shell, &mut layouts, join_index, &aggregate, state)?
+    else {
+        return Ok(None);
+    };
     let join_node = shell
         .nodes
         .get(join_index)
@@ -3595,10 +3620,19 @@ fn try_native_dimension_deferral(
     // externally owned CTE domain) are inputs, not statistics to recompute in
     // the new aggregate's lexical environment.
     let dimension_group = native_deferral_region::selected_group(&shell, binding, dimension_index)
-        .ok_or_else(|| paro_error::internal("native deferral lost its unchanged dimension identity"))?;
+        .ok_or_else(|| {
+            paro_error::internal("native deferral lost its unchanged dimension identity")
+        })?;
     let dimension = NativeChild::memo_group(
-        memo, state, facts, dimension_group, &Arc::new(right_layout.clone()),
-        shell.nodes[dimension_index].operator.output_names_from_child_refs(&[]).into(),
+        memo,
+        state,
+        facts,
+        dimension_group,
+        &Arc::new(right_layout.clone()),
+        shell.nodes[dimension_index]
+            .operator
+            .output_names_from_child_refs(&[])
+            .into(),
     )?;
 
     let mut partial_groups = Vec::with_capacity(join.conditions.len() + aggregate.groups.len());
@@ -3668,23 +3702,35 @@ fn try_native_dimension_deferral(
             reference.facts.unique_keys.clone()
         }
         NativeChild::Node(index) => {
-            let mut keys = if let Some(group) = native_deferral_region::selected_group(&shell, binding, *index) {
-                facts.transport(memo, state, group, &Arc::new(left_layout.clone()))?.unique_keys.clone()
+            let mut keys = if let Some(group) =
+                native_deferral_region::selected_group(&shell, binding, *index)
+            {
+                facts
+                    .transport(memo, state, group, &Arc::new(left_layout.clone()))?
+                    .unique_keys
+                    .clone()
             } else {
                 shell.nodes[*index].stats.unique_keys.clone()
             };
             // Plain aggregation proves its output grouping key structurally,
             // even when the selected boundary snapshot has not derived it.
             if matches!(shell.nodes[*index].operator, LogicalOperator::Aggregate(_)) {
-                keys.extend(crate::statistics::unique_keys::derive_unique_keys_from_facts(
-                    &shell.nodes[*index].operator, &left_layout, &[], &[],
-                ));
+                keys.extend(
+                    crate::statistics::unique_keys::derive_unique_keys_from_facts(
+                        &shell.nodes[*index].operator,
+                        &left_layout,
+                        &[],
+                        &[],
+                    ),
+                );
             }
             keys
         }
     };
     if crate::statistics::unique_keys::expressions_cover_unique_key_from_facts(
-        &left_layout, &keys, &partial_groups.iter().collect::<Vec<_>>(),
+        &left_layout,
+        &keys,
+        &partial_groups.iter().collect::<Vec<_>>(),
     ) {
         return Ok(None);
     }
@@ -3872,7 +3918,9 @@ fn try_native_dimension_deferral(
     if result_layout.bindings() != original_root_layout.bindings()
         || result_layout.types() != original_root_layout.types()
     {
-        return Err(paro_error::internal("native dimension deferral changed its root output contract"));
+        return Err(paro_error::internal(
+            "native dimension deferral changed its root output contract",
+        ));
     }
     Ok(Some(shell))
 }
@@ -4086,10 +4134,9 @@ fn native_replace_equal_subexpressions(
         *expression = replacement.clone();
         return;
     }
-    paro_planner::expression::ExpressionIterator::enumerate_children_mut(
-        expression,
-        |child| native_replace_equal_subexpressions(child, target, replacement),
-    );
+    paro_planner::expression::ExpressionIterator::enumerate_children_mut(expression, |child| {
+        native_replace_equal_subexpressions(child, target, replacement)
+    });
 }
 
 fn native_sharing_branch_view(
@@ -4912,14 +4959,28 @@ fn native_dimension_direct_shape(
     }
     let mut child_binding = &children[0];
     loop {
-        let PatternOperand::Expression { expression, children, .. } = child_binding else {
+        let PatternOperand::Expression {
+            expression,
+            children,
+            ..
+        } = child_binding
+        else {
             return Ok(false);
         };
-        let logical = memo.logical_expr(*expression)
-            .ok_or_else(|| paro_error::internal("native dimension preflight lost its projection"))?;
-        let payload = state.payloads.logical.get(logical.payload.index())
-            .ok_or_else(|| paro_error::internal("native dimension preflight lost projection payload"))?;
-        if !matches!(payload.semantic_template.operator, LogicalOperator::Projection(_)) {
+        let logical = memo.logical_expr(*expression).ok_or_else(|| {
+            paro_error::internal("native dimension preflight lost its projection")
+        })?;
+        let payload = state
+            .payloads
+            .logical
+            .get(logical.payload.index())
+            .ok_or_else(|| {
+                paro_error::internal("native dimension preflight lost projection payload")
+            })?;
+        if !matches!(
+            payload.semantic_template.operator,
+            LogicalOperator::Projection(_)
+        ) {
             break;
         }
         if children.len() != 1 {
@@ -5567,8 +5628,9 @@ fn compact_native_shell_with_layout(
                     NativeChild::Node(index) => compacted_layouts.get(*index).ok_or_else(|| {
                         paro_error::internal("native shell compacted child layout is missing")
                     }),
-                    NativeChild::MemoGroup { layout, .. }
-                    | NativeChild::Group { layout, .. } => Ok(layout),
+                    NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
+                        Ok(layout)
+                    }
                 })
                 .collect::<Result<SmallVec<[_; 2]>>>()?;
             let child_layouts = child_layouts.iter().copied().collect::<SmallVec<[_; 2]>>();
@@ -5684,7 +5746,7 @@ fn native_shell_is_closed(plan: &OwnedLogicalPlan) -> bool {
     !children.is_empty()
         && children
             .into_iter()
-            .all(|child| native_shell_is_closed(&child))
+            .all(|child| native_shell_is_closed(child))
 }
 
 fn rewrite_planner_expressions(
@@ -5706,14 +5768,11 @@ fn rewrite_planner_expressions(
             &environment.bind_context,
         );
     }
-    Ok(rewrite_planner_expression(
-        transformation,
-        plan,
-        environment,
-        rejection_reasons,
-    )?
-    .into_iter()
-    .collect())
+    Ok(
+        rewrite_planner_expression(transformation, plan, environment, rejection_reasons)?
+            .into_iter()
+            .collect(),
+    )
 }
 
 fn rewrite_planner_expression(
@@ -5796,7 +5855,9 @@ fn rewrite_planner_expression(
             unreachable!("aggregate input materialization is native-only in Memo search")
         }
         PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown => {
-            return Err(paro_error::internal("limit rewrites are native-only Memo transformations"));
+            return Err(paro_error::internal(
+                "limit rewrites are native-only Memo transformations",
+            ));
         }
         PlannerTransformation::LatePayloadFetch => {
             let (plan, prefix_changed) = late_payload::rewrite_matched_prefix_node(plan)?;
@@ -6031,9 +6092,7 @@ impl GroupHoleTransportGuard {
 mod tests {
     use super::*;
     use paro_common::types::LogicalType;
-    use paro_planner::expression::{
-        ColumnRefExpression, ConstantExpression,
-    };
+    use paro_planner::expression::{ColumnRefExpression, ConstantExpression};
     use paro_planner::operator::{ExpressionGet, Get, Join, JoinCondition};
 
     #[test]
@@ -6162,11 +6221,7 @@ mod tests {
             paro_planner::expression::ComparisonExpression::new(
                 paro_planner::expression::ComparisonType::Equal,
                 Expression::ColumnRef(
-                    ColumnRefExpression::new(
-                        ColumnBinding::new(12, 0),
-                        LogicalType::BigInt,
-                    )
-                    .into(),
+                    ColumnRefExpression::new(ColumnBinding::new(12, 0), LogicalType::BigInt).into(),
                 ),
                 Expression::Constant(
                     ConstantExpression::new(Value::BigInt(2), LogicalType::BigInt).into(),
@@ -6195,12 +6250,11 @@ mod tests {
             ))),
             vec![predicate],
         )));
-        let mut input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
-            .unwrap();
+        let mut input =
+            MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
         let state = input.planner_state.clone();
-        state.write().unwrap().session = Some(
-            paro_context::TestStatementContextBuilder::minimal().build(),
-        );
+        state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
         let root = input.memo.group(input.root).unwrap().logical_exprs()[0];
         let binding = {
             let state = state.read().unwrap();
@@ -6263,39 +6317,41 @@ mod tests {
             .logical
             .get(outputs[0].payload.index())
             .expect("staged predicate-transfer output");
-        assert!(matches!(output.semantic_template.operator, LogicalOperator::Join(_)));
+        assert!(matches!(
+            output.semantic_template.operator,
+            LogicalOperator::Join(_)
+        ));
     }
 
     #[test]
     fn structural_preflight_stops_only_opaque_no_output_shapes() {
-        let base = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
-            ExpressionGet::new(
-                7,
-                Vec::new(),
-                vec!["key".to_string()],
-                vec![LogicalType::BigInt],
-            ),
-        ));
-        let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(
-            Aggregate::new(8, 9, 10, base, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        let base = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            7,
+            Vec::new(),
+            vec!["key".to_string()],
+            vec![LogicalType::BigInt],
         )));
-        let mut input = MemoBuilder::build(
-            aggregate,
-            BindContext::new(),
-            SearchBudget::default(),
-        )
-        .unwrap();
+        let aggregate =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
+                8,
+                9,
+                10,
+                base,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ))));
+        let mut input =
+            MemoBuilder::build(aggregate, BindContext::new(), SearchBudget::default()).unwrap();
         let aggregate_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
         let aggregate_logical = input
             .memo
             .logical_expr(aggregate_expression)
             .unwrap()
             .clone();
-        let aggregate_binding = PatternBinding::root_only(
-            input.root,
-            aggregate_expression,
-            &aggregate_logical,
-        );
+        let aggregate_binding =
+            PatternBinding::root_only(input.root, aggregate_expression, &aggregate_logical);
         let state = input.planner_state.clone();
         assert!(binding_is_structurally_impossible(
             PlannerTransformation::AggregateJoinSubsumption,
@@ -6320,14 +6376,12 @@ mod tests {
         .unwrap());
 
         let filter = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
-                ExpressionGet::new(
-                    11,
-                    Vec::new(),
-                    vec!["key".to_string()],
-                    vec![LogicalType::BigInt],
-                ),
-            )),
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                11,
+                Vec::new(),
+                vec!["key".to_string()],
+                vec![LogicalType::BigInt],
+            ))),
             vec![Expression::Constant(
                 ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
             )],
@@ -6353,33 +6407,31 @@ mod tests {
                 vec!["key".to_string()],
                 vec![LogicalType::BigInt],
             ))),
-            OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
-                Get::new_without_table(
-                    13,
-                    vec!["key".to_string()],
-                    vec![LogicalType::BigInt],
-                ),
-            ))),
+            OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new_without_table(
+                13,
+                vec!["key".to_string()],
+                vec![LogicalType::BigInt],
+            )))),
             vec![JoinCondition::equality(
                 Expression::ColumnRef(
-                    ColumnRefExpression::new(
-                        ColumnBinding::new(12, 0),
-                        LogicalType::BigInt,
-                    )
-                    .into(),
+                    ColumnRefExpression::new(ColumnBinding::new(12, 0), LogicalType::BigInt).into(),
                 ),
                 Expression::ColumnRef(
-                    ColumnRefExpression::new(
-                        ColumnBinding::new(13, 0),
-                        LogicalType::BigInt,
-                    )
-                    .into(),
+                    ColumnRefExpression::new(ColumnBinding::new(13, 0), LogicalType::BigInt).into(),
                 ),
             )],
         )));
-        let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(
-            Aggregate::new(14, 15, 16, join, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-        )));
+        let aggregate =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
+                14,
+                15,
+                16,
+                join,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ))));
         input = MemoBuilder::build(aggregate, BindContext::new(), SearchBudget::default()).unwrap();
         let aggregate_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
         let aggregate_logical = input
@@ -6390,11 +6442,8 @@ mod tests {
         let child_group = aggregate_logical.key.children[0];
         let join_expression = input.memo.group(child_group).unwrap().logical_exprs()[0];
         let join_logical = input.memo.logical_expr(join_expression).unwrap().clone();
-        let aggregate_binding = PatternBinding::root_only(
-            input.root,
-            aggregate_expression,
-            &aggregate_logical,
-        );
+        let aggregate_binding =
+            PatternBinding::root_only(input.root, aggregate_expression, &aggregate_logical);
         let aggregate_binding = PatternBinding {
             root: PatternOperand::Expression {
                 group: input.root,
@@ -6442,6 +6491,5 @@ mod tests {
             &state,
         )
         .unwrap());
-
     }
 }

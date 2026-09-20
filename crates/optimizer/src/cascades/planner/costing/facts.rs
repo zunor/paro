@@ -162,14 +162,14 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
 /// owned staging, using the boundary's complete source/occurrence coverage.
 pub(in crate::cascades::planner) fn planner_native_cost_facts<Child>(
     operator: &LogicalOperator<Child>,
-    child_materialization_risk_rows: &[u64],
-    child_row_widths: &[u64],
+    child_sizes: (&[u64], &[u64]),
     output_row_width: u64,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
     inputs: &[RuntimeFilterInput<'_>],
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     binding_ids: &BindingCatalog,
 ) -> Result<PlannerCostFacts> {
+    let (child_materialization_risk_rows, child_row_widths) = child_sizes;
     let mut operator_child_count = 0;
     operator.visit_child_links(&mut |_| operator_child_count += 1);
     if operator_child_count != child_materialization_risk_rows.len()

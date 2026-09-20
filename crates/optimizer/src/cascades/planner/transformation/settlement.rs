@@ -23,6 +23,7 @@ mod native;
 pub(super) use native::SettledNative;
 
 type FactId = usize;
+type LoweredResidentIdentity = (Box<[ColumnId]>, Box<[ScalarExprId]>, Fingerprint, Box<[u8]>);
 type CteEnvironment = Arc<BTreeMap<usize, FactId>>;
 
 #[derive(Debug)]
@@ -330,9 +331,9 @@ impl SettlementCache {
         mut entry: NativeRelationEntry,
     ) -> Arc<NativeRelationEntry> {
         if let Some(existing) = self.native_relations.get(&operator).and_then(|entries| {
-            entries.iter().find(|cached| {
-                native_relation_inputs_match(cached, &entry.layout, &entry.inputs)
-            })
+            entries
+                .iter()
+                .find(|cached| native_relation_inputs_match(cached, &entry.layout, &entry.inputs))
         }) {
             return Arc::clone(existing);
         }
@@ -439,15 +440,10 @@ impl SettlementCache {
     /// intentionally separate from a `ColumnId`: structural identity and
     /// fact validity have different lifetimes, and a fact change must miss
     /// even when the binding ordinal is unchanged.
-    pub(super) fn native_column_fingerprint(
-        column: &ColumnStatistics,
-    ) -> Result<Fingerprint> {
+    pub(super) fn native_column_fingerprint(column: &ColumnStatistics) -> Result<Fingerprint> {
         let mut encoder = StableFingerprintBuilder::default();
         encoder.write_bytes(b"paro.native.relation-column.v1");
-        crate::cascades::scalar::encode_logical_type(
-            &mut encoder,
-            column.statistics().get_type(),
-        );
+        crate::cascades::scalar::encode_logical_type(&mut encoder, column.statistics().get_type());
         encoder.write_bytes(&column.to_bytes()?);
         let distinct = column.distinct_evidence();
         encoder.write_u64(distinct.lower);
@@ -668,7 +664,11 @@ impl SettlementCache {
         }
         self.misses += 1;
         if crate::work_partition::enabled() {
-            crate::work_partition::local_lookup(Some(self.classify_local_miss(&key, &shell.operator, recipes)));
+            crate::work_partition::local_lookup(Some(self.classify_local_miss(
+                &key,
+                &shell.operator,
+                recipes,
+            )));
         }
         let child_layouts = inputs
             .iter()
@@ -801,10 +801,12 @@ impl SettlementCache {
             &output_layout,
             inputs,
             identity,
-            &shell_output_layout,
-            &key.output,
-            &key.scalars,
-            &key.operator,
+            (
+                &shell_output_layout,
+                &key.output,
+                &key.scalars,
+                &key.operator,
+            ),
         )?);
         let facts = self.intern_fact(RelationFacts {
             columns: output_layout
@@ -854,11 +856,14 @@ impl SettlementCache {
         output_layout: &LogicalOutputLayout,
         inputs: &[FactId],
         identity: &mut PlannerResidentIdentity<'_>,
-        settled_output_layout: &LogicalOutputLayout,
-        settled_output_columns: &[ColumnId],
-        settled_scalar_roots: &[ScalarExprId],
-        settled_operator_encoding: &[u8],
+        settled: (&LogicalOutputLayout, &[ColumnId], &[ScalarExprId], &[u8]),
     ) -> Result<ResidentNodeContract> {
+        let (
+            settled_output_layout,
+            settled_output_columns,
+            settled_scalar_roots,
+            settled_operator_encoding,
+        ) = settled;
         // The pre-statistics lowering above already interned the exact shell
         // into the session catalogs to form `LocalKey`.  Statistics gathering
         // normally changes only facts; reuse those identities after checking
@@ -877,12 +882,7 @@ impl SettlementCache {
                         encoding,
                     )
                 } else {
-                    self.relower_resident_contract(
-                        operator,
-                        output_layout,
-                        inputs,
-                        identity,
-                    )?
+                    self.relower_resident_contract(operator, output_layout, inputs, identity)?
                 }
             } else {
                 self.relower_resident_contract(operator, output_layout, inputs, identity)?
@@ -938,7 +938,7 @@ impl SettlementCache {
         output_layout: &LogicalOutputLayout,
         inputs: &[FactId],
         identity: &mut PlannerResidentIdentity<'_>,
-    ) -> Result<(Box<[ColumnId]>, Box<[ScalarExprId]>, Fingerprint, Box<[u8]>)> {
+    ) -> Result<LoweredResidentIdentity> {
         let output_columns = super::staging::intern_columns_into(
             identity,
             output_layout,
@@ -1279,12 +1279,7 @@ impl SettlementCache {
                         resident_nodes.insert(node.id, contract);
                     }
                     completed_occurrence(index, output, arena)?;
-                    completed.push((
-                        output,
-                        local.facts,
-                        local.statistics,
-                        aliases,
-                    ));
+                    completed.push((output, local.facts, local.statistics, aliases));
                 }
             }
         }
@@ -1463,10 +1458,7 @@ mod tests {
             native_relation_entry(input.clone()),
         );
         let checkpoint = cache.native_checkpoint();
-        cache.native_insert(
-            Box::from(&b"after"[..]),
-            native_relation_entry(input),
-        );
+        cache.native_insert(Box::from(&b"after"[..]), native_relation_entry(input));
         assert_eq!(cache.native_relation_entry_count(), 2);
         cache.rollback_native_to(checkpoint);
         assert_eq!(cache.native_relation_entry_count(), 1);
@@ -1984,18 +1976,33 @@ mod tests {
         annotated.stats.estimated_cardinality = Some(CardinalityEstimate::exact(999));
         let repeated = cache
             .with_test_identity(|cache, identity| {
-                cache.local(annotated.clone(), &[input], &ctes, &env, &mut arena, identity)
+                cache.local(
+                    annotated.clone(),
+                    &[input],
+                    &ctes,
+                    &env,
+                    &mut arena,
+                    identity,
+                )
             })
             .unwrap();
         assert_eq!(prior.facts, repeated.facts);
         assert_eq!(cache.misses, misses + 1);
-        let key = cache.locals.keys().find(|key| key.input_stats == annotated.stats).unwrap();
-        assert!(matches!(cache.classify_local_miss(key, &annotated.operator, &arena),
-            crate::work_partition::MissKind::SameContentDifferentKey));
+        let key = cache
+            .locals
+            .keys()
+            .find(|key| key.input_stats == annotated.stats)
+            .unwrap();
+        assert!(matches!(
+            cache.classify_local_miss(key, &annotated.operator, &arena),
+            crate::work_partition::MissKind::SameContentDifferentKey
+        ));
         let mut changed_input = key.clone();
         changed_input.inputs = Box::new([usize::MAX]);
-        assert!(matches!(cache.classify_local_miss(&changed_input, &annotated.operator, &arena),
-            crate::work_partition::MissKind::NewContent));
+        assert!(matches!(
+            cache.classify_local_miss(&changed_input, &annotated.operator, &arena),
+            crate::work_partition::MissKind::NewContent
+        ));
     }
 
     #[test]
@@ -2006,8 +2013,15 @@ mod tests {
         let mut results = Vec::new();
         for rows in [10, 100] {
             let mut shell = LogicalPlanNode::from_shell(OwnedLogicalPlan::new(
-                &env.bind_context, LogicalOperator::CTERef(CTERef::new(
-                    2, 3, "unbound".into(), vec!["key".into()], vec![LogicalType::Integer]))));
+                &env.bind_context,
+                LogicalOperator::CTERef(CTERef::new(
+                    2,
+                    3,
+                    "unbound".into(),
+                    vec!["key".into()],
+                    vec![LogicalType::Integer],
+                )),
+            ));
             shell.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
             let result = cache
                 .with_test_identity(|cache, identity| {

@@ -228,14 +228,12 @@ fn prove_matched_prefix_use_path(
             }
             prove_matched_prefix_use_path(filter.child.as_ref(), source_binding, kernel, byte_width)
         }
-        operator if prefix_unary_child(operator).is_some() => {
-            prove_matched_prefix_use_path(
-                prefix_unary_child(operator)?.as_ref(),
-                source_binding,
-                kernel,
-                byte_width,
-            )
-        }
+        operator if prefix_unary_child(operator).is_some() => prove_matched_prefix_use_path(
+            prefix_unary_child(operator)?.as_ref(),
+            source_binding,
+            kernel,
+            byte_width,
+        ),
         LogicalOperator::Join(Join::Comparison(join)) => prove_prefix_join_child(
             join.left.as_ref(),
             join.right.as_ref(),
@@ -400,7 +398,9 @@ fn append_prefix_through_operator(
                 .get_column_bindings()
                 .iter()
                 .position(|candidate| *candidate == binding)
-                .ok_or_else(|| rewrite_invariant("Unary operator hid an appended prefix binding"))?;
+                .ok_or_else(|| {
+                    rewrite_invariant("Unary operator hid an appended prefix binding")
+                })?;
             projection.include(ordinal);
         }
         return Ok(binding);
@@ -763,22 +763,22 @@ fn prove_candidate_profiled(
         _ => None,
     };
     prove_aggregate_topn_inputs(
-        topn.total_rows(),
-        &topn.orders,
-        output,
-        &output.child.operator,
-        output.child.stats.estimated_cardinality,
-        input_cardinality,
+        crate::aggregate::late_payload::AggregateTopNInputs {
+            total_rows: topn.total_rows(),
+            orders: &topn.orders,
+            output,
+            child_operator: &output.child.operator,
+            child_cardinality: output.child.stats.estimated_cardinality,
+            aggregate_input_cardinality: input_cardinality,
+        },
         |table| match &output.child.operator {
             LogicalOperator::Aggregate(aggregate) => unique_get(aggregate.child.as_ref(), table),
             _ => None,
         },
         |table| match &output.child.operator {
-            LogicalOperator::Aggregate(aggregate) => prove_rowid_path(
-                aggregate.child.as_ref(),
-                table,
-                RowIdPathPolicy::NonNull,
-            ),
+            LogicalOperator::Aggregate(aggregate) => {
+                prove_rowid_path(aggregate.child.as_ref(), table, RowIdPathPolicy::NonNull)
+            }
             _ => None,
         },
         cost_model,
@@ -789,18 +789,30 @@ fn prove_candidate_profiled(
 /// Aggregate payload admission over one selected child transport. The group
 /// dependency, non-null row-id witness and ordering constraints are shared by
 /// owned and native construction, rather than re-proved by each adapter.
+pub(crate) struct AggregateTopNInputs<'a, Child> {
+    pub total_rows: usize,
+    pub orders: &'a [paro_planner::binder::ir::OrderByNode],
+    pub output: &'a Projection<Child>,
+    pub child_operator: &'a LogicalOperator<Child>,
+    pub child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    pub aggregate_input_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+}
+
 pub(crate) fn prove_aggregate_topn_inputs<'a, Child>(
-    total_rows: usize,
-    orders: &[paro_planner::binder::ir::OrderByNode],
-    output: &Projection<Child>,
-    child_operator: &LogicalOperator<Child>,
-    child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
-    aggregate_input_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    inputs: AggregateTopNInputs<'_, Child>,
     unique_source: impl Fn(usize) -> Option<&'a Get>,
     path_for_source: impl Fn(usize) -> Option<RowIdPath>,
     cost_model: &CostModel,
     reasons: &mut Option<RejectionReasons>,
 ) -> Option<AggregateTopNCandidate> {
+    let AggregateTopNInputs {
+        total_rows,
+        orders,
+        output,
+        child_operator,
+        child_cardinality,
+        aggregate_input_cardinality,
+    } = inputs;
     if total_rows == 0 {
         return reject(reasons, Guard::AggregateZeroLimit);
     }
@@ -918,9 +930,8 @@ pub(crate) fn prove_aggregate_topn_inputs<'a, Child>(
             let topn_rows = u64::try_from(total_rows)
                 .ok()
                 .or_else(|| reject(reasons, Guard::AggregateMissingCardinality))?;
-            let fetched_rows = topn_rows.min(
-                child_cardinality.map_or(carrier_rows, |estimate| estimate.expected),
-            );
+            let fetched_rows =
+                topn_rows.min(child_cardinality.map_or(carrier_rows, |estimate| estimate.expected));
             let benefit = cost_model
                 .late_row_fetch_benefit(
                     carrier_rows,
@@ -974,12 +985,14 @@ fn prove_row_preserving_candidate_profiled(
         return reject(reasons, Guard::TopNProjectionShape);
     };
     prove_row_preserving_inputs(
-        topn.total_rows(),
-        &topn.orders,
-        &topn.projection_map,
-        output,
-        matches!(output.child.operator, LogicalOperator::RowFetch(_)),
-        output.child.stats.estimated_cardinality,
+        crate::aggregate::late_payload::RowPreservingInputs {
+            total_rows: topn.total_rows(),
+            orders: &topn.orders,
+            projection_map: &topn.projection_map,
+            output,
+            child_is_fetch: matches!(output.child.operator, LogicalOperator::RowFetch(_)),
+            child_cardinality: output.child.stats.estimated_cardinality,
+        },
         |table| unique_get(output.child.as_ref(), table),
         |table| prove_rowid_path(output.child.as_ref(), table, RowIdPathPolicy::RowPreserving),
         |table| source_estimated_rows(output.child.as_ref(), table),
@@ -991,19 +1004,31 @@ fn prove_row_preserving_candidate_profiled(
 /// One admission contract over exact selected inputs, independent of their
 /// owned or Memo-native child transport. Callers must resolve unique sources
 /// and path evidence without exploring unselected alternatives.
+pub(crate) struct RowPreservingInputs<'a, Child> {
+    pub total_rows: usize,
+    pub orders: &'a [paro_planner::binder::ir::OrderByNode],
+    pub projection_map: &'a ProjectionMap,
+    pub output: &'a Projection<Child>,
+    pub child_is_fetch: bool,
+    pub child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+}
+
 pub(crate) fn prove_row_preserving_inputs<'a, Child>(
-    total_rows: usize,
-    orders: &[paro_planner::binder::ir::OrderByNode],
-    projection_map: &ProjectionMap,
-    output: &Projection<Child>,
-    child_is_fetch: bool,
-    child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    inputs: RowPreservingInputs<'_, Child>,
     unique_source: impl Fn(usize) -> Option<&'a Get>,
     path_for_source: impl Fn(usize) -> Option<RowIdPath>,
     source_rows: impl Fn(usize) -> Option<u64>,
     cost_model: &CostModel,
     reasons: &mut Option<RejectionReasons>,
 ) -> Option<RowPreservingCandidate> {
+    let RowPreservingInputs {
+        total_rows,
+        orders,
+        projection_map,
+        output,
+        child_is_fetch,
+        child_cardinality,
+    } = inputs;
     if total_rows == 0 {
         return reject(reasons, Guard::TopNZeroLimit);
     }
@@ -1209,32 +1234,26 @@ pub(crate) fn prove_rowid_operator<'a, Child: 'a>(
     resolve: &impl Fn(&'a Child) -> Option<&'a LogicalOperator<Child>>,
     count: &impl Fn(&'a Child) -> Option<usize>,
 ) -> Option<RowIdPath> {
-    let recurse = |child| {
-        prove_rowid_operator(resolve(child)?, source_table_index, policy, resolve, count)
-    };
+    let recurse =
+        |child| prove_rowid_operator(resolve(child)?, source_table_index, policy, resolve, count);
     match operator {
         LogicalOperator::Get(get) => {
             (get.table_index == source_table_index).then_some(RowIdPath::Get)
         }
         LogicalOperator::Filter(filter) => {
-            recurse(&filter.child)
-                .map(|path| RowIdPath::Filter(Box::new(path)))
+            recurse(&filter.child).map(|path| RowIdPath::Filter(Box::new(path)))
         }
         LogicalOperator::Window(window) => {
-            recurse(&window.child)
-                .map(|path| RowIdPath::Window(Box::new(path)))
+            recurse(&window.child).map(|path| RowIdPath::Window(Box::new(path)))
         }
         LogicalOperator::Order(order) => {
-            recurse(&order.child)
-                .map(|path| RowIdPath::Order(Box::new(path)))
+            recurse(&order.child).map(|path| RowIdPath::Order(Box::new(path)))
         }
         LogicalOperator::Limit(limit) => {
-            recurse(&limit.child)
-                .map(|path| RowIdPath::Limit(Box::new(path)))
+            recurse(&limit.child).map(|path| RowIdPath::Limit(Box::new(path)))
         }
         LogicalOperator::EmptyResult(empty) => {
-            recurse(&empty.child)
-                .map(|path| RowIdPath::EmptyResult(Box::new(path)))
+            recurse(&empty.child).map(|path| RowIdPath::EmptyResult(Box::new(path)))
         }
         LogicalOperator::Join(Join::Comparison(join)) => prove_join_rowid_path(
             RowIdJoinKind::Comparison,
@@ -1326,7 +1345,13 @@ fn prove_join_rowid_path<'a, Child: 'a>(
     if !allowed {
         return None;
     }
-    let child = prove_rowid_operator(resolve(child_plan)?, source_table_index, policy, resolve, count)?;
+    let child = prove_rowid_operator(
+        resolve(child_plan)?,
+        source_table_index,
+        policy,
+        resolve,
+        count,
+    )?;
     Some(RowIdPath::Join {
         kind,
         side,

@@ -6,17 +6,17 @@
 //! This is a complete producer for the admitted local binding, not proof that
 //! PredicateTransfer's other bindings or the surrounding logical domain closed.
 
-use super::*;
-use crate::cascades::planner::domain_transfer;
-use crate::expression::traversal::visit_expression;
-use paro_planner::operator::{BoundReference, BoundReferenceId, LogicalOutputLayout};
-use paro_planner::plan::PlanNodeId;
-use crate::cascades::memo::LogicalExpr;
+use super::settlement::{NativeRelationEntry, NativeRelationInput};
 use super::staging::{
     intern_columns_into, ColumnInternOrigin, ResidentInputFact, ResidentInputFacts,
     ResidentNodeContract,
 };
-use super::settlement::{NativeRelationEntry, NativeRelationInput};
+use super::*;
+use crate::cascades::memo::LogicalExpr;
+use crate::cascades::planner::domain_transfer;
+use crate::expression::traversal::visit_expression;
+use paro_planner::operator::{BoundReference, BoundReferenceId, LogicalOutputLayout};
+use paro_planner::plan::PlanNodeId;
 
 fn local_domain(predicate: &Expression) -> bool {
     domain_transfer::is_local_domain(predicate)
@@ -139,16 +139,15 @@ pub(super) fn try_transfer_with_continuations(
     let Some(root) = memo.group(root_group) else {
         return Ok(None);
     };
-    let mut fixed_point = domain_transfer::DomainFixedPoint::new(
-        domain_transfer::DomainFactContext {
+    let mut fixed_point =
+        domain_transfer::DomainFixedPoint::new(domain_transfer::DomainFactContext {
             relation: root_group,
             occurrence: *expression,
             context: metadata.input_context,
             logical_facts: root.logical_fact_fingerprint(),
             statistics: root.statistics_snapshot_fingerprint(),
             binding_facts: binding_fact_value,
-        },
-    );
+        });
     let nested_path = inputs
         .iter()
         .any(|input| matches!(input, PatternOperand::Expression { .. }));
@@ -555,6 +554,7 @@ fn continuation_binding_fingerprint(
 /// Test-facing compatibility wrapper. Production callers should pass the
 /// layouts returned by `NativeShell::from_pattern_with_layouts` so the exact
 /// same shell is not walked twice.
+#[cfg(test)]
 pub(super) fn transfer_shell(
     shell: NativeShell,
     state: &PlannerTransformState,
@@ -697,9 +697,9 @@ fn transfer_shell_with_layouts(
         let operator_child_layouts = operator_children
             .iter()
             .map(|child| match child {
-                NativeChild::Node(index) => layouts.get(*index).ok_or_else(|| {
-                    paro_error::internal("native domain child layout is missing")
-                }),
+                NativeChild::Node(index) => layouts
+                    .get(*index)
+                    .ok_or_else(|| paro_error::internal("native domain child layout is missing")),
                 NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
                     Ok(layout)
                 }
@@ -985,8 +985,7 @@ fn union_domain(
 /// local closure, not a second Memo optimizer: every Node is already present
 /// in the exact PatternOperand and every leaf remains an immutable Memo hole.
 fn push_domain(
-    nodes: &mut Vec<NativeNode>,
-    layouts: &mut Vec<LogicalOutputLayout>,
+    arena: (&mut Vec<NativeNode>, &mut Vec<LogicalOutputLayout>),
     child: NativeChild,
     predicates: Vec<Expression>,
     state: &PlannerTransformState,
@@ -994,6 +993,7 @@ fn push_domain(
     fixed_point: &mut domain_transfer::DomainFixedPoint,
     path: &[usize],
 ) -> Result<RoutedDomain> {
+    let (nodes, layouts) = arena;
     if predicates.is_empty() {
         return Ok(RoutedDomain {
             child,
@@ -1083,9 +1083,10 @@ fn push_domain(
                     &[&layout],
                     &landing_predicates,
                 );
-                if transfer.as_ref().is_some_and(|transfer| {
-                    !transfer.unsupported && transfer.remaining.is_empty()
-                }) {
+                if transfer
+                    .as_ref()
+                    .is_some_and(|transfer| !transfer.unsupported && transfer.remaining.is_empty())
+                {
                     // This is the legal input landing point, not another
                     // propagation hop. Keep its exact input and namespace;
                     // combine the new restriction with the existing filter
@@ -1121,8 +1122,7 @@ fn push_domain(
             // aggregate-result residual must remain above that boundary.
             let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
             let routed = push_domain(
-                nodes,
-                layouts,
+                (nodes, layouts),
                 filter.child.clone(),
                 predicates,
                 state,
@@ -1180,8 +1180,7 @@ fn push_domain(
                 };
                 let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let routed = push_domain(
-                    nodes,
-                    layouts,
+                    (nodes, layouts),
                     projection.child.clone(),
                     vec![predicate],
                     state,
@@ -1220,8 +1219,7 @@ fn push_domain(
                 };
                 let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let routed = push_domain(
-                    nodes,
-                    layouts,
+                    (nodes, layouts),
                     aggregate.child.clone(),
                     vec![predicate],
                     state,
@@ -1285,8 +1283,7 @@ fn push_domain(
                 };
                 let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let left = push_domain(
-                    nodes,
-                    layouts,
+                    (nodes, layouts),
                     setop.left.clone(),
                     vec![left_predicate],
                     state,
@@ -1295,8 +1292,7 @@ fn push_domain(
                     &child_path(path, 0),
                 )?;
                 let right = push_domain(
-                    nodes,
-                    layouts,
+                    (nodes, layouts),
                     setop.right.clone(),
                     vec![right_predicate],
                     state,
@@ -1359,8 +1355,7 @@ fn push_domain(
                 let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let routed = if left_side {
                     push_domain(
-                        nodes,
-                        layouts,
+                        (nodes, layouts),
                         join.left.clone(),
                         vec![original_predicate.clone()],
                         state,
@@ -1370,8 +1365,7 @@ fn push_domain(
                     )?
                 } else {
                     push_domain(
-                        nodes,
-                        layouts,
+                        (nodes, layouts),
                         join.right.clone(),
                         vec![original_predicate.clone()],
                         state,
@@ -1429,8 +1423,7 @@ fn push_domain(
                 let checkpoint = journal.checkpoint(nodes, layouts, fixed_point);
                 let routed = if left_side {
                     push_domain(
-                        nodes,
-                        layouts,
+                        (nodes, layouts),
                         join.left.clone(),
                         vec![original_predicate.clone()],
                         state,
@@ -1440,8 +1433,7 @@ fn push_domain(
                     )?
                 } else {
                     push_domain(
-                        nodes,
-                        layouts,
+                        (nodes, layouts),
                         join.right.clone(),
                         vec![original_predicate.clone()],
                         state,
@@ -1487,6 +1479,7 @@ fn push_domain(
 /// second optimizer. Every opaque leaf remains the original Memo group hole.
 /// Test-facing compatibility wrapper for the closure helper. The production
 /// path uses the already-computed layouts from the pattern lowering pass.
+#[cfg(test)]
 fn transfer_shell_closure(
     shell: NativeShell,
     state: &PlannerTransformState,
@@ -1521,8 +1514,7 @@ fn transfer_shell_closure_with_layouts(
     let mut nodes = shell.nodes.into_vec();
     let mut journal = NativeRewriteJournal::default();
     let routed = push_domain(
-        &mut nodes,
-        &mut layouts,
+        (&mut nodes, &mut layouts),
         input,
         predicates,
         state,
@@ -1566,9 +1558,10 @@ fn attach_native_operator(
 ) -> Result<LogicalOperator<NativeChild>> {
     let mut ordinal = 0;
     let operator = operator.try_map_child_links(&mut |_reference| {
-        let child = links.get(ordinal).cloned().ok_or_else(|| {
-            paro_error::internal("native relation cache input arity changed")
-        })?;
+        let child = links
+            .get(ordinal)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("native relation cache input arity changed"))?;
         ordinal += 1;
         Ok::<NativeChild, paro_error::ParoError>(child)
     })?;
@@ -1580,17 +1573,17 @@ fn attach_native_operator(
     Ok(operator)
 }
 
+pub(super) type RefreshedNativeStatistics = (
+    NativeShell,
+    HashMap<PlanNodeId, SharedColumnStatistics>,
+    HashMap<PlanNodeId, ResidentNodeContract>,
+);
+
 pub(super) fn refresh_statistics(
     mut shell: NativeShell,
     state: &mut PlannerTransformState,
     memo: &Memo,
-) -> Result<
-    Option<(
-        NativeShell,
-        HashMap<PlanNodeId, SharedColumnStatistics>,
-        HashMap<PlanNodeId, ResidentNodeContract>,
-    )>,
-> {
+) -> Result<Option<RefreshedNativeStatistics>> {
     let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
     let _refresh = crate::work_partition::native_refresh(shell.nodes.len());
     use super::settlement::demand;
@@ -1686,16 +1679,17 @@ pub(super) fn refresh_statistics(
         output_columns: Box<[ColumnId]>,
         names: Arc<[String]>,
     }
+    type CompletedEvidence = (
+        Arc<BoundRelationFacts>,
+        Arc<[Arc<ColumnStatistics>]>,
+        Arc<[Fingerprint]>,
+    );
     fn completed_evidence(
         layout: &LogicalOutputLayout,
         stats: &NodeStats,
         maximum: Option<u64>,
         columns: &SharedColumnStatistics,
-    ) -> Result<(
-        Arc<BoundRelationFacts>,
-        Arc<[Arc<ColumnStatistics>]>,
-        Arc<[Fingerprint]>,
-    )> {
+    ) -> Result<CompletedEvidence> {
         let facts = Arc::new(BoundRelationFacts::new(
             BoundRelationFactValues {
                 cardinality: stats.estimated_cardinality,
@@ -1731,10 +1725,8 @@ pub(super) fn refresh_statistics(
     // OwnedLogicalPlan.  Its column map is replaced with the exact immutable
     // input view for each node below; no facts are shared across unrelated
     // native relations by accident.
-    let mut context = crate::context::OptimizationContext::new(
-        session.clone(),
-        state.bind_context.clone(),
-    );
+    let mut context =
+        crate::context::OptimizationContext::new(session.clone(), state.bind_context.clone());
     context.cost_model = state.cost_model.clone();
     for (index, node) in shell.nodes.iter_mut().enumerate() {
         if !memo.control().checkpoint()? {
@@ -1935,50 +1927,45 @@ pub(super) fn refresh_statistics(
             .iter()
             .map(|columns| columns.as_ref())
             .collect::<Vec<_>>();
-        let output_names: Arc<[String]> =
-            local.output_names_from_child_refs(child_names.as_slice()).into();
+        let output_names: Arc<[String]> = local
+            .output_names_from_child_refs(child_names.as_slice())
+            .into();
         let layout_before =
             local.output_layout_from_child_refs(&layouts.iter().collect::<Vec<_>>());
-        let (pre_output_columns, pre_scalar_roots, pre_operator_fingerprint, pre_operator_encoding) =
-            {
-                let mut identity = PlannerResidentIdentity {
-                    columns: &mut state.columns,
-                    scalars: &mut state.scalars,
-                    binding_ids: &mut state.binding_ids,
-                };
-                let output_columns = intern_columns_into(
-                    &mut identity,
-                    &layout_before,
-                    ColumnInternOrigin::Derived,
-                    Some(output_names.as_ref()),
-                )?;
-                let scalar_roots = if super::settlement::operator_has_no_scalar_payload(&local) {
-                    Box::new([])
-                } else {
-                    intern_operator_scalars(
-                        &local,
-                        &output_columns,
-                        &child_column_refs,
-                        identity.binding_ids,
-                        identity.columns,
-                        identity.scalars,
-                    )?
-                };
-                let (fingerprint, encoding) = query_operator_identity(
-                    &local,
-                    &scalar_roots,
-                    identity.scalars,
-                )?;
-                (output_columns, scalar_roots, fingerprint, encoding)
+        let (pre_output_columns, pre_scalar_roots, pre_operator_fingerprint, pre_operator_encoding) = {
+            let mut identity = PlannerResidentIdentity {
+                columns: &mut state.columns,
+                scalars: &mut state.scalars,
+                binding_ids: &mut state.binding_ids,
             };
+            let output_columns = intern_columns_into(
+                &mut identity,
+                &layout_before,
+                ColumnInternOrigin::Derived,
+                Some(output_names.as_ref()),
+            )?;
+            let scalar_roots = if super::settlement::operator_has_no_scalar_payload(&local) {
+                Box::new([])
+            } else {
+                intern_operator_scalars(
+                    &local,
+                    &output_columns,
+                    &child_column_refs,
+                    identity.binding_ids,
+                    identity.columns,
+                    identity.scalars,
+                )?
+            };
+            let (fingerprint, encoding) =
+                query_operator_identity(&local, &scalar_roots, identity.scalars)?;
+            (output_columns, scalar_roots, fingerprint, encoding)
+        };
         if let Some(cached) = state.settlement_cache.native_lookup(
             &pre_operator_encoding,
             &layout_before,
             &native_inputs,
         ) {
-            state
-                .settlement_cache
-                .native_relation_owned_assembly_skips = state
+            state.settlement_cache.native_relation_owned_assembly_skips = state
                 .settlement_cache
                 .native_relation_owned_assembly_skips
                 .saturating_add(1);
@@ -2067,36 +2054,31 @@ pub(super) fn refresh_statistics(
         let output_names: Arc<[String]> = cached_operator
             .output_names_from_child_refs(child_names.as_slice())
             .into();
-        let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) =
-            if layout == layout_before
-                && query_operator_identity(
-                    &cached_operator,
-                    &pre_scalar_roots,
-                    &state.scalars,
-                )
+        let (output_columns, scalar_roots, operator_fingerprint, operator_encoding) = if layout
+            == layout_before
+            && query_operator_identity(&cached_operator, &pre_scalar_roots, &state.scalars)
                 .is_ok_and(|(_, encoding)| encoding == pre_operator_encoding)
-            {
-                (
-                    pre_output_columns,
-                    pre_scalar_roots,
-                    pre_operator_fingerprint,
-                    pre_operator_encoding.clone(),
-                )
-            } else {
-                let mut identity = PlannerResidentIdentity {
-                    columns: &mut state.columns,
-                    scalars: &mut state.scalars,
-                    binding_ids: &mut state.binding_ids,
-                };
-                let output_columns = intern_columns_into(
-                    &mut identity,
-                    &layout,
-                    ColumnInternOrigin::Derived,
-                    Some(output_names.as_ref()),
-                )?;
-                let scalar_roots = if super::settlement::operator_has_no_scalar_payload(
-                    &cached_operator,
-                ) {
+        {
+            (
+                pre_output_columns,
+                pre_scalar_roots,
+                pre_operator_fingerprint,
+                pre_operator_encoding.clone(),
+            )
+        } else {
+            let mut identity = PlannerResidentIdentity {
+                columns: &mut state.columns,
+                scalars: &mut state.scalars,
+                binding_ids: &mut state.binding_ids,
+            };
+            let output_columns = intern_columns_into(
+                &mut identity,
+                &layout,
+                ColumnInternOrigin::Derived,
+                Some(output_names.as_ref()),
+            )?;
+            let scalar_roots =
+                if super::settlement::operator_has_no_scalar_payload(&cached_operator) {
                     Box::new([])
                 } else {
                     intern_operator_scalars(
@@ -2108,22 +2090,18 @@ pub(super) fn refresh_statistics(
                         identity.scalars,
                     )?
                 };
-                let (operator_fingerprint, operator_encoding) =
-                    query_operator_identity(&cached_operator, &scalar_roots, identity.scalars)?;
-                (
-                    output_columns,
-                    scalar_roots,
-                    operator_fingerprint,
-                    operator_encoding,
-                )
+            let (operator_fingerprint, operator_encoding) =
+                query_operator_identity(&cached_operator, &scalar_roots, identity.scalars)?;
+            (
+                output_columns,
+                scalar_roots,
+                operator_fingerprint,
+                operator_encoding,
+            )
         };
         let columns = output_columns_stats;
-        let (facts, ordered_columns, column_fingerprints) = completed_evidence(
-            &layout,
-            &stats,
-            maximum,
-            &columns,
-        )?;
+        let (facts, ordered_columns, column_fingerprints) =
+            completed_evidence(&layout, &stats, maximum, &columns)?;
         let cached = state.settlement_cache.native_insert(
             pre_operator_encoding.clone(),
             NativeRelationEntry {

@@ -95,10 +95,7 @@ pub(super) fn intern_columns_into(
             }
             let origin = match origin {
                 ColumnInternOrigin::Derived => ColumnOrigin::Derived {
-                    key: typed_binding_fingerprint(
-                        *binding,
-                        logical_type_fingerprint(ty),
-                    ),
+                    key: typed_binding_fingerprint(*binding, logical_type_fingerprint(ty)),
                 },
                 ColumnInternOrigin::Internal => ColumnOrigin::Internal {
                     key: Fingerprint(identity.columns.len() as u128),
@@ -111,12 +108,9 @@ pub(super) fn intern_columns_into(
                 ColumnVisibility::Visible,
                 names.and_then(|names| names.get(index).cloned()),
             )?;
-            identity.binding_ids.insert(
-                binding.table_index,
-                binding.column_index,
-                ty,
-                id,
-            )?;
+            identity
+                .binding_ids
+                .insert(binding.table_index, binding.column_index, ty, id)?;
             Ok(id)
         })
         .collect()
@@ -191,22 +185,32 @@ impl NativeChild {
         names: Arc<[String]>,
     ) -> Result<Self> {
         if layout.bindings().len() != layout.types().len() {
-            return Err(paro_error::internal("native Memo operand has inconsistent binding/type arity"));
+            return Err(paro_error::internal(
+                "native Memo operand has inconsistent binding/type arity",
+            ));
         }
         let group = memo.canonical_group(group);
         let transport = facts.transport(memo, state, group, layout)?;
         let reference = paro_planner::operator::BoundReference::new(
-            paro_planner::operator::BoundReferenceId::group_hole(state.bind_context.next_plan_id().0),
-            layout.bindings().to_vec(), layout.types().to_vec(),
-        ).with_facts(transport)?;
+            paro_planner::operator::BoundReferenceId::group_hole(
+                state.bind_context.next_plan_id().0,
+            ),
+            layout.bindings().to_vec(),
+            layout.types().to_vec(),
+        )
+        .with_facts(transport)?;
         let stats = NodeStats {
             estimated_cardinality: facts.cardinality(memo, group),
             unique_keys: reference.facts.unique_keys.clone(),
             ..Default::default()
         };
         Ok(Self::MemoGroup {
-            group, id: state.bind_context.next_plan_id(), stats,
-            layout: layout.as_ref().clone(), names, reference,
+            group,
+            id: state.bind_context.next_plan_id(),
+            stats,
+            layout: layout.as_ref().clone(),
+            names,
+            reference,
         })
     }
 }
@@ -255,7 +259,12 @@ impl NativeShell {
         binding: &PatternOperand,
         facts: &boundary::BoundarySnapshot,
         collect_layouts: bool,
-    ) -> Result<Option<(Self, Option<Vec<paro_planner::operator::LogicalOutputLayout>>)>> {
+    ) -> Result<
+        Option<(
+            Self,
+            Option<Vec<paro_planner::operator::LogicalOutputLayout>>,
+        )>,
+    > {
         let mut group_names = HashMap::<usize, Arc<[String]>>::new();
 
         struct Built {
@@ -293,11 +302,14 @@ impl NativeShell {
             state: &PlannerTransformState,
             facts: &boundary::BoundarySnapshot,
             operand: &PatternOperand,
-            nodes: &mut Vec<NativeNode>,
-            layouts: &mut Option<Vec<paro_planner::operator::LogicalOutputLayout>>,
+            arena: (
+                &mut Vec<NativeNode>,
+                &mut Option<Vec<paro_planner::operator::LogicalOutputLayout>>,
+            ),
             expected_layout: Option<&PlannerBindingLayout>,
             group_names: &mut HashMap<usize, Arc<[String]>>,
         ) -> Result<Option<Built>> {
+            let (nodes, layouts) = arena;
             match operand {
                 PatternOperand::Group(group_id) => {
                     let Some(layout) = expected_layout else {
@@ -344,8 +356,7 @@ impl NativeShell {
                             state,
                             facts,
                             child,
-                            nodes,
-                            layouts,
+                            (nodes, layouts),
                             Some(layout),
                             group_names,
                         )?
@@ -415,8 +426,7 @@ impl NativeShell {
             state,
             facts,
             binding,
-            &mut nodes,
-            &mut layouts,
+            (&mut nodes, &mut layouts),
             None,
             &mut group_names,
         )?
@@ -743,13 +753,13 @@ pub(super) fn stage_transformed_expression(
             ));
         }
         let columns = bindings
-            .into_iter()
+            .iter()
             .zip(types)
             .map(|(&binding, logical_type)| {
                 session
                     .state
                     .binding_ids
-                    .get(binding.table_index, binding.column_index, &logical_type)
+                    .get(binding.table_index, binding.column_index, logical_type)
                     .copied()
                     .ok_or_else(|| {
                         paro_error::internal("nested group hole references an unknown column")
@@ -1033,7 +1043,7 @@ pub(super) fn stage_transformed_expression(
             derive_logical_properties(&semantic_operator, &child_maximum_cardinalities);
         attach_group_column_domains(
             &mut logical_properties,
-            &output_bindings,
+            output_bindings,
             &output_columns,
             column_stats.as_ref(),
             &schema,
@@ -1352,26 +1362,41 @@ pub(super) fn stage_transformed_expression(
             None
         } else {
             crate::work_partition::settled_node(true);
-            let children = child_states.iter().map(|child| {
-                let reference = paro_planner::operator::BoundReference::new(
-                    child.boundary_reference_id.ok_or_else(|| paro_error::internal("settled child lost its occurrence"))?,
-                    child.layout.bindings().to_vec(),
-                    child.layout.types().to_vec(),
-                ).with_facts(child.boundary_facts.clone().ok_or_else(|| paro_error::internal("settled child lost published facts"))?)?;
-                Ok(Box::new(OwnedLogicalPlan {
-                    id: child.id, stats: child.stats.clone(),
-                    operator: LogicalOperator::BoundReference(reference),
-                }))
-            }).collect::<Result<Vec<_>>>()?;
-            Some(paro_planner::plan::arena::LogicalPlanNode {
-                id, stats: stats.clone(), operator: semantic_operator.clone(),
-            }.assemble(children)?)
+            let children = child_states
+                .iter()
+                .map(|child| {
+                    let reference = paro_planner::operator::BoundReference::new(
+                        child.boundary_reference_id.ok_or_else(|| {
+                            paro_error::internal("settled child lost its occurrence")
+                        })?,
+                        child.layout.bindings().to_vec(),
+                        child.layout.types().to_vec(),
+                    )
+                    .with_facts(child.boundary_facts.clone().ok_or_else(|| {
+                        paro_error::internal("settled child lost published facts")
+                    })?)?;
+                    Ok(Box::new(OwnedLogicalPlan {
+                        id: child.id,
+                        stats: child.stats.clone(),
+                        operator: LogicalOperator::BoundReference(reference),
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(
+                paro_planner::plan::arena::LogicalPlanNode {
+                    id,
+                    stats: stats.clone(),
+                    operator: semantic_operator.clone(),
+                }
+                .assemble(children)?,
+            )
         };
-        let semantic_template = semantic_plan::canonical_template(
-            paro_planner::plan::arena::LogicalPlanNode {
-                id, stats: NodeStats::default(), operator: semantic_operator.clone(),
-            },
-        );
+        let semantic_template =
+            semantic_plan::canonical_template(paro_planner::plan::arena::LogicalPlanNode {
+                id,
+                stats: NodeStats::default(),
+                operator: semantic_operator.clone(),
+            });
         let native_cost_inputs = native_direct.then(|| {
             let child_row_widths = child_states
                 .iter()
@@ -1428,8 +1453,8 @@ pub(super) fn stage_transformed_expression(
                 stage_search_implementation(
                     SearchStagingRequest {
                         plan: search_plan,
-                        expected_output_bindings: &output_bindings,
-                        expected_output_types: &output_types,
+                        expected_output_bindings: output_bindings,
+                        expected_output_types: output_types,
                         output_columns: &output_columns,
                         materialized_columns: &unique_columns,
                         binding_ids: &state.binding_ids,
@@ -1508,9 +1533,11 @@ pub(super) fn stage_transformed_expression(
                 &stats,
                 child_states.len(),
                 output_rows_hard_upper,
-                &child_maximum_cardinalities,
-                child_expected_rows,
-                child_row_widths,
+                (
+                    &child_maximum_cardinalities,
+                    child_expected_rows,
+                    child_row_widths,
+                ),
                 *output_row_width,
             )?
         } else {
@@ -1535,8 +1562,7 @@ pub(super) fn stage_transformed_expression(
                 .expect("native staging input must retain native cost facts");
             planner_native_cost_facts(
                 &semantic_operator,
-                child_materialization_risk_rows,
-                child_row_widths,
+                (child_materialization_risk_rows, child_row_widths),
                 *output_row_width,
                 state.scan_access_cost,
                 &native_filter_inputs,
@@ -1893,68 +1919,69 @@ pub(super) fn stage_transformed_expression(
                     }
                     let is_root = index == root_index;
                     let mut child_states = Vec::new();
-                    let operator = native_node.operator.try_map_child_links(&mut |child| {
-                        match child {
-                            NativeChild::Node(child_index) => {
-                                let (group, state) = completed
-                                    .get(child_index)
-                                    .and_then(Option::as_ref)
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        paro_error::internal(
+                    let operator =
+                        native_node
+                            .operator
+                            .try_map_child_links(&mut |child| match child {
+                                NativeChild::Node(child_index) => {
+                                    let (group, state) = completed
+                                        .get(child_index)
+                                        .and_then(Option::as_ref)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            paro_error::internal(
                                             "native staging referenced an incomplete child node",
                                         )
-                                    })?;
-                                child_states.push(state);
-                                Ok::<_, paro_error::ParoError>(group)
-                            }
-                            NativeChild::MemoGroup {
-                                group,
-                                id,
-                                stats,
-                                layout,
-                                names,
-                                reference,
-                            } => {
-                                let group = session.memo.canonical_group(group);
-                                let node = resolve_direct_group_reference(
-                                    &mut session,
+                                        })?;
+                                    child_states.push(state);
+                                    Ok::<_, paro_error::ParoError>(group)
+                                }
+                                NativeChild::MemoGroup {
                                     group,
                                     id,
                                     stats,
                                     layout,
                                     names,
                                     reference,
-                                )?;
-                                if node.group != group {
-                                    return Err(paro_error::internal(
+                                } => {
+                                    let group = session.memo.canonical_group(group);
+                                    let node = resolve_direct_group_reference(
+                                        &mut session,
+                                        group,
+                                        id,
+                                        stats,
+                                        layout,
+                                        names,
+                                        reference,
+                                    )?;
+                                    if node.group != group {
+                                        return Err(paro_error::internal(
                                         "native Memo group reference changed its group identity",
                                     ));
+                                    }
+                                    child_states.push(node);
+                                    Ok::<_, paro_error::ParoError>(group)
                                 }
-                                child_states.push(node);
-                                Ok::<_, paro_error::ParoError>(group)
-                            }
-                            NativeChild::Group {
-                                id,
-                                stats,
-                                layout,
-                                names,
-                                reference,
-                            } => {
-                                let node = resolve_group_hole_reference(
-                                    &mut session,
+                                NativeChild::Group {
                                     id,
                                     stats,
                                     layout,
                                     names,
                                     reference,
-                                )?;
-                                let group = node.group;
-                                child_states.push(node);
-                                Ok::<_, paro_error::ParoError>(group)
-                            }
-                        }
-                    })?;
+                                } => {
+                                    let node = resolve_group_hole_reference(
+                                        &mut session,
+                                        id,
+                                        stats,
+                                        layout,
+                                        names,
+                                        reference,
+                                    )?;
+                                    let group = node.group;
+                                    child_states.push(node);
+                                    Ok::<_, paro_error::ParoError>(group)
+                                }
+                            })?;
                     let resident = session.resident_nodes.remove(&native_node.id);
                     let Some((mut node, staged)) = stage_node(
                         &mut session,
@@ -2460,49 +2487,84 @@ mod tests {
     fn settled_identity_reuse_retains_fresh_column_facts() {
         use paro_planner::operator::Filter;
         use paro_storage::statistics::BaseStatistics;
-        let plan = || OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-            test_base_get(0, 70_105, "settled_fact_source", 100), vec![],
-        )));
-        let mut input = MemoBuilder::build(plan(), BindContext::new(), SearchBudget::default()).unwrap();
+        let plan = || {
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+                test_base_get(0, 70_105, "settled_fact_source", 100),
+                vec![],
+            )))
+        };
+        let mut input =
+            MemoBuilder::build(plan(), BindContext::new(), SearchBudget::default()).unwrap();
         let root = input.root;
         let mut state = input.planner_state.write().unwrap();
         state.session = Some(TestStatementContextBuilder::minimal().build());
-        let baseline = input.memo.logical_expr(input.memo.group(root).unwrap().logical_exprs()[0]).unwrap().payload;
+        let baseline = input
+            .memo
+            .logical_expr(input.memo.group(root).unwrap().logical_exprs()[0])
+            .unwrap()
+            .payload;
         let mut prior = None;
         for ndv in [8, 3, 3] {
             let root_index = state.staging_arena.import(plan()).unwrap();
-            let resident = state.staging_arena.shared_output_layout(root_index).unwrap();
+            let resident = state
+                .staging_arena
+                .shared_output_layout(root_index)
+                .unwrap();
             let column = *state.binding_ids.get(0, 0, &LogicalType::Integer).unwrap();
             let stats = Arc::new(ColumnStatistics::with_estimated_distinct(
-                BaseStatistics::create_unknown(LogicalType::Integer), Some(ndv),
+                BaseStatistics::create_unknown(LogicalType::Integer),
+                Some(ndv),
             ));
             let before = STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get);
-            let staged = stage_transformed_expression(StagingRequest {
-                input: StagingInput::Arena(root_index),
-                input_facts: boundary::BoundarySnapshot::default(),
-                column_stats: Arc::new(HashMap::from([(ColumnBinding::new(0, 0), stats)])),
-                column_stat_scopes: HashMap::new(),
-                resident_nodes: HashMap::new(),
-                target: StagingTarget {
-                    group: root, rule: RuleId(999), budget_class: TransformationBudgetClass::Local,
-                    input_context: OptimizationContextId(0), child_context: OptimizationContextId(0),
-                    refined_cardinality_kind: None,
+            let staged = stage_transformed_expression(
+                StagingRequest {
+                    input: StagingInput::Arena(root_index),
+                    input_facts: boundary::BoundarySnapshot::default(),
+                    column_stats: Arc::new(HashMap::from([(ColumnBinding::new(0, 0), stats)])),
+                    column_stat_scopes: HashMap::new(),
+                    resident_nodes: HashMap::new(),
+                    target: StagingTarget {
+                        group: root,
+                        rule: RuleId(999),
+                        budget_class: TransformationBudgetClass::Local,
+                        input_context: OptimizationContextId(0),
+                        child_context: OptimizationContextId(0),
+                        refined_cardinality_kind: None,
+                    },
+                    regions: StagingRegionRequirements {
+                        preserved_facet: None,
+                        extended_required_facets: Box::new([]),
+                        inherited_runtime_filter_facet: None,
+                    },
+                    nested_group_holes: BTreeMap::new(),
+                    selected_proofs: HashMap::new(),
                 },
-                regions: StagingRegionRequirements {
-                    preserved_facet: None, extended_required_facets: Box::new([]),
-                    inherited_runtime_filter_facet: None,
-                },
-                nested_group_holes: BTreeMap::new(), selected_proofs: HashMap::new(),
-            }, &mut input.memo, &mut state).unwrap().unwrap();
+                &mut input.memo,
+                &mut state,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(staged.payload, baseline);
-            assert_eq!(STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get), before);
-            assert_eq!(staged.logical_properties.column_domains[&column].ranking_point, ndv as u64);
+            assert_eq!(
+                STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get),
+                before
+            );
+            assert_eq!(
+                staged.logical_properties.column_domains[&column].ranking_point,
+                ndv as u64
+            );
             let value = staged.logical_properties.column_domains.clone();
             if let Some((previous_ndv, previous)) = prior {
                 assert_eq!(value == previous, ndv == previous_ndv);
             }
             prior = Some((ndv, value));
-            assert!(Arc::ptr_eq(&resident, &state.staging_arena.shared_output_layout(root_index).unwrap()));
+            assert!(Arc::ptr_eq(
+                &resident,
+                &state
+                    .staging_arena
+                    .shared_output_layout(root_index)
+                    .unwrap()
+            ));
         }
     }
 

@@ -2396,8 +2396,10 @@ mod tests {
                     257,
                 ));
                 let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
-                let mut options = PageReaderOptions::default();
-                options.cache_decoded = cache_enabled;
+                let mut options = PageReaderOptions {
+                    cache_decoded: cache_enabled,
+                    ..Default::default()
+                };
                 options.decoded_admission_policy.sequential_materialization = false;
                 let reader = PageReader::new(
                     PageReaderContext::new(1, 2, 3, 4),

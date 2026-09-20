@@ -80,15 +80,14 @@ impl PhysicalImplementation for ObservedLeaf {
     }
 }
 
-fn fixture(
-    invariant: bool,
-    rewindable: bool,
-) -> (
+type ObservedGrantFixture = (
     CascadesEngine,
     GroupId,
     OptimizationGoal,
     Arc<Mutex<Vec<(Fingerprint, GrantGoalKey)>>>,
-) {
+);
+
+fn fixture(invariant: bool, rewindable: bool) -> ObservedGrantFixture {
     let (mut engine, root, mut goal) = engine_with_budget(Default::default());
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ImplementationRegistry::default();

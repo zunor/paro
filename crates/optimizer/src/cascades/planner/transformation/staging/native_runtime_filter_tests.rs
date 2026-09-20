@@ -183,9 +183,9 @@ mod native_staging_rf_oracle {
         binding: &PatternBinding,
         source: &PlannerOperatorMetadata,
         column_stats: SharedColumnStatistics,
-        native: bool,
-        aggregate_probe: bool,
+        shape: (bool, bool),
     ) -> StagedEquivalent {
+        let (native, aggregate_probe) = shape;
         // Every attempt gets a new read context, before its first publication.
         let mut tx = TransformContext::new(memo, target);
         let facts = {
@@ -498,7 +498,7 @@ mod native_staging_rf_oracle {
         let source_values = |sources: &[PlannerRuntimeFilterSource]| {
             sources
                 .iter()
-                .map(|source| (source.source, source.rows.clone(), source.multiplicity))
+                .map(|source| (source.source, source.rows, source.multiplicity))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -560,8 +560,7 @@ mod native_staging_rf_oracle {
             &binding,
             &source,
             source_stats.clone(),
-            native_first,
-            aggregate_probe,
+            (native_first, aggregate_probe),
         );
         assert!(
             input
@@ -638,8 +637,7 @@ mod native_staging_rf_oracle {
                 &binding,
                 &source,
                 source_stats,
-                false,
-                aggregate_probe,
+                (false, aggregate_probe),
             );
             assert_eq!(
                 repeated.payload, staged.payload,

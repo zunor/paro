@@ -330,9 +330,7 @@ impl ReadScope {
     pub const PHYSICAL_FRONTIER: Self = Self(1 << 1);
     pub const LOGICAL_FACTS: Self = Self(1 << 2);
     pub const STATISTICS: Self = Self(1 << 3);
-    pub const FRONTIERS: Self = Self(
-        Self::LOGICAL_FRONTIER.0 | Self::PHYSICAL_FRONTIER.0,
-    );
+    pub const FRONTIERS: Self = Self(Self::LOGICAL_FRONTIER.0 | Self::PHYSICAL_FRONTIER.0);
     pub const FACTS: Self = Self(Self::LOGICAL_FACTS.0 | Self::STATISTICS.0);
     pub const ALL: Self = Self(Self::FRONTIERS.0 | Self::FACTS.0);
 
@@ -444,14 +442,16 @@ impl PatternRead {
                 .then(|| group_ref.physical_implementation_version()),
             physical_frontier_revision: physical_goal
                 .map(|goal| group_ref.physical_frontier_version(goal)),
-            logical_fact_fingerprint: scope
-                .contains(ReadScope::LOGICAL_FACTS)
-                .then(|| group_ref.logical_fact_fingerprint())
-                .unwrap_or_default(),
-            statistics_snapshot_fingerprint: scope
-                .contains(ReadScope::STATISTICS)
-                .then(|| memo.local_statistics_fingerprint(group))
-                .unwrap_or_default(),
+            logical_fact_fingerprint: if scope.contains(ReadScope::LOGICAL_FACTS) {
+                group_ref.logical_fact_fingerprint()
+            } else {
+                Default::default()
+            },
+            statistics_snapshot_fingerprint: if scope.contains(ReadScope::STATISTICS) {
+                memo.local_statistics_fingerprint(group)
+            } else {
+                Default::default()
+            },
         })
     }
 

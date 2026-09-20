@@ -52,12 +52,14 @@ pub(super) fn rewrite(
         return Ok(None);
     };
     let Some(candidate) = prove_aggregate_topn_inputs(
-        topn.limit.saturating_add(topn.offset),
-        &topn.orders,
-        &output,
-        &shell.nodes[aggregate_index].operator,
-        shell.nodes[aggregate_index].stats.estimated_cardinality,
-        shell.nodes[input].stats.estimated_cardinality,
+        crate::aggregate::late_payload::AggregateTopNInputs {
+            total_rows: topn.limit.saturating_add(topn.offset),
+            orders: &topn.orders,
+            output: &output,
+            child_operator: &shell.nodes[aggregate_index].operator,
+            child_cardinality: shell.nodes[aggregate_index].stats.estimated_cardinality,
+            aggregate_input_cardinality: shell.nodes[input].stats.estimated_cardinality,
+        },
         |table| {
             if occurrences(&shell, &aggregate.child, table) != Some(1) {
                 return None;

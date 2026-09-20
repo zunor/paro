@@ -484,7 +484,7 @@ impl<'a> PlanEnumerator<'a> {
             left.cost
                 .total_cmp(&right.cost)
                 .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
-                .then_with(|| left.compact_shape().cmp(&right.compact_shape()))
+                .then_with(|| left.compact_shape().cmp(right.compact_shape()))
         });
         // The resident cap is an explicit anytime policy. It can produce a
         // useful seed, but it is never evidence that the discarded frontier
@@ -508,7 +508,7 @@ impl<'a> PlanEnumerator<'a> {
                 left.cost
                     .total_cmp(&right.cost)
                     .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
-                    .then_with(|| left.compact_shape().cmp(&right.compact_shape()))
+                    .then_with(|| left.compact_shape().cmp(right.compact_shape()))
             });
         }
     }

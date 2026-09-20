@@ -79,31 +79,30 @@ use super::region::{
     RegionOwnedArtifact,
 };
 use super::rules::{
-    CostComposition, DomainContinuation, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
-    ImplementationRegistry, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
-    PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, QualityDependency,
-    ReadScope,
-    RootDispatch, RuleContext, RulePromise, SidewaysFilterSource, TaskSupplyContract,
-    TransformContext, TransformationBudgetClass, TransformationPreflight, TransformationRule,
-    WorkSourceId,
-    AGGREGATE_DIMENSION_DEFERRAL_RULE, AGGREGATE_DIMENSION_SHARING_RULE,
-    AGGREGATE_INPUT_MATERIALIZATION_RULE, AGGREGATE_JOIN_PREAGGREGATION_RULE,
-    AGGREGATE_JOIN_SUBSUMPTION_RULE, AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE,
-    CTE_DEMAND_PUSHDOWN_RULE, CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE,
-    CTE_PARTITIONED_MATERIALIZATION_RULE, JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE,
-    KEY_DOMAIN_TRANSFER_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
-    PREDICATE_TRANSFER_RULE, SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
+    CostComposition, DomainContinuation, EquivalentExpression, GrantDependencyDescriptor,
+    ImplementationContext, ImplementationRegistry, PatternBinding, PatternBindingSet,
+    PatternEnumerationCompletion, PatternOperand, PatternRead, PhysicalCandidate,
+    PhysicalImplementation, QualityDependency, RootDispatch, RuleContext, RulePromise,
+    SidewaysFilterSource, TaskSupplyContract, TransformContext, TransformationBudgetClass,
+    TransformationPreflight, TransformationRule, WorkSourceId, AGGREGATE_DIMENSION_DEFERRAL_RULE,
+    AGGREGATE_DIMENSION_SHARING_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
+    AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
+    AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_DEMAND_PUSHDOWN_RULE,
+    CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE, CTE_PARTITIONED_MATERIALIZATION_RULE,
+    JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE, KEY_DOMAIN_TRANSFER_RULE,
+    LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE, PREDICATE_TRANSFER_RULE,
+    SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
     encode_routine_identity, expression_fingerprint, intern_operator_scalars,
     logical_type_fingerprint, BindingCatalog,
 };
+use super::tasks::ReadSet;
 use crate::physical::{
     ExtractedEnforcerContract, ExtractedEnforcerContracts, ExtractedPhysicalEnforcer,
     PhysicalImplementationFlavor, WinnerPhysicalContract, WinnerPhysicalContracts,
 };
-use super::tasks::ReadSet;
 
 mod contracts;
 mod costing;
@@ -384,12 +383,7 @@ fn inspect_quality_candidate(
         if physical.id != winner.expression
             || physical.key.children != logical.key.children
             || winner.children.len() != logical.key.children.len()
-            || !selected_physical_contract_is_exact(
-                logical,
-                physical,
-                metadata,
-                &physical_payload,
-            )
+            || !selected_physical_contract_is_exact(logical, physical, metadata, &physical_payload)
         {
             return Ok(None);
         }
@@ -551,12 +545,12 @@ fn selected_aggregate_region_shape_refs(
                         .get(join_logical.payload.index())
                         .map(|payload| &payload.semantic_template.operator)
                     {
-                        if !join_operator.conditions.is_empty()
-                            && join_node.children.len() == 2
-                        {
+                        if !join_operator.conditions.is_empty() && join_node.children.len() == 2 {
                             let outer = match operator {
                                 Some(LogicalOperator::Aggregate(outer)) => outer,
-                                _ => unreachable!("aggregate operator disappeared during inspection"),
+                                _ => {
+                                    unreachable!("aggregate operator disappeared during inspection")
+                                }
                             };
                             shape.decomposed = join_node.children.iter().any(|partial| {
                                 let Some(partial_node) = quality_node(nodes, *partial) else {
@@ -624,9 +618,11 @@ fn selected_subtree_contains_union_refs(
             )
         });
     is_union
-        || node.children.iter().copied().any(|child| {
-            selected_subtree_contains_union_refs(memo, state, child, nodes, visited)
-        })
+        || node
+            .children
+            .iter()
+            .copied()
+            .any(|child| selected_subtree_contains_union_refs(memo, state, child, nodes, visited))
 }
 
 fn collect_quality_node_choices(
@@ -651,10 +647,13 @@ fn collect_quality_node_choices(
     let Some(physical) = memo.physical_expr(node.physical) else {
         return false;
     };
-    choices.push(candidate_choice_fingerprint(reference, winner, logical, physical));
-    node.children.iter().copied().all(|child| {
-        collect_quality_node_choices(memo, child, nodes, choices, visited)
-    })
+    choices.push(candidate_choice_fingerprint(
+        reference, winner, logical, physical,
+    ));
+    node.children
+        .iter()
+        .copied()
+        .all(|child| collect_quality_node_choices(memo, child, nodes, choices, visited))
 }
 
 fn collect_quality_region_fact_fingerprint(
@@ -730,12 +729,12 @@ fn selected_aggregate_region_witnesses_refs(
         memo: &Memo,
         state: &PlannerTransformState,
         reference: ChildWinnerRef,
-        root_candidate: CandidateId,
-        goal: OptimizationGoal,
+        region_root: (CandidateId, OptimizationGoal),
         nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
         path: &mut Vec<u32>,
         witnesses: &mut Vec<AggregateRegionWitness>,
     ) -> Option<()> {
+        let (root_candidate, goal) = region_root;
         let node = quality_node(nodes, reference)?;
         let logical = memo.logical_expr(node.logical)?;
         let operator = state
@@ -818,8 +817,7 @@ fn selected_aggregate_region_witnesses_refs(
                         memo,
                         state,
                         arm,
-                        root_candidate,
-                        goal,
+                        (root_candidate, goal),
                         nodes,
                         path,
                         witnesses,
@@ -834,8 +832,7 @@ fn selected_aggregate_region_witnesses_refs(
                 memo,
                 state,
                 child,
-                root_candidate,
-                goal,
+                (root_candidate, goal),
                 nodes,
                 path,
                 witnesses,
@@ -847,36 +844,24 @@ fn selected_aggregate_region_witnesses_refs(
         memo,
         state,
         root,
-        root.candidate,
-        goal,
+        (root.candidate, goal),
         &nodes,
         &mut path,
         &mut witnesses,
     )?;
     if witnesses.is_empty() {
         let mut shape_visited = BTreeSet::new();
-        let shape = selected_aggregate_region_shape_refs(
-            memo,
-            state,
-            root,
-            &nodes,
-            &mut shape_visited,
-        );
+        let shape =
+            selected_aggregate_region_shape_refs(memo, state, root, &nodes, &mut shape_visited);
         if shape.aggregates > 0 {
             let mut choices = Vec::new();
             let mut choice_visited = BTreeSet::new();
-            if !collect_quality_node_choices(
-                memo,
-                root,
-                &nodes,
-                &mut choices,
-                &mut choice_visited,
-            ) {
+            if !collect_quality_node_choices(memo, root, &nodes, &mut choices, &mut choice_visited)
+            {
                 return None;
             }
-            let fact_fingerprint = collect_quality_region_fact_fingerprint(
-                memo, root, root, goal, &nodes,
-            )?;
+            let fact_fingerprint =
+                collect_quality_region_fact_fingerprint(memo, root, root, goal, &nodes)?;
             let mut region = StableFingerprintBuilder::default();
             region.write_bytes(b"paro.quality.aggregate-region.root.v1");
             region.write_u64(root.candidate.index() as u64);
@@ -957,12 +942,9 @@ fn planner_quality_preflight(
     // plain scans, joins, and structural alternatives which could never enter
     // the corresponding quality bundle.
     let pending_domain_transfers = if has_filter && has_get {
-        let Some(pending) = quality_domain::pending_transfers_for_refs(
-            memo,
-            reference,
-            &nodes,
-            state,
-        ) else {
+        let Some(pending) =
+            quality_domain::pending_transfers_for_refs(memo, reference, &nodes, state)
+        else {
             return Ok(None);
         };
         pending
@@ -988,13 +970,9 @@ fn planner_quality_preflight(
         facts.insert(BundleFact::JoinRegion);
     }
     let aggregate_regions = if has_aggregate && has_cte_consumer && has_cte_producer {
-        let Some(regions) = selected_aggregate_region_witnesses_refs(
-            memo,
-            state,
-            reference,
-            &nodes,
-            goal,
-        ) else {
+        let Some(regions) =
+            selected_aggregate_region_witnesses_refs(memo, state, reference, &nodes, goal)
+        else {
             return Ok(None);
         };
         regions
@@ -1460,54 +1438,61 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         frozen: &FrozenCandidate,
         goal: OptimizationGoal,
     ) -> Result<Option<NativeQualityEvidence>> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityEvidence);
+        let _partition =
+            crate::work_partition::enter(crate::work_partition::Bucket::QualityEvidence);
         let state = self.state.read().expect("planner transform state poisoned");
         let Some(required) = memo.required(goal.required) else {
             return Ok(None);
         };
         let mut capabilities = BTreeSet::new();
         let mut facts = BTreeSet::new();
-        let mut choices = Vec::new();
-        let mut rules = BTreeSet::new();
-        let mut shape = NativeQualityShape::default();
-        let mut cte_producers = BTreeSet::new();
-        let mut cte_consumers = BTreeSet::new();
-        let mut cte_producer_witnesses = BTreeSet::new();
-        let mut has_filter = false;
-        let mut has_get = false;
-        let mut has_join = false;
-        let mut has_join_region = false;
-        let mut has_aggregate = false;
-        let mut has_cte_consumer = false;
-        let mut has_cte_producer = false;
-        let mut has_ordering = false;
-        let mut has_graph = false;
-        let mut has_dependent = false;
-        let mut exact_contract = true;
-        let mut visited = BTreeSet::new();
+        #[derive(Default)]
+        struct QualityWalk {
+            choices: Vec<Fingerprint>,
+            rules: BTreeSet<RuleId>,
+            shape: NativeQualityShape,
+            cte_producers: BTreeSet<usize>,
+            cte_consumers: BTreeSet<usize>,
+            cte_producer_witnesses: BTreeSet<usize>,
+            has_filter: bool,
+            has_get: bool,
+            has_join: bool,
+            has_join_region: bool,
+            has_aggregate: bool,
+            has_cte_consumer: bool,
+            has_cte_producer: bool,
+            has_ordering: bool,
+            has_graph: bool,
+            has_dependent: bool,
+            exact_contract: bool,
+            visited: BTreeSet<CandidateId>,
+        }
 
         fn visit(
             frozen: &FrozenCandidate,
             state: &PlannerTransformState,
-            choices: &mut Vec<Fingerprint>,
-            rules: &mut BTreeSet<RuleId>,
-            shape: &mut NativeQualityShape,
-            cte_producers: &mut BTreeSet<usize>,
-            cte_consumers: &mut BTreeSet<usize>,
-            cte_producer_witnesses: &mut BTreeSet<usize>,
-            has_filter: &mut bool,
-            has_get: &mut bool,
-            has_join: &mut bool,
-            has_join_region: &mut bool,
-            has_aggregate: &mut bool,
-            has_cte_consumer: &mut bool,
-            has_cte_producer: &mut bool,
-            has_ordering: &mut bool,
-            has_graph: &mut bool,
-            has_dependent: &mut bool,
-            exact_contract: &mut bool,
-            visited: &mut BTreeSet<CandidateId>,
+            walk: &mut QualityWalk,
         ) -> Result<()> {
+            let QualityWalk {
+                choices,
+                rules,
+                shape,
+                cte_producers,
+                cte_consumers,
+                cte_producer_witnesses,
+                has_filter,
+                has_get,
+                has_join,
+                has_join_region,
+                has_aggregate,
+                has_cte_consumer,
+                has_cte_producer,
+                has_ordering,
+                has_graph,
+                has_dependent,
+                exact_contract,
+                visited,
+            } = walk;
             if !visited.insert(frozen.reference.candidate) {
                 return Ok(());
             }
@@ -1633,54 +1618,36 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
                 shape.runtime_filter_joins = shape.runtime_filter_joins.saturating_add(1);
             }
             for child in frozen.children.iter() {
-                visit(
-                    child,
-                    state,
-                    choices,
-                    rules,
-                    shape,
-                    cte_producers,
-                    cte_consumers,
-                    cte_producer_witnesses,
-                    has_filter,
-                    has_get,
-                    has_join,
-                    has_join_region,
-                    has_aggregate,
-                    has_cte_consumer,
-                    has_cte_producer,
-                    has_ordering,
-                    has_graph,
-                    has_dependent,
-                    exact_contract,
-                    visited,
-                )?;
+                visit(child, state, walk)?;
             }
             Ok(())
         }
 
-        visit(
-            frozen,
-            &state,
-            &mut choices,
-            &mut rules,
-            &mut shape,
-            &mut cte_producers,
-            &mut cte_consumers,
-            &mut cte_producer_witnesses,
-            &mut has_filter,
-            &mut has_get,
-            &mut has_join,
-            &mut has_join_region,
-            &mut has_aggregate,
-            &mut has_cte_consumer,
-            &mut has_cte_producer,
-            &mut has_ordering,
-            &mut has_graph,
-            &mut has_dependent,
-            &mut exact_contract,
-            &mut visited,
-        )?;
+        let mut walk = QualityWalk {
+            exact_contract: true,
+            ..QualityWalk::default()
+        };
+        visit(frozen, &state, &mut walk)?;
+        let QualityWalk {
+            choices,
+            rules,
+            mut shape,
+            cte_producers,
+            cte_consumers,
+            cte_producer_witnesses,
+            has_filter,
+            has_get,
+            has_join,
+            has_join_region,
+            has_aggregate,
+            has_cte_consumer,
+            has_cte_producer,
+            has_ordering,
+            has_graph,
+            has_dependent,
+            exact_contract,
+            ..
+        } = walk;
         if !exact_contract || choices.is_empty() {
             return Ok(None);
         }
@@ -1814,26 +1781,27 @@ fn record_frozen_candidate_trace(
     let mut choices = Vec::new();
     let mut reads = BTreeSet::new();
     let mut visited = BTreeSet::new();
+    type TraceChoice = (
+        ChildWinnerRef,
+        LogicalExprId,
+        PhysicalExprId,
+        Fingerprint,
+        u32,
+        u32,
+        u64,
+        u32,
+        Box<[ChildWinnerRef]>,
+        Box<[RuleId]>,
+        Box<[RuleId]>,
+        Box<[EquivalenceProof]>,
+        Option<RuleId>,
+        Box<[EquivalenceProof]>,
+    );
     fn visit(
         memo: &Memo,
         state: &PlannerTransformState,
         frozen: &FrozenCandidate,
-        choices: &mut Vec<(
-            ChildWinnerRef,
-            LogicalExprId,
-            PhysicalExprId,
-            Fingerprint,
-            u32,
-            u32,
-            u64,
-            u32,
-            Box<[ChildWinnerRef]>,
-            Box<[RuleId]>,
-            Box<[RuleId]>,
-            Box<[EquivalenceProof]>,
-            Option<RuleId>,
-            Box<[EquivalenceProof]>,
-        )>,
+        choices: &mut Vec<TraceChoice>,
         reads: &mut BTreeSet<PatternRead>,
         visited: &mut BTreeSet<CandidateId>,
     ) -> Result<()> {

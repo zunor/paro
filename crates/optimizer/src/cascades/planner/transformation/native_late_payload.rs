@@ -42,10 +42,14 @@ pub(super) fn try_native_late_payload_prefix(
         let aggregate_input = match shell.root_operator() {
             LogicalOperator::TopN(topn) => super::native_topn_payload::node(&topn.child)
                 .and_then(|index| match &shell.nodes[index].operator {
-                    LogicalOperator::Projection(output) => super::native_topn_payload::node(&output.child),
+                    LogicalOperator::Projection(output) => {
+                        super::native_topn_payload::node(&output.child)
+                    }
                     _ => None,
                 })
-                .is_some_and(|index| matches!(shell.nodes[index].operator, LogicalOperator::Aggregate(_))),
+                .is_some_and(|index| {
+                    matches!(shell.nodes[index].operator, LogicalOperator::Aggregate(_))
+                }),
             _ => false,
         };
         if aggregate_input {
@@ -519,7 +523,7 @@ mod tests {
                     vec![LogicalType::Varchar],
                     source_table(),
                 ))));
-                let (left, right) = if wrapper % 2 == 0 {
+                let (left, right) = if wrapper.is_multiple_of(2) {
                     (filter, peer)
                 } else {
                     (peer, filter)

@@ -1906,7 +1906,7 @@ fn enumerate_pattern_bindings(
                 return Ok(Vec::new());
             }
             let recursion_cuts = self.recursion_cuts;
-            let mut expressions = if let (Some(state), Some(operator_types)) =
+            let mut expressions = if let (Some(_state), Some(operator_types)) =
                 (self.state, scope.candidate_operator_types())
             {
                 let mut indexed = BTreeSet::new();
@@ -2582,6 +2582,7 @@ mod failure_tests;
 
 #[cfg(test)]
 mod tests {
+    use crate::cascades::rules::ReadScope;
     use super::*;
 
     fn deferral_dispatch_input() -> OptimizationInput {
@@ -3093,13 +3094,8 @@ mod tests {
 
         memo.update_group_facts(group, |properties, cardinality| {
             properties.maximum_cardinality = Some(11);
-            *cardinality = GroupCardinality::new(
-                Fingerprint(31),
-                CardinalityRecipeKind::Statistics,
-                1,
-                2,
-                3,
-            );
+            *cardinality =
+                GroupCardinality::new(Fingerprint(31), CardinalityRecipeKind::Statistics, 1, 2, 3);
             Ok(())
         })
         .unwrap();

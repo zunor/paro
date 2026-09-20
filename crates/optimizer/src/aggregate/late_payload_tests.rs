@@ -501,18 +501,40 @@ fn aggregate_topn_shared_admission_requires_selected_evidence() {
     ] {
         let mut reasons = Some(RejectionReasons::default());
         let result = prove_aggregate_topn_inputs(
-            topn.total_rows(), &topn.orders, output, &output.child.operator,
-            if case == 4 { None } else { output.child.stats.estimated_cardinality },
-            if case == 3 { None } else { aggregate.child.stats.estimated_cardinality },
-            |source| {
-                assert_eq!(source, SOURCE);
-                if case == 2 { None } else { Some(get) }
+            crate::aggregate::late_payload::AggregateTopNInputs {
+                total_rows: topn.total_rows(),
+                orders: &topn.orders,
+                output,
+                child_operator: &output.child.operator,
+                child_cardinality: if case == 4 {
+                    None
+                } else {
+                    output.child.stats.estimated_cardinality
+                },
+                aggregate_input_cardinality: if case == 3 {
+                    None
+                } else {
+                    aggregate.child.stats.estimated_cardinality
+                },
             },
             |source| {
                 assert_eq!(source, SOURCE);
-                if case == 1 { None } else { Some(RowIdPath::Get) }
+                if case == 2 {
+                    None
+                } else {
+                    Some(get)
+                }
             },
-            &CostModel::default(), &mut reasons,
+            |source| {
+                assert_eq!(source, SOURCE);
+                if case == 1 {
+                    None
+                } else {
+                    Some(RowIdPath::Get)
+                }
+            },
+            &CostModel::default(),
+            &mut reasons,
         );
         let mut counts = TransformationRejectionCounts::default();
         counts.record(reasons.unwrap());

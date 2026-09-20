@@ -10,6 +10,7 @@ use std::sync::Arc;
 use paro_common::types::LogicalType;
 
 use super::*;
+use crate::cascades::rules::ReadScope;
 use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::ids::{

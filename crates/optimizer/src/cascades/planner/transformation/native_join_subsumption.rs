@@ -455,13 +455,15 @@ fn try_substitute_reduction_join(
     Ok(Some((nodes, NativeChild::Node(index), replacement)))
 }
 
+type ReductionSumExposure = (Expression, Option<(usize, ColumnBinding, LogicalType)>);
+
 fn expose_reduction_sum(
     nodes: &mut Vec<NativeNode>,
     current: NativeChild,
     preserved_key: ColumnBinding,
     detail: &DetailScan,
     outer_sum: &OuterSum,
-) -> paro_common::error::Result<Option<(Expression, Option<(usize, ColumnBinding, LogicalType)>)>> {
+) -> paro_common::error::Result<Option<ReductionSumExposure>> {
     let NativeChild::Node(index) = current else {
         return Ok(None);
     };

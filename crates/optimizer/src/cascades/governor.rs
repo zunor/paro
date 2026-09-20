@@ -360,6 +360,6 @@ mod tests {
         assert!(!governor.is_search_complete());
         governor.proof_stop(BoundProofId(2));
         assert!(governor.is_search_complete());
-        assert!(governor.snapshot().omitted_work == false);
+        assert!(!governor.snapshot().omitted_work);
     }
 }

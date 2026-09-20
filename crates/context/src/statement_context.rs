@@ -34,6 +34,13 @@ pub struct CompileEnvironmentKey {
     pub grant_limits: (usize, usize),
 }
 
+/// The binding namespace captured together by both live and frozen sessions.
+pub struct CompileNamespace<'a> {
+    pub database: &'a str,
+    pub schema: &'a str,
+    pub search_path: &'a [CatalogSearchEntry],
+}
+
 impl CompileEnvironmentKey {
     /// Capture every input that can change binding or physical planning.
     ///
@@ -42,9 +49,7 @@ impl CompileEnvironmentKey {
     /// contract and forces every capture site to supply it at compile time;
     /// cache-key construction must never drift silently between the two.
     pub fn capture(
-        current_database: &str,
-        current_schema: &str,
-        search_path: &[CatalogSearchEntry],
+        namespace: CompileNamespace<'_>,
         visible_generation: u64,
         catalog_epochs: impl IntoIterator<Item = (u64, u64)>,
         settings: &EffectiveSettings,
@@ -54,9 +59,9 @@ impl CompileEnvironmentKey {
         let mut catalog_epochs = catalog_epochs.into_iter().collect::<Vec<_>>();
         catalog_epochs.sort_unstable_by_key(|(database_id, _)| *database_id);
         Self {
-            current_database: current_database.to_string(),
-            current_schema: current_schema.to_string(),
-            search_path: search_path.to_vec(),
+            current_database: namespace.database.to_string(),
+            current_schema: namespace.schema.to_string(),
+            search_path: namespace.search_path.to_vec(),
             visible_generation,
             catalog_epochs,
             planning_settings_fingerprint: settings.planning_fingerprint(),
@@ -347,9 +352,11 @@ impl StatementContext {
 
     pub fn compile_environment_key(&self) -> CompileEnvironmentKey {
         CompileEnvironmentKey::capture(
-            &self.env.current_database,
-            &self.env.current_schema,
-            &self.env.search_path,
+            CompileNamespace {
+                database: &self.env.current_database,
+                schema: &self.env.current_schema,
+                search_path: &self.env.search_path,
+            },
             self.databases.visible_generation,
             self.databases
                 .iter()
@@ -380,9 +387,11 @@ mod tests {
     fn compile_environment_canonicalizes_catalog_identity_order() {
         let context = TestStatementContextBuilder::minimal().build();
         let key = CompileEnvironmentKey::capture(
-            "paro",
-            "public",
-            &[],
+            super::CompileNamespace {
+                database: "paro",
+                schema: "public",
+                search_path: &[],
+            },
             17,
             [(9, 90), (2, 20), (5, 50)],
             context.settings.as_ref(),

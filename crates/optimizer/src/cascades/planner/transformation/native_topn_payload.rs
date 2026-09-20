@@ -127,12 +127,14 @@ pub(super) fn rewrite(
         return Ok(None);
     };
     let Some(candidate) = crate::aggregate::late_payload::prove_row_preserving_inputs(
-        total_rows,
-        &topn.orders,
-        &topn.projection_map,
-        &output,
-        matches!(shell.nodes[input].operator, LogicalOperator::RowFetch(_)),
-        shell.nodes[input].stats.estimated_cardinality,
+        crate::aggregate::late_payload::RowPreservingInputs {
+            total_rows,
+            orders: &topn.orders,
+            projection_map: &topn.projection_map,
+            output: &output,
+            child_is_fetch: matches!(shell.nodes[input].operator, LogicalOperator::RowFetch(_)),
+            child_cardinality: shell.nodes[input].stats.estimated_cardinality,
+        },
         |table| {
             if occurrences(&shell, &output.child, table) != Some(1) {
                 return None;
