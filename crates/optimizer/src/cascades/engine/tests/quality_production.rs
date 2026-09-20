@@ -47,13 +47,27 @@ struct DomainRule;
 
 struct CountSelectedBindings(Arc<std::sync::atomic::AtomicUsize>);
 impl TransformationRule for CountSelectedBindings {
-    fn id(&self) -> RuleId { crate::cascades::rules::PREDICATE_TRANSFER_RULE }
-    fn matches_root(&self, _: &crate::cascades::memo::LogicalExpr) -> bool { false }
-    fn matches(&self, _: &crate::cascades::memo::LogicalExpr, _: &RuleContext<'_>) -> bool { false }
-    fn apply(&self, _: LogicalExprId, _: &mut TransformContext<'_>) -> Result<Box<[EquivalentExpression]>> {
+    fn id(&self) -> RuleId {
+        crate::cascades::rules::PREDICATE_TRANSFER_RULE
+    }
+    fn matches_root(&self, _: &crate::cascades::memo::LogicalExpr) -> bool {
+        false
+    }
+    fn matches(&self, _: &crate::cascades::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        false
+    }
+    fn apply(
+        &self,
+        _: LogicalExprId,
+        _: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
         Ok(Box::new([]))
     }
-    fn selected_quality_bindings(&self, _: &Memo, _: &FrozenCandidate) -> Result<Box<[PatternBinding]>> {
+    fn selected_quality_bindings(
+        &self,
+        _: &Memo,
+        _: &FrozenCandidate,
+    ) -> Result<Box<[PatternBinding]>> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Box::new([]))
     }
@@ -61,12 +75,15 @@ impl TransformationRule for CountSelectedBindings {
 
 #[test]
 fn quality_request_rejects_before_binding_construction_but_reopens_stale_reads() {
-    use crate::cascades::quality::BundleFact::{PredicateDomain, JoinRegion, CteConsumerDemand};
+    use crate::cascades::quality::BundleFact::{CteConsumerDemand, JoinRegion, PredicateDomain};
     use std::sync::atomic::{AtomicUsize, Ordering};
     for reverse in [false, true] {
         let mut f = Fixture::new(reverse, [101, 102, 103]);
         let calls = Arc::new(AtomicUsize::new(0));
-        f.engine.registry.register_transformation(CountSelectedBindings(calls.clone())).unwrap();
+        f.engine
+            .registry
+            .register_transformation(CountSelectedBindings(calls.clone()))
+            .unwrap();
         let evidence = f.evidence([true, true]);
         // Independent ranking oracle: smaller number of missing facts wins;
         // equal cost/identity leaves the existing request and its payload intact.
@@ -76,16 +93,34 @@ fn quality_request_rejects_before_binding_construction_but_reopens_stale_reads()
             (vec![PredicateDomain, JoinRegion, CteConsumerDemand], 1),
             (vec![PredicateDomain], 2),
         ] {
-            f.engine.record_quality_production_request(f.goal, &f.frozen, f.reads, &evidence, &missing).unwrap();
+            f.engine
+                .record_quality_production_request(f.goal, &f.frozen, f.reads, &evidence, &missing)
+                .unwrap();
             assert_eq!(calls.load(Ordering::Relaxed), expected);
         }
         // Only a child fact changes. Ranking cannot authorize retention of
         // stale work; a worse request must still rebuild in the new context.
-        f.engine.memo.group_mut(f.regions[0]).unwrap().logical_properties.maximum_cardinality = Some(1);
-        let reads = f.engine.winner_fact_reads(f.frozen.reference.group, &f.frozen.winner).unwrap();
+        f.engine
+            .memo
+            .group_mut(f.regions[0])
+            .unwrap()
+            .logical_properties
+            .maximum_cardinality = Some(1);
+        let reads = f
+            .engine
+            .winner_fact_reads(f.frozen.reference.group, &f.frozen.winner)
+            .unwrap();
         let reads = f.engine.task_registry.intern_read_set(reads);
         assert_ne!(reads, f.reads);
-        f.engine.record_quality_production_request(f.goal, &f.frozen, reads, &evidence, &[PredicateDomain, JoinRegion]).unwrap();
+        f.engine
+            .record_quality_production_request(
+                f.goal,
+                &f.frozen,
+                reads,
+                &evidence,
+                &[PredicateDomain, JoinRegion],
+            )
+            .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 }
@@ -518,11 +553,12 @@ fn quality_production_aggregate_coverage_does_not_hide_missing_domain_work() {
         f.engine.pop_transformation_task(&mut agenda).unwrap(),
         Some(f.task(a, 101))
     );
-    assert!(f
-        .engine
-        .pop_transformation_task(&mut agenda)
-        .unwrap()
-        .is_none());
+    assert!(
+        f.engine
+            .pop_transformation_task(&mut agenda)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -583,11 +619,12 @@ fn quality_production_does_not_promote_other_alternatives_of_the_selected_group(
         Some(other),
         "the nonselected alternative remains in the legal agenda"
     );
-    assert!(f
-        .engine
-        .pop_transformation_task(&mut agenda)
-        .unwrap()
-        .is_none());
+    assert!(
+        f.engine
+            .pop_transformation_task(&mut agenda)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -638,11 +675,12 @@ fn quality_production_exact_frozen_root_requests_only_its_uncovered_anchor() {
         Some(f.task(a, 101)),
         "covered region stays runnable but is not preferred"
     );
-    assert!(f
-        .engine
-        .pop_transformation_task(&mut agenda)
-        .unwrap()
-        .is_none());
+    assert!(
+        f.engine
+            .pop_transformation_task(&mut agenda)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(f.engine.quality_producer_dispatch_count, 1);
 
     f.record(&f.evidence([true, true]));
@@ -718,11 +756,12 @@ fn quality_production_round_robin_preserves_the_entire_finite_agenda_under_id_pe
             );
             assert_eq!(seen, exact);
             assert_eq!(order.iter().copied().collect::<BTreeSet<_>>(), expected);
-            assert!(f
-                .engine
-                .pop_transformation_task(&mut agenda)
-                .unwrap()
-                .is_none());
+            assert!(
+                f.engine
+                    .pop_transformation_task(&mut agenda)
+                    .unwrap()
+                    .is_none()
+            );
             assert!(agenda.keys.is_empty() && agenda.tasks.is_empty());
             assert_eq!(f.engine.quality_producer_dispatch_count, 4);
             orders.insert(order);
@@ -739,13 +778,14 @@ fn quality_production_child_fact_change_revokes_old_readset_priority() {
     let mut f = Fixture::new(false, [101, 102, 103]);
     let [a, b] = f.regions;
     f.record(&f.evidence([true, false]));
-    assert!(f
-        .engine
-        .task_registry
-        .read_set(f.reads)
-        .unwrap()
-        .is_current(f.engine.memo())
-        .unwrap());
+    assert!(
+        f.engine
+            .task_registry
+            .read_set(f.reads)
+            .unwrap()
+            .is_current(f.engine.memo())
+            .unwrap()
+    );
     let root_read =
         PatternRead::facts_from_group(f.engine.memo(), f.frozen.reference.group).unwrap();
     // Change only a child's facts, not the root, expression IDs, or frozen DAG.
@@ -759,13 +799,14 @@ fn quality_production_child_fact_change_revokes_old_readset_priority() {
         PatternRead::facts_from_group(f.engine.memo(), f.frozen.reference.group).unwrap(),
         root_read
     );
-    assert!(!f
-        .engine
-        .task_registry
-        .read_set(f.reads)
-        .unwrap()
-        .is_current(f.engine.memo())
-        .unwrap());
+    assert!(
+        !f.engine
+            .task_registry
+            .read_set(f.reads)
+            .unwrap()
+            .is_current(f.engine.memo())
+            .unwrap()
+    );
     let mut agenda = f.agenda(&[(f.unrelated, 101, 0), (a, 5, 1), (b, 101, 2)]);
     assert_eq!(
         f.engine.pop_transformation_task(&mut agenda).unwrap(),
@@ -780,11 +821,12 @@ fn quality_production_child_fact_change_revokes_old_readset_priority() {
         f.engine.pop_transformation_task(&mut agenda).unwrap(),
         Some(f.task(b, 101))
     );
-    assert!(f
-        .engine
-        .pop_transformation_task(&mut agenda)
-        .unwrap()
-        .is_none());
+    assert!(
+        f.engine
+            .pop_transformation_task(&mut agenda)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(f.engine.quality_producer_dispatch_count, 0);
 }
 
@@ -800,11 +842,12 @@ fn quality_production_wrapped_arms_rotate_by_region_and_refresh_same_candidate_c
     }
     let missing = f.evidence([false, false]);
     for witness in missing.aggregate_regions.iter() {
-        assert!(f
-            .frozen
-            .children
-            .iter()
-            .any(|arm| arm.reference.candidate == witness.anchor));
+        assert!(
+            f.frozen
+                .children
+                .iter()
+                .any(|arm| arm.reference.candidate == witness.anchor)
+        );
     }
     f.record(&missing);
     let candidate = f.frozen.reference.candidate;
@@ -884,11 +927,12 @@ fn quality_production_wrapped_arms_rotate_by_region_and_refresh_same_candidate_c
         assert!(seen.insert(task));
     }
     assert_eq!(seen, exact);
-    assert!(f
-        .engine
-        .pop_transformation_task(&mut agenda)
-        .unwrap()
-        .is_none());
+    assert!(
+        f.engine
+            .pop_transformation_task(&mut agenda)
+            .unwrap()
+            .is_none()
+    );
     assert!(agenda.keys.is_empty() && agenda.tasks.is_empty());
     assert_eq!(f.engine.quality_producer_dispatch_count, 2);
 }

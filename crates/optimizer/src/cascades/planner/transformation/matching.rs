@@ -2726,15 +2726,17 @@ mod tests {
             expression,
             &state,
         ));
-        assert!(cached_negative_root_reads(
-            PlannerTransformation::AggregateDimensionDeferral,
-            input.root,
-            expression.id,
-            &input.memo,
-            &state,
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            cached_negative_root_reads(
+                PlannerTransformation::AggregateDimensionDeferral,
+                input.root,
+                expression.id,
+                &input.memo,
+                &state,
+            )
+            .unwrap()
+            .is_none()
+        );
         let bindings = scoped_pattern_bindings(
             PlannerTransformation::AggregateDimensionDeferral,
             input.root,
@@ -2919,10 +2921,12 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(before
-            .reads
-            .iter()
-            .all(|read| read.is_current(&input.memo).unwrap()));
+        assert!(
+            before
+                .reads
+                .iter()
+                .all(|read| read.is_current(&input.memo).unwrap())
+        );
         let after = enumerate_pattern_bindings(
             input.root,
             expression,

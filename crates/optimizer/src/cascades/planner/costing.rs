@@ -1402,11 +1402,11 @@ fn apply_execution_memory_contract(
     max_concurrent_tasks: u16,
     cost: &mut SearchCost,
 ) -> Result<()> {
+    use crate::physical::MemoryCompletion;
     use crate::physical::resources::{
-        ExecutionMemoryContract, BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES,
+        BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES, ExecutionMemoryContract,
         SPILL_BUFFER_MINIMUM_BYTES,
     };
-    use crate::physical::MemoryCompletion;
 
     let stateful = retained_memory_upper > 0
         || matches!(
@@ -2287,8 +2287,8 @@ pub(super) fn external_operator_cost(
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_filtered_probe_work, sort_work, topn_work, CompactRange, RuntimeFilterExactness,
-        RuntimeFilterProbeMultiplicity,
+        CompactRange, RuntimeFilterExactness, RuntimeFilterProbeMultiplicity,
+        runtime_filtered_probe_work, sort_work, topn_work,
     };
 
     #[test]

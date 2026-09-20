@@ -3,10 +3,10 @@
 
 //! Detail TopN's two row-fetch frontiers, operating only on selected native nodes.
 
-use super::staging::{NativeChild, NativeNode, NativeShell};
 use super::PlannerTransformState;
+use super::staging::{NativeChild, NativeNode, NativeShell};
 use crate::aggregate::late_payload::{
-    prove_rowid_operator, RowIdJoinSide, RowIdPath, RowIdPathPolicy,
+    RowIdJoinSide, RowIdPath, RowIdPathPolicy, prove_rowid_operator,
 };
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::error::{self as error, Result};

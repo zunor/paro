@@ -14,10 +14,10 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::NodeStats;
 
-use super::staging::{NativeChild, NativeNode, NativeShell};
 use super::PlannerTransformState;
+use super::staging::{NativeChild, NativeNode, NativeShell};
 use crate::aggregate::late_payload::{
-    prefix_unary_child, prefix_unary_child_mut, prove_rowid_operator, RowIdPathPolicy,
+    RowIdPathPolicy, prefix_unary_child, prefix_unary_child_mut, prove_rowid_operator,
 };
 use crate::expression::traversal::visit_expression;
 

@@ -15,7 +15,9 @@ use super::*;
 use crate::cascades::memo::LogicalExpr;
 use crate::cascades::planner::domain_transfer;
 use crate::expression::traversal::visit_expression;
-use paro_planner::operator::{BoundReference, BoundReferenceId, LogicalOutputLayout};
+use paro_planner::operator::{
+    BoundReference, BoundReferenceId, LogicalOutputLayout,
+};
 use paro_planner::plan::PlanNodeId;
 
 fn local_domain(predicate: &Expression) -> bool {
@@ -84,11 +86,13 @@ pub(super) fn try_transfer_with_continuations(
     {
         return Ok(None);
     }
-    let [PatternOperand::Expression {
-        expression: input,
-        children: inputs,
-        ..
-    }] = children.as_ref()
+    let [
+        PatternOperand::Expression {
+            expression: input,
+            children: inputs,
+            ..
+        },
+    ] = children.as_ref()
     else {
         return Ok(None);
     };

@@ -182,10 +182,11 @@ fn rejected_native_materialization_does_not_rebuild_the_selected_binding() {
             let bridges = semantic_plan::owned_binding_instantiation_count();
             let arena = state.read().unwrap().staging_arena.len();
             let mut context = TransformContext::new(&mut input.memo, input.root);
-            assert!(rule
-                .apply_binding(&binding, &mut context)
-                .unwrap()
-                .is_empty());
+            assert!(
+                rule.apply_binding(&binding, &mut context)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 semantic_plan::owned_binding_instantiation_count(),
                 bridges,
@@ -537,20 +538,24 @@ fn production_materialization_keeps_success_when_another_input_is_rejected() {
                 assert_eq!(actual.reduction_index, expected.reduction_index);
                 assert!(actual.predicate.equals(&expected.predicate));
                 assert_eq!(actual.reducers.len(), expected.reducers.len());
-                assert!(actual
-                    .reducers
-                    .iter()
-                    .zip(&expected.reducers)
-                    .all(|(a, b)| a.equals(b)));
+                assert!(
+                    actual
+                        .reducers
+                        .iter()
+                        .zip(&expected.reducers)
+                        .all(|(a, b)| a.equals(b))
+                );
                 assert_eq!(
                     actual.scalar_expressions.len(),
                     expected.scalar_expressions.len()
                 );
-                assert!(actual
-                    .scalar_expressions
-                    .iter()
-                    .zip(&expected.scalar_expressions)
-                    .all(|(a, b)| a.equals(b)));
+                assert!(
+                    actual
+                        .scalar_expressions
+                        .iter()
+                        .zip(&expected.scalar_expressions)
+                        .all(|(a, b)| a.equals(b))
+                );
             }
             assert_eq!(
                 actual

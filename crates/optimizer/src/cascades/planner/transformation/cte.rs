@@ -621,16 +621,26 @@ mod tests {
         // deliberately defers optional search in every other class. Neither
         // a budget failure nor a missing publication may hide in that list.
         use crate::cascades::budget::{SearchIncompleteReason, SearchObligation};
-        let deferred = grants.iter()
+        let deferred = grants
+            .iter()
             .filter(|class| class.id.index() != expected.index)
             .map(|class| SearchObligation {
                 group: None,
                 reason: SearchIncompleteReason::OptionalGrantDeferred(class.id),
                 witness: Fingerprint(u128::from(class.id.0)),
-            }).collect::<BTreeSet<_>>();
+            })
+            .collect::<BTreeSet<_>>();
         assert!(result.search_summary.exhaustion_events.is_empty());
         assert_eq!(result.search_summary.obligations.len(), deferred.len());
-        assert_eq!(result.search_summary.obligations.iter().cloned().collect::<BTreeSet<_>>(), deferred);
+        assert_eq!(
+            result
+                .search_summary
+                .obligations
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            deferred
+        );
     }
 
     fn bind_requirement(
@@ -780,10 +790,12 @@ mod tests {
         let (input, requirement, plan, _) =
             bind_requirement(owner(consumers), PlannerTransformation::CteFilterPushdown);
         let state = input.planner_state.read().unwrap();
-        assert!(requirement
-            .restrict_predicate_domain(plan.plan, &input.memo, &state)
-            .unwrap()
-            .is_none());
+        assert!(
+            requirement
+                .restrict_predicate_domain(plan.plan, &input.memo, &state)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -880,10 +892,12 @@ mod tests {
             ),
         );
         let original_holes = plan.group_holes.clone();
-        assert!(requirement
-            .inline(plan.plan, &mut plan.group_holes, &input.bind_context)
-            .unwrap()
-            .is_none());
+        assert!(
+            requirement
+                .inline(plan.plan, &mut plan.group_holes, &input.bind_context)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(plan.group_holes, original_holes);
     }
 
@@ -1108,10 +1122,12 @@ mod tests {
         assert_eq!(inlined.output_layout(), original_layout);
         assert_eq!(holes.len(), 2);
         assert!(holes.values().all(|group| *group == requirement.producer));
-        assert!(inlined
-            .children()
-            .iter()
-            .all(|child| matches!(child.operator, LogicalOperator::Projection(_))));
+        assert!(
+            inlined
+                .children()
+                .iter()
+                .all(|child| matches!(child.operator, LogicalOperator::Projection(_)))
+        );
     }
 
     #[test]
@@ -1124,16 +1140,11 @@ mod tests {
                 vec![],
             )),
         )));
-        let mut input = MemoBuilder::build(
-            input_plan,
-            BindContext::new(),
-            SearchBudget::default(),
-        )
-        .unwrap();
+        let mut input =
+            MemoBuilder::build(input_plan, BindContext::new(), SearchBudget::default()).unwrap();
         let planner_state = input.planner_state.clone();
-        planner_state.write().unwrap().session = Some(
-            paro_context::TestStatementContextBuilder::minimal().build(),
-        );
+        planner_state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
         let binding = {
             let state = planner_state.read().unwrap();
             let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
@@ -1213,14 +1224,9 @@ mod tests {
         };
         let (shell, layouts) = {
             let state = input.planner_state.read().unwrap();
-            NativeShell::from_pattern_with_layouts(
-                &input.memo,
-                &state,
-                &binding.root,
-                &facts,
-            )
-            .unwrap()
-            .unwrap()
+            NativeShell::from_pattern_with_layouts(&input.memo, &state, &binding.root, &facts)
+                .unwrap()
+                .unwrap()
         };
         let original_layout = shell.root_layout().unwrap();
         let mut state = input.planner_state.write().unwrap();
@@ -1256,9 +1262,8 @@ mod tests {
         )
         .unwrap();
         let planner_state = input.planner_state.clone();
-        planner_state.write().unwrap().session = Some(
-            paro_context::TestStatementContextBuilder::minimal().build(),
-        );
+        planner_state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
         let binding = {
             let state = planner_state.read().unwrap();
             let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
@@ -1284,7 +1289,10 @@ mod tests {
         let mut context = TransformContext::new(&mut input.memo, input.root);
         let outputs = rule.apply_binding(&binding, &mut context).unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_eq!(planner_state.read().unwrap().staging_arena.len(), before_arena);
+        assert_eq!(
+            planner_state.read().unwrap().staging_arena.len(),
+            before_arena
+        );
         assert_eq!(planner_state.read().unwrap().cte_partition_labels.len(), 2);
     }
 
@@ -1299,9 +1307,8 @@ mod tests {
         )
         .unwrap();
         let planner_state = input.planner_state.clone();
-        planner_state.write().unwrap().session = Some(
-            paro_context::TestStatementContextBuilder::minimal().build(),
-        );
+        planner_state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
         let binding = {
             let state = planner_state.read().unwrap();
             let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
@@ -1372,9 +1379,8 @@ mod tests {
         )
         .unwrap();
         let planner_state = input.planner_state.clone();
-        planner_state.write().unwrap().session = Some(
-            paro_context::TestStatementContextBuilder::minimal().build(),
-        );
+        planner_state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
         let binding = {
             let state = planner_state.read().unwrap();
             let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
@@ -1507,9 +1513,10 @@ impl CteRequirement {
             NativeChild::Node(index) => index,
             NativeChild::MemoGroup { .. } | NativeChild::Group { .. } => return Ok(None),
         };
-        let original_layout = layouts.get(root).cloned().ok_or_else(|| {
-            paro_error::internal("native CTE inline owner layout is missing")
-        })?;
+        let original_layout = layouts
+            .get(root)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("native CTE inline owner layout is missing"))?;
         let mut nodes = shell.nodes.into_vec();
         let mut seen = 0usize;
         for occurrence in &self.occurrences {
@@ -1526,11 +1533,8 @@ impl CteRequirement {
             {
                 return Ok(None);
             }
-            let Some(expressions) = cte_projection_expressions(
-                &owner,
-                producer_layout,
-                &reference,
-            )?
+            let Some(expressions) =
+                cte_projection_expressions(&owner, producer_layout, &reference)?
             else {
                 return Ok(None);
             };
@@ -1632,8 +1636,7 @@ impl CteRequirement {
         let Some(predicates) = crate::cte::predicate_domain::derive_producer_predicates(
             references,
             &producer_reference.bindings,
-        )
-        else {
+        ) else {
             return Ok(None);
         };
         let proof = CteDomainProof::new(self.definition, predicates.clone(), std::iter::empty());
@@ -1644,9 +1647,10 @@ impl CteRequirement {
         let NativeChild::Node(consumer_root) = owner.child else {
             return Ok(None);
         };
-        let original_layout = layouts.get(root).cloned().ok_or_else(|| {
-            paro_error::internal("native CTE filter owner layout is missing")
-        })?;
+        let original_layout = layouts
+            .get(root)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("native CTE filter owner layout is missing"))?;
         let producer_edge = owner.cte_query.clone();
         let mut nodes = shell.nodes.into_vec();
         for occurrence in &self.occurrences {
@@ -1776,9 +1780,10 @@ impl CteRequirement {
         let NativeChild::Node(consumer_root) = owner.child.clone() else {
             return Ok(None);
         };
-        let original_layout = layouts.get(root).cloned().ok_or_else(|| {
-            paro_error::internal("native CTE demand owner layout is missing")
-        })?;
+        let original_layout = layouts
+            .get(root)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("native CTE demand owner layout is missing"))?;
         let mut nodes = shell.nodes.to_vec();
         let mut domain: Option<NativeChild> = None;
         let mut domain_layout = None;
@@ -1897,9 +1902,7 @@ impl CteRequirement {
                 }
                 Ok(JoinCondition::new(
                     Expression::ColumnRef(ColumnRefExpression::new(binding, ty.clone()).into()),
-                    Expression::ColumnRef(
-                        ColumnRefExpression::new(domain_binding, ty).into(),
-                    ),
+                    Expression::ColumnRef(ColumnRefExpression::new(domain_binding, ty).into()),
                     JoinComparisonType::Equal,
                 ))
             })
@@ -2028,9 +2031,10 @@ impl CteRequirement {
         let NativeChild::Node(consumer_root) = owner.child else {
             return Ok(Vec::new());
         };
-        let original_layout = layouts.get(root).cloned().ok_or_else(|| {
-            paro_error::internal("native CTE partition owner layout is missing")
-        })?;
+        let original_layout = layouts
+            .get(root)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("native CTE partition owner layout is missing"))?;
         let candidates = self
             .occurrences
             .iter()
@@ -2062,9 +2066,8 @@ impl CteRequirement {
                 else {
                     return Ok(results);
                 };
-                let partition = if let Some(partition) = values
-                    .iter()
-                    .position(|candidate| candidate.equals(value))
+                let partition = if let Some(partition) =
+                    values.iter().position(|candidate| candidate.equals(value))
                 {
                     partition
                 } else {
@@ -2799,7 +2802,7 @@ impl CteRequirement {
         memo: &Memo,
         state: &PlannerTransformState,
     ) -> Result<Option<(OwnedLogicalPlan, CteDomainProof)>> {
-        use crate::cte::predicate_domain::{derive_producer_predicates, FilteredCTERef};
+        use crate::cte::predicate_domain::{FilteredCTERef, derive_producer_predicates};
         let LogicalOperator::MaterializedCTE(cte) = &mut plan.operator else {
             return Err(paro_error::internal("CTE requirement lost its owner"));
         };
@@ -3032,11 +3035,7 @@ impl CteRequirement {
     }
 }
 
-fn native_path_node(
-    nodes: &[NativeNode],
-    root: usize,
-    path: &[usize],
-) -> Option<usize> {
+fn native_path_node(nodes: &[NativeNode], root: usize, path: &[usize]) -> Option<usize> {
     let mut current = root;
     for ordinal in path {
         let node = nodes.get(current)?;
@@ -3088,8 +3087,7 @@ fn clone_native_memo_group(
     };
     let id = state.bind_context.next_plan_id();
     let mut reference = reference.clone();
-    reference.reference_id =
-        paro_planner::operator::BoundReferenceId::group_hole(id.0);
+    reference.reference_id = paro_planner::operator::BoundReferenceId::group_hole(id.0);
     Ok(NativeChild::MemoGroup {
         group: *group,
         id,

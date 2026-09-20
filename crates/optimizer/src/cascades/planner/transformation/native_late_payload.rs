@@ -17,7 +17,7 @@ use paro_planner::expression::OperatorType;
 use paro_planner::operator::{Join, LogicalOperator};
 
 use super::staging::{NativeChild, NativeShell};
-use super::{boundary, Memo, PatternOperand, PlannerTransformState};
+use super::{Memo, PatternOperand, PlannerTransformState, boundary};
 
 /// Try the supported LatePayloadFetch contracts on the native shell.
 ///
@@ -286,7 +286,7 @@ fn native_prefix_path(
                     ancestors,
                     filter: None,
                     get: *index,
-                })
+                });
             }
             LogicalOperator::Filter(filter) => {
                 if let NativeChild::Node(child) = &filter.child {
@@ -338,8 +338,8 @@ mod tests {
     use paro_catalog::entry::{
         CatalogObjectId, ColumnDefinition, CreateTableInfo, TableCatalogEntry,
     };
-    use paro_function::scalar::string::get_substring_functions;
     use paro_function::scalar::ScalarBindInput;
+    use paro_function::scalar::string::get_substring_functions;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, OperatorExpression,
@@ -348,7 +348,7 @@ mod tests {
     use paro_planner::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
 
-    use super::super::{matching, PlannerTransformation};
+    use super::super::{PlannerTransformation, matching};
     use crate::cascades::budget::{BudgetDimension, SearchBudget};
     use crate::cascades::planner::MemoBuilder;
 
@@ -659,11 +659,12 @@ mod tests {
             crate::aggregate::late_payload::prove_prefix_outputs(&expressions, |_, _, _| None,)
                 .is_none()
         );
-        assert!(crate::aggregate::late_payload::prove_prefix_outputs(
-            &expressions,
-            |_, _, _| Some(true),
-        )
-        .is_none());
+        assert!(
+            crate::aggregate::late_payload::prove_prefix_outputs(&expressions, |_, _, _| Some(
+                true
+            ),)
+            .is_none()
+        );
         let repeated = [substring(source(binding)), substring(source(binding))];
         assert_eq!(
             crate::aggregate::late_payload::prove_prefix_outputs(&repeated, |_, _, _| Some(true),)
@@ -700,9 +701,11 @@ mod tests {
         assert!(!changed);
         let mut counts = TransformationRejectionCounts::default();
         counts.record(reasons.unwrap());
-        assert!(counts
-            .iter()
-            .any(|(guard, count)| guard == Guard::SelectiveInvalidColumn && count == 1));
+        assert!(
+            counts
+                .iter()
+                .any(|(guard, count)| guard == Guard::SelectiveInvalidColumn && count == 1)
+        );
     }
 
     #[test]
@@ -732,20 +735,33 @@ mod tests {
     fn production_prefix_reuses_existing_derived_scan_output() {
         use crate::cascades::rules::TransformationRule;
         let mut plan = production_plan(0);
-        let LogicalOperator::Projection(output) = &mut plan.operator else { unreachable!() };
-        let LogicalOperator::Filter(filter) = &mut output.child.operator else { unreachable!() };
-        let LogicalOperator::Get(get) = &mut filter.child.operator else { unreachable!() };
+        let LogicalOperator::Projection(output) = &mut plan.operator else {
+            unreachable!()
+        };
+        let LogicalOperator::Filter(filter) = &mut output.child.operator else {
+            unreachable!()
+        };
+        let LogicalOperator::Get(get) = &mut filter.child.operator else {
+            unreachable!()
+        };
         let reused = get.append_matched_utf8_prefix(0, 2, LogicalType::Varchar);
         assert_eq!(reused.column_index, 1);
-        let mut input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        let mut input =
+            MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
         input.planner_state.write().unwrap().session =
             Some(paro_context::TestStatementContextBuilder::minimal().build());
         let state = input.planner_state.read().unwrap();
         let expr = input.memo.group(input.root).unwrap().logical_exprs()[0];
         let bindings = matching::scoped_pattern_bindings(
-            PlannerTransformation::LatePayloadFetch, input.root, expr, &input.memo,
-            &state, None, BudgetDimension::RuleWorkPerGroup,
-        ).unwrap();
+            PlannerTransformation::LatePayloadFetch,
+            input.root,
+            expr,
+            &input.memo,
+            &state,
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap();
         drop(state);
         let mut ctx = super::super::TransformContext::new(&mut input.memo, input.root);
         let rule = super::super::PlannerTransformationRule {
@@ -755,13 +771,18 @@ mod tests {
         let bridges = super::super::semantic_plan::owned_binding_instantiation_count();
         let outputs = rule.apply_binding(&bindings.bindings[0], &mut ctx).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(bridges, super::super::semantic_plan::owned_binding_instantiation_count());
+        assert_eq!(
+            bridges,
+            super::super::semantic_plan::owned_binding_instantiation_count()
+        );
         let state = input.planner_state.read().unwrap();
         let payload = &state.payloads.logical[outputs[0].payload.index()];
         let LogicalOperator::Projection(output) = &payload.semantic_template.operator else {
             unreachable!()
         };
-        let Expression::ColumnRef(column) = &output.expressions[0] else { unreachable!() };
+        let Expression::ColumnRef(column) = &output.expressions[0] else {
+            unreachable!()
+        };
         assert_eq!(column.binding, reused);
         drop(state);
         drop(outputs);
@@ -955,13 +976,15 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .max = 100_000;
-                assert!(super::super::native_selective_payload::rewrite(
-                    original,
-                    original_layouts,
-                    &state
-                )
-                .unwrap()
-                .is_none());
+                assert!(
+                    super::super::native_selective_payload::rewrite(
+                        original,
+                        original_layouts,
+                        &state
+                    )
+                    .unwrap()
+                    .is_none()
+                );
             } else {
                 assert!(matches!(
                     projection.expressions.get(usize::from(wrapper == 15)),
@@ -975,7 +998,7 @@ mod tests {
                 assert!(matches!(projection.expressions[0], Expression::Function(_)));
             }
             if wrapper == 10 || wrapper == 11 {
-                use crate::aggregate::late_payload::{prove_rowid_operator, RowIdPathPolicy};
+                use crate::aggregate::late_payload::{RowIdPathPolicy, prove_rowid_operator};
                 use paro_planner::operator::JoinType;
                 for (join_type, allowed) in [
                     (JoinType::Inner, true),

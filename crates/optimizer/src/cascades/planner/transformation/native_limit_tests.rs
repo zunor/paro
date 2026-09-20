@@ -133,8 +133,11 @@ fn native_limit_positive_and_negative_bindings_never_export_owned_ir() {
                     expected,
                     "topn={topn}, count={count}, offset={offset}, control={control}"
                 );
-                assert_eq!(semantic_plan::owned_binding_instantiation_count(), before,
-                "native negative results must not export owned IR: topn={topn}, count={count}, offset={offset}");
+                assert_eq!(
+                    semantic_plan::owned_binding_instantiation_count(),
+                    before,
+                    "native negative results must not export owned IR: topn={topn}, count={count}, offset={offset}"
+                );
                 if let Some(output) = outputs.first() {
                     let state = state.read().unwrap();
                     let operator = &state.payloads.logical[output.payload.index()]

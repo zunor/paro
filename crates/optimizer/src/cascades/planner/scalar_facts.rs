@@ -337,19 +337,14 @@ mod tests {
         )
         .unwrap();
         let mut complete_reads = 0;
-        assert!(NativeScalarFacts::derive(
-            &operator,
-            &roots,
-            &scalars,
-            &bindings,
-            &columns,
-            || {
+        assert!(
+            NativeScalarFacts::derive(&operator, &roots, &scalars, &bindings, &columns, || {
                 complete_reads += 1;
                 Ok(true)
-            }
-        )
-        .unwrap()
-        .is_some());
+            })
+            .unwrap()
+            .is_some()
+        );
         for limit in 0..complete_reads {
             let mut reads = 0;
             let outcome =
@@ -443,9 +438,11 @@ mod tests {
                 .len(),
             1
         );
-        assert!(derive(&operator(vec![col(0, 0, 0)], vec![sum(case(0))]))
-            .materializable_inputs
-            .is_empty());
+        assert!(
+            derive(&operator(vec![col(0, 0, 0)], vec![sum(case(0))]))
+                .materializable_inputs
+                .is_empty()
+        );
         assert!(
             derive(&operator(vec![], vec![sum(case(0)), sum(col(0, 0, 0))]))
                 .materializable_inputs
@@ -457,9 +454,11 @@ mod tests {
                 .len(),
             1
         );
-        assert!(derive(&operator(vec![], vec![sum(case(1))]))
-            .materializable_inputs
-            .is_empty());
+        assert!(
+            derive(&operator(vec![], vec![sum(case(1))]))
+                .materializable_inputs
+                .is_empty()
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::native_topn_payload::restore_root_output;
-use super::super::{boundary, matching, PlannerTransformation, TransformContext};
+use super::super::{PlannerTransformation, TransformContext, boundary, matching};
 use super::*;
 use crate::cascades::budget::{BudgetDimension, SearchBudget};
 use crate::cascades::planner::MemoBuilder;
@@ -284,10 +284,12 @@ fn native_aggregate_topn_exact_group_remap_apply_and_rollback() {
 #[test]
 fn native_aggregate_topn_omits_fetch_when_payload_not_projected() {
     check(fixture(Some(vec![0]), false), true, |_, result| {
-        assert!(!result
-            .nodes
-            .iter()
-            .any(|n| matches!(n.operator, LogicalOperator::RowFetch(_))));
+        assert!(
+            !result
+                .nodes
+                .iter()
+                .any(|n| matches!(n.operator, LogicalOperator::RowFetch(_)))
+        );
         let LogicalOperator::Projection(output) = result.root_operator() else {
             unreachable!()
         };
