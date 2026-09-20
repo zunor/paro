@@ -76,7 +76,7 @@ def main():
         paro_optimizer_verify=args.verify,
     )
     report = {
-        "schema_version": 1, "measurement_mode": "correctness_diagnostic",
+        "schema_version": 2, "measurement_mode": "correctness_diagnostic",
         "result_contract_version": contract.RESULT_CONTRACT_VERSION,
         "result_contract_sha256": content_digest(contract_path),
         "binary_sha256": content_digest(args.binary),
@@ -86,6 +86,7 @@ def main():
         "duckdb_extension_sha256": content_digest(Path(_duckdb.__file__)),
         "duckdb_database_sha256": content_digest(args.duckdb),
         "optimizer_verify": args.verify, "handoff": args.handoff,
+        "default_null_order": "NULLS_LAST_ON_ASC_FIRST_ON_DESC",
         "harness_files": {p.name: content_digest(p) for p in
             sorted((args.harness / "corpora").glob("*.py"))},
         "result_sets": [],
@@ -108,6 +109,7 @@ def main():
             with connection, duckdb.connect(str(args.duckdb), read_only=True) as oracle:
                 oracle.execute("SET threads=4")
                 oracle.execute("SET memory_limit='2GB'")
+                oracle.execute("SET default_null_order='NULLS_LAST_ON_ASC_FIRST_ON_DESC'")
                 statements = oracle.extract_statements(query)
                 with connection.cursor(binary=True) as cursor:
                     # psycopg extended protocol accepts one statement at a time.
@@ -126,21 +128,31 @@ def main():
                             "actual": [[encode_value(v) for v in r] for r in actual_rows],
                             "expected": [[encode_value(v) for v in r] for r in expected_rows],
                         }
-                        try:
-                            assert_compatible_schema(actual_schema, expected_schema, query=sql)
-                            assert_same_multiset(
-                                canonicalize_rows(actual_rows, actual_schema),
-                                canonicalize_rows(expected_rows, expected_schema),
-                            )
+                        item["checks"] = {}
+                        def check(name, operation):
+                            try:
+                                operation()
+                                item["checks"][name] = {"status": "pass"}
+                            except AssertionError as error:
+                                item["checks"][name] = {"status": "fail", "error": str(error)}
+                        check("schema", lambda: assert_compatible_schema(
+                            actual_schema, expected_schema, query=sql))
+                        check("exact_multiset", lambda: assert_same_multiset(
+                            canonicalize_rows(actual_rows, actual_schema),
+                            canonicalize_rows(expected_rows, expected_schema)))
+                        def check_order():
                             keys = contract.parse_order_contract(sql, expected_schema)
                             a_order = contract.assert_peer_order(canonicalize_rows(actual_rows, actual_schema), keys)
                             e_order = contract.assert_peer_order(canonicalize_rows(expected_rows, expected_schema), keys)
                             if a_order != e_order:
                                 raise AssertionError("ordered key sequence differs")
-                            item["oracle_status"] = "exact_match"
-                        except AssertionError as error:
-                            item["oracle_status"] = "mismatch"
-                            item["error"] = str(error)
+                        check("order", check_order)
+                        failures = [name + ": " + result["error"]
+                                    for name, result in item["checks"].items()
+                                    if result["status"] != "pass"]
+                        item["oracle_status"] = "mismatch" if failures else "exact_match"
+                        if failures:
+                            item["error"] = "\n".join(failures)
                         report["result_sets"].append(item)
     except Exception as error:
         report["execution_error"] = f"{type(error).__name__}: {error}"
