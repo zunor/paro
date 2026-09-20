@@ -6,10 +6,11 @@ claim.
 
 ## Active baseline
 
-`re-op` is at `7f0f5251` (`fix(protocol): retain compile lease with pending
-output`) with an empty index and no active tracked or untracked experiment
-delta. The transport commit is the only new production change from this
-turn. The pre-transport source is recoverable at
+`re-op` is at `1b54b432` (`docs(protocol): record bounded terminal ownership`)
+with an empty index and no active tracked or untracked experiment delta. The
+production transport repair is `76cc9e0c` (`fix(protocol): bound cancelled
+terminal output`); the current commit adds only its evidence and disposition
+documents. The pre-transport source is recoverable at
 `refs/codex/recovery/reop-before-transport` (`bd43b308`); the post-transport,
 pre-parking point is recoverable at
 `refs/codex/recovery/reop-after-transport-before-park` (`7f0f5251`).
@@ -61,11 +62,25 @@ is by the recorded worktree path and HEAD, or by the branch/ref shown.
 | `/private/tmp/paro-struct-clean` | 30,035,048 KiB | dirty detached / `d3097038` | Concurrent experiment; untouched, restore only through its owner. |
 | `/private/tmp/paro-nchain-clean` | 785,500 KiB | clean detached / `d4557653` | Historical evidence tree; retain. |
 | `/private/tmp/paro-reop-transport-recovery.us6Zni` | 218,608 KiB | recovery archive | Contains patches, manifests, and parked evidence; retain until the user approves archival cleanup. |
+| `/private/tmp/paro-transport-regress-final.U6jewj` | 9,840 KiB | fresh validation data only | Rebuildable SQL-regress data; retained for this receipt, no source or unique evidence. |
+| `/private/tmp/paro-transport-regress-final2.J2BVi0` | 9,840 KiB | fresh validation data only | Rebuildable SQL-regress data; retained for this receipt, no source or unique evidence. |
 
-There are also 42 registered residual/missing historical worktree entries in
-the preserved inventory (`worktrees.json`). They were not pruned because the
-registration may be the only recovery pointer for old evidence. The largest
-reclaim candidates are target caches under the clean validation trees above;
-they are rebuildable in principle, but no deletion was performed in this
-turn. Source trees, unique evidence, and worktree registrations require a
-separate explicit cleanup decision.
+The preserved inventory (`worktrees.json`) contains 42 registered
+`ResidualNotWorktree` directories and 7 `Missing` registrations, 49 entries
+in those two categories and 65 entries including the 16 live worktrees. They
+were not pruned because a registration may be the only recovery pointer for
+old evidence. The largest reclaim candidates are target caches under the
+clean validation trees above; they are rebuildable in principle, but no
+deletion was performed in this turn. Source trees, unique evidence, and
+worktree registrations require a separate explicit cleanup decision.
+
+The 15-file tracked WIP also has a durable recovery copy at
+`/Users/linjunhong/paro-convergence-archive/20260921/reop-transport-recovery/`.
+Its base is `c4a79abd`; `unstaged.patch` has SHA-256
+`6588a2df89ab0e7fefa03d4ba1baa4449db3bc9e5996423478d85da103c0c2a3`, and the
+empty staged patch has SHA-256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`. The
+tracked portion is additionally reconstructible from
+`refs/codex/recovery/reop-wip-tracked-20260921`; the parked 83-file evidence
+manifest remains outside production Git. The temporary originals and other
+worktrees were not deleted.
