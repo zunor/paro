@@ -50,6 +50,7 @@ def main():
     # explicitly versioned by this checkout. Do not accidentally consume an
     # older contract already imported by the external lifecycle helper.
     contract_path = Path(__file__).resolve().parents[1] / "corpora/tpcds_result_contract.py"
+    sys.path.insert(0, str(contract_path.parent))
     spec = importlib.util.spec_from_file_location("capture_result_contract", contract_path)
     contract = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = contract
@@ -131,25 +132,11 @@ def main():
                             "actual": [[encode_value(v) for v in r] for r in actual_rows],
                             "expected": [[encode_value(v) for v in r] for r in expected_rows],
                         }
-                        item["checks"] = {}
-                        def check(name, operation):
-                            try:
-                                operation()
-                                item["checks"][name] = {"status": "pass"}
-                            except AssertionError as error:
-                                item["checks"][name] = {"status": "fail", "error": str(error)}
-                        check("schema", lambda: assert_compatible_schema(
-                            actual_schema, expected_schema, query=sql))
-                        check("exact_multiset", lambda: assert_same_multiset(
-                            canonicalize_rows(actual_rows, actual_schema),
-                            canonicalize_rows(expected_rows, expected_schema)))
-                        def check_order():
-                            keys = contract.parse_order_contract(sql, expected_schema)
-                            a_order = contract.assert_peer_order(canonicalize_rows(actual_rows, actual_schema), keys)
-                            e_order = contract.assert_peer_order(canonicalize_rows(expected_rows, expected_schema), keys)
-                            if a_order != e_order:
-                                raise AssertionError("ordered key sequence differs")
-                        check("order", check_order)
+                        from bound_result_contract import BoundResult, CATALOG_SQL, catalog_from_rows, result_verdicts
+                        metadata = oracle.execute(CATALOG_SQL).fetchall()
+                        bound = BoundResult(sql, oracle, catalog_from_rows(metadata))
+                        item["checks"] = result_verdicts(bound, actual_rows, actual_schema,
+                                                        expected_rows, expected_schema)
                         failures = [name + ": " + result["error"]
                                     for name, result in item["checks"].items()
                                     if result["status"] != "pass"]

@@ -13,66 +13,12 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from decimal import Decimal
 from typing import Any, Sequence
 
-from exact_result_value import evidence_bytes, validate_exact
-
-
-class ResultContractError(AssertionError):
-    pass
+from exact_result_value import ResultContractError, evidence_bytes, validate_exact
 
 
 RESULT_CONTRACT_VERSION = "typed-result-v3"
-
-
-def _select_expressions(sql: str, *, label_only: bool = False) -> list[dict[str, Any]]:
-    """Parse, never execute, SQL using the pinned oracle's syntax reader.
-
-    Parser locations are not output identity. No algebraic rewriting, name
-    erasure or type conversion is performed. Unsupported projections fail
-    closed; callers retain the raw wire schemas in evidence.
-    """
-    import duckdb
-
-    if duckdb.__version__ != "1.5.5":
-        raise ResultContractError("output identity parser requires DuckDB 1.5.5")
-    with duckdb.connect() as parser:
-        document = json.loads(parser.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0])
-    if document.get("error") or len(document.get("statements", [])) != 1:
-        raise ResultContractError("output identity requires one parseable SELECT")
-    node = document["statements"][0]["node"]
-    if node.get("type") != "SELECT_NODE":
-        raise ResultContractError("output identity for this query shape is Uncovered")
-    if label_only and (node.get("from_table", {}).get("type") != "EMPTY"
-            or node.get("modifiers") or node.get("cte_map", {}).get("map")
-            or any(node.get(key) for key in ["where_clause", "group_expressions", "having", "qualify"])):
-        raise ResultContractError("display label contains query clauses")
-    return node["select_list"]
-
-
-def _expression_identity(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _expression_identity(item) for key, item in value.items()
-                if key != "query_location"}
-    if isinstance(value, list):
-        return [_expression_identity(item) for item in value]
-    return value
-
-
-def _matches_output_identity(label: str, expression: dict[str, Any]) -> bool:
-    if expression.get("alias"):
-        return label == expression["alias"]
-    if expression.get("class") == "COLUMN_REF":
-        # A projected column has SQL identity; an engine may display its
-        # source qualifier. Quoted identifiers with dots remain intact.
-        if label == expression["column_names"][-1]:
-            return True
-    try:
-        parsed = _select_expressions("SELECT " + label, label_only=True)
-    except (ResultContractError, ValueError):
-        return False
-    return len(parsed) == 1 and _expression_identity(parsed[0]) == _expression_identity(expression)
 
 
 @dataclass(frozen=True)
@@ -87,6 +33,7 @@ class OrderKey:
     column: int
     descending: bool
     nulls: str | None
+    expression: tuple | None = None
 
 
 PARO_EXACT_TYPES = {
@@ -207,23 +154,18 @@ def assert_compatible_schema(
 ) -> None:
     if len(paro) != len(duckdb):
         raise ResultContractError(f"schema arity mismatch: Paro={len(paro)}, DuckDB={len(duckdb)}")
-    expressions = _select_expressions(query) if query is not None else None
-    if expressions is not None and (len(expressions) != len(paro)
-            or any(expr.get("class") == "STAR" for expr in expressions)):
-        # No ordinal guessing for star expansion. Equal raw schemas remain
-        # valid; unequal labels need an explicit supported projection.
-        expressions = None
+    if query is not None:
+        import duckdb as duckdb_module
+        from bound_result_contract import BoundResult
+        with duckdb_module.connect() as parser:
+            bound = BoundResult(query, parser)
+            bound.check_identity(paro, "paro")
+            bound.check_identity(duckdb, "duckdb")
+            bound.check_types(paro, duckdb)
+        return
     for index, (actual, expected) in enumerate(zip(paro, duckdb)):
-        names_match = actual.name == expected.name
-        if expressions is not None:
-            names_match = (_matches_output_identity(actual.name, expressions[index])
-                           and _matches_output_identity(expected.name, expressions[index]))
-        if not names_match or actual.logical_type != expected.logical_type:
-            raise ResultContractError(
-                "schema mismatch at column "
-                f"{index}: Paro=({actual.name},{actual.logical_type},{actual.engine_type}) "
-                f"DuckDB=({expected.name},{expected.logical_type},{expected.engine_type})"
-            )
+        if actual != expected:
+            raise ResultContractError(f"same-engine wire schema mismatch at column {index}: {actual}/{expected}")
 
 
 def canonicalize_rows(
@@ -257,11 +199,11 @@ def _canonical_value(value: Any, logical_type: str) -> Any:
         except ValueError as error:
             raise ResultContractError(f"{logical_type}: {error}") from error
     if logical_type.startswith("float"):
-        number = float(value)
-        if math.isnan(number):
-            return "NaN"
-        if math.isinf(number):
-            return "+Inf" if number > 0 else "-Inf"
+        if type(value) is not float:
+            raise ResultContractError("floating wire value must be float")
+        number = value
+        if not math.isfinite(number):
+            raise ResultContractError("nonfinite floating result requires an explicit contract")
         return 0.0 if number == 0 else number
     if logical_type in {"date", "time", "timetz", "timestamp", "timestamptz"}:
         return value.isoformat() if isinstance(value, (date, datetime, time)) else str(value)
@@ -272,6 +214,14 @@ def _canonical_value(value: Any, logical_type: str) -> Any:
 
 def multiset_digest(rows: Sequence[tuple[Any, ...]]) -> str:
     return _counter_digest(Counter(rows))
+
+
+def sequence_digest(rows):
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(evidence_bytes(row))
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def assert_same_multiset(
@@ -300,141 +250,20 @@ def _counter_digest(counter: Counter[tuple[Any, ...]]) -> str:
 
 
 def parse_order_contract(query: str, schema: Sequence[ColumnContract]) -> tuple[OrderKey, ...]:
-    clause = _top_level_order_clause(query)
-    if clause is None:
-        return ()
-    names: dict[str, list[int]] = {}
-    for index, column in enumerate(schema):
-        names.setdefault(column.name, []).append(index)
-    select_expressions = _top_level_select_expressions(query, schema)
-    keys = []
-    for raw in _split_top_level(clause):
-        expression = raw.strip()
-        nulls = None
-        null_match = re.search(r"(?is)\s+nulls\s+(first|last)\s*$", expression)
-        if null_match:
-            nulls = null_match.group(1).lower()
-            expression = expression[: null_match.start()].strip()
-        descending = False
-        direction = re.search(r"(?is)\s+(asc|desc)\s*$", expression)
-        if direction:
-            descending = direction.group(1).lower() == "desc"
-            expression = expression[: direction.start()].strip()
-        if nulls is None:
-            # The harness configures DuckDB to Paro/PostgreSQL semantics:
-            # descending defaults to NULLS FIRST, ascending to NULLS LAST.
-            nulls = "first" if descending else "last"
-        if expression.isdigit():
-            column = int(expression) - 1
-        elif re.fullmatch(r'(?is)(?:"[^"]+"|[a-z_][a-z0-9_]*)(?:\.(?:"[^"]+"|[a-z_][a-z0-9_]*))*', expression):
-            name = expression.rsplit(".", 1)[-1].strip('"').lower()
-            matches = names.get(name, [])
-            if not matches:
-                matches = select_expressions.get(_normalize_sql_expression(expression), [])
-            if len(matches) > 1:
-                expression_matches = select_expressions.get(
-                    _normalize_sql_expression(expression), []
-                )
-                # Repeated projections of the same source expression induce
-                # identical peer groups. Either ordinal is therefore a valid
-                # witness for ORDER BY, while genuinely ambiguous aliases
-                # still fail closed.
-                if expression_matches != matches:
-                    raise ResultContractError(
-                        "top-level ORDER BY expression is ambiguous in the result schema: "
-                        f"{expression!r}"
-                    )
-                matches = matches[:1]
-            column = matches[0] if matches else -1
-        else:
-            matches = select_expressions.get(_normalize_sql_expression(expression), [])
-            # Every entry under one normalized expression is peer-equivalent,
-            # so duplicate projections may use their first ordinal.
-            if len(matches) > 1:
-                matches = matches[:1]
-            column = matches[0] if matches else -1
-        if not 0 <= column < len(schema):
-            raise ResultContractError(
-                f"top-level ORDER BY expression is not a result column: {raw.strip()!r}"
-            )
-        keys.append(OrderKey(column, descending, nulls))
-    if not keys:
-        raise ResultContractError("top-level ORDER BY has no keys")
-    return tuple(keys)
+    import duckdb
+    from bound_result_contract import BoundResult
+    with duckdb.connect() as parser:
+        bound = BoundResult(query, parser)
+        if len(bound.outputs) != len(schema):
+            raise ResultContractError("ORDER binding/output arity mismatch")
+        return tuple(OrderKey(expr[1] if expr[0] == "column" else -1, desc, nulls, expr)
+                     for expr, desc, nulls in bound.bind_order())
 
 
-def _top_level_select_expressions(
-    query: str, schema: Sequence[ColumnContract]
-) -> dict[str, list[int]]:
-    """Bind ORDER BY source expressions to their projected result ordinals."""
-    tokens = _top_level_tokens(query)
-    select_index = next(
-        (index for index, (token, _, _) in enumerate(tokens) if token == "select"),
-        None,
-    )
-    if select_index is None:
-        return {}
-    from_token = next(
-        (entry for entry in tokens[select_index + 1 :] if entry[0] == "from"),
-        None,
-    )
-    if from_token is None:
-        return {}
-
-    select_start = tokens[select_index][2]
-    items = _split_top_level(query[select_start : from_token[1]])
-    if len(items) != len(schema):
-        return {}
-
-    expressions: dict[str, list[int]] = {}
-    for index, (raw_item, column) in enumerate(zip(items, schema)):
-        item = raw_item.strip()
-        item_tokens = _top_level_tokens(item)
-        expression = item
-
-        for token_index in range(len(item_tokens) - 1, -1, -1):
-            token, token_start, _ = item_tokens[token_index]
-            if token == "as" and token_index + 1 == len(item_tokens) - 1:
-                expression = item[:token_start].strip()
-                break
-        else:
-            if item_tokens:
-                alias, alias_start, _ = item_tokens[-1]
-                if (
-                    alias == column.name
-                    and alias_start > 0
-                    and item[alias_start - 1].isspace()
-                ):
-                    expression = item[:alias_start].strip()
-
-        normalized = _normalize_sql_expression(expression)
-        if normalized:
-            expressions.setdefault(normalized, []).append(index)
-    return expressions
-
-
-def _normalize_sql_expression(expression: str) -> str:
-    """Normalize SQL outside quoted literals and identifiers only."""
-    result: list[str] = []
-    quote: str | None = None
-    index = 0
-    while index < len(expression):
-        character = expression[index]
-        if quote is not None:
-            result.append(character)
-            if character == quote:
-                if index + 1 < len(expression) and expression[index + 1] == quote:
-                    result.append(expression[index + 1])
-                    index += 1
-                else:
-                    quote = None
-        elif character in {"'", '"'}:
-            quote = character
-            result.append(character)
-        elif not character.isspace():
-            result.append(character.lower())
-        index += 1
-    return "".join(result)
+def peer_key_values(rows: Sequence[tuple[Any, ...]], keys: Sequence[OrderKey]):
+    from bound_result_contract import order_values
+    return order_values(rows, [(key.expression or ("column", key.column),
+                               key.descending, key.nulls) for key in keys])
 
 
 def assert_peer_order(
@@ -442,109 +271,10 @@ def assert_peer_order(
 ) -> str | None:
     if not keys:
         return None
-    for index in range(1, len(rows)):
-        if _compare_order(rows[index - 1], rows[index], keys) > 0:
-            raise ResultContractError(f"result violates ORDER BY at rows {index - 1}/{index}")
-    digest = hashlib.sha256()
-    for row in rows:
-        digest.update(evidence_bytes(tuple(row[key.column] for key in keys)))
-        digest.update(b"\n")
-    return digest.hexdigest()
+    return sequence_digest(peer_key_values(rows, keys))
 
 
-def _compare_order(left: tuple[Any, ...], right: tuple[Any, ...], keys: Sequence[OrderKey]) -> int:
-    for key in keys:
-        lhs, rhs = left[key.column], right[key.column]
-        if lhs == rhs:
-            continue
-        if lhs is None or rhs is None:
-            if lhs is None:
-                return -1 if key.nulls == "first" else 1
-            return 1 if key.nulls == "first" else -1
-        comparison = -1 if lhs < rhs else 1
-        return -comparison if key.descending else comparison
-    return 0
-
-
-def _top_level_order_clause(query: str) -> str | None:
-    tokens = _top_level_tokens(query)
-    for index in range(len(tokens) - 1):
-        if tokens[index][0] == "order" and tokens[index + 1][0] == "by":
-            start = tokens[index + 1][2]
-            end = len(query)
-            for token, token_start, _ in tokens[index + 2 :]:
-                if token in {"limit", "offset", "fetch", "for"}:
-                    end = token_start
-                    break
-            return query[start:end].strip().rstrip(";")
-    return None
-
-
-def _top_level_tokens(query: str) -> list[tuple[str, int, int]]:
-    tokens = []
-    depth = 0
-    index = 0
-    while index < len(query):
-        char = query[index]
-        following = query[index + 1] if index + 1 < len(query) else ""
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            while index < len(query):
-                if query[index] == quote:
-                    if index + 1 < len(query) and query[index + 1] == quote:
-                        index += 2
-                        continue
-                    index += 1
-                    break
-                index += 1
-            continue
-        if char == "-" and following == "-":
-            newline = query.find("\n", index + 2)
-            index = len(query) if newline < 0 else newline + 1
-            continue
-        if char == "/" and following == "*":
-            end = query.find("*/", index + 2)
-            index = len(query) if end < 0 else end + 2
-            continue
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth = max(0, depth - 1)
-        elif depth == 0 and (char.isalpha() or char == "_"):
-            end = index + 1
-            while end < len(query) and (query[end].isalnum() or query[end] == "_"):
-                end += 1
-            tokens.append((query[index:end].lower(), index, end))
-            index = end
-            continue
-        index += 1
-    return tokens
-
-
-def _split_top_level(clause: str) -> list[str]:
-    parts = []
-    depth = 0
-    start = 0
-    quote = None
-    index = 0
-    while index < len(clause):
-        char = clause[index]
-        if quote is not None:
-            if char == quote:
-                if index + 1 < len(clause) and clause[index + 1] == quote:
-                    index += 2
-                    continue
-                quote = None
-        elif char in {"'", '"'}:
-            quote = char
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth = max(0, depth - 1)
-        elif char == "," and depth == 0:
-            parts.append(clause[start:index])
-            start = index + 1
-        index += 1
-    parts.append(clause[start:])
-    return parts
+def assert_same_order(actual, expected, keys):
+    # Hash equality is never a substitute for semantic key-sequence equality.
+    if peer_key_values(actual, keys) != peer_key_values(expected, keys):
+        raise ResultContractError("ordered peer-key sequences differ")

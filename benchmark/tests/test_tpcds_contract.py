@@ -49,7 +49,7 @@ class TpcdsResultContractTests(unittest.TestCase):
 
     def test_explicit_alias_case_dots_order_and_type_are_strict(self) -> None:
         a = (ColumnContract("A.b", "float64", "701"),)
-        assert_compatible_schema(a, a, query='SELECT x AS "A.b" FROM t')
+        assert_compatible_schema(a, (ColumnContract("A.b", "float64", "DOUBLE"),), query='SELECT x AS "A.b" FROM t')
         for name, kind in [("b", "float64"), ("a.b", "float64"), ("A.b", "float32")]:
             with self.assertRaises(ResultContractError):
                 assert_compatible_schema(a, (ColumnContract(name, kind, "other"),),
@@ -71,7 +71,7 @@ class TpcdsResultContractTests(unittest.TestCase):
             ColumnContract("sum_agg", "decimal", "DECIMAL(38,2)"),
         )
         keys = parse_order_contract(
-            "SELECT 1 ORDER BY dt.d_year, sum_agg DESC, brand_id LIMIT 100;",
+            "SELECT dt.d_year, brand_id, brand, sum_agg FROM dt ORDER BY dt.d_year, sum_agg DESC, brand_id LIMIT 100;",
             schema,
         )
 

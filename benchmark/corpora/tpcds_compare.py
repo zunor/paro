@@ -44,6 +44,7 @@ from tpcds_result_contract import (
     canonicalize_rows,
     duckdb_schema,
     multiset_digest,
+    sequence_digest,
     paro_schema,
     parse_order_contract,
 )
@@ -888,13 +889,19 @@ def main() -> int:
                 try:
                     duck_rows, duck_schema, _ = oracle_duck.execute(query)
                     paro_rows, actual_schema = run_paro(oracle_paro, query, binary_result)
-                    assert_compatible_schema(actual_schema, duck_schema, query=query)
-                    expected = canonicalize_rows(duck_rows, duck_schema)
-                    actual = canonicalize_rows(paro_rows, actual_schema)
+                    from bound_result_contract import BoundResult, CATALOG_SQL, catalog_from_rows, order_values
+                    catalog_rows, _, _ = oracle_duck.execute(CATALOG_SQL)
+                    with duckdb.connect() as output_parser:
+                        bound_result = BoundResult(query, output_parser, catalog_from_rows(catalog_rows))
+                        bound_result.check_identity(actual_schema, "paro")
+                        bound_result.check_identity(duck_schema, "duckdb")
+                        bound_result.check_types(actual_schema, duck_schema)
+                    expected = bound_result.canonical_rows(duck_rows, duck_schema, "duckdb")
+                    actual = bound_result.canonical_rows(paro_rows, actual_schema, "paro")
                     assert_same_multiset(actual, expected)
-                    order_keys = parse_order_contract(query, duck_schema)
-                    expected_order = assert_peer_order(expected, order_keys)
-                    actual_order = assert_peer_order(actual, order_keys)
+                    order_keys = bound_result.bind_order()
+                    expected_order = order_values(expected, order_keys)
+                    actual_order = order_values(actual, order_keys)
                     if actual_order != expected_order:
                         raise AssertionError("ordered key sequence differs across engines")
                     oracle_digest = multiset_digest(expected)
@@ -915,18 +922,16 @@ def main() -> int:
                 rows: list[tuple[Any, ...]],
                 sample_schema: tuple[ColumnContract, ...],
             ) -> tuple[str, str | None]:
-                assert_compatible_schema(sample_schema, duck_schema, query=query)
-                normalized = canonicalize_rows(rows, sample_schema)
+                assert_compatible_schema(sample_schema, actual_schema if engine == "paro" else duck_schema)
+                normalized = bound_result.canonical_rows(rows, sample_schema, engine)
+                assert_same_multiset(normalized, expected)
                 digest = multiset_digest(normalized)
-                if digest != oracle_digest:
-                    raise AssertionError(
-                        f"{engine} sample digest differs from the verified oracle"
-                    )
-                order_digest = assert_peer_order(normalized, order_keys)
-                if order_digest != expected_order:
+                actual_keys = order_values(normalized, order_keys)
+                if actual_keys != expected_order:
                     raise AssertionError(
                         f"{engine} sample ordered-key sequence differs from the oracle"
                     )
+                order_digest = sequence_digest(actual_keys) if order_keys else None
                 return digest, order_digest
 
             samples: dict[str, list[float]] = {"paro": [], "duckdb": []}
@@ -1195,7 +1200,8 @@ def main() -> int:
                     "paro": schema_report(actual_schema),
                     "duckdb": schema_report(duck_schema),
                 },
-                order_keys=[key.__dict__ for key in order_keys],
+                order_keys=[{"expression": repr(expr), "descending": desc, "nulls": nulls}
+                            for expr, desc, nulls in order_keys],
                 optimizer_metadata={
                     "requested_track": args.metadata_track,
                     "paro": paro_inventory,
@@ -1204,7 +1210,7 @@ def main() -> int:
                 },
                 oracle_processes=oracle_identity,
                 oracle_result_sha256=oracle_digest,
-                oracle_order_key_sha256=expected_order,
+                oracle_order_key_sha256=sequence_digest(expected_order) if order_keys else None,
                 measured_sample_result_sha256=sample_digests,
                 verified_measured_samples={
                     "paro": len(sample_digests["paro"]),

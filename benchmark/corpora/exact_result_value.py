@@ -11,6 +11,10 @@ import json
 import re
 
 
+class ResultContractError(AssertionError, ValueError):
+    pass
+
+
 @dataclass(frozen=True, order=True)
 class ExactNumber:
     value: Fraction
