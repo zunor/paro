@@ -295,6 +295,34 @@ fn exact_vector_provider_applies_overlay_visibility_before_topk() {
 }
 
 #[test]
+fn sparse_topk_must_not_replace_the_sql_score_domain() {
+    run_async_test_with_large_stack("sparse-score-domain", async {
+        let mut session = Session::new(1, Instance::new_in_memory());
+        let mut sink = CollectingSink::new();
+        for sql in [
+            "CREATE TABLE sparse_domain (id INT, v BLOB)",
+            "INSERT INTO sparse_domain VALUES (1, sparse_vector('{1:1}')), (2, sparse_vector('{1:2}')), (3, sparse_vector('{2:1}'))",
+            "CREATE VECTOR INDEX sparse_domain_index ON sparse_domain(v) mode='sparse'",
+            "REFRESH VECTOR INDEX sparse_domain_index ON sparse_domain",
+        ] { exec_ok(&mut session, &mut sink, sql).await; }
+        exec_ok(&mut session, &mut sink,
+            "SELECT id FROM sparse_domain ORDER BY sparse_distance(v, sparse_vector('{1:1}')) ASC LIMIT 1").await;
+        assert_eq!(query_i64_col(&sink, 0), vec![3]);
+        exec_ok(&mut session, &mut sink,
+            "SELECT id FROM sparse_domain ORDER BY sparse_distance(v, sparse_vector('{1:1}')) DESC LIMIT 3").await;
+        assert_eq!(query_i64_col(&sink, 0), vec![2, 1, 3]);
+        exec_ok(&mut session, &mut sink,
+            "EXPLAIN ANALYZE SELECT id FROM sparse_domain ORDER BY sparse_distance(v, sparse_vector('{1:1}')) DESC LIMIT 3").await;
+        assert!(
+            explain_lines(&sink)
+                .iter()
+                .all(|line| !line.contains("SPARSE_SEARCH") && !line.contains("ADAPTIVE_SEARCH")),
+            "an index alone does not prove replacement of the complete SQL score domain"
+        );
+    });
+}
+
+#[test]
 fn vector_replacement_preserves_null_rows_and_projected_casts() {
     run_async_test_with_large_stack("vector-score-domain", async {
         let instance = Instance::new_in_memory();
