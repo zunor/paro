@@ -16,12 +16,14 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Sequence
 
+from exact_result_value import evidence_bytes, validate_exact
+
 
 class ResultContractError(AssertionError):
     pass
 
 
-RESULT_CONTRACT_VERSION = "typed-result-v2"
+RESULT_CONTRACT_VERSION = "typed-result-v3"
 
 
 def _select_expressions(sql: str, *, label_only: bool = False) -> list[dict[str, Any]]:
@@ -246,12 +248,14 @@ def _canonical_value(value: Any, logical_type: str) -> Any:
     if value is None:
         return None
     if logical_type == "boolean":
-        return bool(value)
-    if logical_type.startswith(("int", "uint")):
-        return int(value)
-    if logical_type.startswith(("decimal", "numeric")):
-        decimal = value if isinstance(value, Decimal) else Decimal(str(value))
-        return Decimal(0) if decimal.is_zero() else decimal.normalize()
+        if type(value) is not bool:
+            raise ResultContractError("boolean wire value must be bool")
+        return value
+    if logical_type.startswith(("int", "uint", "decimal", "numeric")):
+        try:
+            return validate_exact(value, logical_type)
+        except ValueError as error:
+            raise ResultContractError(f"{logical_type}: {error}") from error
     if logical_type.startswith("float"):
         number = float(value)
         if math.isnan(number):
@@ -287,8 +291,8 @@ def assert_same_multiset(
 
 def _counter_digest(counter: Counter[tuple[Any, ...]]) -> str:
     digest = hashlib.sha256()
-    for row, count in sorted(counter.items(), key=lambda item: repr(item[0])):
-        digest.update(repr(row).encode("utf-8"))
+    for row, count in sorted(counter.items(), key=lambda item: evidence_bytes(item[0])):
+        digest.update(evidence_bytes(row))
         digest.update(b"\0")
         digest.update(str(count).encode("ascii"))
         digest.update(b"\n")
@@ -443,7 +447,7 @@ def assert_peer_order(
             raise ResultContractError(f"result violates ORDER BY at rows {index - 1}/{index}")
     digest = hashlib.sha256()
     for row in rows:
-        digest.update(repr(tuple(row[key.column] for key in keys)).encode("utf-8"))
+        digest.update(evidence_bytes(tuple(row[key.column] for key in keys)))
         digest.update(b"\n")
     return digest.hexdigest()
 
