@@ -93,6 +93,7 @@ class RunnerConfig:
     report_dir: Path
     runtime_profiles: Mapping[str, RuntimeProfile]
     managed_runtime_env: tuple[str, ...]
+    optimizer_verify: bool | None = None
 
     @property
     def cases_dir(self) -> Path:
@@ -227,6 +228,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database", help="Database name")
     parser.add_argument("--user", help="Database user")
     parser.add_argument("--password", help="Database password")
+    parser.add_argument("--optimizer-verify", choices=("on", "off"),
+                        help="Set optimizer verification on every connection, including restarts")
     parser.add_argument(
         "--update",
         action="store_true",
@@ -347,6 +350,8 @@ def resolve_config(
         report_dir=report_dir,
         runtime_profiles=runtime_profiles,
         managed_runtime_env=managed_runtime_env,
+        optimizer_verify=(None if getattr(args, "optimizer_verify", None) is None
+                          else args.optimizer_verify == "on"),
     )
 
 
@@ -756,6 +761,14 @@ def _open_connection(
         ) from exc
 
     conn.autocommit = True
+    if config.optimizer_verify is not None:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SET optimizer_verify = " +
+                               ("true" if config.optimizer_verify else "false"))
+        except Exception:
+            conn.close()
+            raise
     return conn
 
 

@@ -10,6 +10,31 @@ from harness.executor import ExecutionResult, QueryOutput
 from harness.parser import Block
 
 
+def test_optimizer_verifier_is_reapplied_to_each_connection(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    (tmp_path / "config.toml").write_text("[connection]\n[test]\n")
+    config = runner.resolve_config(runner.parse_args(["--optimizer-verify", "on"]),
+                                   env={}, root_dir=tmp_path)
+    statements = []
+
+    class Connection:
+        autocommit = False
+        def cursor(self):
+            return self
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def execute(self, sql):
+            statements.append(sql)
+
+    monkeypatch.setattr(runner, "_import_psycopg",
+                        lambda: SimpleNamespace(connect=lambda **kwargs: Connection()))
+    for _ in range(3):
+        assert runner._open_connection(config).autocommit
+    assert statements == ["SET optimizer_verify = true"] * 3
+
+
 def test_discover_case_files_and_filter(tmp_path: Path) -> None:
     cases = tmp_path / "cases"
     (cases / "dml" / "select").mkdir(parents=True)

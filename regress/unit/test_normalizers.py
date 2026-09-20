@@ -378,6 +378,7 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "explain_adaptive_runtime",
         "explain_routine_ids",
         "explain_search_ids",
+        "explain_logical_ids",
         "explain_schema_order",
         "explain_cte_ids",
         "explain_external_runtime",
