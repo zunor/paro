@@ -21,6 +21,9 @@ pub fn compile_statement_with_parameter_types(
     stmt: Statement,
     parameter_types: &[LogicalType],
 ) -> Result<CompiledStatement> {
+    // Diagnostic entry includes AST identity preparation; the existing normal
+    // compiler clock and its evidence boundary remain unchanged.
+    let capture_started = ctx.options.compile_capture.as_ref().map(|_| Instant::now());
     let statement_tag = stmt.to_string();
     let started_at = Instant::now();
     if let Some(capture) = &ctx.options.compile_capture {
@@ -251,7 +254,7 @@ pub fn compile_statement_with_parameter_types(
         use paro_context::compile_diagnostics::Observation::Observed;
         capture.update(|r| {
             r.finish_ns = Observed(runtime_image_started.elapsed().as_nanos() as u64);
-            r.compiler_ns = Observed(started_at.elapsed().as_nanos() as u64);
+            r.compiler_ns = Observed(capture_started.unwrap_or(started_at).elapsed().as_nanos() as u64);
             if let (Observed(total), Observed(bind), Observed(opt), Observed(verify), Observed(finish)) = (r.compiler_ns, r.bind_ns, r.optimizer_ns, r.verify_ns, r.finish_ns) {
                 r.compiler_other_ns = Observed(total.saturating_sub(bind + opt + verify + finish));
             }
