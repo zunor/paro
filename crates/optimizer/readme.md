@@ -148,6 +148,23 @@ links, bounds and lifecycle. This README does not claim the unified interface
 is implemented. The contributor contracts below are usable in a standalone
 clone; a separate design checkout is optional.
 
+The target public entry point is `EXPLAIN (OPTIMIZER, FORMAT JSON)`, with TEXT
+rendered from the same typed record. This syntax is a planned deliverable, not
+a claim that the current parser accepts it. Summary is the default; explicit
+Detail adds bounded records, not different search semantics. Without ANALYZE,
+the target is not executed: runtime/admission measurements are NotExecuted,
+not zero. Optimizer diagnostics force a target compilation without consuming
+or populating its statement-plan cache; this is not proof of a normal SELECT
+cache miss. The output cannot measure its own future network drain or commit.
+
+Capacity must be enforced before capture allocation, candidate copying and
+serialization, not by compressing an unbounded report afterward. Bound retained
+ownership, variable-length payloads, row/event counts, encoded bytes and total
+process diagnostic memory. Reserve terminal status and omission counters.
+Truncation must preserve valid JSON and label incomplete references/coverage;
+it must never change the query result or masquerade as search completion.
+Do not retain a large Memo graph indirectly through an apparently small Arc.
+
 The production decisions have different contracts:
 
 | Decision | Source | Meaning |
@@ -183,6 +200,11 @@ When extending diagnostics:
 - Do not use raw SQL or parameter values by default.
 - Keep diagnostic runs separate from trace-off performance samples. Export
   outside an optimizer timer can still be inside compiler or client latency.
+- Encode a capture once and select it by invocation/occurrence identity;
+  never embed both all statement traces and an overlapping target subset.
+  SQL fingerprints alone do not identify repeated executions.
+- Converge benchmark consumers on the EXPLAIN schema. Do not add temporary
+  environment exporters, server-log parsers or per-experiment JSON extractors.
 
 ## Making a change
 
@@ -261,9 +283,20 @@ Keep this README short-lived-data free:
 
 - Architecture and contract changes belong here or in a focused design.
 - Decisions and important negative results belong in small indexed records.
-- Benchmark samples and large traces belong in attested evidence packages,
-  not in an ever-growing README.
-- Archive and restore-test necessary evidence before deleting raw data.
-  Never delete the only reproduction of an unresolved correctness failure.
+- Ordinary evidence is four files: manifest.json, timings.json,
+  explain-optimizer.json and README.md, at most 250,000 uncompressed UTF-8
+  bytes per arm. Keep every valid normal timing sample and explicit exclusions;
+  derived medians alone are not sufficient evidence. Diagnostic timings are
+  not normal performance samples.
+- Larger legitimate campaigns, exact replay fixtures and correctness inputs
+  need a registered, bounded extension, not silently discarded samples or an
+  unlimited number of artificial arms. Raw Detail traces are short-lived,
+  quota-bound debugging data. Server .parod.log files do not belong in ordinary
+  evidence packages; operational log retention is a separate responsibility.
+- Compact history once, validate retained identities/samples/conclusions, and
+  restore-test necessary evidence before deleting redundant raw data. Record
+  what was deleted and cannot be reconstructed; a hash is not a backup. Do not
+  move every obsolete trace into another permanent archive. Never delete the
+  only reproduction of an unresolved correctness failure.
 - Deleting a tracked log does not remove its Git history. History rewriting
   and destructive workspace cleanup require separate, explicit scope.
