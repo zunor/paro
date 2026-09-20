@@ -68,10 +68,40 @@ pub fn validate_json(
         || r.encoded_limit != ENCODED_LIMIT
         || r.retained_limit != RETAINED_LIMIT
         || r.process_limit != PROCESS_LIMIT
+        || r.process_reservation != 2 << 20
         || r.rules.len() > MAX_RULES
         || r.variants.len() > MAX_VARIANTS
     {
         return Err("schema/capacity profile mismatch".into());
+    }
+    if r.rules.windows(2).any(|pair| pair[0].id >= pair[1].id)
+        || r.variants
+            .windows(2)
+            .any(|pair| pair[0].ordinal >= pair[1].ordinal)
+    {
+        return Err("duplicate or unordered bounded identity".into());
+    }
+    if let Observation::Observed(count) = r.variant_count {
+        if (r.variants.len() as u64).checked_add(r.omitted_variants) != Some(count as u64)
+            || r.variants.iter().any(|v| usize::from(v.ordinal) >= count)
+        {
+            return Err("portfolio coverage does not close".into());
+        }
+    }
+    if let Observation::Observed(fingerprint) = r.selected_fingerprint {
+        let Observation::Observed(class) = r.expected_class else {
+            return Err("selected artifact has no expected class".into());
+        };
+        let bit = 1u64
+            .checked_shl(class)
+            .ok_or("unrepresented expected class")?;
+        if !r
+            .variants
+            .iter()
+            .any(|v| v.physical_fingerprint == fingerprint && v.admissible_classes & bit != 0)
+        {
+            return Err("selected artifact is not represented in its portfolio".into());
+        }
     }
     if r.admission != Observation::NotExecuted || r.execution != Observation::NotExecuted {
         return Err("Summary cannot claim target execution".into());
@@ -132,5 +162,9 @@ mod tests {
         writer.write_all(&vec![b'x'; ENCODED_LIMIT]).unwrap();
         assert!(writer.write_all(b"x").is_err());
         assert_eq!(writer.0.len(), ENCODED_LIMIT);
+        capture.update(|r| {
+            r.variant_count = paro_context::compile_diagnostics::Observation::Observed(1)
+        });
+        assert!(validate_json(render(&capture, true).as_bytes()).is_err());
     }
 }

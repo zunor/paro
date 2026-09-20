@@ -76,6 +76,12 @@ not change them. The inventory is not a deletion allowlist.
 
 T0 status: recoverable isolated baseline and per-entry classification complete.
 The user subsequently authorized per-hunk integration into re-op in this round.
-Integration is pending review/validation; this authorization is not permission
-to commit, discard or replace unrelated main-tree mixed hunks.
+Re-op was advanced to `5e46148b` after three-way hunk review. The 24 overlapping
+tracked files include 15 conflict regions in five files, resolved individually;
+83 untracked and 26 unaffected tracked files were byte-verified unchanged.
+Identical already-committed hunks were absorbed, while the remaining user delta
+stays unstaged and uncommitted. The original index and patches remain recoverable.
+See `compile-integration-review.json` for each decision. Mixed-tree session/server
+check passes with one existing-path dead-code warning; this is not the clean
+validation identity and not permission to commit unrelated user edits.
 C2's eight regress contracts and F2's independent evidence gaps remain open.

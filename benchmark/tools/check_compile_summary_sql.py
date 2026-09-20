@@ -2,6 +2,7 @@
 """Small real-server T1 contract probe; stdout is raw evidence, never timing data."""
 import argparse
 import json
+from pathlib import Path
 
 import psycopg
 
@@ -10,6 +11,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dsn", required=True)
     args = parser.parse_args()
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "compile-summary"
+    expected = json.loads((fixtures / "query-summary-v1.json").read_text())
+    text_expected = (fixtures / "query-summary-v1.txt").read_text().splitlines()
     with psycopg.connect(args.dsn, autocommit=True) as conn:
         for target in ("SELECT 42", "WITH t AS (SELECT 3 AS x) SELECT x FROM t"):
             with conn.cursor() as cursor:
@@ -19,6 +23,9 @@ def main():
                 assert len(rows) == 1
                 raw = rows[0][0]
                 record = json.loads(raw)
+                # Golden contains only stable contract fields; raw evidence retains
+                # all observed timings, identities and search outcomes unchanged.
+                assert {key: record[key] for key in expected} == expected
                 assert record["cache"] == "ForcedCompile"
                 assert record["outcome"] == "Success"
                 assert record["admission"] == record["execution"] == "NotExecuted"
@@ -28,6 +35,7 @@ def main():
             text = conn.execute(f"EXPLAIN (COMPILE) {target}").fetchone()[0]
             assert text.startswith("EXPLAIN (COMPILE)")
             assert "execution=NotExecuted" in text
+            assert [line for line in text.splitlines() if line.startswith(("EXPLAIN (COMPILE)", "admission="))] == text_expected
             print(text)
         conn.execute("CREATE TEMP TABLE compile_probe (v VARCHAR)")
         conn.execute("INSERT INTO compile_probe VALUES ('invalid-integer')")

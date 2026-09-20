@@ -4,6 +4,27 @@
 use paro_common::runtime_value::Value;
 use paro_instance::Instance;
 use paro_session::{CollectingSink, Session};
+use std::sync::{Arc, Mutex, Weak};
+
+type ObservedOwner = Arc<Mutex<Option<Weak<dyn paro_common::vector::VectorLifetimeOwner>>>>;
+struct TransportSink {
+    blocked: bool,
+    owner: ObservedOwner,
+}
+
+#[async_trait::async_trait]
+impl paro_session::ResultSink for TransportSink {
+    async fn start_result(&mut self, _: &[String], _: &[paro_common::types::LogicalType]) -> paro_common::error::Result<()> { Ok(()) }
+    async fn push_chunk(&mut self, _: &paro_common::chunk::Chunk) -> paro_common::error::Result<()> { panic!("diagnostic must use owned transport") }
+    async fn push_diagnostic_chunk(&mut self, _: &paro_common::chunk::Chunk, owner: Arc<dyn paro_common::vector::VectorLifetimeOwner>) -> paro_common::error::Result<()> {
+        *self.owner.lock().unwrap() = Some(Arc::downgrade(&owner));
+        if self.blocked { std::future::pending::<()>().await; }
+        drop(owner);
+        Err(paro_common::error::internal("injected diagnostic writer failure"))
+    }
+    async fn finish_result(&mut self, _: &paro_session::StatementCompletion) -> paro_common::error::Result<()> { Ok(()) }
+}
+impl paro_session::ProtocolResultSink for TransportSink {}
 
 async fn document(session: &mut Session, sql: &str) -> String {
     let mut sink = CollectingSink::new();
@@ -77,6 +98,17 @@ fn compile_query_cte_and_reject_unimplemented_options() {
             assert_eq!(binding.to_string(), ordinary.to_string());
             drop(retained);
             assert!(!document(&mut session, "EXPLAIN (COMPILE, FORMAT JSON) SELECT 7").await.contains("Unavailable"));
+            for blocked in [false, true] {
+                let owner: ObservedOwner = Arc::new(Mutex::new(None));
+                let mut sink = TransportSink { blocked, owner: owner.clone() };
+                let result = tokio::time::timeout(std::time::Duration::from_millis(50), session.execute_simple_query("EXPLAIN (COMPILE) SELECT 7", &mut sink)).await;
+                if blocked { assert!(result.is_err()); }
+                else { assert!(result.unwrap().unwrap_err().to_string().contains("injected diagnostic writer failure")); }
+                // A failed writer and a dropped/backpressured request both return
+                // their reservation; no disconnected-client history remains.
+                assert!(owner.lock().unwrap().as_ref().unwrap().upgrade().is_none());
+                assert!(!document(&mut session, "EXPLAIN (COMPILE, FORMAT JSON) SELECT 7").await.contains("Unavailable"));
+            }
         });
     }).unwrap().join().unwrap();
 }
