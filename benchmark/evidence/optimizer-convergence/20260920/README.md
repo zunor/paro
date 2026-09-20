@@ -6,6 +6,16 @@ not ArchitectureReady, CompilerTargetMet or FirstStatementParity certification.
 
 ## Latest C2 continuation
 
+The current continuation is [v4 gates](c2-v4-gates.md): the typed mixed-numeric
+ORDER contract closes all three prior Uncovered cases. Both immutable screens
+now certify **98 exact + 1 independently bounded** per arm. Native TopN output
+admission is repaired, and full regress improves to **172 pass / 12 fail**.
+A provider-window experiment exposed a five-row scalar/index ranking mismatch
+and was withdrawn; fulltext/vector execution coverage remains unapproved.
+The new Rust binary is validated separately from old captures. **C2 remains
+open**; F2 and performance admission remain separate. The following v3/v2
+paragraphs are retained historical records, not the latest gate status.
+
 The latest continuation is [v3 gates](c2-v3-gates.md): lossless exact numeric
 identity and unified output binding are implemented. Both immutable screens
 now certify 95 exact + 1 independently bounded query, with 3 mixed-numeric

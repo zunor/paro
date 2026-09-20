@@ -1,0 +1,357 @@
+{
+  "schema_version": 1,
+  "mode": "single_run_expected_comparison",
+  "report": "/Users/linjunhong/paro-convergence-archive/20260920/c0/c2-v4-regress-report",
+  "unexpected_actuals": [],
+  "cases": [
+    {
+      "case": "cases/fulltext/fulltext_exec_mode_split.sql",
+      "expected_sha256": "caaaeae858c3cb4518db6f2e9d269aa41347f4484378f23aef26acfc86b3ce44",
+      "actual": {
+        "actual_sha256": "8632b67e50f5d0967959cdc8892c5b0228d1671ebb869710662e698da5a96220",
+        "expected_blocks": 9,
+        "actual_blocks": 9,
+        "differences": [
+          {
+            "block": 5,
+            "sql": "EXPLAIN\nSELECT id\nFROM ft_exec_mode_split\nWHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')\nORDER BY ts_rank(\n    to_tsvector('simple', content),\n    plainto_tsquery('simple', 'vector database')\n) DESC\nLIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/fulltext/fulltext_index_coverage_guard.sql",
+      "expected_sha256": "3b78f597080f8737d963b6b9344ad00829d09991c15c66864ef8ca4452b8abf9",
+      "actual": {
+        "actual_sha256": "f0ee49ce4ecb856dce44eb0873e8c9904044b082e95ab4268b1c7624eed70df6",
+        "expected_blocks": 8,
+        "actual_blocks": 8,
+        "differences": [
+          {
+            "block": 5,
+            "sql": "EXPLAIN\nSELECT id\nFROM ft_coverage_guard\nWHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')\nORDER BY ts_rank(\n    to_tsvector('simple', content),\n    plainto_tsquery('simple', 'vector')\n) DESC\nLIMIT 5;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/fulltext/fulltext_pg.sql",
+      "expected_sha256": "17a475a69820ce85d7b558d558f1604f032626fb7f0e49fa1c5fd773a88802b3",
+      "actual": {
+        "actual_sha256": "02c5276ffe0c40aa91b9206d4fbf9329d1c61d599ef44bb67ada5ce773b315f1",
+        "expected_blocks": 16,
+        "actual_blocks": 16,
+        "differences": [
+          {
+            "block": 10,
+            "sql": "EXPLAIN\nSELECT id\nFROM ft_docs\nWHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')\nORDER BY ts_rank(\n    to_tsvector('simple', content),\n    plainto_tsquery('simple', 'vector database')\n) DESC\nLIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/query/aggregate/agg_join_subsumption.sql",
+      "expected_sha256": "996c88f52a172e85644dca82b100734cb1ad5109149241a2b58217e7869ca9fd",
+      "actual": {
+        "actual_sha256": "4e7da0defb684fe67e9404881a3025709f2104fd4ab941373db62e76e0dc3a10",
+        "expected_blocks": 8,
+        "actual_blocks": 8,
+        "differences": [
+          {
+            "block": 6,
+            "sql": "EXPLAIN SELECT\n    p.order_key,\n    p.label,\n    sum(d.quantity) AS total_quantity\nFROM agg_sub_preserved AS p\nJOIN agg_sub_detail AS d\n  ON d.order_key = p.order_key\nWHERE p.order_key IN (\n    SELECT order_key\n    FROM agg_sub_detail\n    GROUP BY order_key\n    HAVING sum(quantity) > 100.00\n)\nGROUP BY p.order_key, p.label\nORDER BY p.order_key;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/query/aggregate/agg_singleton_groups.sql",
+      "expected_sha256": "371259136489e34ceecdb3526bd30515b465aa33d0ad28cd308f2fc73c76eae1",
+      "actual": {
+        "actual_sha256": "21771e78627869b6d1db321e8703451536b470f816971aecf64042b999152087",
+        "expected_blocks": 30,
+        "actual_blocks": 30,
+        "differences": [
+          {
+            "block": 15,
+            "sql": "EXPLAIN SELECT c_count, count(*) AS customer_distribution\nFROM (\n    SELECT c.customer_key, count(o.order_key) AS c_count\n    FROM singleton_customer AS c\n    LEFT JOIN singleton_orders_large AS o\n      ON c.customer_key = o.customer_key\n     AND o.comment NOT LIKE '%special%requests%'\n    GROUP BY c.customer_key\n) AS counts\nGROUP BY c_count\nORDER BY c_count;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/query/explain/explain_analyze.sql",
+      "expected_sha256": "cdab4d66a8c8fc1003a8ab5a3e802927dc2ea326c088af3732eec6ae7ecf72e0",
+      "actual": {
+        "actual_sha256": "9128ff3a88e68491e0fb8ca17baf98d54e807bb62a15eef3a642c59a3c0f3f94",
+        "expected_blocks": 17,
+        "actual_blocks": 17,
+        "differences": [
+          {
+            "block": 1,
+            "sql": "EXPLAIN ANALYZE SELECT 1;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 5,
+            "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM explain_analyze_rt\nWHERE score >= 20\nORDER BY score DESC;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 6,
+            "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM explain_analyze_rt\nWHERE score >= 20\nORDER BY score DESC\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 11,
+            "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM explain_analyze_topn_rt\nORDER BY score DESC\nLIMIT 3;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 14,
+            "sql": "EXPLAIN ANALYZE\nSELECT id\nFROM explain_analyze_topn_rt\nORDER BY score DESC\nLIMIT 3;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/query/explain/explain_basic.sql",
+      "expected_sha256": "2bfc7014bbb584c70693e005d228d2ea332775dbef8e9cedc18a703a57dd5e7c",
+      "actual": {
+        "actual_sha256": "ca11ab4d4d00c3de5ea600db8f709909527edfc6d71656a53283704e7ea53881",
+        "expected_blocks": 31,
+        "actual_blocks": 31,
+        "differences": [
+          {
+            "block": 18,
+            "sql": "EXPLAIN\nSELECT *\nFROM explain_piecewise_left AS l\nJOIN explain_piecewise_right AS r ON l.id < r.id\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 29,
+            "sql": "EXPLAIN\nSELECT *\nFROM explain_sort_range_left AS l\nLEFT JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/query/join/join_explain_advanced.sql",
+      "expected_sha256": "e57637cf5c3df41f88764061b701ee041b69d5ceed5331b2b8f720d523b13343",
+      "actual": {
+        "actual_sha256": "edb1b8bbdba653e1e38a33f17415d83bfc43130b2642fc72e6711fc4c5cd924d",
+        "expected_blocks": 33,
+        "actual_blocks": 33,
+        "differences": [
+          {
+            "block": 5,
+            "sql": "EXPLAIN\nSELECT l.id, r.id\nFROM join_explain_piecewise_l AS l\nJOIN join_explain_piecewise_r AS r ON l.id < r.id\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 6,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.id, r.id\nFROM join_explain_piecewise_l AS l\nJOIN join_explain_piecewise_r AS r ON l.id < r.id;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 7,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.id, r.id\nFROM join_explain_piecewise_l AS l\nJOIN join_explain_piecewise_r AS r ON l.id < r.id\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 12,
+            "sql": "EXPLAIN\nSELECT l.x, r.lo, r.hi\nFROM join_explain_sort_range_l AS l\nLEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 13,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.x, r.lo, r.hi\nFROM join_explain_sort_range_l AS l\nLEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 14,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.x, r.lo, r.hi\nFROM join_explain_sort_range_l AS l\nLEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 18,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.k, r.payload\nFROM join_explain_hash_l AS l\nLEFT JOIN join_explain_hash_r AS r ON l.k = r.k;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 19,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.k, r.payload\nFROM join_explain_hash_l AS l\nLEFT JOIN join_explain_hash_r AS r ON l.k = r.k\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 20,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.k\nFROM join_explain_hash_l AS l\nSEMI JOIN join_explain_hash_r AS r ON l.k IS NOT DISTINCT FROM r.k;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 21,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.k\nFROM join_explain_hash_l AS l\nSEMI JOIN join_explain_hash_r AS r ON l.k IS NOT DISTINCT FROM r.k\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 28,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.k\nFROM join_explain_spill_l AS l\nLEFT JOIN join_explain_spill_r AS r ON l.k = r.k;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 29,
+            "sql": "EXPLAIN ANALYZE\nSELECT l.k\nFROM join_explain_spill_l AS l\nLEFT JOIN join_explain_spill_r AS r ON l.k = r.k\nFORMAT JSON;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/query/select/rowset_scan_pushdown.sql",
+      "expected_sha256": "8f86b285f21ac36fdf84b8e3c0af0b4f82eece23308130eac2d64999552cd18f",
+      "actual": {
+        "actual_sha256": "42912ac8917cf72e5c433de6588adb6ccfddea6660b7a464794b921a8a3ec966",
+        "expected_blocks": 37,
+        "actual_blocks": 37,
+        "differences": [
+          {
+            "block": 17,
+            "sql": "EXPLAIN (VERBOSE)\nSELECT COUNT(*)\nFROM rowset_pushdown_case c\nJOIN rowset_pushdown_dim d ON c.k = d.k;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 33,
+            "sql": "EXPLAIN (VERBOSE)\nSELECT phone, wide\nFROM matched_prefix_late_payload_case\nWHERE phone IN ('13x', '31y')\nORDER BY id\nLIMIT 3;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/query/vector/vector_search.sql",
+      "expected_sha256": "2c62d887dc483bad8367ed77be688e72ac75d2cad3babab5e591e0b8386ec92d",
+      "actual": {
+        "actual_sha256": "0fcd17c21dbfa3be78de19e7f53b0817b56c9b0c080e7b48a9d238611606e658",
+        "expected_blocks": 45,
+        "actual_blocks": 45,
+        "differences": [
+          {
+            "block": 21,
+            "sql": "EXPLAIN SELECT id FROM indexed_items\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 22,
+            "sql": "EXPLAIN SELECT id FROM indexed_items\nWHERE bucket = 3\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 23,
+            "sql": "EXPLAIN SELECT id FROM indexed_items\nWHERE id = 1\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 24,
+            "sql": "EXPLAIN SELECT id FROM indexed_items\nWHERE id <= 1024\nORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 36,
+            "sql": "EXPLAIN EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 38,
+            "sql": "EXPLAIN SELECT /*+ HNSW_EF(37) */ id\nFROM indexed_items\nORDER BY emb <-> '[1.0, 1.0, 1.0]'\nLIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 39,
+            "sql": "EXPLAIN SELECT /*+ HNSW_EF(37) HNSW_RERANK(7) */ id\nFROM indexed_items\nORDER BY emb <-> '[1.0, 1.0, 1.0]'\nLIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          },
+          {
+            "block": 40,
+            "sql": "EXPLAIN SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id\nFROM indexed_items\nWHERE id <= 1024\nORDER BY emb <-> '[1.0, 1.0, 1.0]'\nLIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/system/statistics_query.sql",
+      "expected_sha256": "7586d78279c1e0596b22cfc482eaea725001b2e72a98cf0af47cae28344fb60b",
+      "actual": {
+        "actual_sha256": "626652eccd2aee2c4497986d651e0cc261878542a09af407402016bc776b1e25",
+        "expected_blocks": 11,
+        "actual_blocks": 11,
+        "differences": [
+          {
+            "block": 8,
+            "sql": "EXPLAIN (VERBOSE)\nSELECT s.id, b.payload\nFROM stats_small AS s\nJOIN stats_big AS b ON s.id = b.id;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "cases/vector/pgvector_topn_filter_flow.sql",
+      "expected_sha256": "f80d79560049cf7244d5e7b2901915a7324ccaa5e19abc3ec51ac03fdffebfac",
+      "actual": {
+        "actual_sha256": "0e20c7e16552aced534ed4b83f675c760ff7e5e6b60511d9227f0101df5218b1",
+        "expected_blocks": 12,
+        "actual_blocks": 12,
+        "differences": [
+          {
+            "block": 6,
+            "sql": "EXPLAIN SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]' LIMIT 2;",
+            "category": "explain_snapshot",
+            "actual_contains_error": false
+          }
+        ]
+      }
+    }
+  ],
+  "acceptance": "raw snapshots remain failed; categories require explicit adjudication, not automatic acceptance"
+}
