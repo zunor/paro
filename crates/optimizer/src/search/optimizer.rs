@@ -470,6 +470,19 @@ impl SearchOptimizer {
             let Some(intent) = extract_fulltext_match_intent(expr, get)? else {
                 continue;
             };
+            let mut other_predicates = filter.expressions.clone();
+            let match_expression = other_predicates.remove(match_idx);
+            let required_filters = candidate_filters(&other_predicates, get);
+            let (_, residual) =
+                crate::physical::extraction::predicate_builder::build_search_predicate_template(
+                    &required_filters,
+                    get,
+                )?;
+            if !residual.is_empty() {
+                // This leaf implements a bitmap-filter source, not a scalar
+                // residual Filter. Keep the ordinary relational alternative.
+                continue;
+            }
             let search_intent = SearchIntent::FullText(intent.clone());
             let Some(capability) = storage.search_capability(&search_intent) else {
                 continue;
@@ -511,8 +524,6 @@ impl SearchOptimizer {
                 continue;
             };
 
-            let mut other_predicates = filter.expressions.clone();
-            let match_expression = other_predicates.remove(match_idx);
             let operator = LogicalOperator::FullTextFilterScan(Box::new(FullTextFilterScan {
                 get: get.clone(),
                 projection_map: filter.projection_map.clone(),
