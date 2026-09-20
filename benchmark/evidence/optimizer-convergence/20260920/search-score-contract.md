@@ -140,6 +140,10 @@ All artifacts below are in
 - `c2-search-session-r6.log`: 13 real SQL tests pass, including dense overlay
   deletion before truncation, score casts, sparse fallback, fulltext tail,
   compaction and transaction rollback. This does not substitute for corpus.
+- `c2-search-workspace-tests-final.log`: **6854 pass / 0 fail / 85 existing
+  ignored**, all 87 unit/integration/doc-test suites completed.
+  `c2-search-clippy-final.log`: strict workspace/all-targets Clippy passes with
+  `-D warnings`; no blanket allow or weakened assertion was added.
 - Benchmark Python tests: 187 pass plus 9 independent-oracle tests; regress
   harness: 101 pass / 1 existing skip. The unchanged typed-result-v4 and Q39
   contracts are not weakened.
