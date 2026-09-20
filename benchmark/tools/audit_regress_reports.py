@@ -21,6 +21,10 @@ def audit(repository, control, probe):
         return set(re.findall(r"\[SCRIPT   FILE\]: (.*)", (report / "error.txt").read_text()))
 
     c, p = cases(control), cases(probe)
+    unexpected = {}
+    for arm, report, declared in [("control", control, c), ("probe", probe, p)]:
+        names = {"_".join(Path(case).parts[1:]) + ".actual" for case in declared}
+        unexpected[arm] = sorted(path.name for path in (report / "actuals").glob("*.actual") if path.name not in names)
     records = []
     categories = Counter()
     for case in sorted(c | p):
@@ -49,7 +53,8 @@ def audit(repository, control, probe):
         records.append(record)
     return {"schema_version": 1, "control_report": str(control), "probe_report": str(probe),
         "control_only_failures": sorted(c-p), "probe_only_failures": sorted(p-c),
-        "all_actuals_byte_identical": c == p and all(r["actuals_byte_identical"] for r in records),
+        "unexpected_actuals": unexpected,
+        "all_actuals_byte_identical": c == p and not any(unexpected.values()) and all(r["actuals_byte_identical"] for r in records),
         "counts": dict(categories), "cases": records,
         "acceptance": "raw snapshots remain failed; categories require explicit adjudication, not automatic acceptance"}
 
