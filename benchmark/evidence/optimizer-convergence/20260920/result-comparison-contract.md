@@ -32,7 +32,25 @@ budget derived from its input domain and arithmetic, not from measured output
 deviations. The proposed narrow domain is exactly representable integer bags
 with sample variance/mean/CV and Welford/Chan accumulation. It must include
 arbitrary partition/merge order, and reject unbounded or poorly conditioned
-cases as Uncovered. Acceptance code and bounds are not yet admitted here.
+cases as Uncovered.
+
+The bounded oracle `integer-welford-schedules-v1` now enumerates every update
+order and binary partition/merge tree for at most six non-NULL integer inputs
+per group, with sum(abs(inputs)) <= 2**53. That proves all AVG partial sums
+exact. It covers the Paro unfused Chan formula and DuckDB 1.5.5's fused-mean
+formula; fused multiply-add is independently rounded from exact Fractions.
+The closed min/max range of those arithmetic schedules is the output
+enclosure, not a tolerance fitted to either engine's observed results.
+An independent 100-digit integer-moment reference reports mathematical error.
+This is a narrow arithmetic contract, not a universal accuracy guarantee for
+ill-conditioned variance or larger groups. Outside it the result is Uncovered.
+
+Tests cover NULL/empty/singleton/zero mean, duplicate and negative values,
+large-offset small variance, permutations, parallel merges, non-finite
+rejection, signed-zero/subnormal ULP distance, and adversarial overlapping
+numeric matches. The default harness does not automatically apply this
+oracle to SQL: an explicit input/role and relational-boundary proof is still
+required. Admission of Q39 remains pending that complete evidence.
 
 Outputs must be matched bijectively while preserving exact non-approximate
 columns; an approximate Counter comparison is invalid. Predicates and

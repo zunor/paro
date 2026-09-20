@@ -33,7 +33,10 @@ def ulps(a, b):
         raise ValueError("non-finite statistic is not covered by this diagnostic")
     def ordered(value):
         bits = struct.unpack(">Q", struct.pack(">d", value))[0]
-        return ~bits if bits >> 63 else bits | (1 << 63)
+        # Fold the finite number line around zero, identifying signed zeros.
+        # Python's ~ has unbounded sign extension and is not a u64 complement.
+        magnitude = bits & ((1 << 63) - 1)
+        return (1 << 63) - magnitude if bits >> 63 else (1 << 63) + magnitude
     return abs(ordered(a) - ordered(b))
 
 

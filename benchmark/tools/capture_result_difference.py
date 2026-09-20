@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -45,10 +46,18 @@ def main():
         expected_server_diagnostic_environment, open_paro_connection,
         optimizer_evidence_environment,
     )
-    from tpcds_result_contract import (
-        assert_compatible_schema, assert_same_multiset, canonicalize_rows,
-        duckdb_schema, paro_schema,
-    )
+    # Server lifecycle stays frozen independently, but result acceptance is
+    # explicitly versioned by this checkout. Do not accidentally consume an
+    # older contract already imported by the external lifecycle helper.
+    contract_path = Path(__file__).resolve().parents[1] / "corpora/tpcds_result_contract.py"
+    spec = importlib.util.spec_from_file_location("capture_result_contract", contract_path)
+    contract = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = contract
+    spec.loader.exec_module(contract)
+    assert_compatible_schema = contract.assert_compatible_schema
+    assert_same_multiset = contract.assert_same_multiset
+    canonicalize_rows = contract.canonicalize_rows
+    duckdb_schema, paro_schema = contract.duckdb_schema, contract.paro_schema
     import duckdb
     import _duckdb
 
@@ -67,6 +76,8 @@ def main():
     )
     report = {
         "schema_version": 1, "measurement_mode": "correctness_diagnostic",
+        "result_contract_version": contract.RESULT_CONTRACT_VERSION,
+        "result_contract_sha256": content_digest(contract_path),
         "binary_sha256": content_digest(args.binary),
         "seed_sha256": seed.sha256, "sql_sha256": content_digest(args.sql),
         "duckdb_version": duckdb.__version__,
@@ -114,11 +125,16 @@ def main():
                             "expected": [[encode_value(v) for v in r] for r in expected_rows],
                         }
                         try:
-                            assert_compatible_schema(actual_schema, expected_schema)
+                            assert_compatible_schema(actual_schema, expected_schema, query=sql)
                             assert_same_multiset(
                                 canonicalize_rows(actual_rows, actual_schema),
                                 canonicalize_rows(expected_rows, expected_schema),
                             )
+                            keys = contract.parse_order_contract(sql, expected_schema)
+                            a_order = contract.assert_peer_order(canonicalize_rows(actual_rows, actual_schema), keys)
+                            e_order = contract.assert_peer_order(canonicalize_rows(expected_rows, expected_schema), keys)
+                            if a_order != e_order:
+                                raise AssertionError("ordered key sequence differs")
                             item["oracle_status"] = "exact_match"
                         except AssertionError as error:
                             item["oracle_status"] = "mismatch"

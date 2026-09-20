@@ -2,7 +2,7 @@ import copy
 import math
 import unittest
 
-from analyze_integer_moment_oracle import analyze
+from analyze_integer_moment_oracle import analyze, ulps
 
 
 def cell(value):
@@ -10,6 +10,16 @@ def cell(value):
 
 
 class IndependentMomentOracleTests(unittest.TestCase):
+    def test_ulp_number_line_signed_zero_negative_and_subnormal(self):
+        tiny = math.ulp(0.0)
+        self.assertEqual(ulps(-0.0, 0.0), 0)
+        self.assertEqual(ulps(-tiny, tiny), 2)
+        self.assertEqual(ulps(-tiny, -0.0), 1)
+        self.assertEqual(ulps(-1.0, math.nextafter(-1.0, -math.inf)), 1)
+        self.assertEqual(ulps(-1.0, math.nextafter(-1.0, math.inf)), 1)
+        for value in [math.inf, -math.inf, math.nan]:
+            with self.assertRaises(ValueError):
+                ulps(value, value)
     def fixture(self):
         # Input bag [1, 1, 4], not another estimator or engine's stddev.
         # mean=2, sample variance=3, cov=sqrt(3)/2.
