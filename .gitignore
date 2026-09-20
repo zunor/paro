@@ -30,8 +30,12 @@ Thumbs.db
 # Local CI
 /.ci/
 
-# AI workflow
-.agents/
+# AI workflow (only maintained repository skills are shared)
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/paro-benchmark/
+!.agents/skills/paro-evidence/
 .kiro/
 .gemini/
 .cursor/

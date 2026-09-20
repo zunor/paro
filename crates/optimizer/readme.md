@@ -263,13 +263,15 @@ session/execution and SQL regression checks.
 
 For performance work, first read the
 [benchmark README](../../benchmark/README.md). When installed, also follow the
-local paro-benchmark skill; that tooling is not a tracked-clone prerequisite.
+repository paro-benchmark skill, or paro-evidence for controlled comparisons;
+that tooling is not a prerequisite for using the framework directly.
 Use the established first-statement harness, fixed source/binary/data/SQL
 identities, actual resource envelopes and complete result validation. Do not
-run concurrent benchmark runners or compare a diagnostic cohort with a normal
-one. Pin the competitor build, extensions and settings as well; a parity claim
-does not transfer to a new competitor version. Apply the following comparison
-rules before drawing conclusions.
+mix competing runs on shared resources or compare a diagnostic cohort with a
+normal one. Isolated output paths alone do not remove CPU/I/O or fixture
+interference. Pin the competitor build, extensions and settings as well; a
+parity claim does not transfer to a new competitor version. Apply the following
+comparison rules before drawing conclusions.
 
 ### Comparison validity
 

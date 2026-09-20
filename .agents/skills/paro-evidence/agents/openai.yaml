@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paro Evidence"
+  short_description: "Design and validate controlled Paro comparisons"
+  default_prompt: "Use $paro-evidence to plan the requested comparison with fixed identities, bounded evidence and explicit certification gates."
