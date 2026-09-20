@@ -16,6 +16,24 @@ comparison identifies and controls that source state. Review-only work does not
 authorize builds, servers or a new campaign. This workflow never blesses
 results, baselines or policies.
 
+## Workflow
+
+1. Confirm the selected checkout, source state and authorized scope.
+2. Read CORPORA and the optimizer README's comparison/evidence contracts;
+   verify the declared competitor baseline against the actual environment.
+3. Register the comparison: EvidenceId, hypothesis, arms, samples, thresholds,
+   fixed identities and capacity. Existing-data audits verify the original registration.
+4. Collect fresh/interleaved trace-off samples; keep diagnostics separate.
+5. Validate complete typed results for every sample outside its timer, not
+   only after the entire campaign has finished.
+6. Analyze only when the decision rule applies; otherwise report
+   Uncovered, Incomparable or NotCertified as appropriate.
+7. Archive the bounded campaign manifest, cell timings and single capture
+   references through the supported schema; do not pretend a migration is done.
+
+For audit-only requests, inspect existing artifacts without starting collection
+or inventing a retrospective registration. Detailed constraints follow.
+
 ## Use the maintained harness
 
 Read `benchmark/CORPORA.md`, then the comparison-validity and evidence sections
@@ -57,6 +75,17 @@ version **and** package/binary and extension hashes/settings; upgrades create a
 new comparison, not an inherited parity claim. Check the installed harness's
 effective `optimizer_verify` setting: some versions force it on. If a requested
 mode is unsupported, disclose it; do not invent a disabling flag.
+
+The competitor declaration starts at the selected checkout's
+`benchmark/requirements.txt`, supplemented by the referenced runtime manifest
+and campaign registration **when actually present**. Follow
+[Declared competitor baseline](../../../benchmark/CORPORA.md#declared-competitor-baseline):
+check the selected Python/worker's imported package, native engine and extension
+identities against those declarations before collection. A requirement range
+is not an exact baseline, and a version pin does not declare binary/extension
+hashes. Missing declarations or mismatches stop confirmatory collection; do not
+bless whichever version happens to be installed or change dependencies without
+authorization. Do not assume a runtime-manifest filename exists on this branch.
 
 ## Collect comparable samples
 

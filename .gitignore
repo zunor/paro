@@ -30,12 +30,9 @@ Thumbs.db
 # Local CI
 /.ci/
 
-# AI workflow (only maintained repository skills are shared)
-.agents/*
-!.agents/skills/
-.agents/skills/*
-!.agents/skills/paro-benchmark/
-!.agents/skills/paro-evidence/
+# Shared agent guidance is tracked by default; local drafts opt out here.
+.agents/local/
+# Tool-specific local configuration is not shared.
 .kiro/
 .gemini/
 .cursor/

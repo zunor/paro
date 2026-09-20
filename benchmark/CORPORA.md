@@ -68,6 +68,41 @@ Current collectors do not yet implement the complete bounded
 document or infer missing normal receipts from legacy trace data. Archiving,
 baseline updates and cleanup are not automatic parts of a comparison run.
 
+## Declared competitor baseline
+
+The declaration and the observation are separate evidence:
+
+1. Read **this checkout's** [requirements.txt](requirements.txt), any actual
+   referenced runtime/lock manifest, and the campaign's versioned registration.
+   Record their source revision, content hashes and dirty state. A broad range
+   such as `duckdb>=1.4,<2` is not an exact comparison baseline: resolve and
+   approve an exact baseline before confirmatory sampling. An uncommitted pin
+   is not automatically part of the committed source identity.
+2. The package declaration constrains the DuckDB version. Binary/wheel, native
+   `_duckdb` module, loaded DuckDB extensions, platform and settings need their
+   own expected identities in the referenced runtime manifest/registration.
+   Do not claim requirements alone specifies these hashes. Where no runtime
+   manifest exists, register the approved artifacts before collection and mark
+   absent evidence explicitly; do not cite an invented manifest filename.
+3. Using the **selected interpreter and actual worker environment**, compare
+   distribution/imported-package and native-engine versions, module paths and
+   hashes, and the loaded extension set/configuration with that declaration.
+   A controller's `pip show` or an observed hash by itself is not proof of what
+   a worker loaded or of conformity to an approved baseline. Resolve differing
+   declarations before running; do not simply choose the one matching the venv.
+4. On mismatch or missing required identity, stop confirmatory collection and
+   report the discrepancy. Do not silently update requirements, a venv, an
+   extension or the registration to legitimize the installed version. An
+   authorized baseline upgrade or explicit competitor-version experiment gets
+   a new declared comparison; previous parity does not transfer to it.
+
+The existing `tpcds_compare.py` report records an observed DuckDB version and
+native Python-extension hash. Those fields are observations, **not** an already
+implemented declaration-versus-runtime or loaded-extension-set gate. This
+workflow requires the preflight; do not claim the current harness enforces it.
+
+## Oracle-specific semantics
+
 CEB targets PostgreSQL semantics. In particular, PostgreSQL widens
 `REAL`/`NUMERIC` comparisons to double precision, while DuckDB narrows the
 numeric operand to `FLOAT`. When DuckDB is used as the CEB execution oracle,

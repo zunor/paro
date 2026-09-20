@@ -79,6 +79,11 @@ and start its own server, whereas `quality` reads an existing report.
   parameters, policy/platform, actual resource envelope and diagnostic settings.
   Read effective settings, including `optimizer_verify` and allocation
   instrumentation; do not infer them from a label such as "normal".
+- If DuckDB is used as a comparator or oracle, verify its declared baseline
+  in this checkout's `benchmark/requirements.txt` and referenced registration
+  against the selected runtime, not just the installed version string. Follow
+  `benchmark/CORPORA.md`'s declared-competitor contract; do not silently resolve
+  a broad dependency range differently in each worktree.
 - Follow the registered policy's sample minima, calibration, quorum retries,
   coverage and enforcement. Preserve initial failures and all retry samples.
   A zero exit in shadow/soft mode, missing calibration or an Unmeasurable entry
