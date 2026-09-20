@@ -372,6 +372,15 @@ fn vector_replacement_preserves_null_rows_and_projected_casts() {
         exec_ok(&mut session, &mut sink,
             "SELECT CAST(v <-> '[0,0]' AS INT) AS distance FROM vector_domain WHERE v IS NOT NULL ORDER BY distance LIMIT 2").await;
         assert_eq!(query_i64_col(&sink, 0), vec![0, 1]);
+        exec_ok(&mut session, &mut sink,
+            "SELECT v <-> '[0,0]' AS distance FROM vector_domain WHERE v IS NOT NULL ORDER BY distance LIMIT 2").await;
+        let values: Vec<_> = sink
+            .assert_single_result()
+            .chunks
+            .iter()
+            .flat_map(|chunk| (0..chunk.len()).map(|row| chunk.column(0).unwrap().get_value(row)))
+            .collect();
+        assert_eq!(values, vec![Value::Double(0.25), Value::Double(1.25)]);
     });
 }
 

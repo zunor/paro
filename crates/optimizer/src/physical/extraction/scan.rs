@@ -621,7 +621,10 @@ fn lower_search_projection(scan: &LogicalSearchScan) -> Result<SearchProjectionL
         );
     }
     source_output_names.push("__search_score".to_string());
-    source_output_types.push(scan.score_expression.return_type());
+    // All search cursors materialize binary32 scores. SQL dense distance is
+    // DOUBLE, so its widening belongs to the ordinary projection above this
+    // source, not to a false source-schema declaration.
+    source_output_types.push(LogicalType::Float);
 
     let is_identity = expressions.len() == source_output_types.len()
         && expressions.iter().enumerate().all(|(index, expression)| {
@@ -677,9 +680,37 @@ fn rebase_search_projection(
     score_index: usize,
 ) -> Result<()> {
     if expression.equals(score_expression) {
-        *expression = Expression::Reference(
-            ReferenceExpression::new(score_index, score_expression.return_type()).into(),
-        );
+        let raw_score =
+            Expression::Reference(ReferenceExpression::new(score_index, LogicalType::Float).into());
+        *expression = match score_expression.return_type() {
+            LogicalType::Float => raw_score,
+            LogicalType::Double => {
+                use paro_function::scalar::cast::{
+                    numeric_casts::float_to_double, BoundCastInfo, CastFunctionSet,
+                };
+                use paro_planner::expression::CastExpression;
+                let mut casts = CastFunctionSet::new();
+                casts.register_cast(
+                    LogicalType::Float,
+                    LogicalType::Double,
+                    BoundCastInfo::fixed(float_to_double),
+                );
+                Expression::Cast(
+                    CastExpression::new(
+                        raw_score,
+                        LogicalType::Double,
+                        casts.get_cast_function(&LogicalType::Float, &LogicalType::Double)?,
+                        false,
+                    )
+                    .into(),
+                )
+            }
+            other => {
+                return Err(paro_error::internal(format!(
+                    "search score has no proven conversion from FLOAT to {other:?}"
+                )))
+            }
+        };
         return Ok(());
     }
     if let Some(source_index) = search_projection_source_index(expression, get)? {
