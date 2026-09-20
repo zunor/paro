@@ -241,6 +241,17 @@ fn document_rank_executes_index_tail_overlay_and_compacted_sources() {
         exec_ok(&mut session, &mut sink, "ROLLBACK").await;
         exec_ok(&mut session, &mut sink, ranking).await;
         assert_eq!(query_i64_col(&sink, 0), vec![1]);
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT id FROM rank_sources
+             WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+                 AND length(content) < 20 AND id < 3
+             ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1",
+        )
+        .await;
+        assert_eq!(query_i64_col(&sink, 0), vec![2]);
     });
 }
 

@@ -324,14 +324,14 @@ impl SearchOptimizer {
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
             };
-            return Ok(Some(build_search_scan(
+            return build_search_scan(
                 id,
                 root_stats,
                 pattern,
                 request,
                 decision,
                 candidate_filters,
-            )?));
+            );
         }
 
         if let Some(intent) = extract_sparse_intent(pattern.order_expr, pattern.get)? {
@@ -366,14 +366,14 @@ impl SearchOptimizer {
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
             };
-            return Ok(Some(build_search_scan(
+            return build_search_scan(
                 id,
                 root_stats,
                 pattern,
                 request,
                 decision,
                 candidate_filters,
-            )?));
+            );
         }
 
         if let Some(intent) = extract_fulltext_score_intent(pattern.order_expr, pattern.get)? {
@@ -440,14 +440,14 @@ impl SearchOptimizer {
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 return Ok(None);
             };
-            return Ok(Some(build_search_scan(
+            return build_search_scan(
                 id,
                 root_stats,
                 pattern,
                 request,
                 decision,
                 candidate_filters,
-            )?));
+            );
         }
 
         Ok(None)
@@ -571,7 +571,18 @@ fn build_search_scan<C>(
     request: NormalizedSearchRequest,
     decision: SearchDecision,
     candidate_filters: Vec<Expression>,
-) -> Result<OwnedLogicalPlan> {
+) -> Result<Option<OwnedLogicalPlan>> {
+    // TopK cannot discard a predicate and apply it after truncation. Use the
+    // exact extraction contract before publication, not a cost-based guess
+    // that a later extractor will support this shape.
+    let (_, residual) =
+        crate::physical::extraction::predicate_builder::build_search_predicate_template(
+            &candidate_filters,
+            pattern.get,
+        )?;
+    if !residual.is_empty() {
+        return Ok(None);
+    }
     pattern
         .topn
         .projection_map
@@ -616,11 +627,11 @@ fn build_search_scan<C>(
         .with_output_names(output_names),
     ));
     let stats = root_stats.clone();
-    Ok(OwnedLogicalPlan {
+    Ok(Some(OwnedLogicalPlan {
         id,
         stats,
         operator,
-    })
+    }))
 }
 
 fn build_search_candidate(
