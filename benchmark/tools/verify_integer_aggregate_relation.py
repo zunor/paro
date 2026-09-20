@@ -122,9 +122,20 @@ def main():
     for flag in ["inputs", "result", "spec", "output"]:
         parser.add_argument("--"+flag, type=Path, required=True)
     args = parser.parse_args()
-    report = verify(json.loads(args.inputs.read_text())["result_sets"][0],
-                    json.loads(args.result.read_text())["result_sets"][0],
-                    json.loads(args.spec.read_text()))
+    inputs = json.loads(args.inputs.read_text())
+    output = json.loads(args.result.read_text())
+    for identity in ["seed_sha256", "duckdb_database_sha256", "duckdb_version",
+                     "duckdb_extension_sha256"]:
+        if not inputs.get(identity) or inputs[identity] != output.get(identity):
+            raise ValueError("input/result identity differs: " + identity)
+    if len(inputs["result_sets"]) != 1 or len(output["result_sets"]) != 1:
+        raise Uncovered("oracle registration requires exactly one result set")
+    item = output["result_sets"][0]
+    actual_schema = [(c["name"], c["logical_type"]) for c in item["actual_schema"]]
+    expected_schema = [(c["name"], c["logical_type"]) for c in item["expected_schema"]]
+    if actual_schema != expected_schema and item.get("checks", {}).get("schema", {}).get("status") != "pass":
+        raise Uncovered("schema identity has no independent passing certificate")
+    report = verify(inputs["result_sets"][0], item, json.loads(args.spec.read_text()))
     report["manifest"] = {name: {"path": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         for name, path in [("inputs", args.inputs), ("result", args.result), ("spec", args.spec)]}
