@@ -1,4 +1,4 @@
-# Search replacement contract (C2, in progress)
+# Search replacement contract (C2)
 
 This replaces the incompatible use of one `Bm25` identity for two scoring
 functions. The five-row counterexample and the withdrawn implementation remain
@@ -77,3 +77,80 @@ column layout, not yet adjudicated here. These dirty-binary preflights are not
 substitutes for final integration, full regress or current-binary corpus checks.
 Final manifests and gate results will be recorded separately. C2 is not closed;
 F2 remains independently unadmitted. No performance claim is made.
+
+## Final implementation and independently checked boundaries
+
+The final production revision is `4b1d5714`; executable and source hashes are
+recorded in `search-validation-manifest.json`. The earlier `d5f73817` binary
+(SHA-256 `1787994b266a32afe35888935b2ca34880243f7802da1a5640935009e59ee5e3`)
+and its partial corpus remain intermediate evidence, not final certification.
+
+Dense vector score casts are not identity operations. The SQL counterexample
+`CAST(distance AS INT)` previously returned `Float(0.25)` after replacement.
+The matcher now declines outer score casts for dense and sparse intents, as it
+already does for fulltext; ordinary TopN retains the actual conversion and
+output type. The SQL counterexample passes. Dense scalar distance currently
+treats a NULL vector as a zero vector: no-index, indexed, and LIMIT 1 probes
+confirm this existing behavior. This work does **not** silently replace that
+logical contract with NULL propagation.
+
+A second production counterexample exposed the raw score-port type mismatch:
+projected dense distance was declared DOUBLE but materialized FLOAT. Physical
+extraction now declares the provider's actual FLOAT source and uses the existing
+typed, lossless FLOAT-to-DOUBLE cast in ordinary Projection. Both logical score
+values and runtime value types are checked through SQL. This is an extraction
+contract repair, not a distance algorithm or executor change.
+
+Sparse SQL coverage is explicitly **fallback**, not provider certification.
+Storage accepts binary Blob sparse row images; the old SQL provider matcher
+recognizes only Varchar. The new real SQL fixture creates a Blob index, checks
+ASC and DESC (including zero-overlap rows), and checks that no sparse/adaptive
+source executes. This is not evidence that the storage sparse TopK implements
+the entire SQL score domain. No ANN reranking or sparse index existence is
+accepted as an exact SQL replacement proof.
+
+CoverDensity's five-row fixture has three peers, all scoring 2.0. The first
+new test incorrectly assumed row 1 was uniquely best, copying the document-rank
+expectation; raw r3 regress evidence is retained. Independent no-index and
+indexed executions returned identical `(id, score)` multisets. The corrected
+test checks exact scores, deterministic secondary ordering separately, and
+real FULLTEXT_SCAN execution without imposing an arbitrary peer identity at
+LIMIT 1. The original rank counterexample still has a **unique** best row 1.
+
+## Integration gate ledger
+
+All artifacts below are in
+`/Users/linjunhong/paro-convergence-archive/20260920/c0/`.
+
+- `c2-search-full-regress-r4.log`: **177 pass / 8 fail**, all 185 cases run,
+  optimizer verification enabled, FD limit 65536, serial server experiments.
+  DocumentRank and CoverDensity execute FULLTEXT_SCAN; hidden TopN ordering and
+  spill/fallback cases pass. The three old fulltext failures close without
+  changing their expected files.
+- `c2-search-regress-final-comparison.json`: the eight remaining actuals are
+  byte-identical to r2. This establishes attribution, **not acceptance**.
+  Their 25 differing blocks remain unadjudicated EXPLAIN contracts:
+  `agg_join_subsumption`, `agg_singleton_groups`, `explain_analyze`,
+  `explain_basic`, `join_explain_advanced`, `rowset_scan_pushdown`,
+  `statistics_query`, and `pgvector_topn_filter_flow`.
+- Vector snapshot adjudication changes only blocks 22/23/36 of
+  `vector_search.result`: the selected adaptive exact source replaces the
+  index wrapper; request, distance, filtering, result guarantee, and rows are
+  retained. The separate fallback `category` layout is **not** blessed.
+- `c2-search-session-r4.log`: 13 real SQL tests pass, including dense overlay
+  deletion before truncation, score casts, sparse fallback, fulltext tail,
+  compaction and transaction rollback. This does not substitute for corpus.
+- Benchmark Python tests: 187 pass plus 9 independent-oracle tests; regress
+  harness: 101 pass / 1 existing skip. The unchanged typed-result-v4 and Q39
+  contracts are not weakened.
+- `c2-search-preserve-*-final.json`: main 133, docs 17, other isolated tree 57
+  pre-existing files verified unchanged. No user files or unique evidence were
+  removed.
+
+Final workspace/corpus summaries and the clean-source manifest are recorded
+in the validation manifest accompanying this document. The interrupted
+`c2-search-corpus/` batch and the 198 historical captures cannot certify this
+binary. Normal performance was not run. C2 remains blocked by unresolved
+regress contracts; F2 remains separately unadmitted. Search completion is not
+inferred from a successful quality handoff, and no ProofComplete or parity
+claim is made.
