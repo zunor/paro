@@ -54,7 +54,7 @@ FROM order_spill_test
 ORDER BY payload DESC, id ASC
 LIMIT 6;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE SELECT id FROM order_spill_test ORDER BY id DESC, k1 ASC;
 
 SET force_external = DEFAULT;
@@ -71,7 +71,7 @@ INSERT INTO order_spill_smallmem_test VALUES
     (7, 5),
     (3, 6);
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE SELECT id FROM order_spill_smallmem_test ORDER BY id ASC, k1 DESC;
 
 SET force_external = DEFAULT;

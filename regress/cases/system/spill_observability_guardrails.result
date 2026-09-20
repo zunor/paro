@@ -27,12 +27,12 @@ SET
 SET threads = 1;
 SET
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>) logical_node_id=14
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>) logical_node_id=15
   SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=<loops> spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=<loops>)
@@ -42,14 +42,14 @@ MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes>
 Execution Time: <time-ms>
 Rows Returned: 10000
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_adaptive_runtime
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_adaptive_runtime,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT k1, k2, SUM(v)
 FROM spill_h_agg
 GROUP BY k1, k2;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=<loops>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=<loops>) logical_node_id=12
   SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=<loops> spilled=true spilled_bytes=<bytes> aggregate_hash_full_key_fallback_count=<adaptive> aggregate_hash_max_prefix_probe_distance=<adaptive> repartition_depth=1)
 PIPELINE 1
   SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=200000 loops=<loops>)
@@ -81,12 +81,12 @@ PROJECTION  (rows=1000)
 SET temp_directory = DEFAULT;
 SET
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>) logical_node_id=14
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>) logical_node_id=15
   SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=<loops> peak_memory_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=<loops>)
@@ -99,12 +99,12 @@ Rows Returned: 10000
 SET force_external = true;
 SET
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>) logical_node_id=14
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>) logical_node_id=15
   SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=<loops> spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=<loops>)

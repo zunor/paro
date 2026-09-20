@@ -79,12 +79,12 @@ id	payload
 14006	payload_zeta_ffffffffffffffff_dup2_dup3_dup4
 6006	payload_zeta_ffffffffffffffff_dup2_dup3
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE SELECT id FROM order_spill_test ORDER BY id DESC, k1 ASC;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=128 loops=<loops>)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=128 loops=<loops>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=128 loops=<loops>) logical_node_id=17
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=128 loops=<loops>) logical_node_id=18
   SINK #2 SORT_BUILD (actual time=<time-range> rows=128 loops=<loops> spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=128 loops=<loops>)
@@ -113,12 +113,12 @@ INSERT INTO order_spill_smallmem_test VALUES
     (3, 6);
 INSERT 0 6
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE SELECT id FROM order_spill_smallmem_test ORDER BY id ASC, k1 DESC;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=6 loops=<loops>)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=6 loops=<loops>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=6 loops=<loops>) logical_node_id=17
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=6 loops=<loops>) logical_node_id=18
   SINK #2 SORT_BUILD (actual time=<time-range> rows=6 loops=<loops> spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
 PIPELINE 1
   SOURCE #3 SORT_EMIT (actual time=<time-range> rows=6 loops=<loops>)

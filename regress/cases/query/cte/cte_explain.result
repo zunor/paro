@@ -56,7 +56,7 @@ MATERIALIZED_CTE  (rows=0)
                 CTE Index: 0
                 Table Index: 17
 
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE
 WITH base(id, grp, amount) AS MATERIALIZED (
     VALUES
@@ -82,10 +82,10 @@ JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 VALUES (actual time=<time-range> rows=5 loops=<loops>)
+  SOURCE #0 VALUES (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=180
   SINK #1 CTE_MATERIALIZE (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 1
-  SOURCE #2 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  SOURCE #2 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=182
   SINK #3 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 2
   SOURCE #4 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
@@ -99,7 +99,7 @@ PIPELINE 3
   TRANSFORM #11 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
   SINK #12 HASH_JOIN_BUILD (actual time=<time-range> rows=0 loops=<loops>)
 PIPELINE 4
-  SOURCE #13 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  SOURCE #13 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=187
   SINK #14 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 5
   SOURCE #15 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=3 loops=<loops>)
@@ -145,7 +145,7 @@ p.id	p.peer_id	a.total
 1	2	30
 3	4	45
 
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE
 WITH RECURSIVE
 edges(src, dst) AS (
@@ -162,11 +162,11 @@ walk(node, depth) AS (
 SELECT node, depth FROM walk ORDER BY depth, node;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 VALUES (actual time=<time-range> rows=1 loops=<loops>)
+  SOURCE #0 VALUES (actual time=<time-range> rows=1 loops=<loops>) logical_node_id=40
   SINK #1 RECURSIVE_TABLE_APPEND (actual time=<time-range> rows=1 loops=<loops>)
 PIPELINE 1
-  SOURCE #2 VALUES (actual time=<time-range> rows=5 loops=<loops>)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=5 loops=<loops>)
+  SOURCE #2 VALUES (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=43
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=44
   SINK #4 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 2
   SOURCE #5 RECURSIVE_TABLE_SCAN (actual time=<time-range> rows=5 loops=<loops>)

@@ -29,7 +29,7 @@ _OPTIONAL_SCHEDULER_RUNTIME_RE = re.compile(
 )
 _JSON_OPERATOR_TIMING_RE = re.compile(r'"(startup_time_ms|total_time_ms)"\s*:\s*[\d.]+')
 _JSON_OPERATOR_COUNTERS_RE = re.compile(r'"(rows|loops)"\s*:\s*\d+')
-_JSON_LOGICAL_NODE_ID_RE = re.compile(r'("logical_node_id"\s*:\s*)\d+')
+_LOGICAL_NODE_ID_RE = re.compile(r'("logical_node_id"\s*:\s*|\blogical_node_id=)(\d+)')
 _PROFILE_LINE_RE = re.compile(
     r"PROFILE schema_version=(\d+) query_id=\d+ events=\d+ "
     r"parallelism=\d+ workers=\d+ worker_utilization=[\d.]+ "
@@ -197,15 +197,15 @@ def normalize_explain_search_ids(lines: list[str]) -> list[str]:
 
 
 def normalize_explain_logical_ids(lines: list[str]) -> list[str]:
-    """Normalize per-bind logical node ids while preserving node order."""
+    """Alpha-rename IDs in text/JSON, preserving presence and alias relations."""
     canonical_ids: dict[str, int] = {}
 
     def _replace(match: re.Match[str]) -> str:
-        raw_id = match.group(0).rsplit(":", 1)[-1].strip()
+        raw_id = match.group(2)
         canonical_id = canonical_ids.setdefault(raw_id, len(canonical_ids) + 1)
         return f'{match.group(1)}{canonical_id}'
 
-    return [_JSON_LOGICAL_NODE_ID_RE.sub(_replace, line) for line in lines]
+    return [_LOGICAL_NODE_ID_RE.sub(_replace, line) for line in lines]
 
 
 def normalize_explain_cte_ids(lines: list[str]) -> list[str]:

@@ -125,7 +125,7 @@ SELECT
   g
 FROM generate_series(1, 3000) AS t(g);
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT count(r.v)
 FROM join_spill_skew_l l

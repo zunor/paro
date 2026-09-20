@@ -8,6 +8,23 @@ import pytest
 from harness.normalizers import apply_normalizers, normalizer_profiles
 
 
+def test_lineage_alpha_renaming_preserves_presence_roles_and_shared_identity() -> None:
+    def normalize(lines):
+        return apply_normalizers(lines, ("explain_logical_ids",))
+    original = ["SOURCE logical_node_id=90", "BUILD logical_node_id=91",
+                '{"logical_node_id":90,"role":"probe"}']
+    renamed = ["SOURCE logical_node_id=5", "BUILD logical_node_id=7",
+               '{"logical_node_id":5,"role":"probe"}']
+    assert normalize(original) == normalize(renamed)
+    for wrong in [
+        ["SOURCE", *renamed[1:]],
+        [renamed[0], "BUILD logical_node_id=5", renamed[2]],
+        [*renamed[:2], '{"logical_node_id":7,"role":"probe"}'],
+        [*renamed[:2], '{"logical_node_id":5,"role":"build"}'],
+    ]:
+        assert normalize(original) != normalize(wrong)
+
+
 def test_apply_explain_operator_timing_normalizer_rewrites_actual_time() -> None:
     lines = [
         "FILTER  (actual time=0.018..0.024 rows=2)",

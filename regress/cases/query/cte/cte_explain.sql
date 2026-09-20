@@ -25,7 +25,7 @@ FROM peers AS p
 JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE
 WITH base(id, grp, amount) AS MATERIALIZED (
     VALUES
@@ -73,7 +73,7 @@ FROM peers AS p
 JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE
 WITH RECURSIVE
 edges(src, dst) AS (
