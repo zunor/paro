@@ -56,7 +56,7 @@ search-counter hunk was independently reviewable and was committed separately.
 - `cargo check --workspace --locked`: pass.
 - `cargo test --workspace --locked`: pass.
 - strict workspace Clippy with `-D warnings`: pass.
-- benchmark tests: 192 passed, 1 skipped.
+- benchmark tests: 194 passed, 1 skipped.
 - fresh high-FD SQL regress: 177 passed, 8 failures, 0 result mismatches; expected files were not changed.
 - real PgWire smoke: `EXPLAIN (COMPILE, FORMAT JSON) SELECT 1` and
   `EXPLAIN (COMPILE, ANALYZE, FORMAT JSON) SELECT 1` were accepted by the shared v3 validator;
