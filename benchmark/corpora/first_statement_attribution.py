@@ -2,12 +2,12 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-"""Derive auditable D1-Q/D6 attribution from a validated cold-plan report.
+"""Derive auditable D1-Q/D6 attribution from a Compile Evidence report.
 
-This consumes the existing diagnostic trace and optimizer diagnostic rows.  It
-does not enable tracing, replay a plan, or participate in a normal C1 sample.
-Missing trajectory or first-construction fields are represented explicitly
-instead of being inferred from final plan identity or elapsed time.
+The collector consumes the typed EXPLAIN (COMPILE) document and optimizer
+diagnostic rows.  It does not enable tracing, replay a plan, or participate in
+a normal C1 sample.  Candidate trajectory and event-level attribution remain
+explicitly Uncovered rather than being reconstructed from a final plan.
 """
 
 from __future__ import annotations
@@ -19,7 +19,11 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from benchmark.corpora.benchmark_evidence import validate_statement_trace
+from benchmark.harness.receipt_contract import (
+    ReceiptContractError,
+    validate_compile_document,
+)
+from benchmark.harness.run_output import CorpusOutput
 
 
 RULE_METRIC_UNITS = {
@@ -36,39 +40,8 @@ def _content_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _event_index(trace: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    events = trace.get("events")
-    if not isinstance(events, list):
-        raise ValueError("target trace has no events")
-    index: dict[str, dict[str, Any]] = {}
-    for event in events:
-        name = event.get("event")
-        if not isinstance(name, str) or name in index:
-            raise ValueError(f"target trace has duplicate or invalid event: {name!r}")
-        index[name] = event
-    return index
-
-
-def _event_payload(event: dict[str, Any] | None) -> dict[str, int | None] | None:
-    if event is None:
-        return None
-    return {
-        "elapsed_us": event.get("elapsed_us"),
-        "duration_us": event.get("duration_us"),
-        "value": event.get("value"),
-    }
-
-
-def _first_rule_values(events: dict[str, dict[str, Any]], rule: str) -> dict[str, int | None]:
-    values: dict[str, int | None] = {}
-    for phase in ("discovered", "matched", "applicable", "published"):
-        event = events.get(f"rule.{rule}.first_{phase}_us")
-        values[f"first_{phase}_us"] = event.get("value") if event else None
-    return values
-
-
 def _rule_attribution(
-    diagnostics: list[dict[str, Any]], events: dict[str, dict[str, Any]]
+    diagnostics: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     by_rule: dict[str, dict[str, dict[str, Any]]] = {}
     for row in diagnostics:
@@ -97,13 +70,16 @@ def _rule_attribution(
                     if attempts or insertions
                     else None
                 ),
-                **_first_rule_values(events, name),
+                "first_discovered_us": None,
+                "first_matched_us": None,
+                "first_applicable_us": None,
+                "first_published_us": None,
                 "first_constructed_us": None,
                 "first_inserted_us": None,
                 "coverage": {
                     "first_constructed": "uncovered",
                     "first_inserted": "uncovered",
-                    "reason": "current trace exposes counts and first published event only",
+                    "reason": "Compile Evidence Summary does not expose per-event trajectory",
                 },
             }
         )
@@ -387,50 +363,15 @@ def _plan_coordinates(
     }
 
 
-def _milestones(events: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    names = (
-        "first_safe_us",
-        "first_optional_ready_us",
-        "first_optional_selected_us",
-        "first_logical_publication_us",
-        "compiler_call_entry",
-        "compiler_call_return",
-        "compiler_return",
-        "executable_image_frozen",
-        "planning_state_released",
-        "admission_entry",
-        "resource_grant_published",
-        "pipeline_dispatch_entry",
-        "pipeline_initialized",
-        "first_page_ready",
-        "fetch_drain",
-        "command_complete_sent",
-        "commit_published",
-        "statement_scope_return",
-        "statement_complete",
-    )
-    return {name: _event_payload(events.get(name)) for name in names if name in events}
-
-
 def _attribute_sample(
     sample: dict[str, Any],
     *,
-    expected_process_id: int,
-    expected_sample_id: str,
-    expected_fp: int,
     execution_sample: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    traces = sample.get("target_statement_traces")
-    if not isinstance(traces, list) or len(traces) != 1:
-        raise ValueError("sample does not contain exactly one target statement trace")
-    trace = traces[0]
-    validate_statement_trace(
-        trace,
-        expected_process_id=expected_process_id,
-        expected_sample_id=expected_sample_id,
-        expected_query_fingerprint=expected_fp,
-    )
-    events = _event_index(trace)
+    try:
+        compile_status = validate_compile_document(sample.get("compile_document"))
+    except ReceiptContractError as error:
+        raise ValueError(str(error)) from error
     diagnostics = sample.get("diagnostics")
     if not isinstance(diagnostics, list):
         raise ValueError("sample has no optimizer diagnostic rows")
@@ -442,8 +383,19 @@ def _attribute_sample(
         "optimizer_ms": sample.get("optimizer_ms"),
         "explain_wall_ms": sample.get("explain_wall_ms"),
         "components_ms": _component_times(diagnostics),
-        "milestones": _milestones(events),
-        "rules": _rule_attribution(diagnostics, events),
+        "compile_document": {
+            "status": compile_status,
+            "query_fingerprint": sample.get("compile_query_fingerprint"),
+            "outcome": sample["compile_document"].get("outcome"),
+            "artifact": sample["compile_document"].get("artifact"),
+            "admission": sample["compile_document"].get("admission"),
+            "execution": sample["compile_document"].get("execution"),
+        },
+        "milestones": {
+            "status": "uncovered",
+            "reason": "source sequence events are not part of the Summary contract",
+        },
+        "rules": _rule_attribution(diagnostics),
         "plan_coordinates": (
             _plan_coordinates(plan, execution_sample)
             if isinstance(plan, str)
@@ -454,7 +406,7 @@ def _attribute_sample(
         ),
         "physical_decision_trajectory": {
             "status": "uncovered",
-            "reason": "cold-planning trace records milestones and final plan identity, not every candidate transition",
+            "reason": "Summary records bounded aggregates, not every candidate transition",
         },
         "allocation": {
             "status": "uncovered",
@@ -516,7 +468,7 @@ def _execution_profile_compatibility(
         "accepted": all(checks.values()),
         "checks": checks,
         "join_key": "(block, logical_node_id)",
-        "statement_boundary": "diagnostic EXPLAIN ANALYZE is separate from structural EXPLAIN FORMAT JSON",
+        "statement_boundary": "typed EXPLAIN (COMPILE, DETAIL, FORMAT JSON) is the sole diagnostic producer",
         "rejected_when": "SQL, immutable data seed, or binary identity differs",
     }
 
@@ -555,9 +507,6 @@ def build_attribution(
         output_samples.append(
             _attribute_sample(
                 sample,
-                expected_process_id=int(server["pid"]),
-                expected_sample_id=str(server["statement_trace_sample_id"]),
-                expected_fp=int(sample["trace_query_fingerprint"]),
                 execution_sample=execution_sample,
             )
         )
@@ -607,12 +556,23 @@ def main() -> int:
     args = parser.parse_args()
     report = json.loads(args.report.read_text(encoding="utf-8"))
     attribution = build_attribution(report, args.report, args.execution_profile)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(attribution, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-        encoding="utf-8",
+    owned = CorpusOutput.create(
+        args.output,
+        source_id="first_statement_attribution",
+        query_case=str(attribution["query"].get("name") or "attribution"),
+        arm_id="diagnostic",
+        sample_rows=len(attribution["samples"]),
+        product_receipts=len(attribution["samples"]),
+        summary_captures=1,
     )
-    print(json.dumps({"output": str(args.output), "samples": len(attribution["samples"])}, ensure_ascii=False))
+    owned.publish_json(attribution)
+    owned.publish_summary(
+        "First-statement Compile Evidence attribution\n"
+        f"samples={len(attribution['samples'])}\n"
+        "status=Completed\n"
+    )
+    owned.finish(status="Completed")
+    print(json.dumps({"output": str(owned.result_path), "samples": len(attribution["samples"])}, ensure_ascii=False))
     return 0
 
 

@@ -10,6 +10,7 @@ import hashlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 import os
+import json
 import random
 import re
 import socket
@@ -155,6 +156,49 @@ def statement_fingerprint(value: str) -> int:
     return result
 
 
+def fetch_compile_document(
+    connection: Any,
+    query: str,
+    *,
+    detail: bool = False,
+    analyze: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Fetch the typed EXPLAIN(COMPILE) document for one target statement.
+
+    Corpus collectors use this single producer boundary for diagnostic
+    material.  It deliberately does not run the target a second time and it
+    never reconstructs a compile document from logs or ``paro_optimizers``
+    rows.  The raw JSON is retained alongside the decoded object so a later
+    validator can distinguish an encoding problem from a semantic one.
+    """
+    stripped = query.strip()
+    while stripped.endswith(";"):
+        stripped = stripped[:-1].rstrip()
+    if not stripped:
+        raise ValueError("compile document query is empty")
+    options = ["COMPILE"]
+    if analyze:
+        options.append("ANALYZE")
+    if detail:
+        options.append("DETAIL")
+    statement = f"EXPLAIN ({', '.join(options)}, FORMAT JSON) {stripped}"
+    with connection.cursor() as cursor:
+        cursor.execute(statement)
+        rows = cursor.fetchall()
+    payload = "\n".join(
+        str(row[0]) for row in rows if row and row[0] is not None
+    )
+    if not payload.strip():
+        raise ValueError("EXPLAIN (COMPILE) returned an empty document")
+    try:
+        document = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError("EXPLAIN (COMPILE) returned invalid JSON") from error
+    if not isinstance(document, dict):
+        raise ValueError("EXPLAIN (COMPILE) document is not an object")
+    return payload, document
+
+
 def validate_statement_trace(
     trace: dict[str, Any],
     *,
@@ -291,7 +335,7 @@ class ImmutableDataSeed:
 
 @contextmanager
 def isolated_paro_server(binary: Path, seed: ImmutableDataSeed, listen: str,
-                         log_path: Path, *, max_memory: str,
+                         log_path: Path | None, *, max_memory: str,
                          threads: int,
                          statement_trace: bool = False,
                          trace_sample_id: str | None = None,
@@ -299,7 +343,7 @@ def isolated_paro_server(binary: Path, seed: ImmutableDataSeed, listen: str,
                          optimizer_environment: Mapping[str, str | None] | None = None
                          ) -> Iterator["ManagedParoServer"]:
     """Every oracle and measurement process starts from the same verified input."""
-    if log_path.resolve().is_relative_to(seed.path):
+    if log_path is not None and log_path.resolve().is_relative_to(seed.path):
         raise ValueError("benchmark logs must not write into the immutable seed")
     with seed.snapshot() as snapshot:
         with ManagedParoServer(binary, snapshot.path, listen, log_path,
@@ -484,7 +528,7 @@ class ManagedParoServer:
         binary: Path,
         data_dir: Path,
         listen: str,
-        log_path: Path,
+        log_path: Path | None,
         *,
         max_memory: str,
         threads: int,
@@ -497,7 +541,7 @@ class ManagedParoServer:
         self.binary = binary.resolve()
         self.data_dir = data_dir.resolve()
         self.listen = listen
-        self.log_path = log_path.resolve()
+        self.log_path = log_path.resolve() if log_path is not None else None
         self.max_memory = max_memory
         self.threads = max(1, threads)
         self.input_snapshot = input_snapshot
@@ -526,8 +570,9 @@ class ManagedParoServer:
                 )
         except (ConnectionRefusedError, TimeoutError, OSError):
             pass
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log = self.log_path.open("wb")
+        if self.log_path is not None:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log = self.log_path.open("wb")
         environment = os.environ.copy()
         if self.statement_trace:
             environment["PARO_STATEMENT_TRACE"] = "1"
@@ -566,7 +611,7 @@ class ManagedParoServer:
                 "--log-level",
                 "info" if self.statement_trace else "warn",
             ],
-            stdout=self._log,
+            stdout=self._log if self._log is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             cwd=self.binary.parent,
             env=environment,
@@ -575,7 +620,8 @@ class ManagedParoServer:
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError(
-                    f"Paro server exited with {self.process.returncode}; see {self.log_path}"
+                    f"Paro server exited with {self.process.returncode}"
+                    + (f"; see {self.log_path}" if self.log_path is not None else "")
                 )
             try:
                 with socket.create_connection((host, port), timeout=0.25):
@@ -608,7 +654,7 @@ class ManagedParoServer:
             "data_dir": str(self.data_dir),
             "input_snapshot": self.input_snapshot,
             "listen": self.listen,
-            "log": str(self.log_path),
+            "log": str(self.log_path) if self.log_path is not None else None,
             "statement_trace": self.statement_trace,
             "statement_trace_sample_id": self.trace_sample_id,
             "statement_cache_evidence": self.cache_evidence,

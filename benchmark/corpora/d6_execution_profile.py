@@ -2,12 +2,13 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-"""Collect diagnostic-only first-execution profiles for D6.
+"""Collect diagnostic-only first-execution Compile Evidence for D6.
 
 The primary C1 comparator deliberately does not run this collector.  Each
-sample owns a fresh private Paro data copy and executes the original query
-once through ``EXPLAIN ANALYZE``.  The complete wire payload is retained so
-the text renderer and the structured profile parser can be audited together.
+sample owns a fresh private Paro data copy and asks the server once for the
+typed ``EXPLAIN (COMPILE, ANALYZE, DETAIL, FORMAT JSON)`` document.  The
+document is the sole producer of compile/execution evidence; the old free-form
+EXPLAIN ANALYZE log is intentionally not created.
 """
 
 from __future__ import annotations
@@ -33,18 +34,13 @@ from benchmark.corpora.benchmark_evidence import (
     ImmutableDataSeed,
     build_benchmark_server,
     content_digest,
+    fetch_compile_document,
     isolated_paro_server,
-    parse_statement_trace_log,
     repository_identity,
     statement_fingerprint,
-    STATEMENT_TRACE_SCHEMA_VERSION,
-    validate_statement_trace,
 )
 from benchmark.corpora.cold_planning import ProcessWatchdog
-from benchmark.harness.executor import (
-    _extract_explain_execution_time_ms,
-    _flatten_explain_profile,
-)
+from benchmark.harness.run_output import CorpusOutput
 
 
 def _strip_sql(sql_text: str) -> str:
@@ -132,18 +128,15 @@ def _sample(
     block: int,
     seed: ImmutableDataSeed,
 ) -> dict[str, Any]:
-    log = args.report.with_suffix(f".block{block}.parod.log")
-    sample_id = f"d6.block{block}"
-    result: dict[str, Any] = {"block": block, "status": "error", "log": str(log)}
+    result: dict[str, Any] = {"block": block, "status": "error"}
     with isolated_paro_server(
         binary,
         seed,
         args.listen,
-        log,
+        None,
         max_memory=args.memory_limit,
         threads=args.threads,
-        statement_trace=True,
-        trace_sample_id=sample_id,
+        statement_trace=False,
     ) as server:
         result["server"] = server.identity()
         if server.process is None:
@@ -174,16 +167,22 @@ def _sample(
                             sql.Literal(args.watchdog_seconds * 1000)
                         )
                     )
-                    payload = _fetch_all_text(connection, f"EXPLAIN ANALYZE {query}")
-                raw = "\n".join(payload)
+                    raw, compile_document = fetch_compile_document(
+                        connection, query, detail=True, analyze=True
+                    )
                 result.update(
                     {
                         "status": "ok",
                         "client_elapsed_ms": (time.perf_counter_ns() - started) / 1_000_000,
-                        "rows": payload,
-                        "row_count": len(payload),
-                        "execution_time_ms": _extract_explain_execution_time_ms(raw),
-                        "operators": _flatten_explain_profile(raw),
+                        "compile_document": compile_document,
+                        "compile_document_raw": raw,
+                        "execution_time_ms": None,
+                        "operators": [],
+                        "profile_status": "Uncovered",
+                        "profile_reason": (
+                            "the typed COMPILE ANALYZE document is the sole producer; "
+                            "legacy EXPLAIN ANALYZE text profiles are not collected"
+                        ),
                     }
                 )
             except Exception as error:  # pragma: no cover - exercised by live collector
@@ -191,28 +190,9 @@ def _sample(
         result["peak_rss_bytes"] = watchdog.peak_rss
         if watchdog.failure:
             result.update(status="error", error=watchdog.failure)
-    trace_query_fingerprint = statement_fingerprint(f"EXPLAIN ANALYZE {query}")
-    result["query_fingerprint"] = trace_query_fingerprint
-    result["phase_trace_schema_version"] = STATEMENT_TRACE_SCHEMA_VERSION
-    try:
-        traces = parse_statement_trace_log(log)
-        result["statement_traces"] = traces
-        result["target_statement_traces"] = [
-            trace
-            for trace in traces
-            if trace["query_fingerprint"] == trace_query_fingerprint
-        ]
-        if result.get("status") == "ok":
-            if len(result["target_statement_traces"]) != 1:
-                raise ValueError("D6 sample must have exactly one target statement trace")
-            validate_statement_trace(
-                result["target_statement_traces"][0],
-                expected_process_id=result["server"]["pid"],
-                expected_sample_id=sample_id,
-                expected_query_fingerprint=trace_query_fingerprint,
-            )
-    except Exception as error:
-        result.update(status="error", error=f"{type(error).__name__}: {error}")
+    result["query_fingerprint"] = statement_fingerprint(
+        f"EXPLAIN (COMPILE, ANALYZE, DETAIL, FORMAT JSON) {query}"
+    )
     result["pipeline_summary"] = _pipeline_summary(result.get("operators", []))
     return result
 
@@ -245,7 +225,9 @@ def main() -> int:
         "mode": "d6_execution_profile",
         "query_path": str(query_path),
         "query_sha256": content_digest(query_path),
-        "query_fingerprint": statement_fingerprint(f"EXPLAIN ANALYZE {query}"),
+        "query_fingerprint": statement_fingerprint(
+            f"EXPLAIN (COMPILE, ANALYZE, DETAIL, FORMAT JSON) {query}"
+        ),
         "seed": {"path": str(seed.path), "sha256": seed.sha256},
         "binary": build,
         "source_identity": repository_identity(root),
@@ -256,7 +238,8 @@ def main() -> int:
             "watchdog_seconds": args.watchdog_seconds,
             "rss_limit_mb": args.rss_limit_mb,
             "cohort": "diagnostic",
-            "statement_trace": True,
+            "trace_mode": "off",
+            "compile_document": "EXPLAIN (COMPILE, ANALYZE, DETAIL, FORMAT JSON)",
             "normal_c1_included": False,
             "page_cache_policy": "private_copy_per_process; OS cache not flushed",
         },
@@ -269,22 +252,49 @@ def main() -> int:
         },
         "samples": [],
     }
-    for block in range(args.process_blocks):
-        measurement = _sample(args, binary, query, block, seed)
-        report["samples"].append(measurement)
-        print(
-            f"D6 block {block}: {measurement.get('execution_time_ms', '?')} ms, "
-            f"{measurement['status']}",
-            flush=True,
+    owned = CorpusOutput.create(
+        args.report,
+        source_id="d6_execution_profile",
+        query_case=query_path.stem,
+        arm_id="diagnostic",
+        sample_rows=args.process_blocks,
+        product_receipts=args.process_blocks,
+        summary_captures=1,
+    )
+    try:
+        for block in range(args.process_blocks):
+            try:
+                measurement = _sample(args, binary, query, block, seed)
+            except Exception as error:  # keep the failed sample in the receipt
+                measurement = {
+                    "block": block,
+                    "status": "error",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            report["samples"].append(measurement)
+            print(
+                f"D6 block {block}: {measurement.get('client_elapsed_ms', '?')} ms, "
+                f"{measurement['status']}",
+                flush=True,
+            )
+            owned.publish_json(report)
+        failed = any(sample.get("status") != "ok" for sample in report["samples"])
+        owned.publish_summary(
+            "D6 Compile Evidence\n"
+            f"samples={len(report['samples'])}\n"
+            f"status={'Incomplete' if failed else 'Completed'}\n"
         )
-        args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-            encoding="utf-8",
+        owned.finish(
+            status="Incomplete" if failed else "Completed",
+            error="one or more diagnostic samples failed" if failed else None,
         )
-    if any(sample.get("status") != "ok" for sample in report["samples"]):
-        return 1
-    return 0
+        return 1 if failed else 0
+    except Exception as error:
+        try:
+            owned.finish(status="Incomplete", error=f"{type(error).__name__}: {error}")
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":

@@ -35,20 +35,25 @@ try:
         ImmutableDataSeed,
         isolated_paro_server,
         build_benchmark_server,
-        STATEMENT_TRACE_SCHEMA_VERSION,
         content_digest,
-        parse_statement_trace_log,
+        fetch_compile_document,
         repository_identity,
         statement_fingerprint,
         tree_digest,
-        validate_statement_trace,
     )
+    from benchmark.harness.run_output import CampaignOutput
 except ModuleNotFoundError:  # pragma: no cover - script-only import path
-    from benchmark_evidence import (ImmutableDataSeed, isolated_paro_server,
-                                    build_benchmark_server, STATEMENT_TRACE_SCHEMA_VERSION,
-                                    content_digest, parse_statement_trace_log,
-                                    repository_identity, statement_fingerprint, tree_digest,
-                                    validate_statement_trace)
+    from benchmark_evidence import (
+        ImmutableDataSeed,
+        isolated_paro_server,
+        build_benchmark_server,
+        content_digest,
+        fetch_compile_document,
+        repository_identity,
+        statement_fingerprint,
+        tree_digest,
+    )
+    from harness.run_output import CampaignOutput
 
 COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physical_search",
               "memo_exploration", "physical_extraction", "winner_verification"}
@@ -103,22 +108,12 @@ class ProcessWatchdog:
         self.worker.join(timeout=3)
 
 
-def write_report(path: Path, report: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
-    temporary.replace(path)
-
-
 def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block: int,
            seed: ImmutableDataSeed) -> dict[str, Any]:
     result: dict[str, Any] = {"block": block, "status": "error"}
-    log = args.report.with_suffix(f".{name}.{block}.parod.log")
-    trace_sample_id = f"{name}.block{block}"
-    with isolated_paro_server(binary, seed, args.listen, log,
+    with isolated_paro_server(binary, seed, args.listen, None,
                            max_memory=args.memory_limit, threads=args.threads,
-                           statement_trace=True,
-                           trace_sample_id=trace_sample_id) as server:
+                           statement_trace=False) as server:
         result["server"] = server.identity()
         assert server.process is not None
         with ProcessWatchdog(server.process, args.watchdog_seconds,
@@ -133,16 +128,18 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
                     connection.execute(sql.SQL("SET statement_timeout={}").format(
                         sql.Literal(args.watchdog_seconds * 1000)))
                     started = time.perf_counter_ns()
-                    # Keep a structural coordinate system for the diagnostic
-                    # plan.  Runtime EXPLAIN ANALYZE operator ids can be
-                    # aligned to these physical node ids; pipeline position
-                    # is not a semantic coordinate.  This query is outside
-                    # normal C1 and remains a diagnostic-only sidecar.
-                    plan = connection.execute("EXPLAIN " + query + " FORMAT JSON").fetchall()
+                    # The compile document is the sole diagnostic producer.
+                    # Do not run a second structural EXPLAIN: that would
+                    # compile the target twice and would break the receipt
+                    # association used by the collector.
+                    raw_document, compile_document = fetch_compile_document(
+                        connection, query, detail=True
+                    )
                     result["explain_wall_ms"] = (time.perf_counter_ns() - started) / 1_000_000
-                    result["plan"] = "\n".join(str(row[0]) for row in plan)
-                    result["plan_format"] = "json"
-                    result["plan_sha256"] = hashlib.sha256(result["plan"].encode()).hexdigest()
+                    result["compile_document"] = compile_document
+                    result["compile_document_raw"] = raw_document
+                    result["plan_format"] = "compile-json"
+                    result["plan_sha256"] = hashlib.sha256(raw_document.encode()).hexdigest()
                     cursor = connection.execute("SELECT * FROM paro_optimizers()")
                     columns = [column.name for column in cursor.description or ()]
                     diagnostics = diagnostic_rows(columns, cursor.fetchall())
@@ -160,27 +157,9 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
         result["peak_rss_bytes"] = watchdog.peak_rss
         if watchdog.failure:
             result.update(status="error", error=watchdog.failure)
-    result["phase_trace_schema_version"] = STATEMENT_TRACE_SCHEMA_VERSION
-    result["trace_query_fingerprint"] = statement_fingerprint(
-        "EXPLAIN " + query + " FORMAT JSON"
+    result["compile_query_fingerprint"] = statement_fingerprint(
+        f"EXPLAIN (COMPILE, DETAIL, FORMAT JSON) {query}"
     )
-    try:
-        result["statement_traces"] = parse_statement_trace_log(log)
-        result["target_statement_traces"] = [
-            trace for trace in result["statement_traces"]
-            if trace["query_fingerprint"] == result["trace_query_fingerprint"]
-        ]
-        if result.get("status") == "ok":
-            if len(result["target_statement_traces"]) != 1:
-                raise ValueError("cold sample must have exactly one target operation trace")
-            validate_statement_trace(
-                result["target_statement_traces"][0],
-                expected_process_id=result["server"]["pid"],
-                expected_sample_id=trace_sample_id,
-                expected_query_fingerprint=result["trace_query_fingerprint"],
-            )
-    except Exception as error:
-        result.update(status="error", error=f"{type(error).__name__}: {error}")
     return result
 
 
@@ -234,7 +213,8 @@ def main() -> int:
             "page_cache_policy": "private_copy_per_process; OS cache not flushed",
         },
         "cohort": "diagnostic",
-        "trace_mode": "on",
+        "trace_mode": "off",
+        "compile_document": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)",
         "latency_tracks": {
             "C0": {"status": "uncovered", "auxiliary": "startup_to_ready_ms"},
             "C1": {"status": "uncovered", "reason": "EXPLAIN is not the target C1"},
@@ -255,8 +235,24 @@ def main() -> int:
     })
     report["configuration"]["runtime_environment"] = {
         "RUST_LOG": os.environ.get("RUST_LOG"),
-        "PARO_STATEMENT_TRACE": "1",
+        "PARO_STATEMENT_TRACE": "0",
     }
+    owned = CampaignOutput.create(
+        args.report,
+        source_id="cold_planning",
+        cells=[
+            {
+                "query_case": path.stem,
+                "arm_id": "diagnostic",
+                "query_cases": 1,
+                "sample_rows": args.process_blocks,
+                "product_receipts": args.process_blocks,
+                "summary_captures": 1,
+            }
+            for path in args.query
+        ],
+    )
+    failures: dict[tuple[str, str], str] = {}
     for path, observation in zip(args.query, report["queries"], strict=True):
         query = path.read_text().strip()
         while query.endswith(";"):
@@ -272,12 +268,39 @@ def main() -> int:
             observation["samples"].append(measurement)
             print(f"{path.stem} block {block}: {measurement.get('explain_wall_ms', '?')} ms, "
                   f"{measurement['status']}", flush=True)
-            write_report(args.report, report)
+            owned.publish_cell_json(
+                query_case=path.stem,
+                arm_id="diagnostic",
+                payload={
+                    "schema_version": report["schema_version"],
+                    "configuration": report["configuration"],
+                    "evidence": report["evidence"],
+                    "query": observation,
+                },
+            )
+            owned.publish_campaign_json(report)
+        if any(sample_item.get("status") != "ok" for sample_item in observation["samples"]):
+            failures[(path.stem, "diagnostic")] = "one or more cold-planning samples failed"
     if (repository_identity(root) != build["source"] or content_digest(binary) != build["binary_sha256"]
             or tree_digest(args.server_data_dir) != report["evidence"]["dataset_sha256"]
             or any(content_digest(path) != query["sql_sha256"] for path, query in zip(args.query, report["queries"], strict=True))):
         report["invalidated"] = "source, SQL, dataset or binary changed during measurements"
-        write_report(args.report, report)
+        owned.publish_campaign_json(report)
+        failures.update(
+            {
+                (path.stem, "diagnostic"): report["invalidated"]
+                for path in args.query
+            }
+        )
+    owned.control.write_text(
+        "summary.md",
+        "Cold-planning Compile Evidence\n"
+        f"queries={len(report['queries'])}\n"
+        f"status={'Incomplete' if failures else 'Completed'}\n",
+        overwrite=True,
+    )
+    owned.finish(status="Incomplete" if failures else "Completed", errors=failures)
+    if failures:
         return 1
     return 0 if all(s["status"] == "ok" for q in report["queries"] for s in q["samples"]) else 1
 

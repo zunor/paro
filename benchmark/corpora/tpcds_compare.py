@@ -24,17 +24,17 @@ from psycopg import sql
 
 from benchmark_evidence import (
     ImmutableDataSeed,
-    STATEMENT_TRACE_SCHEMA_VERSION,
+    fetch_compile_document,
     isolated_paro_server,
     build_benchmark_server,
     content_digest,
     hierarchical_abba_ratio,
-    parse_statement_trace_log,
     repository_identity,
     statement_fingerprint,
     tree_digest,
-    validate_statement_trace,
 )
+from harness.receipt_contract import ReceiptContractError, validate_compile_document
+from harness.run_output import CampaignOutput
 from tpcds_result_contract import (
     RESULT_CONTRACT_VERSION,
     ColumnContract,
@@ -143,13 +143,6 @@ def parse_args() -> argparse.Namespace:
             "--diagnostic-strong-incumbent"
         )
     return args
-
-
-def write_report(path: Path, report: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
 
 
 def read_pre_touch(path: Path | None, repetitions: int = 1) -> dict[str, Any] | None:
@@ -818,7 +811,7 @@ def main() -> int:
             "cohorts": {
                 "normal": {
                     "purpose": "diagnostic pre-touched target/W" if pre_touch else "primary C1/W",
-                    "statement_trace": False,
+                    "trace_mode": "off",
                     "statement_cache_evidence": True,
                     "allocation_profile": False,
                     "strong_incumbent_experiment": args.strong_incumbent_c1,
@@ -833,7 +826,8 @@ def main() -> int:
                 },
                 "diagnostic": {
                     "purpose": "same-operation phase attribution",
-                    "statement_trace": True,
+                    "trace_mode": "off",
+                    "compile_document": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)",
                     "statement_cache_evidence": True,
                     "excluded_from_c1": True,
                     "strong_incumbent_experiment": args.diagnostic_strong_incumbent,
@@ -882,18 +876,15 @@ def main() -> int:
                 "cold_statement": "first_statement_parse_compile_admit_execute_fetch_and_native_result_metadata",
                 "native_result_metadata": "included_in_each_engine_timer",
                 "canonical_schema_conversion": "outside_each_engine_timer",
-                "server_phase_trace": {
-                    "schema_version": STATEMENT_TRACE_SCHEMA_VERSION,
-                    "clock": "server_monotonic_relative",
-                    "target": "paro::statement_trace",
-                    "correlation": "process_id_session_id_operation_id_sample_id_sequence",
-                    "client_timer": "perf_counter_ns",
-                    "clock_subtraction": False,
-                    "cohort": "diagnostic_only",
+                "compile_document": {
+                    "statement": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)",
+                    "producer": "server_typed_compile_document",
+                    "normal_timing": "trace_off; no auxiliary compile request",
+                    "diagnostic_timing": "excluded_from_c1",
                 },
             },
             "status_semantics": {
-                "evidence": "trace/schema/identity/complete-result validation",
+                "evidence": "typed compile/admission receipt, schema identity and complete-result validation",
                 "regression": "paired normal trace-off C1 comparison against declared baseline",
                 "milestone": "pre-registered C1/quality/resource thresholds",
                 "model": "G-Stats/G-Cost admitted only after declared calibration",
@@ -983,19 +974,37 @@ def main() -> int:
         "queries": [],
     }
 
+    query_cases = [f"{number:02d}" for number in range(args.start, args.end + 1)]
+    normal_rows = args.process_blocks * args.measurement_rounds_per_process * 2
+    output = CampaignOutput.create(
+        args.report,
+        source_id="tpcds_compare",
+        cells=[
+            {
+                "query_case": query_id,
+                "arm_id": arm,
+                "query_cases": 1,
+                "sample_rows": normal_rows if arm == "normal" else args.diagnostic_process_blocks,
+                "product_receipts": normal_rows if arm == "normal" else args.diagnostic_process_blocks,
+            }
+            for query_id in query_cases
+            for arm in ("normal", "diagnostic")
+        ],
+    )
+
     failures = 0
+    output_errors: dict[tuple[str, str], str] = {}
     binary_result = args.paro_result_format == "binary"
     for query_number in range(args.start, args.end + 1):
         query_id = f"{query_number:02d}"
         query = (args.query_dir / f"{query_id}.sql").read_text(encoding="utf-8")
         result: dict[str, Any] = {"query": query_id}
         try:
-            oracle_log = args.report.with_suffix(f".q{query_id}.oracle.parod.log")
             oracle_server_context = isolated_paro_server(
                 server_binary,
                 seed,
                 args.listen,
-                oracle_log,
+                None,
                 max_memory=args.memory_limit,
                 threads=args.threads,
                 statement_trace=False,
@@ -1067,14 +1076,11 @@ def main() -> int:
             blocks: list[dict[str, Any]] = []
             rng = random.Random(args.random_seed + query_number * 1_000_003)
             for block_number in range(args.process_blocks):
-                block_log = args.report.with_suffix(
-                    f".q{query_id}.block{block_number:03d}.parod.log"
-                )
                 block_server_context = isolated_paro_server(
                     server_binary,
                     seed,
                     args.listen,
-                    block_log,
+                    None,
                     max_memory=args.memory_limit,
                     threads=args.threads,
                     statement_trace=False,
@@ -1201,35 +1207,25 @@ def main() -> int:
                                     )
                     finally:
                         paro.close()
-                trace_events = parse_statement_trace_log(block_log)
-                if trace_events:
-                    raise AssertionError(
-                        "normal C1 block emitted diagnostic trace despite trace-off configuration"
-                    )
-                block["statement_trace"] = {
-                    "schema_version": STATEMENT_TRACE_SCHEMA_VERSION,
-                    "enabled": False,
-                    "verified_empty": True,
+                block["compile_document"] = {
+                    "status": "Uncovered",
+                    "reason": (
+                        "normal timing uses the production statement receipt; "
+                        "EXPLAIN (COMPILE) is diagnostic-only and would change C1"
+                    ),
                 }
                 blocks.append(block)
 
             diagnostic_blocks: list[dict[str, Any]] = []
             for diagnostic_block_number in range(args.diagnostic_process_blocks):
-                diagnostic_log = args.report.with_suffix(
-                    f".q{query_id}.diagnostic{diagnostic_block_number:03d}.parod.log"
-                )
-                diagnostic_sample_id = (
-                    f"q{query_id}.diagnostic.block{diagnostic_block_number}"
-                )
                 with isolated_paro_server(
                     server_binary,
                     seed,
                     args.listen,
-                    diagnostic_log,
+                    None,
                     max_memory=args.memory_limit,
                     threads=args.threads,
-                    statement_trace=True,
-                    trace_sample_id=diagnostic_sample_id,
+                    statement_trace=False,
                     cache_evidence=True,
                     optimizer_environment={
                         "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
@@ -1257,6 +1253,15 @@ def main() -> int:
                     try:
                         diagnostic_preparation = collect_pre_touch(
                             diagnostic_paro, None, pre_touch, query, binary_result)
+                        diagnostic_compile_raw, diagnostic_compile_document = fetch_compile_document(
+                            diagnostic_paro, query, detail=True
+                        )
+                        try:
+                            validate_compile_document(diagnostic_compile_document)
+                        except ReceiptContractError as error:
+                            raise AssertionError(
+                                f"diagnostic Compile Evidence failed validation: {error}"
+                            ) from error
                         diagnostic_before_execution_ids = snapshot_execution_ids(diagnostic_paro)
                         diagnostic_rows, diagnostic_schema, diagnostic_ms = timed_run_paro(
                             diagnostic_paro, query, binary_result
@@ -1275,30 +1280,14 @@ def main() -> int:
                             )
                     finally:
                         diagnostic_paro.close()
-                diagnostic_traces = parse_statement_trace_log(diagnostic_log)
-                target_traces = [
-                    trace
-                    for trace in diagnostic_traces
-                    if trace["query_fingerprint"] == statement_fingerprint(query)
-                ]
-                if len(target_traces) != 1:
-                    raise AssertionError(
-                        "diagnostic cohort must have exactly one target operation trace"
-                    )
-                validate_statement_trace(
-                    target_traces[0],
-                    expected_process_id=diagnostic_server_identity["pid"],
-                    expected_sample_id=diagnostic_sample_id,
-                    expected_query_fingerprint=statement_fingerprint(query),
-                )
                 diagnostic_blocks.append({
                     "block": diagnostic_block_number,
                     "cohort": "diagnostic",
                     "pre_touch": diagnostic_preparation,
                     "client_ms": round(diagnostic_ms, 6),
                     "paro_server": diagnostic_server_identity,
-                    "statement_traces": diagnostic_traces,
-                    "target_statement_traces": target_traces,
+                    "compile_document": diagnostic_compile_document,
+                    "compile_document_raw": diagnostic_compile_raw,
                 })
 
             paro_timing = timing_summary(samples["paro"])
@@ -1311,8 +1300,10 @@ def main() -> int:
                 "hierarchical_confidence_interval_95"
             ][1]
             verify_measurement_inputs(repo_root, server_binary, args, report)
-            trace_off_verified = all(
-                item["statement_trace"]["verified_empty"] for item in blocks
+            normal_observation_verified = all(
+                item.get("compile_document", {}).get("status") == "Uncovered"
+                and bool(item.get("compile_document", {}).get("reason"))
+                for item in blocks
             )
             cold_miss_evidence = {
                 "status": (
@@ -1337,7 +1328,7 @@ def main() -> int:
                 and metadata_symmetric
                 and cold_confidence_high <= 1
                 and c1_p50_not_slower
-                and trace_off_verified
+                and normal_observation_verified
                 and cold_miss_verified
             )
             result.update(
@@ -1366,7 +1357,7 @@ def main() -> int:
                 process_blocks=blocks,
                 diagnostic_cohort={
                     "process_blocks": diagnostic_blocks,
-                    "trace_schema_version": STATEMENT_TRACE_SCHEMA_VERSION,
+                    "compile_document_schema_version": 2,
                     "excluded_from_c1": True,
                     "client_ms": timing_summary(
                         [item["client_ms"] for item in diagnostic_blocks]
@@ -1376,11 +1367,11 @@ def main() -> int:
                     "paro": timing_summary(cold_samples["paro"]),
                     "duckdb": timing_summary(cold_samples["duckdb"]),
                     "crossover": cold_crossover,
-                    "cohort": "pre_touch_diagnostic_trace_off" if pre_touch else "normal_trace_off",
+                    "cohort": "pre_touch_diagnostic_compile" if pre_touch else "normal_trace_off",
                     "primary_gate_eligible": pre_touch is None,
-                    "trace_enabled": False,
-                    "trace_off_verified": trace_off_verified,
-                    "trace_query_fingerprint": statement_fingerprint(query),
+                    "trace_mode": "off",
+                    "normal_observation_verified": normal_observation_verified,
+                    "compile_document": "normal target uses production receipt channel",
                     "cold_miss_evidence": cold_miss_evidence,
                 },
                 warmup_and_steady_state={
@@ -1415,7 +1406,32 @@ def main() -> int:
         report["faster_than_duckdb"] = sum(
             item.get("faster_than_duckdb", False) for item in report["queries"]
         )
-        write_report(args.report, report)
+        output.publish_cell_json(
+            query_case=query_id,
+            arm_id="normal",
+            payload={
+                "schema_version": report["schema_version"],
+                "query": result,
+                "cohort": "normal",
+            },
+        )
+        output.publish_cell_json(
+            query_case=query_id,
+            arm_id="diagnostic",
+            payload={
+                "schema_version": report["schema_version"],
+                "query": {
+                    "query": query_id,
+                    "diagnostic_cohort": result.get("diagnostic_cohort"),
+                    "status": result.get("status"),
+                },
+                "cohort": "diagnostic",
+            },
+        )
+        output.publish_campaign_json(report)
+        if result["status"] != "passed":
+            output_errors[(query_id, "normal")] = result.get("error", "query failed")
+            output_errors[(query_id, "diagnostic")] = result.get("error", "query failed")
         if result["status"] == "passed":
             c1_confidence = result["cold_crossover"][
                 "hierarchical_confidence_interval_95"
@@ -1431,6 +1447,17 @@ def main() -> int:
         else:
             print(f"TPC-DS {query_id}: failed: {result['error']}", flush=True)
 
+    output.publish_campaign_json(report)
+    output.control.write_text(
+        "TPC-DS Compile Evidence campaign\n"
+        f"queries={len(report['queries'])}\n"
+        f"status={'Incomplete' if failures else 'Completed'}\n",
+        overwrite=True,
+    )
+    output.finish(
+        status="Incomplete" if failures else "Completed",
+        errors=output_errors,
+    )
     return 1 if failures else 0
 
 

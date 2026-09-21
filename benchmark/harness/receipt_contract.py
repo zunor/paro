@@ -12,10 +12,68 @@ from .run_output import SUMMARY_LIMIT_BYTES
 
 
 RECEIPT_ASSOCIATION_SCHEMA_VERSION = 1
+COMPILE_DOCUMENT_SCHEMA_VERSION = 2
 
 
 class ReceiptContractError(ValueError):
     """A result contains a malformed identity or admission association."""
+
+
+def validate_compile_document(value: Any, *, require_analyze: bool = False) -> str:
+    """Validate the Rust-owned EXPLAIN (COMPILE) wire envelope.
+
+    This is intentionally a structural boundary, not a second compiler.  The
+    Rust renderer/reader remains authoritative for semantic validation; the
+    benchmark side only rejects missing, unknown, or contradictory lifecycle
+    fields before a sample can be marked as jointly verified.
+    """
+    if not isinstance(value, dict):
+        raise ReceiptContractError("compile document must be an object")
+    if value.get("schema_version") != COMPILE_DOCUMENT_SCHEMA_VERSION:
+        raise ReceiptContractError("unsupported compile document schema version")
+    if value.get("diagnostic") == "Unavailable":
+        if value.get("target_compile") not in {"Success", "Incomplete"}:
+            raise ReceiptContractError("unavailable compile document lacks compile outcome")
+        if value.get("reason") not in {"Capacity", "ProcessCapacity"}:
+            raise ReceiptContractError("unavailable compile document has unknown reason")
+        if value.get("target_execution") not in {"NotExecuted", "NotApplicable"} \
+                and not (isinstance(value.get("target_execution"), dict)
+                         and "Uncovered" in value["target_execution"]):
+            raise ReceiptContractError("unavailable compile document has invalid execution state")
+        if require_analyze:
+            raise ReceiptContractError("ANALYZE document is unavailable")
+        return "Unavailable"
+    required = ("outcome", "artifact", "cache", "admission", "execution")
+    missing = [field for field in required if field not in value]
+    if missing:
+        raise ReceiptContractError(
+            "compile document lacks required fields: " + ", ".join(missing)
+        )
+    if value["outcome"] not in {"Incomplete", "Success"}:
+        raise ReceiptContractError("compile document has unknown outcome")
+    if value["artifact"] not in {"NotReady", "CompiledArtifactReady"}:
+        raise ReceiptContractError("compile document has unknown artifact state")
+    if value["cache"] not in {"ForcedCompile", "CacheHit"}:
+        raise ReceiptContractError("compile document has unknown cache state")
+    if value["outcome"] == "Success" and value["artifact"] != "CompiledArtifactReady":
+        raise ReceiptContractError("successful compile lacks a ready artifact")
+    execution = value["execution"]
+    if execution not in {"NotExecuted", "Observed"} and not (
+        isinstance(execution, dict) and ("Observed" in execution or "Uncovered" in execution)
+    ):
+        raise ReceiptContractError("compile document has invalid execution observation")
+    receipt = value.get("execution_receipt")
+    if receipt is not None:
+        if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+            raise ReceiptContractError("compile document has invalid execution receipt")
+        terminal = receipt.get("terminal")
+        if terminal not in {"NotExecuted", "Running", "Completed", "Failed", "Cancelled", "Dropped"}:
+            raise ReceiptContractError("compile document has invalid execution terminal")
+        if require_analyze and terminal == "NotExecuted":
+            raise ReceiptContractError("ANALYZE document claims no execution")
+    elif require_analyze:
+        raise ReceiptContractError("ANALYZE document lacks execution receipt")
+    return "Summary"
 
 
 def validate_receipt_association(value: Any) -> str:
@@ -49,8 +107,16 @@ def validate_receipt_association(value: Any) -> str:
         or any(character not in "0123456789abcdef" for character in fingerprint)
     ):
         raise ReceiptContractError("verified receipt lacks query fingerprint")
-    if not isinstance(value.get("occurrence"), int) or value["occurrence"] < 0:
-        raise ReceiptContractError("verified receipt has invalid occurrence")
+    # Occurrence is retained as an optional diagnostic coordinate only.  It is
+    # derived from a bounded active view and is not an authentication key;
+    # statement_decision_id plus the nested identities are the exact contract.
+    occurrence = value.get("occurrence")
+    if occurrence is not None and (
+        not isinstance(occurrence, int)
+        or isinstance(occurrence, bool)
+        or occurrence < 0
+    ):
+        raise ReceiptContractError("verified receipt has invalid diagnostic occurrence")
     if value.get("compilation") not in {"Executed", "CacheHit"}:
         raise ReceiptContractError("verified receipt has invalid compilation state")
     compile_state = value.get("compile_state")

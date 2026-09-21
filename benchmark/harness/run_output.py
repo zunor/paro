@@ -447,6 +447,100 @@ class CorpusOutput:
 
 
 @dataclass
+class CampaignOutput:
+    """Typed output boundary for a multi-cell corpus collector.
+
+    This is deliberately only an adapter over :class:`RunOutput`: registration,
+    attempts, quota accounting and terminal sealing remain owned by the same
+    implementation used by normal benchmark sources.  It does not execute
+    queries or introduce another archive format.
+    """
+
+    run: "RunOutput"
+    attempts: dict[tuple[str, str], AttemptOutput]
+
+    @classmethod
+    def create(
+        cls,
+        report_path: Path,
+        *,
+        source_id: str,
+        cells: list[dict[str, Any]],
+    ) -> "CampaignOutput":
+        report_path = report_path.resolve()
+        run_id = validate_output_id(f"{report_path.stem}-run", label="run id")
+        run = RunOutput.create(report_path.parent, run_id=run_id)
+        for cell in cells:
+            run.registration.cell(**cell)
+        run.registration.seal()
+        attempts: dict[tuple[str, str], AttemptOutput] = {}
+        for cell in cells:
+            query_case = validate_output_id(cell["query_case"], label="query case")
+            arm_id = validate_output_id(cell["arm_id"], label="arm id")
+            cell_source = validate_output_id(
+                f"{source_id}-{query_case}-{arm_id}", label="source id"
+            )
+            attempts[(query_case, arm_id)] = run.begin_attempt(
+                cell_source, query_case=query_case, arm_id=arm_id
+            )
+        return cls(run, attempts)
+
+    @property
+    def control(self) -> ControlWriter:
+        return self.run.control_writer()
+
+    def publish_cell_json(
+        self, *, query_case: str, arm_id: str, payload: dict[str, Any]
+    ) -> Path:
+        attempt = self.attempts[(query_case, arm_id)]
+        return attempt.cell_writer().write_json("result.json", payload, overwrite=True)
+
+    def publish_campaign_json(self, payload: dict[str, Any]) -> Path:
+        return self.control.write_json("campaign.json", payload, overwrite=True)
+
+    def publish_cell_summary(
+        self, *, query_case: str, arm_id: str, text: str
+    ) -> Path:
+        attempt = self.attempts[(query_case, arm_id)]
+        return attempt.control_writer().write_text("summary.md", text, overwrite=True)
+
+    def finish(
+        self,
+        *,
+        status: str,
+        errors: dict[tuple[str, str], str] | None = None,
+    ) -> None:
+        errors = errors or {}
+        for key, attempt in self.attempts.items():
+            error = errors.get(key)
+            if status == "Completed" and error is None:
+                attempt.seal(
+                    status="Completed",
+                    result_path=attempt.result_path,
+                    summary_path=attempt.summary_path
+                    if attempt.summary_path.exists()
+                    else None,
+                )
+            else:
+                terminal = "Incomplete" if status == "Completed" else status
+                failure = None
+                if error is not None:
+                    attempt.write_failure(status=terminal, error=error)
+                    failure = attempt.failure_path
+                attempt.seal(
+                    status=terminal,
+                    result_path=attempt.result_path
+                    if attempt.result_path.exists()
+                    else None,
+                    summary_path=attempt.summary_path
+                    if attempt.summary_path.exists()
+                    else None,
+                    failure_path=failure,
+                )
+        self.run.finalize(status=status)
+
+
+@dataclass
 class RunOutput:
     """The sole owner of a command's report root and attempt registry."""
 

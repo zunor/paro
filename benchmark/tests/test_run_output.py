@@ -8,13 +8,73 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from harness.receipt_contract import ReceiptContractError, validate_benchmark_payload  # noqa: E402
-from harness.run_output import CorpusOutput, RunOutput, RunOutputError  # noqa: E402
+from harness.receipt_contract import (  # noqa: E402
+    ReceiptContractError,
+    validate_benchmark_payload,
+    validate_compile_document,
+)
+from harness.run_output import CampaignOutput, CorpusOutput, RunOutput, RunOutputError  # noqa: E402
 from harness.executor import BenchmarkExecutor  # noqa: E402
 from harness.loader import QueryDef  # noqa: E402
 
 
 class RunOutputTests(unittest.TestCase):
+    def test_compile_document_contract_rejects_missing_or_contradictory_state(self) -> None:
+        document = {
+            "schema_version": 2,
+            "outcome": "Success",
+            "artifact": "CompiledArtifactReady",
+            "cache": "ForcedCompile",
+            "admission": "NotExecuted",
+            "execution": "NotExecuted",
+        }
+        self.assertEqual(validate_compile_document(document), "Summary")
+        for mutation in (
+            lambda value: value.pop("artifact"),
+            lambda value: value.update(schema_version=99),
+            lambda value: value.update(outcome="Success", artifact="NotReady"),
+            lambda value: value.update(execution="garbage"),
+        ):
+            invalid = dict(document)
+            mutation(invalid)
+            with self.assertRaises(ReceiptContractError):
+                validate_compile_document(invalid)
+
+    def test_campaign_output_seals_each_registered_query_arm_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "campaign.json",
+                source_id="collector",
+                cells=[
+                    {
+                        "query_case": "q11",
+                        "arm_id": "normal",
+                        "query_cases": 1,
+                        "sample_rows": 2,
+                        "product_receipts": 2,
+                    },
+                    {
+                        "query_case": "q11",
+                        "arm_id": "diagnostic",
+                        "query_cases": 1,
+                        "sample_rows": 1,
+                        "product_receipts": 1,
+                    },
+                ],
+            )
+            output.publish_cell_json(
+                query_case="q11", arm_id="normal", payload={"status": "ok"}
+            )
+            output.publish_cell_json(
+                query_case="q11", arm_id="diagnostic", payload={"status": "ok"}
+            )
+            output.publish_campaign_json({"cells": 2})
+            output.finish(status="Completed")
+            manifest = json.loads((output.run.root / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "Completed")
+            self.assertEqual(len(manifest["registration"]["cells"]), 2)
+            self.assertTrue((output.run.root / "campaign.json").exists())
+
     def test_standalone_corpus_output_is_registered_and_sealed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = CorpusOutput.create(
