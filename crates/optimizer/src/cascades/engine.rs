@@ -331,6 +331,9 @@ enum TransformationTaskLifecyclePhase {
 /// rule profile is enabled; normal trace-off searches keep no task entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformationTaskLifecycle {
+    /// Sequence assigned when this task first enters the bounded producer
+    /// stream. Exporters must retain it instead of numbering the snapshot.
+    pub source_sequence: u64,
     pub group: GroupId,
     pub expression: LogicalExprId,
     pub rule: RuleId,
@@ -361,8 +364,9 @@ pub struct TransformationTaskLifecycle {
 }
 
 impl TransformationTaskLifecycle {
-    fn new(task: TransformationTaskId) -> Self {
+    fn new(task: TransformationTaskId, source_sequence: u64) -> Self {
         Self {
+            source_sequence,
             group: task.group,
             expression: task.expression,
             rule: task.rule,
@@ -923,6 +927,9 @@ pub enum CandidateLifecycleStage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateLifecycleEvent {
+    /// Sequence assigned by the producer at the moment the event is retained.
+    /// Exporters must not renumber this stream while traversing categories.
+    pub source_sequence: u64,
     pub stage: CandidateLifecycleStage,
     pub elapsed_us: u64,
     pub group: GroupId,
@@ -993,6 +1000,7 @@ pub struct SearchMilestones {
     /// Bounded diagnostic timeline for the actual same-Memo production path.
     /// Normal trace-off searches keep this empty and allocation-free.
     pub candidate_lifecycle: Vec<CandidateLifecycleEvent>,
+    pub next_candidate_lifecycle_sequence: u64,
     pub candidate_lifecycle_dropped: u64,
     /// Per-stage accounting makes a bounded diagnostic cohort auditable: a
     /// dense child-ready stream must not evict the physical publications
@@ -1004,6 +1012,7 @@ pub struct SearchMilestones {
     /// publication attributable to queueing versus an advancing child
     /// frontier without turning normal C1 into a tracing run.
     pub transformation_task_lifecycle: Vec<TransformationTaskLifecycle>,
+    pub next_transformation_task_sequence: u64,
     pub transformation_task_lifecycle_dropped: u64,
 }
 
@@ -3051,7 +3060,13 @@ impl CascadesEngine {
             }
             milestones
                 .transformation_task_lifecycle
-                .push(TransformationTaskLifecycle::new(task));
+                .push(TransformationTaskLifecycle::new(
+                    task,
+                    milestones.next_transformation_task_sequence,
+                ));
+            milestones.next_transformation_task_sequence = milestones
+                .next_transformation_task_sequence
+                .saturating_add(1);
             milestones
                 .transformation_task_lifecycle
                 .len()
@@ -3179,22 +3194,43 @@ impl CascadesEngine {
             return;
         }
         let stage_index = event.stage as usize;
-        if self.search_milestones.candidate_lifecycle_stage_stored[stage_index]
-            >= CANDIDATE_LIFECYCLE_STAGE_LIMITS[stage_index]
-            || self.search_milestones.candidate_lifecycle.len() >= MAX_CANDIDATE_LIFECYCLE_EVENTS
-        {
-            self.search_milestones.candidate_lifecycle_stage_dropped[stage_index] =
-                self.search_milestones.candidate_lifecycle_stage_dropped[stage_index]
-                    .saturating_add(1);
-            self.search_milestones.candidate_lifecycle_dropped = self
-                .search_milestones
-                .candidate_lifecycle_dropped
-                .saturating_add(1);
+        if !self.candidate_lifecycle_slot_available(event.stage) {
+            self.note_candidate_lifecycle_dropped(event.stage);
             return;
         }
+        let mut event = event;
+        event.source_sequence = self.search_milestones.next_candidate_lifecycle_sequence;
+        self.search_milestones.next_candidate_lifecycle_sequence = self
+            .search_milestones
+            .next_candidate_lifecycle_sequence
+            .saturating_add(1);
         self.search_milestones.candidate_lifecycle_stage_stored[stage_index] =
             self.search_milestones.candidate_lifecycle_stage_stored[stage_index].saturating_add(1);
         self.search_milestones.candidate_lifecycle.push(event);
+    }
+
+    /// Check retention capacity before a producer allocates variable-size
+    /// children or fact payloads. The event method checks again when it
+    /// finally records the compact event, so callers that already built an
+    /// event remain protected as well.
+    fn candidate_lifecycle_slot_available(&self, stage: CandidateLifecycleStage) -> bool {
+        if !self.collect_rule_work_profile {
+            return false;
+        }
+        let stage_index = stage as usize;
+        self.search_milestones.candidate_lifecycle_stage_stored[stage_index]
+            < CANDIDATE_LIFECYCLE_STAGE_LIMITS[stage_index]
+            && self.search_milestones.candidate_lifecycle.len() < MAX_CANDIDATE_LIFECYCLE_EVENTS
+    }
+
+    fn note_candidate_lifecycle_dropped(&mut self, stage: CandidateLifecycleStage) {
+        let stage_index = stage as usize;
+        self.search_milestones.candidate_lifecycle_stage_dropped[stage_index] =
+            self.search_milestones.candidate_lifecycle_stage_dropped[stage_index].saturating_add(1);
+        self.search_milestones.candidate_lifecycle_dropped = self
+            .search_milestones
+            .candidate_lifecycle_dropped
+            .saturating_add(1);
     }
 
     fn lifecycle_elapsed_us(&self) -> u64 {
@@ -3222,9 +3258,15 @@ impl CascadesEngine {
         if !self.collect_rule_work_profile {
             return Ok(());
         }
+        let stage = CandidateLifecycleStage::ParentPublished;
+        if !self.candidate_lifecycle_slot_available(stage) {
+            self.note_candidate_lifecycle_dropped(stage);
+            return Ok(());
+        }
         let children = child_combination_refs(children, &recipe.child_goals)?;
         self.note_candidate_lifecycle(CandidateLifecycleEvent {
-            stage: CandidateLifecycleStage::ParentPublished,
+            source_sequence: 0,
+            stage,
             elapsed_us: self.lifecycle_elapsed_us(),
             group,
             goal: Some(goal),
@@ -3762,6 +3804,7 @@ impl CascadesEngine {
                 };
                 let frozen = &frozen_winner.frozen;
                 self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                    source_sequence: 0,
                     stage: CandidateLifecycleStage::RootQualified,
                     elapsed_us: self.lifecycle_elapsed_us(),
                     group: root,
@@ -5860,41 +5903,56 @@ impl CascadesEngine {
                     let changed_cte_readers = self.memo.take_changed_cte_readers();
                     self.note_logical_publication();
                     if self.collect_rule_work_profile {
-                        let facts = ReadSet::new(
-                            binding_set
-                                .reads
-                                .iter()
-                                .copied()
-                                .chain(application_reads.iter().copied()),
-                        )
-                        .reads()
-                        .to_vec()
-                        .into_boxed_slice();
+                        let can_retain = newly_inserted_expressions.iter().any(|_| {
+                            self.candidate_lifecycle_slot_available(
+                                CandidateLifecycleStage::LogicalPublished,
+                            )
+                        });
+                        let facts = if can_retain {
+                            ReadSet::new(
+                                binding_set
+                                    .reads
+                                    .iter()
+                                    .copied()
+                                    .chain(application_reads.iter().copied()),
+                            )
+                            .reads()
+                            .to_vec()
+                            .into_boxed_slice()
+                        } else {
+                            Box::new([])
+                        };
                         let elapsed_us = self.lifecycle_elapsed_us();
                         for (target, inserted) in newly_inserted_expressions.iter().copied() {
-                            self.note_candidate_lifecycle(CandidateLifecycleEvent {
-                                stage: CandidateLifecycleStage::LogicalPublished,
-                                elapsed_us,
-                                group: target,
-                                goal: None,
-                                candidate: None,
-                                source: Some(expression),
-                                binding: Some(binding.fingerprint),
-                                source_child: match &binding.root {
-                                    PatternOperand::Expression { children, .. } => {
-                                        children.first().and_then(PatternOperand::expression)
-                                    }
-                                    PatternOperand::Group(_) => None,
-                                },
-                                logical: Some(inserted),
-                                physical: None,
-                                recipe: None,
-                                rule: Some(rule),
-                                children: Box::new([]),
-                                facts: facts.clone(),
-                                expected_cost_bits: None,
-                                upper_cost_bits: None,
-                            });
+                            let stage = CandidateLifecycleStage::LogicalPublished;
+                            if self.candidate_lifecycle_slot_available(stage) {
+                                self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                                    source_sequence: 0,
+                                    stage,
+                                    elapsed_us,
+                                    group: target,
+                                    goal: None,
+                                    candidate: None,
+                                    source: Some(expression),
+                                    binding: Some(binding.fingerprint),
+                                    source_child: match &binding.root {
+                                        PatternOperand::Expression { children, .. } => {
+                                            children.first().and_then(PatternOperand::expression)
+                                        }
+                                        PatternOperand::Group(_) => None,
+                                    },
+                                    logical: Some(inserted),
+                                    physical: None,
+                                    recipe: None,
+                                    rule: Some(rule),
+                                    children: Box::new([]),
+                                    facts: facts.clone(),
+                                    expected_cost_bits: None,
+                                    upper_cost_bits: None,
+                                });
+                            } else {
+                                self.note_candidate_lifecycle_dropped(stage);
+                            }
                         }
                     }
                     self.publish_transformation_task(
@@ -7599,30 +7657,36 @@ impl CascadesEngine {
             false
         };
         if recipe_published && self.collect_rule_work_profile {
-            let logical = self
-                .memo
-                .physical_expr(physical)
-                .map(|expression| expression.key.logical);
-            let facts =
-                PatternRead::facts_from_group(&self.memo, group).map(|read| Box::new([read]))?;
-            self.note_candidate_lifecycle(CandidateLifecycleEvent {
-                stage: CandidateLifecycleStage::PhysicalRecipePublished,
-                elapsed_us: self.lifecycle_elapsed_us(),
-                group,
-                goal: Some(goal),
-                candidate: None,
-                source: None,
-                binding: None,
-                source_child: None,
-                logical,
-                physical: Some(physical),
-                recipe: Some(recipe_fingerprint),
-                rule: None,
-                children: Box::new([]),
-                facts,
-                expected_cost_bits: None,
-                upper_cost_bits: None,
-            });
+            let stage = CandidateLifecycleStage::PhysicalRecipePublished;
+            if self.candidate_lifecycle_slot_available(stage) {
+                let logical = self
+                    .memo
+                    .physical_expr(physical)
+                    .map(|expression| expression.key.logical);
+                let facts = PatternRead::facts_from_group(&self.memo, group)
+                    .map(|read| Box::new([read]))?;
+                self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                    source_sequence: 0,
+                    stage,
+                    elapsed_us: self.lifecycle_elapsed_us(),
+                    group,
+                    goal: Some(goal),
+                    candidate: None,
+                    source: None,
+                    binding: None,
+                    source_child: None,
+                    logical,
+                    physical: Some(physical),
+                    recipe: Some(recipe_fingerprint),
+                    rule: None,
+                    children: Box::new([]),
+                    facts,
+                    expected_cost_bits: None,
+                    upper_cost_bits: None,
+                });
+            } else {
+                self.note_candidate_lifecycle_dropped(stage);
+            }
         }
         let owner = self.memo.canonical_group(group);
         self.physical_read_dependencies
@@ -9302,24 +9366,30 @@ impl CascadesEngine {
                 frontier_out.sort_unstable_by_key(|child| child.candidate);
                 if self.collect_rule_work_profile {
                     for child_reference in frontier_candidates {
-                        self.note_candidate_lifecycle(CandidateLifecycleEvent {
-                            stage: CandidateLifecycleStage::ChildReady,
-                            elapsed_us: self.lifecycle_elapsed_us(),
-                            group: child,
-                            goal: Some(child_goal),
-                            candidate: Some(child_reference.candidate),
-                            source: None,
-                            binding: None,
-                            source_child: None,
-                            logical: None,
-                            physical: Some(physical),
-                            recipe: Some(recipe.physical_fingerprint),
-                            rule: None,
-                            children: Box::new([child_reference]),
-                            facts: Box::new([]),
-                            expected_cost_bits: None,
-                            upper_cost_bits: None,
-                        });
+                        let stage = CandidateLifecycleStage::ChildReady;
+                        if self.candidate_lifecycle_slot_available(stage) {
+                            self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                                source_sequence: 0,
+                                stage,
+                                elapsed_us: self.lifecycle_elapsed_us(),
+                                group: child,
+                                goal: Some(child_goal),
+                                candidate: Some(child_reference.candidate),
+                                source: None,
+                                binding: None,
+                                source_child: None,
+                                logical: None,
+                                physical: Some(physical),
+                                recipe: Some(recipe.physical_fingerprint),
+                                rule: None,
+                                children: Box::new([child_reference]),
+                                facts: Box::new([]),
+                                expected_cost_bits: None,
+                                upper_cost_bits: None,
+                            });
+                        } else {
+                            self.note_candidate_lifecycle_dropped(stage);
+                        }
                     }
                 }
             }
@@ -9704,24 +9774,30 @@ impl CascadesEngine {
                 drop(kernel_timer);
                 drop(kernel_partition);
                 if self.collect_rule_work_profile {
-                    self.note_candidate_lifecycle(CandidateLifecycleEvent {
-                        stage: CandidateLifecycleStage::TuplePriced,
-                        elapsed_us: self.lifecycle_elapsed_us(),
-                        group,
-                        goal: Some(goal),
-                        candidate: None,
-                        source: None,
-                        binding: None,
-                        source_child: None,
-                        logical: None,
-                        physical: Some(physical),
-                        recipe: Some(recipe.physical_fingerprint),
-                        rule: None,
-                        children: child_combination_refs(&child_ids, &recipe.child_goals)?,
-                        facts: Box::new([]),
-                        expected_cost_bits: Some(cost.score.range.expected.to_bits()),
-                        upper_cost_bits: Some(cost.score.range.upper.to_bits()),
-                    });
+                    let stage = CandidateLifecycleStage::TuplePriced;
+                    if self.candidate_lifecycle_slot_available(stage) {
+                        self.note_candidate_lifecycle(CandidateLifecycleEvent {
+                            source_sequence: 0,
+                            stage,
+                            elapsed_us: self.lifecycle_elapsed_us(),
+                            group,
+                            goal: Some(goal),
+                            candidate: None,
+                            source: None,
+                            binding: None,
+                            source_child: None,
+                            logical: None,
+                            physical: Some(physical),
+                            recipe: Some(recipe.physical_fingerprint),
+                            rule: None,
+                            children: child_combination_refs(&child_ids, &recipe.child_goals)?,
+                            facts: Box::new([]),
+                            expected_cost_bits: Some(cost.score.range.expected.to_bits()),
+                            upper_cost_bits: Some(cost.score.range.upper.to_bits()),
+                        });
+                    } else {
+                        self.note_candidate_lifecycle_dropped(stage);
+                    }
                 }
                 let fingerprint = enforced_fingerprint(
                     recipe.physical_fingerprint,

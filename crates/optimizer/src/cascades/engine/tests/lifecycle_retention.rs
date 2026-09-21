@@ -21,6 +21,7 @@ fn dense_parent_publications_do_not_hide_logical_or_root_evidence() {
         for ordinal in 0..MAX_CANDIDATE_LIFECYCLE_EVENTS + 1 {
             offered[stage as usize] += 1;
             engine.note_candidate_lifecycle(CandidateLifecycleEvent {
+                source_sequence: 0,
                 stage,
                 elapsed_us: ordinal as u64,
                 group: root,

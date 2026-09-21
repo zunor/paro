@@ -1185,13 +1185,8 @@ impl Optimizer {
                             .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
                     });
                 }
-                for (source_sequence, event) in extraction
-                    .search_milestones
-                    .candidate_lifecycle
-                    .iter()
-                    .enumerate()
-                {
-                    let source_sequence = source_sequence as u64;
+                for event in &extraction.search_milestones.candidate_lifecycle {
+                    let source_sequence = event.source_sequence;
                     if matches!(
                         event.stage,
                         crate::cascades::engine::CandidateLifecycleStage::LogicalPublished
@@ -1282,13 +1277,8 @@ impl Optimizer {
                         });
                     }
                 }
-                for (source_sequence, event) in extraction
-                    .search_milestones
-                    .transformation_task_lifecycle
-                    .iter()
-                    .enumerate()
-                {
-                    let source_sequence = source_sequence as u64;
+                for event in &extraction.search_milestones.transformation_task_lifecycle {
+                    let source_sequence = event.source_sequence;
                     capture.detail(DetailEvent::Task {
                         source_sequence,
                         event_time_us: event.last_run_us.unwrap_or_default(),
