@@ -14,7 +14,7 @@ from tpcds_compare import (read_pre_touch, require_first_target_miss, collect_pr
 class PreTouchTests(unittest.TestCase):
     def test_explicit_second_occurrence_does_not_relax_first_miss_gate(self):
         fp = statement_fingerprint('SELECT 1')
-        identity = {"schema_version": 1, "artifact": [1, 2],
+        identity = {"schema_version": 3, "artifact": [1, 2],
                     "structure": [3, 4], "dependencies": [5, 6]}
         cursor = Mock()
         cursor.description = []
@@ -27,7 +27,7 @@ class PreTouchTests(unittest.TestCase):
             return (record_type, 'receipt', 0, 0, 'receipt', 1,
                     record_type, record_id, json.dumps(payload))
         compile_receipt = {
-            'schema_version': 1, 'artifact_identity': identity,
+            'schema_version': 3, 'artifact_identity': identity,
             'search_stop': {'Observed': 'QualityPolicySatisfied'},
             'search_complete': {'Observed': False},
             'quality_policy_satisfied': {'Observed': True},
@@ -40,11 +40,11 @@ class PreTouchTests(unittest.TestCase):
         }
         cursor.fetchall.return_value = [
             row('statement_cache', 6, {
-                'schema_version': 1, 'decision_id': 6, 'query_fingerprint': fp,
+                'schema_version': 3, 'decision_id': 6, 'query_fingerprint': fp,
                 'occurrence': 9, 'cache_hit': True, 'artifact_identity': identity,
                 'compile_work': None, 'compile_receipt': compile_receipt}),
             row('execution_receipt', 7, {
-                'schema_version': 1, 'execution_id': 7, 'statement_decision_id': 6,
+            'schema_version': 3, 'execution_id': 7, 'statement_decision_id': 6,
                 'artifact_identity': identity, 'expected_class': 2,
                 'actual_class': 2, 'actual_fingerprint': [7, 8],
                 'resources': {
@@ -64,7 +64,7 @@ class PreTouchTests(unittest.TestCase):
         self.assertEqual(collect_statement_cache_evidence(connection, 'SELECT 1')['status'], 'Uncovered')
         evidence = collect_statement_cache_evidence(
             connection, 'SELECT 1', before_execution_ids=set())
-        self.assertEqual(evidence['occurrence'], 9)
+        self.assertEqual(evidence['compile']['occurrence'], 9)
         self.assertEqual(evidence['compilation'], 'CacheHit')
         with self.assertRaises(AssertionError):
             require_first_target_miss(evidence, 'SELECT 1')

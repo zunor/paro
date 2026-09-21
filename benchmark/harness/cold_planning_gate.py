@@ -14,7 +14,11 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from .receipt_contract import ReceiptContractError, validate_compile_document
+from .receipt_contract import (
+    EVIDENCE_SCHEMA_VERSION,
+    ReceiptContractError,
+    validate_compile_document,
+)
 
 VERSION = 6
 COUNTERS = ("search_complete", "memo_group_count", "memo_logical_expression_count",
@@ -68,6 +72,8 @@ def validate(
 ) -> dict[str, list[dict[str, Any]]]:
     if report.get("schema_version") != VERSION:
         raise ValueError("unsupported cold planning report version")
+    if report.get("compile_evidence_schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise ValueError("cold planning report is not on the current compile evidence contract")
     if report.get("invalidated"):
         raise ValueError("measurement provenance was invalidated")
     evidence = report["evidence"]
@@ -118,8 +124,8 @@ def validate(
                 positive(sample[metric])
             if sample["optimizer_ms"] > sample["explain_wall_ms"] * 1.01:
                 raise ValueError("optimizer time exceeds its enclosing statement")
-            if not sample.get("plan_sha256"):
-                raise ValueError("missing plan evidence")
+            if not sample.get("plan_structure_id"):
+                raise ValueError("missing typed plan structure identity")
             for counter in COUNTERS:
                 value = sample["counters"][counter]
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:

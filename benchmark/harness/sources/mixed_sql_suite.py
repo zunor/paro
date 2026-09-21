@@ -50,9 +50,12 @@ class MixedSqlSuiteSource:
         config = runner.resolve_config(args)
         if context.run_output is not None and context.attempt is not None:
             context.run_output.registration.cell(
-                query_cases=5,
-                sample_rows=5 * max(config.iterations, 1),
-                product_receipts=5 * 4,
+                # The payload has three scenario queries, each with one
+                # receipt slot per measured iteration.  Register the actual
+                # cell cardinality before any result bytes are published.
+                query_cases=3,
+                sample_rows=3 * max(config.iterations, 1),
+                product_receipts=3 * max(config.iterations, 1),
                 query_case=context.attempt.query_case,
                 arm_id=context.attempt.arm_id,
             )
@@ -420,7 +423,7 @@ def _payload(
             "validation": scenario.validation,
             "mixed": scenario.mixed,
             "compile_receipt": {
-                "schema_version": 1,
+                "schema_version": 3,
                 "status": "Uncovered",
                 "reason": "mixed scenario combines concurrent statements without one receipt identity",
             },

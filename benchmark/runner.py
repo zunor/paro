@@ -558,8 +558,10 @@ def execute_workloads(
         query_count = sum(len(workload.queries) for workload in workloads)
         active_run.registration.cell(
             query_cases=query_count,
-            sample_rows=query_count * max(config.iterations + config.warmup, 1),
-            product_receipts=query_count * 4,
+            # Warmups never produce benchmark receipts.  Registration counts
+            # only the target executions that the shared payload can bind.
+            sample_rows=query_count * max(config.iterations, 1),
+            product_receipts=query_count * max(config.iterations, 1),
             query_case=args.query_case or args.suite or args.workload or args.source_id or "adhoc",
             arm_id=args.arm_id or "default",
         )

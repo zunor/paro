@@ -23,8 +23,11 @@ import uuid
 from typing import Any
 
 
-RUN_OUTPUT_SCHEMA_VERSION = 1
-RUN_SUMMARY_SCHEMA_VERSION = 1
+# RunOutput is part of the same current Compile Evidence contract. Historical
+# run directories are not reopened by this writer.
+RUN_OUTPUT_SCHEMA_VERSION = 3
+RUN_SUMMARY_SCHEMA_VERSION = 3
+RUN_REGISTRATION_SCHEMA_VERSION = 3
 CAMPAIGN_TOTAL_LIMIT_BYTES = 64 * 1024 * 1024
 SUMMARY_LIMIT_BYTES = 200_000
 # Terminal metadata remains writable after payload capacity is exhausted so a
@@ -38,6 +41,20 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 
 class RunOutputError(ValueError):
     """The requested output identity cannot be safely allocated."""
+
+
+def _default_sample_ids(query_case: str, sample_rows: int) -> list[str]:
+    return [f"{query_case}-sample-{index:04d}" for index in range(sample_rows)]
+
+
+def _validate_sample_ids(sample_ids: list[str], *, sample_rows: int) -> list[str]:
+    if len(sample_ids) != sample_rows or len(set(sample_ids)) != len(sample_ids):
+        raise RunOutputError(
+            "registered sample_ids must be unique and have exactly sample_rows entries"
+        )
+    for sample_id in sample_ids:
+        validate_output_id(sample_id, label="sample id")
+    return list(sample_ids)
 
 
 def validate_output_id(value: str, *, label: str) -> str:
@@ -99,6 +116,8 @@ class PreparedWrite:
     encoded: bytes
     overwrite: bool
     replacing_bytes: int
+    observed_size: int
+    observed_mtime_ns: int | None
 
     def publish(self) -> Path:
         return self.writer._publish(self)
@@ -120,6 +139,7 @@ class CampaignRegistration:
         product_receipts: int,
         calibration_rows: int = 0,
         summary_captures: int = 0,
+        sample_ids: list[str] | None = None,
     ) -> "CellWriter":
         return self.run.register_cell(
             cell_id=f"{query_case}--{arm_id}",
@@ -128,6 +148,7 @@ class CampaignRegistration:
             product_receipts=product_receipts,
             calibration_rows=calibration_rows,
             summary_captures=summary_captures,
+            sample_ids=sample_ids,
             query_case=query_case,
             arm_id=arm_id,
         )
@@ -142,6 +163,7 @@ class ControlWriter:
 
     run: "RunOutput"
     root: Path
+    allow_terminal: bool = False
 
     def _path(self, name: str | Path) -> Path:
         return _owned_relative_path(self.root, name, label="control output")
@@ -151,8 +173,13 @@ class ControlWriter:
     ) -> PreparedWrite:
         path = self._path(name)
         encoded = _encode_json(payload, limit_bytes=CONTROL_OUTPUT_LIMIT_BYTES)
-        replacing = path.stat().st_size if overwrite and path.exists() else 0
-        return PreparedWrite(self, path, encoded, overwrite, replacing)
+        stat = path.stat() if path.exists() else None
+        replacing = stat.st_size if overwrite and stat is not None else 0
+        return PreparedWrite(
+            self, path, encoded, overwrite, replacing,
+            stat.st_size if stat is not None else 0,
+            stat.st_mtime_ns if stat is not None else None,
+        )
 
     def prepare_text(
         self, name: str | Path, text: str, *, overwrite: bool = False
@@ -164,8 +191,13 @@ class ControlWriter:
                 f"control output capacity exceeded: {len(encoded)} > "
                 f"{CONTROL_OUTPUT_LIMIT_BYTES} bytes"
             )
-        replacing = path.stat().st_size if overwrite and path.exists() else 0
-        return PreparedWrite(self, path, encoded, overwrite, replacing)
+        stat = path.stat() if path.exists() else None
+        replacing = stat.st_size if overwrite and stat is not None else 0
+        return PreparedWrite(
+            self, path, encoded, overwrite, replacing,
+            stat.st_size if stat is not None else 0,
+            stat.st_mtime_ns if stat is not None else None,
+        )
 
     def write_json(
         self, name: str | Path, payload: dict[str, Any], *, overwrite: bool = False
@@ -177,6 +209,11 @@ class ControlWriter:
 
     def _publish(self, prepared: PreparedWrite) -> Path:
         with self.run._lock:
+            # A terminal run owns its already-published state.  Reject a late
+            # writer before entering the publication-error path: treating a
+            # caller that raced with finalization as PublicationUnknown would
+            # overwrite a legitimate terminal outcome.
+            self.run._ensure_running_for_publish(prepared)
             try:
                 self.run._commit_control(prepared)
                 return prepared.path
@@ -204,7 +241,8 @@ class CellWriter:
         self, name: str | Path, payload: dict[str, Any], *, overwrite: bool = False
     ) -> PreparedWrite:
         path = self._path(name)
-        replacing = path.stat().st_size if overwrite and path.exists() else 0
+        stat = path.stat() if path.exists() else None
+        replacing = stat.st_size if overwrite and stat is not None else 0
         limit = self.run._available_bytes_for_cell(
             self.cell_id, replacing_bytes=replacing
         )
@@ -213,14 +251,19 @@ class CellWriter:
         except RunOutputError:
             self.run._mark_capacity_exceeded()
             raise
-        return PreparedWrite(self, path, encoded, overwrite, replacing)
+        return PreparedWrite(
+            self, path, encoded, overwrite, replacing,
+            stat.st_size if stat is not None else 0,
+            stat.st_mtime_ns if stat is not None else None,
+        )
 
     def prepare_text(
         self, name: str | Path, text: str, *, overwrite: bool = False
     ) -> PreparedWrite:
         path = self._path(name)
         encoded = text.encode("utf-8")
-        replacing = path.stat().st_size if overwrite and path.exists() else 0
+        stat = path.stat() if path.exists() else None
+        replacing = stat.st_size if overwrite and stat is not None else 0
         limit = self.run._available_bytes_for_cell(
             self.cell_id, replacing_bytes=replacing
         )
@@ -229,7 +272,11 @@ class CellWriter:
             raise RunOutputError(
                 f"cell output capacity exceeded: {len(encoded)} > {limit} bytes"
             )
-        return PreparedWrite(self, path, encoded, overwrite, replacing)
+        return PreparedWrite(
+            self, path, encoded, overwrite, replacing,
+            stat.st_size if stat is not None else 0,
+            stat.st_mtime_ns if stat is not None else None,
+        )
 
     def write_json(
         self, name: str | Path, payload: dict[str, Any], *, overwrite: bool = False
@@ -241,6 +288,7 @@ class CellWriter:
 
     def _publish(self, prepared: PreparedWrite) -> Path:
         with self.run._lock:
+            self.run._ensure_running_for_publish(prepared)
             try:
                 self.run._commit_cell(self.cell_id, prepared)
                 return prepared.path
@@ -297,6 +345,10 @@ class AttemptOutput:
     def control_writer(self) -> ControlWriter:
         return ControlWriter(self.run, self.root)
 
+    def _lifecycle_writer(self) -> ControlWriter:
+        """Complete only this attempt's already-started terminal transition."""
+        return ControlWriter(self.run, self.root, allow_terminal=True)
+
     def cell_writer(self) -> CellWriter:
         return self.run.cell_writer(
             query_case=self.query_case,
@@ -313,7 +365,7 @@ class AttemptOutput:
                 f"attempt {self.attempt_id} is already terminal: {current.get('status')}"
             )
         error = _bounded_error_text(error)
-        self.control_writer().write_json(
+        self._lifecycle_writer().write_json(
             "failure.json",
             {
                 "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
@@ -345,6 +397,11 @@ class AttemptOutput:
             raise RunOutputError(
                 f"attempt {self.attempt_id} is already terminal: {current.get('status')}"
             )
+        if status == "Completed" and not self.run._attempt_payload_complete(self):
+            raise RunOutputError(
+                "cannot complete an attempt without a registered, owned payload "
+                "covering every declared sample"
+            )
         metadata = {
             "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
             "run_id": self.run.run_id,
@@ -363,7 +420,7 @@ class AttemptOutput:
         # be replaced. It is control metadata, not an evidence payload, and
         # therefore uses the explicit control writer even after evidence
         # capacity is exhausted.
-        self.control_writer().write_json("attempt.json", metadata, overwrite=True)
+        self._lifecycle_writer().write_json("attempt.json", metadata, overwrite=True)
         self.run._update_attempt(metadata)
 
 
@@ -426,6 +483,16 @@ class CorpusOutput:
         AttemptId.  A retry or a second process gets a new run/attempt and can
         never overwrite this path.
         """
+        from .receipt_contract import ReceiptContractError, validate_benchmark_payload
+
+        try:
+            validate_benchmark_payload(payload)
+        except ReceiptContractError as error:
+            # The writer boundary exposes one owned error type.  A malformed
+            # producer payload must not bypass the RunOutput state machine or
+            # be mistaken for a filesystem failure by a caller.
+            raise RunOutputError(str(error)) from error
+        self.run._validate_payload_owner(self.attempt, payload)
         return self.attempt.cell_writer().write_json(
             "result.json", payload, overwrite=True
         )
@@ -451,6 +518,9 @@ class CorpusOutput:
                     f"run is already terminal: {current}; cannot finish as {status}"
                 )
             return
+        if status == "Completed" and not self.run._attempt_payload_complete(self.attempt):
+            status = "Incomplete"
+            error = error or "declared samples and receipts are not complete"
         if status == "Completed":
             self.attempt.seal(status=status, result_path=self.result_path, summary_path=self.summary_path)
         else:
@@ -519,7 +589,16 @@ class CampaignOutput:
     def publish_cell_json(
         self, *, query_case: str, arm_id: str, payload: dict[str, Any]
     ) -> Path:
+        # Keep the producer/consumer contract at the shared writer boundary;
+        # a collector cannot publish an arbitrary JSON object as a cell.
+        from .receipt_contract import ReceiptContractError, validate_benchmark_payload
+
+        try:
+            validate_benchmark_payload(payload)
+        except ReceiptContractError as error:
+            raise RunOutputError(str(error)) from error
         attempt = self.attempts[(query_case, arm_id)]
+        self.run._validate_payload_owner(attempt, payload)
         return attempt.cell_writer().write_json("result.json", payload, overwrite=True)
 
     def publish_capture_text(
@@ -533,7 +612,52 @@ class CampaignOutput:
             overwrite=False,
         )
 
-    def publish_campaign_json(self, payload: dict[str, Any]) -> Path:
+    def publish_campaign_summary(self) -> Path:
+        """Publish only the bounded campaign index and terminal metadata.
+
+        Domain reports and Detail captures belong to their cell/attempt owners.
+        Keeping this method payload-free prevents a collector from smuggling an
+        unbounded report or a second, incompatible campaign schema into the
+        control plane.
+        """
+        cells: list[dict[str, Any]] = []
+        for cell in self.run._manifest.get("registration", {}).get("cells", []):
+            cell_id = cell["cell_id"]
+            attempts = [
+                metadata
+                for metadata in self.run._manifest.get("attempts", [])
+                if metadata.get("query_case") == cell.get("query_case")
+                and metadata.get("arm_id") == cell.get("arm_id")
+            ]
+            cells.append({
+                "cell_id": cell_id,
+                "query_case": cell.get("query_case"),
+                "arm_id": cell.get("arm_id"),
+                "declared_samples": cell.get("sample_rows"),
+                "sample_ids": cell.get("sample_ids", []),
+                "declared_receipts": cell.get("product_receipts"),
+                "declared_captures": cell.get("summary_captures"),
+                "attempts": [
+                    {
+                        "source_id": item.get("source_id"),
+                        "attempt_id": item.get("attempt_id"),
+                        "status": item.get("status"),
+                        "result": item.get("result"),
+                        "summary": item.get("summary"),
+                        "failure": item.get("failure"),
+                    }
+                    for item in attempts
+                ],
+            })
+        payload = {
+            "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
+            "kind": "CampaignSummary",
+            "campaign_id": self.run.campaign_id,
+            "run_id": self.run.run_id,
+            "status": self.run._manifest.get("status"),
+            "registration_status": self.run._manifest.get("registration", {}).get("status"),
+            "cells": cells,
+        }
         return self.control.write_json("campaign.json", payload, overwrite=True)
 
     def publish_cell_summary(
@@ -557,7 +681,7 @@ class CampaignOutput:
             # it must not rewrite a successfully sealed cell when a later
             # cell fails.  Each attempt owns its own terminal record and is
             # therefore sealed from its own evidence/error state first.
-            if error is None and attempt.result_path.exists():
+            if error is None and self.run._attempt_payload_complete(attempt):
                 attempt.seal(
                     status="Completed",
                     result_path=attempt.result_path,
@@ -634,7 +758,7 @@ class RunOutput:
             "sealed_at": None,
             "attempts": [],
             "registration": {
-                "schema_version": 1,
+                "schema_version": RUN_REGISTRATION_SCHEMA_VERSION,
                 "cells": [],
                 "budget_bytes": 0,
                 "written_bytes": 0,
@@ -764,6 +888,7 @@ class RunOutput:
         product_receipts: int,
         calibration_rows: int = 0,
         summary_captures: int = 0,
+        sample_ids: list[str] | None = None,
         query_case: str | None = None,
         arm_id: str = "default",
     ) -> CellWriter:
@@ -781,6 +906,12 @@ class RunOutput:
             raise RunOutputError(
                 f"cell id must be query_case--arm_id ({expected_cell_id}), got {cell_id}"
             )
+        sample_ids = _validate_sample_ids(
+            sample_ids
+            if sample_ids is not None
+            else _default_sample_ids(query_case, sample_rows),
+            sample_rows=sample_rows,
+        )
         for current in registration["cells"]:
             if current.get("cell_id") != cell_id:
                 continue
@@ -792,6 +923,7 @@ class RunOutput:
                 "summary_captures": summary_captures,
                 "query_case": query_case,
                 "arm_id": arm_id,
+                "sample_ids": sample_ids,
             }
             if all(current.get(key) == value for key, value in requested.items()):
                 return CellWriter(self, cell_id, self.root / "sources")
@@ -814,6 +946,7 @@ class RunOutput:
             "product_receipts": product_receipts,
             "calibration_rows": calibration_rows,
             "summary_captures": summary_captures,
+            "sample_ids": sample_ids,
             "budget_bytes": cell_budget,
             "written_bytes": 0,
         }]
@@ -868,6 +1001,61 @@ class RunOutput:
                 return cell
         raise RunOutputError(f"cell is not registered: {cell_id}")
 
+    def _validate_payload_owner(
+        self, attempt: AttemptOutput, payload: dict[str, Any]
+    ) -> None:
+        ownership = payload.get("ownership")
+        if not isinstance(ownership, dict):
+            raise RunOutputError("cell payload has no ownership envelope")
+        expected = {
+            "campaign_id": self.campaign_id,
+            "run_id": self.run_id,
+            "source_id": attempt.source_id,
+            "attempt_id": attempt.attempt_id,
+            "query_case": attempt.query_case,
+            "arm_id": attempt.arm_id,
+        }
+        for field, value in expected.items():
+            if ownership.get(field) != value:
+                raise RunOutputError(
+                    f"cell payload ownership mismatch for {field}: "
+                    f"expected {value!r}, got {ownership.get(field)!r}"
+                )
+        cell = self._registered_cell(f"{attempt.query_case}--{attempt.arm_id}")
+        if ownership.get("sample_ids") != cell.get("sample_ids"):
+            raise RunOutputError("cell payload sample_ids differ from registration")
+
+    def _attempt_payload_complete(self, attempt: AttemptOutput) -> bool:
+        if not attempt.result_path.exists():
+            return False
+        try:
+            payload = json.loads(attempt.result_path.read_text(encoding="utf-8"))
+            from .receipt_contract import validate_benchmark_payload
+
+            validate_benchmark_payload(payload)
+            self._validate_payload_owner(attempt, payload)
+        except (OSError, ValueError, TypeError, KeyError, RunOutputError):
+            return False
+        cell = self._registered_cell(f"{attempt.query_case}--{attempt.arm_id}")
+        receipts: list[Any] = []
+        for workload in payload.get("workloads", []):
+            for query in workload.get("queries", []):
+                if isinstance(query.get("compile_receipts"), list):
+                    receipts.extend(query["compile_receipts"])
+                elif query.get("compile_receipt") is not None:
+                    receipts.append(query["compile_receipt"])
+        return (
+            len(receipts) == len(cell.get("sample_ids", []))
+            and len(receipts) == int(cell.get("product_receipts", 0))
+        )
+
+    def _ensure_running_for_publish(self, prepared: PreparedWrite) -> None:
+        status = self._manifest.get("status")
+        if status != "Running" and not getattr(prepared.writer, "allow_terminal", False):
+            raise RunOutputError(
+                f"run is already terminal: {status}; cannot publish new output"
+            )
+
     def _available_bytes_for_cell(
         self, cell_id: str, *, replacing_bytes: int = 0
     ) -> int:
@@ -893,6 +1081,7 @@ class RunOutput:
         return max(0, available)
 
     def _commit_cell(self, cell_id: str, prepared: PreparedWrite) -> None:
+        self._check_prepared_generation(prepared)
         registration = self._manifest["registration"]
         cell = self._registered_cell(cell_id)
         encoded_bytes = len(prepared.encoded)
@@ -917,6 +1106,7 @@ class RunOutput:
         self._persist_manifest()
 
     def _commit_control(self, prepared: PreparedWrite) -> None:
+        self._check_prepared_generation(prepared)
         registration = self._manifest["registration"]
         encoded_bytes = len(prepared.encoded)
         current = int(registration.get("control_written_bytes", 0))
@@ -931,6 +1121,23 @@ class RunOutput:
         )
         registration["control_written_bytes"] = total
         self._persist_manifest()
+
+    @staticmethod
+    def _check_prepared_generation(prepared: PreparedWrite) -> None:
+        """Reject a prepared write whose target changed before commit.
+
+        Capacity is reserved under the RunOutput lock, but preparation can
+        happen before another writer acquires it.  Rechecking both size and
+        mtime makes the replacing-byte accounting a generation check instead
+        of a caller convention.
+        """
+        stat = prepared.path.stat() if prepared.path.exists() else None
+        size = stat.st_size if stat is not None else 0
+        mtime_ns = stat.st_mtime_ns if stat is not None else None
+        if size != prepared.observed_size or mtime_ns != prepared.observed_mtime_ns:
+            raise RunOutputError(
+                f"prepared output changed before commit: {prepared.path}"
+            )
 
     def _persist_manifest(self) -> None:
         registration = self._manifest.setdefault("registration", {})
@@ -965,13 +1172,17 @@ class RunOutput:
         registration["status"] = "PublicationUnknown"
         self._manifest["status"] = "Incomplete"
         self._manifest["sealed_at"] = _now()
+        persist_error: Exception | None = None
         try:
             self._persist_manifest()
-        except Exception:
-            pass
+        except Exception as exc:
+            # A manifest write failure is itself part of the publication
+            # outcome.  Still try the separate marker so recovery tooling can
+            # see the terminal classification, but never hide this error.
+            persist_error = exc
         marker = self.root / "publication-unknown.json"
         payload = {
-            "schema_version": 1,
+            "schema_version": RUN_REGISTRATION_SCHEMA_VERSION,
             "status": "PublicationUnknown",
             "path": _relative_or_none(path, self.root),
             "error": _bounded_error_text(f"{type(error).__name__}: {error}"),
@@ -980,20 +1191,55 @@ class RunOutput:
         try:
             encoded = _encode_json(payload, limit_bytes=CONTROL_OUTPUT_LIMIT_BYTES)
             _write_encoded_atomically(marker, encoded, overwrite=True)
-        except Exception:
-            # If the run root is unavailable, the original exception is the
-            # only truthful signal left to the caller.
-            pass
+        except Exception as marker_error:
+            raise RunOutputError(
+                "publication outcome is unknown and its durable marker could not be written: "
+                f"{type(error).__name__}: {error}; "
+                f"manifest error: {type(persist_error).__name__}: {persist_error}; "
+                f"marker error: {type(marker_error).__name__}: {marker_error}"
+            ) from marker_error
+        if persist_error is not None:
+            raise RunOutputError(
+                "publication outcome is unknown and its manifest could not be persisted: "
+                f"{type(error).__name__}: {error}; "
+                f"manifest error: {type(persist_error).__name__}: {persist_error}"
+            ) from persist_error
 
     def _update_attempt(self, metadata: dict[str, Any]) -> None:
         attempts = self._manifest.setdefault("attempts", [])
         identity = (metadata.get("source_id"), metadata.get("attempt_id"))
-        for index, current in enumerate(attempts):
+        source_id = metadata.get("source_id")
+        attempt_id = metadata.get("attempt_id")
+        if not isinstance(source_id, str) or not isinstance(attempt_id, str):
+            raise RunOutputError("attempt metadata lacks stable source/attempt identity")
+        # The manifest is an index, not a second copy of every attempt's
+        # lifecycle record.  The bounded, durable attempt.json under the
+        # source owner is authoritative for timestamps and terminal details;
+        # these fields are the minimum needed for campaign enumeration and
+        # completion checks.
+        entry = {
+            "source_id": source_id,
+            "attempt_id": attempt_id,
+            "query_case": metadata.get("query_case"),
+            "arm_id": metadata.get("arm_id"),
+            "status": metadata.get("status"),
+            "result": metadata.get("result"),
+            "summary": metadata.get("summary"),
+            "failure": metadata.get("failure"),
+            "metadata": (
+                Path("sources")
+                / source_id
+                / "attempts"
+                / attempt_id
+                / "attempt.json"
+            ).as_posix(),
+        }
+        for position, current in enumerate(attempts):
             if (current.get("source_id"), current.get("attempt_id")) == identity:
-                attempts[index] = dict(metadata)
+                attempts[position] = entry
                 break
         else:
-            attempts.append(dict(metadata))
+            attempts.append(entry)
         self._persist_manifest()
 
 

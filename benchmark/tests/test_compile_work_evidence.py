@@ -48,15 +48,15 @@ class CompileWorkEvidenceTest(unittest.TestCase):
     def test_only_exact_cache_occurrence_is_attached(self):
         query = "SELECT 1"
         fp = statement_fingerprint(query)
-        identity = {"schema_version": 1, "artifact": [1, 2],
+        identity = {"schema_version": 3, "artifact": [1, 2],
                     "structure": [3, 4], "dependencies": [5, 6]}
         rows = [
             typed_row("statement_cache", 11, {
-                "schema_version": 1, "decision_id": 11, "query_fingerprint": fp,
+                "schema_version": 3, "decision_id": 11, "query_fingerprint": fp,
                 "occurrence": 9, "cache_hit": False, "artifact_identity": identity,
                 "compile_work": {"optimizer_elapsed_us": 17},
                 "compile_receipt": {
-                    "schema_version": 1, "artifact_identity": identity,
+                    "schema_version": 3, "artifact_identity": identity,
                     "search_stop": {"Observed": "QualityPolicySatisfied"},
                     "search_complete": {"Observed": False},
                     "quality_policy_satisfied": {"Observed": True},
@@ -77,7 +77,7 @@ class CompileWorkEvidenceTest(unittest.TestCase):
                 },
             }),
             typed_row("execution_receipt", 12, {
-                "schema_version": 1, "execution_id": 12, "statement_decision_id": 11,
+                "schema_version": 3, "execution_id": 12, "statement_decision_id": 11,
                 "artifact_identity": identity, "expected_class": 2,
                 "actual_class": 2, "actual_fingerprint": [7, 8],
                 "resources": {
@@ -92,12 +92,12 @@ class CompileWorkEvidenceTest(unittest.TestCase):
                 "terminal_error": None,
             }),
             typed_row("statement_cache", 13, {
-                "schema_version": 1, "decision_id": 13, "query_fingerprint": fp,
+                "schema_version": 3, "decision_id": 13, "query_fingerprint": fp,
                 "occurrence": 10, "cache_hit": True, "artifact_identity": identity,
                 "compile_work": None,
             }),
             typed_row("execution_receipt", 14, {
-                "schema_version": 1, "execution_id": 14, "statement_decision_id": 13,
+                "schema_version": 3, "execution_id": 14, "statement_decision_id": 13,
                 "artifact_identity": identity,
             }),
         ]
@@ -112,7 +112,7 @@ class CompileWorkEvidenceTest(unittest.TestCase):
         query = "SELECT 1"
         fp = statement_fingerprint(query)
         rows = [typed_row("statement_cache", 11, {
-            "schema_version": 1, "decision_id": 11, "query_fingerprint": fp,
+            "schema_version": 3, "decision_id": 11, "query_fingerprint": fp,
             "occurrence": 0, "cache_hit": False, "artifact_identity": None,
             "compile_work": None,
         })]

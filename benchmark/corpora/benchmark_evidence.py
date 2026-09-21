@@ -156,7 +156,7 @@ def statement_fingerprint(value: str) -> int:
     return result
 
 
-def fetch_compile_document(
+def _fetch_compile_document(
     connection: Any,
     query: str,
     *,
@@ -208,6 +208,49 @@ def fetch_compile_document(
     except ReceiptContractError as error:
         raise ValueError(f"EXPLAIN (COMPILE) document violates its contract: {error}") from error
     return payload, document
+
+
+@dataclass(frozen=True)
+class CompileEvidenceCollector:
+    """The sole benchmark entry point for producer-owned Compile Evidence."""
+
+    connection: Any
+
+    def capture(
+        self,
+        query: str,
+        *,
+        detail: bool = False,
+        analyze: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        return _fetch_compile_document(
+            self.connection, query, detail=detail, analyze=analyze
+        )
+
+
+def plan_structure_id(document: Mapping[str, Any]) -> str:
+    """Return the producer's typed PlanStructureId, never a document hash."""
+    identity: Any = document.get("artifact_identity")
+    if isinstance(identity, dict) and set(identity) == {"Observed"}:
+        identity = identity["Observed"]
+    if not isinstance(identity, dict):
+        raise ValueError("compile document lacks an observed artifact identity")
+    structure: Any = identity.get("structure")
+    if isinstance(structure, dict) and set(structure) == {"PlanStructureId"}:
+        structure = structure["PlanStructureId"]
+    if (
+        not isinstance(structure, list)
+        or len(structure) != 2
+        or any(
+            not isinstance(word, int)
+            or isinstance(word, bool)
+            or word < 0
+            or word >= 1 << 64
+            for word in structure
+        )
+    ):
+        raise ValueError("compile document has no typed PlanStructureId")
+    return "".join(f"{word:016x}" for word in structure)
 
 
 def validate_statement_trace(

@@ -24,7 +24,7 @@ from psycopg import sql
 
 from benchmark_evidence import (
     ImmutableDataSeed,
-    fetch_compile_document,
+    CompileEvidenceCollector,
     isolated_paro_server,
     build_benchmark_server,
     content_digest,
@@ -34,9 +34,11 @@ from benchmark_evidence import (
     tree_digest,
 )
 from harness.receipt_contract import (
+    EVIDENCE_SCHEMA_VERSION,
     ReceiptContractError,
     associate_typed_receipts,
     build_benchmark_cell_payload,
+    uncovered_receipt,
     validate_compile_document,
 )
 from harness.run_output import CampaignOutput
@@ -502,10 +504,8 @@ def collect_statement_cache_evidence(
     fingerprint = statement_fingerprint(query)
     if before_execution_ids is None:
         return {
-            "schema_version": 1,
-            "status": "Uncovered",
+            **uncovered_receipt("target execution boundary was not captured"),
             "query_fingerprint": fingerprint,
-            "reason": "target execution boundary was not captured",
         }
     try:
         _, rows = _typed_optimizer_rows(connection)
@@ -749,6 +749,7 @@ def main() -> int:
     ]
     report: dict[str, Any] = {
         "schema_version": 8,
+        "compile_evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "pre_touch": pre_touch,
         "corpus": "TPC-DS",
         "scale_factor": 1,
@@ -774,6 +775,7 @@ def main() -> int:
             ]
         },
         "configuration": {
+            "compile_evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
             "result_contract_version": RESULT_CONTRACT_VERSION,
             "threads": args.threads,
             "memory_limit": args.memory_limit,
@@ -1240,9 +1242,9 @@ def main() -> int:
                     try:
                         diagnostic_preparation = collect_pre_touch(
                             diagnostic_paro, None, pre_touch, query, binary_result)
-                        diagnostic_compile_raw, diagnostic_compile_document = fetch_compile_document(
-                            diagnostic_paro, query, detail=True
-                        )
+                        diagnostic_compile_raw, diagnostic_compile_document = CompileEvidenceCollector(
+                            diagnostic_paro
+                        ).capture(query, detail=True)
                         try:
                             validate_compile_document(diagnostic_compile_document)
                         except ReceiptContractError as error:
@@ -1367,7 +1369,7 @@ def main() -> int:
                 process_blocks=blocks,
                 diagnostic_cohort={
                     "process_blocks": diagnostic_blocks,
-                    "compile_document_schema_version": 2,
+                    "compile_document_schema_version": 3,
                     "excluded_from_c1": True,
                     "client_ms": timing_summary(
                         [item["client_ms"] for item in diagnostic_blocks]
@@ -1431,9 +1433,7 @@ def main() -> int:
                 .get("normal_receipt_coverage", {})
                 .get("associations", [])
                 or [{
-                    "schema_version": 1,
-                    "status": "Uncovered",
-                    "reason": "normal sample receipt association is absent",
+                    **uncovered_receipt("normal sample receipt association is absent"),
                 }],
                 source_id=output.attempts[(query_id, "normal")].source_id,
                 attempt_id=output.attempts[(query_id, "normal")].attempt_id,
@@ -1453,16 +1453,17 @@ def main() -> int:
                     "diagnostic_cohort": result.get("diagnostic_cohort"),
                     "status": result.get("status"),
                 },
-                compile_receipts=[{
-                    "schema_version": 1,
-                    "status": "Uncovered",
-                    "reason": "diagnostic Compile Evidence is not an execution receipt",
-                }],
+                compile_receipts=[
+                    uncovered_receipt(
+                        "diagnostic Compile Evidence is not an execution receipt"
+                    )
+                    for _ in range(args.diagnostic_process_blocks)
+                ],
                 source_id=output.attempts[(query_id, "diagnostic")].source_id,
                 attempt_id=output.attempts[(query_id, "diagnostic")].attempt_id,
             ),
         )
-        output.publish_campaign_json(report)
+        output.publish_campaign_summary()
         if result["status"] != "passed":
             output_errors[(query_id, "normal")] = result.get("error", "query failed")
             output_errors[(query_id, "diagnostic")] = result.get("error", "query failed")
@@ -1481,7 +1482,7 @@ def main() -> int:
         else:
             print(f"TPC-DS {query_id}: failed: {result['error']}", flush=True)
 
-    output.publish_campaign_json(report)
+    output.publish_campaign_summary()
     output.control.write_text(
         "TPC-DS Compile Evidence campaign\n"
         f"queries={len(report['queries'])}\n"

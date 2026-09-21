@@ -34,15 +34,6 @@ class DivanBenchSource:
         if not source.bench:
             raise ValueError(f"source '{source.name}' is missing bench")
 
-        if context.run_output is not None and context.attempt is not None:
-            context.run_output.registration.cell(
-                query_cases=1,
-                sample_rows=max(context.minimum_sample_count, 1),
-                product_receipts=4,
-                query_case=context.attempt.query_case,
-                arm_id=context.attempt.arm_id,
-            )
-
         report_dir = context.output_dir
         raw_fd, raw_name = tempfile.mkstemp(prefix="paro-divan-", suffix=".json")
         os.close(raw_fd)
@@ -88,6 +79,23 @@ class DivanBenchSource:
             retry_query_keys=context.retry_query_keys,
             minimum_sample_count=context.minimum_sample_count,
         )
+        if context.run_output is not None and context.attempt is not None:
+            query_count = sum(
+                len(workload.get("queries", []))
+                for workload in payload.get("workloads", [])
+            )
+            sample_count = sum(
+                len(query.get("samples_ms", []))
+                for workload in payload.get("workloads", [])
+                for query in workload.get("queries", [])
+            )
+            context.run_output.registration.cell(
+                query_cases=query_count,
+                sample_rows=sample_count,
+                product_receipts=sample_count,
+                query_case=context.attempt.query_case,
+                arm_id=context.attempt.arm_id,
+            )
         reporter = BenchmarkReporter(context.root_dir)
         if context.run_output is not None:
             reporter.attach_run_ownership(
@@ -95,7 +103,7 @@ class DivanBenchSource:
                 context.run_output,
                 source_id=context.attempt.source_id if context.attempt else None,
                 attempt_id=context.attempt.attempt_id if context.attempt else None,
-                query_case=source.name,
+                query_case=context.attempt.query_case if context.attempt else None,
                 arm_id=context.attempt.arm_id if context.attempt else None,
             )
         if context.attempt is None:
@@ -158,7 +166,7 @@ def normalize_divan_payload(
                 "items": _optional_positive_int(bench.get("items")),
             },
             "compile_receipt": {
-                "schema_version": 1,
+                "schema_version": 3,
                 "status": "Uncovered",
                 "reason": "rust micro benchmark has no SQL compiled-statement receipt",
             },

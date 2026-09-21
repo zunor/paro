@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corpora"))
-from benchmark_evidence import fetch_compile_document
+from benchmark_evidence import CompileEvidenceCollector
 from cold_planning import diagnostic_rows
 
 
@@ -45,11 +45,13 @@ class DiagnosticRowsTests(unittest.TestCase):
 
             def fetchall(self):
                 return [(
-                    "{\"schema_version\":2,\"outcome\":\"Success\","
+                    "{\"schema_version\":3,\"outcome\":\"Success\","
                     "\"artifact\":\"CompiledArtifactReady\","
                     "\"cache\":\"ForcedCompile\","
                     "\"admission\":\"NotExecuted\","
-                    "\"execution\":\"NotExecuted\"}",
+                    "\"execution\":\"NotExecuted\","
+                    "\"artifact_identity\":{\"Observed\":{\"schema_version\":3,"
+                    "\"artifact\":[1,2],\"structure\":[3,4],\"dependencies\":[5,6]}}}",
                 )]
 
         class Connection:
@@ -61,8 +63,10 @@ class DiagnosticRowsTests(unittest.TestCase):
                 return self.last_cursor
 
         connection = Connection()
-        raw, document = fetch_compile_document(connection, "SELECT 1", detail=True)
-        self.assertEqual(document["schema_version"], 2)
+        raw, document = CompileEvidenceCollector(connection).capture(
+            "SELECT 1", detail=True
+        )
+        self.assertEqual(document["schema_version"], 3)
         self.assertEqual(document["outcome"], "Success")
         self.assertIn("EXPLAIN (COMPILE, DETAIL, FORMAT JSON)", connection.last_cursor.statement)
         self.assertTrue(raw.startswith("{"))

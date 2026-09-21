@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from harness.receipt_contract import (  # noqa: E402
     ReceiptContractError,
+    build_benchmark_cell_payload,
+    uncovered_receipt,
     validate_benchmark_payload,
     validate_compile_document,
 )
@@ -19,16 +21,49 @@ from harness.loader import QueryDef  # noqa: E402
 
 
 class RunOutputTests(unittest.TestCase):
+    @staticmethod
+    def cell_payload(
+        query_case: str = "q",
+        arm_id: str = "normal",
+        *,
+        campaign_id: str = "campaign",
+        run_id: str = "run",
+        source_id: str = "source",
+        attempt_id: str = "attempt-0001",
+        sample_count: int = 1,
+        **query: object,
+    ) -> dict:
+        return build_benchmark_cell_payload(
+            campaign_id=campaign_id,
+            run_id=run_id,
+            query_case=query_case,
+            arm_id=arm_id,
+            workload_name="test",
+            query_payload={"status": "ok", **query},
+            compile_receipts=[
+                uncovered_receipt("test has no execution receipt")
+                for _ in range(sample_count)
+            ],
+            source_id=source_id,
+            attempt_id=attempt_id,
+        )
+
     def test_compile_document_contract_rejects_missing_or_contradictory_state(self) -> None:
         document = {
-            "schema_version": 2,
+            "schema_version": 3,
             "outcome": "Success",
             "artifact": "CompiledArtifactReady",
             "cache": "ForcedCompile",
             "admission": "NotExecuted",
             "execution": "NotExecuted",
+            "artifact_identity": {"Observed": {"schema_version": 3, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
         }
         self.assertEqual(validate_compile_document(document), "Summary")
+        for legacy_version in (1, 2, 5):
+            legacy = dict(document)
+            legacy["schema_version"] = legacy_version
+            with self.assertRaises(ReceiptContractError):
+                validate_compile_document(legacy)
         for mutation in (
             lambda value: value.pop("artifact"),
             lambda value: value.update(schema_version=99),
@@ -63,17 +98,65 @@ class RunOutputTests(unittest.TestCase):
                 ],
             )
             output.publish_cell_json(
-                query_case="q11", arm_id="normal", payload={"status": "ok"}
+                query_case="q11", arm_id="normal",
+                payload=self.cell_payload(
+                    "q11", "normal", campaign_id=output.run.campaign_id,
+                    run_id=output.run.run_id, source_id="collector-q11-normal",
+                    sample_count=2
+                ),
             )
             output.publish_cell_json(
-                query_case="q11", arm_id="diagnostic", payload={"status": "ok"}
+                query_case="q11", arm_id="diagnostic",
+                payload=self.cell_payload(
+                    "q11", "diagnostic", campaign_id=output.run.campaign_id,
+                    run_id=output.run.run_id, source_id="collector-q11-diagnostic"
+                ),
             )
-            output.publish_campaign_json({"cells": 2})
+            output.publish_campaign_summary()
+            campaign = json.loads((output.run.root / "campaign.json").read_text())
+            self.assertEqual(campaign["kind"], "CampaignSummary")
+            self.assertNotIn("workloads", campaign)
             output.finish(status="Completed")
             manifest = json.loads((output.run.root / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "Completed")
             self.assertEqual(len(manifest["registration"]["cells"]), 2)
             self.assertTrue((output.run.root / "campaign.json").exists())
+
+    def test_cell_payload_must_match_registered_identity_and_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "campaign.json",
+                source_id="collector",
+                cells=[{
+                    "query_case": "q11",
+                    "arm_id": "normal",
+                    "query_cases": 1,
+                    "sample_rows": 2,
+                    "product_receipts": 2,
+                }],
+            )
+            payload = self.cell_payload(
+                "q11",
+                "normal",
+                campaign_id=output.run.campaign_id,
+                run_id=output.run.run_id,
+                source_id="collector-q11-normal",
+                sample_count=2,
+            )
+            payload["ownership"]["sample_ids"] = ["q11-sample-0000"]
+            with self.assertRaises(RunOutputError):
+                output.publish_cell_json(
+                    query_case="q11", arm_id="normal", payload=payload
+                )
+
+            payload["ownership"]["sample_ids"] = [
+                "q11-sample-0000", "q11-sample-0001"
+            ]
+            payload["ownership"]["attempt_id"] = "attempt-9999"
+            with self.assertRaises(RunOutputError):
+                output.publish_cell_json(
+                    query_case="q11", arm_id="normal", payload=payload
+                )
 
     def test_campaign_failure_does_not_rewrite_previous_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,7 +181,11 @@ class RunOutputTests(unittest.TestCase):
                 ],
             )
             output.publish_cell_json(
-                query_case="q11", arm_id="normal", payload={"status": "ok"}
+                query_case="q11", arm_id="normal",
+                payload=self.cell_payload(
+                    "q11", "normal", campaign_id=output.run.campaign_id,
+                    run_id=output.run.run_id, source_id="collector-q11-normal"
+                ),
             )
             output.finish(
                 status="Incomplete",
@@ -114,6 +201,51 @@ class RunOutputTests(unittest.TestCase):
             self.assertEqual(diagnostic_attempt["status"], "Incomplete")
             self.assertTrue(
                 (output.attempts[("q11", "diagnostic")].root / "failure.json").exists()
+            )
+
+    def test_terminal_run_rejects_late_payload_without_reclassifying_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "campaign.json",
+                source_id="collector",
+                cells=[{
+                    "query_case": "q11",
+                    "arm_id": "normal",
+                    "query_cases": 1,
+                    "sample_rows": 1,
+                    "product_receipts": 1,
+                }],
+            )
+            output.finish(
+                status="Incomplete",
+                errors={("q11", "normal"): "cancelled before publication"},
+            )
+            manifest_before = json.loads(
+                (output.run.root / "manifest.json").read_text(encoding="utf-8")
+            )
+            with self.assertRaises(RunOutputError):
+                output.publish_cell_json(
+                    query_case="q11",
+                    arm_id="normal",
+                    payload=self.cell_payload(
+                        "q11",
+                        "normal",
+                        campaign_id=output.run.campaign_id,
+                        run_id=output.run.run_id,
+                        source_id="collector-q11-normal",
+                    ),
+                )
+            manifest_after = json.loads(
+                (output.run.root / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest_after["status"], "Incomplete")
+            self.assertEqual(
+                manifest_after["registration"]["status"],
+                manifest_before["registration"]["status"],
+            )
+            self.assertEqual(
+                manifest_after["registration"]["written_bytes"],
+                manifest_before["registration"]["written_bytes"],
             )
 
     def test_capacity_failure_seals_incomplete_and_preserves_terminal_metadata(self) -> None:
@@ -133,7 +265,14 @@ class RunOutputTests(unittest.TestCase):
                 output.publish_cell_json(
                     query_case="q11",
                     arm_id="normal",
-                    payload={"payload": "x" * 20_000},
+                    payload=self.cell_payload(
+                        "q11",
+                        "normal",
+                        campaign_id=output.run.campaign_id,
+                        run_id=output.run.run_id,
+                        source_id="collector-q11-normal",
+                        payload="x" * 20_000,
+                    ),
                 )
             output.finish(status="Completed")
             attempt = json.loads(
@@ -155,7 +294,16 @@ class RunOutputTests(unittest.TestCase):
                 product_receipts=2,
                 summary_captures=1,
             )
-            output.publish_json({"version": 1, "samples": [{"status": "ok"}]})
+            output.publish_json(
+                self.cell_payload(
+                    "q11",
+                    "diagnostic",
+                    campaign_id=output.run.campaign_id,
+                    run_id=output.run.run_id,
+                    source_id="cold-planning",
+                    sample_count=2,
+                )
+            )
             output.publish_summary("# diagnostic\n")
             output.finish(status="Completed")
             manifest = json.loads((output.run.root / "manifest.json").read_text())
@@ -174,7 +322,12 @@ class RunOutputTests(unittest.TestCase):
                 sample_rows=1,
                 product_receipts=1,
             )
-            output.publish_json({"version": 1, "samples": [{"status": "ok"}]})
+            output.publish_json(
+                self.cell_payload(
+                    "q4", "diagnostic", campaign_id=output.run.campaign_id,
+                    run_id=output.run.run_id, source_id="d6"
+                )
+            )
             output.finish(status="Failed", error="watchdog timeout")
             manifest = json.loads((output.run.root / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "Failed")
@@ -214,7 +367,7 @@ class RunOutputTests(unittest.TestCase):
 
             def _collect_compile_receipt(self, conn, **kwargs):
                 return {
-                    "schema_version": 1,
+                    "schema_version": 3,
                     "status": "Verified",
                     "sample": len(getattr(self, "receipts", [])) + 1,
                 }
@@ -312,16 +465,16 @@ class RunOutputTests(unittest.TestCase):
                     record_type, record_id, json.dumps(payload) if payload is not None else "")
 
         def identity(artifact: tuple[int, int]):
-            return {"schema_version": 1, "artifact": list(artifact),
+            return {"schema_version": 3, "artifact": list(artifact),
                     "structure": [3, 4], "dependencies": [5, 6]}
 
         target_identity = identity((1, 2))
         target_decision = {
-            "schema_version": 1, "decision_id": 6, "query_fingerprint": 123,
+            "schema_version": 3, "decision_id": 6, "query_fingerprint": 123,
             "occurrence": 0, "cache_hit": True,
             "artifact_identity": target_identity, "compile_work": None,
             "compile_receipt": {
-                "schema_version": 1, "artifact_identity": target_identity,
+                "schema_version": 3, "artifact_identity": target_identity,
                 "search_stop": {"Observed": "QualityPolicySatisfied"},
                 "search_complete": {"Observed": False},
                 "quality_policy_satisfied": {"Observed": True},
@@ -337,7 +490,7 @@ class RunOutputTests(unittest.TestCase):
             },
         }
         target_execution = {
-            "schema_version": 1, "execution_id": 7, "statement_decision_id": 6,
+            "schema_version": 3, "execution_id": 7, "statement_decision_id": 6,
             "artifact_identity": target_identity, "expected_class": 2,
             "actual_class": 2, "actual_fingerprint": [7, 8],
             "resources": {
@@ -353,12 +506,12 @@ class RunOutputTests(unittest.TestCase):
         }
         observer_identity = identity((90, 91))
         observer_decision = {
-            "schema_version": 1, "decision_id": 9, "query_fingerprint": 456,
+            "schema_version": 3, "decision_id": 9, "query_fingerprint": 456,
             "occurrence": 0, "cache_hit": False,
             "artifact_identity": observer_identity, "compile_work": None,
         }
         observer_execution = {
-            "schema_version": 1, "execution_id": 8, "statement_decision_id": 9,
+            "schema_version": 3, "execution_id": 8, "statement_decision_id": 9,
             "artifact_identity": observer_identity, "expected_class": 2,
             "actual_class": None, "actual_fingerprint": None, "resources": None,
             "admission": "Failed", "fallback": None, "reservation": "NotRequired",
@@ -383,14 +536,17 @@ class RunOutputTests(unittest.TestCase):
         self.assertEqual(result["execution_id"], 7)
         self.assertEqual(result["compilation"], "CacheHit")
         self.assertEqual(result["compile_state"], "NotExecuted")
-        self.assertEqual(result["artifact_identity"]["schema_version"], 1)
+        self.assertEqual(result["artifact_identity"]["schema_version"], 3)
 
     def test_explicit_run_id_is_exclusive_and_attempts_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report_root = Path(tmp) / "report"
             run = RunOutput.create(report_root, run_id="run-one")
             first = run.begin_attempt("sql-source")
-            first.seal(status="Completed")
+            with self.assertRaises(RunOutputError):
+                first.seal(status="Completed")
+            first.write_failure(status="Incomplete", error="no owned payload")
+            first.seal(status="Incomplete", failure_path=first.failure_path)
             second = run.begin_attempt("sql-source")
             second.write_failure(status="Failed", error="cancelled")
             second.seal(status="Failed", failure_path=second.failure_path)
@@ -405,7 +561,7 @@ class RunOutputTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "Failed")
             self.assertEqual(
                 [attempt["status"] for attempt in manifest["attempts"]],
-                ["Completed", "Failed"],
+                ["Incomplete", "Failed"],
             )
 
     def test_campaign_budget_is_frozen_and_bounded(self) -> None:
@@ -435,6 +591,56 @@ class RunOutputTests(unittest.TestCase):
                     query_case="oversized",
                     arm_id="default",
                 )
+
+    def test_manifest_index_supports_a_ninety_nine_query_campaign(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "tpcds.json",
+                source_id="tpcds",
+                cells=[
+                    {
+                        "query_case": f"q{query_number:02d}",
+                        "arm_id": "normal",
+                        "query_cases": 1,
+                        "sample_rows": 1,
+                        "product_receipts": 1,
+                    }
+                    for query_number in range(1, 100)
+                ],
+            )
+            manifest = json.loads((output.run.root / "manifest.json").read_text())
+            self.assertEqual(len(manifest["registration"]["cells"]), 99)
+            self.assertEqual(len(manifest["attempts"]), 99)
+            self.assertLessEqual(
+                manifest["registration"]["manifest_bytes"],
+                manifest["registration"]["manifest_limit_bytes"],
+            )
+            self.assertTrue(all("started_at" not in attempt for attempt in manifest["attempts"]))
+            self.assertTrue(all(attempt["metadata"].endswith("/attempt.json") for attempt in manifest["attempts"]))
+
+    def test_attempt_lifecycle_timestamps_live_in_authoritative_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="attempt-index")
+            run.register_cell(
+                cell_id="q--normal",
+                query_cases=1,
+                sample_rows=1,
+                product_receipts=1,
+                query_case="q",
+                arm_id="normal",
+            )
+            attempt = run.begin_attempt("source", query_case="q", arm_id="normal")
+            manifest = json.loads((run.root / "manifest.json").read_text())
+            index = manifest["attempts"][0]
+            self.assertNotIn("started_at", index)
+            authoritative = json.loads((run.root / index["metadata"]).read_text())
+            self.assertEqual(authoritative["status"], "Running")
+            self.assertIn("started_at", authoritative)
+            attempt.write_failure(status="Incomplete", error="test")
+            attempt.seal(status="Incomplete", failure_path=attempt.failure_path)
+            authoritative = json.loads((run.root / index["metadata"]).read_text())
+            self.assertIn("sealed_at", authoritative)
+            self.assertEqual(authoritative["status"], "Incomplete")
 
     def test_cells_are_owned_by_query_and_arm_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -527,7 +733,7 @@ class RunOutputTests(unittest.TestCase):
                 raise OSError("manifest filesystem failure")
 
             run._persist_manifest = fail_persist  # type: ignore[method-assign]
-            with self.assertRaises(OSError):
+            with self.assertRaises(RunOutputError):
                 attempt.cell_writer().write_text("payload.txt", "payload")
             marker = json.loads(
                 (run.root / "publication-unknown.json").read_text(encoding="utf-8")
@@ -538,6 +744,26 @@ class RunOutputTests(unittest.TestCase):
                 run._manifest["registration"]["status"], "PublicationUnknown"
             )
             run._persist_manifest = original_persist  # type: ignore[method-assign]
+
+    def test_prepared_write_rejects_external_generation_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="generation")
+            run.register_cell(
+                cell_id="q--control",
+                query_cases=1,
+                sample_rows=1,
+                product_receipts=1,
+                query_case="q",
+                arm_id="control",
+            )
+            attempt = run.begin_attempt("source", query_case="q", arm_id="control")
+            prepared = attempt.cell_writer().prepare_text("payload.txt", "before")
+            prepared.path.parent.mkdir(parents=True, exist_ok=True)
+            prepared.path.write_text("concurrent", encoding="utf-8")
+            with self.assertRaises(RunOutputError):
+                prepared.publish()
+            self.assertEqual(run._manifest["registration"]["status"], "PublicationUnknown")
+            self.assertTrue((run.root / "publication-unknown.json").exists())
 
     def test_concurrent_cell_writers_share_one_capacity_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -611,22 +837,27 @@ class RunOutputTests(unittest.TestCase):
 
     def test_receipt_contract_does_not_turn_uncovered_into_success(self) -> None:
         payload = {
+            "schema_version": 3,
             "version": 3,
             "ownership": {
-                "schema_version": 1,
+                "schema_version": 3,
                 "campaign_id": "campaign",
                 "run_id": "run",
                 "query_case": "q",
                 "arm_id": "normal",
+                "sample_ids": ["q-sample-0000"],
             },
             "workloads": [{
                 "name": "w",
                 "queries": [{
                     "id": "q",
                     "compile_receipt": {
-                        "schema_version": 1,
+                        "schema_version": 3,
                         "status": "Uncovered",
                         "reason": "historical source has no receipt",
+                        "sample_id": "q-sample-0000",
+                        "query_case": "q",
+                        "arm_id": "normal",
                     },
                 }],
             }],
@@ -637,21 +868,26 @@ class RunOutputTests(unittest.TestCase):
 
     def test_verified_receipt_requires_nested_identity(self) -> None:
         payload = {
+            "schema_version": 3,
             "version": 3,
             "ownership": {
-                "schema_version": 1,
+                "schema_version": 3,
                 "campaign_id": "campaign",
                 "run_id": "run",
                 "query_case": "q",
                 "arm_id": "normal",
+                "sample_ids": ["q-sample-0000"],
             },
             "workloads": [{
                 "name": "w",
                 "queries": [{
                     "id": "q",
                     "compile_receipt": {
-                        "schema_version": 1,
+                        "schema_version": 3,
                         "status": "Verified",
+                        "sample_id": "q-sample-0000",
+                        "query_case": "q",
+                        "arm_id": "normal",
                         "association_basis": "statement_decision_id",
                         "statement_decision_id": 4,
                         "query_fingerprint": "000000000000abcd",
@@ -660,20 +896,20 @@ class RunOutputTests(unittest.TestCase):
                         "compile_state": "Executed",
                         "execution_id": 1,
                         "artifact_identity": {
-                            "schema_version": 1,
+                            "schema_version": 3,
                             "artifact": [1, 2],
                             "structure": [3, 4],
                             "dependencies": [5, 6],
                         },
                         "compile": {"artifact_identity": {
-                            "schema_version": 1,
+                            "schema_version": 3,
                             "artifact": [1, 2],
                             "structure": [3, 4],
                             "dependencies": [5, 6],
                         }, "decision_id": 4, "cache_hit": False, "receipt": {
-                            "schema_version": 1,
+                            "schema_version": 3,
                             "artifact_identity": {
-                                "schema_version": 1,
+                                "schema_version": 3,
                                 "artifact": [1, 2],
                                 "structure": [3, 4],
                                 "dependencies": [5, 6],
@@ -692,16 +928,16 @@ class RunOutputTests(unittest.TestCase):
                             "compile_work": None,
                         }},
                         "execution": {"execution_id": 1, "artifact_identity": {
-                            "schema_version": 1,
+                            "schema_version": 3,
                             "artifact": [1, 2],
                             "structure": [3, 4],
                             "dependencies": [5, 6],
                         }, "raw": {
-                            "schema_version": 1,
+                            "schema_version": 3,
                             "execution_id": 1,
                             "statement_decision_id": 4,
                             "artifact_identity": {
-                                "schema_version": 1,
+                                "schema_version": 3,
                                 "artifact": [1, 2],
                                 "structure": [3, 4],
                                 "dependencies": [5, 6],

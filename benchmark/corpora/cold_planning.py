@@ -36,26 +36,36 @@ try:
         isolated_paro_server,
         build_benchmark_server,
         content_digest,
-        fetch_compile_document,
+        CompileEvidenceCollector,
+        plan_structure_id,
         repository_identity,
         statement_fingerprint,
         tree_digest,
     )
     from benchmark.harness.run_output import CampaignOutput
-    from benchmark.harness.receipt_contract import build_benchmark_cell_payload
+    from benchmark.harness.receipt_contract import (
+        EVIDENCE_SCHEMA_VERSION,
+        build_benchmark_cell_payload,
+        uncovered_receipt,
+    )
 except ModuleNotFoundError:  # pragma: no cover - script-only import path
     from benchmark_evidence import (
         ImmutableDataSeed,
         isolated_paro_server,
         build_benchmark_server,
         content_digest,
-        fetch_compile_document,
+        CompileEvidenceCollector,
+        plan_structure_id,
         repository_identity,
         statement_fingerprint,
         tree_digest,
     )
     from harness.run_output import CampaignOutput
-    from harness.receipt_contract import build_benchmark_cell_payload
+    from harness.receipt_contract import (
+        EVIDENCE_SCHEMA_VERSION,
+        build_benchmark_cell_payload,
+        uncovered_receipt,
+    )
 
 COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physical_search",
               "memo_exploration", "physical_extraction", "winner_verification"}
@@ -134,14 +144,14 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
                     # Do not run a second structural EXPLAIN: that would
                     # compile the target twice and would break the receipt
                     # association used by the collector.
-                    raw_document, compile_document = fetch_compile_document(
-                        connection, query, detail=True
-                    )
+                    raw_document, compile_document = CompileEvidenceCollector(
+                        connection
+                    ).capture(query, detail=True)
                     result["explain_wall_ms"] = (time.perf_counter_ns() - started) / 1_000_000
                     result["compile_document"] = compile_document
                     result["compile_document_raw"] = raw_document
                     result["plan_format"] = "compile-json"
-                    result["plan_sha256"] = hashlib.sha256(raw_document.encode()).hexdigest()
+                    result["plan_structure_id"] = plan_structure_id(compile_document)
                     cursor = connection.execute("SELECT * FROM paro_optimizers()")
                     columns = [column.name for column in cursor.description or ()]
                     diagnostics = diagnostic_rows(columns, cursor.fetchall())
@@ -223,6 +233,7 @@ def main() -> int:
                      root / "benchmark/harness/cold_planning_gate.py")
     report: dict[str, Any] = {
         "schema_version": 5,
+        "compile_evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "configuration": {key: getattr(args, key) for key in ("process_blocks", "threads", "memory_limit",
                              "watchdog_seconds", "rss_limit_mb", "alloc_metrics")},
         "evidence": {"build": build, "dataset_sha256": seed.sha256,
@@ -318,23 +329,24 @@ def main() -> int:
                         "evidence": report["evidence"],
                         "query": observation,
                     },
-                    compile_receipts=[{
-                        "schema_version": 1,
-                        "status": "Uncovered",
-                        "reason": "diagnostic Compile Evidence is not an execution receipt",
-                    }],
+                    compile_receipts=[
+                        uncovered_receipt(
+                            "diagnostic Compile Evidence is not an execution receipt"
+                        )
+                        for _ in observation["samples"]
+                    ],
                     source_id=owned.attempts[(path.stem, "diagnostic")].source_id,
                     attempt_id=owned.attempts[(path.stem, "diagnostic")].attempt_id,
                 ),
             )
-            owned.publish_campaign_json(report)
+            owned.publish_campaign_summary()
         if any(sample_item.get("status") != "ok" for sample_item in observation["samples"]):
             failures[(path.stem, "diagnostic")] = "one or more cold-planning samples failed"
     if (repository_identity(root) != build["source"] or content_digest(binary) != build["binary_sha256"]
             or tree_digest(args.server_data_dir) != report["evidence"]["dataset_sha256"]
             or any(content_digest(path) != query["sql_sha256"] for path, query in zip(args.query, report["queries"], strict=True))):
         report["invalidated"] = "source, SQL, dataset or binary changed during measurements"
-        owned.publish_campaign_json(report)
+        owned.publish_campaign_summary()
         failures.update(
             {
                 (path.stem, "diagnostic"): report["invalidated"]

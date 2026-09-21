@@ -14,6 +14,7 @@ from harness.cold_planning_gate import COUNTERS, evaluate
 def report():
     return {
         "schema_version": 6,
+        "compile_evidence_schema_version": 3,
         "configuration": {
             "process_blocks": 3,
             "runtime_environment": {"RUST_LOG": None, "PARO_STATEMENT_TRACE": "0"},
@@ -29,17 +30,18 @@ def report():
                 "pid": 100 + block, "sha256": "binary", "data_dir": f"/snapshot/{block}",
                 "input_snapshot": {"policy": "private_copy_per_process", "seed_path": "/seed",
                                    "seed_sha256": "data", "initial_sha256": "data"}},
-             "explain_wall_ms": 20, "optimizer_ms": 15, "peak_rss_bytes": 1000, "plan_sha256": "plan",
+             "explain_wall_ms": 20, "optimizer_ms": 15, "peak_rss_bytes": 1000, "plan_structure_id": "00112233445566778899aabbccddeeff",
              "counters": {counter: 0 if counter in ("search_rule_failure_count", "search_deadline_reached") else 1
                           for counter in COUNTERS},
              "compile_query_fingerprint": 123,
              "compile_document": {
-                 "schema_version": 2,
+                 "schema_version": 3,
                  "outcome": "Success",
                  "artifact": "CompiledArtifactReady",
                  "cache": "ForcedCompile",
                  "admission": "NotExecuted",
                  "execution": "NotExecuted",
+                 "artifact_identity": {"Observed": {"schema_version": 3, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
              }}
             for block in range(3)]}],
     }

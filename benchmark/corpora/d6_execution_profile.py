@@ -34,13 +34,17 @@ from benchmark.corpora.benchmark_evidence import (
     ImmutableDataSeed,
     build_benchmark_server,
     content_digest,
-    fetch_compile_document,
+    CompileEvidenceCollector,
     isolated_paro_server,
     repository_identity,
     statement_fingerprint,
 )
 from benchmark.corpora.cold_planning import ProcessWatchdog
-from benchmark.harness.receipt_contract import build_benchmark_cell_payload
+from benchmark.harness.receipt_contract import (
+    EVIDENCE_SCHEMA_VERSION,
+    build_benchmark_cell_payload,
+    uncovered_receipt,
+)
 from benchmark.harness.run_output import CorpusOutput
 
 
@@ -168,9 +172,9 @@ def _sample(
                             sql.Literal(args.watchdog_seconds * 1000)
                         )
                     )
-                    raw, compile_document = fetch_compile_document(
-                        connection, query, detail=True, analyze=True
-                    )
+                    raw, compile_document = CompileEvidenceCollector(
+                        connection
+                    ).capture(query, detail=True, analyze=True)
                 result.update(
                     {
                         "status": "ok",
@@ -244,7 +248,7 @@ def main() -> int:
     binary, build = build_benchmark_server(root, args.build_jobs)
     seed = ImmutableDataSeed.capture(args.server_data_dir)
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
         "mode": "d6_execution_profile",
         "query_path": str(query_path),
         "query_sha256": content_digest(query_path),
@@ -309,15 +313,14 @@ def main() -> int:
                     arm_id="diagnostic",
                     workload_name="d6_execution_profile",
                     query_payload=report,
-                    compile_receipts=[{
-                        "schema_version": 1,
-                        "status": "Uncovered",
-                        "reason": "diagnostic Compile Evidence is not an execution receipt",
-                    } for _ in report["samples"]] or [{
-                        "schema_version": 1,
-                        "status": "Uncovered",
-                        "reason": "diagnostic Compile Evidence is not an execution receipt",
-                    }],
+                    compile_receipts=[
+                        uncovered_receipt(
+                            "diagnostic Compile Evidence is not an execution receipt"
+                        )
+                        for _ in report["samples"]
+                    ] or [uncovered_receipt(
+                        "diagnostic Compile Evidence is not an execution receipt"
+                    )],
                     source_id=owned.attempt.source_id,
                     attempt_id=owned.attempt.attempt_id,
                 )

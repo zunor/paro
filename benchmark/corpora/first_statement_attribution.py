@@ -20,11 +20,13 @@ from pathlib import Path
 from typing import Any
 
 from benchmark.harness.receipt_contract import (
+    EVIDENCE_SCHEMA_VERSION,
     ReceiptContractError,
     build_benchmark_cell_payload,
     validate_compile_document,
 )
 from benchmark.harness.run_output import CorpusOutput
+from benchmark.corpora.benchmark_evidence import plan_structure_id
 
 
 RULE_METRIC_UNITS = {
@@ -414,7 +416,15 @@ def _attribute_sample(
     return {
         "block": sample.get("block"),
         "status": sample.get("status"),
-        "plan_sha256": sample.get("plan_sha256"),
+        # A rendered EXPLAIN/JSON digest is not a physical identity.  Use the
+        # typed producer identity when the compile document actually carries
+        # one; failed or unavailable samples remain explicitly uncovered.
+        "plan_structure_id": (
+            plan_structure_id(compile_document)
+            if compile_status == "Summary"
+            and compile_document.get("outcome") == "Success"
+            else None
+        ),
         "optimizer_ms": sample.get("optimizer_ms"),
         "explain_wall_ms": sample.get("explain_wall_ms"),
         "components_ms": _component_times(diagnostics),
@@ -548,6 +558,7 @@ def build_attribution(
         )
     return {
         "schema_version": 1,
+        "compile_evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "kind": "first_statement_attribution",
         "source_report": str(source_path.resolve()),
         "source_report_sha256": _content_digest(source_path),
@@ -609,11 +620,14 @@ def main() -> int:
             arm_id="diagnostic",
             workload_name="first_statement_attribution",
             query_payload=attribution,
-            compile_receipts=[{
-                "schema_version": 1,
-                "status": "Uncovered",
-                "reason": "attribution is derived diagnostic evidence, not an execution receipt",
-            }],
+            compile_receipts=[
+                {
+                    "schema_version": 3,
+                    "status": "Uncovered",
+                    "reason": "attribution is derived diagnostic evidence, not an execution receipt",
+                }
+                for _ in attribution["samples"]
+            ],
             source_id=owned.attempt.source_id,
             attempt_id=owned.attempt.attempt_id,
         )

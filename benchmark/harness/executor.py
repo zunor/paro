@@ -15,7 +15,7 @@ import time as time_module
 from typing import Any, Mapping
 
 from .loader import QueryDef, WorkloadDef
-from .receipt_contract import associate_typed_receipts
+from .receipt_contract import associate_typed_receipts, uncovered_receipt
 from .result_protocol import normalize_row_v1
 from .validator import BenchmarkValidator
 
@@ -321,14 +321,10 @@ class BenchmarkExecutor:
                     )
                 if execution_error is not None:
                     if self._collect_compile_receipts:
-                        sample_receipts.append({
-                            "schema_version": 1,
-                            "status": "Uncovered",
-                            "reason": (
-                                "timed execution failed before receipt: "
-                                f"{_format_error(execution_error)}"
-                            ),
-                        })
+                        sample_receipts.append(uncovered_receipt(
+                            "timed execution failed before receipt: "
+                            f"{_format_error(execution_error)}"
+                        ))
                         query_result.receipt_associations = list(sample_receipts)
                         query_result.receipt_association = sample_receipts[0]
                     raise execution_error
@@ -410,20 +406,16 @@ class BenchmarkExecutor:
         try:
             columns, rows = self._read_compile_channel(conn)
         except Exception as exc:
-            return {
-                "schema_version": 1,
-                "status": "Uncovered",
-                "reason": f"receipt channel unavailable: {_format_error(exc)}",
-            }
+            return uncovered_receipt(
+                f"receipt channel unavailable: {_format_error(exc)}"
+            )
 
         indexes = {name.rsplit(".", 1)[-1]: index for index, name in enumerate(columns)}
         required = {"record_type", "record_id", "payload_json"}
         if not required.issubset(indexes):
-            return {
-                "schema_version": 1,
-                "status": "Uncovered",
-                "reason": "typed receipt channel schema is missing required columns",
-            }
+            return uncovered_receipt(
+                "typed receipt channel schema is missing required columns"
+            )
 
         cache_decisions: dict[int, dict[str, Any]] = {}
         execution_records: dict[int, dict[str, Any]] = {}
