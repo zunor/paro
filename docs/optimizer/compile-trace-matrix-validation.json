@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "source_commit": "4f6786a65abcd9c4da8fd5de71aa57abb13d6d68",
+  "scope": "T2 plus bounded T3 Detail and Summary-level T4-a/b/c/d",
+  "environment": {
+    "duckdb_version": "1.5.5",
+    "optimizer_policy_changes": false,
+    "search_budget_changes": false,
+    "f2_admission": "not_certified",
+    "trace_matrix_ready": false
+  },
+  "gates": {
+    "cargo_check_workspace_locked": "pass",
+    "cargo_test_workspace_locked": "pass",
+    "strict_clippy_all_targets_all_features": "pass",
+    "benchmark_unittest": {
+      "status": "pass",
+      "passed": 174
+    },
+    "sql_regress": {
+      "status": "known_differences",
+      "passed": 177,
+      "failed": 8,
+      "result_mismatches": 0,
+      "expected_files_updated": false,
+      "known_explain_only_failures": [
+        "cases/query/aggregate/agg_join_subsumption.sql",
+        "cases/query/aggregate/agg_singleton_groups.sql",
+        "cases/query/explain/explain_analyze.sql",
+        "cases/query/explain/explain_basic.sql",
+        "cases/query/join/join_explain_advanced.sql",
+        "cases/query/select/rowset_scan_pushdown.sql",
+        "cases/system/statistics_query.sql",
+        "cases/vector/pgvector_topn_filter_flow.sql"
+      ]
+    }
+  },
+  "not_certified": [
+    "full Trace Matrix coverage",
+    "C2 correctness closure",
+    "F2 admission",
+    "Q11 or other performance target",
+    "SQL expected-file parity"
+  ]
+}

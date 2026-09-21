@@ -166,8 +166,10 @@ actual execution of that sealed artifact.
 The optimizer is one producer in a compiler-wide record, not the owner of
 session or execution instrumentation.
 
-Summary is the default; Detail remains a separate T3 deliverable. Without
-ANALYZE, the target is not executed: runtime/admission measurements are
+Summary is the default; bounded Detail is an opt-in T3 surface for supported
+COMPILE targets. It retains fixed opaque references from the real Memo and
+TaskRegistry lifecycle and reports overflow explicitly; it is not the complete
+Trace Matrix. Without ANALYZE, the target is not executed: runtime/admission measurements are
 NotExecuted, not zero. COMPILE invokes the real target compiler exactly once,
 without an Explain wrapper in its Memo and without consuming or populating its
 statement-plan cache. Record ForcedCompile rather than claiming a normal

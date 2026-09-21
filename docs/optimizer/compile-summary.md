@@ -2,8 +2,8 @@
 
 This is the bounded compile/execution contract, not C2/F2 admission or a
 latency claim. Existing search, grant, verification and behavior-experiment
-defaults are unchanged. Detail remains T3 and the full Trace Matrix is not
-claimed.
+defaults are unchanged. Bounded Detail is delivered for the supported SQL
+COMPILE shapes; full Trace Matrix coverage is not claimed.
 The authoritative wire document is `context::compile_diagnostics::CompileDocument`;
 the renderer and validator share its Summary/Unavailable variants and schema
 version 2. Version 1 artifacts remain historical evidence, not current input.
@@ -28,7 +28,7 @@ and rejects incomplete parameter environments rather than inventing values.
 | simple query/CTE Summary, TEXT/JSON | implemented |
 | binding/compilation error | original SQLSTATE and primary error preserved |
 | cancellation | compiler and backpressured Summary delivery observe statement cancellation |
-| DETAIL | explicitly Unsupported (T3) |
+| DETAIL | bounded real Memo/TaskRegistry lifecycle Detail for supported SELECT/CTE COMPILE shapes; omitted records are explicit |
 | ANALYZE | one actual admission and one execution of the sealed artifact |
 | extended/prepared COMPILE | known-typed Parse/Bind/Describe/Execute supported; Describe does not execute |
 | DML/DDL/utility/nested EXPLAIN | explicitly Unsupported |
@@ -127,11 +127,13 @@ lowering succeeds, then closes as Completed, Failed, Cancelled or Dropped.
 Non-ANALYZE COMPILE cannot manufacture an admission receipt.
 
 Normal benchmark execution reads the bounded `paro_optimizers()` channel after
-the timed statement. It associates the newest execution receipt with the
-matching immutable artifact and original compile receipt; cache hits point to
-the original compile receipt while the current compilation is NotExecuted.
-Association failure is an explicit `Uncovered` reason and does not remove a
-timing or slow sample. The run-owned output contract is documented in
+each timed statement. It snapshots execution identities at the statement
+boundary and associates exactly one newly completed execution receipt with
+the matching immutable artifact and original compile receipt; it never chooses
+the latest receipt or a maximum occurrence. Cache hits point to the original
+compile receipt while the current compilation is NotExecuted. Association
+failure is an explicit `Uncovered` reason and does not remove a timing or slow
+sample. The run-owned output contract is documented in
 [`compile-artifact-execution-receipts.md`](compile-artifact-execution-receipts.md).
 
 ## Historical T1 validation status (before independent review)
@@ -149,10 +151,10 @@ artifact neutrality and bounded encoding. Raw logs are retained under the T0
 private recovery/evidence root recorded in `compile-observation-baseline.md`.
 
 T0 is integrated into re-op with the user's mixed delta retained; see
-`compile-integration-review.json`. T1's non-executing Summary implementation is
-delivered, and T2 plus Summary-level T4 are now layered on top. This is not
-TraceMatrixReady: full Detail, broader source coverage and remaining matrix
-cells are separate work.
+`compile-integration-review.json`. The following paragraphs record the
+historical T1/T2 checkpoint and are not the current support boundary. The
+current bounded Detail and Summary-level T4 status is maintained in
+[`compile-trace-matrix-status.md`](compile-trace-matrix-status.md).
 
 Final clean source `d996be77` and its dev server binary are recorded in
 [`compile-summary-validation.json`](compile-summary-validation.json):
@@ -179,17 +181,19 @@ server-readiness failures are also retained, not counted as passing attempts.
 No performance/observer-overhead campaign was run. Functional artifact
 neutrality is not timing neutrality near a deadline. No latency, parity, C2/F2
 admission or complete Matrix claim is made. The full 99-query corpus was not
-rerun for that request-observation change. T3 Detail and unaccepted legacy
-DiagnosticOutput/BehaviorExperiment retirement remain separate; no behavior
-experiment was removed.
+rerun for that request-observation change. The historical checkpoint did not
+include T3 Detail; the current bounded Detail delivery and unaccepted legacy
+DiagnosticOutput/BehaviorExperiment retirement are tracked separately, and no
+behavior experiment was removed.
 
 ## Current T2/Summary-T4 validation boundary
 
 The current delivery is validated from a clean release build after the T2
-artifact/receipt and Summary-level benchmark changes. Workspace tests and
-strict all-target Clippy pass. Benchmark unit tests pass, including exclusive
-RunId/attempt ownership, retry retention, receipt identity matching, cache-hit
-NotExecuted state, and the no-overwrite gate path.
+artifact/receipt, bounded Detail, and Summary-level benchmark changes.
+Workspace check and strict all-target Clippy pass; the benchmark suite passes
+in the pinned DuckDB 1.5.5 environment, including exclusive RunId/attempt
+ownership, retry retention, receipt identity matching, cache-hit NotExecuted
+state, and the bounded manifest/writer path.
 
 The fresh-directory SQL regression run reports 177 passed and eight existing
 EXPLAIN-only differences. The eight are retained as failures and classified as
@@ -202,6 +206,6 @@ blessed. A reused regression directory also produced a duplicate-fixture
 part of the fresh-directory result.
 
 This validation covers real PgWire TEXT/JSON COMPILE, known-typed extended
-parameters, one-shot ANALYZE execution, receipt publication, and cancellation
-/transport ownership tests. It does not certify T3 Detail, full TraceMatrix,
-C2, F2, latency, or a 99-query performance campaign.
+parameters, one-shot ANALYZE execution, bounded Detail, receipt publication,
+and cancellation/transport ownership tests. It does not certify full Trace
+Matrix coverage, C2, F2, latency, or a 99-query performance campaign.

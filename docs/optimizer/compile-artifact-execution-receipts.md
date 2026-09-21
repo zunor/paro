@@ -1,8 +1,9 @@
 # Compile artifact, admission and benchmark receipts
 
-Status: T2 plus the Summary portion of T4-a/b/c/d. This document is a
-support matrix and ownership contract, not a performance certification. Full
-Detail remains T3; C2, F2 and TraceMatrixReady are not claimed.
+Status: T2, bounded T3 Detail, and the supported Summary portion of
+T4-a/b/c/d. This document is a support matrix and ownership contract, not a
+performance certification. Full Trace Matrix coverage, C2, F2 and
+TraceMatrixReady are not claimed.
 
 ## Lifecycle
 
@@ -33,7 +34,7 @@ grant ordinals are not cross-run identities.
 | extended Parse/Bind/Describe/Execute | known parameter types only; Describe never executes; incomplete Bind rejects |
 | cache hit | current compilation is `NotExecuted`; receipt points to original artifact receipt |
 | forced diagnostic compile | `ForcedCompile`; does not read or populate target plan cache |
-| Detail | T3, not part of this delivery |
+| `DETAIL` | bounded real Memo/TaskRegistry Detail in TEXT/JSON; 8,192 retained events plus `omitted_detail`; unsupported shapes remain explicit |
 | DML/DDL/utility and unsupported parameter/protocol shapes | explicit unsupported/error result |
 
 ## Benchmark ownership
@@ -64,6 +65,12 @@ ambiguous data is `Uncovered`; timing and slow samples remain. Rust micro and
 mixed-concurrency aggregate scenarios explicitly carry `Uncovered` when no
 single SQL execution identity exists.
 
+The run manifest is also published through the bounded writer. Its encoded
+UTF-8 size is checked on creation and every state transition; payload bytes,
+terminal-control bytes, and the campaign total are separate limits. A failed
+capacity transition preserves already-published samples and writes an
+explicit terminal state when the bounded manifest can still be published.
+
 ## Retention and deletion
 
 Only files fully replaced by this run/source/attempt and accepted by their
@@ -79,20 +86,16 @@ schema, two-u64 identities, actual selection/resource fields and Summary size.
 It can be run in strict receipt mode by a certified campaign, but normal
 execution never converts an uncovered association into a failed timing sample.
 Protocol and Rust tests separately cover cache hit/miss, ForcedCompile,
-fallback/infeasible admission, image readiness, cancellation/drop, and sealed
-receipt terminal transitions. Existing SQL regress differences remain
+fallback/infeasible admission, image readiness, cancellation/drop, bounded
+Detail, and sealed receipt terminal transitions. Existing SQL regress differences remain
 classified rather than blessed by this delivery.
 
 The current clean release validation also exercised the real PgWire path for
 TEXT, JSON, CTE, known-typed extended parameters, and `COMPILE, ANALYZE`; the
 last case produced one completed execution receipt while non-ANALYZE cases
-reported `NotExecuted`. The fresh SQL regression run was 177 passed with eight
-retained EXPLAIN-only failures: `agg_join_subsumption`,
-`agg_singleton_groups`, `explain_analyze`, `explain_basic`,
-`join_explain_advanced`, `rowset_scan_pushdown`, `statistics_query`, and
-`pgvector_topn_filter_flow`. No result mismatch or expected-file update was
-accepted. The benchmark 99-query performance campaign, T3 Detail, C2 and F2
-remain outside this delivery.
+reported `NotExecuted`. The benchmark 99-query performance campaign, C2 and
+F2 remain outside this delivery; bounded Detail is included, but full Trace
+Matrix coverage is not claimed.
 
 The machine-readable gate record is
 [`compile-artifact-execution-receipts-validation.json`](compile-artifact-execution-receipts-validation.json).
