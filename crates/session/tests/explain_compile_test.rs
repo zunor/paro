@@ -153,8 +153,7 @@ fn compile_query_cte_and_reject_unimplemented_options() {
             let detail_events = detail_record["detail"].as_array().unwrap();
             assert!(!detail_events.is_empty());
             assert!(detail_events.iter().any(|event| {
-                event["kind"]
-                    == paro_context::compile_diagnostics::detail_kind::PROPOSAL
+                event["type"] == "Proposal"
             }));
             assert!(receipt_payloads.iter().any(|payload| payload.contains("schema_version")));
             for sql in ["EXPLAIN (COMPILE) CREATE TABLE forbidden (x INT)", "EXPLAIN (COMPILE) SELECT 1 FORMAT JSON", "EXPLAIN (COMPILE) EXPLAIN SELECT 1"] {

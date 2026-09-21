@@ -37,6 +37,10 @@ pub use attached_databases::{
     AttachedDatabaseTransactionMetricsSnapshot, AttachedDatabaseWalMetricsSnapshot,
     DatabaseSnapshotIdentity,
 };
+pub use compile_diagnostics::{
+    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt,
+    ExecutionTerminal, MemoryCompletionReceipt, ResourceReceipt, RECEIPT_SCHEMA_VERSION,
+};
 pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
 pub use diagnostic_environment::{
     initialize_diagnostic_environment, snapshot as diagnostic_environment,
@@ -58,15 +62,10 @@ pub use query_resources::{
     QueryResourceGovernance, QueryResources,
 };
 pub use runtime_limits::RuntimeLimits;
-pub use compile_diagnostics::{
-    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt, ExecutionTerminal,
-    MemoryCompletionReceipt, ResourceReceipt, RECEIPT_SCHEMA_VERSION,
-};
 pub use session_diagnostics::{
-    compile_work_evidence_enabled, CompileReceiptSummary, CompileWork,
-    COMPILE_RECEIPT_SCHEMA_VERSION, OptimizerDiagnostic,
-    OptimizerMetricUnit, ExecutionReceiptHandle, ExecutionReceiptStart, SessionDiagnostics,
-    StatementCacheDecision,
+    compile_work_evidence_enabled, CompileReceiptSummary, CompileWork, ExecutionReceiptHandle,
+    ExecutionReceiptStart, OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics,
+    StatementCacheDecision, COMPILE_RECEIPT_SCHEMA_VERSION,
 };
 pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,

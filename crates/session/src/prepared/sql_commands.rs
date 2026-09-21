@@ -149,6 +149,7 @@ async fn execute_prepare<S: ProtocolResultSink>(
         result_schema,
         generic_plan,
         generic_plan_uses: 0,
+        compile_decision_id: None,
         source: PreparedStatementSource::Sql,
         statement_trace: None,
     };
@@ -248,20 +249,24 @@ async fn execute_deallocate<S: ProtocolResultSink>(
 ) -> Result<()> {
     let completion = match stmt.name {
         Some(name) => {
-            if session
-                .state
-                .remove_prepared_statement(name.name.as_str())
-                .is_none()
-            {
+            let removed = session.state.remove_prepared_statement(name.name.as_str());
+            if removed.is_none() {
                 return Err(paro_error::catalog(format!(
                     "prepared statement \"{}\" does not exist",
                     name.name
                 )));
             }
+            if let Some(decision_id) = removed.and_then(|entry| entry.compile_decision_id) {
+                session.finish_statement_cache_decision(decision_id);
+            }
             StatementCompletion::Deallocate { all: false }
         }
         None => {
-            session.state.clear_prepared_statements();
+            for entry in session.state.clear_prepared_statements() {
+                if let Some(decision_id) = entry.compile_decision_id {
+                    session.finish_statement_cache_decision(decision_id);
+                }
+            }
             StatementCompletion::Deallocate { all: true }
         }
     };

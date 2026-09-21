@@ -84,47 +84,56 @@ impl Executor {
         if let Some(trace) = &statement_trace {
             trace.record_event("admission", "admission_entry");
         }
+        // Own the execution identity before admission starts.  A later
+        // reservation or lowering failure must update this same receipt; it
+        // must not create a second failure-only record after admission.
+        let receipt = self
+            .session
+            .diagnostics
+            .begin_execution_receipt(ExecutionReceiptStart {
+                statement_decision_id,
+                artifact_identity: compiled.artifact_identity(),
+                expected_class: compiled.expected_grant_class(),
+                actual_class: None,
+                actual_fingerprint: None,
+                resources: None,
+                admission: AdmissionResult::Failed,
+                fallback: None,
+            });
         let admission_started = Instant::now();
-        let admitted = self.admit_program(&compiled, &query_memory_pool, external_worker_slots);
+        let admitted = self.admit_program(
+            &compiled,
+            &query_memory_pool,
+            external_worker_slots,
+            &receipt,
+        );
         if let Some(trace) = &statement_trace {
             trace.record_span("admission", "lower_and_admit", admission_started);
         }
         let (selected, execution_lease, selection, fallback) = match admitted {
             Ok(admitted) => admitted,
             Err(error) => {
-                let admission = if error.sqlstate().is_resource_error() {
-                    AdmissionResult::Infeasible
+                // Close the one receipt created before admission.  For an
+                // unselected failure this preserves NotExecuted; when a
+                // selected reservation/lowering path reported the error, the
+                // same handle retains that selection and archives Failed.
+                if error.sqlstate().is_resource_error() {
+                    receipt.infeasible(error.to_string());
                 } else {
-                    AdmissionResult::Failed
-                };
-                let receipt = self.session.diagnostics.begin_execution_receipt(ExecutionReceiptStart {
-                    statement_decision_id,
-                    artifact_identity: compiled.artifact_identity(),
-                    expected_class: compiled.expected_grant_class(),
-                    actual_class: None,
-                    actual_fingerprint: None,
-                    resources: None,
-                    admission,
-                    fallback: None,
-                });
-                receipt.record_error(error.to_string());
-                drop(receipt);
+                    receipt.fail(error.to_string());
+                }
                 if let Some(trace) = &statement_trace {
                     trace.record_event("admission", "admission_error");
                 }
                 return Err(error);
             }
         };
-        let receipt = self.session.diagnostics.begin_execution_receipt(ExecutionReceiptStart {
-            statement_decision_id,
-            artifact_identity: compiled.artifact_identity(),
-            expected_class: compiled.expected_grant_class(),
-            actual_class: selection.map(|selection| selection.resources.class.0),
-            actual_fingerprint: selection.map(|selection| fingerprint_words(selection.physical_fingerprint)),
-            resources: selection.map(|selection| resource_receipt(selection.resources)),
-            admission: AdmissionResult::Selected,
+        receipt.selected(
+            selection.map(|selection| selection.resources.class.0),
+            selection.map(|selection| fingerprint_words(selection.physical_fingerprint)),
+            selection.map(|selection| resource_receipt(selection.resources)),
             fallback,
-        });
+        );
         if let Some(lease) = execution_lease {
             if let Err(error) = query_memory_pool.install_execution_lease(lease) {
                 receipt.reservation_failed(error.to_string());
@@ -189,6 +198,7 @@ impl Executor {
         compiled: &CompiledStatement,
         query_memory_pool: &Arc<QueryMemoryPool>,
         available_external_worker_slots: u16,
+        receipt: &ExecutionReceiptHandle,
     ) -> Result<(
         SelectedStatementProgram,
         Option<ExecutionLease>,
@@ -245,10 +255,10 @@ impl Executor {
                     .unwrap_or_else(|| NEXT_STANDALONE_EXECUTION_ID.fetch_add(1, Ordering::AcqRel));
                 match self
                     .session
-                    .try_acquire_python_worker_slots(query_id, resources.external_worker_slots)?
+                    .try_acquire_python_worker_slots(query_id, resources.external_worker_slots)
                 {
-                    Some(lease) => Some(lease),
-                    None => {
+                    Ok(Some(lease)) => Some(lease),
+                    Ok(None) => {
                         if let Some(trace) = self.session.statement_trace() {
                             trace.record_event("admission", "external_capacity_retry");
                         }
@@ -256,17 +266,61 @@ impl Executor {
                         fallback = Some(AdmissionFallback::ExternalCapacity);
                         continue;
                     }
+                    Err(error) => {
+                        receipt.selected(
+                            Some(resources.class.0),
+                            Some(fingerprint_words(
+                                selected
+                                    .selection()
+                                    .expect("selection")
+                                    .physical_fingerprint,
+                            )),
+                            Some(resource_receipt(resources)),
+                            fallback,
+                        );
+                        receipt.reservation_failed(error.to_string());
+                        return Err(error);
+                    }
                 }
             };
             let working_set =
                 usize::try_from(resources.working_set_memory_bytes).unwrap_or(usize::MAX);
-            if query_memory_pool.try_reserve_minimum_capacity(working_set)? {
-                return Ok((
-                    selected,
-                    Some(ExecutionLease::new(resources, external_workers)?),
-                    selection,
-                    fallback,
-                ));
+            match query_memory_pool.try_reserve_minimum_capacity(working_set) {
+                Ok(true) => {
+                    let lease = match ExecutionLease::new(resources, external_workers) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            receipt.selected(
+                                Some(resources.class.0),
+                                selection
+                                    .map(|value| fingerprint_words(value.physical_fingerprint)),
+                                Some(resource_receipt(resources)),
+                                fallback,
+                            );
+                            receipt.reservation_failed(error.to_string());
+                            return Err(error);
+                        }
+                    };
+                    receipt.selected(
+                        Some(resources.class.0),
+                        selection.map(|value| fingerprint_words(value.physical_fingerprint)),
+                        Some(resource_receipt(resources)),
+                        fallback,
+                    );
+                    return Ok((selected, Some(lease), selection, fallback));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let error: paro_common::error::ParoError = error.into();
+                    receipt.selected(
+                        Some(resources.class.0),
+                        selection.map(|value| fingerprint_words(value.physical_fingerprint)),
+                        Some(resource_receipt(resources)),
+                        fallback,
+                    );
+                    receipt.reservation_failed(error.to_string());
+                    return Err(error);
+                }
             }
             drop(external_workers);
             if resources.working_set_memory_bytes == 0 {
@@ -377,12 +431,18 @@ fn resource_receipt(
     resources: paro_optimizer::physical::ExecutionResourceContract,
 ) -> ResourceReceipt {
     let memory_completion = match resources.memory_completion {
-        paro_optimizer::physical::MemoryCompletion::Guaranteed => MemoryCompletionReceipt::Guaranteed,
+        paro_optimizer::physical::MemoryCompletion::Guaranteed => {
+            MemoryCompletionReceipt::Guaranteed
+        }
         completion => match completion.uncapped_memory_demand() {
-            Some(paro_optimizer::physical::UncappedMemoryDemand::KnownBytes(bytes)) =>
-                MemoryCompletionReceipt::RuntimeCappedKnown { uncapped_memory_bytes: bytes },
-            Some(paro_optimizer::physical::UncappedMemoryDemand::Unbounded) | None =>
-                MemoryCompletionReceipt::RuntimeCappedUnbounded,
+            Some(paro_optimizer::physical::UncappedMemoryDemand::KnownBytes(bytes)) => {
+                MemoryCompletionReceipt::RuntimeCappedKnown {
+                    uncapped_memory_bytes: bytes,
+                }
+            }
+            Some(paro_optimizer::physical::UncappedMemoryDemand::Unbounded) | None => {
+                MemoryCompletionReceipt::RuntimeCappedUnbounded
+            }
         },
     };
     ResourceReceipt {

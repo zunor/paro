@@ -47,6 +47,10 @@ pub struct PreparedStatementEntry {
     pub generic_plan: Option<CompiledStatement>,
     /// Successful generic-plan selections by SQL EXECUTE or protocol Bind.
     pub generic_plan_uses: i64,
+    /// Terminal identity of the compilation that produced `generic_plan`.
+    /// The decision is not kept active by the prepared statement; later
+    /// executions reference the immutable historical compile receipt.
+    pub compile_decision_id: Option<u64>,
     pub source: PreparedStatementSource,
     /// Trace started at protocol Parse and carried into the first Bind/portal.
     pub statement_trace: Option<Arc<StatementTrace>>,
@@ -122,9 +126,15 @@ impl PreparedState {
         removed
     }
 
-    pub fn clear_statements(&mut self) {
-        self.named_statements.clear();
-        self.unnamed_statement = None;
+    pub fn clear_statements(&mut self) -> Vec<PreparedStatementEntry> {
+        let mut removed = self
+            .named_statements
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+        if let Some(entry) = self.unnamed_statement.take() {
+            removed.push(entry);
+        }
         self.named_portals
             .retain(|_, portal| matches!(portal.statement_ref, PortalStatementRef::None));
         if self
@@ -134,6 +144,7 @@ impl PreparedState {
         {
             self.unnamed_portal = None;
         }
+        removed
     }
 
     pub fn set_unnamed_statement(
@@ -315,6 +326,7 @@ mod tests {
             result_schema: Vec::new(),
             generic_plan: None,
             generic_plan_uses: 0,
+            compile_decision_id: None,
             source: PreparedStatementSource::Protocol,
             statement_trace: None,
         }

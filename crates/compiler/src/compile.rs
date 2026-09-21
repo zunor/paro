@@ -70,7 +70,11 @@ pub fn compile_statement_with_parameter_types(
     }
     let result_names = planner.names.clone();
     if let Some(capture) = &ctx.options.compile_capture {
-        capture.update(|r| r.bind_ns = paro_context::compile_diagnostics::Observation::Observed(bind_and_plan_started.elapsed().as_nanos() as u64));
+        capture.update(|r| {
+            r.bind_ns = paro_context::compile_diagnostics::Observation::Observed(
+                bind_and_plan_started.elapsed().as_nanos() as u64,
+            )
+        });
     }
     let result_types = planner.types.clone();
 
@@ -111,12 +115,23 @@ pub fn compile_statement_with_parameter_types(
     };
     let optimizer_finished = Instant::now();
     if let Some(capture) = &ctx.options.compile_capture {
-        capture.update(|r| r.optimizer_ns = paro_context::compile_diagnostics::Observation::Observed(optimizer_finished.duration_since(optimizer_started).as_nanos() as u64));
+        capture.update(|r| {
+            r.optimizer_ns = paro_context::compile_diagnostics::Observation::Observed(
+                optimizer_finished
+                    .duration_since(optimizer_started)
+                    .as_nanos() as u64,
+            )
+        });
     }
     let partition_report = partition.finish(optimizer_finished);
-    let compile_work = paro_context::compile_work_evidence_enabled().then(|| {
+    let mut compile_work = paro_context::compile_work_evidence_enabled().then(|| {
         let mut work = optimizer.compile_work();
-        work.optimizer_elapsed_us = u64::try_from(optimizer_finished.duration_since(optimizer_started).as_micros()).unwrap_or(u64::MAX);
+        work.optimizer_elapsed_us = u64::try_from(
+            optimizer_finished
+                .duration_since(optimizer_started)
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
         work
     });
     if let Some(trace) = &statement_trace {
@@ -158,16 +173,30 @@ pub fn compile_statement_with_parameter_types(
     if let Some(capture) = &ctx.options.compile_capture {
         use paro_context::compile_diagnostics::Observation::Observed;
         capture.update(|r| {
-            r.verify_ns = Observed(runtime_image_started.duration_since(verify_started).as_nanos() as u64);
+            r.verify_ns = Observed(
+                runtime_image_started
+                    .duration_since(verify_started)
+                    .as_nanos() as u64,
+            );
             r.safety_verified = Observed(true);
             r.output_columns = Observed(result_names.len());
             if let paro_optimizer::OptimizedStatement::Physical(portfolio) = &optimized {
-                if let Some(class) = portfolio.grant_search.as_ref().and_then(|s| s.expected_class) {
+                if let Some(class) = portfolio
+                    .grant_search
+                    .as_ref()
+                    .and_then(|s| s.expected_class)
+                {
                     r.expected_class = Observed(class.0);
-                    let mut matches = portfolio.variants.iter().filter(|v| v.admissible_classes.contains(&class));
+                    let mut matches = portfolio
+                        .variants
+                        .iter()
+                        .filter(|v| v.admissible_classes.contains(&class));
                     if let Some(variant) = matches.next() {
                         if matches.next().is_none() {
-                            r.selected_fingerprint = Observed([(variant.physical_fingerprint.0 >> 64) as u64, variant.physical_fingerprint.0 as u64]);
+                            r.selected_fingerprint = Observed([
+                                (variant.physical_fingerprint.0 >> 64) as u64,
+                                variant.physical_fingerprint.0 as u64,
+                            ]);
                         }
                     }
                 }
@@ -175,13 +204,30 @@ pub fn compile_statement_with_parameter_types(
         });
         if let paro_optimizer::OptimizedStatement::Physical(portfolio) = &optimized {
             use paro_context::compile_diagnostics::{VariantSummary, MAX_VARIANTS};
-            capture.variants(portfolio.variants.len(), portfolio.variants.iter().take(MAX_VARIANTS).enumerate().filter_map(|(ordinal, variant)| {
-                let admissible_classes = variant.admissible_classes.iter().try_fold(0u64, |mask, class| {
-                    1u64.checked_shl(class.0).map(|bit| mask | bit)
-                })?;
-                Some(VariantSummary { ordinal: ordinal as u16,
-                    physical_fingerprint: [(variant.physical_fingerprint.0 >> 64) as u64, variant.physical_fingerprint.0 as u64], admissible_classes })
-            }));
+            capture.variants(
+                portfolio.variants.len(),
+                portfolio
+                    .variants
+                    .iter()
+                    .take(MAX_VARIANTS)
+                    .enumerate()
+                    .filter_map(|(ordinal, variant)| {
+                        let admissible_classes = variant
+                            .admissible_classes
+                            .iter()
+                            .try_fold(0u64, |mask, class| {
+                                1u64.checked_shl(class.0).map(|bit| mask | bit)
+                            })?;
+                        Some(VariantSummary {
+                            ordinal: ordinal as u16,
+                            physical_fingerprint: [
+                                (variant.physical_fingerprint.0 >> 64) as u64,
+                                variant.physical_fingerprint.0 as u64,
+                            ],
+                            admissible_classes,
+                        })
+                    }),
+            );
         }
     }
     let executable = match optimized {
@@ -224,21 +270,17 @@ pub fn compile_statement_with_parameter_types(
             column.name.hash(&mut identity);
             column.logical_type.hash(&mut identity);
         }
-        capture.update(|r| r.output_identity = paro_context::compile_diagnostics::Observation::Observed(identity.finish()));
+        capture.update(|r| {
+            r.output_identity =
+                paro_context::compile_diagnostics::Observation::Observed(identity.finish())
+        });
     }
 
-    let compile_work = compile_work.map(|mut work| {
-        work.compiler_elapsed_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-        work
-    });
-    if let Some(mut receipt) = optimizer.compile_receipt() {
-        receipt.artifact_identity = Some(compiled.artifact_identity());
-        receipt.compile_work = compile_work;
-        compiled = compiled.with_compile_receipt(receipt);
-    }
-    if let Some(work) = compile_work {
-        compiled = compiled.with_compile_work(work);
-    }
+    // Copy the small immutable summaries before releasing the planner.  The
+    // compiler clock is finalized below, after that release, so the normal
+    // receipt and compile-work channels retain the historical compiler
+    // boundary instead of silently excluding planner-state cleanup.
+    let mut compile_receipt = optimizer.compile_receipt();
 
     // The optimizer and planner state are no longer needed once the deferred
     // executable image has been materialized.  Keep this release boundary in
@@ -247,6 +289,21 @@ pub fn compile_statement_with_parameter_types(
     drop(optimizer);
     if let Some(trace) = &statement_trace {
         trace.record_event("compile", "planning_state_released");
+    }
+
+    let compiler_elapsed_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if let Some(work) = compile_work.as_mut() {
+        work.compiler_elapsed_us = compiler_elapsed_us;
+    }
+    if let Some(receipt) = compile_receipt.as_mut() {
+        receipt.artifact_identity = Some(compiled.artifact_identity());
+        receipt.compile_work = compile_work;
+    }
+    if let Some(receipt) = compile_receipt {
+        compiled = compiled.with_compile_receipt(receipt);
+    }
+    if let Some(work) = compile_work {
+        compiled = compiled.with_compile_work(work);
     }
 
     debug!(
@@ -265,8 +322,21 @@ pub fn compile_statement_with_parameter_types(
         use paro_context::compile_diagnostics::Observation::Observed;
         capture.update(|r| {
             r.finish_ns = Observed(runtime_image_started.elapsed().as_nanos() as u64);
-            r.compiler_ns = Observed(capture_started.unwrap_or(started_at).elapsed().as_nanos() as u64);
-            if let (Observed(total), Observed(bind), Observed(opt), Observed(verify), Observed(finish)) = (r.compiler_ns, r.bind_ns, r.optimizer_ns, r.verify_ns, r.finish_ns) {
+            r.compiler_ns =
+                Observed(capture_started.unwrap_or(started_at).elapsed().as_nanos() as u64);
+            if let (
+                Observed(total),
+                Observed(bind),
+                Observed(opt),
+                Observed(verify),
+                Observed(finish),
+            ) = (
+                r.compiler_ns,
+                r.bind_ns,
+                r.optimizer_ns,
+                r.verify_ns,
+                r.finish_ns,
+            ) {
                 r.compiler_other_ns = Observed(total.saturating_sub(bind + opt + verify + finish));
             }
             r.artifact = paro_context::compile_diagnostics::ArtifactStatus::CompiledArtifactReady;

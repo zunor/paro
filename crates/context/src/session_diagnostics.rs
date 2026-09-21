@@ -6,12 +6,12 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
-use crate::StatementTraceSnapshot;
 use crate::compile_diagnostics::{
     AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt,
     ExecutionTerminal, LoweringStatus, Observation, ResourceReceipt, ResourceReservationStatus,
     SearchStop, RECEIPT_SCHEMA_VERSION,
 };
+use crate::StatementTraceSnapshot;
 
 pub const COMPILE_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const MAX_ACTIVE_EXECUTION_RECEIPTS: usize = 256;
@@ -105,8 +105,8 @@ pub struct CompileReceiptSummary {
 
 pub fn compile_work_evidence_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PARO_COMPILE_WORK_EVIDENCE")
-        .is_ok_and(|value| value == "1"))
+    *ENABLED
+        .get_or_init(|| std::env::var("PARO_COMPILE_WORK_EVIDENCE").is_ok_and(|value| value == "1"))
 }
 
 #[derive(Debug, Default)]
@@ -192,21 +192,29 @@ impl ExecutionReceiptHandle {
     }
 
     pub fn image_ready(&self) {
-        if !self.lease.registered { return; }
+        if !self.lease.registered {
+            return;
+        }
         self.lease
             .diagnostics
             .mark_execution_image_ready(self.lease.execution_id);
     }
 
     pub fn lowering_ready(&self) {
-        if !self.lease.registered { return; }
-        self.lease
-            .diagnostics
-            .mark_execution_lowering(self.lease.execution_id, LoweringStatus::Ready, None);
+        if !self.lease.registered {
+            return;
+        }
+        self.lease.diagnostics.mark_execution_lowering(
+            self.lease.execution_id,
+            LoweringStatus::Ready,
+            None,
+        );
     }
 
     pub fn lowering_failed(&self, error: impl Into<String>) {
-        if !self.lease.registered { return; }
+        if !self.lease.registered {
+            return;
+        }
         let error = error.into();
         self.lease.diagnostics.mark_execution_lowering(
             self.lease.execution_id,
@@ -217,24 +225,65 @@ impl ExecutionReceiptHandle {
     }
 
     pub fn reservation_failed(&self, error: impl Into<String>) {
-        if !self.lease.registered { return; }
+        if !self.lease.registered {
+            return;
+        }
         self.lease
             .diagnostics
             .mark_execution_reservation_failed(self.lease.execution_id, error.into());
+    }
+
+    /// Publish the exact selection only after the execution has crossed the
+    /// admission boundary.  The executor may call this before a fallible
+    /// reservation operation so a reservation error retains the selected
+    /// variant instead of being misreported as a planning failure.
+    pub fn selected(
+        &self,
+        actual_class: Option<u32>,
+        actual_fingerprint: Option<[u64; 2]>,
+        resources: Option<ResourceReceipt>,
+        fallback: Option<AdmissionFallback>,
+    ) {
+        if !self.lease.registered {
+            return;
+        }
+        self.lease.diagnostics.mark_execution_selected(
+            self.lease.execution_id,
+            actual_class,
+            actual_fingerprint,
+            resources,
+            fallback,
+        );
     }
 
     /// Preserve an admission failure without turning it into an execution
     /// terminal.  An infeasible or failed admission is deliberately
     /// `NotExecuted`; the original bounded error still belongs on the receipt.
     pub fn record_error(&self, error: impl Into<String>) {
-        if !self.lease.registered { return; }
+        if !self.lease.registered {
+            return;
+        }
         self.lease
             .diagnostics
             .record_execution_receipt_error(self.lease.execution_id, error.into());
     }
 
+    /// Record a verified resource/dependency infeasibility without claiming
+    /// that the selected image failed.  The execution remains NotExecuted;
+    /// the caller's normal error path retains the original SQL error.
+    pub fn infeasible(&self, error: impl Into<String>) {
+        if !self.lease.registered {
+            return;
+        }
+        self.lease
+            .diagnostics
+            .mark_execution_infeasible(self.lease.execution_id, error.into());
+    }
+
     fn finish(&self, terminal: ExecutionTerminal, error: Option<String>) {
-        if !self.lease.registered { return; }
+        if !self.lease.registered {
+            return;
+        }
         self.lease
             .diagnostics
             .finish_execution_receipt(self.lease.execution_id, terminal, error);
@@ -243,7 +292,9 @@ impl ExecutionReceiptHandle {
 
 impl Drop for ExecutionReceiptLease {
     fn drop(&mut self) {
-        if !self.registered { return; }
+        if !self.registered {
+            return;
+        }
         self.diagnostics.finish_execution_receipt(
             self.execution_id,
             ExecutionTerminal::Dropped,
@@ -253,18 +304,32 @@ impl Drop for ExecutionReceiptLease {
 }
 
 impl SessionDiagnostics {
-    pub fn publish_execution_work(&self, query_fingerprint: u64, image_id: u64, snapshot: paro_common::cold_work::Snapshot) {
-        let execution_id = self.execution_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pub fn publish_execution_work(
+        &self,
+        execution_id: u64,
+        query_fingerprint: u64,
+        image_id: u64,
+        snapshot: paro_common::cold_work::Snapshot,
+    ) {
         let mut records = self.execution_work.write().unwrap();
-        records.push(ExecutionWorkRecord { query_fingerprint, execution_id, image_id, snapshot });
-        if records.len() > 64 { records.remove(0); }
+        records.push(ExecutionWorkRecord {
+            query_fingerprint,
+            execution_id,
+            image_id,
+            snapshot,
+        });
+        if records.len() > 64 {
+            records.remove(0);
+        }
     }
 
     pub fn begin_execution_receipt(
         self: &Arc<Self>,
         start: ExecutionReceiptStart,
     ) -> ExecutionReceiptHandle {
-        let execution_id = self.execution_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let execution_id = self
+            .execution_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let statement_decision_id = start.statement_decision_id;
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
@@ -338,6 +403,35 @@ impl SessionDiagnostics {
         {
             receipt.image = ExecutionImageStatus::Ready;
         }
+    }
+
+    fn mark_execution_selected(
+        &self,
+        execution_id: u64,
+        actual_class: Option<u32>,
+        actual_fingerprint: Option<[u64; 2]>,
+        resources: Option<ResourceReceipt>,
+        fallback: Option<AdmissionFallback>,
+    ) {
+        let mut receipts = self.active_execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.get_mut(&execution_id) else {
+            return;
+        };
+        if receipt.terminal != ExecutionTerminal::NotExecuted {
+            return;
+        }
+        receipt.admission = AdmissionResult::Selected;
+        receipt.actual_class = actual_class;
+        receipt.actual_fingerprint = actual_fingerprint;
+        receipt.resources = resources;
+        receipt.fallback = fallback;
+        receipt.reservation = if receipt.resources.is_some() {
+            ResourceReservationStatus::Committed
+        } else {
+            ResourceReservationStatus::NotRequired
+        };
+        receipt.terminal = ExecutionTerminal::Running;
+        receipt.terminal_error = None;
     }
 
     fn mark_execution_lowering(
@@ -417,9 +511,26 @@ impl SessionDiagnostics {
         }
     }
 
+    fn mark_execution_infeasible(&self, execution_id: u64, error: String) {
+        let mut receipts = self.active_execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.get_mut(&execution_id) else {
+            return;
+        };
+        if receipt.terminal == ExecutionTerminal::NotExecuted {
+            receipt.admission = AdmissionResult::Infeasible;
+            receipt.terminal_error = Some(error.chars().take(256).collect());
+        }
+    }
+
     pub fn execution_receipts_snapshot(&self) -> Vec<ExecutionReceipt> {
         let mut result = self.execution_receipts.read().unwrap().clone();
-        result.extend(self.active_execution_receipts.read().unwrap().values().cloned());
+        result.extend(
+            self.active_execution_receipts
+                .read()
+                .unwrap()
+                .values()
+                .cloned(),
+        );
         result.sort_by_key(|receipt| receipt.execution_id);
         result
     }
@@ -499,15 +610,18 @@ impl SessionDiagnostics {
             .iter()
             .filter(|(_, decision)| decision.query_fingerprint == query_fingerprint)
             .count() as u64;
-        active.insert(decision_id, StatementCacheDecision {
+        active.insert(
             decision_id,
-            query_fingerprint,
-            occurrence,
-            cache_hit,
-            artifact_identity: None,
-            compile_work: None,
-            compile_receipt: None,
-        });
+            StatementCacheDecision {
+                decision_id,
+                query_fingerprint,
+                occurrence,
+                cache_hit,
+                artifact_identity: None,
+                compile_work: None,
+                compile_receipt: None,
+            },
+        );
         Some(decision_id)
     }
 
@@ -516,7 +630,11 @@ impl SessionDiagnostics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn publish_statement_artifact(&self, decision_id: u64, artifact_identity: ArtifactIdentity) {
+    pub fn publish_statement_artifact(
+        &self,
+        decision_id: u64,
+        artifact_identity: ArtifactIdentity,
+    ) {
         let mut active = self.active_statement_cache.write().unwrap();
         if let Some(decision) = active.get_mut(&decision_id) {
             decision.artifact_identity = Some(artifact_identity);
@@ -533,11 +651,7 @@ impl SessionDiagnostics {
         }
     }
 
-    pub fn publish_compile_receipt(
-        &self,
-        decision_id: u64,
-        mut receipt: CompileReceiptSummary,
-    ) {
+    pub fn publish_compile_receipt(&self, decision_id: u64, mut receipt: CompileReceiptSummary) {
         let mut active = self.active_statement_cache.write().unwrap();
         if let Some(decision) = active.get_mut(&decision_id) {
             if receipt.artifact_identity.is_none() {
@@ -552,7 +666,13 @@ impl SessionDiagnostics {
 
     pub fn statement_cache_snapshot(&self) -> Vec<StatementCacheDecision> {
         let mut result = self.statement_cache.read().unwrap().clone();
-        result.extend(self.active_statement_cache.read().unwrap().values().cloned());
+        result.extend(
+            self.active_statement_cache
+                .read()
+                .unwrap()
+                .values()
+                .cloned(),
+        );
         result.sort_by_key(|decision| decision.decision_id);
         result
     }
@@ -565,11 +685,21 @@ mod tests {
     #[test]
     fn compile_work_is_bound_to_the_decision_id_not_occurrence_or_latest_query() {
         let diagnostics = SessionDiagnostics::default();
-        let first = diagnostics.publish_statement_cache_decision(11, false).unwrap();
-        let second = diagnostics.publish_statement_cache_decision(11, true).unwrap();
-        diagnostics.publish_statement_cache_decision(22, false).unwrap();
-        let work = CompileWork { compiler_elapsed_us: 20, optimizer_elapsed_us: 10,
-            rule_elapsed_us: 3, child_combination_cost_synthesis_count: 7 };
+        let first = diagnostics
+            .publish_statement_cache_decision(11, false)
+            .unwrap();
+        let second = diagnostics
+            .publish_statement_cache_decision(11, true)
+            .unwrap();
+        diagnostics
+            .publish_statement_cache_decision(22, false)
+            .unwrap();
+        let work = CompileWork {
+            compiler_elapsed_us: 20,
+            optimizer_elapsed_us: 10,
+            rule_elapsed_us: 3,
+            child_combination_cost_synthesis_count: 7,
+        };
         diagnostics.publish_compile_work(first, work);
         diagnostics.publish_compile_work(first, CompileWork::default());
         diagnostics.publish_compile_work(second, work);
@@ -601,12 +731,94 @@ mod tests {
             admission: AdmissionResult::Selected,
             fallback: None,
         });
-        assert_eq!(diagnostics.execution_receipts_snapshot()[0].terminal, ExecutionTerminal::Running);
-        assert_eq!(diagnostics.execution_receipts_snapshot()[0].image, ExecutionImageStatus::NotReady);
+        assert_eq!(
+            diagnostics.execution_receipts_snapshot()[0].terminal,
+            ExecutionTerminal::Running
+        );
+        assert_eq!(
+            diagnostics.execution_receipts_snapshot()[0].image,
+            ExecutionImageStatus::NotReady
+        );
         handle.image_ready();
-        assert_eq!(diagnostics.execution_receipts_snapshot()[0].image, ExecutionImageStatus::Ready);
+        assert_eq!(
+            diagnostics.execution_receipts_snapshot()[0].image,
+            ExecutionImageStatus::Ready
+        );
         handle.complete();
-        assert_eq!(diagnostics.execution_receipts_snapshot()[0].terminal, ExecutionTerminal::Completed);
+        assert_eq!(
+            diagnostics.execution_receipts_snapshot()[0].terminal,
+            ExecutionTerminal::Completed
+        );
+    }
+
+    #[test]
+    fn selected_reservation_failure_keeps_the_real_selection() {
+        let diagnostics = Arc::new(SessionDiagnostics::default());
+        let identity = ArtifactIdentity {
+            schema_version: 1,
+            artifact: [21, 22],
+            structure: [23, 24],
+            dependencies: [25, 26],
+        };
+        let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            statement_decision_id: None,
+            artifact_identity: identity,
+            expected_class: Some(2),
+            actual_class: None,
+            actual_fingerprint: None,
+            resources: None,
+            admission: AdmissionResult::Failed,
+            fallback: None,
+        });
+        handle.selected(
+            Some(2),
+            Some([31, 32]),
+            Some(ResourceReceipt {
+                class: 2,
+                minimum_memory_bytes: 100,
+                working_set_memory_bytes: 200,
+                memory_ceiling_bytes: 300,
+                memory_completion: crate::compile_diagnostics::MemoryCompletionReceipt::Guaranteed,
+                max_parallel_tasks: 4,
+                external_worker_slots: 0,
+            }),
+            Some(AdmissionFallback::LowerResourceClass),
+        );
+        handle.reservation_failed("reservation race");
+        handle.fail("reservation race");
+        let receipt = diagnostics.execution_receipts_snapshot().pop().unwrap();
+        assert_eq!(receipt.admission, AdmissionResult::Selected);
+        assert_eq!(receipt.actual_class, Some(2));
+        assert_eq!(receipt.actual_fingerprint, Some([31, 32]));
+        assert_eq!(receipt.reservation, ResourceReservationStatus::Failed);
+        assert_eq!(receipt.terminal, ExecutionTerminal::Failed);
+        assert_eq!(receipt.terminal_error.as_deref(), Some("reservation race"));
+    }
+
+    #[test]
+    fn infeasible_admission_is_not_execution_failure() {
+        let diagnostics = Arc::new(SessionDiagnostics::default());
+        let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            statement_decision_id: None,
+            artifact_identity: ArtifactIdentity {
+                schema_version: 1,
+                artifact: [41, 42],
+                structure: [43, 44],
+                dependencies: [45, 46],
+            },
+            expected_class: Some(2),
+            actual_class: None,
+            actual_fingerprint: None,
+            resources: None,
+            admission: AdmissionResult::Failed,
+            fallback: None,
+        });
+        handle.infeasible("no verified variant fits the resource contract");
+        drop(handle);
+        let receipt = diagnostics.execution_receipts_snapshot().pop().unwrap();
+        assert_eq!(receipt.admission, AdmissionResult::Infeasible);
+        assert_eq!(receipt.terminal, ExecutionTerminal::NotExecuted);
+        assert!(receipt.terminal_error.is_some());
     }
 
     #[test]
@@ -619,18 +831,23 @@ mod tests {
             dependencies: [5, 6],
         };
         let handles: Vec<_> = (0..(MAX_ACTIVE_EXECUTION_RECEIPTS + 1))
-            .map(|_| diagnostics.begin_execution_receipt(ExecutionReceiptStart {
-                statement_decision_id: None,
-                artifact_identity: identity,
-                expected_class: Some(2),
-                actual_class: Some(2),
-                actual_fingerprint: Some([7, 8]),
-                resources: None,
-                admission: AdmissionResult::Selected,
-                fallback: None,
-            }))
+            .map(|_| {
+                diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+                    statement_decision_id: None,
+                    artifact_identity: identity,
+                    expected_class: Some(2),
+                    actual_class: Some(2),
+                    actual_fingerprint: Some([7, 8]),
+                    resources: None,
+                    admission: AdmissionResult::Selected,
+                    fallback: None,
+                })
+            })
             .collect();
-        assert_eq!(diagnostics.execution_receipts_snapshot().len(), MAX_ACTIVE_EXECUTION_RECEIPTS);
+        assert_eq!(
+            diagnostics.execution_receipts_snapshot().len(),
+            MAX_ACTIVE_EXECUTION_RECEIPTS
+        );
         assert_eq!(diagnostics.execution_receipt_capacity_exceeded(), 1);
         assert!(handles.last().unwrap().execution_id().is_none());
     }
@@ -686,9 +903,15 @@ mod tests {
     fn active_statement_decision_capacity_is_explicit_and_releases_on_terminal() {
         let diagnostics = SessionDiagnostics::default();
         let decisions: Vec<_> = (0..MAX_ACTIVE_STATEMENT_DECISIONS)
-            .map(|index| diagnostics.publish_statement_cache_decision(index as u64, false).unwrap())
+            .map(|index| {
+                diagnostics
+                    .publish_statement_cache_decision(index as u64, false)
+                    .unwrap()
+            })
             .collect();
-        assert!(diagnostics.publish_statement_cache_decision(999, false).is_none());
+        assert!(diagnostics
+            .publish_statement_cache_decision(999, false)
+            .is_none());
         assert_eq!(diagnostics.statement_decision_capacity_exceeded(), 1);
         diagnostics.finish_statement_cache_decision(decisions[0]);
         let replacement = diagnostics

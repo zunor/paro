@@ -212,7 +212,8 @@ async fn execute_parse_inner<R: ExtendedQueryResponder>(
             trace.record_event("compile", "plan_cache_hit");
             trace.record_event("protocol", "parse_reused_image");
         }
-        session.state.set_unnamed_prepared_statement(entry);
+        let replaced = session.state.set_unnamed_prepared_statement(entry);
+        finish_statement_decision(session, replaced);
         let result = responder.send_parse_complete().await;
         if result.is_ok() {
             if let Some(trace) = &statement_trace {
@@ -250,8 +251,8 @@ async fn execute_parse_inner<R: ExtendedQueryResponder>(
             reusable_unnamed_parse_artifacts(session, &message.query, &raw_stmt, &parameter_types)
         })
         .flatten();
-    let (result_schema, generic_plan) = if is_client_copy(&raw_stmt) {
-        (Vec::new(), None)
+    let (result_schema, generic_plan, compile_decision_id) = if is_client_copy(&raw_stmt) {
+        (Vec::new(), None, None)
     } else if let Some(artifacts) = reusable_unnamed {
         artifacts
     } else {
@@ -273,6 +274,7 @@ async fn execute_parse_inner<R: ExtendedQueryResponder>(
         result_schema,
         generic_plan,
         generic_plan_uses: 0,
+        compile_decision_id,
         source: PreparedStatementSource::Protocol,
         statement_trace: statement_trace.clone(),
     };
@@ -288,7 +290,8 @@ async fn execute_parse_inner<R: ExtendedQueryResponder>(
             session.state.add_prepared_statement(entry);
         }
         None => {
-            session.state.set_unnamed_prepared_statement(entry);
+            let replaced = session.state.set_unnamed_prepared_statement(entry);
+            finish_statement_decision(session, replaced);
         }
     }
 
@@ -357,7 +360,11 @@ fn reusable_unnamed_parse_artifacts(
     sql: &str,
     stmt: &Statement,
     parameter_types: &[Option<LogicalType>],
-) -> Option<(Vec<ResultColumnDesc>, Option<CompiledStatement>)> {
+) -> Option<(
+    Vec<ResultColumnDesc>,
+    Option<CompiledStatement>,
+    Option<u64>,
+)> {
     let previous = reusable_unnamed_statement_image(session, sql)?;
     if previous.raw_stmt.as_ref() != stmt || previous.parameter_types != parameter_types {
         return None;
@@ -368,7 +375,11 @@ fn reusable_unnamed_parse_artifacts(
         sql_bytes = sql.len(),
         "Repeated unnamed Parse reused immutable generic plan"
     );
-    Some((previous.result_schema.clone(), Some(plan.clone())))
+    Some((
+        previous.result_schema.clone(),
+        Some(plan.clone()),
+        previous.compile_decision_id,
+    ))
 }
 
 async fn execute_bind<R: ExtendedQueryResponder>(
@@ -438,8 +449,8 @@ async fn execute_bind_inner<R: ExtendedQueryResponder>(
             parameter_env: parameter_env.clone(),
         },
         StatementClass::Query if compile_explain_parts(&statement.raw_stmt).is_some() => {
-            let (target, options) = compile_explain_parts(&statement.raw_stmt)
-                .expect("compile EXPLAIN guard checked");
+            let (target, options) =
+                compile_explain_parts(&statement.raw_stmt).expect("compile EXPLAIN guard checked");
             let parameter_types = parameter_env
                 .logical_types()
                 .into_iter()
@@ -471,15 +482,16 @@ async fn execute_bind_inner<R: ExtendedQueryResponder>(
                 &parameter_env,
                 statement_trace.clone(),
             )?;
-            let execution = match ExecutionRequest::from_typed_env(planned.plan.clone(), &parameter_env) {
-                Ok(execution) => execution,
-                Err(error) => {
-                    if let Some(decision_id) = planned.statement_decision_id {
-                        session.finish_statement_cache_decision(decision_id);
+            let execution =
+                match ExecutionRequest::from_typed_env(planned.plan.clone(), &parameter_env) {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        if let Some(decision_id) = planned.statement_decision_id {
+                            session.finish_statement_cache_decision(decision_id);
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
-            };
+                };
             let execution = if let Some(id) = planned.statement_decision_id {
                 execution.with_statement_decision_id(id)
             } else {
@@ -721,12 +733,14 @@ async fn execute_close<R: ExtendedQueryResponder>(
     match target {
         CloseTarget::Statement(name) => match name.as_deref() {
             Some(name) => {
-                let _ = session.state.remove_prepared_statement(name);
+                let removed = session.state.remove_prepared_statement(name);
+                finish_statement_decision(session, removed);
                 refresh_prepared = true;
                 refresh_cursors = true;
             }
             None => {
-                let _ = session.state.remove_unnamed_prepared_statement();
+                let removed = session.state.remove_unnamed_prepared_statement();
+                finish_statement_decision(session, removed);
             }
         },
         CloseTarget::Portal(name) => match name.as_deref() {
@@ -756,14 +770,18 @@ fn build_parse_artifacts(
     route: &FrontendRoute,
     type_oids: &[u32],
     statement_trace: Option<Arc<StatementTrace>>,
-) -> Result<(Vec<ResultColumnDesc>, Option<CompiledStatement>)> {
+) -> Result<(
+    Vec<ResultColumnDesc>,
+    Option<CompiledStatement>,
+    Option<u64>,
+)> {
     match route {
         FrontendRoute::Query(_) if compile_explain_parts(stmt).is_some() => {
             // COMPILE is deliberately not run during Parse.  The statement
             // entry only exposes the diagnostic row schema; actual binding,
             // compilation, admission and optional ANALYZE happen at Execute.
             let _ = resolve_parse_parameter_types(stmt, type_oids)?;
-            Ok((compile_explain_result_schema(), None))
+            Ok((compile_explain_result_schema(), None, None))
         }
         FrontendRoute::Query(_) => {
             let parameter_types = resolve_parse_parameter_types(stmt, type_oids)?;
@@ -785,7 +803,11 @@ fn build_parse_artifacts(
                     share_across_sessions,
                     statement_fingerprint(sql),
                 )?;
-                Ok((planned.plan.result_schema().to_vec(), Some(planned.plan)))
+                Ok((
+                    planned.plan.result_schema().to_vec(),
+                    Some(planned.plan),
+                    planned.statement_decision_id,
+                ))
             } else {
                 let parameter_types = parameter_types
                     .iter()
@@ -803,10 +825,14 @@ fn build_parse_artifacts(
                     .iter()
                     .all(|ty| !matches!(ty, LogicalType::Unknown))
                     .then_some(planned.plan.clone());
-                Ok((planned.plan.result_schema().to_vec(), generic_plan))
+                Ok((
+                    planned.plan.result_schema().to_vec(),
+                    generic_plan,
+                    planned.statement_decision_id,
+                ))
             }
         }
-        FrontendRoute::Utility(cmd) => Ok((utility_result_schema(cmd), None)),
+        FrontendRoute::Utility(cmd) => Ok((utility_result_schema(cmd), None, None)),
         FrontendRoute::Prepared(_) => Err(paro_error::not_supported(format!(
             "extended query Parse does not support statement \"{sql}\"",
         ))),
@@ -856,12 +882,24 @@ fn build_query_plan(
         if let Some(plan) =
             session.reusable_instance_query_plan(&stmt, parameter_types, snapshot.as_ref())
         {
-            let statement_decision_id = session
-                .record_statement_cache_decision(cache_query_fingerprint, true);
+            let statement_decision_id =
+                session.record_statement_cache_decision(cache_query_fingerprint, true);
             if let Some(decision_id) = statement_decision_id {
                 snapshot
                     .diagnostics
                     .publish_statement_artifact(decision_id, plan.artifact_identity());
+                if let Some(receipt) = plan.compile_receipt() {
+                    snapshot
+                        .diagnostics
+                        .publish_compile_receipt(decision_id, receipt);
+                } else if let Some(work) = plan.compile_work() {
+                    snapshot.diagnostics.publish_compile_work(decision_id, work);
+                }
+                // A cache lookup is a terminal compile decision.  The
+                // immutable source receipt remains in bounded history and is
+                // referenced by later executions; it must not occupy an
+                // active slot until the portal happens to Execute.
+                session.finish_statement_cache_decision(decision_id);
             }
             if let Some(trace) = &statement_trace {
                 trace.record_event("compile", "plan_cache_hit");
@@ -872,8 +910,9 @@ fn build_query_plan(
             });
         }
     }
-    let statement_decision_id = share_across_sessions.then(||
-        session.record_statement_cache_decision(cache_query_fingerprint, false)).flatten();
+    let statement_decision_id = share_across_sessions
+        .then(|| session.record_statement_cache_decision(cache_query_fingerprint, false))
+        .flatten();
     if let Some(trace) = &statement_trace {
         trace.record_event("compile", "plan_cache_miss");
         trace.record_event("compile", "compiler_call_entry");
@@ -893,15 +932,19 @@ fn build_query_plan(
         }
     };
     if let Some(decision_id) = statement_decision_id {
-        snapshot.diagnostics.publish_statement_artifact(
-            decision_id,
-            plan.artifact_identity(),
-        );
+        snapshot
+            .diagnostics
+            .publish_statement_artifact(decision_id, plan.artifact_identity());
         if let Some(receipt) = plan.compile_receipt() {
-            snapshot.diagnostics.publish_compile_receipt(decision_id, receipt);
+            snapshot
+                .diagnostics
+                .publish_compile_receipt(decision_id, receipt);
         } else if let Some(work) = plan.compile_work() {
             snapshot.diagnostics.publish_compile_work(decision_id, work);
         }
+        // Compilation owns this decision.  Execution receipts refer back to
+        // the sealed history entry but do not keep the compile decision live.
+        session.finish_statement_cache_decision(decision_id);
     }
     if share_across_sessions {
         session.publish_instance_query_plan(
@@ -941,7 +984,7 @@ fn select_protocol_query_plan(
             }
             return Ok(PlannedQuery {
                 plan: plan.clone(),
-                statement_decision_id: None,
+                statement_decision_id: statement.compile_decision_id,
             });
         }
     }
@@ -1141,10 +1184,13 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
             let execution_started = Instant::now();
             let cold_work = paro_common::cold_work::Window::begin();
             let cold_diagnostics = cold_work.as_ref().map(|_| snapshot.diagnostics.clone());
-            let cold_image = cold_work.as_ref().map(|_| execution.statement().diagnostic_image_identity());
+            let cold_image = cold_work
+                .as_ref()
+                .map(|_| execution.statement().diagnostic_image_identity());
             let executor = Executor::new(snapshot);
             session.set_executor(executor);
             let mut stream = session.get_executor().execute(execution)?;
+            let execution_id = stream.execution_id();
             let mut row_count = 0usize;
             let mut first_page = false;
             let fetch_started = Instant::now();
@@ -1174,8 +1220,15 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
                 trace.record_value("execution", "rows_returned", row_count as u64);
                 trace.record_span("execution", "portal_execution", execution_started);
             }
-            if let (Some(window), Some(diagnostics)) = (cold_work, cold_diagnostics) {
-                diagnostics.publish_execution_work(statement_fingerprint(portal.source_sql.as_ref()), cold_image.unwrap(), window.finish());
+            if let (Some(execution_id), Some(window), Some(diagnostics)) =
+                (execution_id, cold_work, cold_diagnostics)
+            {
+                diagnostics.publish_execution_work(
+                    execution_id,
+                    statement_fingerprint(portal.source_sql.as_ref()),
+                    cold_image.unwrap(),
+                    window.finish(),
+                );
             }
             portal.execution_state = PortalExecutionState::Exhausted {
                 position: row_count as i64,
@@ -1519,6 +1572,12 @@ fn overwrite_portal_entry(session: &mut Session, name: Option<&str>, portal: Por
     }
 }
 
+fn finish_statement_decision(session: &Session, entry: Option<PreparedStatementEntry>) {
+    if let Some(decision_id) = entry.and_then(|entry| entry.compile_decision_id) {
+        session.finish_statement_cache_decision(decision_id);
+    }
+}
+
 fn named_or_unnamed_statement_entry_mut<'a>(
     session: &'a mut Session,
     name: Option<&str>,
@@ -1565,12 +1624,12 @@ async fn execute_compile_explain_portal<R: ExtendedQueryResponder>(
     let mut sink = ResponderSink::new(responder, &portal.result_schema, &portal.result_formats);
     session
         .execute_compile_explain_with_parameters(
-        target,
-        &options,
-        None,
-        &parameter_types,
-        Some(&parameter_env),
-        &mut sink,
+            target,
+            &options,
+            None,
+            &parameter_types,
+            Some(&parameter_env),
+            &mut sink,
         )
         .await?;
     let completion = sink
@@ -1742,9 +1801,9 @@ mod tests {
     use crate::dispatch::UtilityCommand;
     use crate::result::collecting_sink::CollectingSink;
     use async_trait::async_trait;
-    use paro_context::ExecutionTerminal;
     use paro_common::runtime_value::Value;
     use paro_common::types::pg_oid::{INT4OID, NUMERICOID};
+    use paro_context::ExecutionTerminal;
     use tokio_util::bytes::Bytes;
 
     #[derive(Default)]
@@ -2153,8 +2212,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("compile_stmt".to_string()),
-                query: "EXPLAIN (COMPILE, ANALYZE, FORMAT JSON) SELECT $1::INT + 1"
-                    .to_string(),
+                query: "EXPLAIN (COMPILE, ANALYZE, FORMAT JSON) SELECT $1::INT + 1".to_string(),
                 type_oids: vec![INT4OID],
             }),
             &mut responder,
@@ -2165,7 +2223,10 @@ mod tests {
         let statement = statement_entry(&session, Some("compile_stmt")).unwrap();
         assert_eq!(statement.result_schema.len(), 1);
         assert_eq!(statement.result_schema[0].name, "QUERY PLAN");
-        assert!(statement.generic_plan.is_none(), "Parse must not compile the target");
+        assert!(
+            statement.generic_plan.is_none(),
+            "Parse must not compile the target"
+        );
 
         execute_extended_query_message(
             &mut session,
@@ -2177,7 +2238,10 @@ mod tests {
         .await
         .unwrap();
         assert!(responder.events.iter().any(|event| event == "row_desc:1"));
-        assert!(responder.rows.is_empty(), "Describe must not execute the target");
+        assert!(
+            responder.rows.is_empty(),
+            "Describe must not execute the target"
+        );
 
         execute_extended_query_message(
             &mut session,

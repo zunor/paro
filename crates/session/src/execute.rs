@@ -256,9 +256,21 @@ impl Session {
     ) -> Result<()> {
         match route {
             FrontendRoute::Query(stmt) => {
-                if let Statement::Explain { options: (_, options), query, .. } = stmt.as_ref() {
+                if let Statement::Explain {
+                    options: (_, options),
+                    query,
+                    ..
+                } = stmt.as_ref()
+                {
                     if options.contains(&paro_parser::ast::ExplainOption::Compile) {
-                        return self.execute_compile_explain(query.as_ref().clone(), options, statement_format, sink).await;
+                        return self
+                            .execute_compile_explain(
+                                query.as_ref().clone(),
+                                options,
+                                statement_format,
+                                sink,
+                            )
+                            .await;
                     }
                 }
                 self.execute_query_statement(*stmt, statement_format, None, sink)
@@ -482,7 +494,9 @@ impl Session {
                 statement_fingerprint(&stmt.to_string()),
                 cached_plan.is_some(),
             )
-        } else { None };
+        } else {
+            None
+        };
         if let Some(trace) = ctx.statement_trace() {
             trace.record_event(
                 "compile",
@@ -541,12 +555,11 @@ impl Session {
             }
         };
         if let Some(decision_id) = cache_occurrence {
-            ctx.diagnostics.publish_statement_artifact(
-                decision_id,
-                compiled.artifact_identity(),
-            );
+            ctx.diagnostics
+                .publish_statement_artifact(decision_id, compiled.artifact_identity());
             if let Some(receipt) = compiled.compile_receipt() {
-                ctx.diagnostics.publish_compile_receipt(decision_id, receipt);
+                ctx.diagnostics
+                    .publish_compile_receipt(decision_id, receipt);
             } else if let Some(work) = compiled.compile_work() {
                 ctx.diagnostics.publish_compile_work(decision_id, work);
             }
@@ -585,7 +598,9 @@ impl Session {
         );
 
         let execution = match parameter_env {
-            Some(parameter_env) => ExecutionRequest::from_typed_env(compiled.clone(), parameter_env),
+            Some(parameter_env) => {
+                ExecutionRequest::from_typed_env(compiled.clone(), parameter_env)
+            }
             None => ExecutionRequest::unparameterized(compiled.clone()),
         };
         let execution = match execution {

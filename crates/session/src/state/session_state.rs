@@ -101,8 +101,8 @@ impl SessionState {
         self.prepared.remove_statement(name)
     }
 
-    pub fn clear_prepared_statements(&mut self) {
-        self.prepared.clear_statements();
+    pub fn clear_prepared_statements(&mut self) -> Vec<PreparedStatementEntry> {
+        self.prepared.clear_statements()
     }
 
     pub fn set_unnamed_prepared_statement(
@@ -248,6 +248,7 @@ mod tests {
             result_schema: Vec::new(),
             generic_plan: None,
             generic_plan_uses: 0,
+            compile_decision_id: None,
             source: PreparedStatementSource::Sql,
             statement_trace: None,
         }
