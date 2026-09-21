@@ -75,6 +75,47 @@ class RunOutputTests(unittest.TestCase):
             self.assertEqual(len(manifest["registration"]["cells"]), 2)
             self.assertTrue((output.run.root / "campaign.json").exists())
 
+    def test_campaign_failure_does_not_rewrite_previous_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "campaign.json",
+                source_id="collector",
+                cells=[
+                    {
+                        "query_case": "q11",
+                        "arm_id": "normal",
+                        "query_cases": 1,
+                        "sample_rows": 1,
+                        "product_receipts": 1,
+                    },
+                    {
+                        "query_case": "q11",
+                        "arm_id": "diagnostic",
+                        "query_cases": 1,
+                        "sample_rows": 1,
+                        "product_receipts": 1,
+                    },
+                ],
+            )
+            output.publish_cell_json(
+                query_case="q11", arm_id="normal", payload={"status": "ok"}
+            )
+            output.finish(
+                status="Incomplete",
+                errors={("q11", "diagnostic"): "cancelled"},
+            )
+            normal_attempt = json.loads(
+                (output.attempts[("q11", "normal")].root / "attempt.json").read_text()
+            )
+            diagnostic_attempt = json.loads(
+                (output.attempts[("q11", "diagnostic")].root / "attempt.json").read_text()
+            )
+            self.assertEqual(normal_attempt["status"], "Completed")
+            self.assertEqual(diagnostic_attempt["status"], "Incomplete")
+            self.assertTrue(
+                (output.attempts[("q11", "diagnostic")].root / "failure.json").exists()
+            )
+
     def test_standalone_corpus_output_is_registered_and_sealed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = CorpusOutput.create(
@@ -251,6 +292,21 @@ class RunOutputTests(unittest.TestCase):
             "schema_version": 1, "decision_id": 6, "query_fingerprint": 123,
             "occurrence": 0, "cache_hit": True,
             "artifact_identity": target_identity, "compile_work": None,
+            "compile_receipt": {
+                "schema_version": 1, "artifact_identity": target_identity,
+                "search_stop": {"Observed": "QualityPolicySatisfied"},
+                "search_complete": {"Observed": False},
+                "quality_policy_satisfied": {"Observed": True},
+                "budget_limited": {"Observed": False},
+                "obligations": {"Observed": 0},
+                "groups": {"Observed": 1},
+                "logical_expressions": {"Observed": 1},
+                "physical_expressions": {"Observed": 1},
+                "expected_class": {"Observed": 2},
+                "variant_count": {"Observed": 1},
+                "omitted_variants": 0,
+                "compile_work": None,
+            },
         }
         target_execution = {
             "schema_version": 1, "execution_id": 7, "statement_decision_id": 6,

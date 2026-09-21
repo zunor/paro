@@ -513,7 +513,11 @@ class CampaignOutput:
         errors = errors or {}
         for key, attempt in self.attempts.items():
             error = errors.get(key)
-            if status == "Completed" and error is None:
+            # A campaign terminal state describes the campaign as a whole;
+            # it must not rewrite a successfully sealed cell when a later
+            # cell fails.  Each attempt owns its own terminal record and is
+            # therefore sealed from its own evidence/error state first.
+            if error is None and attempt.result_path.exists():
                 attempt.seal(
                     status="Completed",
                     result_path=attempt.result_path,

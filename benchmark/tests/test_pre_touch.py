@@ -26,14 +26,37 @@ class PreTouchTests(unittest.TestCase):
         def row(record_type, record_id, payload):
             return (record_type, 'receipt', 0, 0, 'receipt', 1,
                     record_type, record_id, json.dumps(payload))
+        compile_receipt = {
+            'schema_version': 1, 'artifact_identity': identity,
+            'search_stop': {'Observed': 'QualityPolicySatisfied'},
+            'search_complete': {'Observed': False},
+            'quality_policy_satisfied': {'Observed': True},
+            'budget_limited': {'Observed': False},
+            'obligations': {'Observed': 0}, 'groups': {'Observed': 1},
+            'logical_expressions': {'Observed': 1},
+            'physical_expressions': {'Observed': 1},
+            'expected_class': {'Observed': 2}, 'variant_count': {'Observed': 1},
+            'omitted_variants': 0, 'compile_work': None,
+        }
         cursor.fetchall.return_value = [
             row('statement_cache', 6, {
                 'schema_version': 1, 'decision_id': 6, 'query_fingerprint': fp,
                 'occurrence': 9, 'cache_hit': True, 'artifact_identity': identity,
-                'compile_work': None}),
+                'compile_work': None, 'compile_receipt': compile_receipt}),
             row('execution_receipt', 7, {
                 'schema_version': 1, 'execution_id': 7, 'statement_decision_id': 6,
-                'artifact_identity': identity}),
+                'artifact_identity': identity, 'expected_class': 2,
+                'actual_class': 2, 'actual_fingerprint': [7, 8],
+                'resources': {
+                    'class': 2, 'minimum_memory_bytes': 100,
+                    'working_set_memory_bytes': 200, 'memory_ceiling_bytes': 1000,
+                    'memory_completion': 'Guaranteed', 'max_parallel_tasks': 4,
+                    'external_worker_slots': 0,
+                },
+                'admission': 'Selected', 'fallback': None,
+                'reservation': 'Committed', 'lowering': 'Ready',
+                'lowering_error': None, 'image': 'Ready', 'terminal': 'Completed',
+                'terminal_error': None}),
         ]
         connection = Mock()
         connection.cursor.return_value.__enter__ = Mock(return_value=cursor)

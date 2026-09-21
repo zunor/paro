@@ -33,7 +33,11 @@ from benchmark_evidence import (
     statement_fingerprint,
     tree_digest,
 )
-from harness.receipt_contract import ReceiptContractError, validate_compile_document
+from harness.receipt_contract import (
+    ReceiptContractError,
+    associate_typed_receipts,
+    validate_compile_document,
+)
 from harness.run_output import CampaignOutput
 from tpcds_result_contract import (
     RESULT_CONTRACT_VERSION,
@@ -497,6 +501,7 @@ def collect_statement_cache_evidence(
     fingerprint = statement_fingerprint(query)
     if before_execution_ids is None:
         return {
+            "schema_version": 1,
             "status": "Uncovered",
             "query_fingerprint": fingerprint,
             "reason": "target execution boundary was not captured",
@@ -518,43 +523,18 @@ def collect_statement_cache_evidence(
             for row in rows
             if row["record_type"] == "execution_work"
         }
-        matches = [
-            (execution_id, receipt)
-            for execution_id, receipt in executions.items()
-            if execution_id not in before_execution_ids
-            and receipt.get("statement_decision_id") in decisions
-            and decisions[receipt["statement_decision_id"]].get("query_fingerprint") == fingerprint
-        ]
-        if len(matches) != 1:
-            return {
-                "status": "Uncovered",
-                "query_fingerprint": fingerprint,
-                "reason": "target execution receipt was missing or ambiguous",
-                "matching_execution_ids": sorted(execution_id for execution_id, _ in matches),
-            }
-        execution_id, execution = matches[0]
-        decision_id = execution["statement_decision_id"]
-        decision = decisions[decision_id]
-        identity = execution.get("artifact_identity")
-        if identity != decision.get("artifact_identity"):
-            return {
-                "status": "Uncovered",
-                "query_fingerprint": fingerprint,
-                "execution_id": execution_id,
-                "reason": "statement decision and execution artifact differ",
-            }
-        return {
-            "status": "Verified",
-            "query_fingerprint": fingerprint,
-            "statement_decision_id": decision_id,
-            "execution_id": execution_id,
-            "occurrence": decision.get("occurrence"),
-            "cache_hit": decision.get("cache_hit"),
-            "compile_work": decision.get("compile_work"),
-            "execution_work": works.get(execution_id, {}),
-            "artifact_identity": identity,
-            "source": "paro_optimizers_typed_receipt_channel",
-        }
+        association = associate_typed_receipts(
+            decisions,
+            executions,
+            before_execution_ids=before_execution_ids,
+            query_fingerprint=fingerprint,
+        )
+        if association.get("status") == "Verified":
+            association["execution_work"] = works.get(
+                association["execution_id"], {}
+            )
+            association["source"] = "paro_optimizers_typed_receipt_channel"
+        return association
     except (IndexError, KeyError, TypeError, ValueError, psycopg.Error) as error:
         return {
             "status": "Uncovered",
@@ -1167,12 +1147,14 @@ def main() -> int:
                         block = {
                             "block": block_number,
                             "cohort": "pre_touch_diagnostic" if pre_touch else "normal",
+                            "trace_mode": "off",
                             "pre_touch": preparation,
                             "cold_order": cold_order,
                             "cold_statement_ms": cold_statement_ms,
                             "cold_miss_evidence": cold_cache_evidence,
                             "measurement_round_orders": round_orders,
                             "paro_ms": [],
+                            "paro_receipt_associations": [],
                             "paro_execution_work": [],
                             "duckdb_ms": [],
                             "paro_server": block_server.identity(),
@@ -1181,11 +1163,7 @@ def main() -> int:
                         for order in round_orders:
                             for engine in order:
                                 if engine == "paro":
-                                    before_execution_ids = (
-                                        snapshot_execution_ids(paro)
-                                        if os.environ.get("PARO_COLD_WORK_EVIDENCE") == "1"
-                                        else None
-                                    )
+                                    before_execution_ids = snapshot_execution_ids(paro)
                                     rows, sample_schema, elapsed_ms = timed_run_paro(
                                         paro, query, binary_result
                                     )
@@ -1197,14 +1175,22 @@ def main() -> int:
                                 samples[engine].append(elapsed_ms)
                                 sample_digests[engine].append(digest)
                                 block[f"{engine}_ms"].append(round(elapsed_ms, 6))
-                                if engine == "paro" and os.environ.get("PARO_COLD_WORK_EVIDENCE") == "1":
-                                    block["paro_execution_work"].append(
-                                        collect_execution_work(
+                                if engine == "paro":
+                                    block["paro_receipt_associations"].append(
+                                        collect_statement_cache_evidence(
                                             paro,
                                             query,
                                             before_execution_ids=before_execution_ids,
                                         )
                                     )
+                                    if os.environ.get("PARO_COLD_WORK_EVIDENCE") == "1":
+                                        block["paro_execution_work"].append(
+                                            collect_execution_work(
+                                                paro,
+                                                query,
+                                                before_execution_ids=before_execution_ids,
+                                            )
+                                        )
                     finally:
                         paro.close()
                 block["compile_document"] = {
@@ -1301,10 +1287,32 @@ def main() -> int:
             ][1]
             verify_measurement_inputs(repo_root, server_binary, args, report)
             normal_observation_verified = all(
-                item.get("compile_document", {}).get("status") == "Uncovered"
+                item.get("trace_mode") == "off"
+                and item.get("compile_document", {}).get("status") == "Uncovered"
                 and bool(item.get("compile_document", {}).get("reason"))
                 for item in blocks
             )
+            normal_receipt_associations = [
+                receipt
+                for item in blocks
+                for receipt in item.get("paro_receipt_associations", [])
+            ]
+            normal_receipt_coverage = {
+                "status": (
+                    "Verified"
+                    if normal_receipt_associations
+                    and all(receipt.get("status") == "Verified"
+                            for receipt in normal_receipt_associations)
+                    else "Uncovered"
+                ),
+                "sample_count": len(normal_receipt_associations),
+                "verified_count": sum(
+                    receipt.get("status") == "Verified"
+                    for receipt in normal_receipt_associations
+                ),
+                "associations": normal_receipt_associations,
+                "method": "post_timer_statement_decision_and_execution_id",
+            }
             cold_miss_evidence = {
                 "status": (
                     "Verified"
@@ -1330,6 +1338,7 @@ def main() -> int:
                 and c1_p50_not_slower
                 and normal_observation_verified
                 and cold_miss_verified
+                and normal_receipt_coverage["status"] == "Verified"
             )
             result.update(
                 status="passed",
@@ -1371,6 +1380,7 @@ def main() -> int:
                     "primary_gate_eligible": pre_touch is None,
                     "trace_mode": "off",
                     "normal_observation_verified": normal_observation_verified,
+                    "normal_receipt_coverage": normal_receipt_coverage,
                     "compile_document": "normal target uses production receipt channel",
                     "cold_miss_evidence": cold_miss_evidence,
                 },

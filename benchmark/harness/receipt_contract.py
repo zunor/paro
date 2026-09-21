@@ -275,6 +275,137 @@ def validate_receipt_association(value: Any) -> str:
     return status
 
 
+def associate_typed_receipts(
+    decisions: dict[int, dict[str, Any]],
+    executions: dict[int, dict[str, Any]],
+    *,
+    before_execution_ids: set[int] | None,
+    query_fingerprint: int | str | None,
+) -> dict[str, Any]:
+    """Bind one target execution to its immutable compile decision.
+
+    This is the single benchmark-side projection of the Rust receipt channel.
+    Callers supply already decoded, record-id-checked maps; no caller may pick
+    the newest occurrence or an artifact-only match.  A structurally complete
+    association is validated before it can be labelled ``Verified``.
+    """
+    if before_execution_ids is None:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "target execution boundary was not captured",
+        }
+    if not decisions or not executions:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "compile or execution receipt was not published",
+        }
+
+    matches = [
+        (execution_id, execution)
+        for execution_id, execution in executions.items()
+        if execution_id not in before_execution_ids
+        and execution.get("statement_decision_id") in decisions
+        and (
+            query_fingerprint is None
+            or decisions[execution["statement_decision_id"]].get("query_fingerprint")
+            == query_fingerprint
+        )
+    ]
+    if not matches:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "no execution receipt matches this statement decision",
+        }
+    if len(matches) != 1:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "statement execution boundary is ambiguous",
+            "matching_execution_ids": sorted(execution_id for execution_id, _ in matches),
+        }
+
+    execution_id, execution = matches[0]
+    decision_id = execution.get("statement_decision_id")
+    decision = decisions[decision_id]
+    identity = execution.get("artifact_identity")
+    if not isinstance(identity, dict):
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "execution receipt lacks artifact identity",
+            "execution_id": execution_id,
+        }
+    if decision.get("artifact_identity") != identity:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "statement decision and execution artifact differ",
+            "execution_id": execution_id,
+        }
+
+    compile_detail = {
+        "artifact_identity": identity,
+        "decision_id": decision_id,
+        "query_fingerprint": decision.get("query_fingerprint"),
+        "occurrence": decision.get("occurrence"),
+        "cache_hit": decision.get("cache_hit"),
+        "receipt": decision.get("compile_receipt"),
+        "raw": decision.get("compile_work"),
+    }
+    execution_detail = {
+        "execution_id": execution_id,
+        "artifact_identity": identity,
+        "raw": execution,
+    }
+    selection = {
+        "expected_class": execution.get("expected_class"),
+        "actual_class": execution.get("actual_class"),
+        "actual_fingerprint": execution.get("actual_fingerprint"),
+        "admission": execution.get("admission"),
+        "fallback": execution.get("fallback"),
+        "image": execution.get("image"),
+        "terminal": execution.get("terminal"),
+        "reservation": execution.get("reservation"),
+        "lowering": execution.get("lowering"),
+        "lowering_error": execution.get("lowering_error"),
+        "terminal_error": execution.get("terminal_error"),
+        "resources": execution.get("resources"),
+    }
+    raw_fingerprint = decision.get("query_fingerprint", 0)
+    if isinstance(raw_fingerprint, int) and not isinstance(raw_fingerprint, bool):
+        fingerprint = f"{raw_fingerprint:016x}"
+    else:
+        fingerprint = str(raw_fingerprint)
+    association = {
+        "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+        "status": "Verified",
+        "association_basis": "statement_decision_id",
+        "statement_decision_id": decision_id,
+        "query_fingerprint": fingerprint,
+        "occurrence": decision.get("occurrence"),
+        "compilation": "CacheHit" if decision.get("cache_hit") else "Executed",
+        "compile_state": "NotExecuted" if decision.get("cache_hit") else "Executed",
+        "artifact_identity": identity,
+        "compile": compile_detail,
+        "execution_id": execution_id,
+        "execution": execution_detail,
+        "selection": selection,
+    }
+    try:
+        validate_receipt_association(association)
+    except ReceiptContractError as error:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": f"receipt association failed validation: {error}",
+            "execution_id": execution_id,
+        }
+    return association
+
+
 def _validate_execution_producer_record(
     raw: dict[str, Any],
     *,

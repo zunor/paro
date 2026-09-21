@@ -20,6 +20,7 @@ from .performance_gate import (
 from .reporter import BenchmarkReporter
 from .receipt_contract import (
     ReceiptContractError,
+    associate_typed_receipts,
     validate_benchmark_payload,
     validate_compile_document,
     validate_receipt_association,
@@ -42,6 +43,7 @@ __all__ = [
     "GateStatus",
     "PolicyError",
     "ReceiptContractError",
+    "associate_typed_receipts",
     "RunOutput",
     "RunOutputError",
     "QueryDef",

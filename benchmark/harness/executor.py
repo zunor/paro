@@ -15,6 +15,7 @@ import time as time_module
 from typing import Any, Mapping
 
 from .loader import QueryDef, WorkloadDef
+from .receipt_contract import associate_typed_receipts
 from .result_protocol import normalize_row_v1
 from .validator import BenchmarkValidator
 
@@ -453,106 +454,12 @@ class BenchmarkExecutor:
                 ):
                     execution_records[execution_id] = decoded
 
-        if before_execution_ids is None:
-            return {
-                "schema_version": 1,
-                "status": "Uncovered",
-                "reason": "target execution boundary was not captured",
-            }
-        if not cache_decisions or not execution_records:
-            return {
-                "schema_version": 1,
-                "status": "Uncovered",
-                "reason": "compile or execution receipt was not published",
-            }
-
-        matching_executions = [
-            (execution_id, receipt)
-            for execution_id, receipt in execution_records.items()
-            if (before_execution_ids is None or execution_id not in before_execution_ids)
-            and receipt.get("statement_decision_id") in cache_decisions
-            and (
-                query_fingerprint is None
-                or cache_decisions[receipt["statement_decision_id"]].get("query_fingerprint")
-                == query_fingerprint
-            )
-        ]
-        if not matching_executions:
-            return {
-                "schema_version": 1,
-                "status": "Uncovered",
-                "reason": "no execution receipt matches this statement decision",
-            }
-        # Reading the channel is itself a statement and can publish a receipt
-        # while the table function is scanning it.  The target is therefore
-        # selected by its exact statement-decision identity and query contract,
-        # never by latest occurrence or by an artifact-only heuristic.
-        if len(matching_executions) != 1:
-            return {
-                "schema_version": 1,
-                "status": "Uncovered",
-                "reason": "statement execution boundary is ambiguous",
-                "matching_execution_ids": sorted(item[0] for item in matching_executions),
-            }
-        execution_id, execution = matching_executions[0]
-        decision_id = execution.get("statement_decision_id")
-        decision = cache_decisions[decision_id]
-        identity = execution.get("artifact_identity")
-        if not isinstance(identity, dict):
-            return {"schema_version": 1, "status": "Uncovered",
-                    "reason": "execution receipt lacks artifact identity",
-                    "execution_id": execution_id}
-        if decision.get("artifact_identity") != identity:
-            return {"schema_version": 1, "status": "Uncovered",
-                    "reason": "statement decision and execution artifact differ",
-                    "execution_id": execution_id}
-        compile_detail = {
-            "artifact_identity": identity,
-            "decision_id": decision_id,
-            "query_fingerprint": decision.get("query_fingerprint"),
-            "occurrence": decision.get("occurrence"),
-            "cache_hit": decision.get("cache_hit"),
-            "receipt": decision.get("compile_receipt"),
-            "raw": decision.get("compile_work"),
-        }
-        execution_detail = {
-            "execution_id": execution_id,
-            "artifact_identity": identity,
-            "raw": execution,
-        }
-        resources = execution.get("resources")
-        selection = {
-            "expected_class": execution.get("expected_class"),
-            "actual_class": execution.get("actual_class"),
-            "actual_fingerprint": execution.get("actual_fingerprint"),
-            "admission": execution.get("admission"),
-            "fallback": execution.get("fallback"),
-            "image": execution.get("image"),
-            "terminal": execution.get("terminal"),
-            "reservation": execution.get("reservation"),
-            "lowering": execution.get("lowering"),
-            "lowering_error": execution.get("lowering_error"),
-            "terminal_error": execution.get("terminal_error"),
-            "resources": resources,
-        }
-        return {
-            "schema_version": 1,
-            "status": "Verified",
-            "association_basis": "statement_decision_id",
-            "statement_decision_id": decision_id,
-            "query_fingerprint": f"{int(decision.get('query_fingerprint', 0)):016x}",
-            "occurrence": decision.get("occurrence"),
-            "compilation": "CacheHit" if decision.get("cache_hit") else "Executed",
-            # A cache hit reuses the original compile receipt.  This run did
-            # not execute the compiler, even though it still has its own
-            # admission/execution receipt below.
-            "compile_state": "NotExecuted" if decision.get("cache_hit") else "Executed",
-            "artifact_identity": identity,
-            "compile": compile_detail,
-            "execution_id": execution_id,
-            "execution": execution_detail,
-            "selection": selection,
-        }
+        return associate_typed_receipts(
+            cache_decisions,
+            execution_records,
+            before_execution_ids=before_execution_ids,
+            query_fingerprint=query_fingerprint,
+        )
 
     def _read_compile_channel(
         self, conn: Any
