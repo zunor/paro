@@ -462,6 +462,7 @@ async fn socket_looks_like_cancel_request(socket: &TcpStream) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::transport::CANCELLED_OUTPUT_STALL_TIMEOUT;
     use paro_instance::InstanceShutdownDisposition;
     use paro_instance::{InstanceLayout, InstanceLifecycleState, InstanceRunStateStore};
     use paro_storage::meta::{FileMetadataStore, MetadataStore};
@@ -1122,6 +1123,82 @@ mod tests {
             .expect("write recovery Sync");
         let recovered = read_messages_until_ready(&mut client).await;
         assert_eq!(recovered.last().map(|(tag, _)| *tag), Some(b'Z'));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_extended_sync_keeps_normal_backpressure_after_recovery_window() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = connect_with_small_receive_buffer(addr).await;
+        complete_startup(&mut client).await;
+
+        // This is deliberately a successful extended exchange.  It produces
+        // enough output to block the real PgWire socket, but it is finite so
+        // the test can drain it and inspect the complete protocol sequence.
+        for message in [
+            PgWireFrontendMessage::Parse(Parse::new(
+                Some("backpressure_stmt".to_string()),
+                "SELECT * FROM range(0, 10000)".to_string(),
+                Vec::new(),
+            )),
+            PgWireFrontendMessage::Bind(Bind::new(
+                Some("backpressure_portal".to_string()),
+                Some("backpressure_stmt".to_string()),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )),
+            PgWireFrontendMessage::Execute(Execute::new(
+                Some("backpressure_portal".to_string()),
+                0,
+            )),
+            PgWireFrontendMessage::Sync(Sync::new()),
+        ] {
+            client
+                .write_all(&encode_frontend_message(message))
+                .await
+                .expect("write extended success exchange");
+        }
+
+        // Wait for the server to enter the result stream, then intentionally
+        // stop reading longer than the cancellation-recovery budget.  A
+        // normal successful Sync must retain ordinary backpressure semantics;
+        // it must not be closed by the recovery-only deadline.
+        let first = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("extended query should start producing output");
+        assert!(
+            matches!(first.0, b'1' | b'2' | b'T' | b'D'),
+            "unexpected first backend message tag: {:?}",
+            first.0 as char
+        );
+        sleep(CANCELLED_OUTPUT_STALL_TIMEOUT + Duration::from_millis(50)).await;
+
+        let messages = read_many_messages_until_ready(&mut client).await;
+        assert_eq!(
+            messages.iter().filter(|(tag, _)| *tag == b'Z').count(),
+            1,
+            "successful Sync must emit exactly one ReadyForQuery"
+        );
+        assert!(
+            messages.iter().any(|(tag, payload)| {
+                *tag == b'C'
+                    && command_complete_tag(payload).is_some_and(|tag| tag.starts_with("SELECT "))
+            }),
+            "successful extended query must emit CommandComplete"
+        );
+        assert!(!messages.iter().any(|(tag, _)| *tag == b'E'));
+
+        let probe = run_simple_query_roundtrip(&mut client, "SELECT 1").await;
+        assert!(!probe.iter().any(|(tag, _)| *tag == b'E'));
 
         server
             .shutdown(Duration::from_secs(5))
