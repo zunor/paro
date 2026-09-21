@@ -41,12 +41,11 @@
 - unstaged tracked paths before this document commit: `77`
 - untracked paths: `0`
 - current unstaged diff SHA-256 before this document commit: `816862d4c3b37f3cd9a550a7493317d453bb2da20ae368c9a7033711ce5c9793`
-- the 77 paths consist of 73 preserved mixed WIP paths, this task's
-  `benchmark/tests/test_cold_planning_gate.py`, and the three task-owned
-  support documents
+- the 77 paths consisted of the preserved mixed WIP plus the task-owned test
+  and support documents that were still pending at that snapshot
 - recovery material remains at `/private/tmp/paro-reop-compile-evidence-v2-recovery-post-20260922/`; no recovery ref or historical worktree was removed
 
-The 73 mixed paths remain separated by the categories above. The task commits
+The 74 mixed paths remain separated by the categories above. The task commits
 contain only the compile-evidence/RunOutput/collector/renderer/validator/test/
 document hunks listed in their commit summaries. The preserved optimizer/native,
 storage/execution, and session/server paths remain unstaged; the optimizer
@@ -80,7 +79,7 @@ The independently reviewable task commits are now:
 - `77677ece` — declared-capture completion guard and regression tests.
 
 After the final document commit the worktree will have no staged paths, no
-untracked paths, and 73 unstaged tracked mixed-WIP paths. The recovery refs and
+untracked paths, and 74 unstaged tracked mixed-WIP paths. The recovery refs and
 the post-2026-09-22 recovery directory remain unchanged. The final mixed diff
 hash is intentionally recorded by the handoff command after this document is
 committed; it is not used as a task source identity.
