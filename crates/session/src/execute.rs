@@ -534,20 +534,24 @@ impl Session {
                 if require_new_transaction {
                     let _ = self.rollback_auto_transaction(Some(&e));
                 }
+                if let Some(decision_id) = cache_occurrence {
+                    self.finish_statement_cache_decision(decision_id);
+                }
                 return Err(e);
             }
         };
-        if let Some(occurrence) = cache_occurrence {
+        if let Some(decision_id) = cache_occurrence {
             ctx.diagnostics.publish_statement_artifact(
-                statement_fingerprint(&stmt.to_string()),
-                occurrence,
+                decision_id,
                 compiled.artifact_identity(),
             );
+            if let Some(receipt) = compiled.compile_receipt() {
+                ctx.diagnostics.publish_compile_receipt(decision_id, receipt);
+            } else if let Some(work) = compiled.compile_work() {
+                ctx.diagnostics.publish_compile_work(decision_id, work);
+            }
         }
         if shared_plan_cache_eligible && cached_plan.is_none() {
-            if let (Some(occurrence), Some(work)) = (cache_occurrence, compiled.compile_work()) {
-                ctx.diagnostics.publish_compile_work(statement_fingerprint(&stmt.to_string()), occurrence, work);
-            }
             self.publish_instance_query_plan(
                 stmt.clone(),
                 Vec::new(),
@@ -581,10 +585,25 @@ impl Session {
         );
 
         let execution = match parameter_env {
-            Some(parameter_env) => {
-                ExecutionRequest::from_typed_env(compiled.clone(), parameter_env)?
+            Some(parameter_env) => ExecutionRequest::from_typed_env(compiled.clone(), parameter_env),
+            None => ExecutionRequest::unparameterized(compiled.clone()),
+        };
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                if let Some(decision_id) = cache_occurrence {
+                    self.finish_statement_cache_decision(decision_id);
+                }
+                if require_new_transaction {
+                    let _ = self.rollback_auto_transaction(Some(&error));
+                }
+                return Err(error);
             }
-            None => ExecutionRequest::unparameterized(compiled.clone())?,
+        };
+        let execution = if let Some(decision_id) = cache_occurrence {
+            execution.with_statement_decision_id(decision_id)
+        } else {
+            execution
         };
         let result = self.get_executor().execute(execution);
 

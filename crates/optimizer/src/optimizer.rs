@@ -21,7 +21,8 @@ use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
-use paro_context::StatementContext;
+use paro_context::compile_diagnostics::{Observation, SearchStop};
+use paro_context::{CompileReceiptSummary, StatementContext};
 use paro_planner::binder::deep_copy::{
     duplicate_plan_preserving_indices, fork_plan_preserving_indices,
 };
@@ -400,6 +401,7 @@ pub struct Optimizer {
     budget: SearchBudget,
     calibration: Arc<MachineCalibrationBundle>,
     compile_work: paro_context::CompileWork,
+    compile_receipt: Option<CompileReceiptSummary>,
 }
 
 /// Complete optimizer output.  Execution receives no logical tree and makes
@@ -421,6 +423,7 @@ impl Optimizer {
             budget: SearchBudget::default(),
             calibration: Arc::new(MachineCalibrationBundle::builtin_production()),
             compile_work: Default::default(),
+            compile_receipt: None,
         }
     }
 
@@ -431,6 +434,10 @@ impl Optimizer {
 
     pub fn compile_work(&self) -> paro_context::CompileWork {
         self.compile_work
+    }
+
+    pub fn compile_receipt(&self) -> Option<CompileReceiptSummary> {
+        self.compile_receipt
     }
 
     pub fn with_calibration(mut self, calibration: Arc<MachineCalibrationBundle>) -> Self {
@@ -1031,6 +1038,41 @@ impl Optimizer {
                     search_phase_allocated,
                 )
             };
+        self.compile_receipt = Some(CompileReceiptSummary {
+            schema_version: paro_context::COMPILE_RECEIPT_SCHEMA_VERSION,
+            artifact_identity: None,
+            search_stop: Observation::Observed(match extraction.search_stop.reason {
+                crate::cascades::engine::SearchStopReason::Complete => SearchStop::Complete,
+                crate::cascades::engine::SearchStopReason::SearchIncomplete => SearchStop::Incomplete,
+                crate::cascades::engine::SearchStopReason::Deadline => SearchStop::Deadline,
+                crate::cascades::engine::SearchStopReason::BudgetLimited => SearchStop::BudgetLimited,
+                crate::cascades::engine::SearchStopReason::RuleFailure => SearchStop::RuleFailure,
+                crate::cascades::engine::SearchStopReason::QualityPolicySatisfied => SearchStop::QualityPolicySatisfied,
+            }),
+            search_complete: Observation::Observed(extraction.search_summary.is_complete()),
+            quality_policy_satisfied: Observation::Observed(matches!(
+                extraction.quality_policy_status,
+                crate::cascades::quality::QualityPolicyStatus::Satisfied(_)
+            )),
+            budget_limited: Observation::Observed(extraction.search_stop.budget_limited),
+            obligations: Observation::Observed(extraction.search_summary.obligations.len() as u64),
+            groups: Observation::Observed(extraction.search_summary.groups),
+            logical_expressions: Observation::Observed(extraction.search_summary.logical_expressions),
+            physical_expressions: Observation::Observed(extraction.search_summary.physical_expressions),
+            expected_class: extraction
+                .grant_search
+                .as_ref()
+                .and_then(|coverage| coverage.expected_class)
+                .map_or(
+                    Observation::Uncovered(
+                        paro_context::compile_diagnostics::UncoveredReason::NotInstrumented,
+                    ),
+                    |class| Observation::Observed(class.0),
+                ),
+            variant_count: Observation::Observed(extraction.variants.len()),
+            omitted_variants: 0,
+            compile_work: None,
+        });
         let _finish_partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         if let Some(capture) = &self.ctx.session.options.compile_capture {
             use paro_context::compile_diagnostics::{Observation::Observed, RuleSummary, SearchStop};
@@ -1053,7 +1095,9 @@ impl Optimizer {
             });
             let active_rules: std::collections::BTreeSet<_> = extraction.rule_attempts.keys()
                 .chain(extraction.rule_elapsed.keys())
-                .chain(extraction.rule_insertions.keys()).copied().collect();
+                .chain(extraction.rule_insertions.keys())
+                .chain(extraction.rule_binding_work.keys())
+                .copied().collect();
             for id in active_rules {
                 let binding = extraction.rule_binding_work.get(&id).copied().unwrap_or_default();
                 capture.rule(RuleSummary { id: id.0,
@@ -1062,6 +1106,183 @@ impl Optimizer {
                     attempts: extraction.rule_attempts.get(&id).copied().unwrap_or(0),
                     inserted: extraction.rule_insertions.get(&id).copied().unwrap_or(0),
                     elapsed_ns: extraction.rule_elapsed.get(&id).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) });
+            }
+            if capture.level() == paro_context::compile_diagnostics::CaptureLevel::Detail {
+                capture.detail_omitted(
+                    extraction
+                        .search_milestones
+                        .candidate_lifecycle_dropped
+                        .saturating_add(
+                            extraction
+                                .search_milestones
+                                .transformation_task_lifecycle_dropped,
+                        ),
+                );
+                use paro_context::compile_diagnostics::{detail_kind, DetailEvent};
+                let mut sequence = 0_u64;
+                for id in extraction
+                    .rule_attempts
+                    .keys()
+                    .chain(extraction.rule_elapsed.keys())
+                    .chain(extraction.rule_insertions.keys())
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    let binding = extraction.rule_binding_work.get(&id).copied().unwrap_or_default();
+                    capture.detail(DetailEvent {
+                        sequence,
+                        kind: detail_kind::RULE,
+                        phase: 0,
+                        primary: id.0 as u64,
+                        secondary: extraction.rule_attempts.get(&id).copied().unwrap_or(0),
+                        tertiary: extraction.rule_insertions.get(&id).copied().unwrap_or(0),
+                        reference: 0,
+                        cause: 0,
+                    });
+                    sequence = sequence.saturating_add(1);
+                    capture.detail(DetailEvent {
+                        sequence,
+                        kind: detail_kind::RULE,
+                        phase: 1,
+                        primary: id.0 as u64,
+                        secondary: binding.calls,
+                        tertiary: u64::try_from(binding.elapsed.as_nanos()).unwrap_or(u64::MAX),
+                        reference: 0,
+                        cause: 0,
+                    });
+                    sequence = sequence.saturating_add(1);
+                }
+                for event in &extraction.search_milestones.candidate_lifecycle {
+                    if matches!(
+                        event.stage,
+                        crate::cascades::engine::CandidateLifecycleStage::LogicalPublished
+                            | crate::cascades::engine::CandidateLifecycleStage::PhysicalRecipePublished
+                    ) {
+                        capture.detail(DetailEvent {
+                            sequence,
+                            kind: detail_kind::PROPOSAL,
+                            phase: event.stage as u16,
+                            primary: event.group.0 as u64,
+                            secondary: event
+                                .logical
+                                .map_or(u64::MAX, |logical| logical.index() as u64),
+                            tertiary: event
+                                .physical
+                                .map_or(u64::MAX, |physical| physical.index() as u64),
+                            reference: event.binding.map_or(
+                                event
+                                    .source
+                                    .map_or(u64::MAX, |source| source.index() as u64),
+                                |binding| binding.0 as u64,
+                            ),
+                            cause: event.rule.map_or(0, |rule| rule.0 as u64),
+                        });
+                        sequence = sequence.saturating_add(1);
+                    }
+                    capture.detail(DetailEvent {
+                        sequence,
+                        kind: detail_kind::CANDIDATE,
+                        phase: event.stage as u16,
+                        primary: event.group.0 as u64,
+                        secondary: event.candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
+                        tertiary: event.logical.map_or(
+                            event.physical.map_or(u64::MAX, |physical| physical.index() as u64),
+                            |logical| logical.index() as u64,
+                        ),
+                        reference: event.source.map_or(
+                            event.source_child.map_or(u64::MAX, |child| child.index() as u64),
+                            |source| source.index() as u64,
+                        ),
+                        cause: event.rule.map_or(0, |rule| rule.0 as u64),
+                    });
+                    sequence = sequence.saturating_add(1);
+                    if let Some(goal) = event.goal {
+                        capture.detail(DetailEvent {
+                            sequence,
+                            kind: detail_kind::QUALITY,
+                            phase: event.stage as u16,
+                            primary: event.candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
+                            secondary: goal.required.0 as u64,
+                            tertiary: goal.grant.stable_tag(),
+                            reference: goal.context.0 as u64,
+                            cause: event.expected_cost_bits.unwrap_or(0),
+                        });
+                        sequence = sequence.saturating_add(1);
+                    }
+                    for child in &event.children {
+                        capture.detail(DetailEvent {
+                            sequence,
+                            kind: detail_kind::CANDIDATE_CHILD,
+                            phase: event.stage as u16,
+                            primary: event.candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
+                            secondary: child.group.0 as u64,
+                            tertiary: child.candidate.index() as u64,
+                            reference: child.goal.required.0 as u64,
+                            cause: child.goal.grant.stable_tag(),
+                        });
+                        sequence = sequence.saturating_add(1);
+                    }
+                    for fact in &event.facts {
+                        capture.detail(DetailEvent {
+                            sequence,
+                            kind: detail_kind::FACT,
+                            phase: event.stage as u16,
+                            primary: event.candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
+                            secondary: fact.logical_fact_fingerprint.0 as u64,
+                            tertiary: fact.statistics_snapshot_fingerprint.0 as u64,
+                            reference: fact.group.0 as u64,
+                            cause: (fact.logical_fact_fingerprint.0 >> 64) as u64,
+                        });
+                        sequence = sequence.saturating_add(1);
+                    }
+                }
+                for event in &extraction.search_milestones.transformation_task_lifecycle {
+                    capture.detail(DetailEvent {
+                        sequence,
+                        kind: detail_kind::TASK,
+                        phase: event.first_published_us.is_some() as u16,
+                        primary: event.group.0 as u64,
+                        secondary: event.expression.index() as u64,
+                        tertiary: event.rule.0 as u64,
+                        reference: event.first_binding.map_or(0, |binding| binding.0 as u64),
+                        cause: event.first_binding.map_or(0, |binding| (binding.0 >> 64) as u64),
+                    });
+                    sequence = sequence.saturating_add(1);
+                    capture.detail(DetailEvent {
+                        sequence,
+                        kind: detail_kind::TASK,
+                        phase: 2,
+                        primary: event.group.0 as u64,
+                        secondary: event.expression.index() as u64,
+                        tertiary: event.match_count,
+                        reference: event.published_count,
+                        cause: event.no_match_count,
+                    });
+                    sequence = sequence.saturating_add(1);
+                }
+                for variant in &extraction.variants {
+                    capture.detail(DetailEvent {
+                        sequence,
+                        kind: detail_kind::GRANT,
+                        phase: 0,
+                        primary: variant.class.0 as u64,
+                        secondary: variant.physical_fingerprint.0 as u64,
+                        tertiary: variant.cost.score.range.expected.to_bits(),
+                        reference: (variant.physical_fingerprint.0 >> 64) as u64,
+                        cause: variant.cost.max_parallel_tasks as u64,
+                    });
+                    sequence = sequence.saturating_add(1);
+                }
+                capture.detail(DetailEvent {
+                    sequence,
+                    kind: detail_kind::SEARCH,
+                    phase: 0,
+                    primary: extraction.search_summary.groups,
+                    secondary: extraction.search_summary.logical_expressions,
+                    tertiary: extraction.search_summary.physical_expressions,
+                    reference: extraction.search_summary.obligations.len() as u64,
+                    cause: extraction.search_stop.reason as u64,
+                });
             }
         }
         if paro_context::compile_work_evidence_enabled() {

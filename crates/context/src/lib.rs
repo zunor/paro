@@ -63,8 +63,10 @@ pub use compile_diagnostics::{
     MemoryCompletionReceipt, ResourceReceipt, RECEIPT_SCHEMA_VERSION,
 };
 pub use session_diagnostics::{
-    compile_work_evidence_enabled, CompileWork, OptimizerDiagnostic, OptimizerMetricUnit,
-    ExecutionReceiptHandle, ExecutionReceiptStart, SessionDiagnostics, StatementCacheDecision,
+    compile_work_evidence_enabled, CompileReceiptSummary, CompileWork,
+    COMPILE_RECEIPT_SCHEMA_VERSION, OptimizerDiagnostic,
+    OptimizerMetricUnit, ExecutionReceiptHandle, ExecutionReceiptStart, SessionDiagnostics,
+    StatementCacheDecision,
 };
 pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,

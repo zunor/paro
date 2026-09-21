@@ -14,6 +14,7 @@ pub const PROCESS_LIMIT: usize = 64 << 20;
 pub const MAX_CAPTURES: usize = 8;
 pub const MAX_RULES: usize = 64;
 pub const MAX_VARIANTS: usize = 16;
+pub const MAX_DETAIL_EVENTS: usize = 8_192;
 pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
 // Includes fixed recorder, encoder workspace, vector and protocol copy headroom.
 const RESERVATION: usize = 2 << 20;
@@ -74,6 +75,50 @@ pub enum CacheObservation {
 pub enum MeasurementMode {
     Diagnostic,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CaptureLevel {
+    Summary,
+    Detail,
+}
+
+/// Stable machine kinds for the bounded Detail stream.  The values are part
+/// of the Detail schema; the payload fields remain fixed-width references into
+/// the real Memo/TaskRegistry snapshot rather than copied planner objects.
+pub mod detail_kind {
+    pub const RULE: u16 = 1;
+    pub const CANDIDATE: u16 = 2;
+    pub const TASK: u16 = 3;
+    pub const CANDIDATE_CHILD: u16 = 4;
+    pub const QUALITY: u16 = 5;
+    pub const FACT: u16 = 6;
+    pub const GRANT: u16 = 7;
+    pub const SEARCH: u16 = 8;
+    /// A same-Memo publication edge before the output is consumed as a
+    /// candidate. Consumers can distinguish production from later selection
+    /// without replaying rules.
+    pub const PROPOSAL: u16 = 9;
+    pub const MAX: u16 = PROPOSAL;
+}
+
+/// A compact event copied from the real optimizer lifecycle.  IDs are opaque
+/// to the renderer; the Memo/TaskRegistry remain the semantic authority. The
+/// fixed-width shape is deliberate: admitting an event never allocates a
+/// planner object or retains a subtree.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DetailEvent {
+    pub sequence: u64,
+    pub kind: u16,
+    pub phase: u16,
+    pub primary: u64,
+    pub secondary: u64,
+    pub tertiary: u64,
+    /// An additional opaque reference.  Its meaning is fixed by `kind` and
+    /// is never a pointer or a retained planner object.
+    pub reference: u64,
+    pub cause: u64,
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TimerBoundary {
     ParsedAstCompilerEntryToReturnV1,
@@ -128,6 +173,22 @@ pub enum ExecutionImageStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub enum ResourceReservationStatus {
+    NotRequired,
+    Committed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum LoweringStatus {
+    NotStarted,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub enum AdmissionFallback {
     LowerResourceClass,
     ExternalCapacity,
@@ -161,6 +222,7 @@ pub struct ResourceReceipt {
 pub struct ExecutionReceipt {
     pub schema_version: u32,
     pub execution_id: u64,
+    pub statement_decision_id: Option<u64>,
     pub artifact_identity: ArtifactIdentity,
     pub expected_class: Option<u32>,
     pub actual_class: Option<u32>,
@@ -168,6 +230,9 @@ pub struct ExecutionReceipt {
     pub resources: Option<ResourceReceipt>,
     pub admission: AdmissionResult,
     pub fallback: Option<AdmissionFallback>,
+    pub reservation: ResourceReservationStatus,
+    pub lowering: LoweringStatus,
+    pub lowering_error: Option<String>,
     pub image: ExecutionImageStatus,
     pub terminal: ExecutionTerminal,
     pub terminal_error: Option<String>,
@@ -238,6 +303,10 @@ pub struct CompileRecord {
     pub encoded_limit: usize,
     pub process_limit: usize,
     pub process_reservation: usize,
+    pub capture_level: CaptureLevel,
+    pub detail: Vec<DetailEvent>,
+    pub omitted_detail: u64,
+    pub detail_limit: usize,
     pub execution_receipt: Option<ExecutionReceipt>,
 }
 
@@ -298,6 +367,7 @@ pub struct CompileFields {
 pub struct CompileCapture {
     record: Mutex<CompileRecord>,
     sealed: AtomicBool,
+    level: CaptureLevel,
 }
 
 /// Immutable transport view. Its lease keeps the reservation alive after the
@@ -314,6 +384,10 @@ impl SealedCompileCapture {
 impl CompileCapture {
     /// Reserve before allocating. Capacity refusal is diagnostic, not a search error.
     pub fn try_start() -> Option<Arc<Self>> {
+        Self::try_start_with_level(CaptureLevel::Summary)
+    }
+
+    pub fn try_start_with_level(level: CaptureLevel) -> Option<Arc<Self>> {
         ACTIVE
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_CAPTURES && (n + 1) * RESERVATION <= PROCESS_LIMIT).then_some(n + 1)
@@ -387,8 +461,13 @@ impl CompileCapture {
                 encoded_limit: ENCODED_LIMIT,
                 process_limit: PROCESS_LIMIT,
                 process_reservation: RESERVATION,
+                capture_level: level,
+                detail: Vec::new(),
+                omitted_detail: 0,
+                detail_limit: MAX_DETAIL_EVENTS,
                 execution_receipt: None,
             }),
+            level,
         }))
     }
 
@@ -428,6 +507,40 @@ impl CompileCapture {
         }
     }
 
+    pub fn level(&self) -> CaptureLevel {
+        self.level
+    }
+
+    pub fn detail(&self, event: DetailEvent) {
+        if self.level != CaptureLevel::Detail {
+            return;
+        }
+        let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        if self.sealed.load(Ordering::Acquire) {
+            return;
+        }
+        if record.detail.len() < MAX_DETAIL_EVENTS {
+            record.detail.push(event);
+        } else {
+            record.omitted_detail = record.omitted_detail.saturating_add(1);
+        }
+    }
+
+    /// Account for lifecycle records that the real optimizer intentionally
+    /// dropped before this bounded capture was copied.  This is separate from
+    /// `detail()`'s capture-capacity counter so a consumer can distinguish
+    /// source retention loss from transport capacity loss without retaining
+    /// an unbounded event log.
+    pub fn detail_omitted(&self, count: u64) {
+        if self.level != CaptureLevel::Detail || count == 0 {
+            return;
+        }
+        let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.sealed.load(Ordering::Acquire) {
+            record.omitted_detail = record.omitted_detail.saturating_add(count);
+        }
+    }
+
     pub fn variants(&self, count: usize, variants: impl Iterator<Item = VariantSummary>) {
         let mut r = self.record.lock().unwrap_or_else(|e| e.into_inner());
         if self.sealed.load(Ordering::Acquire) {
@@ -449,8 +562,16 @@ impl Drop for CompileCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn capture_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
     #[test]
     fn capacity_is_admitted_before_growth_and_retained_until_last_owner() {
+        let _lock = capture_test_lock();
         let captures: Vec<_> = (0..MAX_CAPTURES)
             .map(|_| CompileCapture::try_start().unwrap())
             .collect();
@@ -503,5 +624,50 @@ mod tests {
         assert_eq!(ACTIVE.load(Ordering::Acquire), 1);
         drop(sealed);
         assert_eq!(ACTIVE.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn detail_is_opt_in_bounded_and_summary_has_no_event_buffer() {
+        let _lock = capture_test_lock();
+        let summary = CompileCapture::try_start().unwrap();
+        summary.detail(DetailEvent {
+            sequence: 0,
+            kind: detail_kind::RULE,
+            phase: 0,
+            primary: 1,
+            secondary: 2,
+            tertiary: 3,
+            reference: 4,
+            cause: 5,
+        });
+        summary.read(|record| {
+            assert_eq!(record.capture_level, CaptureLevel::Summary);
+            assert!(record.detail.is_empty());
+            assert_eq!(record.omitted_detail, 0);
+        });
+
+        let detail = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
+        const DETAIL_ATTEMPTS: usize = 809_720;
+        for sequence in 0..DETAIL_ATTEMPTS {
+            detail.detail(DetailEvent {
+                sequence: sequence as u64,
+                kind: detail_kind::TASK,
+                phase: 0,
+                primary: sequence as u64,
+                secondary: 0,
+                tertiary: 0,
+                reference: 0,
+                cause: 0,
+            });
+        }
+        detail.read(|record| {
+            assert_eq!(record.capture_level, CaptureLevel::Detail);
+            assert_eq!(record.detail.len(), MAX_DETAIL_EVENTS);
+            assert_eq!(
+                record.omitted_detail,
+                (DETAIL_ATTEMPTS - MAX_DETAIL_EVENTS) as u64
+            );
+            assert_eq!(record.detail.first().unwrap().sequence, 0);
+        });
     }
 }

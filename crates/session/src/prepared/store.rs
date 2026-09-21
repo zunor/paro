@@ -54,7 +54,7 @@ pub struct PreparedStatementEntry {
 
 #[derive(Debug, Clone)]
 pub enum PortalKind {
-    Query(ExecutionRequest),
+    Query(Box<ExecutionRequest>),
     CompileExplain {
         target: Box<Statement>,
         options: Vec<ExplainOption>,

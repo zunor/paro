@@ -33,6 +33,15 @@ pub fn render_with_execution(
     json: bool,
     execution: Option<ExecutionReceipt>,
 ) -> String {
+    render_with_execution_level(capture, json, execution, false)
+}
+
+pub fn render_with_execution_level(
+    capture: &SealedCompileCapture,
+    json: bool,
+    execution: Option<ExecutionReceipt>,
+    include_detail: bool,
+) -> String {
     let mut writer = LimitedWriter(Vec::new());
     if writer.0.try_reserve_exact(ENCODED_LIMIT).is_err() {
         return unavailable(json);
@@ -53,7 +62,13 @@ pub fn render_with_execution(
             for v in &record.variants { writeln!(writer, "variant {} fingerprint={:?} admissible_classes={}", v.ordinal,v.physical_fingerprint,v.admissible_classes)?; }
             writeln!(writer, "admission={:?} execution={:?}", record.admission, record.execution)?;
             for r in &record.rules { writeln!(writer, "rule {} binding_calls={} binding_ns={} apply_attempts={} apply_ns={} inserted={} elapsed_ns={}",r.id,r.binding_calls,r.binding_ns,r.attempts,r.elapsed_ns.saturating_sub(r.binding_ns),r.inserted,r.elapsed_ns)?; }
-            writeln!(writer, "omitted_rules={} omitted_variants={} retained_limit={} encoded_limit={} response_terminal={:?} execution_receipt={:?}",record.omitted_rules,record.omitted_variants,record.retained_limit,record.encoded_limit,record.response_terminal,record.execution_receipt)
+            writeln!(writer, "omitted_rules={} omitted_variants={} omitted_detail={} retained_limit={} encoded_limit={} response_terminal={:?} execution_receipt={:?}",record.omitted_rules,record.omitted_variants,record.omitted_detail,record.retained_limit,record.encoded_limit,record.response_terminal,record.execution_receipt)?;
+            if include_detail {
+                for event in &record.detail {
+                    writeln!(writer, "detail seq={} kind={} phase={} primary={} secondary={} tertiary={} reference={} cause={}", event.sequence, event.kind, event.phase, event.primary, event.secondary, event.tertiary, event.reference, event.cause)?;
+                }
+            }
+            Ok(())
         }
     });
     if result.is_err() {
@@ -100,10 +115,20 @@ pub fn validate_json(
         || r.process_reservation != 2 << 20
         || r.rules.len() > MAX_RULES
         || r.variants.len() > MAX_VARIANTS
+        || r.detail_limit != MAX_DETAIL_EVENTS
+        || r.detail.len() > MAX_DETAIL_EVENTS
+        || (r.capture_level == CaptureLevel::Summary
+            && (r.omitted_detail != 0 || !r.detail.is_empty()))
     {
         return Err("schema/capacity profile mismatch".into());
     }
+    if r.detail.windows(2).any(|pair| pair[0].sequence >= pair[1].sequence)
+        || r.detail.iter().any(|event| event.kind == 0 || event.kind > detail_kind::MAX)
+    {
+        return Err("detail events are unordered or use an unsupported kind".into());
+    }
     if let Some(execution) = &r.execution_receipt {
+        use paro_context::compile_diagnostics::{LoweringStatus, ResourceReservationStatus};
         if execution.schema_version != paro_context::compile_diagnostics::RECEIPT_SCHEMA_VERSION
             || r.artifact_identity != Observation::Observed(execution.artifact_identity)
         {
@@ -115,6 +140,23 @@ pub fn validate_json(
                 || execution.resources.is_none())
         {
             return Err("selected execution receipt lacks actual admission".into());
+        }
+        if let (Some(actual_class), Some(resources)) = (execution.actual_class, execution.resources) {
+            if resources.class != actual_class
+                || resources.max_parallel_tasks == 0
+                || resources.memory_ceiling_bytes < resources.minimum_memory_bytes
+                || resources.working_set_memory_bytes < resources.minimum_memory_bytes
+            {
+                return Err("execution resource contract is inconsistent".into());
+            }
+            if let paro_context::compile_diagnostics::MemoryCompletionReceipt::RuntimeCappedKnown {
+                uncapped_memory_bytes,
+            } = resources.memory_completion
+            {
+                if uncapped_memory_bytes < resources.working_set_memory_bytes {
+                    return Err("known uncapped memory is below the working set".into());
+                }
+            }
         }
         if execution.admission == AdmissionResult::Selected
             && matches!(
@@ -128,9 +170,69 @@ pub fn validate_json(
             return Err("selected execution terminal lacks an executable image".into());
         }
         if execution.admission != AdmissionResult::Selected
+            && (execution.actual_class.is_some()
+                || execution.actual_fingerprint.is_some()
+                || execution.resources.is_some()
+                || execution.reservation != ResourceReservationStatus::NotRequired
+                || execution.lowering != LoweringStatus::NotStarted
+                || execution.lowering_error.is_some()
+                || execution.image != ExecutionImageStatus::NotReady)
+        {
+            return Err("non-selected receipt claims an actual resource or image".into());
+        }
+        if execution.admission != AdmissionResult::Selected
             && execution.terminal != ExecutionTerminal::NotExecuted
         {
-            return Err("non-selected admission cannot have an execution terminal".into());
+            return Err("non-selected receipt claims execution".into());
+        }
+        if execution.image == ExecutionImageStatus::Ready
+            && execution.lowering != LoweringStatus::Ready
+        {
+            return Err("ready image has no successful lowering".into());
+        }
+        if execution.lowering == LoweringStatus::Failed
+            && execution.lowering_error.is_none()
+        {
+            return Err("failed lowering lacks its original error".into());
+        }
+        if execution.reservation == ResourceReservationStatus::Failed
+            && (execution.terminal != ExecutionTerminal::Failed
+                || execution.lowering != LoweringStatus::NotStarted
+                || execution.image != ExecutionImageStatus::NotReady
+                || execution.terminal_error.is_none())
+        {
+            return Err("failed reservation has an inconsistent lifecycle".into());
+        }
+        if execution.reservation == ResourceReservationStatus::Failed
+            && execution.lowering_error.is_some()
+        {
+            return Err("failed reservation must not claim lowering".into());
+        }
+        if execution.lowering == LoweringStatus::Failed
+            && (execution.terminal != ExecutionTerminal::Failed
+                || execution.image != ExecutionImageStatus::NotReady
+                || execution.terminal_error.is_none())
+        {
+            return Err("failed lowering has an inconsistent lifecycle".into());
+        }
+        if execution.lowering == LoweringStatus::NotStarted
+            && execution.image != ExecutionImageStatus::NotReady
+        {
+            return Err("image is ready before lowering".into());
+        }
+        if matches!(
+            execution.terminal,
+            ExecutionTerminal::Failed | ExecutionTerminal::Cancelled
+        ) && execution.terminal_error.is_none()
+        {
+            return Err("failed execution lacks its original error".into());
+        }
+        if execution.terminal == ExecutionTerminal::Completed
+            && (execution.reservation != ResourceReservationStatus::Committed
+                || execution.lowering != LoweringStatus::Ready
+                || execution.image != ExecutionImageStatus::Ready)
+        {
+            return Err("completed execution has incomplete lifecycle phases".into());
         }
     }
     if r.rules.windows(2).any(|pair| pair[0].id >= pair[1].id)
@@ -286,5 +388,102 @@ mod tests {
             r.artifact = ArtifactStatus::CompiledArtifactReady;
         });
         assert!(validate_json(render(&capture.seal(), true).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn execution_receipt_validates_selection_reservation_and_lowering_order() {
+        use paro_context::compile_diagnostics::*;
+
+        let identity = ArtifactIdentity {
+            schema_version: 1,
+            artifact: [1, 2],
+            structure: [3, 4],
+            dependencies: [5, 6],
+        };
+        let resources = ResourceReceipt {
+            class: 2,
+            minimum_memory_bytes: 100,
+            working_set_memory_bytes: 200,
+            memory_ceiling_bytes: 1_000,
+            memory_completion: MemoryCompletionReceipt::Guaranteed,
+            max_parallel_tasks: 4,
+            external_worker_slots: 0,
+        };
+        let receipt = ExecutionReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            execution_id: 7,
+            statement_decision_id: Some(4),
+            artifact_identity: identity,
+            expected_class: Some(2),
+            actual_class: Some(2),
+            actual_fingerprint: Some([7, 8]),
+            resources: Some(resources),
+            admission: AdmissionResult::Selected,
+            fallback: None,
+            reservation: ResourceReservationStatus::Committed,
+            lowering: LoweringStatus::Ready,
+            lowering_error: None,
+            image: ExecutionImageStatus::Ready,
+            terminal: ExecutionTerminal::Completed,
+            terminal_error: None,
+        };
+
+        let capture = CompileCapture::try_start().unwrap();
+        capture.update(|record| {
+            record.outcome = CompileOutcome::Success;
+            record.safety_verified = Observation::Observed(true);
+            record.artifact = ArtifactStatus::CompiledArtifactReady;
+            record.artifact_identity = Observation::Observed(identity);
+            record.compiler_ns = Observation::Observed(0);
+            record.bind_ns = Observation::Observed(0);
+            record.optimizer_ns = Observation::Observed(0);
+            record.verify_ns = Observation::Observed(0);
+            record.finish_ns = Observation::Observed(0);
+            record.compiler_other_ns = Observation::Observed(0);
+        });
+        let json = render_with_execution(&capture.seal(), true, Some(receipt.clone()));
+        validate_json(json.as_bytes()).unwrap();
+
+        let mut invalid = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        let execution = invalid
+            .get_mut("execution_receipt")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        execution.insert(
+            "image".into(),
+            serde_json::Value::String("NotReady".into()),
+        );
+        assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
+
+        let capture = CompileCapture::try_start().unwrap();
+        capture.update(|record| {
+            record.outcome = CompileOutcome::Success;
+            record.safety_verified = Observation::Observed(true);
+            record.artifact = ArtifactStatus::CompiledArtifactReady;
+            record.artifact_identity = Observation::Observed(identity);
+            record.compiler_ns = Observation::Observed(0);
+            record.bind_ns = Observation::Observed(0);
+            record.optimizer_ns = Observation::Observed(0);
+            record.verify_ns = Observation::Observed(0);
+            record.finish_ns = Observation::Observed(0);
+            record.compiler_other_ns = Observation::Observed(0);
+        });
+        let mut invalid = serde_json::from_str::<serde_json::Value>(
+            &render_with_execution(&capture.seal(), true, Some(receipt)),
+        )
+        .unwrap();
+        let execution = invalid
+            .get_mut("execution_receipt")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        execution.insert(
+            "reservation".into(),
+            serde_json::Value::String("Failed".into()),
+        );
+        execution.insert(
+            "terminal".into(),
+            serde_json::Value::String("Completed".into()),
+        );
+        assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
     }
 }

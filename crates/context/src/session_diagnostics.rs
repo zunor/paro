@@ -3,13 +3,19 @@
 
 //! Session-owned diagnostic snapshots shared across statement contexts.
 
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
 use crate::StatementTraceSnapshot;
 use crate::compile_diagnostics::{
-    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt, ExecutionTerminal,
-    ResourceReceipt, RECEIPT_SCHEMA_VERSION,
+    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt,
+    ExecutionTerminal, LoweringStatus, Observation, ResourceReceipt, ResourceReservationStatus,
+    SearchStop, RECEIPT_SCHEMA_VERSION,
 };
+
+pub const COMPILE_RECEIPT_SCHEMA_VERSION: u32 = 1;
+const MAX_ACTIVE_EXECUTION_RECEIPTS: usize = 256;
+const MAX_ACTIVE_STATEMENT_DECISIONS: usize = 256;
 
 /// Unit of the value exposed by one optimizer diagnostic row.
 ///
@@ -54,21 +60,47 @@ pub struct OptimizerDiagnostic {
 /// sample can prove a miss without enabling per-event tracing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementCacheDecision {
+    /// Session-monotonic identity of this cache decision.  `occurrence` is
+    /// retained only as human-readable context and is not an association key.
+    pub decision_id: u64,
     pub query_fingerprint: u64,
     pub occurrence: u64,
     pub cache_hit: bool,
     pub artifact_identity: Option<ArtifactIdentity>,
     pub compile_work: Option<CompileWork>,
+    pub compile_receipt: Option<CompileReceiptSummary>,
 }
 
 /// Scalar work ledger read after the client timer. Collection is not free:
 /// the clocks/counter copies still execute inside the original SELECT.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompileWork {
     pub compiler_elapsed_us: u64,
     pub optimizer_elapsed_us: u64,
     pub rule_elapsed_us: u64,
     pub child_combination_cost_synthesis_count: u64,
+}
+
+/// Immutable compiler-side context retained by a shareable artifact. This is
+/// the source receipt for a cache hit; the hit still receives a fresh
+/// execution receipt for its actual admission and terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompileReceiptSummary {
+    pub schema_version: u32,
+    pub artifact_identity: Option<ArtifactIdentity>,
+    pub search_stop: Observation<SearchStop>,
+    pub search_complete: Observation<bool>,
+    pub quality_policy_satisfied: Observation<bool>,
+    pub budget_limited: Observation<bool>,
+    pub obligations: Observation<u64>,
+    pub groups: Observation<u64>,
+    pub logical_expressions: Observation<u64>,
+    pub physical_expressions: Observation<u64>,
+    pub expected_class: Observation<u32>,
+    pub variant_count: Observation<usize>,
+    pub omitted_variants: u64,
+    pub compile_work: Option<CompileWork>,
 }
 
 pub fn compile_work_evidence_enabled() -> bool {
@@ -82,9 +114,19 @@ pub struct SessionDiagnostics {
     optimizer: RwLock<Vec<OptimizerDiagnostic>>,
     statement_trace: RwLock<Option<StatementTraceSnapshot>>,
     statement_cache: RwLock<Vec<StatementCacheDecision>>,
+    /// Decisions with a live producer/execution owner stay outside bounded
+    /// terminal history so a live handle can never lose its update target.
+    active_statement_cache: RwLock<std::collections::BTreeMap<u64, StatementCacheDecision>>,
     execution_work: RwLock<Vec<ExecutionWorkRecord>>,
+    /// Completed/terminal receipts are retained in a bounded history.  An
+    /// active handle is kept separately so history eviction can never make a
+    /// live execution silently unupdatable.
     execution_receipts: RwLock<Vec<ExecutionReceipt>>,
+    active_execution_receipts: RwLock<std::collections::BTreeMap<u64, ExecutionReceipt>>,
     execution_sequence: std::sync::atomic::AtomicU64,
+    statement_sequence: std::sync::atomic::AtomicU64,
+    statement_decision_capacity_exceeded: std::sync::atomic::AtomicU64,
+    execution_receipt_capacity_exceeded: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +144,7 @@ pub struct ExecutionWorkRecord {
 /// artifact with a selection or resource contract from another admission.
 #[derive(Debug, Clone)]
 pub struct ExecutionReceiptStart {
+    pub statement_decision_id: Option<u64>,
     pub artifact_identity: ArtifactIdentity,
     pub expected_class: Option<u32>,
     pub actual_class: Option<u32>,
@@ -128,11 +171,12 @@ pub struct ExecutionReceiptHandle {
 struct ExecutionReceiptLease {
     diagnostics: Arc<SessionDiagnostics>,
     execution_id: u64,
+    registered: bool,
 }
 
 impl ExecutionReceiptHandle {
-    pub fn execution_id(&self) -> u64 {
-        self.lease.execution_id
+    pub fn execution_id(&self) -> Option<u64> {
+        self.lease.registered.then_some(self.lease.execution_id)
     }
 
     pub fn complete(&self) {
@@ -148,21 +192,49 @@ impl ExecutionReceiptHandle {
     }
 
     pub fn image_ready(&self) {
+        if !self.lease.registered { return; }
         self.lease
             .diagnostics
             .mark_execution_image_ready(self.lease.execution_id);
+    }
+
+    pub fn lowering_ready(&self) {
+        if !self.lease.registered { return; }
+        self.lease
+            .diagnostics
+            .mark_execution_lowering(self.lease.execution_id, LoweringStatus::Ready, None);
+    }
+
+    pub fn lowering_failed(&self, error: impl Into<String>) {
+        if !self.lease.registered { return; }
+        let error = error.into();
+        self.lease.diagnostics.mark_execution_lowering(
+            self.lease.execution_id,
+            LoweringStatus::Failed,
+            Some(error.clone()),
+        );
+        self.fail(error);
+    }
+
+    pub fn reservation_failed(&self, error: impl Into<String>) {
+        if !self.lease.registered { return; }
+        self.lease
+            .diagnostics
+            .mark_execution_reservation_failed(self.lease.execution_id, error.into());
     }
 
     /// Preserve an admission failure without turning it into an execution
     /// terminal.  An infeasible or failed admission is deliberately
     /// `NotExecuted`; the original bounded error still belongs on the receipt.
     pub fn record_error(&self, error: impl Into<String>) {
+        if !self.lease.registered { return; }
         self.lease
             .diagnostics
             .record_execution_receipt_error(self.lease.execution_id, error.into());
     }
 
     fn finish(&self, terminal: ExecutionTerminal, error: Option<String>) {
+        if !self.lease.registered { return; }
         self.lease
             .diagnostics
             .finish_execution_receipt(self.lease.execution_id, terminal, error);
@@ -171,6 +243,7 @@ impl ExecutionReceiptHandle {
 
 impl Drop for ExecutionReceiptLease {
     fn drop(&mut self) {
+        if !self.registered { return; }
         self.diagnostics.finish_execution_receipt(
             self.execution_id,
             ExecutionTerminal::Dropped,
@@ -192,9 +265,11 @@ impl SessionDiagnostics {
         start: ExecutionReceiptStart,
     ) -> ExecutionReceiptHandle {
         let execution_id = self.execution_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let statement_decision_id = start.statement_decision_id;
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             execution_id,
+            statement_decision_id,
             artifact_identity: start.artifact_identity,
             expected_class: start.expected_class,
             actual_class: start.actual_class,
@@ -202,6 +277,13 @@ impl SessionDiagnostics {
             resources: start.resources,
             admission: start.admission,
             fallback: start.fallback,
+            reservation: if start.admission == AdmissionResult::Selected {
+                ResourceReservationStatus::Committed
+            } else {
+                ResourceReservationStatus::NotRequired
+            },
+            lowering: LoweringStatus::NotStarted,
+            lowering_error: None,
             image: ExecutionImageStatus::NotReady,
             terminal: if start.admission == AdmissionResult::Selected {
                 ExecutionTerminal::Running
@@ -210,22 +292,45 @@ impl SessionDiagnostics {
             },
             terminal_error: None,
         };
-        let mut receipts = self.execution_receipts.write().unwrap();
-        receipts.push(receipt);
-        if receipts.len() > 64 {
-            receipts.remove(0);
+        let mut active = self.active_execution_receipts.write().unwrap();
+        if active.len() >= MAX_ACTIVE_EXECUTION_RECEIPTS {
+            self.execution_receipt_capacity_exceeded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The execution is still allowed to proceed without a retained
+            // diagnostic receipt, but its statement decision must not remain
+            // an unbounded live handle.  Preserve the decision in bounded
+            // history and expose the missing execution receipt through the
+            // capacity counter/table row.
+            drop(active);
+            if let Some(decision_id) = statement_decision_id {
+                self.finish_statement_cache_decision(decision_id);
+            }
+            return ExecutionReceiptHandle {
+                lease: Arc::new(ExecutionReceiptLease {
+                    diagnostics: Arc::clone(self),
+                    execution_id,
+                    registered: false,
+                }),
+            };
         }
+        active.insert(execution_id, receipt);
         ExecutionReceiptHandle {
             lease: Arc::new(ExecutionReceiptLease {
                 diagnostics: Arc::clone(self),
                 execution_id,
+                registered: true,
             }),
         }
     }
 
+    pub fn execution_receipt_capacity_exceeded(&self) -> u64 {
+        self.execution_receipt_capacity_exceeded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn mark_execution_image_ready(&self, execution_id: u64) {
-        let mut receipts = self.execution_receipts.write().unwrap();
-        let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.execution_id == execution_id) else {
+        let mut receipts = self.active_execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.get_mut(&execution_id) else {
             return;
         };
         if receipt.admission == AdmissionResult::Selected
@@ -235,26 +340,76 @@ impl SessionDiagnostics {
         }
     }
 
+    fn mark_execution_lowering(
+        &self,
+        execution_id: u64,
+        status: LoweringStatus,
+        error: Option<String>,
+    ) {
+        let mut receipts = self.active_execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.get_mut(&execution_id) else {
+            return;
+        };
+        if receipt.terminal == ExecutionTerminal::Running {
+            receipt.lowering = status;
+            receipt.lowering_error = error.map(|value| value.chars().take(256).collect());
+        }
+    }
+
+    fn mark_execution_reservation_failed(&self, execution_id: u64, error: String) {
+        let mut receipts = self.active_execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.get_mut(&execution_id) else {
+            return;
+        };
+        if receipt.terminal == ExecutionTerminal::Running {
+            receipt.reservation = ResourceReservationStatus::Failed;
+            receipt.terminal_error = Some(error.chars().take(256).collect());
+        }
+    }
+
     pub fn finish_execution_receipt(
         &self,
         execution_id: u64,
         terminal: ExecutionTerminal,
         error: Option<String>,
     ) {
-        let mut receipts = self.execution_receipts.write().unwrap();
-        let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.execution_id == execution_id) else {
+        let mut active = self.active_execution_receipts.write().unwrap();
+        let Some(receipt) = active.get_mut(&execution_id) else {
             return;
         };
-        if receipt.terminal != ExecutionTerminal::Running {
-            return;
+        match receipt.terminal {
+            ExecutionTerminal::Running => {
+                receipt.terminal = terminal;
+                receipt.terminal_error = error.map(|value| value.chars().take(256).collect());
+            }
+            ExecutionTerminal::NotExecuted => {
+                if let Some(error) = error {
+                    receipt.terminal_error = Some(error.chars().take(256).collect());
+                }
+                // Preserve the admission failure as NotExecuted. Dropping its
+                // handle closes the record but must not relabel it as a query
+                // cancellation or successful execution.
+            }
+            _ => return,
         }
-        receipt.terminal = terminal;
-        receipt.terminal_error = error.map(|value| value.chars().take(256).collect());
+        let decision_id = receipt.statement_decision_id;
+        let receipt = active
+            .remove(&execution_id)
+            .expect("active receipt was just looked up");
+        drop(active);
+        let mut history = self.execution_receipts.write().unwrap();
+        history.push(receipt);
+        if history.len() > 64 {
+            history.remove(0);
+        }
+        if let Some(decision_id) = decision_id {
+            self.finish_statement_cache_decision(decision_id);
+        }
     }
 
     fn record_execution_receipt_error(&self, execution_id: u64, error: String) {
-        let mut receipts = self.execution_receipts.write().unwrap();
-        let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.execution_id == execution_id) else {
+        let mut receipts = self.active_execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.get_mut(&execution_id) else {
             return;
         };
         if receipt.terminal == ExecutionTerminal::NotExecuted {
@@ -263,8 +418,50 @@ impl SessionDiagnostics {
     }
 
     pub fn execution_receipts_snapshot(&self) -> Vec<ExecutionReceipt> {
-        self.execution_receipts.read().unwrap().clone()
+        let mut result = self.execution_receipts.read().unwrap().clone();
+        result.extend(self.active_execution_receipts.read().unwrap().values().cloned());
+        result.sort_by_key(|receipt| receipt.execution_id);
+        result
     }
+
+    pub fn execution_receipt(&self, execution_id: u64) -> Option<ExecutionReceipt> {
+        if let Some(receipt) = self
+            .active_execution_receipts
+            .read()
+            .unwrap()
+            .get(&execution_id)
+            .cloned()
+        {
+            return Some(receipt);
+        }
+        self.execution_receipts
+            .read()
+            .unwrap()
+            .iter()
+            .find(|receipt| receipt.execution_id == execution_id)
+            .cloned()
+    }
+
+    /// Close a decision when compilation itself fails before an execution
+    /// receipt can be created.  This is the same terminal transition used by
+    /// an execution receipt; it prevents a failed active decision from
+    /// consuming unbounded live state while preserving it in history.
+    pub fn finish_statement_cache_decision(&self, decision_id: u64) {
+        let Some(decision) = self
+            .active_statement_cache
+            .write()
+            .unwrap()
+            .remove(&decision_id)
+        else {
+            return;
+        };
+        let mut history = self.statement_cache.write().unwrap();
+        history.push(decision);
+        if history.len() > 256 {
+            history.remove(0);
+        }
+    }
+
     pub fn execution_work_snapshot(&self) -> Vec<ExecutionWorkRecord> {
         self.execution_work.read().unwrap().clone()
     }
@@ -284,51 +481,80 @@ impl SessionDiagnostics {
         self.statement_trace.read().unwrap().clone()
     }
 
-    pub fn publish_statement_cache_decision(&self, query_fingerprint: u64, cache_hit: bool) -> u64 {
-        const MAX_DECISIONS: usize = 256;
-        let mut decisions = self.statement_cache.write().unwrap();
-        let occurrence = decisions
+    pub fn publish_statement_cache_decision(
+        &self,
+        query_fingerprint: u64,
+        cache_hit: bool,
+    ) -> Option<u64> {
+        let mut active = self.active_statement_cache.write().unwrap();
+        if active.len() >= MAX_ACTIVE_STATEMENT_DECISIONS {
+            self.statement_decision_capacity_exceeded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        let decision_id = self
+            .statement_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let occurrence = active
             .iter()
-            .filter(|decision| decision.query_fingerprint == query_fingerprint)
+            .filter(|(_, decision)| decision.query_fingerprint == query_fingerprint)
             .count() as u64;
-        decisions.push(StatementCacheDecision {
+        active.insert(decision_id, StatementCacheDecision {
+            decision_id,
             query_fingerprint,
             occurrence,
             cache_hit,
             artifact_identity: None,
             compile_work: None,
+            compile_receipt: None,
         });
-        if decisions.len() > MAX_DECISIONS {
-            decisions.remove(0);
-        }
-        occurrence
+        Some(decision_id)
     }
 
-    pub fn publish_statement_artifact(
-        &self,
-        query: u64,
-        occurrence: u64,
-        artifact_identity: ArtifactIdentity,
-    ) {
-        let mut decisions = self.statement_cache.write().unwrap();
-        if let Some(decision) = decisions.iter_mut().find(|decision|
-            decision.query_fingerprint == query && decision.occurrence == occurrence
-        ) {
+    pub fn statement_decision_capacity_exceeded(&self) -> u64 {
+        self.statement_decision_capacity_exceeded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn publish_statement_artifact(&self, decision_id: u64, artifact_identity: ArtifactIdentity) {
+        let mut active = self.active_statement_cache.write().unwrap();
+        if let Some(decision) = active.get_mut(&decision_id) {
             decision.artifact_identity = Some(artifact_identity);
         }
     }
 
-    pub fn publish_compile_work(&self, query: u64, occurrence: u64, work: CompileWork) {
-        let mut decisions = self.statement_cache.write().unwrap();
-        if let Some(decision) = decisions.iter_mut().find(|decision|
-            decision.query_fingerprint == query && decision.occurrence == occurrence
-            && !decision.cache_hit && decision.compile_work.is_none()) {
+    pub fn publish_compile_work(&self, decision_id: u64, work: CompileWork) {
+        let mut active = self.active_statement_cache.write().unwrap();
+        if let Some(decision) = active.get_mut(&decision_id) {
+            if decision.compile_work.is_some() {
+                return;
+            }
             decision.compile_work = Some(work);
         }
     }
 
+    pub fn publish_compile_receipt(
+        &self,
+        decision_id: u64,
+        mut receipt: CompileReceiptSummary,
+    ) {
+        let mut active = self.active_statement_cache.write().unwrap();
+        if let Some(decision) = active.get_mut(&decision_id) {
+            if receipt.artifact_identity.is_none() {
+                receipt.artifact_identity = decision.artifact_identity;
+            }
+            if decision.compile_receipt.is_none() {
+                decision.compile_work = receipt.compile_work;
+                decision.compile_receipt = Some(receipt);
+            }
+        }
+    }
+
     pub fn statement_cache_snapshot(&self) -> Vec<StatementCacheDecision> {
-        self.statement_cache.read().unwrap().clone()
+        let mut result = self.statement_cache.read().unwrap().clone();
+        result.extend(self.active_statement_cache.read().unwrap().values().cloned());
+        result.sort_by_key(|decision| decision.decision_id);
+        result
     }
 }
 
@@ -337,20 +563,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compile_work_is_exact_occurrence_not_the_latest_query_or_cached_cost() {
+    fn compile_work_is_bound_to_the_decision_id_not_occurrence_or_latest_query() {
         let diagnostics = SessionDiagnostics::default();
-        let first = diagnostics.publish_statement_cache_decision(11, false);
-        let second = diagnostics.publish_statement_cache_decision(11, true);
-        diagnostics.publish_statement_cache_decision(22, false);
+        let first = diagnostics.publish_statement_cache_decision(11, false).unwrap();
+        let second = diagnostics.publish_statement_cache_decision(11, true).unwrap();
+        diagnostics.publish_statement_cache_decision(22, false).unwrap();
         let work = CompileWork { compiler_elapsed_us: 20, optimizer_elapsed_us: 10,
             rule_elapsed_us: 3, child_combination_cost_synthesis_count: 7 };
-        diagnostics.publish_compile_work(11, first, work);
-        diagnostics.publish_compile_work(11, first, CompileWork::default());
-        diagnostics.publish_compile_work(11, second, work);
-        diagnostics.publish_compile_work(33, first, work);
+        diagnostics.publish_compile_work(first, work);
+        diagnostics.publish_compile_work(first, CompileWork::default());
+        diagnostics.publish_compile_work(second, work);
+        diagnostics.publish_compile_work(33, work);
         let rows = diagnostics.statement_cache_snapshot();
+        assert_eq!(rows[0].decision_id, first);
+        assert_eq!(rows[1].decision_id, second);
         assert_eq!(rows[0].compile_work, Some(work));
-        assert_eq!(rows[1].compile_work, None);
+        assert_eq!(rows[1].compile_work, Some(work));
         assert_eq!(rows[2].compile_work, None);
     }
 
@@ -364,6 +592,7 @@ mod tests {
             dependencies: [5, 6],
         };
         let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            statement_decision_id: None,
             artifact_identity: identity,
             expected_class: Some(2),
             actual_class: Some(2),
@@ -381,6 +610,101 @@ mod tests {
     }
 
     #[test]
+    fn active_receipt_capacity_is_explicit_and_does_not_grow_unboundedly() {
+        let diagnostics = Arc::new(SessionDiagnostics::default());
+        let identity = ArtifactIdentity {
+            schema_version: 1,
+            artifact: [1, 2],
+            structure: [3, 4],
+            dependencies: [5, 6],
+        };
+        let handles: Vec<_> = (0..(MAX_ACTIVE_EXECUTION_RECEIPTS + 1))
+            .map(|_| diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+                statement_decision_id: None,
+                artifact_identity: identity,
+                expected_class: Some(2),
+                actual_class: Some(2),
+                actual_fingerprint: Some([7, 8]),
+                resources: None,
+                admission: AdmissionResult::Selected,
+                fallback: None,
+            }))
+            .collect();
+        assert_eq!(diagnostics.execution_receipts_snapshot().len(), MAX_ACTIVE_EXECUTION_RECEIPTS);
+        assert_eq!(diagnostics.execution_receipt_capacity_exceeded(), 1);
+        assert!(handles.last().unwrap().execution_id().is_none());
+    }
+
+    #[test]
+    fn receipt_capacity_closes_the_associated_statement_decision() {
+        let diagnostics = Arc::new(SessionDiagnostics::default());
+        let decision = diagnostics
+            .publish_statement_cache_decision(77, false)
+            .unwrap();
+        let identity = ArtifactIdentity {
+            schema_version: 1,
+            artifact: [1, 2],
+            structure: [3, 4],
+            dependencies: [5, 6],
+        };
+        let handles: Vec<_> = (0..MAX_ACTIVE_EXECUTION_RECEIPTS)
+            .map(|_| {
+                diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+                    statement_decision_id: None,
+                    artifact_identity: identity,
+                    expected_class: Some(2),
+                    actual_class: Some(2),
+                    actual_fingerprint: Some([7, 8]),
+                    resources: None,
+                    admission: AdmissionResult::Selected,
+                    fallback: None,
+                })
+            })
+            .collect();
+
+        let unregistered = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            statement_decision_id: Some(decision),
+            artifact_identity: identity,
+            expected_class: Some(2),
+            actual_class: Some(2),
+            actual_fingerprint: Some([7, 8]),
+            resources: None,
+            admission: AdmissionResult::Selected,
+            fallback: None,
+        });
+        assert!(unregistered.execution_id().is_none());
+        assert_eq!(diagnostics.execution_receipt_capacity_exceeded(), 1);
+        assert!(diagnostics
+            .statement_cache_snapshot()
+            .iter()
+            .any(|item| item.decision_id == decision));
+
+        drop(handles);
+    }
+
+    #[test]
+    fn active_statement_decision_capacity_is_explicit_and_releases_on_terminal() {
+        let diagnostics = SessionDiagnostics::default();
+        let decisions: Vec<_> = (0..MAX_ACTIVE_STATEMENT_DECISIONS)
+            .map(|index| diagnostics.publish_statement_cache_decision(index as u64, false).unwrap())
+            .collect();
+        assert!(diagnostics.publish_statement_cache_decision(999, false).is_none());
+        assert_eq!(diagnostics.statement_decision_capacity_exceeded(), 1);
+        diagnostics.finish_statement_cache_decision(decisions[0]);
+        let replacement = diagnostics
+            .publish_statement_cache_decision(1000, true)
+            .expect("terminal decision releases its active slot");
+        assert_ne!(replacement, decisions[0]);
+        // The terminal decision remains in bounded history while the
+        // replacement occupies the newly freed live slot.  The contract is
+        // on active decisions, not on the combined live-plus-history view.
+        assert_eq!(
+            diagnostics.statement_cache_snapshot().len(),
+            MAX_ACTIVE_STATEMENT_DECISIONS + 1
+        );
+    }
+
+    #[test]
     fn dropping_one_receipt_clone_does_not_close_running_execution() {
         let diagnostics = Arc::new(SessionDiagnostics::default());
         let identity = ArtifactIdentity {
@@ -390,6 +714,7 @@ mod tests {
             dependencies: [15, 16],
         };
         let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            statement_decision_id: None,
             artifact_identity: identity,
             expected_class: Some(2),
             actual_class: Some(2),

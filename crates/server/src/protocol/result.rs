@@ -161,10 +161,25 @@ pub(crate) async fn send_chunk_rows(
     schema: &[ResultColumnDesc],
     format_codes: &[FormatCode],
 ) -> Result<()> {
-    let encoded = encode_chunk_rows(chunk, schema, format_codes)?.into_inner();
-    socket.write_buffer_mut().unsplit(encoded);
+    append_chunk_rows(socket, chunk, schema, format_codes)?;
     flush_result_buffer_if_needed(socket).await?;
     Ok(())
+}
+
+/// Append binary/text-protocol result rows without deciding ownership of the
+/// encoded bytes. Diagnostic callers transfer that ownership to `PgCodec`
+/// immediately after this function returns; ordinary result callers do not
+/// retain a diagnostic lease.
+pub(crate) fn append_chunk_rows(
+    socket: &mut Framed<TcpStream, PgCodec>,
+    chunk: &Chunk,
+    schema: &[ResultColumnDesc],
+    format_codes: &[FormatCode],
+) -> Result<usize> {
+    let encoded = encode_chunk_rows(chunk, schema, format_codes)?.into_inner();
+    let bytes = encoded.len();
+    socket.write_buffer_mut().unsplit(encoded);
+    Ok(bytes)
 }
 
 fn append_text_chunk_rows(

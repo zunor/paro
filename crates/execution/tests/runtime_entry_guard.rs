@@ -41,8 +41,10 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
     );
     assert!(
         executor.contains("pub fn execute(&self, request: ExecutionRequest)")
-            && executor.contains("let (compiled, parameter_bindings) = request.into_parts()"),
-        "Executor must require an explicit plan-plus-bindings execution request"
+            && executor.contains(
+                "let (compiled, parameter_bindings, statement_decision_id) = request.into_parts()",
+            ),
+        "Executor must require an explicit plan, bindings, and statement identity request"
     );
     assert!(
         !executor.contains("CompiledExecutable::LegacyPhysicalPlan")
@@ -110,9 +112,9 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
     );
     let program = read(&manifest, "src/pipeline/program.rs");
     assert!(
-        program.contains("pub fn admit_for_execution")
-            && program.contains("Self::from_physical_portfolio"),
-        "execution must admit a verified optimizer portfolio before lowering"
+        program.contains("pub fn select_for_execution")
+            && program.contains("pub fn from_physical_portfolio"),
+        "execution must select a verified optimizer portfolio before lowering"
     );
     assert!(
         !compiler.contains(".plan(&mut optimized_plan)"),

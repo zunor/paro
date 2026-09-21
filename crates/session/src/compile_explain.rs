@@ -9,7 +9,7 @@ use paro_common::{
     types::LogicalType,
     vector::Vector,
 };
-use paro_context::{StatementOptions, compile_diagnostics::CompileCapture};
+use paro_context::{StatementOptions, compile_diagnostics::{CaptureLevel, CompileCapture}};
 use paro_context::ExecutionTerminal;
 use paro_execution::query_executor::compiled::ExecutionRequest;
 use paro_execution::query_executor::executor::Executor;
@@ -71,11 +71,6 @@ impl Session {
                 "EXPLAIN (COMPILE) does not accept trailing FORMAT",
             ));
         }
-        if options.contains(&ExplainOption::Detail) {
-            return Err(error::not_supported(
-                "EXPLAIN (COMPILE, DETAIL) is not implemented in this phase",
-            ));
-        }
         if !matches!(target, Statement::Query(_)) {
             return Err(error::not_supported(
                 "EXPLAIN (COMPILE) supports query/CTE targets only",
@@ -91,7 +86,11 @@ impl Session {
             auto,
         };
         let session = &mut *transaction.session;
-        let capture = CompileCapture::try_start();
+        let capture = CompileCapture::try_start_with_level(if options.contains(&ExplainOption::Detail) {
+            CaptureLevel::Detail
+        } else {
+            CaptureLevel::Summary
+        });
         let cancellation = session
             .current_statement_cancellation()
             .expect("compile request scope");
@@ -155,25 +154,23 @@ impl Session {
                     return Err(error);
                 }
             };
+            let execution_id = handler.execution_id();
             while let Some(_chunk) = handler.fetch()? {}
-            let identity = compiled.artifact_identity();
-            session
-                .diagnostics
-                .execution_receipts_snapshot()
-                .into_iter()
-                .rev()
-                .find(|receipt| {
-                    receipt.artifact_identity == identity
-                        && receipt.terminal != ExecutionTerminal::NotExecuted
-                })
+            execution_id.and_then(|id| {
+                session
+                    .diagnostics
+                    .execution_receipt(id)
+                    .filter(|receipt| receipt.terminal != ExecutionTerminal::NotExecuted)
+            })
         } else {
             None
         };
         drop(compiled);
-        let document = paro_execution::explain::compile_render::render_with_execution(
+        let document = paro_execution::explain::compile_render::render_with_execution_level(
             &capture,
             json,
             execution_receipt,
+            options.contains(&ExplainOption::Detail),
         );
         let send = async {
             sink.start_result(&["QUERY PLAN".into()], &[LogicalType::Varchar])

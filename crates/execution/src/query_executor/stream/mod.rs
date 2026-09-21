@@ -82,6 +82,15 @@ impl std::fmt::Debug for ResultHandler {
 }
 
 impl ResultHandler {
+    /// Stable identity of the execution receipt owned by this handler.  The
+    /// value is captured before the handler is drained so callers never have
+    /// to search session history for a "latest" matching artifact.
+    pub fn execution_id(&self) -> Option<u64> {
+        self.execution_receipt
+            .as_ref()
+            .and_then(ExecutionReceiptHandle::execution_id)
+    }
+
     /// Create an empty ResultHandler (for DDL/DML that return no rows).
     pub fn empty(allocator: Arc<dyn Allocator>) -> Result<Self> {
         Ok(Self {

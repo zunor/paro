@@ -103,41 +103,61 @@ fn compile_query_cte_and_reject_unimplemented_options() {
             let mut receipt_sink = CollectingSink::new();
             session
                 .execute_simple_query(
-                    "SELECT name FROM paro_optimizers()",
+                    "SELECT name, record_type, record_id, payload_json FROM paro_optimizers()",
                     &mut receipt_sink,
                 )
                 .await
                 .unwrap();
             let receipt_result = receipt_sink.assert_single_result();
             let mut receipt_names = Vec::new();
+            let mut receipt_types = Vec::new();
+            let mut receipt_ids = Vec::new();
+            let mut receipt_payloads = Vec::new();
             for chunk in &receipt_result.chunks {
                 for row in 0..chunk.len() {
                     if let Value::Varchar(name) = chunk.column(0).unwrap().get_value(row) {
                         receipt_names.push(name);
                     }
+                    if let Value::Varchar(record_type) = chunk.column(1).unwrap().get_value(row) {
+                        receipt_types.push(record_type);
+                    }
+                    if let Value::BigInt(record_id) = chunk.column(2).unwrap().get_value(row) {
+                        receipt_ids.push(record_id);
+                    }
+                    if let Value::Varchar(payload) = chunk.column(3).unwrap().get_value(row) {
+                        receipt_payloads.push(payload);
+                    }
                 }
             }
             assert!(
-                receipt_names
+                receipt_types
                     .iter()
-                    .any(|name| name.starts_with("statement_compile_receipt/")),
-                "normal SELECT did not publish a compile receipt: {receipt_names:?}"
+                    .any(|record_type| record_type == "statement_cache"),
+                "normal SELECT did not publish a typed statement decision: {receipt_names:?}"
             );
             assert!(
-                receipt_names
+                receipt_types
                     .iter()
-                    .any(|name| name.starts_with("statement_execution_receipt/")),
-                "normal SELECT did not publish an execution receipt: {receipt_names:?}"
+                    .any(|record_type| record_type == "execution_receipt"),
+                "normal SELECT did not publish a typed execution receipt: {receipt_names:?}"
             );
             assert!(
-                receipt_names
+                receipt_ids
                     .iter()
-                    .filter(|name| name.starts_with("statement_plan_cache/"))
-                    .count()
-                    >= 2,
-                "normal SELECT cache decisions were not retained: {receipt_names:?}"
+                    .any(|id| *id >= 0),
+                "typed receipt ids were not exported: {receipt_names:?}"
             );
-            for sql in ["EXPLAIN (COMPILE, DETAIL) SELECT 1", "EXPLAIN (COMPILE) CREATE TABLE forbidden (x INT)", "EXPLAIN (COMPILE) SELECT 1 FORMAT JSON", "EXPLAIN (COMPILE) EXPLAIN SELECT 1"] {
+            let detail = document(&mut session, "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) SELECT 1").await;
+            let detail_record: serde_json::Value = serde_json::from_str(&detail).unwrap();
+            assert_eq!(detail_record["capture_level"], "Detail");
+            let detail_events = detail_record["detail"].as_array().unwrap();
+            assert!(!detail_events.is_empty());
+            assert!(detail_events.iter().any(|event| {
+                event["kind"]
+                    == paro_context::compile_diagnostics::detail_kind::PROPOSAL
+            }));
+            assert!(receipt_payloads.iter().any(|payload| payload.contains("schema_version")));
+            for sql in ["EXPLAIN (COMPILE) CREATE TABLE forbidden (x INT)", "EXPLAIN (COMPILE) SELECT 1 FORMAT JSON", "EXPLAIN (COMPILE) EXPLAIN SELECT 1"] {
                 let mut sink = CollectingSink::new();
                 assert!(session.execute_simple_query(sql, &mut sink).await.is_err(), "{sql}");
             }

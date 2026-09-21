@@ -2515,9 +2515,20 @@ impl OptimizationInput {
         };
         let seed_reprice_us = (seed_reprice_count > 0)
             .then(|| u64::try_from(seed_reprice_started.elapsed().as_micros()).unwrap_or(u64::MAX));
-        engine.set_rule_work_profile_enabled(paro_context::StatementTrace::enabled());
-        if self.planner_state.read().expect("planner transform state poisoned")
-            .session.as_ref().is_some_and(|context| context.options.compile_capture.is_some()) {
+        let capture_level = self
+            .planner_state
+            .read()
+            .expect("planner transform state poisoned")
+            .session
+            .as_ref()
+            .and_then(|context| context.options.compile_capture.as_ref())
+            .map(|capture| capture.level());
+        let detail_capture = matches!(
+            capture_level,
+            Some(paro_context::compile_diagnostics::CaptureLevel::Detail)
+        );
+        engine.set_rule_work_profile_enabled(paro_context::StatementTrace::enabled() || detail_capture);
+        if capture_level.is_some() {
             engine.observe_compile_rule_work();
         }
         let env_certified_group_pruning = std::env::var_os("PARO_CERTIFIED_GROUP_PRUNING")

@@ -11,7 +11,9 @@ use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
-use paro_context::{ArtifactIdentity, CompileEnvironmentKey, StatementContext};
+use paro_context::{
+    ArtifactIdentity, CompileEnvironmentKey, CompileReceiptSummary, StatementContext,
+};
 use paro_optimizer::physical::{
     Fingerprint, PhysicalNodeKind, SearchSourceSpec, StableFingerprintBuilder,
 };
@@ -40,6 +42,7 @@ impl ResultColumnDesc {
 pub struct CompiledStatement {
     image: Arc<CompiledStatementImage>,
     compile_work: Option<paro_context::CompileWork>,
+    compile_receipt: Option<CompileReceiptSummary>,
 }
 
 #[derive(Debug)]
@@ -66,6 +69,7 @@ impl CompiledStatement {
         );
         Self {
             compile_work: None,
+            compile_receipt: None,
             image: Arc::new(CompiledStatementImage {
                 program,
                 result_schema: result_schema.into_boxed_slice(),
@@ -83,6 +87,15 @@ impl CompiledStatement {
 
     pub fn compile_work(&self) -> Option<paro_context::CompileWork> {
         self.compile_work
+    }
+
+    pub fn with_compile_receipt(mut self, receipt: CompileReceiptSummary) -> Self {
+        self.compile_receipt = Some(receipt);
+        self
+    }
+
+    pub fn compile_receipt(&self) -> Option<CompileReceiptSummary> {
+        self.compile_receipt
     }
 
     #[inline]
@@ -238,6 +251,7 @@ fn write_program_identity(
         }
         StatementProgram::Pipeline { plan, .. } => {
             structure.write_bytes(b"pipeline");
+            structure.write_fingerprint(plan.structural_identity_fingerprint());
             write_plan_dependencies(dependencies, plan);
         }
         StatementProgram::ExplainAnalyze { target, .. } => {
@@ -426,6 +440,7 @@ pub(crate) fn physical_plan_dependencies_available(
 pub struct ExecutionRequest {
     statement: CompiledStatement,
     bindings: Arc<ParameterBindings>,
+    statement_decision_id: Option<u64>,
 }
 
 impl ExecutionRequest {
@@ -434,6 +449,7 @@ impl ExecutionRequest {
         Ok(Self {
             statement,
             bindings: Arc::new(bindings),
+            statement_decision_id: None,
         })
     }
 
@@ -487,6 +503,7 @@ impl ExecutionRequest {
         Ok(Self {
             statement,
             bindings: self.bindings,
+            statement_decision_id: self.statement_decision_id,
         })
     }
 
@@ -495,8 +512,18 @@ impl ExecutionRequest {
         &self.statement
     }
 
-    pub fn into_parts(self) -> (CompiledStatement, Arc<ParameterBindings>) {
-        (self.statement, self.bindings)
+    pub fn into_parts(self) -> (CompiledStatement, Arc<ParameterBindings>, Option<u64>) {
+        (self.statement, self.bindings, self.statement_decision_id)
+    }
+
+    pub fn with_statement_decision_id(mut self, decision_id: u64) -> Self {
+        self.statement_decision_id = Some(decision_id);
+        self
+    }
+
+    #[inline]
+    pub fn statement_decision_id(&self) -> Option<u64> {
+        self.statement_decision_id
     }
 }
 
@@ -567,7 +594,7 @@ mod tests {
         let replaced = request
             .with_statement(replacement.clone())
             .expect("matching replacement signature");
-        let (replaced_statement, replaced_bindings) = replaced.into_parts();
+        let (replaced_statement, replaced_bindings, _) = replaced.into_parts();
 
         assert!(replaced_statement.shares_image_with(&replacement));
         assert!(Arc::ptr_eq(&original_bindings, &replaced_bindings));

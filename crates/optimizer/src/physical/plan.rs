@@ -243,6 +243,21 @@ impl PhysicalPlan {
         out
     }
 
+    /// Stable identity of the executable physical structure.  This is an
+    /// identity for receipt correlation, not a claim of SQL equivalence: the
+    /// explain representation carries operator payloads while the tree
+    /// carries child topology and output layout.  Keep the domain/version
+    /// explicit so a consumer never treats a later encoding as compatible.
+    pub fn structural_identity_fingerprint(&self) -> Fingerprint {
+        let mut builder = StableFingerprintBuilder::default();
+        builder.write_bytes(b"paro.physical-plan-structure.v1");
+        builder.write_u64(self.root.index() as u64);
+        builder.write_u64(self.nodes.len() as u64);
+        builder.write_bytes(self.format_tree().as_bytes());
+        builder.write_bytes(self.format_explain_json(ExplainSpec::default()).as_bytes());
+        builder.finish()
+    }
+
     pub fn format_explain_text_with_spec(&self, spec: &ExplainSpec) -> String {
         let doc = self.to_explain_doc(*spec);
         let mut out = String::new();

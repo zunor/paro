@@ -207,7 +207,7 @@ pub fn compile_statement_with_parameter_types(
         "Runtime program generated"
     );
 
-    let compiled = CompiledStatement::new(
+    let mut compiled = CompiledStatement::new(
         executable,
         result_names
             .into_iter()
@@ -225,6 +225,19 @@ pub fn compile_statement_with_parameter_types(
             column.logical_type.hash(&mut identity);
         }
         capture.update(|r| r.output_identity = paro_context::compile_diagnostics::Observation::Observed(identity.finish()));
+    }
+
+    let compile_work = compile_work.map(|mut work| {
+        work.compiler_elapsed_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        work
+    });
+    if let Some(mut receipt) = optimizer.compile_receipt() {
+        receipt.artifact_identity = Some(compiled.artifact_identity());
+        receipt.compile_work = compile_work;
+        compiled = compiled.with_compile_receipt(receipt);
+    }
+    if let Some(work) = compile_work {
+        compiled = compiled.with_compile_work(work);
     }
 
     // The optimizer and planner state are no longer needed once the deferred
@@ -261,11 +274,5 @@ pub fn compile_statement_with_parameter_types(
             r.outcome = paro_context::compile_diagnostics::CompileOutcome::Success;
         });
     }
-    Ok(match compile_work {
-        Some(mut work) => {
-            work.compiler_elapsed_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-            compiled.with_compile_work(work)
-        }
-        None => compiled,
-    })
+    Ok(compiled)
 }

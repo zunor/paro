@@ -1121,10 +1121,12 @@ impl Session {
         query_fingerprint: u64,
         cache_hit: bool,
     ) -> Option<u64> {
-        Some(
-            self.diagnostics
-                .publish_statement_cache_decision(query_fingerprint, cache_hit),
-        )
+        self.diagnostics
+            .publish_statement_cache_decision(query_fingerprint, cache_hit)
+    }
+
+    pub(crate) fn finish_statement_cache_decision(&self, decision_id: u64) {
+        self.diagnostics.finish_statement_cache_decision(decision_id);
     }
 
     /// Hold an extended-protocol trace until Sync has completed the pipeline.

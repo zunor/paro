@@ -1065,149 +1065,97 @@ fn populate_paro_optimizers(
                 metric_value: entry.metric_value,
                 metric_unit: entry.metric_unit.as_str().to_string(),
                 invocation_count: entry.invocation_count,
+                record_type: "metric".into(),
+                record_id: 0,
+                payload_json: None,
             })
             .collect::<Vec<_>>();
         let mut entries = entries;
-        entries.extend(
-            ctx.diagnostics
-                .statement_cache_snapshot()
-                .into_iter()
-                .map(|decision| OptimizerData {
-                    name: format!(
-                        "statement_plan_cache/{:016x}/{}",
-                        decision.query_fingerprint, decision.occurrence
-                    ),
-                    kind: "evidence".to_string(),
-                    last_elapsed_us: 0,
-                    metric_value: i64::from(decision.cache_hit),
-                    metric_unit: "count".to_string(),
-                    invocation_count: 1,
-                }),
-        );
+        let receipt_capacity_exceeded = ctx.diagnostics.execution_receipt_capacity_exceeded();
+        if receipt_capacity_exceeded > 0 {
+            entries.push(OptimizerData {
+                name: "statement_execution_receipt_capacity_exceeded".into(),
+                kind: "capacity".into(),
+                last_elapsed_us: 0,
+                metric_value: i64::try_from(receipt_capacity_exceeded).unwrap_or(i64::MAX),
+                metric_unit: "count".into(),
+                invocation_count: 1,
+                record_type: "metric".into(),
+                record_id: 0,
+                payload_json: None,
+            });
+        }
+        let decision_capacity_exceeded = ctx.diagnostics.statement_decision_capacity_exceeded();
+        if decision_capacity_exceeded > 0 {
+            entries.push(OptimizerData {
+                name: "statement_cache_decision_capacity_exceeded".into(),
+                kind: "capacity".into(),
+                last_elapsed_us: 0,
+                metric_value: i64::try_from(decision_capacity_exceeded).unwrap_or(i64::MAX),
+                metric_unit: "count".into(),
+                invocation_count: 1,
+                record_type: "metric".into(),
+                record_id: 0,
+                payload_json: None,
+            });
+        }
         for decision in ctx.diagnostics.statement_cache_snapshot() {
-            if let Some(identity) = decision.artifact_identity {
-                for (name, value) in [
-                    ("identity_schema_version", u64::from(identity.schema_version)),
-                    ("artifact_hi", identity.artifact[0]),
-                    ("artifact_lo", identity.artifact[1]),
-                    ("structure_hi", identity.structure[0]),
-                    ("structure_lo", identity.structure[1]),
-                    ("dependencies_hi", identity.dependencies[0]),
-                    ("dependencies_lo", identity.dependencies[1]),
-                ] {
-                    entries.push(OptimizerData {
-                        name: format!(
-                            "statement_compile_receipt/{:016x}/{}/{}",
-                            decision.query_fingerprint, decision.occurrence, name
-                        ),
-                        kind: "receipt".into(),
-                        last_elapsed_us: 0,
-                        // BigInt is the existing diagnostic wire type.  Preserve the
-                        // complete u64 identity by carrying its two's-complement bit
-                        // pattern; readers decode identity_word values back to u64.
-                        metric_value: value as i64,
-                        metric_unit: "identity_word".into(),
-                        invocation_count: 1,
-                    });
-                }
-            }
-            let Some(work) = decision.compile_work else { continue };
-            for (name, value, unit) in [
-                ("compiler_elapsed_us", work.compiler_elapsed_us, "microseconds"),
-                ("optimizer_elapsed_us", work.optimizer_elapsed_us, "microseconds"),
-                ("rule_elapsed_us", work.rule_elapsed_us, "microseconds"),
-                ("child_combination_cost_synthesis_count", work.child_combination_cost_synthesis_count, "count"),
-            ] {
-                entries.push(OptimizerData {
-                    name: format!("statement_compile_work/{:016x}/{}/{}", decision.query_fingerprint, decision.occurrence, name),
-                    kind: "evidence".into(),
-                    last_elapsed_us: 0,
-                    metric_value: i64::try_from(value).unwrap_or(i64::MAX),
-                    metric_unit: unit.into(),
-                    invocation_count: 1,
-                });
-            }
+            // One typed row is the machine contract.  The human metric columns
+            // are intentionally not used to reconstruct identity or enums.
+            entries.push(OptimizerData {
+                name: "statement_cache_decision".into(),
+                kind: "receipt".into(),
+                last_elapsed_us: 0,
+                metric_value: i64::from(decision.cache_hit),
+                metric_unit: "count".into(),
+                invocation_count: 1,
+                record_type: "statement_cache".into(),
+                record_id: decision.decision_id,
+                payload_json: Some(serde_json::json!({
+                    "schema_version": 1,
+                    "decision_id": decision.decision_id,
+                    "query_fingerprint": decision.query_fingerprint,
+                    "occurrence": decision.occurrence,
+                    "cache_hit": decision.cache_hit,
+                    "artifact_identity": decision.artifact_identity,
+                    "compile_work": decision.compile_work,
+                    "compile_receipt": decision.compile_receipt,
+                }).to_string()),
+            });
         }
         for receipt in ctx.diagnostics.execution_receipts_snapshot() {
-            let identity = receipt.artifact_identity;
-            let mut values = vec![
-                ("identity_schema_version", u64::from(identity.schema_version)),
-                ("artifact_hi", identity.artifact[0]),
-                ("artifact_lo", identity.artifact[1]),
-                ("structure_hi", identity.structure[0]),
-                ("structure_lo", identity.structure[1]),
-                ("dependencies_hi", identity.dependencies[0]),
-                ("dependencies_lo", identity.dependencies[1]),
-                ("expected_class", u64::from(receipt.expected_class.unwrap_or(u32::MAX))),
-                ("actual_class", u64::from(receipt.actual_class.unwrap_or(u32::MAX))),
-                ("admission", match receipt.admission {
-                    paro_context::AdmissionResult::Selected => 1,
-                    paro_context::AdmissionResult::Infeasible => 2,
-                    paro_context::AdmissionResult::Failed => 3,
-                }),
-                ("terminal", match receipt.terminal {
-                    paro_context::ExecutionTerminal::NotExecuted => 0,
-                    paro_context::ExecutionTerminal::Running => 1,
-                    paro_context::ExecutionTerminal::Completed => 2,
-                    paro_context::ExecutionTerminal::Failed => 3,
-                    paro_context::ExecutionTerminal::Cancelled => 4,
-                    paro_context::ExecutionTerminal::Dropped => 5,
-                }),
-                ("image", match receipt.image {
-                    paro_context::ExecutionImageStatus::NotReady => 0,
-                    paro_context::ExecutionImageStatus::Ready => 1,
-                }),
-            ];
-            if let Some(fingerprint) = receipt.actual_fingerprint {
-                values.extend([
-                    ("actual_fingerprint_hi", fingerprint[0]),
-                    ("actual_fingerprint_lo", fingerprint[1]),
-                ]);
-            }
-            if let Some(fallback) = receipt.fallback {
-                values.push((
-                    "fallback",
-                    match fallback {
-                        paro_context::AdmissionFallback::LowerResourceClass => 1,
-                        paro_context::AdmissionFallback::ExternalCapacity => 2,
-                        paro_context::AdmissionFallback::DependencyChanged => 3,
-                    },
-                ));
-            }
-            if let Some(resources) = receipt.resources {
-                values.extend([
-                    ("working_set_memory_bytes", resources.working_set_memory_bytes),
-                    ("memory_ceiling_bytes", resources.memory_ceiling_bytes),
-                    ("max_parallel_tasks", u64::from(resources.max_parallel_tasks)),
-                    ("external_worker_slots", u64::from(resources.external_worker_slots)),
-                ]);
-            }
-            for (name, value) in values {
-                entries.push(OptimizerData {
-                    name: format!("statement_execution_receipt/{}/{}", receipt.execution_id, name),
-                    kind: "receipt".into(),
-                    last_elapsed_us: 0,
-                    metric_value: value as i64,
-                    metric_unit: if name.ends_with("_hi") || name.ends_with("_lo") {
-                        "identity_word"
-                    } else {
-                        "receipt"
-                    }
-                    .into(),
-                    invocation_count: 1,
-                });
-            }
+            entries.push(OptimizerData {
+                name: "statement_execution_receipt".into(),
+                kind: "receipt".into(),
+                last_elapsed_us: 0,
+                metric_value: 0,
+                metric_unit: "receipt".into(),
+                invocation_count: 1,
+                record_type: "execution_receipt".into(),
+                record_id: receipt.execution_id,
+                payload_json: Some(
+                    serde_json::to_string(&receipt).unwrap_or_else(|_| "null".into()),
+                ),
+            });
         }
         for record in ctx.diagnostics.execution_work_snapshot() {
-            for (name, value) in record.snapshot.rows().into_iter().chain(std::iter::once(("image_id".into(), record.image_id))) {
-                entries.push(OptimizerData {
-                    name: format!("statement_execution_work/{:016x}/{}/{}", record.query_fingerprint, record.execution_id, name),
-                    kind: "evidence".into(), last_elapsed_us: 0,
-                    metric_value: i64::try_from(value).unwrap_or(i64::MAX),
-                    metric_unit: if name.ends_with("_bytes") { "bytes" } else if name.ends_with("_ns") { "nanoseconds" } else if name.ends_with("_us") { "microseconds" } else { "count" }.into(),
-                    invocation_count: 1,
-                });
-            }
+            entries.push(OptimizerData {
+                name: "statement_execution_work".into(),
+                kind: "receipt".into(),
+                last_elapsed_us: 0,
+                metric_value: 0,
+                metric_unit: "receipt".into(),
+                invocation_count: 1,
+                record_type: "execution_work".into(),
+                record_id: record.execution_id,
+                payload_json: Some(serde_json::json!({
+                    "schema_version": 1,
+                    "execution_id": record.execution_id,
+                    "query_fingerprint": record.query_fingerprint,
+                    "image_id": record.image_id,
+                    "metrics": record.snapshot.rows(),
+                }).to_string()),
+            });
         }
         populate_optimizer_data(state, entries);
     }

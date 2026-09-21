@@ -13,6 +13,7 @@ use paro_session::{
     CopyProtocolSink, CopyProtocolSource, ExtendedQueryResponder, FormatCode,
     StatementCancellation, StatementCompletion,
 };
+use paro_common::vector::VectorLifetimeOwner;
 use pgwire::messages::data::{NoData, ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
     BindComplete, CloseComplete, ParseComplete, PortalSuspended,
@@ -28,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::PgCodec;
 
 use super::copy::{create_copy_in_source, create_copy_out_sink, CopyFrontendMode};
-use super::result::{build_error_response, field_description_with_format, send_chunk_rows};
+use super::result::{
+    append_chunk_rows, build_error_response, field_description_with_format, send_chunk_rows,
+};
 use super::transport;
 
 pub struct PgWireExtendedQueryResponder<'a> {
@@ -130,6 +133,25 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
         format_codes: &[FormatCode],
     ) -> Result<()> {
         send_chunk_rows(self.socket, chunk, schema, format_codes).await
+    }
+
+    async fn send_diagnostic_chunk(
+        &mut self,
+        chunk: &Chunk,
+        schema: &[ResultColumnDesc],
+        format_codes: &[FormatCode],
+        owner: Arc<dyn VectorLifetimeOwner>,
+    ) -> Result<()> {
+        let bytes = append_chunk_rows(self.socket, chunk, schema, format_codes)?;
+        // The encoded rows are now owned by Framed's write buffer. Retaining
+        // the owner in PgCodec, rather than on this request future, keeps the
+        // capture alive across backpressure, cancellation and future drop.
+        self.socket
+            .codec_mut()
+            .retain_pending_output_owner(bytes, owner);
+        transport::flush(self.socket)
+            .await
+            .map_err(|e| paro_common::error::internal(e.to_string()))
     }
 
     async fn send_command_complete(&mut self, completion: &StatementCompletion) -> Result<()> {

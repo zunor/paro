@@ -20,7 +20,7 @@ use paro_scheduler::scheduler::TaskScheduler;
 use tracing::debug;
 
 use crate::memory_runtime::{ExecutionLease, QueryMemoryPool};
-use crate::pipeline::{AdmissionSelection, StatementProgram};
+use crate::pipeline::{AdmissionSelection, SelectedStatementProgram};
 use crate::query_executor::compiled::{CompiledStatement, ExecutionRequest};
 use crate::query_executor::program_executor;
 use crate::runtime::ParameterBindings;
@@ -54,7 +54,7 @@ impl Executor {
 
     /// Execute a typed runtime program and return a streaming result handler.
     pub fn execute(&self, request: ExecutionRequest) -> Result<ResultHandler> {
-        let (compiled, parameter_bindings) = request.into_parts();
+        let (compiled, parameter_bindings, statement_decision_id) = request.into_parts();
         let result_names = compiled.result_names();
         let result_types = compiled.result_types();
         let is_query = !result_names.is_empty();
@@ -89,7 +89,7 @@ impl Executor {
         if let Some(trace) = &statement_trace {
             trace.record_span("admission", "lower_and_admit", admission_started);
         }
-        let (program, execution_lease, selection, fallback) = match admitted {
+        let (selected, execution_lease, selection, fallback) = match admitted {
             Ok(admitted) => admitted,
             Err(error) => {
                 let admission = if error.sqlstate().is_resource_error() {
@@ -98,6 +98,7 @@ impl Executor {
                     AdmissionResult::Failed
                 };
                 let receipt = self.session.diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+                    statement_decision_id,
                     artifact_identity: compiled.artifact_identity(),
                     expected_class: compiled.expected_grant_class(),
                     actual_class: None,
@@ -115,6 +116,7 @@ impl Executor {
             }
         };
         let receipt = self.session.diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            statement_decision_id,
             artifact_identity: compiled.artifact_identity(),
             expected_class: compiled.expected_grant_class(),
             actual_class: selection.map(|selection| selection.resources.class.0),
@@ -124,11 +126,26 @@ impl Executor {
             fallback,
         });
         if let Some(lease) = execution_lease {
-            query_memory_pool.install_execution_lease(lease)?;
+            if let Err(error) = query_memory_pool.install_execution_lease(lease) {
+                receipt.reservation_failed(error.to_string());
+                receipt.fail(error.to_string());
+                return Err(error);
+            }
             if let Some(trace) = &statement_trace {
                 trace.record_event("admission", "resource_grant_published");
             }
         }
+        let program = match selected.lower() {
+            Ok(program) => program,
+            Err(error) => {
+                // Admission already selected and reserved this operating
+                // point. Lowering failure is a distinct post-selection
+                // failure, never an Infeasible/no-plan result.
+                receipt.lowering_failed(error.to_string());
+                return Err(error);
+            }
+        };
+        receipt.lowering_ready();
         if let Some(trace) = &statement_trace {
             trace.record_event("execution", "pipeline_dispatch_entry");
         }
@@ -173,7 +190,7 @@ impl Executor {
         query_memory_pool: &Arc<QueryMemoryPool>,
         available_external_worker_slots: u16,
     ) -> Result<(
-        StatementProgram,
+        SelectedStatementProgram,
         Option<ExecutionLease>,
         Option<AdmissionSelection>,
         Option<AdmissionFallback>,
@@ -190,17 +207,18 @@ impl Executor {
             if let Some(trace) = self.session.statement_trace() {
                 trace.record_value("admission", "admission_attempt", admission_attempt);
             }
-            let (program, selection) = compiled.program().admit_for_execution_with_selection(
+            let selected = compiled.program().select_for_execution(
                 memory_ceiling,
                 available_parallel_tasks,
                 external_ceiling,
                 &|plan| super::compiled::physical_plan_dependencies_available(plan, &self.session),
             )?;
-            let Some(resources) = program.execution_resources() else {
+            let selection = selected.selection();
+            let Some(resources) = selected.execution_resources() else {
                 if let Some(trace) = self.session.statement_trace() {
                     trace.record_event("admission", "resource_contract_absent");
                 }
-                return Ok((program, None, selection, fallback));
+                return Ok((selected, None, selection, fallback));
             };
             if let Some(trace) = self.session.statement_trace() {
                 trace.record_value(
@@ -244,7 +262,7 @@ impl Executor {
                 usize::try_from(resources.working_set_memory_bytes).unwrap_or(usize::MAX);
             if query_memory_pool.try_reserve_minimum_capacity(working_set)? {
                 return Ok((
-                    program,
+                    selected,
                     Some(ExecutionLease::new(resources, external_workers)?),
                     selection,
                     fallback,

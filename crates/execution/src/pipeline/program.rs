@@ -66,6 +66,53 @@ pub struct AdmissionSelection {
     pub resources: paro_optimizer::physical::ExecutionResourceContract,
 }
 
+/// A resource-selected program whose physical image has not been lowered yet.
+/// Selection is an admission fact; lowering is a separate fallible lifecycle
+/// edge so a lowering error cannot be reported as if no plan had been chosen.
+#[derive(Debug)]
+pub enum SelectedStatementProgram {
+    Physical {
+        plan: PhysicalPlan,
+        selection: AdmissionSelection,
+    },
+    ExplainAnalyze {
+        target: Box<SelectedStatementProgram>,
+        spec: paro_planner::operator::ExplainSpec,
+    },
+    Ready(StatementProgram),
+}
+
+impl SelectedStatementProgram {
+    pub fn selection(&self) -> Option<AdmissionSelection> {
+        match self {
+            Self::Physical { selection, .. } => Some(*selection),
+            Self::ExplainAnalyze { target, .. } => target.selection(),
+            Self::Ready(_) => None,
+        }
+    }
+
+    pub fn execution_resources(
+        &self,
+    ) -> Option<paro_optimizer::physical::ExecutionResourceContract> {
+        match self {
+            Self::Physical { plan, .. } => plan.execution_resources,
+            Self::ExplainAnalyze { target, .. } => target.execution_resources(),
+            Self::Ready(program) => program.execution_resources(),
+        }
+    }
+
+    pub fn lower(self) -> Result<StatementProgram> {
+        match self {
+            Self::Physical { plan, .. } => StatementProgram::from_physical_plan(plan),
+            Self::ExplainAnalyze { target, spec } => Ok(StatementProgram::ExplainAnalyze {
+                target: Box::new(target.lower()?),
+                spec,
+            }),
+            Self::Ready(program) => Ok(program),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PipelineProgram {
     pub id: PipelineId,
@@ -313,57 +360,63 @@ impl StatementProgram {
     where
         F: Fn(&PhysicalPlan) -> bool,
     {
-        match self {
-            Self::Portfolio(portfolio) => {
-                let (program, selection) = Self::from_physical_portfolio_with_selection(
-                portfolio.clone(),
-                available_memory_bytes,
-                available_parallel_tasks,
-                available_external_worker_slots,
-                dependency_available,
-                )?;
-                Ok((program, Some(selection)))
-            }
-            Self::ExplainAnalyze { target, spec } => {
-                let (target, selection) = target.admit_for_execution_with_selection(
-                    available_memory_bytes,
-                    available_parallel_tasks,
-                    available_external_worker_slots,
-                    dependency_available,
-                )?;
-                Ok((Self::ExplainAnalyze { target: Box::new(target), spec: *spec }, selection))
-            }
-            Self::Pipeline { .. } | Self::Utility(_) => Ok((self.clone(), None)),
-        }
-    }
-
-    fn from_physical_portfolio_with_selection<F>(
-        portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
-        available_memory_bytes: u64,
-        available_parallel_tasks: u16,
-        available_external_worker_slots: u16,
-        dependency_available: &F,
-    ) -> Result<(Self, AdmissionSelection)>
-    where
-        F: Fn(&PhysicalPlan) -> bool,
-    {
-        portfolio.verify()?;
-        let mut admitted = portfolio.admit(
+        let selected = self.select_for_execution(
             available_memory_bytes,
             available_parallel_tasks,
             available_external_worker_slots,
             dependency_available,
         )?;
-        let selection = AdmissionSelection {
-            physical_fingerprint: admitted.physical_fingerprint,
-            resources: admitted.resources,
-        };
-        admitted.plan.execution_resources = Some(admitted.resources);
-        // Retain the optimizer's sharing proof. The reservation selects an
-        // operating point; it does not change which points the winner was
-        // costed for. Physical verification checks root and child contracts.
-        Ok((Self::from_physical_plan(admitted.plan)?, selection))
+        let selection = selected.selection();
+        Ok((selected.lower()?, selection))
     }
+
+    /// Select an executable physical alternative without lowering it.  The
+    /// executor uses this boundary to publish the actual selection before a
+    /// fallible image construction begins.
+    pub fn select_for_execution<F>(
+        &self,
+        available_memory_bytes: u64,
+        available_parallel_tasks: u16,
+        available_external_worker_slots: u16,
+        dependency_available: &F,
+    ) -> Result<SelectedStatementProgram>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
+        match self {
+            Self::Portfolio(portfolio) => {
+                portfolio.verify()?;
+                let mut admitted = portfolio.admit(
+                    available_memory_bytes,
+                    available_parallel_tasks,
+                    available_external_worker_slots,
+                    dependency_available,
+                )?;
+                let selection = AdmissionSelection {
+                    physical_fingerprint: admitted.physical_fingerprint,
+                    resources: admitted.resources,
+                };
+                admitted.plan.execution_resources = Some(admitted.resources);
+                Ok(SelectedStatementProgram::Physical {
+                    plan: admitted.plan,
+                    selection,
+                })
+            }
+            Self::ExplainAnalyze { target, spec } => Ok(SelectedStatementProgram::ExplainAnalyze {
+                target: Box::new(target.select_for_execution(
+                    available_memory_bytes,
+                    available_parallel_tasks,
+                    available_external_worker_slots,
+                    dependency_available,
+                )?),
+                spec: *spec,
+            }),
+            Self::Pipeline { .. } | Self::Utility(_) => {
+                Ok(SelectedStatementProgram::Ready(self.clone()))
+            }
+        }
+    }
+
 }
 
 #[derive(Debug, Default)]

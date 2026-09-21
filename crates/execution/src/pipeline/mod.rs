@@ -17,5 +17,5 @@ pub use program::{
     AdmissionSelection, ControlRegionKind, ControlRegionProgram, ExtensionOperatorFactory, ExtensionSinkSpec,
     ExtensionSourceSpec, ExtensionTransformSpec, OperatorRuntimeRegistry, PipelineIdMap,
     PipelineProgram, PipelineProgramBuilder, PipelineProgramIndex, PipelineProgramSet,
-    StatementProgram, UtilityProgram,
+    SelectedStatementProgram, StatementProgram, UtilityProgram,
 };

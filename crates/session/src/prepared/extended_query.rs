@@ -116,6 +116,16 @@ pub trait ExtendedQueryResponder: Send {
         schema: &[ResultColumnDesc],
         format_codes: &[FormatCode],
     ) -> Result<()>;
+    /// Send diagnostic bytes while transferring their lifetime owner to the
+    /// protocol transport. Returning from this method does not imply that
+    /// the connection buffer has drained the encoded bytes.
+    async fn send_diagnostic_chunk(
+        &mut self,
+        chunk: &Chunk,
+        schema: &[ResultColumnDesc],
+        format_codes: &[FormatCode],
+        owner: Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> Result<()>;
     async fn send_command_complete(&mut self, completion: &StatementCompletion) -> Result<()>;
     async fn send_close_complete(&mut self) -> Result<()>;
     async fn send_no_data(&mut self) -> Result<()>;
@@ -455,15 +465,28 @@ async fn execute_bind_inner<R: ExtendedQueryResponder>(
             }
         }
         StatementClass::Query => {
-            let plan = select_protocol_query_plan(
+            let planned = select_protocol_query_plan(
                 session,
                 &statement,
                 &parameter_env,
                 statement_trace.clone(),
             )?;
-            let execution = ExecutionRequest::from_typed_env(plan.clone(), &parameter_env)?;
-            cached_query_plan = Some(plan);
-            PortalKind::Query(execution)
+            let execution = match ExecutionRequest::from_typed_env(planned.plan.clone(), &parameter_env) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    if let Some(decision_id) = planned.statement_decision_id {
+                        session.finish_statement_cache_decision(decision_id);
+                    }
+                    return Err(error);
+                }
+            };
+            let execution = if let Some(id) = planned.statement_decision_id {
+                execution.with_statement_decision_id(id)
+            } else {
+                execution
+            };
+            cached_query_plan = Some(planned.plan);
+            PortalKind::Query(Box::new(execution))
         }
     };
 
@@ -617,7 +640,7 @@ async fn execute_portal<R: ExtendedQueryResponder>(
 
                 match portal_kind {
                     PortalKind::Query(execution) => {
-                        execute_query_portal(session, &mut portal, execution, &message, responder)
+                        execute_query_portal(session, &mut portal, *execution, &message, responder)
                             .await
                     }
                     PortalKind::CompileExplain {
@@ -754,7 +777,7 @@ fn build_parse_artifacts(
             );
             let share_across_sessions = !session.transaction.has_active_transaction();
             if parameter_types.is_empty() {
-                let compiled = build_query_plan(
+                let planned = build_query_plan(
                     session,
                     snapshot,
                     stmt.clone(),
@@ -762,13 +785,13 @@ fn build_parse_artifacts(
                     share_across_sessions,
                     statement_fingerprint(sql),
                 )?;
-                Ok((compiled.result_schema().to_vec(), Some(compiled)))
+                Ok((planned.plan.result_schema().to_vec(), Some(planned.plan)))
             } else {
                 let parameter_types = parameter_types
                     .iter()
                     .map(|ty| ty.clone().unwrap_or(LogicalType::Unknown))
                     .collect::<Vec<_>>();
-                let compiled = build_query_plan(
+                let planned = build_query_plan(
                     session,
                     snapshot,
                     stmt.clone(),
@@ -779,8 +802,8 @@ fn build_parse_artifacts(
                 let generic_plan = parameter_types
                     .iter()
                     .all(|ty| !matches!(ty, LogicalType::Unknown))
-                    .then_some(compiled.clone());
-                Ok((compiled.result_schema().to_vec(), generic_plan))
+                    .then_some(planned.plan.clone());
+                Ok((planned.plan.result_schema().to_vec(), generic_plan))
             }
         }
         FrontendRoute::Utility(cmd) => Ok((utility_result_schema(cmd), None)),
@@ -815,6 +838,11 @@ fn compile_explain_result_schema() -> Vec<ResultColumnDesc> {
     vec![ResultColumnDesc::new("QUERY PLAN", LogicalType::Varchar)]
 }
 
+struct PlannedQuery {
+    plan: CompiledStatement,
+    statement_decision_id: Option<u64>,
+}
+
 fn build_query_plan(
     session: &Session,
     snapshot: Arc<StatementContext>,
@@ -822,28 +850,29 @@ fn build_query_plan(
     parameter_types: &[LogicalType],
     share_across_sessions: bool,
     cache_query_fingerprint: u64,
-) -> Result<CompiledStatement> {
+) -> Result<PlannedQuery> {
     let statement_trace = snapshot.statement_trace();
     if share_across_sessions {
         if let Some(plan) =
             session.reusable_instance_query_plan(&stmt, parameter_types, snapshot.as_ref())
         {
-            if let Some(occurrence) =
-                session.record_statement_cache_decision(cache_query_fingerprint, true)
-            {
-                snapshot.diagnostics.publish_statement_artifact(
-                    cache_query_fingerprint,
-                    occurrence,
-                    plan.artifact_identity(),
-                );
+            let statement_decision_id = session
+                .record_statement_cache_decision(cache_query_fingerprint, true);
+            if let Some(decision_id) = statement_decision_id {
+                snapshot
+                    .diagnostics
+                    .publish_statement_artifact(decision_id, plan.artifact_identity());
             }
             if let Some(trace) = &statement_trace {
                 trace.record_event("compile", "plan_cache_hit");
             }
-            return Ok(plan);
+            return Ok(PlannedQuery {
+                plan,
+                statement_decision_id,
+            });
         }
     }
-    let cache_occurrence = share_across_sessions.then(||
+    let statement_decision_id = share_across_sessions.then(||
         session.record_statement_cache_decision(cache_query_fingerprint, false)).flatten();
     if let Some(trace) = &statement_trace {
         trace.record_event("compile", "plan_cache_miss");
@@ -854,16 +883,25 @@ fn build_query_plan(
     if let Some(trace) = &statement_trace {
         trace.record_event("compile", "compiler_call_return");
     }
-    let plan = compiled?;
-    if let Some(occurrence) = cache_occurrence {
+    let plan = match compiled {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Some(decision_id) = statement_decision_id {
+                session.finish_statement_cache_decision(decision_id);
+            }
+            return Err(error);
+        }
+    };
+    if let Some(decision_id) = statement_decision_id {
         snapshot.diagnostics.publish_statement_artifact(
-            cache_query_fingerprint,
-            occurrence,
+            decision_id,
             plan.artifact_identity(),
         );
-    }
-    if let (Some(occurrence), Some(work)) = (cache_occurrence, plan.compile_work()) {
-        snapshot.diagnostics.publish_compile_work(cache_query_fingerprint, occurrence, work);
+        if let Some(receipt) = plan.compile_receipt() {
+            snapshot.diagnostics.publish_compile_receipt(decision_id, receipt);
+        } else if let Some(work) = plan.compile_work() {
+            snapshot.diagnostics.publish_compile_work(decision_id, work);
+        }
     }
     if share_across_sessions {
         session.publish_instance_query_plan(
@@ -876,7 +914,10 @@ fn build_query_plan(
             trace.record_event("compile", "plan_cache_publish");
         }
     }
-    Ok(plan)
+    Ok(PlannedQuery {
+        plan,
+        statement_decision_id,
+    })
 }
 
 fn select_protocol_query_plan(
@@ -884,7 +925,7 @@ fn select_protocol_query_plan(
     statement: &PreparedStatementEntry,
     parameter_env: &TypedParameterEnv,
     statement_trace: Option<Arc<StatementTrace>>,
-) -> Result<CompiledStatement> {
+) -> Result<PlannedQuery> {
     let parameter_types = parameter_env
         .logical_types()
         .into_iter()
@@ -898,7 +939,10 @@ fn select_protocol_query_plan(
             if let Some(trace) = &statement_trace {
                 trace.record_event("compile", "prepared_plan_cache_hit");
             }
-            return Ok(plan.clone());
+            return Ok(PlannedQuery {
+                plan: plan.clone(),
+                statement_decision_id: None,
+            });
         }
     }
 
@@ -1082,7 +1126,7 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
             trace.record_span("frontend", "statement_snapshot", snapshot_started);
         }
         let execution = revalidate_portal_execution(session, snapshot.clone(), portal, execution)?;
-        portal.kind = PortalKind::Query(execution.clone());
+        portal.kind = PortalKind::Query(Box::new(execution.clone()));
         if !execution.statement().is_query() {
             return execute_non_row_query_portal(
                 session,
@@ -1245,7 +1289,7 @@ fn revalidate_portal_execution(
     }
 
     let parameter_types = execution.statement().parameter_types().to_vec();
-    let plan = build_query_plan(
+    let planned = build_query_plan(
         session,
         snapshot,
         portal.raw_stmt.as_ref().clone(),
@@ -1253,14 +1297,19 @@ fn revalidate_portal_execution(
         false,
         statement_fingerprint(portal.source_sql.as_ref()),
     )?;
-    if plan.result_schema() != portal.result_schema.as_ref() {
+    if planned.plan.result_schema() != portal.result_schema.as_ref() {
         return Err(ParoError::new(paro_error::ErrorData::new(
             paro_error::Severity::Error,
             paro_error::codes::feature::FEATURE_NOT_SUPPORTED,
             "cached plan must not change result type",
         )));
     }
-    execution.with_statement(plan)
+    let execution = execution.with_statement(planned.plan)?;
+    Ok(if let Some(id) = planned.statement_decision_id {
+        execution.with_statement_decision_id(id)
+    } else {
+        execution
+    })
 }
 
 async fn execute_non_row_query_portal<R: ExtendedQueryResponder>(
@@ -1664,13 +1713,11 @@ impl<R: ExtendedQueryResponder> crate::result::sink::ResultSink for ResponderSin
     async fn push_diagnostic_chunk(
         &mut self,
         chunk: &Chunk,
-        _owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+        owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
     ) -> Result<()> {
-        // Extended protocol writes are awaited by the responder before this
-        // adapter returns.  The diagnostic vector owner therefore remains
-        // alive through the only send, while the protocol transport owns any
-        // bytes that it buffers.  It is intentionally not retained here.
-        self.push_chunk(chunk).await
+        self.responder
+            .send_diagnostic_chunk(chunk, self.schema, self.format_codes, owner)
+            .await
     }
 
     async fn finish_result(&mut self, completion: &StatementCompletion) -> Result<()> {
@@ -1756,6 +1803,17 @@ mod tests {
                 self.rows.push(row);
             }
             Ok(())
+        }
+
+        async fn send_diagnostic_chunk(
+            &mut self,
+            chunk: &Chunk,
+            schema: &[ResultColumnDesc],
+            format_codes: &[FormatCode],
+            owner: Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+        ) -> Result<()> {
+            let _ = owner;
+            self.send_data_chunk(chunk, schema, format_codes).await
         }
 
         async fn send_command_complete(&mut self, completion: &StatementCompletion) -> Result<()> {
