@@ -65,6 +65,45 @@ class RunOutputTests(unittest.TestCase):
         self.assertEqual(result.receipt_associations[1]["status"], "Uncovered")
         self.assertIn("second sample failed", result.error or "")
 
+    def test_base_exception_cancellation_keeps_elapsed_and_receipt_state(self) -> None:
+        class Cancelled(BaseException):
+            pass
+
+        class Validator:
+            def check_plan(self, query, conn):
+                return SimpleNamespace(status="PASS", detail=None)
+
+            def validate_query(self, query, rows):
+                return SimpleNamespace(status="PASS", detail=None)
+
+        class Executor(BenchmarkExecutor):
+            def __init__(self):
+                super().__init__(
+                    connection={},
+                    iterations=1,
+                    warmup=0,
+                    timeout_seconds=1,
+                    collect_memory=False,
+                    collect_compile_receipts=True,
+                )
+
+            def _execute_sql(self, conn, sql, *, fetch):
+                raise Cancelled("client cancellation")
+
+            def _snapshot_compile_execution_ids(self, conn):
+                return set()
+
+        result = Executor()._run_query(
+            object(),
+            QueryDef(id="cancelled", file=Path("cancelled.sql"), sql="SELECT 1"),
+            Validator(),
+        )
+        self.assertEqual(len(result.samples_ms), 1)
+        self.assertGreaterEqual(result.samples_ms[0], 0.0)
+        self.assertEqual(len(result.receipt_associations), 1)
+        self.assertEqual(result.receipt_associations[0]["status"], "Uncovered")
+        self.assertIn("client cancellation", result.error or "")
+
     def test_receipt_collector_ignores_its_own_introspection_execution(self) -> None:
         columns = [
             "name", "kind", "last_elapsed_us", "metric_value", "metric_unit",
@@ -519,6 +558,9 @@ class RunOutputTests(unittest.TestCase):
             }],
         }
         validate_benchmark_payload(payload, require_receipts=True)
+        occurrence_free = json.loads(json.dumps(payload))
+        del occurrence_free["workloads"][0]["queries"][0]["compile_receipt"]["occurrence"]
+        validate_benchmark_payload(occurrence_free, require_receipts=True)
         mismatched = json.loads(json.dumps(payload))
         mismatched["workloads"][0]["queries"][0]["compile_receipt"]["execution"]["artifact_identity"]["artifact"] = [9, 10]
         with self.assertRaises(ReceiptContractError):

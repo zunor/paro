@@ -297,10 +297,17 @@ class BenchmarkExecutor:
                 rss_sampler.start()
                 start = time_module.perf_counter()
                 rows: list[tuple[Any, ...]] | None = None
-                execution_error: Exception | None = None
+                # Cancellation can be represented by a BaseException (for
+                # example asyncio.CancelledError) rather than an Exception.
+                # Capture it only after the timer/finally boundary has closed;
+                # KeyboardInterrupt/SystemExit still escape so the process is
+                # not made falsely successful by the benchmark harness.
+                execution_error: BaseException | None = None
                 try:
                     rows = self._execute_sql(conn, query.sql, fetch=True)
-                except Exception as exc:
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        raise
                     execution_error = exc
                 finally:
                     elapsed_ms = (time_module.perf_counter() - start) * 1000.0
@@ -361,7 +368,9 @@ class BenchmarkExecutor:
             query_result.validation_detail = str(exc)
             query_result.explain_profile_status = "SKIP"
             query_result.explain_profile_detail = "primary query timed out"
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             query_result.error = _format_error(exc)
             query_result.validation_result = "FAIL"
             query_result.validation_detail = _format_error(exc)
@@ -374,7 +383,9 @@ class BenchmarkExecutor:
             if query.teardown_sql:
                 try:
                     self._execute_script(conn, query.teardown_sql)
-                except Exception as exc:
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        raise
                     if query_result.error is None:
                         query_result.error = f"QUERY TEARDOWN: {_format_error(exc)}"
                         query_result.validation_result = "FAIL"
@@ -1206,7 +1217,7 @@ def _split_sql_statements(script: str) -> list[str]:
     return statements
 
 
-def _format_error(exc: Exception) -> str:
+def _format_error(exc: BaseException) -> str:
     diag = getattr(exc, "diag", None)
     primary = getattr(diag, "message_primary", None) or str(exc)
     primary = str(primary).splitlines()[0]

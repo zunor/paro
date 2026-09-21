@@ -787,17 +787,41 @@ def _relative_or_none(path: Path | None, root: Path) -> str | None:
 
 
 def _write_encoded_atomically(path: Path, encoded: bytes, *, overwrite: bool) -> None:
-    """Publish already-accounted bytes without creating an untracked writer."""
+    """Publish already-accounted bytes with durable rename semantics.
+
+    The accounting lease is acquired before this function is called.  A
+    short-lived private file is therefore the only untracked writer: its
+    contents are flushed before the atomic rename and the containing
+    directory is flushed after it.  This keeps a process interruption from
+    leaving a manifest claiming a publication that never reached the owned
+    directory entry.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if not overwrite and path.exists():
         raise RunOutputError(f"refusing to overwrite owned output: {path}")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    temporary.write_bytes(encoded)
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
     try:
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
         if not overwrite and path.exists():
             raise RunOutputError(f"refusing to overwrite owned output: {path}")
-        temporary.replace(path)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
+        if fd >= 0:
+            os.close(fd)
         if temporary.exists():
             temporary.unlink()
 
