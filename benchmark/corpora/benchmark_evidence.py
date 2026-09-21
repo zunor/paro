@@ -204,7 +204,7 @@ def _fetch_compile_document(
     except ModuleNotFoundError:  # pragma: no cover - script-only import path
         from harness.receipt_contract import ReceiptContractError, validate_compile_document
     try:
-        validate_compile_document(document)
+        validate_compile_document(document, require_analyze=analyze)
     except ReceiptContractError as error:
         raise ValueError(f"EXPLAIN (COMPILE) document violates its contract: {error}") from error
     return payload, document

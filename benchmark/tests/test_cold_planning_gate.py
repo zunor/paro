@@ -8,12 +8,14 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from harness.cold_planning_gate import COUNTERS, evaluate
+from harness.cold_planning_gate import COUNTERS, evaluate, load_run_output_report
+from harness.receipt_contract import build_benchmark_cell_payload, uncovered_receipt
+from harness.run_output import CampaignOutput
 
 
 def report():
     return {
-        "schema_version": 6,
+        "schema_version": 3,
         "compile_evidence_schema_version": 3,
         "configuration": {
             "process_blocks": 3,
@@ -21,6 +23,7 @@ def report():
             "cohort": "diagnostic",
             "trace_mode": "off",
             "compile_document": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)",
+            "compile_metrics_source": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document",
         },
         "evidence": {"build": {"binary_sha256": "binary", "source": {"commit": "commit",
                       "working_tree_sha256": "source"}}, "harness_sha256": "harness",
@@ -31,6 +34,7 @@ def report():
                 "input_snapshot": {"policy": "private_copy_per_process", "seed_path": "/seed",
                                    "seed_sha256": "data", "initial_sha256": "data"}},
              "explain_wall_ms": 20, "optimizer_ms": 15, "peak_rss_bytes": 1000, "plan_structure_id": "00112233445566778899aabbccddeeff",
+             "compile_metrics_source": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document",
              "counters": {counter: 0 if counter in ("search_rule_failure_count", "search_deadline_reached") else 1
                           for counter in COUNTERS},
              "compile_query_fingerprint": 123,
@@ -42,12 +46,76 @@ def report():
                  "admission": "NotExecuted",
                  "execution": "NotExecuted",
                  "artifact_identity": {"Observed": {"schema_version": 3, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
+                 "search_counters": [
+                     {"name": "memo_group_count", "value": 1},
+                     {"name": "memo_logical_expression_count", "value": 1},
+                     {"name": "memo_physical_expression_count", "value": 1},
+                     {"name": "search_complete", "value": 1},
+                     {"name": "search_rule_failure_count", "value": 0},
+                     {"name": "search_deadline_reached", "value": 0},
+                     {"name": "settlement_local_hit_count", "value": 0},
+                     {"name": "settlement_local_miss_count", "value": 0},
+                 ],
+                 "omitted_search_counters": 0,
              }}
             for block in range(3)]}],
     }
 
 
 class ColdPlanningGateTests(unittest.TestCase):
+    def test_gate_reads_sealed_runoutput_cell_instead_of_free_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = CampaignOutput.create(
+                Path(directory) / "cold-cell",
+                source_id="cold",
+                cells=[{
+                    "query_case": "q11",
+                    "arm_id": "diagnostic",
+                    "query_cases": 1,
+                    "sample_rows": 3,
+                    "product_receipts": 3,
+                    "summary_captures": 3,
+                }],
+            )
+            attempt = output.attempts[("q11", "diagnostic")]
+            source = report()
+            payload = build_benchmark_cell_payload(
+                campaign_id=output.run.campaign_id,
+                run_id=output.run.run_id,
+                query_case="q11",
+                arm_id="diagnostic",
+                workload_name="cold_planning",
+                query_payload={
+                    "schema_version": source["schema_version"],
+                    "configuration": source["configuration"],
+                    "evidence": source["evidence"],
+                    "query": source["queries"][0],
+                },
+                compile_receipts=[
+                    uncovered_receipt("diagnostic compile is not execution")
+                    for _ in range(3)
+                ],
+                source_id=attempt.source_id,
+                attempt_id=attempt.attempt_id,
+            )
+            output.publish_cell_json(
+                query_case="q11", arm_id="diagnostic", payload=payload
+            )
+            output.publish_campaign_summary()
+            output.finish(status="Completed")
+            self.assertEqual(
+                json.loads((output.run.root / "campaign.json").read_text())["status"],
+                "Completed",
+            )
+            loaded, root = load_run_output_report(output.run.root)
+            self.assertTrue(evaluate(loaded, report_root=root)["passed"])
+            result_path = next(output.run.root.rglob("result.json"))
+            stored = json.loads(result_path.read_text())
+            stored["query"]["schema_version"] = 5
+            result_path.write_text(json.dumps(stored))
+            with self.assertRaises(ValueError):
+                load_run_output_report(output.run.root)
+
     def test_reused_unverified_and_in_place_databases_are_not_fresh_samples(self):
         for mutation in (
             lambda s: s.pop("input_snapshot"),

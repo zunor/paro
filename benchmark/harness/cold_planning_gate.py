@@ -14,17 +14,117 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from .receipt_contract import (
-    EVIDENCE_SCHEMA_VERSION,
-    ReceiptContractError,
-    validate_compile_document,
-)
+try:
+    from .receipt_contract import (
+        EVIDENCE_SCHEMA_VERSION,
+        ReceiptContractError,
+        validate_benchmark_payload,
+        validate_compile_document,
+    )
+except ImportError:  # pragma: no cover - documented script invocation
+    from receipt_contract import (  # type: ignore[no-redef]
+        EVIDENCE_SCHEMA_VERSION,
+        ReceiptContractError,
+        validate_benchmark_payload,
+        validate_compile_document,
+    )
 
-VERSION = 6
+VERSION = EVIDENCE_SCHEMA_VERSION
 COUNTERS = ("search_complete", "memo_group_count", "memo_logical_expression_count",
             "memo_physical_expression_count", "settlement_local_hit_count", "settlement_local_miss_count",
             "search_rule_failure_count", "search_deadline_reached")
 METRICS = ("explain_wall_ms", "optimizer_ms", "peak_rss_bytes")
+
+
+def _owned_json(root: Path, relative: str) -> dict[str, Any]:
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as error:
+        raise ValueError("RunOutput reference escapes its run root") from error
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"RunOutput reference is unreadable: {relative}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"RunOutput reference is not an object: {relative}")
+    return value
+
+
+def load_run_output_report(path: Path) -> tuple[dict[str, Any], Path]:
+    """Read one sealed v3 RunOutput and build the bounded gate view.
+
+    The gate never consumes a free-standing legacy report.  It reads the
+    sealed manifest, then exactly one completed cell attempt per registered
+    cell, and projects the producer-owned query payload without copying raw
+    captures into the campaign control plane.
+    """
+    root = path.resolve()
+    if root.is_file():
+        if root.name not in {"campaign.json", "manifest.json"}:
+            raise ValueError("cold-planning gate requires a v3 RunOutput root")
+        root = root.parent
+    if not root.is_dir():
+        raise ValueError("cold-planning gate RunOutput root does not exist")
+    manifest = _owned_json(root, "manifest.json")
+    if manifest.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise ValueError("unsupported RunOutput schema version")
+    if manifest.get("status") != "Completed":
+        raise ValueError(f"RunOutput is not completed: {manifest.get('status')!r}")
+    registration = manifest.get("registration")
+    cells = registration.get("cells") if isinstance(registration, dict) else None
+    if not isinstance(cells, list) or not cells:
+        raise ValueError("RunOutput has no registered cells")
+    attempts = manifest.get("attempts")
+    if not isinstance(attempts, list):
+        raise ValueError("RunOutput manifest has no attempt index")
+
+    reports: list[dict[str, Any]] = []
+    shared_configuration: dict[str, Any] | None = None
+    shared_evidence: dict[str, Any] | None = None
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise ValueError("RunOutput cell index is malformed")
+        cell_attempts = [
+            attempt for attempt in attempts
+            if attempt.get("query_case") == cell.get("query_case")
+            and attempt.get("arm_id") == cell.get("arm_id")
+        ]
+        if len(cell_attempts) != 1:
+            raise ValueError("cold-planning gate cannot guess among cell attempts")
+        attempt = cell_attempts[0]
+        if attempt.get("status") != "Completed" or not isinstance(attempt.get("result"), str):
+            raise ValueError("cold-planning cell attempt is not completed")
+        payload = _owned_json(root, attempt["result"])
+        try:
+            validate_benchmark_payload(payload)
+        except ReceiptContractError as error:
+            raise ValueError(f"cell payload violates the shared contract: {error}") from error
+        query_payload = payload.get("query")
+        if not isinstance(query_payload, dict):
+            raise ValueError("cold-planning cell has no query payload")
+        if query_payload.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+            raise ValueError("cold-planning query envelope is not on the current schema")
+        configuration = query_payload.get("configuration")
+        evidence = query_payload.get("evidence")
+        query = query_payload.get("query")
+        if not isinstance(configuration, dict) or not isinstance(evidence, dict) \
+                or not isinstance(query, dict):
+            raise ValueError("cold-planning cell payload is incomplete")
+        if shared_configuration is None:
+            shared_configuration = configuration
+            shared_evidence = evidence
+        elif configuration != shared_configuration or evidence != shared_evidence:
+            raise ValueError("cold-planning cells have incomparable configuration or provenance")
+        reports.append(query)
+    assert shared_configuration is not None and shared_evidence is not None
+    return {
+        "schema_version": VERSION,
+        "compile_evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
+        "configuration": shared_configuration,
+        "evidence": shared_evidence,
+        "queries": reports,
+    }, root
 
 
 def positive(value: Any) -> float:
@@ -84,7 +184,9 @@ def validate(
     if (report["configuration"].get("cohort") != "diagnostic"
             or report["configuration"].get("trace_mode") != "off"
             or report["configuration"].get("compile_document")
-            != "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)"):
+            != "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)"
+            or report["configuration"].get("compile_metrics_source")
+            != "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document"):
         raise ValueError("cold planning gate requires the compile-document diagnostic cohort")
     for value in (evidence["build"]["binary_sha256"], evidence["build"]["source"]["commit"],
                   evidence["build"]["source"]["working_tree_sha256"], evidence["harness_sha256"],
@@ -124,6 +226,10 @@ def validate(
                 positive(sample[metric])
             if sample["optimizer_ms"] > sample["explain_wall_ms"] * 1.01:
                 raise ValueError("optimizer time exceeds its enclosing statement")
+            if sample.get("compile_metrics_source") != report["configuration"]["compile_metrics_source"]:
+                raise ValueError("compile metrics are not sourced from the typed document")
+            if sample.get("omitted_search_counters", 0) != 0:
+                raise ValueError("compile search counters are incomplete")
             if not sample.get("plan_structure_id"):
                 raise ValueError("missing typed plan structure identity")
             for counter in COUNTERS:
@@ -199,12 +305,17 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--max-ratio", type=float, default=1.15)
     args = parser.parse_args()
+    report, report_root = load_run_output_report(args.report)
+    baseline = None
+    baseline_root = None
+    if args.baseline:
+        baseline, baseline_root = load_run_output_report(args.baseline)
     result = evaluate(
-        json.loads(args.report.read_text()),
-        json.loads(args.baseline.read_text()) if args.baseline else None,
+        report,
+        baseline,
         args.max_ratio,
-        report_root=args.report.parent,
-        baseline_root=args.baseline.parent if args.baseline else None,
+        report_root=report_root,
+        baseline_root=baseline_root,
     )
     print(json.dumps(result, indent=2, allow_nan=False))
     return 0 if result["passed"] else 1

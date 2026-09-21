@@ -16,6 +16,7 @@ pub const RETAINED_LIMIT: usize = 1 << 20;
 pub const PROCESS_LIMIT: usize = 64 << 20;
 pub const MAX_CAPTURES: usize = 8;
 pub const MAX_RULES: usize = 64;
+pub const MAX_SEARCH_COUNTERS: usize = 256;
 pub const MAX_VARIANTS: usize = 16;
 pub const MAX_DETAIL_EVENTS: usize = 2_048;
 pub const RECEIPT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
@@ -60,6 +61,16 @@ pub struct RuleSummary {
     pub inserted: u64,
     /// A different projection of optimizer time; never add to phases.
     pub elapsed_ns: u64,
+}
+
+/// A bounded, typed search counter exported by the compiler producer.  The
+/// name is an immutable producer-owned key from the planner's counter set;
+/// it is not reconstructed by a consumer from a diagnostic side channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SearchCounter {
+    pub name: String,
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -486,6 +497,8 @@ pub struct CompileRecord {
     fields: CompileFields,
     pub rules: Vec<RuleSummary>,
     pub omitted_rules: u64,
+    pub search_counters: Vec<SearchCounter>,
+    pub omitted_search_counters: u64,
     pub variants: Vec<VariantSummary>,
     pub omitted_variants: u64,
     pub retained_limit: usize,
@@ -650,6 +663,8 @@ impl CompileCapture {
                 },
                 rules: Vec::new(),
                 omitted_rules: 0,
+                search_counters: Vec::new(),
+                omitted_search_counters: 0,
                 variants: Vec::new(),
                 omitted_variants: 0,
                 retained_limit: RETAINED_LIMIT,
@@ -701,6 +716,27 @@ impl CompileCapture {
                     r.rules.insert(at, rule);
                 }
             }
+        }
+    }
+
+    /// Replace the bounded search-counter snapshot before sealing.  The
+    /// planner supplies an ordered map of static counter names, so sorting and
+    /// truncation are deterministic and do not depend on hash/map iteration.
+    pub fn search_counters(&self, counters: impl IntoIterator<Item = (&'static str, u64)>) {
+        let mut values: Vec<_> = counters
+            .into_iter()
+            .map(|(name, value)| SearchCounter {
+                name: name.to_string(),
+                value,
+            })
+            .collect();
+        values.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        let omitted = values.len().saturating_sub(MAX_SEARCH_COUNTERS);
+        values.truncate(MAX_SEARCH_COUNTERS);
+        let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.sealed.load(Ordering::Acquire) {
+            record.search_counters = values;
+            record.omitted_search_counters = omitted as u64;
         }
     }
 
@@ -871,6 +907,22 @@ mod tests {
                 (DETAIL_ATTEMPTS - MAX_DETAIL_EVENTS) as u64
             );
             assert_eq!(record.detail.first().unwrap().source_sequence(), 0);
+        });
+    }
+
+    #[test]
+    fn search_counter_snapshot_is_sorted_and_bounded() {
+        let _lock = capture_test_lock();
+        let capture = CompileCapture::try_start().unwrap();
+        capture.search_counters((0..MAX_SEARCH_COUNTERS + 2).map(|index| {
+            let name = Box::leak(format!("counter_{index:03}").into_boxed_str());
+            (name as &'static str, index as u64)
+        }));
+        capture.read(|record| {
+            assert_eq!(record.search_counters.len(), MAX_SEARCH_COUNTERS);
+            assert_eq!(record.omitted_search_counters, 2);
+            assert_eq!(record.search_counters[0].name, "counter_000");
+            assert_eq!(record.search_counters[255].name, "counter_255");
         });
     }
 }

@@ -557,7 +557,7 @@ def build_attribution(
             )
         )
     return {
-        "schema_version": 1,
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
         "compile_evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "kind": "first_statement_attribution",
         "source_report": str(source_path.resolve()),

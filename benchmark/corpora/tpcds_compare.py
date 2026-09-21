@@ -748,7 +748,7 @@ def main() -> int:
         Path(__file__).with_name("tpcds_setup.py").resolve(),
     ]
     report: dict[str, Any] = {
-        "schema_version": 8,
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
         "compile_evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "pre_touch": pre_touch,
         "corpus": "TPC-DS",
@@ -969,6 +969,9 @@ def main() -> int:
                 "query_cases": 1,
                 "sample_rows": normal_rows if arm == "normal" else args.diagnostic_process_blocks,
                 "product_receipts": normal_rows if arm == "normal" else args.diagnostic_process_blocks,
+                "summary_captures": (
+                    args.diagnostic_process_blocks if arm == "diagnostic" else 0
+                ),
             }
             for query_id in query_cases
             for arm in ("normal", "diagnostic")
@@ -981,7 +984,10 @@ def main() -> int:
     for query_number in range(args.start, args.end + 1):
         query_id = f"{query_number:02d}"
         query = (args.query_dir / f"{query_id}.sql").read_text(encoding="utf-8")
-        result: dict[str, Any] = {"query": query_id}
+        result: dict[str, Any] = {
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "query": query_id,
+        }
         try:
             oracle_server_context = isolated_paro_server(
                 server_binary,
@@ -1279,6 +1285,28 @@ def main() -> int:
                     "compile_document_raw": diagnostic_compile_raw,
                 })
 
+            # The typed EXPLAIN document is an immutable producer capture.
+            # Store it once under the diagnostic cell and leave only a bounded
+            # reference in the cell payload; embedding the raw document in
+            # diagnostic_cohort would create a second evidence owner.
+            for item in diagnostic_blocks:
+                raw_document = item.pop("compile_document_raw", None)
+                document = item.get("compile_document")
+                if not isinstance(raw_document, str) or not isinstance(document, dict):
+                    raise RuntimeError("diagnostic compile capture is incomplete")
+                capture_path = output.publish_capture_text(
+                    query_case=query_id,
+                    arm_id="diagnostic",
+                    name=f"block-{item['block']:04d}.json",
+                    text=raw_document,
+                )
+                item["compile_document"] = {
+                    "status": "Captured",
+                    "path": capture_path.relative_to(output.run.root).as_posix(),
+                    "sha256": content_digest(capture_path),
+                    "schema_version": document.get("schema_version"),
+                }
+
             paro_timing = timing_summary(samples["paro"])
             duckdb_timing = timing_summary(samples["duckdb"])
             warm_crossover = hierarchical_abba_ratio(blocks, args.bootstrap_samples)
@@ -1449,6 +1477,7 @@ def main() -> int:
                 arm_id="diagnostic",
                 workload_name="tpcds",
                 query_payload={
+                    "schema_version": EVIDENCE_SCHEMA_VERSION,
                     "query": query_id,
                     "diagnostic_cohort": result.get("diagnostic_cohort"),
                     "status": result.get("status"),

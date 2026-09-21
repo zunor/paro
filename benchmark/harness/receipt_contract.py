@@ -8,7 +8,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .run_output import SUMMARY_LIMIT_BYTES
+try:
+    from .run_output import SUMMARY_LIMIT_BYTES
+except ImportError:  # pragma: no cover - documented script invocation
+    from run_output import SUMMARY_LIMIT_BYTES  # type: ignore[no-redef]
 
 
 # One current producer/consumer contract. Historical v1/v2/v5 documents are
@@ -18,6 +21,7 @@ RECEIPT_ASSOCIATION_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 COMPILE_DOCUMENT_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 BENCHMARK_CELL_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 OWNERSHIP_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+MAX_SEARCH_COUNTERS = 256
 
 
 class ReceiptContractError(ValueError):
@@ -73,6 +77,32 @@ def validate_compile_document(value: Any, *, require_analyze: bool = False) -> s
         raise ReceiptContractError("compile document has unknown cache state")
     if value["outcome"] == "Success" and value["artifact"] != "CompiledArtifactReady":
         raise ReceiptContractError("successful compile lacks a ready artifact")
+    counters = value.get("search_counters")
+    omitted_counters = value.get("omitted_search_counters")
+    if not isinstance(counters, list) or len(counters) > MAX_SEARCH_COUNTERS:
+        raise ReceiptContractError("compile document has invalid search counter snapshot")
+    if (
+        not isinstance(omitted_counters, int)
+        or isinstance(omitted_counters, bool)
+        or omitted_counters < 0
+    ):
+        raise ReceiptContractError("compile document has invalid omitted search counter count")
+    names = set()
+    for counter in counters:
+        if not isinstance(counter, dict) or set(counter) != {"name", "value"}:
+            raise ReceiptContractError("compile document has malformed search counter")
+        name = counter["name"]
+        value_number = counter["value"]
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in names
+            or not isinstance(value_number, int)
+            or isinstance(value_number, bool)
+            or value_number < 0
+        ):
+            raise ReceiptContractError("compile document has invalid search counter")
+        names.add(name)
     identity = value.get("artifact_identity")
     if isinstance(identity, dict) and set(identity) == {"Observed"}:
         identity = identity["Observed"]

@@ -47,6 +47,7 @@ try:
         EVIDENCE_SCHEMA_VERSION,
         build_benchmark_cell_payload,
         uncovered_receipt,
+        validate_compile_document,
     )
 except ModuleNotFoundError:  # pragma: no cover - script-only import path
     from benchmark_evidence import (
@@ -65,20 +66,75 @@ except ModuleNotFoundError:  # pragma: no cover - script-only import path
         EVIDENCE_SCHEMA_VERSION,
         build_benchmark_cell_payload,
         uncovered_receipt,
+        validate_compile_document,
     )
 
-COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physical_search",
-              "memo_exploration", "physical_extraction", "winner_verification"}
+_REQUIRED_COMPILE_COUNTERS = {
+    "search_complete",
+    "memo_group_count",
+    "memo_logical_expression_count",
+    "memo_physical_expression_count",
+    "settlement_local_hit_count",
+    "settlement_local_miss_count",
+    "search_rule_failure_count",
+    "search_deadline_reached",
+}
 
 
-def diagnostic_rows(columns: list[str], rows: list[tuple]) -> list[dict[str, Any]]:
-    # pgwire may qualify unaliased system-function outputs. Accept the declared
-    # relation prefix, but never silently zip missing/duplicate metric fields.
-    columns = [name.removeprefix("paro_optimizers.") for name in columns]
-    expected = {"name", "kind", "last_elapsed_us", "metric_value", "metric_unit", "invocation_count"}
-    if len(columns) != len(expected) or set(columns) != expected:
-        raise ValueError("optimizer diagnostic schema differs from the measurement contract")
-    return [dict(zip(columns, row, strict=True)) for row in rows]
+def _observed(document: dict[str, Any], field: str) -> Any:
+    value = document.get(field)
+    if not isinstance(value, dict) or set(value) != {"Observed"}:
+        raise ValueError(f"compile document field {field!r} is not observed")
+    return value["Observed"]
+
+
+def _typed_compile_measurements(document: dict[str, Any]) -> dict[str, Any]:
+    """Read all cold-planning metrics from one Rust-owned v3 document.
+
+    ``paro_optimizers()`` is intentionally not consulted here.  Its receipt
+    rows describe ordinary execution and may have a different schema; they
+    are never a source for compile timing or optimizer counters.
+    """
+    if validate_compile_document(document) != "Summary":
+        raise ValueError("cold planning requires a v3 compile summary")
+    omitted_counters = document.get("omitted_search_counters")
+    if omitted_counters != 0:
+        raise ValueError("cold planning requires a complete search counter snapshot")
+    optimizer_ns = _observed(document, "optimizer_ns")
+    if isinstance(optimizer_ns, bool) or not isinstance(optimizer_ns, int) or optimizer_ns < 0:
+        raise ValueError("compile document has invalid optimizer duration")
+    counters = {
+        counter["name"]: counter["value"]
+        for counter in document.get("search_counters", [])
+    }
+    missing = _REQUIRED_COMPILE_COUNTERS - counters.keys()
+    if missing:
+        raise ValueError(
+            "compile document lacks required search counters: "
+            + ", ".join(sorted(missing))
+        )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in counters.values()
+    ):
+        raise ValueError("compile document has a non-integer search counter")
+    search_complete = _observed(document, "search_complete")
+    if not isinstance(search_complete, bool):
+        raise ValueError("compile document has invalid search completion state")
+    counters["search_complete"] = int(search_complete)
+    stop = _observed(document, "search_stop")
+    if not isinstance(stop, str) or not stop:
+        raise ValueError("compile document has invalid search stop reason")
+    return {
+        "optimizer_ms": optimizer_ns / 1_000_000,
+        "counters": counters,
+        "omitted_search_counters": omitted_counters,
+        "rules": document.get("rules", []),
+        "search_stop": stop,
+        "compile_metrics_source": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document",
+        "diagnostics": [],
+        "diagnostics_source": "not_collected; paro_optimizers is execution-only auxiliary",
+    }
 
 
 class ProcessWatchdog:
@@ -152,17 +208,7 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
                     result["compile_document_raw"] = raw_document
                     result["plan_format"] = "compile-json"
                     result["plan_structure_id"] = plan_structure_id(compile_document)
-                    cursor = connection.execute("SELECT * FROM paro_optimizers()")
-                    columns = [column.name for column in cursor.description or ()]
-                    diagnostics = diagnostic_rows(columns, cursor.fetchall())
-                    result["diagnostics"] = diagnostics
-                    seen = {row["name"] for row in diagnostics if row["name"] in COMPONENTS}
-                    if seen != COMPONENTS:
-                        raise RuntimeError("missing optimizer component diagnostics")
-                    result["optimizer_ms"] = sum(row["last_elapsed_us"] for row in diagnostics
-                                                 if row["name"] in COMPONENTS) / 1000
-                    result["counters"] = {row["name"]: row["metric_value"] for row in diagnostics
-                                          if row["kind"] == "search_counter" and row["metric_unit"] == "count"}
+                    result.update(_typed_compile_measurements(compile_document))
                     result["status"] = "ok"
             except Exception as error:
                 result["error"] = f"{type(error).__name__}: {error}"
@@ -232,7 +278,7 @@ def main() -> int:
     harness_files = (Path(__file__).resolve(), Path(__file__).with_name("benchmark_evidence.py"),
                      root / "benchmark/harness/cold_planning_gate.py")
     report: dict[str, Any] = {
-        "schema_version": 5,
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
         "compile_evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
         "configuration": {key: getattr(args, key) for key in ("process_blocks", "threads", "memory_limit",
                              "watchdog_seconds", "rss_limit_mb", "alloc_metrics")},
@@ -258,6 +304,8 @@ def main() -> int:
         "cohort": "diagnostic",
         "trace_mode": "off",
         "compile_document": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)",
+        "compile_metrics_source": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document",
+        "execution_receipt_source": "not_collected; EXPLAIN target is not executed",
         "latency_tracks": {
             "C0": {"status": "uncovered", "auxiliary": "startup_to_ready_ms"},
             "C1": {"status": "uncovered", "reason": "EXPLAIN is not the target C1"},

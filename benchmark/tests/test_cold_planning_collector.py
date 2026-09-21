@@ -7,28 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "corpora"))
 from benchmark_evidence import CompileEvidenceCollector
-from cold_planning import diagnostic_rows
+from cold_planning import _typed_compile_measurements
 
 
-class DiagnosticRowsTests(unittest.TestCase):
-    def test_qualified_pgwire_names_and_typed_values(self):
-        columns = ["name", "kind", "last_elapsed_us", "metric_value", "metric_unit", "invocation_count"]
-        values = [("memo_exploration", "search", 200, 1, "invocations", 1)]
-        self.assertEqual(
-            diagnostic_rows(columns, values),
-            diagnostic_rows(["paro_optimizers." + name for name in columns], values),
-        )
-        self.assertEqual(diagnostic_rows(columns, values)[0]["last_elapsed_us"], 200)
-
-    def test_schema_and_row_arity_fail_closed(self):
-        with self.assertRaises(ValueError):
-            diagnostic_rows(["name", "name"], [(1, 2)])
-        with self.assertRaises(ValueError):
-            diagnostic_rows(
-                ["name", "kind", "last_elapsed_us", "metric_value", "metric_unit", "invocation_count"],
-                [(1,)],
-            )
-
+class CompileCollectorTests(unittest.TestCase):
     def test_compile_document_reader_keeps_raw_and_typed_identity(self):
         class Cursor:
             def __init__(self):
@@ -50,6 +32,8 @@ class DiagnosticRowsTests(unittest.TestCase):
                     "\"cache\":\"ForcedCompile\","
                     "\"admission\":\"NotExecuted\","
                     "\"execution\":\"NotExecuted\","
+                    "\"search_counters\":[{\"name\":\"search_complete\",\"value\":1}],"
+                    "\"omitted_search_counters\":0,"
                     "\"artifact_identity\":{\"Observed\":{\"schema_version\":3,"
                     "\"artifact\":[1,2],\"structure\":[3,4],\"dependencies\":[5,6]}}}",
                 )]
@@ -70,6 +54,47 @@ class DiagnosticRowsTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "Success")
         self.assertIn("EXPLAIN (COMPILE, DETAIL, FORMAT JSON)", connection.last_cursor.statement)
         self.assertTrue(raw.startswith("{"))
+        with self.assertRaises(ValueError):
+            CompileEvidenceCollector(connection).capture("SELECT 1", analyze=True)
+
+    def test_compile_metrics_are_read_from_typed_document_not_auxiliary_receipts(self):
+        document = {
+            "schema_version": 3,
+            "outcome": "Success",
+            "artifact": "CompiledArtifactReady",
+            "cache": "ForcedCompile",
+            "admission": "NotExecuted",
+            "execution": "NotExecuted",
+            "artifact_identity": {"Observed": {"schema_version": 3,
+                                                   "artifact": [1, 2],
+                                                   "structure": [3, 4],
+                                                   "dependencies": [5, 6]}},
+            "optimizer_ns": {"Observed": 4_000_000},
+            "search_complete": {"Observed": True},
+            "search_stop": {"Observed": "Complete"},
+            "search_counters": [
+                {"name": "search_complete", "value": 1},
+                {"name": "memo_group_count", "value": 2},
+                {"name": "memo_logical_expression_count", "value": 3},
+                {"name": "memo_physical_expression_count", "value": 4},
+                {"name": "settlement_local_hit_count", "value": 5},
+                {"name": "settlement_local_miss_count", "value": 6},
+                {"name": "search_rule_failure_count", "value": 0},
+                {"name": "search_deadline_reached", "value": 0},
+            ],
+            "omitted_search_counters": 0,
+        }
+        metrics = _typed_compile_measurements(document)
+        self.assertEqual(metrics["optimizer_ms"], 4.0)
+        self.assertEqual(metrics["counters"]["memo_group_count"], 2)
+        self.assertEqual(metrics["compile_metrics_source"],
+                         "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document")
+
+        with self.assertRaises(ValueError):
+            _typed_compile_measurements({
+                **document,
+                "search_counters": [],
+            })
 
 
 if __name__ == "__main__":

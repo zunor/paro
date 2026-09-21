@@ -612,7 +612,7 @@ class CampaignOutput:
             overwrite=False,
         )
 
-    def publish_campaign_summary(self) -> Path:
+    def publish_campaign_summary(self, *, allow_terminal: bool = False) -> Path:
         """Publish only the bounded campaign index and terminal metadata.
 
         Domain reports and Detail captures belong to their cell/attempt owners.
@@ -658,7 +658,8 @@ class CampaignOutput:
             "registration_status": self.run._manifest.get("registration", {}).get("status"),
             "cells": cells,
         }
-        return self.control.write_json("campaign.json", payload, overwrite=True)
+        writer = ControlWriter(self.run, self.run.root, allow_terminal=allow_terminal)
+        return writer.write_json("campaign.json", payload, overwrite=True)
 
     def publish_cell_summary(
         self, *, query_case: str, arm_id: str, text: str
@@ -713,6 +714,10 @@ class CampaignOutput:
             else status
         )
         self.run.finalize(status=terminal_status)
+        # The manifest is the lifecycle authority.  Refresh the bounded
+        # campaign index only after that transition so consumers never see a
+        # completed attempt paired with a stale Running campaign summary.
+        self.publish_campaign_summary(allow_terminal=True)
 
 
 @dataclass

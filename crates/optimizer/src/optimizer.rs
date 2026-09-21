@@ -1088,6 +1088,41 @@ impl Optimizer {
             use paro_context::compile_diagnostics::{
                 Observation::Observed, RuleSummary, SearchStop,
             };
+            let mut search_counters = extraction.search_summary.work_counters.clone();
+            search_counters.insert(
+                "search_complete",
+                u64::from(extraction.search_summary.is_complete()),
+            );
+            search_counters.insert("memo_group_count", extraction.search_summary.groups);
+            search_counters.insert(
+                "memo_logical_expression_count",
+                extraction.search_summary.logical_expressions,
+            );
+            search_counters.insert(
+                "memo_physical_expression_count",
+                extraction.search_summary.physical_expressions,
+            );
+            search_counters.insert(
+                "search_rule_failure_count",
+                extraction
+                    .search_summary
+                    .obligations
+                    .iter()
+                    .filter(|obligation| {
+                        matches!(
+                            obligation.reason,
+                            crate::cascades::budget::SearchIncompleteReason::RuleFailure { .. }
+                        )
+                    })
+                    .count() as u64,
+            );
+            search_counters.insert(
+                "search_deadline_reached",
+                u64::from(extraction.search_summary.obligations.iter().any(|obligation| {
+                    obligation.reason
+                        == crate::cascades::budget::SearchIncompleteReason::Deadline
+                })),
+            );
             capture.update(|record| {
                 record.groups = Observed(extraction.search_summary.groups);
                 record.logical_expressions =
@@ -1118,6 +1153,7 @@ impl Optimizer {
                     }
                 });
             });
+            capture.search_counters(search_counters);
             let active_rules: std::collections::BTreeSet<_> = extraction
                 .rule_attempts
                 .keys()

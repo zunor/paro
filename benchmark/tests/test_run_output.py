@@ -39,7 +39,7 @@ class RunOutputTests(unittest.TestCase):
             query_case=query_case,
             arm_id=arm_id,
             workload_name="test",
-            query_payload={"status": "ok", **query},
+            query_payload={"schema_version": 3, "status": "ok", **query},
             compile_receipts=[
                 uncovered_receipt("test has no execution receipt")
                 for _ in range(sample_count)
@@ -57,6 +57,8 @@ class RunOutputTests(unittest.TestCase):
             "admission": "NotExecuted",
             "execution": "NotExecuted",
             "artifact_identity": {"Observed": {"schema_version": 3, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
+            "search_counters": [],
+            "omitted_search_counters": 0,
         }
         self.assertEqual(validate_compile_document(document), "Summary")
         for legacy_version in (1, 2, 5):

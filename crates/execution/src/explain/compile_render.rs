@@ -138,6 +138,7 @@ pub fn validate_json(
         || r.process_limit != PROCESS_LIMIT
         || r.process_reservation != 2 << 20
         || r.rules.len() > MAX_RULES
+        || r.search_counters.len() > MAX_SEARCH_COUNTERS
         || r.variants.len() > MAX_VARIANTS
         || r.detail_limit != MAX_DETAIL_EVENTS
         || r.detail.len() > MAX_DETAIL_EVENTS
@@ -148,6 +149,12 @@ pub fn validate_json(
                 || !r.detail.is_empty()))
     {
         return Err("schema/capacity profile mismatch".into());
+    }
+    let mut search_counter_names = BTreeSet::new();
+    for counter in &r.search_counters {
+        if counter.name.is_empty() || !search_counter_names.insert(counter.name.as_str()) {
+            return Err("search counter names are not unique".into());
+        }
     }
     let mut source_sequences = BTreeMap::<&'static str, u64>::new();
     let candidate_event_ids: BTreeSet<u64> = r
