@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -88,6 +89,34 @@ def _encode_json(payload: dict[str, Any], *, limit_bytes: int | None = None) -> 
         output.extend(encoded)
     output.extend(b"\n")
     return bytes(output)
+
+
+def _iter_capture_references(value: Any):
+    """Yield producer-owned capture references embedded in a cell payload.
+
+    Capture references are deliberately discovered by their typed status and
+    fields rather than by a collector-specific JSON path.  The cell envelope
+    remains generic, while the writer can still enforce that every registered
+    capture is present before an attempt becomes Completed.
+    """
+    if isinstance(value, dict):
+        if value.get("status") == "Captured" and {
+            "status", "path", "sha256", "schema_version"
+        }.issubset(value):
+            yield value
+        for child in value.values():
+            yield from _iter_capture_references(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_capture_references(child)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _write_bounded_json(
@@ -1042,6 +1071,40 @@ class RunOutput:
         except (OSError, ValueError, TypeError, KeyError, RunOutputError):
             return False
         cell = self._registered_cell(f"{attempt.query_case}--{attempt.arm_id}")
+        capture_references = list(_iter_capture_references(payload))
+        declared_captures = int(cell.get("summary_captures", 0))
+        if len(capture_references) != declared_captures:
+            return False
+        capture_paths: set[str] = set()
+        attempt_root = attempt.root.resolve()
+        for reference in capture_references:
+            path_value = reference.get("path")
+            digest_value = reference.get("sha256")
+            if (
+                not isinstance(path_value, str)
+                or not isinstance(digest_value, str)
+                or len(digest_value) != 64
+                or any(character not in "0123456789abcdef" for character in digest_value)
+                or reference.get("schema_version") != RUN_OUTPUT_SCHEMA_VERSION
+            ):
+                return False
+            try:
+                relative_path = Path(path_value)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    return False
+                capture_path = self.owned_path(self.root / path_value)
+                capture_path.relative_to(attempt_root)
+            except (RunOutputError, ValueError):
+                return False
+            relative = capture_path.relative_to(self.root.resolve()).as_posix()
+            if relative in capture_paths or not capture_path.is_file():
+                return False
+            try:
+                if _file_sha256(capture_path) != digest_value:
+                    return False
+            except OSError:
+                return False
+            capture_paths.add(relative)
         receipts: list[Any] = []
         for workload in payload.get("workloads", []):
             for query in workload.get("queries", []):

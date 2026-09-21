@@ -1,5 +1,6 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 from pathlib import Path
 import sys
 import tempfile
@@ -294,7 +295,7 @@ class RunOutputTests(unittest.TestCase):
                 arm_id="diagnostic",
                 sample_rows=2,
                 product_receipts=2,
-                summary_captures=1,
+                summary_captures=0,
             )
             output.publish_json(
                 self.cell_payload(
@@ -313,6 +314,68 @@ class RunOutputTests(unittest.TestCase):
             self.assertTrue(output.result_path.exists())
             self.assertTrue(output.summary_path.exists())
             self.assertTrue(manifest["registration"]["registration_sealed"])
+
+    def test_declared_capture_must_be_present_before_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CorpusOutput.create(
+                Path(tmp) / "cold.json",
+                source_id="cold-planning",
+                query_case="q11",
+                arm_id="diagnostic",
+                sample_rows=1,
+                product_receipts=1,
+                summary_captures=1,
+            )
+            output.publish_json(
+                self.cell_payload(
+                    "q11",
+                    "diagnostic",
+                    campaign_id=output.run.campaign_id,
+                    run_id=output.run.run_id,
+                    source_id="cold-planning",
+                )
+            )
+            output.publish_summary("# diagnostic\n")
+            output.finish(status="Completed")
+            manifest = json.loads((output.run.root / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "Incomplete")
+            self.assertEqual(
+                json.loads(output.attempt.root.joinpath("attempt.json").read_text())["status"],
+                "Incomplete",
+            )
+
+    def test_completed_capture_is_verified_by_path_and_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CorpusOutput.create(
+                Path(tmp) / "cold.json",
+                source_id="cold-planning",
+                query_case="q11",
+                arm_id="diagnostic",
+                sample_rows=1,
+                product_receipts=1,
+                summary_captures=1,
+            )
+            capture = output.publish_capture_text("block-0000.json", '{"schema_version":3}\n')
+            capture_ref = {
+                "status": "Captured",
+                "path": capture.relative_to(output.run.root).as_posix(),
+                "sha256": hashlib.sha256(capture.read_bytes()).hexdigest(),
+                "schema_version": 3,
+            }
+            output.publish_json(
+                self.cell_payload(
+                    "q11",
+                    "diagnostic",
+                    campaign_id=output.run.campaign_id,
+                    run_id=output.run.run_id,
+                    source_id="cold-planning",
+                    compile_document=capture_ref,
+                )
+            )
+            output.publish_summary("# diagnostic\n")
+            output.finish(status="Completed")
+            manifest = json.loads((output.run.root / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "Completed")
 
     def test_standalone_corpus_failure_preserves_payload_and_terminal_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

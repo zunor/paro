@@ -610,7 +610,10 @@ def main() -> int:
         arm_id="diagnostic",
         sample_rows=len(attribution["samples"]),
         product_receipts=len(attribution["samples"]),
-        summary_captures=1,
+        # Attribution is derived from an existing source report.  It does not
+        # own a new raw EXPLAIN capture, so it must not declare one in the
+        # RunOutput registration.
+        summary_captures=0,
     )
     owned.publish_json(
         build_benchmark_cell_payload(
