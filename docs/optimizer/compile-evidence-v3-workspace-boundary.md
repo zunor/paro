@@ -5,11 +5,11 @@
 ## 起点
 
 - branch: `re-op`
-- HEAD: `49fbd05dd630add9ea33c66398adcfad6942b075`
+- HEAD: `1e3188d2fb9c94cddcbf1a242849e91362c3daf6`
 - staged paths: `0`
-- unstaged tracked paths: `75`
+- unstaged tracked paths observed at task entry: `87`
 - untracked paths: `0`
-- unstaged diff SHA-256: `0dfc6dbc4f42d3b1fefaf9f8790b37c8d6b5e776a9ffb584411aa2d90a8008c1`
+- task-entry diff SHA-256: preserved in the task-entry shell evidence; task-owned files were staged by explicit path
 - recovery snapshot: `/private/tmp/paro-reop-compile-evidence-v2-recovery-post-20260922/`
 - existing recovery refs: `refs/codex/recovery/reop-after-transport-before-park`, `refs/codex/recovery/reop-before-transport`, `refs/codex/recovery/reop-wip-tracked-20260921`, `refs/paro-recovery/compile-evidence-v2-prework-20260921`
 
@@ -23,7 +23,7 @@
 
 ### optimizer/native
 
-`crates/optimizer/src/aggregate/late_payload.rs`, `crates/optimizer/src/aggregate/late_payload_tests.rs`, `crates/optimizer/src/cascades/budget.rs`, `crates/optimizer/src/cascades/engine.rs`, `crates/optimizer/src/cascades/engine/quality_production.rs`, `crates/optimizer/src/cascades/engine/tests.rs`, `crates/optimizer/src/cascades/engine/tests/closure.rs`, `crates/optimizer/src/cascades/engine/tests/grant_lazy.rs`, `crates/optimizer/src/cascades/engine/tests/quality_production.rs`, `crates/optimizer/src/cascades/memo.rs`, `crates/optimizer/src/cascades/memo/diagnostic_snapshot.rs`, `crates/optimizer/src/cascades/memo/tests.rs`, `crates/optimizer/src/cascades/oracle.rs`, `crates/optimizer/src/cascades/planner/boundary/tests.rs`, `crates/optimizer/src/cascades/planner/contracts.rs`, `crates/optimizer/src/cascades/planner/costing.rs`, `crates/optimizer/src/cascades/planner/domain_transfer.rs`, `crates/optimizer/src/cascades/planner/mod.rs`, `crates/optimizer/src/cascades/planner/predicate_order.rs`, `crates/optimizer/src/cascades/planner/quality_domain.rs`, `crates/optimizer/src/cascades/planner/scalar_facts.rs`, `crates/optimizer/src/cascades/planner/tests.rs`, `crates/optimizer/src/cascades/planner/transformation.rs`, `crates/optimizer/src/cascades/planner/transformation/cte.rs`, `crates/optimizer/src/cascades/planner/transformation/matching.rs`, `crates/optimizer/src/cascades/planner/transformation/matching_failure_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_aggregate_topn_payload.rs`, `crates/optimizer/src/cascades/planner/transformation/native_aggregate_topn_payload_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_deferral_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_domain.rs`, `crates/optimizer/src/cascades/planner/transformation/native_domain_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_join_elimination.rs`, `crates/optimizer/src/cascades/planner/transformation/native_join_preaggregation.rs`, `crates/optimizer/src/cascades/planner/transformation/native_join_subsumption.rs`, `crates/optimizer/src/cascades/planner/transformation/native_late_payload.rs`, `crates/optimizer/src/cascades/planner/transformation/native_materialization_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_non_null_inputs.rs`, `crates/optimizer/src/cascades/planner/transformation/native_post_reduction.rs`, `crates/optimizer/src/cascades/planner/transformation/native_scalar_aggregate_window.rs`, `crates/optimizer/src/cascades/planner/transformation/native_selective_payload.rs`, `crates/optimizer/src/cascades/planner/transformation/native_topn_payload.rs`, `crates/optimizer/src/cascades/planner/transformation/native_topn_payload_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/settlement.rs`, `crates/optimizer/src/cascades/planner/transformation/settlement/demand.rs`, `crates/optimizer/src/cascades/planner/transformation/settlement/native.rs`, `crates/optimizer/src/cascades/rules.rs`, `crates/optimizer/src/cascades/tasks.rs`, `crates/optimizer/src/cascades/verifier.rs`, `crates/optimizer/src/optimizer.rs`, `crates/optimizer/src/statistics/gathering.rs`, `crates/optimizer/src/statistics/propagator.rs`, `crates/optimizer/src/work_partition.rs`, `crates/optimizer/src/work_partition/b3.rs`
+`crates/optimizer/src/aggregate/late_payload.rs`, `crates/optimizer/src/aggregate/late_payload_tests.rs`, `crates/optimizer/src/cascades/budget.rs`, `crates/optimizer/src/cascades/engine.rs`, `crates/optimizer/src/cascades/engine/quality_production.rs`, `crates/optimizer/src/cascades/engine/tests.rs`, `crates/optimizer/src/cascades/engine/tests/closure.rs`, `crates/optimizer/src/cascades/engine/tests/grant_lazy.rs`, `crates/optimizer/src/cascades/engine/tests/quality_production.rs`, `crates/optimizer/src/cascades/memo.rs`, `crates/optimizer/src/cascades/memo/diagnostic_snapshot.rs`, `crates/optimizer/src/cascades/memo/tests.rs`, `crates/optimizer/src/cascades/oracle.rs`, `crates/optimizer/src/cascades/planner/boundary/tests.rs`, `crates/optimizer/src/cascades/planner/contracts.rs`, `crates/optimizer/src/cascades/planner/costing.rs`, `crates/optimizer/src/cascades/planner/domain_transfer.rs`, `crates/optimizer/src/cascades/planner/mod.rs`, `crates/optimizer/src/cascades/planner/predicate_order.rs`, `crates/optimizer/src/cascades/planner/quality_domain.rs`, `crates/optimizer/src/cascades/planner/scalar_facts.rs`, `crates/optimizer/src/cascades/planner/tests.rs`, `crates/optimizer/src/cascades/planner/transformation.rs`, `crates/optimizer/src/cascades/planner/transformation/cte.rs`, `crates/optimizer/src/cascades/planner/transformation/matching.rs`, `crates/optimizer/src/cascades/planner/transformation/matching_failure_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_aggregate_topn_payload.rs`, `crates/optimizer/src/cascades/planner/transformation/native_aggregate_topn_payload_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_deferral_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_domain.rs`, `crates/optimizer/src/cascades/planner/transformation/native_domain_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_join_elimination.rs`, `crates/optimizer/src/cascades/planner/transformation/native_join_preaggregation.rs`, `crates/optimizer/src/cascades/planner/transformation/native_join_subsumption.rs`, `crates/optimizer/src/cascades/planner/transformation/native_late_payload.rs`, `crates/optimizer/src/cascades/planner/transformation/native_materialization_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/native_non_null_inputs.rs`, `crates/optimizer/src/cascades/planner/transformation/native_post_reduction.rs`, `crates/optimizer/src/cascades/planner/transformation/native_scalar_aggregate_window.rs`, `crates/optimizer/src/cascades/planner/transformation/native_selective_payload.rs`, `crates/optimizer/src/cascades/planner/transformation/native_topn_payload.rs`, `crates/optimizer/src/cascades/planner/transformation/native_topn_payload_tests.rs`, `crates/optimizer/src/cascades/planner/transformation/settlement.rs`, `crates/optimizer/src/cascades/planner/transformation/settlement/demand.rs`, `crates/optimizer/src/cascades/planner/transformation/settlement/native.rs`, `crates/optimizer/src/cascades/rules.rs`, `crates/optimizer/src/cascades/tasks.rs`, `crates/optimizer/src/cascades/verifier.rs`, `crates/optimizer/src/statistics/gathering.rs`, `crates/optimizer/src/statistics/propagator.rs`, `crates/optimizer/src/work_partition.rs`, `crates/optimizer/src/work_partition/b3.rs`
 
 ### session/server protocol
 
@@ -33,21 +33,24 @@
 
 本轮只在 Compile Evidence v3、context compile-diagnostics producer、EXPLAIN renderer/validator、RunOutput/collector/gate、相应测试和文档中逐 hunk 修改。若某文件同时含有用户 WIP，先保存恢复材料并只提交可独立证明的 hunk；无法安全分离的改动留在原工作树并标记为未准入。
 
-## 结束时快照（2026-09-22）
+## 本轮提交后的快照（2026-09-22）
 
 - branch: `re-op`
-- HEAD before this task's commits: `49fbd05dd630add9ea33c66398adcfad6942b075`
+- HEAD: `77677ece5fa0bbf5d151855d1235ea447abbbd6e`
 - staged paths: `0`
-- unstaged tracked paths: `104`
-- untracked paths: `3`
-- current unstaged diff SHA-256 before topic commits: `1c259dd82b2a9bac8db3548fbc039ed4fb5fff56d7f44fcbb9bcadf5ea50311e`
-- current untracked paths: the two `query-summary-v3` fixtures and this boundary document
+- unstaged tracked paths before this document commit: `77`
+- untracked paths: `0`
+- current unstaged diff SHA-256 before this document commit: `816862d4c3b37f3cd9a550a7493317d453bb2da20ae368c9a7033711ce5c9793`
+- the 77 paths consist of 73 preserved mixed WIP paths, this task's
+  `benchmark/tests/test_cold_planning_gate.py`, and the three task-owned
+  support documents
 - recovery material remains at `/private/tmp/paro-reop-compile-evidence-v2-recovery-post-20260922/`; no recovery ref or historical worktree was removed
 
-The 104 tracked paths are still separated by the categories above. The task commits contain only
-the compile-evidence/RunOutput/collector/renderer/validator/test/document hunks listed in their
-commit summaries. Mixed optimizer/native, storage/execution, and session/server paths remain
-unstaged unless an independently reviewable task hunk was required to compile the typed producer.
+The 73 mixed paths remain separated by the categories above. The task commits
+contain only the compile-evidence/RunOutput/collector/renderer/validator/test/
+document hunks listed in their commit summaries. The preserved optimizer/native,
+storage/execution, and session/server paths remain unstaged; the optimizer
+search-counter hunk was independently reviewable and was committed separately.
 
 ## Verification boundary
 
@@ -72,11 +75,12 @@ The independently reviewable task commits are now:
 - `0a5a2bea` — v3 typed receipt and Detail validation contract;
 - `775e9315` — bounded RunOutput, collector, gate, and benchmark lifecycle;
 - `922820a6` — versioned physical-identity guardrails, with the typed-payload gate intentionally still blocked;
-- `ff5188e4`, `f8188153`, `c7254bd9` — validation boundary, real Detail smoke, and support-matrix updates.
+- `ff5188e4`, `f8188153`, `c7254bd9` — validation boundary, real Detail smoke, and support-matrix updates;
+- `93992b09` — typed Rust search counters consumed by the v3 collector/gate;
+- `77677ece` — declared-capture completion guard and regression tests.
 
-After these commits the worktree has no staged paths, no untracked paths, and 75 unstaged tracked
-paths. The remaining unstaged diff SHA-256 is
-`ca07e79254ef7bb740356c3448aa952b081df539f6a475bf7d5b1543a43f1865`. Those paths are the
-pre-existing mixed optimizer/native, storage/execution, and session/server WIP listed in the
-classification above; they were not included in the topic commits. The recovery refs and the
-post-2026-09-22 recovery directory remain unchanged.
+After the final document commit the worktree will have no staged paths, no
+untracked paths, and 73 unstaged tracked mixed-WIP paths. The recovery refs and
+the post-2026-09-22 recovery directory remain unchanged. The final mixed diff
+hash is intentionally recorded by the handoff command after this document is
+committed; it is not used as a task source identity.

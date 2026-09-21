@@ -132,11 +132,16 @@ recorded in `compile-trace-matrix-validation.json`; this remains a targeted
 smoke, not a complete campaign.
 
 The shared `cold_planning.py` collector was also exercised with the pinned
-release build and an immutable seed. Its owned server exited before SQL
-execution, and the collector preserved three bounded `Incomplete` RunOutput
-trees rather than emitting a success or inventing a compile receipt. This is
-useful failure-path evidence, not a successful benchmark cell; a working
-cold-planning producer-to-gate cell and a normal cell remain uncovered.
+release build and an immutable seed. The first three attempts preserved
+bounded `Incomplete` RunOutput trees when the owned server exited before SQL;
+they remain failure-path evidence. After using a catalog-complete immutable
+seed, a real `SELECT 1` diagnostic cell reached PgWire EXPLAIN, wrote one v3
+capture, sealed one cell, and passed the shared `cold_planning_gate` from the
+sealed RunOutput. Report 13 repeated that smoke after the capture-completion
+guard was added (`explain_wall_ms=5.626250`, `optimizer_ms=3.499666`). The
+gate now reads optimizer timing, rules, search counters, and stop reason only
+from the Rust-owned EXPLAIN document; `paro_optimizers()` is not a compile
+semantic source. A normal timing cell and the full campaign remain uncovered.
 
 The historical verification run completed the workspace tests, strict Clippy,
 benchmark unit tests, and the high-file-descriptor SQL regress harness without

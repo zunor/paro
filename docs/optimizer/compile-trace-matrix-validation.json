@@ -1,7 +1,9 @@
 {
   "schema_version": 3,
   "compile_evidence_schema_version": 3,
-  "source_commit": "922820a6",
+  "source_commit": "77677ece5fa0bbf5d151855d1235ea447abbbd6e",
+  "source_tree_dirty": true,
+  "source_tree_dirty_reason": "The smoke binary retained the separately preserved mixed WIP paths; this is targeted evidence, not a clean-campaign certification.",
   "scope": "v3 producer/consumer contract, bounded Detail and Summary-level RunOutput",
   "validation_status": "targeted_checks_only",
   "environment": {
@@ -22,7 +24,7 @@
     "strict_clippy_all_targets_all_features": "pass",
     "benchmark_unittest": {
       "status": "pass",
-      "passed": 192,
+      "passed": 194,
       "skipped": 1
     },
     "sql_regress": {
@@ -52,7 +54,20 @@
     "real_explain_compile_summary": "pass",
     "real_explain_compile_analyze": "pass",
     "real_pgwire_select": "pass",
-    "clean_producer_to_gate_campaign": "not_run",
+    "targeted_producer_to_gate_smoke": {
+      "status": "pass_targeted_smoke",
+      "run_root": "/tmp/paro-compile-evidence-v3-cold-select1-report-13-run",
+      "campaign_status": "Completed",
+      "cell": "paro-compile-evidence-v3-cold-select1 x diagnostic",
+      "samples": 1,
+      "capture_count": 1,
+      "gate": "pass",
+      "explain_wall_ms": 5.62625,
+      "optimizer_ms": 3.499666,
+      "compile_metrics_source": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document",
+      "normal_cell": "not_run",
+      "full_campaign": "not_run"
+    },
     "real_detail_shape_campaign": {
       "status": "pass_targeted_smoke",
       "server_data_dir": "/tmp/paro-compile-evidence-v3-detail-0922",
@@ -68,15 +83,25 @@
       "full_campaign": "not_run"
     },
     "cold_planning_collector_smoke": {
-      "status": "failed_before_sql",
-      "reason": "owned release server exited before the collector could issue EXPLAIN",
+      "status": "pass_targeted_smoke",
+      "reason": "three earlier catalog-incomplete attempts remain preserved as Incomplete evidence; the catalog-complete retry reached the real producer",
       "run_roots": [
         "/tmp/paro-compile-evidence-v3-cold-select1-report-run",
         "/tmp/paro-compile-evidence-v3-cold-select1-report-2-run",
-        "/tmp/paro-compile-evidence-v3-cold-select1-report-3-run"
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-3-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-6-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-7-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-8-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-9-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-10-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-11-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-12-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-13-run"
       ],
-      "terminal": "Incomplete",
-      "producer_output": "not_reached",
+      "successful_run_root": "/tmp/paro-compile-evidence-v3-cold-select1-report-13-run",
+      "terminal": "Completed",
+      "producer_output": "v3 EXPLAIN capture",
+      "gate": "pass",
       "normal_cell": "not_run"
     }
   },
@@ -88,7 +113,7 @@
     "SQL expected-file parity",
     "typed physical identity for cross-run association",
     "full real producer-to-gate Detail campaign",
-    "successful benchmark cold-planning producer cell",
+    "full benchmark cold-planning campaign",
     "current clean workspace validation",
     "full Trace Matrix Detail producer coverage"
   ]

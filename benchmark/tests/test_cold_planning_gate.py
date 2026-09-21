@@ -74,7 +74,7 @@ class ColdPlanningGateTests(unittest.TestCase):
                     "query_cases": 1,
                     "sample_rows": 3,
                     "product_receipts": 3,
-                    "summary_captures": 3,
+                    "summary_captures": 0,
                 }],
             )
             attempt = output.attempts[("q11", "diagnostic")]
