@@ -63,3 +63,18 @@ unstaged unless an independently reviewable task hunk was required to compile th
 The physical identity implementation still contains a Debug-derived payload fallback and the
 multi-shape real Detail producer campaign was not run. Those are explicit unadmitted boundaries;
 this snapshot therefore does not claim TraceMatrixReady, C2, F2, parity, or a performance target.
+
+## Post-topic-commit state
+
+The independently reviewable task commits are now:
+
+- `0a5a2bea` — v3 typed receipt and Detail validation contract;
+- `775e9315` — bounded RunOutput, collector, gate, and benchmark lifecycle;
+- `922820a6` — versioned physical-identity guardrails, with the typed-payload gate intentionally still blocked.
+
+After these commits the worktree has no staged paths, no untracked paths, and 75 unstaged tracked
+paths. The remaining unstaged diff SHA-256 is
+`ca07e79254ef7bb740356c3448aa952b081df539f6a475bf7d5b1543a43f1865`. Those paths are the
+pre-existing mixed optimizer/native, storage/execution, and session/server WIP listed in the
+classification above; they were not included in the topic commits. The recovery refs and the
+post-2026-09-22 recovery directory remain unchanged.

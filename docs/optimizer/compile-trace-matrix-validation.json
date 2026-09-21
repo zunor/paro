@@ -1,7 +1,7 @@
 {
   "schema_version": 3,
   "compile_evidence_schema_version": 3,
-  "source_commit": "49fbd05dd630add9ea33c66398adcfad6942b075",
+  "source_commit": "922820a6",
   "scope": "v3 producer/consumer contract, bounded Detail and Summary-level RunOutput",
   "validation_status": "targeted_checks_only",
   "environment": {
