@@ -12,7 +12,7 @@ use paro_common::error::Result;
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
 use paro_context::{
-    AdmissionFallback, AdmissionResult, ExecutionReceiptHandle,
+    AdmissionFallback, AdmissionResult, ExecutionReceiptHandle, ExecutionReceiptStart,
     MemoryCompletionReceipt, QueryMemoryBudgetSpec, QueryMemoryTarget, ResourceReceipt,
     StatementContext,
 };
@@ -97,15 +97,15 @@ impl Executor {
                 } else {
                     AdmissionResult::Failed
                 };
-                let receipt = self.session.diagnostics.begin_execution_receipt(
-                    compiled.artifact_identity(),
-                    compiled.expected_grant_class(),
-                    None,
-                    None,
-                    None,
+                let receipt = self.session.diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+                    artifact_identity: compiled.artifact_identity(),
+                    expected_class: compiled.expected_grant_class(),
+                    actual_class: None,
+                    actual_fingerprint: None,
+                    resources: None,
                     admission,
-                    None,
-                );
+                    fallback: None,
+                });
                 receipt.record_error(error.to_string());
                 drop(receipt);
                 if let Some(trace) = &statement_trace {
@@ -114,15 +114,15 @@ impl Executor {
                 return Err(error);
             }
         };
-        let receipt = self.session.diagnostics.begin_execution_receipt(
-            compiled.artifact_identity(),
-            compiled.expected_grant_class(),
-            selection.map(|selection| selection.resources.class.0),
-            selection.map(|selection| fingerprint_words(selection.physical_fingerprint)),
-            selection.map(|selection| resource_receipt(selection.resources)),
-            AdmissionResult::Selected,
+        let receipt = self.session.diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            artifact_identity: compiled.artifact_identity(),
+            expected_class: compiled.expected_grant_class(),
+            actual_class: selection.map(|selection| selection.resources.class.0),
+            actual_fingerprint: selection.map(|selection| fingerprint_words(selection.physical_fingerprint)),
+            resources: selection.map(|selection| resource_receipt(selection.resources)),
+            admission: AdmissionResult::Selected,
             fallback,
-        );
+        });
         if let Some(lease) = execution_lease {
             query_memory_pool.install_execution_lease(lease)?;
             if let Some(trace) = &statement_trace {
@@ -147,6 +147,7 @@ impl Executor {
                 return Err(error);
             }
         };
+        receipt.image_ready();
         if let Some(trace) = &statement_trace {
             trace.record_event("execution", "result_handler_ready");
             trace.record_event("execution", "executor_return");

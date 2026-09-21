@@ -82,7 +82,62 @@ fn compile_query_cte_and_reject_unimplemented_options() {
                 assert!(!text.contains("answer"));
             }
             assert!(document(&mut session, "EXPLAIN (COMPILE) SELECT 1").await.starts_with("EXPLAIN (COMPILE)"));
-            for sql in ["EXPLAIN (COMPILE, DETAIL) SELECT 1", "EXPLAIN (COMPILE, ANALYZE) SELECT 1", "EXPLAIN (COMPILE) CREATE TABLE forbidden (x INT)", "EXPLAIN (COMPILE) SELECT 1 FORMAT JSON", "EXPLAIN (COMPILE) EXPLAIN SELECT 1"] {
+            let analyzed = document(
+                &mut session,
+                "EXPLAIN (COMPILE, ANALYZE, FORMAT JSON) SELECT 1",
+            )
+            .await;
+            let analyzed_record: serde_json::Value = serde_json::from_str(&analyzed).unwrap();
+            let analyzed_receipt = analyzed_record["execution_receipt"].as_object().unwrap();
+            assert_eq!(analyzed_receipt["admission"], "Selected");
+            assert_eq!(analyzed_receipt["image"], "Ready");
+            assert_eq!(analyzed_receipt["terminal"], "Completed");
+            session
+                .execute_simple_query("SELECT 7", &mut CollectingSink::new())
+                .await
+                .unwrap();
+            session
+                .execute_simple_query("SELECT 7", &mut CollectingSink::new())
+                .await
+                .unwrap();
+            let mut receipt_sink = CollectingSink::new();
+            session
+                .execute_simple_query(
+                    "SELECT name FROM paro_optimizers()",
+                    &mut receipt_sink,
+                )
+                .await
+                .unwrap();
+            let receipt_result = receipt_sink.assert_single_result();
+            let mut receipt_names = Vec::new();
+            for chunk in &receipt_result.chunks {
+                for row in 0..chunk.len() {
+                    if let Value::Varchar(name) = chunk.column(0).unwrap().get_value(row) {
+                        receipt_names.push(name);
+                    }
+                }
+            }
+            assert!(
+                receipt_names
+                    .iter()
+                    .any(|name| name.starts_with("statement_compile_receipt/")),
+                "normal SELECT did not publish a compile receipt: {receipt_names:?}"
+            );
+            assert!(
+                receipt_names
+                    .iter()
+                    .any(|name| name.starts_with("statement_execution_receipt/")),
+                "normal SELECT did not publish an execution receipt: {receipt_names:?}"
+            );
+            assert!(
+                receipt_names
+                    .iter()
+                    .filter(|name| name.starts_with("statement_plan_cache/"))
+                    .count()
+                    >= 2,
+                "normal SELECT cache decisions were not retained: {receipt_names:?}"
+            );
+            for sql in ["EXPLAIN (COMPILE, DETAIL) SELECT 1", "EXPLAIN (COMPILE) CREATE TABLE forbidden (x INT)", "EXPLAIN (COMPILE) SELECT 1 FORMAT JSON", "EXPLAIN (COMPILE) EXPLAIN SELECT 1"] {
                 let mut sink = CollectingSink::new();
                 assert!(session.execute_simple_query(sql, &mut sink).await.is_err(), "{sql}");
             }

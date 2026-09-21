@@ -1087,6 +1087,7 @@ fn populate_paro_optimizers(
         for decision in ctx.diagnostics.statement_cache_snapshot() {
             if let Some(identity) = decision.artifact_identity {
                 for (name, value) in [
+                    ("identity_schema_version", u64::from(identity.schema_version)),
                     ("artifact_hi", identity.artifact[0]),
                     ("artifact_lo", identity.artifact[1]),
                     ("structure_hi", identity.structure[0]),
@@ -1101,7 +1102,10 @@ fn populate_paro_optimizers(
                         ),
                         kind: "receipt".into(),
                         last_elapsed_us: 0,
-                        metric_value: i64::try_from(value).unwrap_or(i64::MAX),
+                        // BigInt is the existing diagnostic wire type.  Preserve the
+                        // complete u64 identity by carrying its two's-complement bit
+                        // pattern; readers decode identity_word values back to u64.
+                        metric_value: value as i64,
                         metric_unit: "identity_word".into(),
                         invocation_count: 1,
                     });
@@ -1127,6 +1131,7 @@ fn populate_paro_optimizers(
         for receipt in ctx.diagnostics.execution_receipts_snapshot() {
             let identity = receipt.artifact_identity;
             let mut values = vec![
+                ("identity_schema_version", u64::from(identity.schema_version)),
                 ("artifact_hi", identity.artifact[0]),
                 ("artifact_lo", identity.artifact[1]),
                 ("structure_hi", identity.structure[0]),
@@ -1148,9 +1153,26 @@ fn populate_paro_optimizers(
                     paro_context::ExecutionTerminal::Cancelled => 4,
                     paro_context::ExecutionTerminal::Dropped => 5,
                 }),
+                ("image", match receipt.image {
+                    paro_context::ExecutionImageStatus::NotReady => 0,
+                    paro_context::ExecutionImageStatus::Ready => 1,
+                }),
             ];
             if let Some(fingerprint) = receipt.actual_fingerprint {
-                values.extend([("actual_fingerprint_hi", fingerprint[0]), ("actual_fingerprint_lo", fingerprint[1])]);
+                values.extend([
+                    ("actual_fingerprint_hi", fingerprint[0]),
+                    ("actual_fingerprint_lo", fingerprint[1]),
+                ]);
+            }
+            if let Some(fallback) = receipt.fallback {
+                values.push((
+                    "fallback",
+                    match fallback {
+                        paro_context::AdmissionFallback::LowerResourceClass => 1,
+                        paro_context::AdmissionFallback::ExternalCapacity => 2,
+                        paro_context::AdmissionFallback::DependencyChanged => 3,
+                    },
+                ));
             }
             if let Some(resources) = receipt.resources {
                 values.extend([
@@ -1165,8 +1187,13 @@ fn populate_paro_optimizers(
                     name: format!("statement_execution_receipt/{}/{}", receipt.execution_id, name),
                     kind: "receipt".into(),
                     last_elapsed_us: 0,
-                    metric_value: i64::try_from(value).unwrap_or(i64::MAX),
-                    metric_unit: "receipt".into(),
+                    metric_value: value as i64,
+                    metric_unit: if name.ends_with("_hi") || name.ends_with("_lo") {
+                        "identity_word"
+                    } else {
+                        "receipt"
+                    }
+                    .into(),
                     invocation_count: 1,
                 });
             }

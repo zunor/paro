@@ -59,12 +59,12 @@ pub use query_resources::{
 };
 pub use runtime_limits::RuntimeLimits;
 pub use compile_diagnostics::{
-    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionReceipt, ExecutionTerminal,
+    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt, ExecutionTerminal,
     MemoryCompletionReceipt, ResourceReceipt, RECEIPT_SCHEMA_VERSION,
 };
 pub use session_diagnostics::{
     compile_work_evidence_enabled, CompileWork, OptimizerDiagnostic, OptimizerMetricUnit,
-    ExecutionReceiptHandle, SessionDiagnostics, StatementCacheDecision,
+    ExecutionReceiptHandle, ExecutionReceiptStart, SessionDiagnostics, StatementCacheDecision,
 };
 pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,

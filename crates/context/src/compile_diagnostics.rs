@@ -116,6 +116,16 @@ pub enum ExecutionTerminal {
     Dropped,
 }
 
+/// Admission selects a portfolio member before the executable image is
+/// lowered.  Keep that lifecycle edge explicit instead of treating a
+/// selected portfolio entry as an executable image.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum ExecutionImageStatus {
+    NotReady,
+    Ready,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub enum AdmissionFallback {
@@ -158,6 +168,7 @@ pub struct ExecutionReceipt {
     pub resources: Option<ResourceReceipt>,
     pub admission: AdmissionResult,
     pub fallback: Option<AdmissionFallback>,
+    pub image: ExecutionImageStatus,
     pub terminal: ExecutionTerminal,
     pub terminal_error: Option<String>,
 }

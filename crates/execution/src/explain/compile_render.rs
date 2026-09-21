@@ -116,6 +116,17 @@ pub fn validate_json(
         {
             return Err("selected execution receipt lacks actual admission".into());
         }
+        if execution.admission == AdmissionResult::Selected
+            && matches!(
+                execution.terminal,
+                ExecutionTerminal::Running
+                    | ExecutionTerminal::Completed
+                    | ExecutionTerminal::Dropped
+            )
+            && execution.image != ExecutionImageStatus::Ready
+        {
+            return Err("selected execution terminal lacks an executable image".into());
+        }
         if execution.admission != AdmissionResult::Selected
             && execution.terminal != ExecutionTerminal::NotExecuted
         {

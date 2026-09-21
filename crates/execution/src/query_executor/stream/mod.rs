@@ -5,6 +5,7 @@
 
 mod background_output;
 mod completed_output;
+mod receipt;
 mod typed_streaming;
 
 use std::sync::Arc;
@@ -276,33 +277,6 @@ impl ResultHandler {
             }
         }
         self.mark_cancelled("result handler closed before terminal output");
-    }
-
-    fn mark_closed(&mut self) {
-        if let Some(receipt) = self.execution_receipt.take() {
-            receipt.complete();
-        }
-        self.closed = true;
-        self.output = ResultOutput::Closed;
-        self.detach_query_memory_pool();
-    }
-
-    pub(super) fn mark_cancelled(&mut self, error: impl Into<String>) {
-        if let Some(receipt) = self.execution_receipt.take() {
-            receipt.cancel(error);
-        }
-        self.closed = true;
-        self.output = ResultOutput::Closed;
-        self.detach_query_memory_pool();
-    }
-
-    pub(super) fn mark_failed(&mut self, error: impl Into<String>) {
-        if let Some(receipt) = self.execution_receipt.take() {
-            receipt.fail(error);
-        }
-        self.closed = true;
-        self.output = ResultOutput::Closed;
-        self.detach_query_memory_pool();
     }
 
     fn detach_query_memory_pool(&mut self) {

@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::StatementTraceSnapshot;
 use crate::compile_diagnostics::{
-    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionReceipt, ExecutionTerminal,
+    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt, ExecutionTerminal,
     ResourceReceipt, RECEIPT_SCHEMA_VERSION,
 };
 
@@ -97,19 +97,42 @@ pub struct ExecutionWorkRecord {
     pub snapshot: paro_common::cold_work::Snapshot,
 }
 
+/// Immutable admission facts supplied when an execution receipt is created.
+/// Keeping these facts together prevents callers from accidentally pairing an
+/// artifact with a selection or resource contract from another admission.
+#[derive(Debug, Clone)]
+pub struct ExecutionReceiptStart {
+    pub artifact_identity: ArtifactIdentity,
+    pub expected_class: Option<u32>,
+    pub actual_class: Option<u32>,
+    pub actual_fingerprint: Option<[u64; 2]>,
+    pub resources: Option<ResourceReceipt>,
+    pub admission: AdmissionResult,
+    pub fallback: Option<AdmissionFallback>,
+}
+
 /// A small capability held by a real result handler.  Admission is published
 /// before the pipeline is built; the handler closes the same record when the
 /// terminal execution state is known.  Dropping the handler therefore cannot
 /// leave an apparently successful execution receipt behind.
 #[derive(Debug, Clone)]
 pub struct ExecutionReceiptHandle {
+    lease: Arc<ExecutionReceiptLease>,
+}
+
+/// The terminal-drop fallback belongs to the shared receipt lease, not to
+/// each clone of the capability.  The executor keeps one clone while the
+/// result handler owns another; dropping the executor's local clone must not
+/// turn a still-running execution into `Dropped`.
+#[derive(Debug)]
+struct ExecutionReceiptLease {
     diagnostics: Arc<SessionDiagnostics>,
     execution_id: u64,
 }
 
 impl ExecutionReceiptHandle {
     pub fn execution_id(&self) -> u64 {
-        self.execution_id
+        self.lease.execution_id
     }
 
     pub fn complete(&self) {
@@ -124,24 +147,35 @@ impl ExecutionReceiptHandle {
         self.finish(ExecutionTerminal::Cancelled, Some(error.into()));
     }
 
+    pub fn image_ready(&self) {
+        self.lease
+            .diagnostics
+            .mark_execution_image_ready(self.lease.execution_id);
+    }
+
     /// Preserve an admission failure without turning it into an execution
     /// terminal.  An infeasible or failed admission is deliberately
     /// `NotExecuted`; the original bounded error still belongs on the receipt.
     pub fn record_error(&self, error: impl Into<String>) {
-        self.diagnostics
-            .record_execution_receipt_error(self.execution_id, error.into());
+        self.lease
+            .diagnostics
+            .record_execution_receipt_error(self.lease.execution_id, error.into());
     }
 
     fn finish(&self, terminal: ExecutionTerminal, error: Option<String>) {
-        self.diagnostics
-            .finish_execution_receipt(self.execution_id, terminal, error);
+        self.lease
+            .diagnostics
+            .finish_execution_receipt(self.lease.execution_id, terminal, error);
     }
 }
 
-impl Drop for ExecutionReceiptHandle {
+impl Drop for ExecutionReceiptLease {
     fn drop(&mut self) {
-        self.diagnostics
-            .finish_execution_receipt(self.execution_id, ExecutionTerminal::Dropped, None);
+        self.diagnostics.finish_execution_receipt(
+            self.execution_id,
+            ExecutionTerminal::Dropped,
+            None,
+        );
     }
 }
 
@@ -155,26 +189,21 @@ impl SessionDiagnostics {
 
     pub fn begin_execution_receipt(
         self: &Arc<Self>,
-        artifact_identity: ArtifactIdentity,
-        expected_class: Option<u32>,
-        actual_class: Option<u32>,
-        actual_fingerprint: Option<[u64; 2]>,
-        resources: Option<ResourceReceipt>,
-        admission: AdmissionResult,
-        fallback: Option<AdmissionFallback>,
+        start: ExecutionReceiptStart,
     ) -> ExecutionReceiptHandle {
         let execution_id = self.execution_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             execution_id,
-            artifact_identity,
-            expected_class,
-            actual_class,
-            actual_fingerprint,
-            resources,
-            admission,
-            fallback,
-            terminal: if admission == AdmissionResult::Selected {
+            artifact_identity: start.artifact_identity,
+            expected_class: start.expected_class,
+            actual_class: start.actual_class,
+            actual_fingerprint: start.actual_fingerprint,
+            resources: start.resources,
+            admission: start.admission,
+            fallback: start.fallback,
+            image: ExecutionImageStatus::NotReady,
+            terminal: if start.admission == AdmissionResult::Selected {
                 ExecutionTerminal::Running
             } else {
                 ExecutionTerminal::NotExecuted
@@ -187,8 +216,22 @@ impl SessionDiagnostics {
             receipts.remove(0);
         }
         ExecutionReceiptHandle {
-            diagnostics: Arc::clone(self),
-            execution_id,
+            lease: Arc::new(ExecutionReceiptLease {
+                diagnostics: Arc::clone(self),
+                execution_id,
+            }),
+        }
+    }
+
+    fn mark_execution_image_ready(&self, execution_id: u64) {
+        let mut receipts = self.execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.execution_id == execution_id) else {
+            return;
+        };
+        if receipt.admission == AdmissionResult::Selected
+            && receipt.terminal == ExecutionTerminal::Running
+        {
+            receipt.image = ExecutionImageStatus::Ready;
         }
     }
 
@@ -320,17 +363,51 @@ mod tests {
             structure: [3, 4],
             dependencies: [5, 6],
         };
-        let handle = diagnostics.begin_execution_receipt(
-            identity,
-            Some(2),
-            Some(2),
-            Some([7, 8]),
-            None,
-            AdmissionResult::Selected,
-            None,
-        );
+        let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            artifact_identity: identity,
+            expected_class: Some(2),
+            actual_class: Some(2),
+            actual_fingerprint: Some([7, 8]),
+            resources: None,
+            admission: AdmissionResult::Selected,
+            fallback: None,
+        });
         assert_eq!(diagnostics.execution_receipts_snapshot()[0].terminal, ExecutionTerminal::Running);
+        assert_eq!(diagnostics.execution_receipts_snapshot()[0].image, ExecutionImageStatus::NotReady);
+        handle.image_ready();
+        assert_eq!(diagnostics.execution_receipts_snapshot()[0].image, ExecutionImageStatus::Ready);
         handle.complete();
         assert_eq!(diagnostics.execution_receipts_snapshot()[0].terminal, ExecutionTerminal::Completed);
+    }
+
+    #[test]
+    fn dropping_one_receipt_clone_does_not_close_running_execution() {
+        let diagnostics = Arc::new(SessionDiagnostics::default());
+        let identity = ArtifactIdentity {
+            schema_version: 1,
+            artifact: [11, 12],
+            structure: [13, 14],
+            dependencies: [15, 16],
+        };
+        let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
+            artifact_identity: identity,
+            expected_class: Some(2),
+            actual_class: Some(2),
+            actual_fingerprint: Some([17, 18]),
+            resources: None,
+            admission: AdmissionResult::Selected,
+            fallback: None,
+        });
+        let handler_handle = handle.clone();
+        drop(handle);
+        assert_eq!(
+            diagnostics.execution_receipts_snapshot()[0].terminal,
+            ExecutionTerminal::Running
+        );
+        handler_handle.complete();
+        assert_eq!(
+            diagnostics.execution_receipts_snapshot()[0].terminal,
+            ExecutionTerminal::Completed
+        );
     }
 }
