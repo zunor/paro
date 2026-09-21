@@ -44,14 +44,18 @@ class MixedSqlSuiteSource:
             suite=source.suite,
             pid=context.pid,
             run_output=context.run_output,
+            query_case=context.attempt.query_case if context.attempt else source.name,
+            arm_id=context.attempt.arm_id if context.attempt else None,
         )
         config = runner.resolve_config(args)
         if context.run_output is not None and context.attempt is not None:
             context.run_output.register_cell(
-                cell_id=f"{context.attempt.source_id}--{context.attempt.attempt_id}",
+                cell_id=f"{context.attempt.query_case}--{context.attempt.arm_id}",
                 query_cases=5,
                 sample_rows=5 * max(config.iterations, 1),
                 product_receipts=5 * 4,
+                query_case=context.attempt.query_case,
+                arm_id=context.attempt.arm_id,
             )
         workloads = runner.load_selected_workloads(config, args, {})
         if len(workloads) != 1:
@@ -153,8 +157,12 @@ class MixedSqlSuiteSource:
                 context.run_output,
                 source_id=context.attempt.source_id if context.attempt else None,
                 attempt_id=context.attempt.attempt_id if context.attempt else None,
+                query_case=source.name,
+                arm_id=context.attempt.arm_id if context.attempt else None,
             )
-        result_path, summary_path = reporter.write_reports(payload, report_dir / "result.json")
+        result_path, summary_path = reporter.write_reports(
+            payload, report_dir / "result.json", run_output=context.run_output
+        )
         failed = bool(setup_error or teardown_error or any(s.error for s in scenarios))
         failed = failed or any(s.validation.get("result") != "PASS" for s in scenarios)
         return SourceMeasurement(
@@ -166,6 +174,8 @@ class MixedSqlSuiteSource:
             run_id=context.run_output.run_id if context.run_output else None,
             source_id=context.attempt.source_id if context.attempt else None,
             attempt_id=context.attempt.attempt_id if context.attempt else None,
+            query_case=source.name,
+            arm_id=context.attempt.arm_id if context.attempt else None,
             attempt_status="Completed" if not failed else "Failed",
         )
 

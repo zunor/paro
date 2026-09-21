@@ -43,4 +43,6 @@ class SourceMeasurement:
     run_id: str | None = None
     source_id: str | None = None
     attempt_id: str | None = None
+    query_case: str | None = None
+    arm_id: str | None = None
     attempt_status: str = "Uncovered"

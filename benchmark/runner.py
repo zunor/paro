@@ -86,6 +86,8 @@ class BenchmarkInvocation:
     run_output: RunOutput | None = None
     source_id: str | None = None
     attempt_id: str | None = None
+    query_case: str | None = None
+    arm_id: str | None = None
     output_root: Path | None = None
 
 
@@ -183,6 +185,10 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--run-id",
         help="exclusive run identity; an opaque identity is generated when omitted",
+    )
+    parser.add_argument(
+        "--arm-id",
+        help="stable campaign arm identity; it is part of the QueryCase×ArmId cell",
     )
     parser.add_argument("--pid", type=int, default=0, help="Sample peak RSS for the given parod pid")
 
@@ -521,16 +527,42 @@ def execute_workloads(
             run_id=args.run_id,
         )
 
+    # Direct `runner.py run` is itself a source invocation.  Give it the same
+    # AttemptId-owned directory as gate/source adapters; otherwise it would
+    # write a root-level result with no recoverable attempt state.  Adapters
+    # that already own an attempt pass its identity through and do not enter
+    # this branch.
+    owned_attempt = None
+    if args.attempt_id is None:
+        source_id = args.source_id or args.query_case or args.suite or args.workload or "adhoc"
+        query_case = args.query_case or args.suite or args.workload or source_id
+        arm_id = args.arm_id or "default"
+        owned_attempt = active_run.begin_attempt(
+            source_id,
+            query_case=query_case,
+            arm_id=arm_id,
+        )
+        args = replace(
+            args,
+            source_id=owned_attempt.source_id,
+            attempt_id=owned_attempt.attempt_id,
+            query_case=owned_attempt.query_case,
+            arm_id=owned_attempt.arm_id,
+            output_root=owned_attempt.root,
+        )
+
     try:
         workloads = load_selected_workloads(config, args, param_overrides)
         if not workloads:
             raise RunnerError("no workloads selected")
         query_count = sum(len(workload.queries) for workload in workloads)
         active_run.register_cell(
-            cell_id=(args.source_id and args.attempt_id and f"{args.source_id}--{args.attempt_id}") or "adhoc",
+            cell_id=f"{args.query_case or args.suite or args.workload or args.source_id or 'adhoc'}--{args.arm_id or 'default'}",
             query_cases=query_count,
             sample_rows=query_count * max(config.iterations + config.warmup, 1),
             product_receipts=query_count * 4,
+            query_case=args.query_case or args.suite or args.workload or args.source_id or "adhoc",
+            arm_id=args.arm_id or "default",
         )
 
         executor = BenchmarkExecutor(
@@ -560,9 +592,13 @@ def execute_workloads(
             run_output=active_run,
             source_id=args.source_id,
             attempt_id=args.attempt_id,
+            query_case=args.query_case or args.suite or args.workload or args.source_id or "adhoc",
+            arm_id=args.arm_id or "default",
         )
         output_root = active_run.owned_path(args.output_root or active_run.root)
-        result_path, summary_path = reporter.write_reports(payload, output_root / "result.json")
+        result_path, summary_path = reporter.write_reports(
+            payload, output_root / "result.json", run_output=active_run
+        )
         reporter.print_terminal_summary(workload_results, result_path)
 
         result = BenchmarkRunResult(
@@ -571,7 +607,22 @@ def execute_workloads(
             summary_path=summary_path,
             failed=reporter.has_failures(workload_results),
         )
+        if owned_attempt is not None:
+            owned_attempt.seal(
+                status="Failed" if result.failed else "Completed",
+                result_path=result.result_path,
+                summary_path=result.summary_path,
+            )
     except BaseException:
+        if owned_attempt is not None:
+            try:
+                owned_attempt.write_failure(status="Incomplete", error="benchmark run did not reach a terminal result")
+                owned_attempt.seal(status="Incomplete", failure_path=owned_attempt.failure_path)
+            except (RunOutputError, OSError):
+                # The original run exception is authoritative.  A bounded
+                # terminal writer failure is visible in the run manifest or
+                # capacity state and must not replace it.
+                pass
         if owned_run:
             active_run.finalize(status="Incomplete")
         raise

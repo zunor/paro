@@ -42,6 +42,7 @@ from harness.archive.store import (  # noqa: E402
 from harness.cli import gate_bisect  # noqa: E402
 from harness.performance_gate import GateEnforcement, GateFingerprint, GateOutcome, load_policy  # noqa: E402
 from harness.reporter import BenchmarkReporter  # noqa: E402
+from harness.run_output import RunOutput  # noqa: E402
 
 
 POLICY_PATH = Path(__file__).resolve().parents[1] / "policies" / "operator-runtime.toml"
@@ -194,11 +195,13 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(health.status, ArchiveHealthStatus.UNAVAILABLE)
             self.assertEqual(health.policy_enforcement, GateEnforcement.HARD)
             self.assertEqual(health.effective_enforcement, GateEnforcement.SOFT)
+            run = RunOutput.create(root / "report" / "runs", run_id="archive-test")
             report_path = BenchmarkReporter(root).write_gate_report(
                 gate=policy.name,
                 outcomes=[GateOutcome(gate=policy.name, enforcement=health.effective_enforcement, entries=())],
-                output_path=root / "report" / "runs" / "archive-test" / "gate.json",
+                output_path=run.gate_path,
                 archive_health=health,
+                run_output=run,
             )
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(report["archive"]["status"], "ArchiveUnavailable")
@@ -613,7 +616,9 @@ class ArchiveTests(unittest.TestCase):
                 run_id="bisect-read-only",
             )
             commit = Path(write.relative_path).name.split("-", 1)[0]
-            summary_path = root / "summary.md"
+            report_root = root / "report"
+            run_output = RunOutput.create(report_root, run_id="bisect-read-only")
+            summary_path = run_output.root / "summary.md"
             summary_path.write_text("", encoding="utf-8")
             measurement = measurement_for(policy)
             measurement = SimpleNamespace(
@@ -631,6 +636,8 @@ class ArchiveTests(unittest.TestCase):
                 pid="auto",
                 include_source=[],
                 skip_source=[],
+                report_root=report_root,
+                run_id="bisect-read-only",
             )
             before = store.list_json(f"results/{policy.name}/macos-arm64")
 
@@ -653,7 +660,12 @@ class ArchiveTests(unittest.TestCase):
                 ),
             ):
                 with redirect_stdout(io.StringIO()):
-                    exit_code = gate_bisect.run_bisect(args, root_dir=root, runner_module=object())
+                    exit_code = gate_bisect.run_bisect(
+                        args,
+                        root_dir=root,
+                        runner_module=object(),
+                        run_output=run_output,
+                    )
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(store.list_json(f"results/{policy.name}/macos-arm64"), before)

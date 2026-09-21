@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from .executor import QueryExecutionResult, WorkloadExecutionResult
 from .performance_gate import GateOutcome
-from .run_output import RunOutput, atomic_write_json, atomic_write_text
+from .run_output import RunOutput
 from .receipt_contract import validate_benchmark_payload, validate_summary_bytes
 from .runtime_contract import runtime_contract_payload
 
@@ -44,6 +44,8 @@ class BenchmarkReporter:
         run_output: RunOutput | None = None,
         source_id: str | None = None,
         attempt_id: str | None = None,
+        query_case: str | None = None,
+        arm_id: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "version": 3,
@@ -65,8 +67,11 @@ class BenchmarkReporter:
             payload["ownership"] = {
                 "schema_version": 1,
                 "run_id": run_output.run_id,
+                "campaign_id": run_output.campaign_id,
                 "source_id": source_id,
                 "attempt_id": attempt_id,
+                "query_case": query_case,
+                "arm_id": arm_id,
                 "artifact": "result.json",
                 "receipt_channel": "paro_optimizers_post_statement",
                 "receipt_statuses": ["Verified", "Uncovered"],
@@ -130,7 +135,7 @@ class BenchmarkReporter:
                         "raw_json": query.explain_profile_raw_json,
                         "operators": query.operator_profiles,
                     },
-                    "compile_receipt": query.receipt_association,
+                    "compile_receipts": query.receipt_associations,
                     "error": query.error,
                 }
                 workload_entry["queries"].append(query_entry)
@@ -144,13 +149,18 @@ class BenchmarkReporter:
         *,
         source_id: str | None = None,
         attempt_id: str | None = None,
+        query_case: str | None = None,
+        arm_id: str | None = None,
     ) -> dict[str, Any]:
         payload["version"] = 3
         payload["ownership"] = {
             "schema_version": 1,
             "run_id": run_output.run_id,
+            "campaign_id": run_output.campaign_id,
             "source_id": source_id,
             "attempt_id": attempt_id,
+            "query_case": query_case,
+            "arm_id": arm_id,
             "artifact": "result.json",
             "receipt_channel": "not-configured",
             "receipt_statuses": ["Uncovered"],
@@ -158,7 +168,13 @@ class BenchmarkReporter:
         payload.setdefault("config", {})["collect_compile_receipts"] = False
         return payload
 
-    def write_reports(self, payload: dict[str, Any], output_path: Path) -> tuple[Path, Path]:
+    def write_reports(
+        self,
+        payload: dict[str, Any],
+        output_path: Path,
+        *,
+        run_output: RunOutput,
+    ) -> tuple[Path, Path]:
         if payload.get("ownership") is not None:
             validate_benchmark_payload(
                 payload,
@@ -168,14 +184,13 @@ class BenchmarkReporter:
                 # ask validate_benchmark_payload(..., require_receipts=True).
                 require_receipts=False,
             )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(output_path, payload, overwrite=False)
+        run_output.write_json(output_path, payload, overwrite=False)
         summary_path = output_path.with_name("summary.md")
         if summary_path.exists():
             raise FileExistsError(f"refusing to overwrite owned summary: {summary_path}")
         summary = self._render_summary_markdown(payload)
         validate_summary_bytes(summary)
-        atomic_write_text(summary_path, summary, overwrite=False)
+        run_output.write_text(summary_path, summary, overwrite=False)
         return output_path, summary_path
 
     def print_terminal_summary(self, workloads: list[WorkloadExecutionResult], report_path: Path) -> None:
@@ -268,6 +283,8 @@ class BenchmarkReporter:
         self,
         summary_path: Path,
         outcome: GateOutcome,
+        *,
+        run_output: RunOutput,
     ) -> None:
         if not outcome.entries and outcome.archive_health is None:
             return
@@ -302,7 +319,7 @@ class BenchmarkReporter:
         current = summary_path.read_text(encoding="utf-8")
         updated = current + "\n".join(lines) + "\n"
         validate_summary_bytes(updated)
-        atomic_write_text(summary_path, updated, overwrite=True)
+        run_output.write_text(summary_path, updated, overwrite=True)
 
     def write_gate_report(
         self,
@@ -311,9 +328,9 @@ class BenchmarkReporter:
         outcomes: list[GateOutcome],
         output_path: Path,
         archive_health: Any | None = None,
+        run_output: RunOutput,
     ) -> Path:
         path = output_path
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
             "schema_version": 1,
             "gate": gate,
@@ -322,7 +339,7 @@ class BenchmarkReporter:
         }
         if archive_health is not None:
             payload["archive"] = _archive_health_payload(archive_health)
-        atomic_write_json(path, payload, overwrite=False)
+        run_output.write_json(path, payload, overwrite=False)
         return path
 
     def _print_archive_health(self, archive_health: "ArchiveHealth") -> None:

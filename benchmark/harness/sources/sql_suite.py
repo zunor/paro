@@ -24,6 +24,8 @@ class SqlSuiteSource:
             run_output=context.run_output,
             source_id=context.attempt.source_id if context.attempt else None,
             attempt_id=context.attempt.attempt_id if context.attempt else None,
+            query_case=context.attempt.query_case if context.attempt else source.name,
+            arm_id=context.attempt.arm_id if context.attempt else None,
             output_root=context.attempt.root if context.attempt else None,
         )
         config = runner.resolve_config(args)

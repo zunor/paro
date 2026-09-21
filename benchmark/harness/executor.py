@@ -55,6 +55,7 @@ class QueryExecutionResult:
     explain_profile_overhead_ratio: float | None = None
     operator_profiles: list[dict[str, Any]] = field(default_factory=list)
     receipt_association: dict[str, Any] | None = None
+    receipt_associations: list[dict[str, Any]] = field(default_factory=list)
     rss_before_kb: int | None = None
     rss_after_kb: int | None = None
     rss_peak_kb: int | None = None
@@ -275,7 +276,18 @@ class BenchmarkExecutor:
             if self._profile_pid > 0:
                 query_result.rss_before_kb = _read_process_rss_kb(self._profile_pid)
 
+            receipt_before_execution_ids: set[int] | None = None
+            if self._collect_compile_receipts:
+                try:
+                    receipt_before_execution_ids = self._snapshot_compile_execution_ids(conn)
+                except Exception:
+                    # Receipt coverage is an independent observation.  A
+                    # failed pre-snapshot must not turn the timed SQL sample
+                    # into a query failure.
+                    receipt_before_execution_ids = None
+
             last_rows: list[tuple[Any, ...]] = []
+            sample_receipts: list[dict[str, Any]] = []
             for _ in range(self._iterations):
                 rss_sampler = RssSampler(self._profile_pid)
                 rss_sampler.start()
@@ -292,6 +304,18 @@ class BenchmarkExecutor:
                         rss_sampler.peak_kb,
                     )
                 last_rows = rows
+                if self._collect_compile_receipts:
+                    sample_receipts.append(
+                        self._collect_compile_receipt(
+                            conn,
+                            before_execution_ids=receipt_before_execution_ids,
+                            query_fingerprint=_statement_fingerprint(query.sql),
+                        )
+                    )
+                    try:
+                        receipt_before_execution_ids = self._snapshot_compile_execution_ids(conn)
+                    except Exception:
+                        receipt_before_execution_ids = None
 
             if self._collect_memory:
                 query_result.memory_tags_after = self._fetch_memory_tag_rows(conn)
@@ -306,7 +330,8 @@ class BenchmarkExecutor:
             query_result.validation_result = outcome.status
             query_result.validation_detail = outcome.detail
             if self._collect_compile_receipts:
-                query_result.receipt_association = self._collect_compile_receipt(conn)
+                query_result.receipt_associations = sample_receipts
+                query_result.receipt_association = sample_receipts[0] if sample_receipts else None
             self._collect_explain_profile(conn, query, query_result)
         except QueryTimeoutError as exc:
             query_result.error = f"TIMEOUT: {exc}"
@@ -331,7 +356,13 @@ class BenchmarkExecutor:
                         query_result.validation_detail = _format_error(exc)
         return query_result
 
-    def _collect_compile_receipt(self, conn: Any) -> dict[str, Any]:
+    def _collect_compile_receipt(
+        self,
+        conn: Any,
+        *,
+        before_execution_ids: set[int] | None = None,
+        query_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
         """Read the bounded post-statement receipt channel.
 
         This is deliberately outside the timed loop and never asks the
@@ -340,10 +371,7 @@ class BenchmarkExecutor:
         reason to discard the normal timing sample.
         """
         try:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT * FROM paro_optimizers()")
-                columns = [getattr(column, "name", str(column)) for column in cursor.description or ()]
-                rows = cursor.fetchall()
+            columns, rows = self._read_compile_channel(conn)
         except Exception as exc:
             return {
                 "schema_version": 1,
@@ -352,155 +380,169 @@ class BenchmarkExecutor:
             }
 
         indexes = {name.rsplit(".", 1)[-1]: index for index, name in enumerate(columns)}
-        required = {"name", "kind", "metric_value", "metric_unit"}
+        required = {"record_type", "record_id", "payload_json"}
         if not required.issubset(indexes):
             return {
                 "schema_version": 1,
                 "status": "Uncovered",
-                "reason": "receipt channel schema is missing required columns",
+                "reason": "typed receipt channel schema is missing required columns",
             }
 
-        name_index = indexes["name"]
-        kind_index = indexes["kind"]
-        value_index = indexes["metric_value"]
-        unit_index = indexes["metric_unit"]
-        compile_records: dict[tuple[str, int], dict[str, int]] = {}
-        cache_decisions: dict[tuple[str, int], bool] = {}
-        execution_records: dict[int, dict[str, int]] = {}
+        cache_decisions: dict[int, dict[str, Any]] = {}
+        execution_records: dict[int, dict[str, Any]] = {}
         for row in rows:
-            name = str(row[name_index])
-            kind = str(row[kind_index])
-            value = int(row[value_index])
-            unit = str(row[unit_index])
-            if name.startswith("statement_compile_receipt/"):
-                if kind != "receipt":
-                    continue
-                parts = name.split("/")
-                if len(parts) == 4:
-                    try:
-                        key = (parts[1], int(parts[2]))
-                    except ValueError:
-                        continue
-                    compile_records.setdefault(key, {})[parts[3]] = _decode_receipt_word(
-                        value, unit, field=parts[3]
-                    )
-            elif name.startswith("statement_execution_receipt/"):
-                if kind != "receipt":
-                    continue
-                parts = name.split("/")
-                if len(parts) == 3:
-                    try:
-                        execution_id = int(parts[1])
-                    except ValueError:
-                        continue
-                    execution_records.setdefault(execution_id, {})[parts[2]] = _decode_receipt_word(
-                        value, unit, field=parts[2]
-                    )
-            elif name.startswith("statement_plan_cache/"):
-                if kind != "evidence":
-                    continue
-                parts = name.split("/")
-                if len(parts) == 3:
-                    try:
-                        key = (parts[1], int(parts[2]))
-                    except ValueError:
-                        continue
-                    cache_decisions[key] = value == 1
+            record_type = str(row[indexes["record_type"]])
+            record_id = row[indexes["record_id"]]
+            payload = row[indexes["payload_json"]]
+            if not payload:
+                continue
+            try:
+                decoded = json.loads(str(payload))
+            except (TypeError, ValueError):
+                continue
+            if record_type == "statement_cache" and isinstance(decoded, dict):
+                decision_id = decoded.get("decision_id")
+                if (
+                    isinstance(decision_id, int)
+                    and not isinstance(decision_id, bool)
+                    and record_id == decision_id
+                ):
+                    cache_decisions[decision_id] = decoded
+            elif record_type == "execution_receipt" and isinstance(decoded, dict):
+                execution_id = decoded.get("execution_id")
+                if (
+                    isinstance(execution_id, int)
+                    and not isinstance(execution_id, bool)
+                    and record_id == execution_id
+                ):
+                    execution_records[execution_id] = decoded
 
-        if not compile_records or not execution_records:
+        if before_execution_ids is None:
+            return {
+                "schema_version": 1,
+                "status": "Uncovered",
+                "reason": "target execution boundary was not captured",
+            }
+        if not cache_decisions or not execution_records:
             return {
                 "schema_version": 1,
                 "status": "Uncovered",
                 "reason": "compile or execution receipt was not published",
             }
 
-        compile_identities = {
-            identity_key
-            for values in compile_records.values()
-            if (identity_key := _receipt_identity_key(values)) is not None
-        }
         matching_executions = [
-            (execution_id, values)
-            for execution_id, values in execution_records.items()
-            if (identity_key := _receipt_identity_key(values)) in compile_identities
+            (execution_id, receipt)
+            for execution_id, receipt in execution_records.items()
+            if (before_execution_ids is None or execution_id not in before_execution_ids)
+            and receipt.get("statement_decision_id") in cache_decisions
+            and (
+                query_fingerprint is None
+                or cache_decisions[receipt["statement_decision_id"]].get("query_fingerprint")
+                == query_fingerprint
+            )
         ]
         if not matching_executions:
             return {
                 "schema_version": 1,
                 "status": "Uncovered",
-                "reason": "no execution receipt matches a compiled artifact",
+                "reason": "no execution receipt matches this statement decision",
             }
-        execution_id, execution = max(matching_executions, key=lambda item: item[0])
-        identity = _receipt_identity(execution)
-        assert identity is not None
-
-        matches = [
-            (key, values)
-            for key, values in compile_records.items()
-            if _receipt_identity(values) == identity
-        ]
-        if not matches:
+        # Reading the channel is itself a statement and can publish a receipt
+        # while the table function is scanning it.  The target is therefore
+        # selected by its exact statement-decision identity and query contract,
+        # never by latest occurrence or by an artifact-only heuristic.
+        if len(matching_executions) != 1:
             return {
                 "schema_version": 1,
                 "status": "Uncovered",
-                "reason": "execution artifact has no matching compile receipt",
-                "execution_id": execution_id,
-                "execution_artifact": identity,
+                "reason": "statement execution boundary is ambiguous",
+                "matching_execution_ids": sorted(item[0] for item in matching_executions),
             }
-        key, compile = max(matches, key=lambda item: item[0][1])
-        cache_hit = cache_decisions.get(key)
-        if cache_hit is None:
-            return {
-                "schema_version": 1,
-                "status": "Uncovered",
-                "reason": "compiled artifact has no matching cache decision",
-                "execution_id": execution_id,
-                "artifact_identity": identity,
-            }
+        execution_id, execution = matching_executions[0]
+        decision_id = execution.get("statement_decision_id")
+        decision = cache_decisions[decision_id]
+        identity = execution.get("artifact_identity")
+        if not isinstance(identity, dict):
+            return {"schema_version": 1, "status": "Uncovered",
+                    "reason": "execution receipt lacks artifact identity",
+                    "execution_id": execution_id}
+        if decision.get("artifact_identity") != identity:
+            return {"schema_version": 1, "status": "Uncovered",
+                    "reason": "statement decision and execution artifact differ",
+                    "execution_id": execution_id}
         compile_detail = {
-            "artifact_identity": _receipt_identity(compile),
-            "raw": compile,
-        }
-        execution_detail = {
             "artifact_identity": identity,
-            "raw": execution,
+            "decision_id": decision_id,
+            "query_fingerprint": decision.get("query_fingerprint"),
+            "occurrence": decision.get("occurrence"),
+            "cache_hit": decision.get("cache_hit"),
+            "receipt": decision.get("compile_receipt"),
+            "raw": decision.get("compile_work"),
         }
+        execution_detail = {"artifact_identity": identity, "raw": execution}
+        resources = execution.get("resources")
         selection = {
-            "expected_class": _optional_class(execution.get("expected_class")),
-            "actual_class": _optional_class(execution.get("actual_class")),
-            "actual_fingerprint": _receipt_fingerprint(execution, "actual_fingerprint"),
-            "admission": _admission_name(execution.get("admission")),
-            "fallback": _fallback_name(execution.get("fallback")),
-            "image": _image_name(execution.get("image")),
-            "terminal": _terminal_name(execution.get("terminal")),
-            "resources": {
-                key: execution[key]
-                for key in (
-                    "working_set_memory_bytes",
-                    "memory_ceiling_bytes",
-                    "max_parallel_tasks",
-                    "external_worker_slots",
-                )
-                if key in execution
-            },
+            "expected_class": execution.get("expected_class"),
+            "actual_class": execution.get("actual_class"),
+            "actual_fingerprint": execution.get("actual_fingerprint"),
+            "admission": execution.get("admission"),
+            "fallback": execution.get("fallback"),
+            "image": execution.get("image"),
+            "terminal": execution.get("terminal"),
+            "reservation": execution.get("reservation"),
+            "lowering": execution.get("lowering"),
+            "lowering_error": execution.get("lowering_error"),
+            "terminal_error": execution.get("terminal_error"),
+            "resources": resources,
         }
         return {
             "schema_version": 1,
             "status": "Verified",
-            "association_basis": "latest_execution_same_artifact",
-            "query_fingerprint": key[0],
-            "occurrence": key[1],
-            "compilation": "CacheHit" if cache_hit else "Executed",
+            "association_basis": "statement_decision_id",
+            "statement_decision_id": decision_id,
+            "query_fingerprint": f"{int(decision.get('query_fingerprint', 0)):016x}",
+            "occurrence": decision.get("occurrence"),
+            "compilation": "CacheHit" if decision.get("cache_hit") else "Executed",
             # A cache hit reuses the original compile receipt.  This run did
             # not execute the compiler, even though it still has its own
             # admission/execution receipt below.
-            "compile_state": "NotExecuted" if cache_hit else "Executed",
+            "compile_state": "NotExecuted" if decision.get("cache_hit") else "Executed",
             "artifact_identity": identity,
             "compile": compile_detail,
             "execution_id": execution_id,
             "execution": execution_detail,
             "selection": selection,
         }
+
+    def _read_compile_channel(
+        self, conn: Any
+    ) -> tuple[list[str], list[tuple[Any, ...]]]:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM paro_optimizers()")
+            columns = [
+                getattr(column, "name", str(column))
+                for column in cursor.description or ()
+            ]
+            return columns, cursor.fetchall()
+
+    def _snapshot_compile_execution_ids(self, conn: Any) -> set[int] | None:
+        columns, rows = self._read_compile_channel(conn)
+        indexes = {name.rsplit(".", 1)[-1]: index for index, name in enumerate(columns)}
+        if not {"record_type", "payload_json"}.issubset(indexes):
+            return None
+        result: set[int] = set()
+        for row in rows:
+            if row[indexes["record_type"]] != "execution_receipt":
+                continue
+            payload = row[indexes["payload_json"]]
+            try:
+                decoded = json.loads(str(payload))
+            except (TypeError, ValueError):
+                continue
+            execution_id = decoded.get("execution_id") if isinstance(decoded, dict) else None
+            if isinstance(execution_id, int) and not isinstance(execution_id, bool):
+                result.add(execution_id)
+        return result
 
     def _collect_explain_profile(
         self,
@@ -1156,6 +1198,15 @@ def _format_error(exc: Exception) -> str:
     if suffixes:
         return f"{type(exc).__name__}: {primary} ({'; '.join(suffixes)})"
     return f"{type(exc).__name__}: {primary}"
+
+
+def _statement_fingerprint(sql: str) -> int:
+    """Match the Rust statement identity only as a receipt consistency check."""
+    result = 0xCBF29CE484222325
+    for byte in sql.encode("utf-8"):
+        result ^= byte
+        result = (result * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return result
 
 
 def _decode_receipt_word(value: int, unit: str, *, field: str) -> int:

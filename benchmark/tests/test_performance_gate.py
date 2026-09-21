@@ -49,6 +49,7 @@ from harness.performance_gate.quorum_statistics import (  # noqa: E402
     mann_whitney_one_sided,
     rolling_p95_delta,
 )
+from harness.run_output import RunOutput  # noqa: E402
 from harness.sources import SourceContext, SourceRegistry, default_registry  # noqa: E402
 from harness.sources.divan_bench import DivanBenchSource, normalize_divan_payload  # noqa: E402
 
@@ -1026,6 +1027,8 @@ staging_until = "2026-06-30"
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            run = RunOutput.create(root / "report", run_id="divan")
+            attempt = run.begin_attempt("divan-source", query_case="divan", arm_id="default")
 
             def fake_run(command, cwd, env, text, capture_output, check, timeout):
                 self.assertIn("--locked", command)
@@ -1053,8 +1056,16 @@ staging_until = "2026-06-30"
                             pid=0,
                             runner_module=SimpleNamespace(),
                             minimum_sample_count=50,
+                            run_output=run,
+                            attempt=attempt,
                         ),
                     )
+            attempt.seal(
+                status="Completed",
+                result_path=measurement.result_path,
+                summary_path=measurement.summary_path,
+            )
+            run.finalize(status="Completed")
 
         self.assertFalse(measurement.failed)
         self.assertEqual(measurement.payload["workloads"][0]["queries"][0]["samples_count"], 50)

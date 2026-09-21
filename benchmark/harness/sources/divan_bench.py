@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
+import tempfile
 from typing import Any
 
 from ..baseline_index import QueryKey
@@ -35,45 +36,52 @@ class DivanBenchSource:
 
         if context.run_output is not None and context.attempt is not None:
             context.run_output.register_cell(
-                cell_id=f"{context.attempt.source_id}--{context.attempt.attempt_id}",
+                cell_id=f"{context.attempt.query_case}--{context.attempt.arm_id}",
                 query_cases=1,
                 sample_rows=max(context.minimum_sample_count, 1),
                 product_receipts=4,
+                query_case=context.attempt.query_case,
+                arm_id=context.attempt.arm_id,
             )
 
         report_dir = context.output_dir
-        raw_path = report_dir / "divan-raw.json"
+        raw_fd, raw_name = tempfile.mkstemp(prefix="paro-divan-", suffix=".json")
+        os.close(raw_fd)
+        raw_path = Path(raw_name)
         env = _divan_env(raw_path, source, context)
         command = ["cargo", "bench", "--locked", "-p", source.crate, "--bench", source.bench]
 
         try:
-            completed = subprocess.run(
-                command,
-                cwd=context.root_dir.parent,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=_timeout_seconds(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ValueError(
-                "structured Divan bench timed out "
-                f"({source.crate}/{source.bench}, timeout={_timeout_seconds()}s): "
-                f"{_tail(_timeout_output(exc))}"
-            ) from exc
-        if completed.returncode != 0:
-            raise ValueError(
-                "structured Divan bench failed "
-                f"({source.crate}/{source.bench}): {_tail(completed.stderr or completed.stdout)}"
-            )
-        if not raw_path.exists():
-            raise ValueError(f"structured Divan bench did not write result: {raw_path}")
-
-        try:
-            raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid structured Divan JSON {raw_path}: {exc}") from exc
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=context.root_dir.parent,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=_timeout_seconds(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError(
+                    "structured Divan bench timed out "
+                    f"({source.crate}/{source.bench}, timeout={_timeout_seconds()}s): "
+                    f"{_tail(_timeout_output(exc))}"
+                ) from exc
+            if completed.returncode != 0:
+                raise ValueError(
+                    "structured Divan bench failed "
+                    f"({source.crate}/{source.bench}): {_tail(completed.stderr or completed.stdout)}"
+                )
+            if not raw_path.exists():
+                raise ValueError(f"structured Divan bench did not write result: {raw_path}")
+            raw_text = raw_path.read_text(encoding="utf-8")
+            try:
+                raw_payload = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid structured Divan JSON {raw_path}: {exc}") from exc
+        finally:
+            raw_path.unlink(missing_ok=True)
 
         payload = normalize_divan_payload(
             source,
@@ -88,8 +96,12 @@ class DivanBenchSource:
                 context.run_output,
                 source_id=context.attempt.source_id if context.attempt else None,
                 attempt_id=context.attempt.attempt_id if context.attempt else None,
+                query_case=source.name,
+                arm_id=context.attempt.arm_id if context.attempt else None,
             )
-        result_path, summary_path = reporter.write_reports(payload, report_dir / "result.json")
+        result_path, summary_path = reporter.write_reports(
+            payload, report_dir / "result.json", run_output=context.run_output
+        )
         return SourceMeasurement(
             source=source,
             payload=payload,
@@ -99,6 +111,8 @@ class DivanBenchSource:
             run_id=context.run_output.run_id if context.run_output else None,
             source_id=context.attempt.source_id if context.attempt else None,
             attempt_id=context.attempt.attempt_id if context.attempt else None,
+            query_case=source.name,
+            arm_id=context.attempt.arm_id if context.attempt else None,
             attempt_status="Completed",
         )
 

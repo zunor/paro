@@ -104,6 +104,7 @@ def _add_common_args(parser: argparse.ArgumentParser, *, include_baseline: bool)
     parser.add_argument("--skip-source", action="append", default=[])
     parser.add_argument("--report-root", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--arm-id", default=None)
 
 
 def _add_archive_args(parser: argparse.ArgumentParser) -> None:

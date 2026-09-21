@@ -27,7 +27,7 @@ from ..performance_gate import (
 )
 from ..performance_gate.policy import GatePolicy
 from ..process_probe import ProcessProbeError, resolve_parod_process
-from ..run_output import RunOutput, RunOutputError, atomic_write_text
+from ..run_output import RunOutput, RunOutputError
 from ..sources import SourceContext, SourceMeasurement, default_registry
 
 
@@ -211,7 +211,12 @@ def run_sources(
             if not retry_keys:
                 continue
         try:
-            attempt = active_run.begin_attempt(source.name)
+            configured_arm = getattr(args, "arm_id", None)
+            attempt = active_run.begin_attempt(
+                source.name,
+                query_case=source.name,
+                arm_id=configured_arm or source.name,
+            )
         except RunOutputError as exc:
             raise GateCommandError(str(exc)) from exc
         source_context = SourceContext(
@@ -227,6 +232,7 @@ def run_sources(
             measurement = adapter.execute(source, source_context)
         except KeyboardInterrupt as exc:
             attempt.write_failure(status="Cancelled", error="source execution cancelled")
+            attempt.seal(status="Cancelled", failure_path=attempt.failure_path)
             active_run.finalize(status="Cancelled")
             raise
         except Exception as exc:
@@ -239,6 +245,8 @@ def run_sources(
             run_id=active_run.run_id,
             source_id=attempt.source_id,
             attempt_id=attempt.attempt_id,
+            query_case=attempt.query_case,
+            arm_id=attempt.arm_id,
             attempt_status="Failed" if measurement.failed else "Completed",
         )
         attempt.seal(
@@ -262,11 +270,14 @@ def resolve_report_root(root_dir: Path, args: argparse.Namespace) -> Path:
 
 def _record_source_failure(attempt, source, error: Exception) -> SourceMeasurement:
     summary = attempt.summary_path
-    atomic_write_text(
-        summary,
-        f"# Source attempt failed\n\n- source: `{source.name}`\n- status: `Failed`\n- error: `{type(error).__name__}: {error}`\n",
-        overwrite=False,
+    summary_text = (
+        f"# Source attempt failed\n\n- source: `{source.name}`\n"
+        f"- status: `Failed`\n- error: `{type(error).__name__}: {error}`\n"
     )
+    if attempt.run.capacity_exceeded:
+        attempt.run.write_control_text(summary, summary_text, overwrite=False)
+    else:
+        attempt.run.write_text(summary, summary_text, overwrite=False)
     failure = attempt.write_failure(status="Failed", error=f"{type(error).__name__}: {error}")
     attempt.seal(status="Failed", summary_path=summary, failure_path=failure)
     return SourceMeasurement(
@@ -282,6 +293,8 @@ def _record_source_failure(attempt, source, error: Exception) -> SourceMeasureme
         run_id=attempt.run.run_id,
         source_id=attempt.source_id,
         attempt_id=attempt.attempt_id,
+        query_case=attempt.query_case,
+        arm_id=attempt.arm_id,
         attempt_status="Failed",
     )
 

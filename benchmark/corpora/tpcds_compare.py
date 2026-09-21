@@ -167,11 +167,66 @@ def read_pre_touch(path: Path | None, repetitions: int = 1) -> dict[str, Any] | 
 
 
 def require_first_target_miss(evidence: dict[str, Any], query: str) -> None:
-    if (evidence.get("status") != "verified"
+    if (evidence.get("status") != "Verified"
             or evidence.get("cache_hit") is not False
-            or evidence.get("occurrence") != 0
             or evidence.get("query_fingerprint") != statement_fingerprint(query)):
-        raise AssertionError("pre-touch invalidated target first-occurrence cache miss")
+        raise AssertionError("pre-touch did not produce an exact target cache miss")
+
+
+def _typed_optimizer_rows(
+    connection: psycopg.Connection[Any],
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    """Read the versioned machine receipt channel without reconstructing enums.
+
+    The old name/kind/metric-value side channel is intentionally not accepted
+    here.  A receipt is usable only when the row identity and the embedded
+    identity agree; malformed rows remain Uncovered evidence rather than being
+    guessed into a target execution.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM paro_optimizers()")
+        columns = [column.name.rsplit(".", 1)[-1] for column in cursor.description or ()]
+        rows = cursor.fetchall()
+    indexes = {column: index for index, column in enumerate(columns)}
+    required = {"record_type", "record_id", "payload_json"}
+    if not required.issubset(indexes):
+        raise ValueError("typed receipt channel schema is missing required columns")
+    decoded_rows: list[dict[str, Any]] = []
+    for row in rows:
+        record_type = row[indexes["record_type"]]
+        if record_type not in {"statement_cache", "execution_receipt", "execution_work"}:
+            continue
+        payload = row[indexes["payload_json"]]
+        if not payload:
+            continue
+        try:
+            decoded = json.loads(str(payload))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid typed receipt JSON: {error}") from error
+        if not isinstance(decoded, dict):
+            raise ValueError("typed receipt payload is not an object")
+        record_id = row[indexes["record_id"]]
+        if not isinstance(record_id, int) or isinstance(record_id, bool) or record_id < 0:
+            raise ValueError("typed receipt row has an invalid record id")
+        expected_id_key = {
+            "statement_cache": "decision_id",
+            "execution_receipt": "execution_id",
+            "execution_work": "execution_id",
+        }[record_type]
+        if decoded.get(expected_id_key) != record_id:
+            raise ValueError(f"typed {record_type} row identity does not match payload")
+        decoded_rows.append({"record_type": record_type, "record_id": record_id, "payload": decoded})
+    return indexes, decoded_rows
+
+
+def snapshot_execution_ids(connection: psycopg.Connection[Any]) -> set[int]:
+    """Capture the exact receipt boundary before one target execution."""
+    _, rows = _typed_optimizer_rows(connection)
+    return {
+        row["record_id"]
+        for row in rows
+        if row["record_type"] == "execution_receipt"
+    }
 
 
 def collect_pre_touch(paro: Any, duck: Any, spec: dict[str, Any] | None,
@@ -185,6 +240,11 @@ def collect_pre_touch(paro: Any, duck: Any, spec: dict[str, Any] | None,
     schemas = {}
     normalized = {}
     for engine in ("paro", "duckdb") if duck is not None else ("paro",):
+        before_execution_ids = (
+            snapshot_execution_ids(paro)
+            if engine == "paro" and paro is not None
+            else None
+        )
         rows, schema, elapsed = (timed_run_paro(paro, spec["sql"], binary)
                                  if engine == "paro" else duck.execute(spec["sql"]))
         schemas[engine] = schema
@@ -193,8 +253,17 @@ def collect_pre_touch(paro: Any, duck: Any, spec: dict[str, Any] | None,
                            "schema": schema_report(schema),
                            "result_sha256": multiset_digest(normalized[engine])}
         if engine == "paro":
-            records[engine]["cache_evidence"] = collect_statement_cache_evidence(paro, spec["sql"])
+            # Pre-touch is diagnostic.  Keep its receipt association exact, but
+            # do not attempt to infer it after the fact from occurrence.
+            records[engine]["cache_evidence"] = collect_statement_cache_evidence(
+                paro, spec["sql"], before_execution_ids=before_execution_ids
+            )
         if spec.get("repetitions", 1) == 2:
+            before_execution_ids = (
+                snapshot_execution_ids(paro)
+                if engine == "paro" and paro is not None
+                else None
+            )
             warm_rows, warm_schema, warm_elapsed = (
                 timed_run_paro(paro, spec["sql"], binary)
                 if engine == "paro" else duck.execute(spec["sql"]))
@@ -207,7 +276,9 @@ def collect_pre_touch(paro: Any, duck: Any, spec: dict[str, Any] | None,
                 "result_sha256": multiset_digest(warm_normalized)}
             if engine == "paro":
                 records[engine]["second_execution"]["cache_evidence"] = (
-                    collect_statement_cache_evidence(paro, spec["sql"], expected_occurrence=1))
+                    collect_statement_cache_evidence(
+                        paro, spec["sql"], before_execution_ids=before_execution_ids
+                    ))
     if duck is not None:
         assert_compatible_schema(schemas["paro"], schemas["duckdb"], query=spec["sql"])
         assert_same_multiset(normalized["paro"], normalized["duckdb"])
@@ -419,87 +490,142 @@ def run_paro_raw(
 
 
 def collect_statement_cache_evidence(
-    connection: psycopg.Connection[Any], query: str, *, expected_occurrence: int | None = None
+    connection: psycopg.Connection[Any],
+    query: str,
+    *,
+    before_execution_ids: set[int] | None = None,
 ) -> dict[str, Any]:
-    """Read the lightweight miss side-channel after, never before, C1."""
+    """Associate one target execution with its exact statement decision.
+
+    The boundary is mandatory.  A post-statement scan can itself publish a
+    receipt, so selecting the newest row or a cache occurrence is not a valid
+    association strategy.
+    """
     fingerprint = statement_fingerprint(query)
-    prefix = f"statement_plan_cache/{fingerprint:016x}/"
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM paro_optimizers()")
-            columns = [column.name for column in cursor.description or ()]
-            rows = cursor.fetchall()
-        indexes = {
-            column.rsplit(".", 1)[-1]: index
-            for index, column in enumerate(columns)
+    if before_execution_ids is None:
+        return {
+            "status": "Uncovered",
+            "query_fingerprint": fingerprint,
+            "reason": "target execution boundary was not captured",
         }
-        name_index = indexes["name"]
-        kind_index = indexes["kind"]
-        value_index = indexes["metric_value"]
-        unit_index = indexes["metric_unit"]
-        matches = [
-            row
+    try:
+        _, rows = _typed_optimizer_rows(connection)
+        decisions = {
+            row["record_id"]: row["payload"]
             for row in rows
-            if str(row[kind_index]) == "evidence"
-            and str(row[unit_index]) == "count"
-            and str(row[name_index]).startswith(prefix)
-            and (expected_occurrence is None
-                 or str(row[name_index]) == f"{prefix}{expected_occurrence}")
+            if row["record_type"] == "statement_cache"
+        }
+        executions = {
+            row["record_id"]: row["payload"]
+            for row in rows
+            if row["record_type"] == "execution_receipt"
+        }
+        works = {
+            row["record_id"]: row["payload"]
+            for row in rows
+            if row["record_type"] == "execution_work"
+        }
+        matches = [
+            (execution_id, receipt)
+            for execution_id, receipt in executions.items()
+            if execution_id not in before_execution_ids
+            and receipt.get("statement_decision_id") in decisions
+            and decisions[receipt["statement_decision_id"]].get("query_fingerprint") == fingerprint
         ]
         if len(matches) != 1:
             return {
-                "status": "uncovered",
+                "status": "Uncovered",
                 "query_fingerprint": fingerprint,
-                "reason": "post-timer cache decision was missing or ambiguous",
-                "matching_rows": len(matches),
+                "reason": "target execution receipt was missing or ambiguous",
+                "matching_execution_ids": sorted(execution_id for execution_id, _ in matches),
             }
-        name = str(matches[0][name_index])
-        occurrence = int(name.rsplit("/", 1)[1])
-        cache_hit = int(matches[0][value_index]) == 1
-        work_prefix = f"statement_compile_work/{fingerprint:016x}/{occurrence}/"
-        compile_work = {
-            str(row[name_index])[len(work_prefix):]: int(row[value_index])
-            for row in rows
-            if str(row[kind_index]) == "evidence"
-            and str(row[name_index]).startswith(work_prefix)
-        }
+        execution_id, execution = matches[0]
+        decision_id = execution["statement_decision_id"]
+        decision = decisions[decision_id]
+        identity = execution.get("artifact_identity")
+        if identity != decision.get("artifact_identity"):
+            return {
+                "status": "Uncovered",
+                "query_fingerprint": fingerprint,
+                "execution_id": execution_id,
+                "reason": "statement decision and execution artifact differ",
+            }
         return {
-            "status": "verified",
+            "status": "Verified",
             "query_fingerprint": fingerprint,
-            "occurrence": occurrence,
-            "cache_hit": cache_hit,
-            "compile_work": compile_work,
-            "execution_work": execution_work_from_rows(rows, indexes, fingerprint),
-            "source": "paro_optimizers_post_timer_side_channel",
+            "statement_decision_id": decision_id,
+            "execution_id": execution_id,
+            "occurrence": decision.get("occurrence"),
+            "cache_hit": decision.get("cache_hit"),
+            "compile_work": decision.get("compile_work"),
+            "execution_work": works.get(execution_id, {}),
+            "artifact_identity": identity,
+            "source": "paro_optimizers_typed_receipt_channel",
         }
     except (IndexError, KeyError, TypeError, ValueError, psycopg.Error) as error:
         return {
-            "status": "uncovered",
+            "status": "Uncovered",
             "query_fingerprint": fingerprint,
-            "reason": f"post-timer cache decision could not be read: {error}",
+            "reason": f"typed receipt could not be read: {error}",
         }
 
 
-def execution_work_from_rows(rows: list[Any], indexes: dict[str, int], fingerprint: int) -> dict[str, Any]:
-    prefix = f"statement_execution_work/{fingerprint:016x}/"
-    records: dict[int, dict[str, int]] = {}
-    for row in rows:
-        name = str(row[indexes["name"]])
-        if str(row[indexes["kind"]]) != "evidence" or not name.startswith(prefix):
-            continue
-        identity, metric = name[len(prefix):].split("/", 1)
-        records.setdefault(int(identity), {})[metric] = int(row[indexes["metric_value"]])
-    if not records:
+def execution_work_from_rows(
+    rows: list[Any], indexes: dict[str, int], fingerprint: int,
+    *, before_execution_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Compatibility-free typed test helper; it never chooses the latest ID."""
+    if before_execution_ids is None:
         return {}
-    latest = max(records)
-    return {"query_fingerprint": fingerprint, "execution_id": latest, "metrics": records[latest]}
+    records: list[tuple[int, dict[str, Any]]] = []
+    for row in rows:
+        if row[indexes["record_type"]] != "execution_work":
+            continue
+        payload = row[indexes["payload_json"]]
+        if not payload:
+            continue
+        decoded = json.loads(str(payload))
+        execution_id = row[indexes["record_id"]]
+        if (
+            isinstance(decoded, dict)
+            and decoded.get("execution_id") == execution_id
+            and decoded.get("query_fingerprint") == fingerprint
+            and execution_id not in before_execution_ids
+        ):
+            records.append((execution_id, decoded))
+    if len(records) != 1:
+        return {}
+    execution_id, record = records[0]
+    return {
+        "query_fingerprint": fingerprint,
+        "execution_id": execution_id,
+        "metrics": record.get("metrics", {}),
+    }
 
 
-def collect_execution_work(connection: psycopg.Connection[Any], query: str) -> dict[str, Any]:
+def collect_execution_work(
+    connection: psycopg.Connection[Any],
+    query: str,
+    *,
+    before_execution_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    if before_execution_ids is None:
+        return {
+            "status": "Uncovered",
+            "query_fingerprint": statement_fingerprint(query),
+            "reason": "target execution boundary was not captured",
+        }
     with connection.cursor() as cursor:
         cursor.execute("SELECT * FROM paro_optimizers()")
-        indexes = {column.name.rsplit(".", 1)[-1]: i for i, column in enumerate(cursor.description or ())}
-        return execution_work_from_rows(cursor.fetchall(), indexes, statement_fingerprint(query))
+        columns = {
+            column.name.rsplit(".", 1)[-1]: i
+            for i, column in enumerate(cursor.description or ())
+        }
+        rows = cursor.fetchall()
+    return execution_work_from_rows(
+        rows, columns, statement_fingerprint(query),
+        before_execution_ids=before_execution_ids,
+    )
 
 
 def run_paro(
@@ -730,7 +856,7 @@ def main() -> int:
             "latency_tracks": {
                 "C0": {
                     "name": "first_result_from_process_start",
-                    "status": "uncovered",
+                    "status": "Uncovered",
                     "auxiliary": "managed_server.startup_to_ready_ms",
                 },
                 "C1": {
@@ -991,11 +1117,12 @@ def main() -> int:
                             cold_order.reverse()
                         cold_statement_ms: dict[str, float] = {}
                         cold_cache_evidence: dict[str, Any] = {
-                            "status": "uncovered",
+                            "status": "Uncovered",
                             "reason": "Paro cold observation was not reached",
                         }
                         for engine in cold_order:
                             if engine == "paro":
+                                cold_before_execution_ids = snapshot_execution_ids(paro)
                                 rows, sample_schema, elapsed_ms = timed_run_paro(
                                     paro, query, binary_result
                                 )
@@ -1006,7 +1133,8 @@ def main() -> int:
                             cold_statement_ms[engine] = round(elapsed_ms, 6)
                             if engine == "paro":
                                 cold_cache_evidence = collect_statement_cache_evidence(
-                                    paro, query
+                                    paro, query,
+                                    before_execution_ids=cold_before_execution_ids,
                                 )
                                 if pre_touch:
                                     require_first_target_miss(cold_cache_evidence, query)
@@ -1047,6 +1175,11 @@ def main() -> int:
                         for order in round_orders:
                             for engine in order:
                                 if engine == "paro":
+                                    before_execution_ids = (
+                                        snapshot_execution_ids(paro)
+                                        if os.environ.get("PARO_COLD_WORK_EVIDENCE") == "1"
+                                        else None
+                                    )
                                     rows, sample_schema, elapsed_ms = timed_run_paro(
                                         paro, query, binary_result
                                     )
@@ -1059,7 +1192,13 @@ def main() -> int:
                                 sample_digests[engine].append(digest)
                                 block[f"{engine}_ms"].append(round(elapsed_ms, 6))
                                 if engine == "paro" and os.environ.get("PARO_COLD_WORK_EVIDENCE") == "1":
-                                    block["paro_execution_work"].append(collect_execution_work(paro, query))
+                                    block["paro_execution_work"].append(
+                                        collect_execution_work(
+                                            paro,
+                                            query,
+                                            before_execution_ids=before_execution_ids,
+                                        )
+                                    )
                     finally:
                         paro.close()
                 trace_events = parse_statement_trace_log(block_log)
@@ -1118,6 +1257,7 @@ def main() -> int:
                     try:
                         diagnostic_preparation = collect_pre_touch(
                             diagnostic_paro, None, pre_touch, query, binary_result)
+                        diagnostic_before_execution_ids = snapshot_execution_ids(diagnostic_paro)
                         diagnostic_rows, diagnostic_schema, diagnostic_ms = timed_run_paro(
                             diagnostic_paro, query, binary_result
                         )
@@ -1126,7 +1266,13 @@ def main() -> int:
                         )
                         if pre_touch:
                             require_first_target_miss(
-                                collect_statement_cache_evidence(diagnostic_paro, query), query)
+                                collect_statement_cache_evidence(
+                                    diagnostic_paro,
+                                    query,
+                                    before_execution_ids=diagnostic_before_execution_ids,
+                                ),
+                                query,
+                            )
                     finally:
                         diagnostic_paro.close()
                 diagnostic_traces = parse_statement_trace_log(diagnostic_log)
@@ -1170,18 +1316,18 @@ def main() -> int:
             )
             cold_miss_evidence = {
                 "status": (
-                    "verified"
+                    "Verified"
                     if all(
-                        item.get("cold_miss_evidence", {}).get("status") == "verified"
+                        item.get("cold_miss_evidence", {}).get("status") == "Verified"
                         and not item["cold_miss_evidence"].get("cache_hit", True)
                         for item in blocks
                     )
-                    else "uncovered"
+                    else "Uncovered"
                 ),
                 "samples": [item.get("cold_miss_evidence") for item in blocks],
-                "method": "post_timer_statement_plan_cache_side_channel",
+                "method": "post_timer_typed_statement_receipt_channel",
             }
-            cold_miss_verified = cold_miss_evidence["status"] == "verified"
+            cold_miss_verified = cold_miss_evidence["status"] == "Verified"
             c1_p50_not_slower = (
                 statistics.median(cold_samples["paro"])
                 <= statistics.median(cold_samples["duckdb"])

@@ -13,7 +13,10 @@ from harness.executor import BenchmarkExecutor  # noqa: E402
 
 class RunOutputTests(unittest.TestCase):
     def test_receipt_collector_ignores_its_own_introspection_execution(self) -> None:
-        columns = ["name", "kind", "metric_value", "metric_unit"]
+        columns = [
+            "name", "kind", "last_elapsed_us", "metric_value", "metric_unit",
+            "invocation_count", "record_type", "record_id", "payload_json",
+        ]
 
         class Column:
             def __init__(self, name: str) -> None:
@@ -44,46 +47,54 @@ class RunOutputTests(unittest.TestCase):
             def cursor(self):
                 return Cursor(self.rows)
 
-        def row(name: str, kind: str, value: int, unit: str = "receipt"):
-            return (name, kind, value, unit)
+        def row(record_type: str, record_id: int, payload: dict[str, object] | None):
+            return (record_type, record_type, 0, 0, "receipt", 0,
+                    record_type, record_id, json.dumps(payload) if payload is not None else "")
 
-        def identity(prefix: str, artifact: tuple[int, int]):
-            return [
-                row(f"statement_{prefix}_receipt/aa/0/identity_schema_version", "receipt", 1),
-                row(f"statement_{prefix}_receipt/aa/0/artifact_hi", "receipt", artifact[0], "identity_word"),
-                row(f"statement_{prefix}_receipt/aa/0/artifact_lo", "receipt", artifact[1], "identity_word"),
-                row(f"statement_{prefix}_receipt/aa/0/structure_hi", "receipt", 3, "identity_word"),
-                row(f"statement_{prefix}_receipt/aa/0/structure_lo", "receipt", 4, "identity_word"),
-                row(f"statement_{prefix}_receipt/aa/0/dependencies_hi", "receipt", 5, "identity_word"),
-                row(f"statement_{prefix}_receipt/aa/0/dependencies_lo", "receipt", 6, "identity_word"),
-            ]
+        def identity(artifact: tuple[int, int]):
+            return {"schema_version": 1, "artifact": list(artifact),
+                    "structure": [3, 4], "dependencies": [5, 6]}
 
-        rows = identity("compile", (1, 2)) + [
-            row("statement_plan_cache/aa/0", "evidence", 1, "count"),
-            row("statement_execution_receipt/7/identity_schema_version", "receipt", 1),
-            row("statement_execution_receipt/7/artifact_hi", "receipt", 1, "identity_word"),
-            row("statement_execution_receipt/7/artifact_lo", "receipt", 2, "identity_word"),
-            row("statement_execution_receipt/7/structure_hi", "receipt", 3, "identity_word"),
-            row("statement_execution_receipt/7/structure_lo", "receipt", 4, "identity_word"),
-            row("statement_execution_receipt/7/dependencies_hi", "receipt", 5, "identity_word"),
-            row("statement_execution_receipt/7/dependencies_lo", "receipt", 6, "identity_word"),
-            row("statement_execution_receipt/7/expected_class", "receipt", 2),
-            row("statement_execution_receipt/7/actual_class", "receipt", 2),
-            row("statement_execution_receipt/7/actual_fingerprint_hi", "receipt", 7, "identity_word"),
-            row("statement_execution_receipt/7/actual_fingerprint_lo", "receipt", 8, "identity_word"),
-            row("statement_execution_receipt/7/admission", "receipt", 1),
-            row("statement_execution_receipt/7/terminal", "receipt", 2),
-            row("statement_execution_receipt/7/image", "receipt", 1),
-            row("statement_execution_receipt/7/working_set_memory_bytes", "receipt", 100),
-            # The collector query itself has the newest execution id, but its
-            # artifact is not the target compile receipt.
-            row("statement_execution_receipt/8/identity_schema_version", "receipt", 1),
-            row("statement_execution_receipt/8/artifact_hi", "receipt", 90, "identity_word"),
-            row("statement_execution_receipt/8/artifact_lo", "receipt", 91, "identity_word"),
-            row("statement_execution_receipt/8/structure_hi", "receipt", 3, "identity_word"),
-            row("statement_execution_receipt/8/structure_lo", "receipt", 4, "identity_word"),
-            row("statement_execution_receipt/8/dependencies_hi", "receipt", 5, "identity_word"),
-            row("statement_execution_receipt/8/dependencies_lo", "receipt", 6, "identity_word"),
+        target_identity = identity((1, 2))
+        target_decision = {
+            "schema_version": 1, "decision_id": 6, "query_fingerprint": 123,
+            "occurrence": 0, "cache_hit": True,
+            "artifact_identity": target_identity, "compile_work": None,
+        }
+        target_execution = {
+            "schema_version": 1, "execution_id": 7, "statement_decision_id": 6,
+            "artifact_identity": target_identity, "expected_class": 2,
+            "actual_class": 2, "actual_fingerprint": [7, 8],
+            "resources": {
+                "class": 2, "minimum_memory_bytes": 100,
+                "working_set_memory_bytes": 200, "memory_ceiling_bytes": 1000,
+                "memory_completion": "Guaranteed", "max_parallel_tasks": 4,
+                "external_worker_slots": 0,
+            },
+            "admission": "Selected", "fallback": None,
+            "reservation": "Committed", "lowering": "Ready",
+            "lowering_error": None, "image": "Ready", "terminal": "Completed",
+            "terminal_error": None,
+        }
+        observer_identity = identity((90, 91))
+        observer_decision = {
+            "schema_version": 1, "decision_id": 9, "query_fingerprint": 456,
+            "occurrence": 0, "cache_hit": False,
+            "artifact_identity": observer_identity, "compile_work": None,
+        }
+        observer_execution = {
+            "schema_version": 1, "execution_id": 8, "statement_decision_id": 9,
+            "artifact_identity": observer_identity, "expected_class": 2,
+            "actual_class": None, "actual_fingerprint": None, "resources": None,
+            "admission": "Failed", "fallback": None, "reservation": "NotRequired",
+            "lowering": "NotStarted", "lowering_error": None, "image": "NotReady",
+            "terminal": "NotExecuted", "terminal_error": "not selected",
+        }
+        rows = [
+            row("statement_cache", 6, target_decision),
+            row("execution_receipt", 7, target_execution),
+            row("statement_cache", 9, observer_decision),
+            row("execution_receipt", 8, observer_execution),
         ]
         executor = BenchmarkExecutor(
             connection={},
@@ -92,7 +103,7 @@ class RunOutputTests(unittest.TestCase):
             timeout_seconds=1,
             collect_memory=False,
         )
-        result = executor._collect_compile_receipt(Connection(rows))
+        result = executor._collect_compile_receipt(Connection(rows), before_execution_ids={8})
         self.assertEqual(result["status"], "Verified")
         self.assertEqual(result["execution_id"], 7)
         self.assertEqual(result["compilation"], "CacheHit")
@@ -126,10 +137,12 @@ class RunOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run = RunOutput.create(Path(tmp), run_id="budget")
             run.register_cell(
-                cell_id="source--attempt-0001",
+                cell_id="source--default",
                 query_cases=99,
                 sample_rows=198,
                 product_receipts=396,
+                query_case="source",
+                arm_id="default",
             )
             manifest = json.loads((run.root / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["registration"]["status"], "WithinBudget")
@@ -140,16 +153,85 @@ class RunOutputTests(unittest.TestCase):
 
             with self.assertRaises(RunOutputError):
                 run.register_cell(
-                    cell_id="oversized",
+                    cell_id="oversized--default",
                     query_cases=100_000,
                     sample_rows=100_000,
                     product_receipts=100_000,
+                    query_case="oversized",
+                    arm_id="default",
                 )
+
+    def test_cells_are_owned_by_query_and_arm_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="cells")
+            contract = dict(
+                cell_id="q11--control",
+                query_cases=1,
+                sample_rows=4,
+                product_receipts=4,
+                query_case="q11",
+                arm_id="control",
+            )
+            run.register_cell(**contract)
+            run.register_cell(**contract)
+            run.register_cell(
+                cell_id="q11--probe",
+                query_cases=1,
+                sample_rows=4,
+                product_receipts=4,
+                query_case="q11",
+                arm_id="probe",
+            )
+            with self.assertRaises(RunOutputError):
+                run.register_cell(**{**contract, "sample_rows": 5})
+            manifest = json.loads((run.root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                {cell["cell_id"] for cell in manifest["registration"]["cells"]},
+                {"q11--control", "q11--probe"},
+            )
+
+    def test_actual_utf8_writer_quota_preserves_existing_output_and_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="quota")
+            run._manifest["registration"]["total_limit_bytes"] = 256
+            run.write_text(run.root / "kept.txt", "ok")
+            with self.assertRaises(RunOutputError):
+                run.write_text(run.root / "too-large.txt", "汉字" * 200)
+            self.assertTrue((run.root / "kept.txt").exists())
+            self.assertFalse((run.root / "too-large.txt").exists())
+            manifest = json.loads((run.root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "Incomplete")
+            self.assertEqual(manifest["registration"]["status"], "CapacityExceeded")
+            with self.assertRaises(RunOutputError):
+                run.finalize(status="Completed")
+
+    def test_manifest_is_published_through_a_bounded_utf8_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="manifest")
+            registration = run._manifest["registration"]
+            registration["manifest_limit_bytes"] = 128
+            registration["cells"] = [{"cell_id": "q--control", "detail": "汉字" * 100}]
+            with self.assertRaises(RunOutputError):
+                run._persist_manifest()
+            manifest = json.loads((run.root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "Running")
+            self.assertEqual(manifest["registration"]["cells"], [])
+
+    def test_terminal_attempt_cannot_be_overwritten_by_retry_or_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="terminal")
+            attempt = run.begin_attempt("source", query_case="q", arm_id="control")
+            attempt.write_failure(status="Cancelled", error="client cancelled")
+            attempt.seal(status="Cancelled", failure_path=attempt.failure_path)
+            with self.assertRaises(RunOutputError):
+                attempt.write_failure(status="Failed", error="late error")
+            with self.assertRaises(RunOutputError):
+                attempt.seal(status="Completed")
 
     def test_receipt_contract_does_not_turn_uncovered_into_success(self) -> None:
         payload = {
             "version": 3,
-            "ownership": {"schema_version": 1, "run_id": "run"},
+            "ownership": {"schema_version": 1, "campaign_id": "campaign", "run_id": "run"},
             "workloads": [{
                 "name": "w",
                 "queries": [{
@@ -169,7 +251,7 @@ class RunOutputTests(unittest.TestCase):
     def test_verified_receipt_requires_nested_identity(self) -> None:
         payload = {
             "version": 3,
-            "ownership": {"schema_version": 1, "run_id": "run"},
+            "ownership": {"schema_version": 1, "campaign_id": "campaign", "run_id": "run"},
             "workloads": [{
                 "name": "w",
                 "queries": [{
@@ -177,8 +259,9 @@ class RunOutputTests(unittest.TestCase):
                     "compile_receipt": {
                         "schema_version": 1,
                         "status": "Verified",
-                        "association_basis": "latest_execution_same_artifact",
-                        "query_fingerprint": "abcd",
+                        "association_basis": "statement_decision_id",
+                        "statement_decision_id": 4,
+                        "query_fingerprint": "000000000000abcd",
                         "occurrence": 0,
                         "compilation": "Executed",
                         "compile_state": "Executed",
@@ -194,20 +277,83 @@ class RunOutputTests(unittest.TestCase):
                             "artifact": [1, 2],
                             "structure": [3, 4],
                             "dependencies": [5, 6],
+                        }, "decision_id": 4, "cache_hit": False, "receipt": {
+                            "schema_version": 1,
+                            "artifact_identity": {
+                                "schema_version": 1,
+                                "artifact": [1, 2],
+                                "structure": [3, 4],
+                                "dependencies": [5, 6],
+                            },
+                            "search_stop": {"Observed": "QualityPolicySatisfied"},
+                            "search_complete": {"Observed": False},
+                            "quality_policy_satisfied": {"Observed": True},
+                            "budget_limited": {"Observed": False},
+                            "obligations": {"Observed": 0},
+                            "groups": {"Observed": 1},
+                            "logical_expressions": {"Observed": 1},
+                            "physical_expressions": {"Observed": 1},
+                            "expected_class": {"Observed": 2},
+                            "variant_count": {"Observed": 1},
+                            "omitted_variants": 0,
+                            "compile_work": None,
                         }},
-                        "execution": {"artifact_identity": {
+                        "execution": {"execution_id": 1, "artifact_identity": {
                             "schema_version": 1,
                             "artifact": [1, 2],
                             "structure": [3, 4],
                             "dependencies": [5, 6],
+                        }, "raw": {
+                            "schema_version": 1,
+                            "execution_id": 1,
+                            "statement_decision_id": 4,
+                            "artifact_identity": {
+                                "schema_version": 1,
+                                "artifact": [1, 2],
+                                "structure": [3, 4],
+                                "dependencies": [5, 6],
+                            },
+                            "expected_class": 2,
+                            "actual_class": 2,
+                            "actual_fingerprint": [7, 8],
+                            "resources": {
+                                "class": 2,
+                                "minimum_memory_bytes": 100,
+                                "working_set_memory_bytes": 200,
+                                "memory_ceiling_bytes": 1000,
+                                "memory_completion": "Guaranteed",
+                                "max_parallel_tasks": 4,
+                                "external_worker_slots": 0,
+                            },
+                            "admission": "Selected",
+                            "fallback": None,
+                            "reservation": "Committed",
+                            "lowering": "Ready",
+                            "lowering_error": None,
+                            "image": "Ready",
+                            "terminal": "Completed",
+                            "terminal_error": None,
                         }},
                         "selection": {
+                            "expected_class": 2,
                             "admission": "Selected",
                             "actual_class": 2,
                             "actual_fingerprint": [7, 8],
                             "image": "Ready",
                             "terminal": "Completed",
-                            "resources": {"max_parallel_tasks": 4},
+                            "reservation": "Committed",
+                            "lowering": "Ready",
+                            "lowering_error": None,
+                            "terminal_error": None,
+                            "resources": {
+                                "class": 2,
+                                "minimum_memory_bytes": 100,
+                                "working_set_memory_bytes": 200,
+                                "memory_ceiling_bytes": 1000,
+                                "memory_completion": "Guaranteed",
+                                "max_parallel_tasks": 4,
+                                "external_worker_slots": 0,
+                            },
                         },
                     },
                 }],
@@ -222,6 +368,16 @@ class RunOutputTests(unittest.TestCase):
         not_executed["workloads"][0]["queries"][0]["compile_receipt"]["selection"]["terminal"] = "NotExecuted"
         with self.assertRaises(ReceiptContractError):
             validate_benchmark_payload(not_executed, require_receipts=True)
+
+        same_hash_different_contract = json.loads(json.dumps(payload))
+        same_hash_different_contract["workloads"][0]["queries"][0]["compile_receipt"]["execution"]["raw"]["terminal"] = "Failed"
+        with self.assertRaises(ReceiptContractError):
+            validate_benchmark_payload(same_hash_different_contract, require_receipts=True)
+
+        unknown_producer_version = json.loads(json.dumps(payload))
+        unknown_producer_version["workloads"][0]["queries"][0]["compile_receipt"]["execution"]["raw"]["schema_version"] = 99
+        with self.assertRaises(ReceiptContractError):
+            validate_benchmark_payload(unknown_producer_version, require_receipts=True)
 
 
 if __name__ == "__main__":
