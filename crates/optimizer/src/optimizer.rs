@@ -1043,11 +1043,17 @@ impl Optimizer {
             artifact_identity: None,
             search_stop: Observation::Observed(match extraction.search_stop.reason {
                 crate::cascades::engine::SearchStopReason::Complete => SearchStop::Complete,
-                crate::cascades::engine::SearchStopReason::SearchIncomplete => SearchStop::Incomplete,
+                crate::cascades::engine::SearchStopReason::SearchIncomplete => {
+                    SearchStop::Incomplete
+                }
                 crate::cascades::engine::SearchStopReason::Deadline => SearchStop::Deadline,
-                crate::cascades::engine::SearchStopReason::BudgetLimited => SearchStop::BudgetLimited,
+                crate::cascades::engine::SearchStopReason::BudgetLimited => {
+                    SearchStop::BudgetLimited
+                }
                 crate::cascades::engine::SearchStopReason::RuleFailure => SearchStop::RuleFailure,
-                crate::cascades::engine::SearchStopReason::QualityPolicySatisfied => SearchStop::QualityPolicySatisfied,
+                crate::cascades::engine::SearchStopReason::QualityPolicySatisfied => {
+                    SearchStop::QualityPolicySatisfied
+                }
             }),
             search_complete: Observation::Observed(extraction.search_summary.is_complete()),
             quality_policy_satisfied: Observation::Observed(matches!(
@@ -1057,8 +1063,12 @@ impl Optimizer {
             budget_limited: Observation::Observed(extraction.search_stop.budget_limited),
             obligations: Observation::Observed(extraction.search_summary.obligations.len() as u64),
             groups: Observation::Observed(extraction.search_summary.groups),
-            logical_expressions: Observation::Observed(extraction.search_summary.logical_expressions),
-            physical_expressions: Observation::Observed(extraction.search_summary.physical_expressions),
+            logical_expressions: Observation::Observed(
+                extraction.search_summary.logical_expressions,
+            ),
+            physical_expressions: Observation::Observed(
+                extraction.search_summary.physical_expressions,
+            ),
             expected_class: extraction
                 .grant_search
                 .as_ref()
@@ -1075,37 +1085,64 @@ impl Optimizer {
         });
         let _finish_partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         if let Some(capture) = &self.ctx.session.options.compile_capture {
-            use paro_context::compile_diagnostics::{Observation::Observed, RuleSummary, SearchStop};
+            use paro_context::compile_diagnostics::{
+                Observation::Observed, RuleSummary, SearchStop,
+            };
             capture.update(|record| {
                 record.groups = Observed(extraction.search_summary.groups);
-                record.logical_expressions = Observed(extraction.search_summary.logical_expressions);
-                record.physical_expressions = Observed(extraction.search_summary.physical_expressions);
+                record.logical_expressions =
+                    Observed(extraction.search_summary.logical_expressions);
+                record.physical_expressions =
+                    Observed(extraction.search_summary.physical_expressions);
                 record.obligations = Observed(extraction.search_summary.obligations.len() as u64);
                 record.search_complete = Observed(extraction.search_summary.is_complete());
-                record.quality_policy_satisfied = Observed(matches!(extraction.quality_policy_status, crate::cascades::quality::QualityPolicyStatus::Satisfied(_)));
+                record.quality_policy_satisfied = Observed(matches!(
+                    extraction.quality_policy_status,
+                    crate::cascades::quality::QualityPolicyStatus::Satisfied(_)
+                ));
                 record.budget_limited = Observed(extraction.search_stop.budget_limited);
                 record.search_stop = Observed(match extraction.search_stop.reason {
                     crate::cascades::engine::SearchStopReason::Complete => SearchStop::Complete,
-                    crate::cascades::engine::SearchStopReason::SearchIncomplete => SearchStop::Incomplete,
+                    crate::cascades::engine::SearchStopReason::SearchIncomplete => {
+                        SearchStop::Incomplete
+                    }
                     crate::cascades::engine::SearchStopReason::Deadline => SearchStop::Deadline,
-                    crate::cascades::engine::SearchStopReason::BudgetLimited => SearchStop::BudgetLimited,
-                    crate::cascades::engine::SearchStopReason::RuleFailure => SearchStop::RuleFailure,
-                    crate::cascades::engine::SearchStopReason::QualityPolicySatisfied => SearchStop::QualityPolicySatisfied,
+                    crate::cascades::engine::SearchStopReason::BudgetLimited => {
+                        SearchStop::BudgetLimited
+                    }
+                    crate::cascades::engine::SearchStopReason::RuleFailure => {
+                        SearchStop::RuleFailure
+                    }
+                    crate::cascades::engine::SearchStopReason::QualityPolicySatisfied => {
+                        SearchStop::QualityPolicySatisfied
+                    }
                 });
             });
-            let active_rules: std::collections::BTreeSet<_> = extraction.rule_attempts.keys()
+            let active_rules: std::collections::BTreeSet<_> = extraction
+                .rule_attempts
+                .keys()
                 .chain(extraction.rule_elapsed.keys())
                 .chain(extraction.rule_insertions.keys())
                 .chain(extraction.rule_binding_work.keys())
-                .copied().collect();
+                .copied()
+                .collect();
             for id in active_rules {
-                let binding = extraction.rule_binding_work.get(&id).copied().unwrap_or_default();
-                capture.rule(RuleSummary { id: id.0,
+                let binding = extraction
+                    .rule_binding_work
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_default();
+                capture.rule(RuleSummary {
+                    id: id.0,
                     binding_calls: binding.calls,
                     binding_ns: u64::try_from(binding.elapsed.as_nanos()).unwrap_or(u64::MAX),
                     attempts: extraction.rule_attempts.get(&id).copied().unwrap_or(0),
                     inserted: extraction.rule_insertions.get(&id).copied().unwrap_or(0),
-                    elapsed_ns: extraction.rule_elapsed.get(&id).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) });
+                    elapsed_ns: extraction
+                        .rule_elapsed
+                        .get(&id)
+                        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+                });
             }
             if capture.level() == paro_context::compile_diagnostics::CaptureLevel::Detail {
                 capture.detail_omitted(
@@ -1118,8 +1155,10 @@ impl Optimizer {
                                 .transformation_task_lifecycle_dropped,
                         ),
                 );
-                use paro_context::compile_diagnostics::{detail_kind, DetailEvent};
-                let mut sequence = 0_u64;
+                use paro_context::compile_diagnostics::{
+                    BindingRef, CandidateRef, DetailEvent, FingerprintRef, GoalRef, LogicalExprRef,
+                    MemoGroupRef, PhysicalExprRef, RuleRef,
+                };
                 for id in extraction
                     .rule_attempts
                     .keys()
@@ -1128,169 +1167,240 @@ impl Optimizer {
                     .copied()
                     .collect::<std::collections::BTreeSet<_>>()
                 {
-                    let binding = extraction.rule_binding_work.get(&id).copied().unwrap_or_default();
-                    capture.detail(DetailEvent {
-                        sequence,
-                        kind: detail_kind::RULE,
-                        phase: 0,
-                        primary: id.0 as u64,
-                        secondary: extraction.rule_attempts.get(&id).copied().unwrap_or(0),
-                        tertiary: extraction.rule_insertions.get(&id).copied().unwrap_or(0),
-                        reference: 0,
-                        cause: 0,
+                    let binding = extraction
+                        .rule_binding_work
+                        .get(&id)
+                        .copied()
+                        .unwrap_or_default();
+                    capture.detail(DetailEvent::RuleSummary {
+                        source_sequence: id.0 as u64,
+                        rule: RuleRef(id.0),
+                        binding_calls: binding.calls,
+                        binding_ns: u64::try_from(binding.elapsed.as_nanos()).unwrap_or(u64::MAX),
+                        attempts: extraction.rule_attempts.get(&id).copied().unwrap_or(0),
+                        inserted: extraction.rule_insertions.get(&id).copied().unwrap_or(0),
+                        elapsed_ns: extraction
+                            .rule_elapsed
+                            .get(&id)
+                            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
                     });
-                    sequence = sequence.saturating_add(1);
-                    capture.detail(DetailEvent {
-                        sequence,
-                        kind: detail_kind::RULE,
-                        phase: 1,
-                        primary: id.0 as u64,
-                        secondary: binding.calls,
-                        tertiary: u64::try_from(binding.elapsed.as_nanos()).unwrap_or(u64::MAX),
-                        reference: 0,
-                        cause: 0,
-                    });
-                    sequence = sequence.saturating_add(1);
                 }
-                for event in &extraction.search_milestones.candidate_lifecycle {
+                for (source_sequence, event) in extraction
+                    .search_milestones
+                    .candidate_lifecycle
+                    .iter()
+                    .enumerate()
+                {
+                    let source_sequence = source_sequence as u64;
                     if matches!(
                         event.stage,
                         crate::cascades::engine::CandidateLifecycleStage::LogicalPublished
                             | crate::cascades::engine::CandidateLifecycleStage::PhysicalRecipePublished
                     ) {
-                        capture.detail(DetailEvent {
-                            sequence,
-                            kind: detail_kind::PROPOSAL,
-                            phase: event.stage as u16,
-                            primary: event.group.0 as u64,
-                            secondary: event
-                                .logical
-                                .map_or(u64::MAX, |logical| logical.index() as u64),
-                            tertiary: event
-                                .physical
-                                .map_or(u64::MAX, |physical| physical.index() as u64),
-                            reference: event.binding.map_or(
-                                event
-                                    .source
-                                    .map_or(u64::MAX, |source| source.index() as u64),
-                                |binding| binding.0 as u64,
-                            ),
-                            cause: event.rule.map_or(0, |rule| rule.0 as u64),
+                        capture.detail(DetailEvent::Proposal {
+                            source_sequence,
+                            event_time_us: event.elapsed_us,
+                            stage: event.stage as u8,
+                            group: MemoGroupRef(event.group.0 as u64),
+                            source: event.source.map(|source| LogicalExprRef(source.index() as u64)),
+                            logical: event.logical.map(|logical| LogicalExprRef(logical.index() as u64)),
+                            physical: event.physical.map(|physical| PhysicalExprRef(physical.index() as u64)),
+                            binding: event.binding.map(|binding| BindingRef([(binding.0 >> 64) as u64, binding.0 as u64])),
+                            rule: event.rule.map(|rule| RuleRef(rule.0)),
                         });
-                        sequence = sequence.saturating_add(1);
                     }
-                    capture.detail(DetailEvent {
-                        sequence,
-                        kind: detail_kind::CANDIDATE,
-                        phase: event.stage as u16,
-                        primary: event.group.0 as u64,
-                        secondary: event.candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
-                        tertiary: event.logical.map_or(
-                            event.physical.map_or(u64::MAX, |physical| physical.index() as u64),
-                            |logical| logical.index() as u64,
-                        ),
-                        reference: event.source.map_or(
-                            event.source_child.map_or(u64::MAX, |child| child.index() as u64),
-                            |source| source.index() as u64,
-                        ),
-                        cause: event.rule.map_or(0, |rule| rule.0 as u64),
+                    let goal = event.goal.map(|goal| GoalRef {
+                        required: goal.required.0 as u64,
+                        grant: goal.grant.stable_tag(),
+                        context: goal.context.0 as u64,
                     });
-                    sequence = sequence.saturating_add(1);
-                    if let Some(goal) = event.goal {
-                        capture.detail(DetailEvent {
-                            sequence,
-                            kind: detail_kind::QUALITY,
-                            phase: event.stage as u16,
-                            primary: event.candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
-                            secondary: goal.required.0 as u64,
-                            tertiary: goal.grant.stable_tag(),
-                            reference: goal.context.0 as u64,
-                            cause: event.expected_cost_bits.unwrap_or(0),
-                        });
-                        sequence = sequence.saturating_add(1);
-                    }
+                    // A goal-bearing candidate is not itself a quality
+                    // decision.  The candidate event carries the goal, while
+                    // quality remains represented only by the sealed Summary
+                    // facts and actual handoff receipt.
+                    capture.detail(DetailEvent::Candidate {
+                        source_sequence,
+                        event_time_us: event.elapsed_us,
+                        stage: event.stage as u8,
+                        group: MemoGroupRef(event.group.0 as u64),
+                        goal,
+                        candidate: event
+                            .candidate
+                            .map(|candidate| CandidateRef(candidate.index() as u64)),
+                        source: event
+                            .source
+                            .map(|source| LogicalExprRef(source.index() as u64)),
+                        source_child: event
+                            .source_child
+                            .map(|child| LogicalExprRef(child.index() as u64)),
+                        logical: event
+                            .logical
+                            .map(|logical| LogicalExprRef(logical.index() as u64)),
+                        physical: event
+                            .physical
+                            .map(|physical| PhysicalExprRef(physical.index() as u64)),
+                        recipe: event.recipe.map(|recipe| {
+                            FingerprintRef([(recipe.0 >> 64) as u64, recipe.0 as u64])
+                        }),
+                        rule: event.rule.map(|rule| RuleRef(rule.0)),
+                        expected_cost_bits: event.expected_cost_bits,
+                        upper_cost_bits: event.upper_cost_bits,
+                    });
                     for child in &event.children {
-                        capture.detail(DetailEvent {
-                            sequence,
-                            kind: detail_kind::CANDIDATE_CHILD,
-                            phase: event.stage as u16,
-                            primary: event.candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
-                            secondary: child.group.0 as u64,
-                            tertiary: child.candidate.index() as u64,
-                            reference: child.goal.required.0 as u64,
-                            cause: child.goal.grant.stable_tag(),
+                        capture.detail(DetailEvent::CandidateChild {
+                            source_sequence,
+                            event_time_us: event.elapsed_us,
+                            stage: event.stage as u8,
+                            candidate: event
+                                .candidate
+                                .map(|candidate| CandidateRef(candidate.index() as u64)),
+                            child_group: MemoGroupRef(child.group.0 as u64),
+                            child_candidate: CandidateRef(child.candidate.index() as u64),
+                            goal: GoalRef {
+                                required: child.goal.required.0 as u64,
+                                grant: child.goal.grant.stable_tag(),
+                                context: child.goal.context.0 as u64,
+                            },
                         });
-                        sequence = sequence.saturating_add(1);
                     }
                     for fact in &event.facts {
-                        capture.detail(DetailEvent {
-                            sequence,
-                            kind: detail_kind::FACT,
-                            phase: event.stage as u16,
-                            primary: event.candidate.map_or(u64::MAX, |candidate| candidate.index() as u64),
-                            secondary: fact.logical_fact_fingerprint.0 as u64,
-                            tertiary: fact.statistics_snapshot_fingerprint.0 as u64,
-                            reference: fact.group.0 as u64,
-                            cause: (fact.logical_fact_fingerprint.0 >> 64) as u64,
+                        capture.detail(DetailEvent::Fact {
+                            source_sequence,
+                            event_time_us: event.elapsed_us,
+                            candidate: event
+                                .candidate
+                                .map(|candidate| CandidateRef(candidate.index() as u64)),
+                            group: MemoGroupRef(fact.group.0 as u64),
+                            logical_fact: FingerprintRef([
+                                (fact.logical_fact_fingerprint.0 >> 64) as u64,
+                                fact.logical_fact_fingerprint.0 as u64,
+                            ]),
+                            statistics_snapshot: FingerprintRef([
+                                (fact.statistics_snapshot_fingerprint.0 >> 64) as u64,
+                                fact.statistics_snapshot_fingerprint.0 as u64,
+                            ]),
                         });
-                        sequence = sequence.saturating_add(1);
                     }
                 }
-                for event in &extraction.search_milestones.transformation_task_lifecycle {
-                    capture.detail(DetailEvent {
-                        sequence,
-                        kind: detail_kind::TASK,
-                        phase: event.first_published_us.is_some() as u16,
-                        primary: event.group.0 as u64,
-                        secondary: event.expression.index() as u64,
-                        tertiary: event.rule.0 as u64,
-                        reference: event.first_binding.map_or(0, |binding| binding.0 as u64),
-                        cause: event.first_binding.map_or(0, |binding| (binding.0 >> 64) as u64),
+                for (source_sequence, event) in extraction
+                    .search_milestones
+                    .transformation_task_lifecycle
+                    .iter()
+                    .enumerate()
+                {
+                    let source_sequence = source_sequence as u64;
+                    capture.detail(DetailEvent::Task {
+                        source_sequence,
+                        event_time_us: event.last_run_us.unwrap_or_default(),
+                        group: MemoGroupRef(event.group.0 as u64),
+                        expression: LogicalExprRef(event.expression.index() as u64),
+                        rule: RuleRef(event.rule.0),
+                        first_binding: event.first_binding.map(|binding| {
+                            BindingRef([(binding.0 >> 64) as u64, binding.0 as u64])
+                        }),
+                        first_run_us: event.first_run_us,
+                        first_published_us: event.first_published_us,
+                        match_count: event.match_count,
+                        applicable_count: event.applicable_count,
+                        published_count: event.published_count,
+                        no_match_count: event.no_match_count,
+                        no_output_count: event.no_output_count,
+                        budget_rejected_count: event.budget_rejected_count,
                     });
-                    sequence = sequence.saturating_add(1);
-                    capture.detail(DetailEvent {
-                        sequence,
-                        kind: detail_kind::TASK,
-                        phase: 2,
-                        primary: event.group.0 as u64,
-                        secondary: event.expression.index() as u64,
-                        tertiary: event.match_count,
-                        reference: event.published_count,
-                        cause: event.no_match_count,
-                    });
-                    sequence = sequence.saturating_add(1);
                 }
-                for variant in &extraction.variants {
-                    capture.detail(DetailEvent {
-                        sequence,
-                        kind: detail_kind::GRANT,
-                        phase: 0,
-                        primary: variant.class.0 as u64,
-                        secondary: variant.physical_fingerprint.0 as u64,
-                        tertiary: variant.cost.score.range.expected.to_bits(),
-                        reference: (variant.physical_fingerprint.0 >> 64) as u64,
-                        cause: variant.cost.max_parallel_tasks as u64,
+                for (source_sequence, variant) in extraction.variants.iter().enumerate() {
+                    capture.detail(DetailEvent::Grant {
+                        source_sequence: source_sequence as u64,
+                        class: variant.class.0,
+                        physical_fingerprint: FingerprintRef([
+                            (variant.physical_fingerprint.0 >> 64) as u64,
+                            variant.physical_fingerprint.0 as u64,
+                        ]),
+                        expected_cost_bits: variant.cost.score.range.expected.to_bits(),
+                        max_parallel_tasks: variant.cost.max_parallel_tasks,
                     });
-                    sequence = sequence.saturating_add(1);
                 }
-                capture.detail(DetailEvent {
-                    sequence,
-                    kind: detail_kind::SEARCH,
-                    phase: 0,
-                    primary: extraction.search_summary.groups,
-                    secondary: extraction.search_summary.logical_expressions,
-                    tertiary: extraction.search_summary.physical_expressions,
-                    reference: extraction.search_summary.obligations.len() as u64,
-                    cause: extraction.search_stop.reason as u64,
+                let quality = &extraction.quality_last_evaluation;
+                let (quality_candidate, quality_goal) = extraction.quality_last_evaluation_identity;
+                let quality_event_time_us = extraction
+                    .search_milestones
+                    .quality_policy_satisfied_us
+                    .or(extraction.search_stop.actual_stop_us)
+                    .unwrap_or_default();
+                capture.detail(DetailEvent::Quality {
+                    // The quality producer emits one final snapshot for this
+                    // compile.  Its sequence is local to this snapshot
+                    // stream, not the renderer's category traversal order.
+                    source_sequence: 0,
+                    event_time_us: quality_event_time_us,
+                    candidate: quality_candidate
+                        .map(|candidate| CandidateRef(candidate.index() as u64)),
+                    goal: quality_goal.map(|goal| GoalRef {
+                        required: goal.required.0 as u64,
+                        grant: goal.grant.stable_tag(),
+                        context: goal.context.0 as u64,
+                    }),
+                    completed: quality.completed,
+                    not_applicable: quality.not_applicable,
+                    missing_evidence: quality.missing_evidence,
+                    suspended: quality.suspended,
+                    missing_facts: quality.missing_facts,
+                    missing_bundles: quality
+                        .missing_bundles
+                        .iter()
+                        .map(|bundle| bundle.0)
+                        .collect(),
+                    missing_fact_kinds: quality
+                        .missing_fact_kinds
+                        .iter()
+                        .map(|fact| fact.stable_tag())
+                        .collect(),
+                    policy_satisfied: matches!(
+                        extraction.quality_policy_status,
+                        crate::cascades::quality::QualityPolicyStatus::Satisfied(_)
+                    ),
+                });
+                capture.detail(DetailEvent::Search {
+                    source_sequence: 0,
+                    groups: extraction.search_summary.groups,
+                    logical_expressions: extraction.search_summary.logical_expressions,
+                    physical_expressions: extraction.search_summary.physical_expressions,
+                    obligations: extraction.search_summary.obligations.len() as u64,
+                    stop: match extraction.search_stop.reason {
+                        crate::cascades::engine::SearchStopReason::Complete => {
+                            paro_context::compile_diagnostics::SearchStop::Complete
+                        }
+                        crate::cascades::engine::SearchStopReason::SearchIncomplete => {
+                            paro_context::compile_diagnostics::SearchStop::Incomplete
+                        }
+                        crate::cascades::engine::SearchStopReason::Deadline => {
+                            paro_context::compile_diagnostics::SearchStop::Deadline
+                        }
+                        crate::cascades::engine::SearchStopReason::BudgetLimited => {
+                            paro_context::compile_diagnostics::SearchStop::BudgetLimited
+                        }
+                        crate::cascades::engine::SearchStopReason::RuleFailure => {
+                            paro_context::compile_diagnostics::SearchStop::RuleFailure
+                        }
+                        crate::cascades::engine::SearchStopReason::QualityPolicySatisfied => {
+                            paro_context::compile_diagnostics::SearchStop::QualityPolicySatisfied
+                        }
+                    },
                 });
             }
         }
         if paro_context::compile_work_evidence_enabled() {
-            self.compile_work.rule_elapsed_us = extraction.rule_elapsed.values()
+            self.compile_work.rule_elapsed_us = extraction
+                .rule_elapsed
+                .values()
                 .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
                 .fold(0u64, u64::saturating_add);
-            self.compile_work.child_combination_cost_synthesis_count = extraction.search_summary
-                .work_counters.get("child_combination_cost_synthesis_count").copied().unwrap_or(0);
+            self.compile_work.child_combination_cost_synthesis_count = extraction
+                .search_summary
+                .work_counters
+                .get("child_combination_cost_synthesis_count")
+                .copied()
+                .unwrap_or(0);
         }
         self.ctx
             .profiler

@@ -2022,6 +2022,19 @@ impl CascadesEngine {
         &self.quality_last_evaluation
     }
 
+    /// Identity of the candidate and goal at the most recent real quality
+    /// evaluation.  These are intentionally exposed together with the
+    /// summary: a bundle count without the evaluated target is not a causal
+    /// quality event.
+    pub fn quality_last_evaluation_identity(
+        &self,
+    ) -> (Option<CandidateId>, Option<OptimizationGoal>) {
+        (
+            self.quality_last_evaluation_candidate,
+            self.quality_last_evaluation_goal,
+        )
+    }
+
     pub fn governor_mut(&mut self) -> &mut Governor {
         &mut self.governor
     }

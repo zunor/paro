@@ -2921,6 +2921,8 @@ impl OptimizationInput {
             search_summary,
             search_stop: stop,
             quality_policy_status: engine.quality_policy_status(),
+            quality_last_evaluation: engine.quality_last_evaluation().clone(),
+            quality_last_evaluation_identity: engine.quality_last_evaluation_identity(),
             strong_incumbent_plans,
             strong_incumbent_logical_plans,
             strong_incumbent_reprice_us: seed_reprice_us,
@@ -2954,6 +2956,10 @@ pub struct OptimizationOutput {
     /// ProofComplete or a deadline/budget stop.
     pub search_stop: super::engine::SearchStop,
     pub quality_policy_status: QualityPolicyStatus,
+    /// The last real quality-policy decision, kept as a typed snapshot so
+    /// diagnostic consumers do not infer it from candidate lifecycle events.
+    pub quality_last_evaluation: super::quality::QualityEvaluationSummary,
+    pub quality_last_evaluation_identity: (Option<CandidateId>, Option<OptimizationGoal>),
     /// Exported only when `PARO_EXPORT_STRONG_INCUMBENT=1`; diagnostic/setup
     /// callers can feed these immutable seeds to a fresh Memo.
     pub strong_incumbent_plans: Box<[SeedPlan]>,

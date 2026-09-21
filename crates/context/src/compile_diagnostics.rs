@@ -14,7 +14,7 @@ pub const PROCESS_LIMIT: usize = 64 << 20;
 pub const MAX_CAPTURES: usize = 8;
 pub const MAX_RULES: usize = 64;
 pub const MAX_VARIANTS: usize = 16;
-pub const MAX_DETAIL_EVENTS: usize = 8_192;
+pub const MAX_DETAIL_EVENTS: usize = 2_048;
 pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
 // Includes fixed recorder, encoder workspace, vector and protocol copy headroom.
 const RESERVATION: usize = 2 << 20;
@@ -82,42 +82,202 @@ pub enum CaptureLevel {
     Detail,
 }
 
-/// Stable machine kinds for the bounded Detail stream.  The values are part
-/// of the Detail schema; the payload fields remain fixed-width references into
-/// the real Memo/TaskRegistry snapshot rather than copied planner objects.
-pub mod detail_kind {
-    pub const RULE: u16 = 1;
-    pub const CANDIDATE: u16 = 2;
-    pub const TASK: u16 = 3;
-    pub const CANDIDATE_CHILD: u16 = 4;
-    pub const QUALITY: u16 = 5;
-    pub const FACT: u16 = 6;
-    pub const GRANT: u16 = 7;
-    pub const SEARCH: u16 = 8;
-    /// A same-Memo publication edge before the output is consumed as a
-    /// candidate. Consumers can distinguish production from later selection
-    /// without replaying rules.
-    pub const PROPOSAL: u16 = 9;
-    pub const MAX: u16 = PROPOSAL;
+/// Typed, scoped references used by Detail.  Keeping these as distinct Rust
+/// types prevents a logical expression, physical expression, group, and
+/// fingerprint from silently occupying the same integer slot in a report.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct MemoGroupRef(pub u64);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct LogicalExprRef(pub u64);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalExprRef(pub u64);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateRef(pub u64);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct RuleRef(pub u32);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct BindingRef(pub [u64; 2]);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct FingerprintRef(pub [u64; 2]);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct GoalRef {
+    pub required: u64,
+    pub grant: u64,
+    pub context: u64,
 }
 
-/// A compact event copied from the real optimizer lifecycle.  IDs are opaque
-/// to the renderer; the Memo/TaskRegistry remain the semantic authority. The
-/// fixed-width shape is deliberate: admitting an event never allocates a
-/// planner object or retains a subtree.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct DetailEvent {
-    pub sequence: u64,
-    pub kind: u16,
-    pub phase: u16,
-    pub primary: u64,
-    pub secondary: u64,
-    pub tertiary: u64,
-    /// An additional opaque reference.  Its meaning is fixed by `kind` and
-    /// is never a pointer or a retained planner object.
-    pub reference: u64,
-    pub cause: u64,
+/// A bounded lifecycle record. `source_sequence` is local to the producer
+/// stream named by the variant; it is never the order in which the renderer
+/// happened to visit categories. `event_time_us` is the actual monotonic
+/// search timestamp when the source supplied one. Aggregate snapshots keep a
+/// zero timestamp and are explicitly typed as such.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "data", deny_unknown_fields)]
+pub enum DetailEvent {
+    RuleSummary {
+        source_sequence: u64,
+        rule: RuleRef,
+        binding_calls: u64,
+        binding_ns: u64,
+        attempts: u64,
+        inserted: u64,
+        elapsed_ns: u64,
+    },
+    Proposal {
+        source_sequence: u64,
+        event_time_us: u64,
+        stage: u8,
+        group: MemoGroupRef,
+        source: Option<LogicalExprRef>,
+        logical: Option<LogicalExprRef>,
+        physical: Option<PhysicalExprRef>,
+        binding: Option<BindingRef>,
+        rule: Option<RuleRef>,
+    },
+    Candidate {
+        source_sequence: u64,
+        event_time_us: u64,
+        stage: u8,
+        group: MemoGroupRef,
+        goal: Option<GoalRef>,
+        candidate: Option<CandidateRef>,
+        source: Option<LogicalExprRef>,
+        source_child: Option<LogicalExprRef>,
+        logical: Option<LogicalExprRef>,
+        physical: Option<PhysicalExprRef>,
+        recipe: Option<FingerprintRef>,
+        rule: Option<RuleRef>,
+        expected_cost_bits: Option<u64>,
+        upper_cost_bits: Option<u64>,
+    },
+    CandidateChild {
+        source_sequence: u64,
+        event_time_us: u64,
+        stage: u8,
+        candidate: Option<CandidateRef>,
+        child_group: MemoGroupRef,
+        child_candidate: CandidateRef,
+        goal: GoalRef,
+    },
+    Fact {
+        source_sequence: u64,
+        event_time_us: u64,
+        candidate: Option<CandidateRef>,
+        group: MemoGroupRef,
+        logical_fact: FingerprintRef,
+        statistics_snapshot: FingerprintRef,
+    },
+    Task {
+        source_sequence: u64,
+        event_time_us: u64,
+        group: MemoGroupRef,
+        expression: LogicalExprRef,
+        rule: RuleRef,
+        first_binding: Option<BindingRef>,
+        first_run_us: Option<u64>,
+        first_published_us: Option<u64>,
+        match_count: u64,
+        applicable_count: u64,
+        published_count: u64,
+        no_match_count: u64,
+        no_output_count: u64,
+        budget_rejected_count: u64,
+    },
+    Grant {
+        source_sequence: u64,
+        class: u32,
+        physical_fingerprint: FingerprintRef,
+        expected_cost_bits: u64,
+        max_parallel_tasks: u16,
+    },
+    /// A real quality-policy evaluation snapshot.  This is emitted only from
+    /// the planner's quality decision point; a candidate carrying a goal is
+    /// deliberately not treated as a quality decision.
+    Quality {
+        source_sequence: u64,
+        event_time_us: u64,
+        candidate: Option<CandidateRef>,
+        goal: Option<GoalRef>,
+        completed: u64,
+        not_applicable: u64,
+        missing_evidence: u64,
+        suspended: u64,
+        missing_facts: u64,
+        missing_bundles: Box<[u32]>,
+        missing_fact_kinds: Box<[u64]>,
+        policy_satisfied: bool,
+    },
+    Search {
+        source_sequence: u64,
+        groups: u64,
+        logical_expressions: u64,
+        physical_expressions: u64,
+        obligations: u64,
+        stop: SearchStop,
+    },
+}
+
+impl DetailEvent {
+    pub fn source_sequence(&self) -> u64 {
+        match self {
+            Self::RuleSummary {
+                source_sequence, ..
+            }
+            | Self::Proposal {
+                source_sequence, ..
+            }
+            | Self::Candidate {
+                source_sequence, ..
+            }
+            | Self::CandidateChild {
+                source_sequence, ..
+            }
+            | Self::Fact {
+                source_sequence, ..
+            }
+            | Self::Task {
+                source_sequence, ..
+            }
+            | Self::Grant {
+                source_sequence, ..
+            }
+            | Self::Quality {
+                source_sequence, ..
+            }
+            | Self::Search {
+                source_sequence, ..
+            } => *source_sequence,
+        }
+    }
+
+    pub fn stream_name(&self) -> &'static str {
+        match self {
+            Self::RuleSummary { .. } => "rule-summary",
+            Self::Proposal { .. } => "proposal-lifecycle",
+            Self::Candidate { .. } => "candidate-lifecycle",
+            Self::CandidateChild { .. } => "candidate-child-lifecycle",
+            Self::Fact { .. } => "fact-lifecycle",
+            Self::Task { .. } => "task-lifecycle",
+            Self::Grant { .. } => "grant-snapshot",
+            Self::Quality { .. } => "quality-evaluation",
+            Self::Search { .. } => "search-snapshot",
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TimerBoundary {
@@ -305,7 +465,13 @@ pub struct CompileRecord {
     pub process_reservation: usize,
     pub capture_level: CaptureLevel,
     pub detail: Vec<DetailEvent>,
-    pub omitted_detail: u64,
+    /// Lifecycle records the optimizer could not retain before this capture
+    /// was copied.  This is not the same failure as capture capacity.
+    pub omitted_source_detail: u64,
+    /// Records rejected by this bounded capture after the producer supplied
+    /// them.  Encoding loss is tracked separately by the renderer.
+    pub omitted_capture_detail: u64,
+    pub omitted_encoding_detail: u64,
     pub detail_limit: usize,
     pub execution_receipt: Option<ExecutionReceipt>,
 }
@@ -463,7 +629,9 @@ impl CompileCapture {
                 process_reservation: RESERVATION,
                 capture_level: level,
                 detail: Vec::new(),
-                omitted_detail: 0,
+                omitted_source_detail: 0,
+                omitted_capture_detail: 0,
+                omitted_encoding_detail: 0,
                 detail_limit: MAX_DETAIL_EVENTS,
                 execution_receipt: None,
             }),
@@ -522,7 +690,7 @@ impl CompileCapture {
         if record.detail.len() < MAX_DETAIL_EVENTS {
             record.detail.push(event);
         } else {
-            record.omitted_detail = record.omitted_detail.saturating_add(1);
+            record.omitted_capture_detail = record.omitted_capture_detail.saturating_add(1);
         }
     }
 
@@ -537,7 +705,7 @@ impl CompileCapture {
         }
         let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
         if !self.sealed.load(Ordering::Acquire) {
-            record.omitted_detail = record.omitted_detail.saturating_add(count);
+            record.omitted_source_detail = record.omitted_source_detail.saturating_add(count);
         }
     }
 
@@ -630,44 +798,50 @@ mod tests {
     fn detail_is_opt_in_bounded_and_summary_has_no_event_buffer() {
         let _lock = capture_test_lock();
         let summary = CompileCapture::try_start().unwrap();
-        summary.detail(DetailEvent {
-            sequence: 0,
-            kind: detail_kind::RULE,
-            phase: 0,
-            primary: 1,
-            secondary: 2,
-            tertiary: 3,
-            reference: 4,
-            cause: 5,
+        summary.detail(DetailEvent::RuleSummary {
+            source_sequence: 1,
+            rule: RuleRef(1),
+            binding_calls: 2,
+            binding_ns: 3,
+            attempts: 4,
+            inserted: 5,
+            elapsed_ns: 6,
         });
         summary.read(|record| {
             assert_eq!(record.capture_level, CaptureLevel::Summary);
             assert!(record.detail.is_empty());
-            assert_eq!(record.omitted_detail, 0);
+            assert_eq!(record.omitted_source_detail, 0);
+            assert_eq!(record.omitted_capture_detail, 0);
         });
 
         let detail = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
         const DETAIL_ATTEMPTS: usize = 809_720;
         for sequence in 0..DETAIL_ATTEMPTS {
-            detail.detail(DetailEvent {
-                sequence: sequence as u64,
-                kind: detail_kind::TASK,
-                phase: 0,
-                primary: sequence as u64,
-                secondary: 0,
-                tertiary: 0,
-                reference: 0,
-                cause: 0,
+            detail.detail(DetailEvent::Task {
+                source_sequence: sequence as u64,
+                event_time_us: sequence as u64,
+                group: MemoGroupRef(sequence as u64),
+                expression: LogicalExprRef(sequence as u64),
+                rule: RuleRef(1),
+                first_binding: None,
+                first_run_us: None,
+                first_published_us: None,
+                match_count: 0,
+                applicable_count: 0,
+                published_count: 0,
+                no_match_count: 0,
+                no_output_count: 0,
+                budget_rejected_count: 0,
             });
         }
         detail.read(|record| {
             assert_eq!(record.capture_level, CaptureLevel::Detail);
             assert_eq!(record.detail.len(), MAX_DETAIL_EVENTS);
             assert_eq!(
-                record.omitted_detail,
+                record.omitted_capture_detail,
                 (DETAIL_ATTEMPTS - MAX_DETAIL_EVENTS) as u64
             );
-            assert_eq!(record.detail.first().unwrap().sequence, 0);
+            assert_eq!(record.detail.first().unwrap().source_sequence(), 0);
         });
     }
 }
