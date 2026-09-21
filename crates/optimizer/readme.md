@@ -151,33 +151,34 @@ certify production latency.
 
 ## Compile diagnostics
 
-The current profiler, exclusive work ledger and Memo snapshots are separate
-sources. Diagnostics converge on one typed compile record with common
-identities, units, causal links, bounds and lifecycle. This README does not
-claim the unified interface is implemented. The contributor contracts below
-are usable in a standalone clone.
+The current profiler, exclusive work ledger and Memo snapshots remain separate
+producer details, but the public compile record is typed, bounded and sealed.
+Later admission/execution receipts extend that record without reopening it.
+The benchmark consumer uses the same versioned identities and keeps missing
+associations explicit.
 
-The target public entry point is `EXPLAIN (COMPILE, FORMAT JSON)`, with TEXT
-rendered from the same typed record. This syntax is a planned deliverable, not
-a claim that the current parser accepts it. Earlier OPTIMIZER and bare COMPILE
-proposals are superseded, not retained as aliases. Ordinary EXPLAIN shows a
-plan; COMPILE observes its construction; ANALYZE measures actual execution.
+The public entry point is `EXPLAIN (COMPILE, FORMAT JSON)`, with TEXT rendered
+from the same typed record. Query/CTE targets support Summary and
+`COMPILE, ANALYZE`; simple and known-typed extended executions use one compile
+and one execution. Earlier OPTIMIZER aliases are not retained. Ordinary
+EXPLAIN shows a plan; COMPILE observes its construction; ANALYZE measures the
+actual execution of that sealed artifact.
 The optimizer is one producer in a compiler-wide record, not the owner of
 session or execution instrumentation.
 
-Summary is the default; `EXPLAIN (COMPILE, DETAIL, FORMAT JSON)` adds bounded
-records, not different search semantics. Without ANALYZE, the target is not
-executed: runtime/admission measurements are NotExecuted, not zero. COMPILE
-invokes the real target compiler exactly once, without an Explain wrapper in
-its Memo and without consuming or populating its statement-plan cache. Record
-ForcedCompile rather than claiming a normal SELECT cache miss. A subsequent
-`EXPLAIN (COMPILE, ANALYZE, FORMAT JSON)` integration must reuse that same
-compiled artifact and the existing runtime profiler, never compile twice.
-Unsupported syntax or statement/protocol combinations must fail explicitly.
+Summary is the default; Detail remains a separate T3 deliverable. Without
+ANALYZE, the target is not executed: runtime/admission measurements are
+NotExecuted, not zero. COMPILE invokes the real target compiler exactly once,
+without an Explain wrapper in its Memo and without consuming or populating its
+statement-plan cache. Record ForcedCompile rather than claiming a normal
+SELECT cache miss. With ANALYZE, the executor admits and runs that same sealed
+compiled artifact and attaches the actual execution receipt; it never compiles
+twice. Unsupported syntax or statement/protocol combinations fail explicitly.
 
 Keep the established compiler timer boundary. Parsing may precede that timer;
 a compiled portfolio may still need execution-time admission and lowering.
-CompiledArtifactReady is not ExecutionImageReady. Report expected and actual
+CompiledArtifactReady, actual portfolio selection, ExecutableImageReady and
+execution terminal are separate receipt states. Report expected and actual
 resource classes separately, without constructing unused images to fill a
 table. Sealed compile records can be linked to later execution records but
 must not be rewritten to hide deferred work. The output cannot measure its
@@ -231,6 +232,10 @@ When extending diagnostics:
   SQL fingerprints alone do not identify repeated executions.
 - Converge benchmark consumers on the EXPLAIN schema. Do not add temporary
   environment exporters, server-log parsers or per-experiment JSON extractors.
+- Normal benchmark timing remains trace-off. Its bounded post-statement
+  receipt channel records an association when the immutable artifact and real
+  admission match; missing or mismatched receipts are `Uncovered` and never
+  remove the timing sample.
 - Classify controls by their effects, not their names. Retire replaced
   diagnostic outputs only; preserve behavior experiments, normal measurement
   receipts and unclassified/mixed controls until their owning workstream

@@ -1,7 +1,9 @@
-# Bounded compile Summary (T1)
+# Bounded compile Summary and execution association (T2/T4)
 
-This is compile observation, not C2/F2 admission or a latency claim. Existing
-search, grant, verification and behavior-experiment defaults are unchanged.
+This is the bounded compile/execution contract, not C2/F2 admission or a
+latency claim. Existing search, grant, verification and behavior-experiment
+defaults are unchanged. Detail remains T3 and the full Trace Matrix is not
+claimed.
 The authoritative wire document is `context::compile_diagnostics::CompileDocument`;
 the renderer and validator share its Summary/Unavailable variants and schema
 version 2. Version 1 artifacts remain historical evidence, not current input.
@@ -16,20 +18,23 @@ EXPLAIN (COMPILE, FORMAT JSON) WITH t AS (SELECT 1 AS x) SELECT x FROM t;
 Both produce one `QUERY PLAN` text column and one diagnostic document row.
 Simple-protocol queries/CTEs use the production compiler exactly once on the
 bare target AST. They bypass target cache lookup and publication (`ForcedCompile`,
-not a cache-miss claim), discard the compiled portfolio, and never construct a
-target execution image, admit a grant or execute the target.
+not a cache-miss claim). `ANALYZE` admits and executes the same sealed compiled
+artifact exactly once; it does not compile a second time. Extended Parse/Bind/
+Describe/Execute supports known parameter types, does not execute on Describe,
+and rejects incomplete parameter environments rather than inventing values.
 
 | Combination | Status |
 | --- | --- |
 | simple query/CTE Summary, TEXT/JSON | implemented |
 | binding/compilation error | original SQLSTATE and primary error preserved |
 | cancellation | compiler and backpressured Summary delivery observe statement cancellation |
-| DETAIL / ANALYZE | parsed, explicitly Unsupported (T3/T2) |
-| extended/prepared COMPILE | explicitly Unsupported at binder boundary (T2) |
+| DETAIL | explicitly Unsupported (T3) |
+| ANALYZE | one actual admission and one execution of the sealed artifact |
+| extended/prepared COMPILE | known-typed Parse/Bind/Describe/Execute supported; Describe does not execute |
 | DML/DDL/utility/nested EXPLAIN | explicitly Unsupported |
 | legacy EXPLAIN syntax | unchanged |
 | source-build/catalog receipt and parse time | Uncovered, never guessed |
-| actual admission/execution | NotExecuted, not zero time |
+| actual admission/execution | attached only by the real ANALYZE execution receipt; otherwise NotExecuted |
 | response-terminal measurement | Uncovered until the response boundary (T2) |
 
 Unknown options, duplicates, conflicting FORMAT options, legacy option mixing
@@ -110,7 +115,26 @@ invalid capacity profiles, fabricated execution, unsupported completion claims
 and non-closing phase sums. It validates a record, not cross-run association or
 the correctness of an external arbitrary fingerprint.
 
-## Historical validation status (before independent review)
+## Artifact, admission and benchmark receipt contract
+
+`CompileRecord.artifact_identity` is a versioned cross-run identity containing
+artifact, structure and dependency words. It is emitted when the immutable
+compiled artifact is ready. A portfolio summary is not an executable image.
+The execution receipt is created at real admission and records expected class,
+actual class/fingerprint, fallback reason and the resource contract. The
+receipt moves through `image=NotReady` to `image=Ready` only after executable
+lowering succeeds, then closes as Completed, Failed, Cancelled or Dropped.
+Non-ANALYZE COMPILE cannot manufacture an admission receipt.
+
+Normal benchmark execution reads the bounded `paro_optimizers()` channel after
+the timed statement. It associates the newest execution receipt with the
+matching immutable artifact and original compile receipt; cache hits point to
+the original compile receipt while the current compilation is NotExecuted.
+Association failure is an explicit `Uncovered` reason and does not remove a
+timing or slow sample. The run-owned output contract is documented in
+[`compile-artifact-execution-receipts.md`](compile-artifact-execution-receipts.md).
+
+## Historical T1 validation status (before independent review)
 
 The following e1a04282-era results did not test transaction state after a
 dropped request, unavailable-document reading, contradictory terminal states,
@@ -126,7 +150,9 @@ private recovery/evidence root recorded in `compile-observation-baseline.md`.
 
 T0 is integrated into re-op with the user's mixed delta retained; see
 `compile-integration-review.json`. T1's non-executing Summary implementation is
-delivered. It is not TraceMatrixReady or a complete cross-run receipt protocol.
+delivered, and T2 plus Summary-level T4 are now layered on top. This is not
+TraceMatrixReady: full Detail, broader source coverage and remaining matrix
+cells are separate work.
 
 Final clean source `d996be77` and its dev server binary are recorded in
 [`compile-summary-validation.json`](compile-summary-validation.json):
@@ -153,5 +179,29 @@ server-readiness failures are also retained, not counted as passing attempts.
 No performance/observer-overhead campaign was run. Functional artifact
 neutrality is not timing neutrality near a deadline. No latency, parity, C2/F2
 admission or complete Matrix claim is made. The full 99-query corpus was not
-rerun for this request-observation change. T2–T5 and legacy output retirement
-remain separate; no legacy DiagnosticOutput or BehaviorExperiment was removed.
+rerun for that request-observation change. T3 Detail and unaccepted legacy
+DiagnosticOutput/BehaviorExperiment retirement remain separate; no behavior
+experiment was removed.
+
+## Current T2/Summary-T4 validation boundary
+
+The current delivery is validated from a clean release build after the T2
+artifact/receipt and Summary-level benchmark changes. Workspace tests and
+strict all-target Clippy pass. Benchmark unit tests pass, including exclusive
+RunId/attempt ownership, retry retention, receipt identity matching, cache-hit
+NotExecuted state, and the no-overwrite gate path.
+
+The fresh-directory SQL regression run reports 177 passed and eight existing
+EXPLAIN-only differences. The eight are retained as failures and classified as
+plan/display contracts: `agg_join_subsumption`, `agg_singleton_groups`,
+`explain_analyze`, `explain_basic`, `join_explain_advanced`,
+`rowset_scan_pushdown`, `statistics_query`, and `pgvector_topn_filter_flow`.
+There were no result mismatches and no expected or `.actual` files were
+blessed. A reused regression directory also produced a duplicate-fixture
+`prepared_cursor_t` failure; it is retained as invalid-run evidence and is not
+part of the fresh-directory result.
+
+This validation covers real PgWire TEXT/JSON COMPILE, known-typed extended
+parameters, one-shot ANALYZE execution, receipt publication, and cancellation
+/transport ownership tests. It does not certify T3 Detail, full TraceMatrix,
+C2, F2, latency, or a 99-query performance campaign.
