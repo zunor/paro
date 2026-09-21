@@ -1670,6 +1670,7 @@ dependencies = [
  "paro-scheduler",
  "paro-storage",
  "paro-transaction",
+ "serde",
  "serde_json",
  "smallvec",
  "tempfile",

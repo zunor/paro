@@ -56,6 +56,7 @@ paro-external = { workspace = true }
 tracing = { workspace = true }
 parking_lot = "0.12"
 num_cpus = "1.16"
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio-util = { workspace = true }
 tokio = { workspace = true }
