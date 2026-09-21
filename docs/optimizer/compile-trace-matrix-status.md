@@ -108,3 +108,12 @@ The targeted contract tests and workspace check cover this follow-up. A fresh
 clean-source campaign, full SQL regression, strict Clippy run, and complete
 Trace Matrix gate remain required before this document can claim
 `TraceMatrixReady`, C2, F2, or a performance result.
+
+The current verification run completed the workspace tests, strict Clippy,
+benchmark unit tests, and the high-file-descriptor SQL regress harness without
+changing expected files. The regress result was 177 passed and 8 existing
+failures (`agg_join_subsumption`, `agg_singleton_groups`, `explain_analyze`,
+`explain_basic`, `join_explain_advanced`, `rowset_scan_pushdown`,
+`statistics_query`, and `pgvector_topn_filter_flow`). Those failures remain
+unresolved evidence; they are not converted into a pass by the typed output
+work.
