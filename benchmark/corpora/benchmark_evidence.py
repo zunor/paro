@@ -196,6 +196,17 @@ def fetch_compile_document(
         raise ValueError("EXPLAIN (COMPILE) returned invalid JSON") from error
     if not isinstance(document, dict):
         raise ValueError("EXPLAIN (COMPILE) document is not an object")
+    try:
+        from benchmark.harness.receipt_contract import (
+            ReceiptContractError,
+            validate_compile_document,
+        )
+    except ModuleNotFoundError:  # pragma: no cover - script-only import path
+        from harness.receipt_contract import ReceiptContractError, validate_compile_document
+    try:
+        validate_compile_document(document)
+    except ReceiptContractError as error:
+        raise ValueError(f"EXPLAIN (COMPILE) document violates its contract: {error}") from error
     return payload, document
 
 

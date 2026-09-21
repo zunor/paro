@@ -116,6 +116,34 @@ class RunOutputTests(unittest.TestCase):
                 (output.attempts[("q11", "diagnostic")].root / "failure.json").exists()
             )
 
+    def test_capacity_failure_seals_incomplete_and_preserves_terminal_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "campaign.json",
+                source_id="collector",
+                cells=[{
+                    "query_case": "q11",
+                    "arm_id": "normal",
+                    "query_cases": 1,
+                    "sample_rows": 1,
+                    "product_receipts": 1,
+                }],
+            )
+            with self.assertRaises(RunOutputError):
+                output.publish_cell_json(
+                    query_case="q11",
+                    arm_id="normal",
+                    payload={"payload": "x" * 20_000},
+                )
+            output.finish(status="Completed")
+            attempt = json.loads(
+                output.attempts[("q11", "normal")].root.joinpath("attempt.json").read_text()
+            )
+            manifest = json.loads((output.run.root / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "Incomplete")
+            self.assertEqual(manifest["registration"]["status"], "CapacityExceeded")
+            self.assertEqual(attempt["status"], "Incomplete")
+
     def test_standalone_corpus_output_is_registered_and_sealed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = CorpusOutput.create(
@@ -584,7 +612,13 @@ class RunOutputTests(unittest.TestCase):
     def test_receipt_contract_does_not_turn_uncovered_into_success(self) -> None:
         payload = {
             "version": 3,
-            "ownership": {"schema_version": 1, "campaign_id": "campaign", "run_id": "run"},
+            "ownership": {
+                "schema_version": 1,
+                "campaign_id": "campaign",
+                "run_id": "run",
+                "query_case": "q",
+                "arm_id": "normal",
+            },
             "workloads": [{
                 "name": "w",
                 "queries": [{
@@ -604,7 +638,13 @@ class RunOutputTests(unittest.TestCase):
     def test_verified_receipt_requires_nested_identity(self) -> None:
         payload = {
             "version": 3,
-            "ownership": {"schema_version": 1, "campaign_id": "campaign", "run_id": "run"},
+            "ownership": {
+                "schema_version": 1,
+                "campaign_id": "campaign",
+                "run_id": "run",
+                "query_case": "q",
+                "arm_id": "normal",
+            },
             "workloads": [{
                 "name": "w",
                 "queries": [{

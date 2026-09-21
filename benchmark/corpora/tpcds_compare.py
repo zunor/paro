@@ -36,6 +36,7 @@ from benchmark_evidence import (
 from harness.receipt_contract import (
     ReceiptContractError,
     associate_typed_receipts,
+    build_benchmark_cell_payload,
     validate_compile_document,
 )
 from harness.run_output import CampaignOutput
@@ -1419,24 +1420,47 @@ def main() -> int:
         output.publish_cell_json(
             query_case=query_id,
             arm_id="normal",
-            payload={
-                "schema_version": report["schema_version"],
-                "query": result,
-                "cohort": "normal",
-            },
+            payload=build_benchmark_cell_payload(
+                campaign_id=output.run.campaign_id,
+                run_id=output.run.run_id,
+                query_case=query_id,
+                arm_id="normal",
+                workload_name="tpcds",
+                query_payload=result,
+                compile_receipts=result.get("cold_statement", {})
+                .get("normal_receipt_coverage", {})
+                .get("associations", [])
+                or [{
+                    "schema_version": 1,
+                    "status": "Uncovered",
+                    "reason": "normal sample receipt association is absent",
+                }],
+                source_id=output.attempts[(query_id, "normal")].source_id,
+                attempt_id=output.attempts[(query_id, "normal")].attempt_id,
+            ),
         )
         output.publish_cell_json(
             query_case=query_id,
             arm_id="diagnostic",
-            payload={
-                "schema_version": report["schema_version"],
-                "query": {
+            payload=build_benchmark_cell_payload(
+                campaign_id=output.run.campaign_id,
+                run_id=output.run.run_id,
+                query_case=query_id,
+                arm_id="diagnostic",
+                workload_name="tpcds",
+                query_payload={
                     "query": query_id,
                     "diagnostic_cohort": result.get("diagnostic_cohort"),
                     "status": result.get("status"),
                 },
-                "cohort": "diagnostic",
-            },
+                compile_receipts=[{
+                    "schema_version": 1,
+                    "status": "Uncovered",
+                    "reason": "diagnostic Compile Evidence is not an execution receipt",
+                }],
+                source_id=output.attempts[(query_id, "diagnostic")].source_id,
+                attempt_id=output.attempts[(query_id, "diagnostic")].attempt_id,
+            ),
         )
         output.publish_campaign_json(report)
         if result["status"] != "passed":

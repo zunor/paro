@@ -21,6 +21,7 @@ from typing import Any
 
 from benchmark.harness.receipt_contract import (
     ReceiptContractError,
+    build_benchmark_cell_payload,
     validate_compile_document,
 )
 from benchmark.harness.run_output import CorpusOutput
@@ -38,6 +39,38 @@ def _content_digest(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _compile_document_from_sample(sample: dict[str, Any], source_path: Path) -> dict[str, Any]:
+    document = sample.get("compile_document")
+    if not isinstance(document, dict) or document.get("status") != "Captured":
+        if not isinstance(document, dict):
+            raise ValueError("sample has no compile document")
+        return document
+    relative = document.get("path")
+    expected_sha = document.get("sha256")
+    if not isinstance(relative, str) or not isinstance(expected_sha, str):
+        raise ValueError("compile capture reference is incomplete")
+    root = source_path.parent
+    for candidate in (source_path.parent, *source_path.parents):
+        if (candidate / "manifest.json").is_file():
+            root = candidate
+            break
+    capture = (root / relative).resolve()
+    try:
+        capture.relative_to(root.resolve())
+    except ValueError as error:
+        raise ValueError("compile capture escapes its run") from error
+    raw = capture.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha:
+        raise ValueError("compile capture identity does not match its reference")
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("compile capture is not valid JSON") from error
+    if not isinstance(loaded, dict):
+        raise ValueError("compile capture is not an object")
+    return loaded
 
 
 def _rule_attribution(
@@ -366,10 +399,12 @@ def _plan_coordinates(
 def _attribute_sample(
     sample: dict[str, Any],
     *,
+    source_path: Path,
     execution_sample: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    compile_document = _compile_document_from_sample(sample, source_path)
     try:
-        compile_status = validate_compile_document(sample.get("compile_document"))
+        compile_status = validate_compile_document(compile_document)
     except ReceiptContractError as error:
         raise ValueError(str(error)) from error
     diagnostics = sample.get("diagnostics")
@@ -386,10 +421,10 @@ def _attribute_sample(
         "compile_document": {
             "status": compile_status,
             "query_fingerprint": sample.get("compile_query_fingerprint"),
-            "outcome": sample["compile_document"].get("outcome"),
-            "artifact": sample["compile_document"].get("artifact"),
-            "admission": sample["compile_document"].get("admission"),
-            "execution": sample["compile_document"].get("execution"),
+            "outcome": compile_document.get("outcome"),
+            "artifact": compile_document.get("artifact"),
+            "admission": compile_document.get("admission"),
+            "execution": compile_document.get("execution"),
         },
         "milestones": {
             "status": "uncovered",
@@ -507,6 +542,7 @@ def build_attribution(
         output_samples.append(
             _attribute_sample(
                 sample,
+                source_path=source_path,
                 execution_sample=execution_sample,
             )
         )
@@ -565,7 +601,23 @@ def main() -> int:
         product_receipts=len(attribution["samples"]),
         summary_captures=1,
     )
-    owned.publish_json(attribution)
+    owned.publish_json(
+        build_benchmark_cell_payload(
+            campaign_id=owned.run.campaign_id,
+            run_id=owned.run.run_id,
+            query_case=str(attribution["query"].get("name") or "attribution"),
+            arm_id="diagnostic",
+            workload_name="first_statement_attribution",
+            query_payload=attribution,
+            compile_receipts=[{
+                "schema_version": 1,
+                "status": "Uncovered",
+                "reason": "attribution is derived diagnostic evidence, not an execution receipt",
+            }],
+            source_id=owned.attempt.source_id,
+            attempt_id=owned.attempt.attempt_id,
+        )
+    )
     owned.publish_summary(
         "First-statement Compile Evidence attribution\n"
         f"samples={len(attribution['samples'])}\n"

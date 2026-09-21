@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -30,7 +31,41 @@ def positive(value: Any) -> float:
     return float(value)
 
 
-def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def _sample_compile_document(
+    sample: dict[str, Any], *, report_root: Path | None
+) -> dict[str, Any]:
+    document = sample.get("compile_document")
+    if isinstance(document, dict) and document.get("status") == "Captured":
+        if report_root is None:
+            raise ValueError("compile capture reference cannot be resolved without report path")
+        relative = document.get("path")
+        expected_sha = document.get("sha256")
+        if not isinstance(relative, str) or not isinstance(expected_sha, str):
+            raise ValueError("compile capture reference is incomplete")
+        capture = (report_root / relative).resolve()
+        try:
+            capture.relative_to(report_root.resolve())
+        except ValueError as error:
+            raise ValueError("compile capture escapes its owned attempt") from error
+        raw = capture.read_bytes()
+        actual_sha = hashlib.sha256(raw).hexdigest()
+        if actual_sha != expected_sha:
+            raise ValueError("compile capture identity does not match its reference")
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError("compile capture is not valid JSON") from error
+        if not isinstance(loaded, dict):
+            raise ValueError("compile capture is not an object")
+        return loaded
+    if not isinstance(document, dict):
+        raise ValueError("sample has no compile document")
+    return document
+
+
+def validate(
+    report: dict[str, Any], *, report_root: Path | None = None
+) -> dict[str, list[dict[str, Any]]]:
     if report.get("schema_version") != VERSION:
         raise ValueError("unsupported cold planning report version")
     if report.get("invalidated"):
@@ -95,7 +130,7 @@ def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 raise ValueError("advisory rule failure in a performance sample")
             if sample["counters"]["search_deadline_reached"]:
                 raise ValueError("deadline-limited search is not qualifying latency evidence")
-            document = sample.get("compile_document")
+            document = _sample_compile_document(sample, report_root=report_root)
             try:
                 validate_compile_document(document)
             except ReceiptContractError as error:
@@ -106,17 +141,23 @@ def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     return result
 
 
-def evaluate(report: dict[str, Any], baseline: dict[str, Any] | None = None,
-             max_ratio: float = 1.15) -> dict[str, Any]:
+def evaluate(
+    report: dict[str, Any],
+    baseline: dict[str, Any] | None = None,
+    max_ratio: float = 1.15,
+    *,
+    report_root: Path | None = None,
+    baseline_root: Path | None = None,
+) -> dict[str, Any]:
     positive(max_ratio)
-    samples = validate(report)
+    samples = validate(report, report_root=report_root)
     summary = {name: {metric: {"median": statistics.median(s[metric] for s in block),
                              "maximum": max(s[metric] for s in block)}
                       for metric in METRICS} for name, block in samples.items()}
     result: dict[str, Any] = {"passed": True, "summary": summary, "regressions": []}
     if baseline is None:
         return result
-    previous = validate(baseline)
+    previous = validate(baseline, report_root=baseline_root)
     if report["configuration"] != baseline["configuration"]:
         raise ValueError("measurement settings differ")
     for key in ("dataset_sha256", "harness_sha256", "machine"):
@@ -152,9 +193,13 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--max-ratio", type=float, default=1.15)
     args = parser.parse_args()
-    result = evaluate(json.loads(args.report.read_text()),
-                      json.loads(args.baseline.read_text()) if args.baseline else None,
-                      args.max_ratio)
+    result = evaluate(
+        json.loads(args.report.read_text()),
+        json.loads(args.baseline.read_text()) if args.baseline else None,
+        args.max_ratio,
+        report_root=args.report.parent,
+        baseline_root=args.baseline.parent if args.baseline else None,
+    )
     print(json.dumps(result, indent=2, allow_nan=False))
     return 0 if result["passed"] else 1
 

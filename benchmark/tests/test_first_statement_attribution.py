@@ -93,7 +93,7 @@ class FirstStatementAttributionTest(unittest.TestCase):
             compatibility["checks"],
             {"sql_sha256": True, "dataset_sha256": True, "binary_sha256": False},
         )
-        self.assertIn("diagnostic EXPLAIN ANALYZE", compatibility["statement_boundary"])
+        self.assertIn("typed EXPLAIN (COMPILE", compatibility["statement_boundary"])
 
 
 if __name__ == "__main__":

@@ -445,6 +445,9 @@ def validate_benchmark_payload(payload: dict[str, Any], *, require_receipts: boo
     for field in ("campaign_id", "run_id"):
         if not isinstance(ownership.get(field), str) or not ownership[field]:
             raise ReceiptContractError(f"benchmark payload lacks ownership {field}")
+    for field in ("query_case", "arm_id"):
+        if not isinstance(ownership.get(field), str) or not ownership[field]:
+            raise ReceiptContractError(f"benchmark payload lacks cell ownership {field}")
     queries = 0
     for workload in payload.get("workloads", []):
         if not isinstance(workload, dict):
@@ -470,6 +473,54 @@ def validate_benchmark_payload(payload: dict[str, Any], *, require_receipts: boo
                 )
     if queries == 0:
         raise ReceiptContractError("benchmark payload contains no query cells")
+
+
+def build_benchmark_cell_payload(
+    *,
+    campaign_id: str,
+    run_id: str,
+    query_case: str,
+    arm_id: str,
+    workload_name: str,
+    query_payload: dict[str, Any],
+    compile_receipts: list[dict[str, Any]],
+    source_id: str | None = None,
+    attempt_id: str | None = None,
+    require_receipts: bool = False,
+) -> dict[str, Any]:
+    """Build the one cell envelope consumed by all benchmark readers.
+
+    Collectors may put their domain-specific report under ``query``; the
+    ownership and receipt association are deliberately not inferred from that
+    report.  In particular, a diagnostic cell must carry an explicit
+    ``Uncovered`` receipt instead of pretending that a compile-only document
+    is an execution receipt.
+    """
+    if not isinstance(compile_receipts, list) or not compile_receipts:
+        raise ReceiptContractError("cell payload requires an explicit receipt list")
+    payload = {
+        "version": 3,
+        "ownership": {
+            "schema_version": 1,
+            "campaign_id": campaign_id,
+            "run_id": run_id,
+            "source_id": source_id,
+            "attempt_id": attempt_id,
+            "query_case": query_case,
+            "arm_id": arm_id,
+        },
+        "workloads": [{
+            "name": workload_name,
+            "queries": [{
+                "id": query_case,
+                "compile_receipts": compile_receipts,
+            }],
+        }],
+        "schema_version": 1,
+        "query": query_payload,
+    }
+    validate_benchmark_payload(payload, require_receipts=require_receipts)
+    return payload
 
 
 def validate_summary_bytes(summary: str) -> None:

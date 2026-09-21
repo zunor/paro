@@ -40,6 +40,7 @@ from benchmark.corpora.benchmark_evidence import (
     statement_fingerprint,
 )
 from benchmark.corpora.cold_planning import ProcessWatchdog
+from benchmark.harness.receipt_contract import build_benchmark_cell_payload
 from benchmark.harness.run_output import CorpusOutput
 
 
@@ -197,6 +198,28 @@ def _sample(
     return result
 
 
+def _detach_compile_capture(
+    owned: CorpusOutput, *, measurement: dict[str, Any]
+) -> dict[str, Any]:
+    """Store one ANALYZE document and keep only its bounded receipt reference."""
+    raw = measurement.get("compile_document_raw")
+    document = measurement.get("compile_document")
+    if not isinstance(raw, str) or not isinstance(document, dict):
+        return measurement
+    capture_name = f"block-{measurement['block']:04d}.json"
+    capture_path = owned.publish_capture_text(capture_name, raw)
+    relative = capture_path.relative_to(owned.run.root).as_posix()
+    bounded = dict(measurement)
+    bounded.pop("compile_document_raw", None)
+    bounded["compile_document"] = {
+        "status": "Captured",
+        "path": relative,
+        "sha256": content_digest(capture_path),
+        "schema_version": document.get("schema_version"),
+    }
+    return bounded
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-data-dir", type=Path, required=True)
@@ -259,7 +282,7 @@ def main() -> int:
         arm_id="diagnostic",
         sample_rows=args.process_blocks,
         product_receipts=args.process_blocks,
-        summary_captures=1,
+        summary_captures=args.process_blocks,
     )
     try:
         for block in range(args.process_blocks):
@@ -271,13 +294,34 @@ def main() -> int:
                     "status": "error",
                     "error": f"{type(error).__name__}: {error}",
                 }
+            measurement = _detach_compile_capture(owned, measurement=measurement)
             report["samples"].append(measurement)
             print(
                 f"D6 block {block}: {measurement.get('client_elapsed_ms', '?')} ms, "
                 f"{measurement['status']}",
                 flush=True,
             )
-            owned.publish_json(report)
+            owned.publish_json(
+                build_benchmark_cell_payload(
+                    campaign_id=owned.run.campaign_id,
+                    run_id=owned.run.run_id,
+                    query_case=query_path.stem,
+                    arm_id="diagnostic",
+                    workload_name="d6_execution_profile",
+                    query_payload=report,
+                    compile_receipts=[{
+                        "schema_version": 1,
+                        "status": "Uncovered",
+                        "reason": "diagnostic Compile Evidence is not an execution receipt",
+                    } for _ in report["samples"]] or [{
+                        "schema_version": 1,
+                        "status": "Uncovered",
+                        "reason": "diagnostic Compile Evidence is not an execution receipt",
+                    }],
+                    source_id=owned.attempt.source_id,
+                    attempt_id=owned.attempt.attempt_id,
+                )
+            )
         failed = any(sample.get("status") != "ok" for sample in report["samples"])
         owned.publish_summary(
             "D6 Compile Evidence\n"

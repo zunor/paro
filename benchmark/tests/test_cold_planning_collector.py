@@ -44,7 +44,13 @@ class DiagnosticRowsTests(unittest.TestCase):
                 self.statement = statement
 
             def fetchall(self):
-                return [("{\"schema_version\":2,\"outcome\":\"Success\"}",)]
+                return [(
+                    "{\"schema_version\":2,\"outcome\":\"Success\","
+                    "\"artifact\":\"CompiledArtifactReady\","
+                    "\"cache\":\"ForcedCompile\","
+                    "\"admission\":\"NotExecuted\","
+                    "\"execution\":\"NotExecuted\"}",
+                )]
 
         class Connection:
             def __init__(self):

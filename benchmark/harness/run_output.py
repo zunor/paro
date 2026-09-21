@@ -288,6 +288,12 @@ class AttemptOutput:
     def failure_path(self) -> Path:
         return self.root / "failure.json"
 
+    @property
+    def status(self) -> str:
+        return str(
+            json.loads((self.root / "attempt.json").read_text(encoding="utf-8"))["status"]
+        )
+
     def control_writer(self) -> ControlWriter:
         return ControlWriter(self.run, self.root)
 
@@ -424,12 +430,27 @@ class CorpusOutput:
             "result.json", payload, overwrite=True
         )
 
+    def publish_capture_text(self, name: str, text: str) -> Path:
+        """Publish one immutable producer capture without duplicating it in result.json."""
+        return self.attempt.cell_writer().write_text(
+            Path("captures") / validate_output_id(name, label="capture name"),
+            text,
+            overwrite=False,
+        )
+
     def publish_summary(self, text: str) -> Path:
         return self.attempt.control_writer().write_text(
             "summary.md", text, overwrite=True
         )
 
     def finish(self, *, status: str, error: str | None = None) -> None:
+        if self.attempt.status != "Running":
+            current = self.run._manifest.get("status", "Incomplete")
+            if status != current:
+                raise RunOutputError(
+                    f"run is already terminal: {current}; cannot finish as {status}"
+                )
+            return
         if status == "Completed":
             self.attempt.seal(status=status, result_path=self.result_path, summary_path=self.summary_path)
         else:
@@ -443,7 +464,13 @@ class CorpusOutput:
                 summary_path=self.summary_path if self.summary_path.exists() else None,
                 failure_path=failure,
             )
-        self.run.finalize(status=status)
+        terminal_status = (
+            "Incomplete"
+            if self.run._manifest.get("registration", {}).get("status")
+            in {"CapacityExceeded", "PublicationUnknown"}
+            else status
+        )
+        self.run.finalize(status=terminal_status)
 
 
 @dataclass
@@ -495,6 +522,17 @@ class CampaignOutput:
         attempt = self.attempts[(query_case, arm_id)]
         return attempt.cell_writer().write_json("result.json", payload, overwrite=True)
 
+    def publish_capture_text(
+        self, *, query_case: str, arm_id: str, name: str, text: str
+    ) -> Path:
+        """Store one immutable EXPLAIN capture under its owning cell."""
+        attempt = self.attempts[(query_case, arm_id)]
+        return attempt.cell_writer().write_text(
+            Path("captures") / validate_output_id(name, label="capture name"),
+            text,
+            overwrite=False,
+        )
+
     def publish_campaign_json(self, payload: dict[str, Any]) -> Path:
         return self.control.write_json("campaign.json", payload, overwrite=True)
 
@@ -512,6 +550,8 @@ class CampaignOutput:
     ) -> None:
         errors = errors or {}
         for key, attempt in self.attempts.items():
+            if attempt.status != "Running":
+                continue
             error = errors.get(key)
             # A campaign terminal state describes the campaign as a whole;
             # it must not rewrite a successfully sealed cell when a later
@@ -541,7 +581,14 @@ class CampaignOutput:
                     else None,
                     failure_path=failure,
                 )
-        self.run.finalize(status=status)
+        terminal_status = (
+            "Incomplete"
+            if self.run._manifest.get("status") == "Incomplete"
+            or self.run._manifest.get("registration", {}).get("status")
+            in {"CapacityExceeded", "PublicationUnknown"}
+            else status
+        )
+        self.run.finalize(status=terminal_status)
 
 
 @dataclass

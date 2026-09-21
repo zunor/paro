@@ -42,6 +42,7 @@ try:
         tree_digest,
     )
     from benchmark.harness.run_output import CampaignOutput
+    from benchmark.harness.receipt_contract import build_benchmark_cell_payload
 except ModuleNotFoundError:  # pragma: no cover - script-only import path
     from benchmark_evidence import (
         ImmutableDataSeed,
@@ -54,6 +55,7 @@ except ModuleNotFoundError:  # pragma: no cover - script-only import path
         tree_digest,
     )
     from harness.run_output import CampaignOutput
+    from harness.receipt_contract import build_benchmark_cell_payload
 
 COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physical_search",
               "memo_exploration", "physical_extraction", "winner_verification"}
@@ -163,6 +165,36 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
     return result
 
 
+def _detach_compile_capture(
+    owned: CampaignOutput,
+    *,
+    query_case: str,
+    measurement: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist the raw typed document once and leave a bounded reference."""
+    raw = measurement.get("compile_document_raw")
+    document = measurement.get("compile_document")
+    if not isinstance(raw, str) or not isinstance(document, dict):
+        return measurement
+    capture_name = f"block-{measurement['block']:04d}.json"
+    capture_path = owned.publish_capture_text(
+        query_case=query_case,
+        arm_id="diagnostic",
+        name=capture_name,
+        text=raw,
+    )
+    relative = capture_path.relative_to(owned.run.root).as_posix()
+    bounded = dict(measurement)
+    bounded.pop("compile_document_raw", None)
+    bounded["compile_document"] = {
+        "status": "Captured",
+        "path": relative,
+        "sha256": content_digest(capture_path),
+        "schema_version": document.get("schema_version"),
+    }
+    return bounded
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-data-dir", type=Path, required=True)
@@ -247,7 +279,7 @@ def main() -> int:
                 "query_cases": 1,
                 "sample_rows": args.process_blocks,
                 "product_receipts": args.process_blocks,
-                "summary_captures": 1,
+                "summary_captures": args.process_blocks,
             }
             for path in args.query
         ],
@@ -265,18 +297,35 @@ def main() -> int:
                 measurement = sample(args, binary, query, path.stem, block, seed)
             except Exception as error:
                 measurement = {"block": block, "status": "error", "error": f"{type(error).__name__}: {error}"}
+            measurement = _detach_compile_capture(
+                owned, query_case=path.stem, measurement=measurement
+            )
             observation["samples"].append(measurement)
             print(f"{path.stem} block {block}: {measurement.get('explain_wall_ms', '?')} ms, "
                   f"{measurement['status']}", flush=True)
             owned.publish_cell_json(
                 query_case=path.stem,
                 arm_id="diagnostic",
-                payload={
-                    "schema_version": report["schema_version"],
-                    "configuration": report["configuration"],
-                    "evidence": report["evidence"],
-                    "query": observation,
-                },
+                payload=build_benchmark_cell_payload(
+                    campaign_id=owned.run.campaign_id,
+                    run_id=owned.run.run_id,
+                    query_case=path.stem,
+                    arm_id="diagnostic",
+                    workload_name="cold_planning",
+                    query_payload={
+                        "schema_version": report["schema_version"],
+                        "configuration": report["configuration"],
+                        "evidence": report["evidence"],
+                        "query": observation,
+                    },
+                    compile_receipts=[{
+                        "schema_version": 1,
+                        "status": "Uncovered",
+                        "reason": "diagnostic Compile Evidence is not an execution receipt",
+                    }],
+                    source_id=owned.attempts[(path.stem, "diagnostic")].source_id,
+                    attempt_id=owned.attempts[(path.stem, "diagnostic")].attempt_id,
+                ),
             )
             owned.publish_campaign_json(report)
         if any(sample_item.get("status") != "ok" for sample_item in observation["samples"]):

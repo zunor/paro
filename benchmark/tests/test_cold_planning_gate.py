@@ -1,7 +1,11 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import json
 import math
+from pathlib import Path
+import tempfile
 import unittest
 
 from harness.cold_planning_gate import COUNTERS, evaluate
@@ -81,6 +85,28 @@ class ColdPlanningGateTests(unittest.TestCase):
 
     def test_same_report_passes(self):
         self.assertTrue(evaluate(report(), report())["passed"])
+
+    def test_captured_compile_document_is_resolved_and_hash_checked(self):
+        current = report()
+        sample = current["queries"][0]["samples"][0]
+        document = sample.pop("compile_document")
+        raw = (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_text("{}\n", encoding="utf-8")
+            capture = root / "captures" / "block-0000.json"
+            capture.parent.mkdir()
+            capture.write_bytes(raw)
+            sample["compile_document"] = {
+                "status": "Captured",
+                "path": "captures/block-0000.json",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "schema_version": document["schema_version"],
+            }
+            self.assertTrue(evaluate(current, report_root=root)["passed"])
+            capture.write_bytes(raw + b"changed")
+            with self.assertRaises(ValueError):
+                evaluate(current, report_root=root)
 
     def test_missing_failed_duplicate_and_nonfinite_samples_fail_closed(self):
         for mutation in (

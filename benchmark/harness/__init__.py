@@ -21,6 +21,7 @@ from .reporter import BenchmarkReporter
 from .receipt_contract import (
     ReceiptContractError,
     associate_typed_receipts,
+    build_benchmark_cell_payload,
     validate_benchmark_payload,
     validate_compile_document,
     validate_receipt_association,
@@ -44,6 +45,7 @@ __all__ = [
     "PolicyError",
     "ReceiptContractError",
     "associate_typed_receipts",
+    "build_benchmark_cell_payload",
     "RunOutput",
     "RunOutputError",
     "QueryDef",
