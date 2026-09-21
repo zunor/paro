@@ -669,11 +669,11 @@ impl Connection {
             }
             PgWireFrontendMessage::Sync(_) => {
                 self.finish_extended_query_pipeline().await?;
-                if self.send_bounded_ready_for_query().await?
-                    == TerminalSendOutcome::ConnectionClosed
-                {
-                    return Ok(DispatchResult::Terminate);
-                }
+                // A successful Sync is ordinary protocol backpressure.  The
+                // bounded drain policy is reserved for cancellation/error
+                // recovery; applying it here would close a healthy client
+                // merely because it paused reading for the recovery window.
+                self.send_ready_for_query().await?;
                 Ok(DispatchResult::Continue {
                     send_ready_for_query: false,
                 })
@@ -896,9 +896,9 @@ impl Connection {
             },
             None => TransactionStatus::Idle,
         };
-        self.send_bounded_backend_message(PgWireBackendMessage::ReadyForQuery(
-            ReadyForQuery::new(status),
-        ))
+        self.send_bounded_backend_message(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+            status,
+        )))
         .await
     }
 
