@@ -60,9 +60,10 @@ unstaged unless an independently reviewable task hunk was required to compile th
   `EXPLAIN (COMPILE, ANALYZE, FORMAT JSON) SELECT 1` were accepted by the shared v3 validator;
   ANALYZE carried an actual execution receipt, and ordinary `SELECT 1` returned successfully.
 
-The physical identity implementation still contains a Debug-derived payload fallback and the
-multi-shape real Detail producer campaign was not run. Those are explicit unadmitted boundaries;
-this snapshot therefore does not claim TraceMatrixReady, C2, F2, parity, or a performance target.
+The physical identity implementation still contains a Debug-derived payload fallback. A targeted
+six-shape real Detail producer smoke passed through PgWire and the shared validator, but the full
+producer-to-gate campaign was not run. These remain explicit unadmitted boundaries; this snapshot
+therefore does not claim TraceMatrixReady, C2, F2, parity, or a performance target.
 
 ## Post-topic-commit state
 

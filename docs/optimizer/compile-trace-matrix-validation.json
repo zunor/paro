@@ -53,7 +53,20 @@
     "real_explain_compile_analyze": "pass",
     "real_pgwire_select": "pass",
     "clean_producer_to_gate_campaign": "not_run",
-    "real_detail_shape_campaign": "not_run"
+    "real_detail_shape_campaign": {
+      "status": "pass_targeted_smoke",
+      "server_data_dir": "/tmp/paro-compile-evidence-v3-detail-0922",
+      "cases": {
+        "select1": {"detail_events": 34, "sha256": "6b9b9aff61e3de73ad231c128e337dc5687c692fc8b1975021e7509e90567926"},
+        "join": {"detail_events": 222, "sha256": "14fb219f40f6fc4da2715dd4ced496b54ef2a02c1fa1d188be91783a960e7d4a"},
+        "cte_union": {"detail_events": 230, "sha256": "6f07d348038fd2e00c4ed3667e9c884380f0797badeaed95334c6cee6e1feb65"},
+        "aggregate": {"detail_events": 101, "sha256": "2a8040666e9ff9fff8adb8cfbb7fece9ef0aadbc43beb8c87c7c1f3297f39b6d"},
+        "runtime_filter": {"detail_events": 282, "sha256": "64cbdcc72ded2a4ceba2aec1cfd325babe1261ea5ad57b73d2cb3b8ea4870f05"},
+        "multi_child": {"detail_events": 434, "sha256": "97729ccf84ad134d8d21bc1f009f9e135794f9d23f0bc481216e31e38353821f"}
+      },
+      "consumer": "shared Python v3 validator",
+      "full_campaign": "not_run"
+    }
   },
   "not_certified": [
     "full Trace Matrix coverage",

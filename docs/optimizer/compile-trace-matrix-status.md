@@ -122,6 +122,15 @@ producer coverage, and the typed physical-identity boundary remain required
 before this document can claim `TraceMatrixReady`, C2, F2, or a performance
 result.
 
+The 2026-09-22 targeted real producer smoke additionally ran
+`EXPLAIN (COMPILE, DETAIL, FORMAT JSON)` through PgWire and the shared reader/
+validator for `SELECT 1`, a two-table join, CTE/UNION, aggregate, runtime-filter
+join, and a multi-child join. The resulting streams contained 34, 222, 230,
+101, 282, and 434 events respectively and were accepted without hand-written
+Detail fixtures. Their SHA-256 values and the bounded evidence directory are
+recorded in `compile-trace-matrix-validation.json`; this remains a targeted
+smoke, not a complete campaign.
+
 The historical verification run completed the workspace tests, strict Clippy,
 benchmark unit tests, and the high-file-descriptor SQL regress harness without
 changing expected files. A new full validation is not claimed by this working
@@ -138,7 +147,7 @@ The current Rust identity implementation still streams `Debug` formatting for
 several physical operator/specification and property payloads. The stream is
 not EXPLAIN text, but it is still presentation formatting rather than the
 required typed binary contract. Therefore the identity changes are not
-accepted as a cross-run `PlanStructureId`, and the real multi-shape
-producer-to-reader/validator campaign has not been certified. This is the
-first blocking boundary for Trace Matrix closure; no performance or C2/F2
-claim is inferred from the targeted passes.
+accepted as a cross-run `PlanStructureId`, and the full producer-to-reader/
+gate campaign has not been certified. This is the first blocking boundary for
+Trace Matrix closure; no performance or C2/F2 claim is inferred from the
+targeted passes.
