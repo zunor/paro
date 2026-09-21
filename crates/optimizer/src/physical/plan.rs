@@ -18,8 +18,10 @@ use super::ids::PhysicalPlanNodeId;
 use super::node::PhysicalPlanNode;
 use super::portfolio::ExecutionResourceContract;
 use super::properties::{PhysicalGrantContract, PlanPropertyMap};
+use super::row_type::{ColumnIdentity, RowType};
 use super::specs::{AggregateSpec, NestedLoopJoinSpec, PhysicalNodeKind, SearchSourceSpec};
 use paro_catalog::entry::{StandardEntry, TableCatalogEntry};
+use paro_common::types::LogicalType;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, Expression, OperatorType, WindowFrameBound, WindowFrameType,
 };
@@ -250,12 +252,14 @@ impl PhysicalPlan {
     /// explicit so a consumer never treats a later encoding as compatible.
     pub fn structural_identity_fingerprint(&self) -> Fingerprint {
         let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.physical-plan-structure.v2.canonical");
+        builder.write_bytes(b"paro.physical-plan-structure.v3.typed-canonical");
 
         // The traversal is iterative on purpose.  Physical plans can contain
         // long unary spines and a fingerprint must not depend on recursion
         // depth or arena allocation order.
-        let order = self.canonical_postorder();
+        let order = self
+            .canonical_postorder()
+            .expect("physical plan identity cannot canonicalize an invalid graph");
         let canonical_ids = order
             .iter()
             .enumerate()
@@ -269,12 +273,7 @@ impl PhysicalPlan {
             builder.write_u64(canonical as u64);
             builder.write_bytes(node.kind.name().as_bytes());
             write_debug_value(&mut builder, &node.kind);
-            write_debug_value(&mut builder, &node.output);
-            write_debug_value(&mut builder, &node.cardinality);
-            // The logical occurrence is a semantic coordinate.  The display
-            // label is deliberately excluded: it is presentation, not plan
-            // identity.
-            builder.write_u64(node.label.logical_plan_node.0 as u64);
+            write_row_type(&mut builder, &node.output);
             let children = self.child_ids(&node.children);
             builder.write_u64(children.len() as u64);
             for child in children {
@@ -285,13 +284,8 @@ impl PhysicalPlan {
                 write_debug_value(&mut builder, &properties.required_from_parent);
                 write_debug_value(&mut builder, &properties.provided);
                 write_debug_value(&mut builder, &properties.characteristics);
-                write_debug_value(&mut builder, &properties.output_estimate);
-                write_debug_value(&mut builder, &properties.cumulative_cost);
-                write_debug_value(&mut builder, &properties.grant_contract);
                 write_debug_value(&mut builder, &properties.region_owner);
                 write_debug_value(&mut builder, &properties.owned_artifacts);
-                write_debug_value(&mut builder, &properties.origin);
-                write_debug_value(&mut builder, &properties.winner_goal);
                 let mut dependencies = properties
                     .auxiliary_dependencies
                     .iter()
@@ -344,27 +338,48 @@ impl PhysicalPlan {
             }
         }
         write_debug_value(&mut builder, &self.dependencies);
-        write_debug_value(&mut builder, &self.execution_resources);
         builder.finish()
     }
 
-    fn canonical_postorder(&self) -> Vec<PhysicalPlanNodeId> {
+    fn canonical_postorder(&self) -> Option<Vec<PhysicalPlanNodeId>> {
+        if self.root == PhysicalPlanNodeId::INVALID || self.nodes.get(self.root).is_none() {
+            return None;
+        }
+        if self.edges.iter().any(|edge| {
+            edge.producer == PhysicalPlanNodeId::INVALID
+                || edge.consumer == PhysicalPlanNodeId::INVALID
+                || self.nodes.get(edge.producer).is_none()
+                || self.nodes.get(edge.consumer).is_none()
+        }) {
+            return None;
+        }
         let mut order = Vec::new();
         let mut visited = BTreeSet::new();
+        let mut visiting = BTreeSet::new();
         let mut stack = vec![(self.root, false)];
         while let Some((id, expanded)) = stack.pop() {
             if id == PhysicalPlanNodeId::INVALID || self.nodes.get(id).is_none() {
-                continue;
+                return None;
             }
             if expanded {
+                visiting.remove(&id);
                 order.push(id);
                 continue;
+            }
+            if visiting.contains(&id) {
+                return None;
             }
             if !visited.insert(id) {
                 continue;
             }
+            visiting.insert(id);
             stack.push((id, true));
             let node = self.node(id);
+            if self.child_ids(&node.children).iter().any(|child| {
+                *child == PhysicalPlanNodeId::INVALID || self.nodes.get(*child).is_none()
+            }) {
+                return None;
+            }
             for child in self.child_ids(&node.children).iter().rev() {
                 stack.push((*child, false));
             }
@@ -372,14 +387,32 @@ impl PhysicalPlan {
                 .edges
                 .iter()
                 .filter(|edge| edge.consumer == id)
-                .map(|edge| (edge_kind_key(edge.kind), edge.producer))
+                .map(|edge| {
+                    (
+                        edge_kind_key(edge.kind),
+                        self.local_identity_key(edge.producer),
+                        edge.producer,
+                    )
+                })
                 .collect::<Vec<_>>();
-            producers.sort_unstable_by_key(|(kind, producer)| (*kind, *producer));
-            for (_, producer) in producers.into_iter().rev() {
+            producers.sort_unstable_by_key(|(kind, local, producer)| (*kind, *local, *producer));
+            for (_, _, producer) in producers.into_iter().rev() {
                 stack.push((producer, false));
             }
         }
-        order
+        if !visiting.is_empty() {
+            return None;
+        }
+        Some(order)
+    }
+
+    fn local_identity_key(&self, id: PhysicalPlanNodeId) -> Fingerprint {
+        let node = self.node(id);
+        let mut builder = StableFingerprintBuilder::default();
+        builder.write_bytes(node.kind.name().as_bytes());
+        write_debug_value(&mut builder, &node.kind);
+        write_row_type(&mut builder, &node.output);
+        builder.finish()
     }
 
     pub fn format_explain_text_with_spec(&self, spec: &ExplainSpec) -> String {
@@ -722,6 +755,112 @@ impl PhysicalPlan {
     }
 }
 
+fn write_row_type(builder: &mut StableFingerprintBuilder, row: &RowType) {
+    builder.write_u64(row.names.len() as u64);
+    for name in &row.names {
+        builder.write_bytes(name.as_bytes());
+    }
+    builder.write_u64(row.types.len() as u64);
+    for logical_type in &row.types {
+        write_logical_type(builder, logical_type);
+    }
+    builder.write_u64(row.identities.len() as u64);
+    for identity in &row.identities {
+        write_column_identity(builder, identity);
+    }
+}
+
+fn write_column_identity(builder: &mut StableFingerprintBuilder, identity: &ColumnIdentity) {
+    match identity {
+        ColumnIdentity::Visible { name, qualifier } => {
+            builder.write_u64(0);
+            builder.write_bytes(name.as_bytes());
+            match qualifier {
+                Some(path) => {
+                    builder.write_u64(1);
+                    builder.write_u64(path.len() as u64);
+                    for component in path.iter() {
+                        builder.write_bytes(component.as_bytes());
+                    }
+                }
+                None => builder.write_u64(0),
+            }
+        }
+        ColumnIdentity::Internal => builder.write_u64(1),
+        ColumnIdentity::InternalNamed(name) => {
+            builder.write_u64(2);
+            builder.write_bytes(name.as_bytes());
+        }
+        ColumnIdentity::Locator { object_id } => {
+            builder.write_u64(3);
+            builder.write_u64(*object_id);
+        }
+    }
+}
+
+fn write_logical_type(builder: &mut StableFingerprintBuilder, logical_type: &LogicalType) {
+    match logical_type {
+        LogicalType::Boolean => builder.write_u64(0),
+        LogicalType::TinyInt => builder.write_u64(1),
+        LogicalType::SmallInt => builder.write_u64(2),
+        LogicalType::Integer => builder.write_u64(3),
+        LogicalType::BigInt => builder.write_u64(4),
+        LogicalType::HugeInt => builder.write_u64(5),
+        LogicalType::UTinyInt => builder.write_u64(6),
+        LogicalType::USmallInt => builder.write_u64(7),
+        LogicalType::UInteger => builder.write_u64(8),
+        LogicalType::UBigInt => builder.write_u64(9),
+        LogicalType::UHugeInt => builder.write_u64(10),
+        LogicalType::Float => builder.write_u64(11),
+        LogicalType::Double => builder.write_u64(12),
+        LogicalType::Decimal { precision, scale } => {
+            builder.write_u64(13);
+            builder.write_u64(u64::from(*precision));
+            builder.write_u64(u64::from(*scale));
+        }
+        LogicalType::Varchar => builder.write_u64(14),
+        LogicalType::VarcharCollation(collation) => {
+            builder.write_u64(15);
+            builder.write_bytes(collation.as_bytes());
+        }
+        LogicalType::TsVector => builder.write_u64(16),
+        LogicalType::TsQuery => builder.write_u64(17),
+        LogicalType::Date => builder.write_u64(18),
+        LogicalType::Timestamp => builder.write_u64(19),
+        LogicalType::TimestampTz => builder.write_u64(20),
+        LogicalType::Time => builder.write_u64(21),
+        LogicalType::Interval => builder.write_u64(22),
+        LogicalType::Blob => builder.write_u64(23),
+        LogicalType::Uuid => builder.write_u64(24),
+        LogicalType::Json => builder.write_u64(25),
+        LogicalType::Jsonb => builder.write_u64(26),
+        LogicalType::Null => builder.write_u64(27),
+        LogicalType::IntegerLiteral(value) => {
+            builder.write_u64(28);
+            builder.write_i64(*value);
+        }
+        LogicalType::StringLiteral => builder.write_u64(29),
+        LogicalType::Unknown => builder.write_u64(30),
+        LogicalType::Array(element, length) => {
+            builder.write_u64(31);
+            builder.write_u64(*length as u64);
+            write_logical_type(builder, element);
+        }
+        LogicalType::List(element) => {
+            builder.write_u64(32);
+            write_logical_type(builder, element);
+        }
+        LogicalType::Struct(fields) => {
+            builder.write_u64(33);
+            builder.write_u64(fields.len() as u64);
+            for (name, field_type) in fields {
+                builder.write_bytes(name.as_bytes());
+                write_logical_type(builder, field_type);
+            }
+        }
+    }
+}
+
 struct CanonicalFmtWriter<'a> {
     builder: &'a mut StableFingerprintBuilder,
 }
@@ -735,9 +874,10 @@ impl fmt::Write for CanonicalFmtWriter<'_> {
 
 fn write_debug_value<T: fmt::Debug + ?Sized>(builder: &mut StableFingerprintBuilder, value: &T) {
     let mut writer = CanonicalFmtWriter { builder };
-    // Formatting directly into the fingerprint stream avoids a temporary
-    // plan-sized String.  This is only for typed payloads; no EXPLAIN text or
-    // presentation renderer participates in the identity.
+    // Transitional fallback only.  It avoids a temporary plan-sized String,
+    // but Debug formatting is not a certified typed identity encoding.  The
+    // physical identity gate must remain blocked until every payload reaching
+    // this helper has an explicit versioned encoder.
     let _ = fmt::write(&mut writer, format_args!("{value:?}"));
 }
 
@@ -2589,7 +2729,9 @@ fn format_search_predicate(
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    use crate::physical::cost::MemoryCompletion;
     use crate::physical::specs::DummyScanSpec;
+    use crate::physical::{InlinePlanChildren, ResourceGrantClassId};
     use crate::physical::{OperatorLabel, RowType};
     use paro_common::types::LogicalType;
     use paro_planner::plan::PlanNodeId;
@@ -2640,5 +2782,55 @@ mod identity_tests {
             left.structural_identity_fingerprint(),
             right.structural_identity_fingerprint()
         );
+    }
+
+    #[test]
+    fn structural_identity_excludes_cost_and_resource_operating_point() {
+        let mut left = dummy_plan(false, "same", "value");
+        let mut right = dummy_plan(false, "same", "value");
+        left.nodes
+            .get_mut(left.root)
+            .expect("dummy root")
+            .cardinality = Some(CardinalityEstimate::exact(1));
+        right
+            .nodes
+            .get_mut(right.root)
+            .expect("dummy root")
+            .cardinality = Some(CardinalityEstimate::exact(99));
+        right.execution_resources = Some(ExecutionResourceContract {
+            class: ResourceGrantClassId(2),
+            minimum_memory_bytes: 1,
+            working_set_memory_bytes: 2,
+            memory_ceiling_bytes: 3,
+            memory_completion: MemoryCompletion::Guaranteed,
+            max_parallel_tasks: 4,
+            external_worker_slots: 0,
+        });
+        assert_eq!(
+            left.structural_identity_fingerprint(),
+            right.structural_identity_fingerprint()
+        );
+    }
+
+    #[test]
+    fn structural_identity_fails_closed_for_cycles_and_invalid_edges() {
+        let mut cyclic = dummy_plan(false, "same", "value");
+        cyclic.nodes.get_mut(cyclic.root).unwrap().children =
+            PlanChildren::Inline(InlinePlanChildren::new(&[cyclic.root]));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cyclic.structural_identity_fingerprint();
+        }))
+        .is_err());
+
+        let mut invalid_edge = dummy_plan(false, "same", "value");
+        invalid_edge.edges.push(
+            invalid_edge.root,
+            PhysicalPlanNodeId::INVALID,
+            PhysicalEdgeKind::Data,
+        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            invalid_edge.structural_identity_fingerprint();
+        }))
+        .is_err());
     }
 }

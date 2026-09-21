@@ -166,6 +166,18 @@ actual execution of that sealed artifact.
 The optimizer is one producer in a compiler-wide record, not the owner of
 session or execution instrumentation.
 
+The current Compile Evidence wire contract is schema v3. Physical identity is
+intended to be split from admission and execution: `PlanStructureId` will be
+derived from typed executable topology and payload, `CompiledArtifactId`
+includes the immutable dependency contract, and `ExecutionReceiptId` belongs
+to one actual admission. This crate does not yet certify that boundary because
+the working physical encoder still has a Debug-derived payload fallback; that
+fallback must be replaced with explicit typed binary encoders before the ID is
+used as a cross-run proof. The benchmark consumer must not reconstruct compile
+timing from `paro_optimizers()`, display text, arena ids or occurrence numbers.
+Current readers reject older evidence schemas, and missing identity joins remain
+`Uncovered` rather than being guessed.
+
 Summary is the default; bounded Detail is an opt-in T3 surface for supported
 COMPILE targets. It retains fixed opaque references from the real Memo and
 TaskRegistry lifecycle and reports overflow explicitly; it is not the complete
