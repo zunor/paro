@@ -9,12 +9,51 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from harness.receipt_contract import ReceiptContractError, validate_benchmark_payload  # noqa: E402
-from harness.run_output import RunOutput, RunOutputError  # noqa: E402
+from harness.run_output import CorpusOutput, RunOutput, RunOutputError  # noqa: E402
 from harness.executor import BenchmarkExecutor  # noqa: E402
 from harness.loader import QueryDef  # noqa: E402
 
 
 class RunOutputTests(unittest.TestCase):
+    def test_standalone_corpus_output_is_registered_and_sealed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CorpusOutput.create(
+                Path(tmp) / "cold.json",
+                source_id="cold-planning",
+                query_case="q11",
+                arm_id="diagnostic",
+                sample_rows=2,
+                product_receipts=2,
+                summary_captures=1,
+            )
+            output.publish_json({"version": 1, "samples": [{"status": "ok"}]})
+            output.publish_summary("# diagnostic\n")
+            output.finish(status="Completed")
+            manifest = json.loads((output.run.root / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "Completed")
+            self.assertTrue(output.result_path.exists())
+            self.assertTrue(output.summary_path.exists())
+            self.assertTrue(manifest["registration"]["registration_sealed"])
+
+    def test_standalone_corpus_failure_preserves_payload_and_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CorpusOutput.create(
+                Path(tmp) / "d6.json",
+                source_id="d6",
+                query_case="q4",
+                arm_id="diagnostic",
+                sample_rows=1,
+                product_receipts=1,
+            )
+            output.publish_json({"version": 1, "samples": [{"status": "ok"}]})
+            output.finish(status="Failed", error="watchdog timeout")
+            manifest = json.loads((output.run.root / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "Failed")
+            self.assertTrue(output.result_path.exists())
+            self.assertTrue(output.attempt.failure_path.exists())
+            with self.assertRaises(RunOutputError):
+                output.finish(status="Completed")
+
     def test_failed_timed_sample_keeps_elapsed_and_previous_receipt(self) -> None:
         class Validator:
             def check_plan(self, query, conn):

@@ -362,6 +362,91 @@ class AttemptOutput:
 
 
 @dataclass
+class CorpusOutput:
+    """Small adapter for standalone corpus collectors.
+
+    Corpus programs are not runners: they already own their server loop and
+    measurement semantics.  They still use the same RunOutput transaction and
+    receipt envelope as gate sources.  ``report_path`` is an allocation hint;
+    the durable result lives below the returned run/attempt and an existing
+    run is never overwritten.
+    """
+
+    run: "RunOutput"
+    attempt: AttemptOutput
+
+    @classmethod
+    def create(
+        cls,
+        report_path: Path,
+        *,
+        source_id: str,
+        query_case: str,
+        arm_id: str,
+        query_cases: int = 1,
+        sample_rows: int = 1,
+        product_receipts: int = 1,
+        summary_captures: int = 0,
+    ) -> "CorpusOutput":
+        report_path = report_path.resolve()
+        run_id = validate_output_id(f"{report_path.stem}-run", label="run id")
+        run = RunOutput.create(report_path.parent, run_id=run_id)
+        run.registration.cell(
+            query_case=query_case,
+            arm_id=arm_id,
+            query_cases=query_cases,
+            sample_rows=sample_rows,
+            product_receipts=product_receipts,
+            summary_captures=summary_captures,
+        )
+        # A standalone collector has a finite manifest before it starts a
+        # server.  No later code can silently add a cell or enlarge its lease.
+        run.registration.seal()
+        attempt = run.begin_attempt(source_id, query_case=query_case, arm_id=arm_id)
+        return cls(run, attempt)
+
+    @property
+    def result_path(self) -> Path:
+        return self.attempt.result_path
+
+    @property
+    def summary_path(self) -> Path:
+        return self.attempt.summary_path
+
+    def publish_json(self, payload: dict[str, Any]) -> Path:
+        """Publish a collector-owned payload transactionally.
+
+        The collector may replace its in-progress snapshot within the same
+        AttemptId.  A retry or a second process gets a new run/attempt and can
+        never overwrite this path.
+        """
+        return self.attempt.cell_writer().write_json(
+            "result.json", payload, overwrite=True
+        )
+
+    def publish_summary(self, text: str) -> Path:
+        return self.attempt.control_writer().write_text(
+            "summary.md", text, overwrite=True
+        )
+
+    def finish(self, *, status: str, error: str | None = None) -> None:
+        if status == "Completed":
+            self.attempt.seal(status=status, result_path=self.result_path, summary_path=self.summary_path)
+        else:
+            failure = None
+            if error is not None:
+                self.attempt.write_failure(status=status, error=error)
+                failure = self.attempt.failure_path
+            self.attempt.seal(
+                status=status,
+                result_path=self.result_path if self.result_path.exists() else None,
+                summary_path=self.summary_path if self.summary_path.exists() else None,
+                failure_path=failure,
+            )
+        self.run.finalize(status=status)
+
+
+@dataclass
 class RunOutput:
     """The sole owner of a command's report root and attempt registry."""
 

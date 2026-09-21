@@ -556,8 +556,7 @@ def execute_workloads(
         if not workloads:
             raise RunnerError("no workloads selected")
         query_count = sum(len(workload.queries) for workload in workloads)
-        active_run.register_cell(
-            cell_id=f"{args.query_case or args.suite or args.workload or args.source_id or 'adhoc'}--{args.arm_id or 'default'}",
+        active_run.registration.cell(
             query_cases=query_count,
             sample_rows=query_count * max(config.iterations + config.warmup, 1),
             product_receipts=query_count * 4,

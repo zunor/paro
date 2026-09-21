@@ -35,8 +35,7 @@ class DivanBenchSource:
             raise ValueError(f"source '{source.name}' is missing bench")
 
         if context.run_output is not None and context.attempt is not None:
-            context.run_output.register_cell(
-                cell_id=f"{context.attempt.query_case}--{context.attempt.arm_id}",
+            context.run_output.registration.cell(
                 query_cases=1,
                 sample_rows=max(context.minimum_sample_count, 1),
                 product_receipts=4,

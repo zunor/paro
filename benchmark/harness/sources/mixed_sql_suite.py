@@ -49,8 +49,7 @@ class MixedSqlSuiteSource:
         )
         config = runner.resolve_config(args)
         if context.run_output is not None and context.attempt is not None:
-            context.run_output.register_cell(
-                cell_id=f"{context.attempt.query_case}--{context.attempt.arm_id}",
+            context.run_output.registration.cell(
                 query_cases=5,
                 sample_rows=5 * max(config.iterations, 1),
                 product_receipts=5 * 4,
