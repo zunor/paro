@@ -40,8 +40,19 @@ class MixedSqlSuiteSource:
             raise ValueError(f"source '{source.name}' is missing suite")
 
         runner = context.runner_module
-        args = runner.BenchmarkInvocation(suite=source.suite, pid=context.pid)
+        args = runner.BenchmarkInvocation(
+            suite=source.suite,
+            pid=context.pid,
+            run_output=context.run_output,
+        )
         config = runner.resolve_config(args)
+        if context.run_output is not None and context.attempt is not None:
+            context.run_output.register_cell(
+                cell_id=f"{context.attempt.source_id}--{context.attempt.attempt_id}",
+                query_cases=5,
+                sample_rows=5 * max(config.iterations, 1),
+                product_receipts=5 * 4,
+            )
         workloads = runner.load_selected_workloads(config, args, {})
         if len(workloads) != 1:
             raise ValueError(
@@ -132,10 +143,17 @@ class MixedSqlSuiteSource:
             setup_error=setup_error,
             teardown_error=teardown_error,
         )
-        report_dir = context.root_dir / "report" / _safe_path_name(source.name)
+        report_dir = context.output_dir
         from ..reporter import BenchmarkReporter
 
         reporter = BenchmarkReporter(context.root_dir)
+        if context.run_output is not None:
+            reporter.attach_run_ownership(
+                payload,
+                context.run_output,
+                source_id=context.attempt.source_id if context.attempt else None,
+                attempt_id=context.attempt.attempt_id if context.attempt else None,
+            )
         result_path, summary_path = reporter.write_reports(payload, report_dir / "result.json")
         failed = bool(setup_error or teardown_error or any(s.error for s in scenarios))
         failed = failed or any(s.validation.get("result") != "PASS" for s in scenarios)
@@ -145,6 +163,10 @@ class MixedSqlSuiteSource:
             result_path=result_path,
             summary_path=summary_path,
             failed=failed,
+            run_id=context.run_output.run_id if context.run_output else None,
+            source_id=context.attempt.source_id if context.attempt else None,
+            attempt_id=context.attempt.attempt_id if context.attempt else None,
+            attempt_status="Completed" if not failed else "Failed",
         )
 
 
@@ -386,6 +408,11 @@ def _payload(
             "rss": scenario.rss,
             "validation": scenario.validation,
             "mixed": scenario.mixed,
+            "compile_receipt": {
+                "schema_version": 1,
+                "status": "Uncovered",
+                "reason": "mixed scenario combines concurrent statements without one receipt identity",
+            },
             "error": scenario.error,
         }
         workload["queries"].append(query)

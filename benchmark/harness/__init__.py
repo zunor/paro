@@ -18,11 +18,14 @@ from .performance_gate import (
     evaluate_gate,
 )
 from .reporter import BenchmarkReporter
+from .receipt_contract import ReceiptContractError, validate_benchmark_payload, validate_receipt_association
+from .run_output import AttemptOutput, RunOutput, RunOutputError
 from .validator import BenchmarkValidator, STRONG_VALIDATE_MODES
 
 __all__ = [
     "BenchmarkExecutor",
     "BenchmarkReporter",
+    "AttemptOutput",
     "BenchmarkValidator",
     "GateEntry",
     "GateEntryKind",
@@ -31,6 +34,9 @@ __all__ = [
     "GatePolicy",
     "GateStatus",
     "PolicyError",
+    "ReceiptContractError",
+    "RunOutput",
+    "RunOutputError",
     "QueryDef",
     "QueryExecutionResult",
     "SourcePolicy",
@@ -38,6 +44,8 @@ __all__ = [
     "WorkloadDef",
     "WorkloadExecutionResult",
     "evaluate_gate",
+    "validate_benchmark_payload",
+    "validate_receipt_association",
     "load_policy",
     "load_named_workload",
     "load_workloads",

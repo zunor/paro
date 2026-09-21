@@ -197,6 +197,7 @@ class ArchiveTests(unittest.TestCase):
             report_path = BenchmarkReporter(root).write_gate_report(
                 gate=policy.name,
                 outcomes=[GateOutcome(gate=policy.name, enforcement=health.effective_enforcement, entries=())],
+                output_path=root / "report" / "runs" / "archive-test" / "gate.json",
                 archive_health=health,
             )
             report = json.loads(report_path.read_text(encoding="utf-8"))

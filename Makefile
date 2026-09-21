@@ -247,10 +247,16 @@ bench: ## Run benchmark (WORKLOAD= FILTER= SUITE= PARAMS= PID=)
 		$(if $(WORKLOAD),WORKLOAD=$(WORKLOAD)) \
 		$(if $(FILTER),FILTER=$(FILTER)) \
 		$(if $(PARAMS),PARAMS="$(PARAMS)") \
-		$(if $(PID),PID=$(PID))
+		$(if $(PID),PID=$(PID)) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID)) \
+		$(if $(COLLECT_RECEIPTS),COLLECT_RECEIPTS=$(COLLECT_RECEIPTS))
 
 bench-ci: ## Run benchmark CI suite (default PARO_HOST/PARO_PORT = 127.0.0.1:6432)
-	@PARO_HOST=$(PARO_HOST) PARO_PORT=$(PARO_PORT) $(MAKE) -C benchmark ci
+	@PARO_HOST=$(PARO_HOST) PARO_PORT=$(PARO_PORT) $(MAKE) -C benchmark ci \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID)) \
+		$(if $(COLLECT_RECEIPTS),COLLECT_RECEIPTS=$(COLLECT_RECEIPTS))
 
 bench-check: ## Run benchmark performance gate (GATE= INCLUDE_SOURCE= BASELINE= POLICY= PID= ARCHIVE=)
 	@$(MAKE) -C benchmark check \
@@ -261,7 +267,9 @@ bench-check: ## Run benchmark performance gate (GATE= INCLUDE_SOURCE= BASELINE= 
 		$(if $(PID),PID=$(PID)) \
 		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
 		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE))) \
-		$(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
+		$(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES)) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
 
 bench-bless: ## Update benchmark gate baseline (GATE= BASELINE= POLICY= PID= BLESS_RUNS= POLICY_EVOLUTION=1)
 	@$(MAKE) -C benchmark bless \
@@ -271,7 +279,9 @@ bench-bless: ## Update benchmark gate baseline (GATE= BASELINE= POLICY= PID= BLE
 		$(if $(INCLUDE_SOURCE),INCLUDE_SOURCE=$(INCLUDE_SOURCE)) \
 		$(if $(PID),PID=$(PID)) \
 		$(if $(BLESS_RUNS),BLESS_RUNS=$(BLESS_RUNS)) \
-		$(if $(POLICY_EVOLUTION),POLICY_EVOLUTION=$(POLICY_EVOLUTION))
+		$(if $(POLICY_EVOLUTION),POLICY_EVOLUTION=$(POLICY_EVOLUTION)) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
 
 bench-calibrate: ## Append benchmark gate observations to archive (GATE= ARCHIVE= RUN_ID=)
 	@$(MAKE) -C benchmark calibrate \
@@ -282,7 +292,8 @@ bench-calibrate: ## Append benchmark gate observations to archive (GATE= ARCHIVE
 		$(if $(PID),PID=$(PID)) \
 		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
 		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE))) \
-		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID)) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT)))
 
 bench-bisect: ## Compare current checkout against archived gate result (GATE= AGAINST= ARCHIVE= PID=)
 	@$(MAKE) -C benchmark bisect \
@@ -292,7 +303,9 @@ bench-bisect: ## Compare current checkout against archived gate result (GATE= AG
 		$(if $(INCLUDE_SOURCE),INCLUDE_SOURCE=$(INCLUDE_SOURCE)) \
 		$(if $(PID),PID=$(PID)) \
 		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
-		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE)))
+		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE))) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
 
 bench-archive-manifest: ## Rebuild benchmark archive manifest (ARCHIVE= GATE= PLATFORM= POLICY_VERSION=)
 	@$(MAKE) -C benchmark archive-manifest \

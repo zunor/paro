@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ..archive.calibration import append_calibration_observation, append_gate_result, default_run_id
 from ..performance_gate import BaselineError, baseline_payload_for_source, collect_fingerprint, evaluate_gate, platform_key
+from ..run_output import RunOutput
 from .common import (
     GateCommandError,
     archive_store,
@@ -22,14 +23,30 @@ from .common import (
 )
 
 
-def run_calibrate(args: argparse.Namespace, *, root_dir: Path, runner_module: object) -> int:
+def run_calibrate(
+    args: argparse.Namespace,
+    *,
+    root_dir: Path,
+    runner_module: object,
+    run_output: RunOutput | None = None,
+) -> int:
+    from .common import ensure_run_output
+
+    run_output = ensure_run_output(run_output, root_dir=root_dir, args=args)
     policy = load_policy_for_gate(root_dir, args.gate, args.policy)
     baseline = load_baseline_checked(resolve_baseline(root_dir, args.gate, args.baseline))
     current_platform = platform_key()
     pid = resolve_pid(args, root_dir=root_dir, policy=policy)
     fingerprint = collect_fingerprint(root_dir, pid=pid)
     staging_queries = load_staging_queries_checked(root_dir, policy)
-    measurements = run_sources(args, policy=policy, root_dir=root_dir, runner_module=runner_module, pid=pid)
+    measurements = run_sources(
+        args,
+        policy=policy,
+        root_dir=root_dir,
+        runner_module=runner_module,
+        pid=pid,
+        run_output=run_output,
+    )
     if not measurements:
         raise GateCommandError("gate selected no measurement sources")
     if any(measurement.failed for measurement in measurements):
@@ -51,7 +68,7 @@ def run_calibrate(args: argparse.Namespace, *, root_dir: Path, runner_module: ob
             )
 
     store = archive_store(root_dir, args)
-    run_id = default_run_id() if args.run_id == "auto" else args.run_id
+    run_id = run_output.run_id if run_output is not None else (default_run_id() if args.run_id in (None, "auto") else args.run_id)
     try:
         result = append_gate_result(
             store=store,

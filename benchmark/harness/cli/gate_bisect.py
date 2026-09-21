@@ -14,6 +14,7 @@ from ..archive.manifest import result_prefix
 from ..archive.store import ArchiveError, ArchiveStore
 from ..performance_gate import evaluate_gate, platform_key
 from ..reporter import BenchmarkReporter
+from ..run_output import RunOutput
 from .common import (
     GateCommandError,
     archive_store,
@@ -26,7 +27,16 @@ from .common import (
 )
 
 
-def run_bisect(args: argparse.Namespace, *, root_dir: Path, runner_module: object) -> int:
+def run_bisect(
+    args: argparse.Namespace,
+    *,
+    root_dir: Path,
+    runner_module: object,
+    run_output: RunOutput | None = None,
+) -> int:
+    from .common import ensure_run_output
+
+    run_output = ensure_run_output(run_output, root_dir=root_dir, args=args)
     policy = load_policy_for_gate(root_dir, args.gate, args.policy)
     store = archive_store(root_dir, args)
     platform = platform_key()
@@ -47,7 +57,14 @@ def run_bisect(args: argparse.Namespace, *, root_dir: Path, runner_module: objec
     effective_policy = replace(policy, enforcement=archive_health.effective_enforcement)
     pid = resolve_pid(args, root_dir=root_dir, policy=policy)
     staging_queries = load_staging_queries_checked(root_dir, policy)
-    measurements = run_sources(args, policy=policy, root_dir=root_dir, runner_module=runner_module, pid=pid)
+    measurements = run_sources(
+        args,
+        policy=policy,
+        root_dir=root_dir,
+        runner_module=runner_module,
+        pid=pid,
+        run_output=run_output,
+    )
     if not measurements:
         raise GateCommandError("gate selected no measurement sources")
     family_policy = policy_for_source_family(effective_policy, len(measurements))
@@ -82,6 +99,7 @@ def run_bisect(args: argparse.Namespace, *, root_dir: Path, runner_module: objec
     reporter.write_gate_report(
         gate=args.gate,
         outcomes=[outcome for _, outcome in results],
+        output_path=run_output.gate_path,
         archive_health=archive_health,
     )
     return 1 if any(measurement.failed or outcome.failed for measurement, outcome in results) else 0

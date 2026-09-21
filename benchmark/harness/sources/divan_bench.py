@@ -33,7 +33,15 @@ class DivanBenchSource:
         if not source.bench:
             raise ValueError(f"source '{source.name}' is missing bench")
 
-        report_dir = context.root_dir / "report" / _safe_path_name(source.name)
+        if context.run_output is not None and context.attempt is not None:
+            context.run_output.register_cell(
+                cell_id=f"{context.attempt.source_id}--{context.attempt.attempt_id}",
+                query_cases=1,
+                sample_rows=max(context.minimum_sample_count, 1),
+                product_receipts=4,
+            )
+
+        report_dir = context.output_dir
         raw_path = report_dir / "divan-raw.json"
         env = _divan_env(raw_path, source, context)
         command = ["cargo", "bench", "--locked", "-p", source.crate, "--bench", source.bench]
@@ -74,6 +82,13 @@ class DivanBenchSource:
             minimum_sample_count=context.minimum_sample_count,
         )
         reporter = BenchmarkReporter(context.root_dir)
+        if context.run_output is not None:
+            reporter.attach_run_ownership(
+                payload,
+                context.run_output,
+                source_id=context.attempt.source_id if context.attempt else None,
+                attempt_id=context.attempt.attempt_id if context.attempt else None,
+            )
         result_path, summary_path = reporter.write_reports(payload, report_dir / "result.json")
         return SourceMeasurement(
             source=source,
@@ -81,6 +96,10 @@ class DivanBenchSource:
             result_path=result_path,
             summary_path=summary_path,
             failed=False,
+            run_id=context.run_output.run_id if context.run_output else None,
+            source_id=context.attempt.source_id if context.attempt else None,
+            attempt_id=context.attempt.attempt_id if context.attempt else None,
+            attempt_status="Completed",
         )
 
 
@@ -122,6 +141,11 @@ def normalize_divan_payload(
             "stats": _compute_stats(samples),
             "divan": {
                 "items": _optional_positive_int(bench.get("items")),
+            },
+            "compile_receipt": {
+                "schema_version": 1,
+                "status": "Uncovered",
+                "reason": "rust micro benchmark has no SQL compiled-statement receipt",
             },
         }
         audit = _optional_audit(bench.get("audit"))

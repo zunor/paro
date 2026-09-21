@@ -452,7 +452,9 @@ class PerformanceGateTests(unittest.TestCase):
             )
 
             self.assertEqual(result, 0)
-            report = json.loads((root / "report" / "gate.json").read_text(encoding="utf-8"))
+            reports = list((root / "report").glob("*/gate.json"))
+            self.assertEqual(len(reports), 1)
+            report = json.loads(reports[0].read_text(encoding="utf-8"))
             entry = report["outcomes"][0]["entries"][0]
             self.assertEqual(entry["kind"], "InvalidBaseline")
             self.assertEqual(entry["status"], "UNMEASURABLE")

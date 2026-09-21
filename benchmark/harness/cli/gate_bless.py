@@ -20,6 +20,7 @@ from ..performance_gate import (
     platform_key,
     validate_existing_baseline_for_bless,
 )
+from ..run_output import RunOutput
 from .common import (
     GateCommandError,
     load_baseline_checked,
@@ -33,7 +34,16 @@ from .common import (
 )
 
 
-def run_bless(args: argparse.Namespace, *, root_dir: Path, runner_module: object) -> int:
+def run_bless(
+    args: argparse.Namespace,
+    *,
+    root_dir: Path,
+    runner_module: object,
+    run_output: RunOutput | None = None,
+) -> int:
+    from .common import ensure_run_output
+
+    run_output = ensure_run_output(run_output, root_dir=root_dir, args=args)
     policy = load_policy_for_gate(root_dir, args.gate, args.policy)
     baseline_path = resolve_baseline(root_dir, args.gate, args.baseline, must_exist=False)
     current_platform = platform_key()
@@ -60,7 +70,14 @@ def run_bless(args: argparse.Namespace, *, root_dir: Path, runner_module: object
     staging_queries = load_staging_queries_checked(root_dir, policy)
     measurement_runs = []
     for run_index in range(args.bless_runs):
-        measurements = run_sources(args, policy=policy, root_dir=root_dir, runner_module=runner_module, pid=pid)
+        measurements = run_sources(
+            args,
+            policy=policy,
+            root_dir=root_dir,
+            runner_module=runner_module,
+            pid=pid,
+            run_output=run_output,
+        )
         measurement_runs.append(measurements)
         if not measurements:
             raise GateCommandError("gate selected no measurement sources")

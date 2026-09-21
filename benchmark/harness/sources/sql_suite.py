@@ -21,6 +21,10 @@ class SqlSuiteSource:
             suite=source.suite,
             pid=context.pid,
             query_ids_by_workload=retry_queries,
+            run_output=context.run_output,
+            source_id=context.attempt.source_id if context.attempt else None,
+            attempt_id=context.attempt.attempt_id if context.attempt else None,
+            output_root=context.attempt.root if context.attempt else None,
         )
         config = runner.resolve_config(args)
         result = runner.execute_workloads(config, args, {})
@@ -30,6 +34,10 @@ class SqlSuiteSource:
             result_path=result.result_path,
             summary_path=result.summary_path,
             failed=result.failed,
+            run_id=context.run_output.run_id if context.run_output else None,
+            source_id=context.attempt.source_id if context.attempt else None,
+            attempt_id=context.attempt.attempt_id if context.attempt else None,
+            attempt_status="Completed" if not result.failed else "Failed",
         )
 
 

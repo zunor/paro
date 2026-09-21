@@ -21,7 +21,7 @@ benchmark/
 ├── policies/                # Gate policy TOML files
 ├── baselines/               # Gate measurement references
 ├── suites/                  # Checked-in workload/query selections for CI
-└── report/                  # Runtime outputs (result.json, summary.md)
+└── report/                  # Run-owned runtime outputs
 ```
 
 ## Prerequisites
@@ -280,7 +280,7 @@ Notes:
 - `gate check` reads the calibration manifest, verifies checksums, and uses a
   local 72-hour cache only when the archive is unavailable. Corrupt archive
   objects are reported instead of hidden by cache fallback. Archive outages or
-  missing calibration are surfaced in `benchmark/report/gate.json` and the gate
+missing calibration are surfaced in the run-owned `gate.json` and the gate
   summary; hard gates degrade to soft for archive/calibration availability
   problems. Policy or fingerprint mismatches still fail before gate evaluation.
 - When calibration is ready, the evaluator consumes archive calibration content
@@ -374,25 +374,37 @@ The operator runtime SQL gate requires RSS sampling for memory coverage. The
 CLI accepts `PID=<pid>` through Make, `--pid <pid>` through `runner.py gate`,
 or `PARO_PID` / `.ci/parod.pid` when `--pid auto` is used.
 
-## Output Files
+## Output ownership
 
-Current implementation (shared defaults, not run-isolated):
+Every runner or gate invocation allocates one exclusive RunId below
+`benchmark/report/<RunId>/` (override the parent with `--report-root` or
+`REPORT_ROOT`; provide `--run-id`/`RUN_ID` only for a fresh, unused identity).
+Reusing an existing RunId is an error. A source invocation owns
+`sources/<SourceId>/attempts/<AttemptId>/`; its `result.json`, `summary.md`,
+`failure.json`, and `attempt.json` cannot be written by another source or
+retry. The run `manifest.json` records Running/Completed/Failed/Cancelled and
+all attempts, so a failed first sample remains available when a quorum retry
+is started.
 
-- `benchmark/report/result.json`: full structured report
-- `benchmark/report/summary.md`: compact human-readable report
-- `benchmark/report/gate.json`: performance gate outcome and archive health
+Gate output is the run-owned `gate.json`. Archive objects remain append-only
+and are separate from the live run directory. There is no `report/result.json`,
+`report/summary.md`, `report/gate.json`, `latest` alias, or source-name-cleaned
+fallback path. `make` and `runner.py` use the same `REPORT_ROOT`/`RUN_ID`
+configuration.
 
-Mixed/Divan source adapters also write under `report/<source>/`; SQL suites use
-the default result path. Retries and repeated bless measurements can overwrite
-earlier artifacts there. Until run/source/attempt
-isolation is implemented, serialize gate invocations sharing the output tree
-and disclose missing raw attempt evidence. Ad-hoc `runner.py run --output`
-can use a fresh parent directory, but changing just the JSON filename is not
-enough: `summary.md` is a sibling file. Do not create more worktrees just to
-obtain different report directories. The planned migration must retain all
-attempts, including initial failures, and explicitly pass output ownership
-through the runner, gate, source adapters, reporter and archive integration;
-it is not implemented merely by documenting `report/<run-id>/`.
+`--collect-receipts` (or `BENCH_COLLECT_RECEIPTS=1`) reads the bounded
+`paro_optimizers()` post-statement channel after timed execution. It never
+executes or compiles the target again and is recorded in the payload config.
+Each query carries either a verified artifact/actual-admission association or
+an explicit `Uncovered` reason; missing receipts never delete timings or slow
+samples. This is a normal receipt side channel, not Detail capture, and does
+not enable statement traces or `.parod.log` collection.
+
+Run registration freezes the campaign budget before source execution using the
+convergence formula (64 MiB total, 200,000-byte Summary cap). Over-budget new
+cells are rejected without discarding existing attempts. Filesystem isolation
+does not make shared CPU, memory, I/O, server, or fixture state comparable;
+confirmation runs still serialize unless their experiment registers isolation.
 
 Filesystem isolation does not imply measurement isolation. Competing CPU,
 memory, I/O or shared fixture state can invalidate a comparison even with
