@@ -4,12 +4,12 @@
 //! Arena-backed immutable physical plan.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
-use std::fmt::Write;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::{self, Write};
 
 use super::children::{PlanChildren, PlanChildrenArena};
 use super::dependencies::PlanDependencies;
-use super::edges::PhysicalEdgeArena;
+use super::edges::{PhysicalEdgeArena, PhysicalEdgeKind};
 use super::explain::types::{
     ExplainDoc, ExplainNode, ExplainProperty, ExplainValue, EXPLAIN_FORMAT_VERSION,
 };
@@ -250,12 +250,136 @@ impl PhysicalPlan {
     /// explicit so a consumer never treats a later encoding as compatible.
     pub fn structural_identity_fingerprint(&self) -> Fingerprint {
         let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.physical-plan-structure.v1");
-        builder.write_u64(self.root.index() as u64);
-        builder.write_u64(self.nodes.len() as u64);
-        builder.write_bytes(self.format_tree().as_bytes());
-        builder.write_bytes(self.format_explain_json(ExplainSpec::default()).as_bytes());
+        builder.write_bytes(b"paro.physical-plan-structure.v2.canonical");
+
+        // The traversal is iterative on purpose.  Physical plans can contain
+        // long unary spines and a fingerprint must not depend on recursion
+        // depth or arena allocation order.
+        let order = self.canonical_postorder();
+        let canonical_ids = order
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index as u64))
+            .collect::<BTreeMap<_, _>>();
+        builder.write_u64(order.len() as u64);
+        builder.write_u64(*canonical_ids.get(&self.root).unwrap_or(&u64::MAX));
+
+        for (canonical, id) in order.iter().enumerate() {
+            let node = self.node(*id);
+            builder.write_u64(canonical as u64);
+            builder.write_bytes(node.kind.name().as_bytes());
+            write_debug_value(&mut builder, &node.kind);
+            write_debug_value(&mut builder, &node.output);
+            write_debug_value(&mut builder, &node.cardinality);
+            // The logical occurrence is a semantic coordinate.  The display
+            // label is deliberately excluded: it is presentation, not plan
+            // identity.
+            builder.write_u64(node.label.logical_plan_node.0 as u64);
+            let children = self.child_ids(&node.children);
+            builder.write_u64(children.len() as u64);
+            for child in children {
+                builder.write_u64(*canonical_ids.get(child).unwrap_or(&u64::MAX));
+            }
+            if let Some(properties) = self.properties.get(*id) {
+                builder.write_u64(1);
+                write_debug_value(&mut builder, &properties.required_from_parent);
+                write_debug_value(&mut builder, &properties.provided);
+                write_debug_value(&mut builder, &properties.characteristics);
+                write_debug_value(&mut builder, &properties.output_estimate);
+                write_debug_value(&mut builder, &properties.cumulative_cost);
+                write_debug_value(&mut builder, &properties.grant_contract);
+                write_debug_value(&mut builder, &properties.region_owner);
+                write_debug_value(&mut builder, &properties.owned_artifacts);
+                write_debug_value(&mut builder, &properties.origin);
+                write_debug_value(&mut builder, &properties.winner_goal);
+                let mut dependencies = properties
+                    .auxiliary_dependencies
+                    .iter()
+                    .filter_map(|edge| self.edges.get(super::edges::PhysicalEdgeId(*edge)))
+                    .filter_map(|edge| {
+                        Some((
+                            *canonical_ids.get(&edge.producer)?,
+                            *canonical_ids.get(&edge.consumer)?,
+                            edge_kind_key(edge.kind),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                dependencies.sort_unstable();
+                builder.write_u64(dependencies.len() as u64);
+                for (producer, consumer, (kind, fingerprint)) in dependencies {
+                    builder.write_u64(producer);
+                    builder.write_u64(consumer);
+                    builder.write_u64(kind);
+                    if let Some(fingerprint) = fingerprint {
+                        builder.write_fingerprint(fingerprint);
+                    }
+                }
+            } else {
+                builder.write_u64(0);
+            }
+        }
+
+        let mut edges = self
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                Some((
+                    *canonical_ids.get(&edge.producer)?,
+                    *canonical_ids.get(&edge.consumer)?,
+                    edge.kind,
+                ))
+            })
+            .collect::<Vec<_>>();
+        edges.sort_unstable_by_key(|(producer, consumer, kind)| {
+            (*consumer, *producer, edge_kind_key(*kind))
+        });
+        builder.write_u64(edges.len() as u64);
+        for (producer, consumer, kind) in edges {
+            builder.write_u64(producer);
+            builder.write_u64(consumer);
+            let (tag, fingerprint) = edge_kind_key(kind);
+            builder.write_u64(tag);
+            if let Some(fingerprint) = fingerprint {
+                builder.write_fingerprint(fingerprint);
+            }
+        }
+        write_debug_value(&mut builder, &self.dependencies);
+        write_debug_value(&mut builder, &self.execution_resources);
         builder.finish()
+    }
+
+    fn canonical_postorder(&self) -> Vec<PhysicalPlanNodeId> {
+        let mut order = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut stack = vec![(self.root, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if id == PhysicalPlanNodeId::INVALID || self.nodes.get(id).is_none() {
+                continue;
+            }
+            if expanded {
+                order.push(id);
+                continue;
+            }
+            if !visited.insert(id) {
+                continue;
+            }
+            stack.push((id, true));
+            let node = self.node(id);
+            for child in self.child_ids(&node.children).iter().rev() {
+                stack.push((*child, false));
+            }
+            let mut producers = self
+                .edges
+                .iter()
+                .filter(|edge| edge.consumer == id)
+                .map(|edge| (edge_kind_key(edge.kind), edge.producer))
+                .collect::<Vec<_>>();
+            producers.sort_unstable_by_key(|(kind, producer)| (*kind, *producer));
+            for (_, producer) in producers.into_iter().rev() {
+                stack.push((producer, false));
+            }
+        }
+        order
     }
 
     pub fn format_explain_text_with_spec(&self, spec: &ExplainSpec) -> String {
@@ -595,6 +719,35 @@ impl PhysicalPlan {
             return Vec::new();
         };
         self.node(child_id).output.explain_names(true)
+    }
+}
+
+struct CanonicalFmtWriter<'a> {
+    builder: &'a mut StableFingerprintBuilder,
+}
+
+impl fmt::Write for CanonicalFmtWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.builder.write_bytes(value.as_bytes());
+        Ok(())
+    }
+}
+
+fn write_debug_value<T: fmt::Debug + ?Sized>(builder: &mut StableFingerprintBuilder, value: &T) {
+    let mut writer = CanonicalFmtWriter { builder };
+    // Formatting directly into the fingerprint stream avoids a temporary
+    // plan-sized String.  This is only for typed payloads; no EXPLAIN text or
+    // presentation renderer participates in the identity.
+    let _ = fmt::write(&mut writer, format_args!("{value:?}"));
+}
+
+fn edge_kind_key(kind: PhysicalEdgeKind) -> (u64, Option<Fingerprint>) {
+    match kind {
+        PhysicalEdgeKind::Data => (0, None),
+        PhysicalEdgeKind::Control => (1, None),
+        PhysicalEdgeKind::RuntimeFilter(fingerprint) => (2, Some(fingerprint)),
+        PhysicalEdgeKind::SharedSpool(fingerprint) => (3, Some(fingerprint)),
+        PhysicalEdgeKind::FixpointFeedback(fingerprint) => (4, Some(fingerprint)),
     }
 }
 
@@ -2431,4 +2584,61 @@ fn format_search_predicate(
     table: &TableCatalogEntry,
 ) -> String {
     format_predicate_tree(predicate.tree(), table)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::physical::specs::DummyScanSpec;
+    use crate::physical::{OperatorLabel, RowType};
+    use paro_common::types::LogicalType;
+    use paro_planner::plan::PlanNodeId;
+
+    fn dummy_plan(prefix_unreachable: bool, label: &str, output_name: &str) -> PhysicalPlan {
+        let mut nodes = PhysicalPlanNodeArena::default();
+        if prefix_unreachable {
+            nodes.push(PhysicalPlanNode {
+                id: PhysicalPlanNodeId::INVALID,
+                output: RowType::new(Vec::new(), Vec::new()),
+                cardinality: None,
+                kind: PhysicalNodeKind::DummyScan(DummyScanSpec),
+                children: PlanChildren::Empty,
+                label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "unreachable"),
+            });
+        }
+        let root = nodes.push(PhysicalPlanNode {
+            id: PhysicalPlanNodeId::INVALID,
+            output: RowType::new(vec![output_name.to_string()], vec![LogicalType::Unknown]),
+            cardinality: None,
+            kind: PhysicalNodeKind::DummyScan(DummyScanSpec),
+            children: PlanChildren::Empty,
+            label: OperatorLabel::new(PlanNodeId::SYNTHETIC, label),
+        });
+        PhysicalPlan::new(
+            root,
+            nodes,
+            PlanChildrenArena::default(),
+            PlanPropertyMap::default(),
+        )
+    }
+
+    #[test]
+    fn structural_identity_ignores_arena_and_display_allocation() {
+        let left = dummy_plan(false, "left presentation", "value");
+        let right = dummy_plan(true, "right presentation", "value");
+        assert_eq!(
+            left.structural_identity_fingerprint(),
+            right.structural_identity_fingerprint()
+        );
+    }
+
+    #[test]
+    fn structural_identity_includes_output_layout() {
+        let left = dummy_plan(false, "same", "left");
+        let right = dummy_plan(false, "same", "right");
+        assert_ne!(
+            left.structural_identity_fingerprint(),
+            right.structural_identity_fingerprint()
+        );
+    }
 }
