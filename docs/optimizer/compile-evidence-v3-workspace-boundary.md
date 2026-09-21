@@ -71,7 +71,8 @@ The independently reviewable task commits are now:
 
 - `0a5a2bea` — v3 typed receipt and Detail validation contract;
 - `775e9315` — bounded RunOutput, collector, gate, and benchmark lifecycle;
-- `922820a6` — versioned physical-identity guardrails, with the typed-payload gate intentionally still blocked.
+- `922820a6` — versioned physical-identity guardrails, with the typed-payload gate intentionally still blocked;
+- `ff5188e4`, `f8188153`, `c7254bd9` — validation boundary, real Detail smoke, and support-matrix updates.
 
 After these commits the worktree has no staged paths, no untracked paths, and 75 unstaged tracked
 paths. The remaining unstaged diff SHA-256 is
