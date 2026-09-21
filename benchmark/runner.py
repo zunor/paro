@@ -596,8 +596,17 @@ def execute_workloads(
             arm_id=args.arm_id or "default",
         )
         output_root = active_run.owned_path(args.output_root or active_run.root)
+        evidence_writer = (
+            owned_attempt.cell_writer()
+            if owned_attempt is not None
+            else active_run.cell_writer(
+                query_case=args.query_case or args.suite or args.workload or args.source_id or "adhoc",
+                arm_id=args.arm_id or "default",
+                root=output_root,
+            )
+        )
         result_path, summary_path = reporter.write_reports(
-            payload, output_root / "result.json", run_output=active_run
+            payload, evidence_writer
         )
         reporter.print_terminal_summary(workload_results, result_path)
 

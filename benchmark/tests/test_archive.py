@@ -199,9 +199,8 @@ class ArchiveTests(unittest.TestCase):
             report_path = BenchmarkReporter(root).write_gate_report(
                 gate=policy.name,
                 outcomes=[GateOutcome(gate=policy.name, enforcement=health.effective_enforcement, entries=())],
-                output_path=run.gate_path,
                 archive_health=health,
-                run_output=run,
+                writer=run.control_writer(),
             )
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(report["archive"]["status"], "ArchiveUnavailable")
@@ -618,6 +617,15 @@ class ArchiveTests(unittest.TestCase):
             commit = Path(write.relative_path).name.split("-", 1)[0]
             report_root = root / "report"
             run_output = RunOutput.create(report_root, run_id="bisect-read-only")
+            source_name = measurement_for(policy).source.name
+            run_output.register_cell(
+                cell_id=f"{source_name}--{source_name}",
+                query_cases=1,
+                sample_rows=1,
+                product_receipts=1,
+                query_case=source_name,
+                arm_id=source_name,
+            )
             summary_path = run_output.root / "summary.md"
             summary_path.write_text("", encoding="utf-8")
             measurement = measurement_for(policy)

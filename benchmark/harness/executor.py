@@ -256,6 +256,11 @@ class BenchmarkExecutor:
             validate_mode=query.validate,
             expected=query.expected,
         )
+        # This list is owned by the query result from the first timed sample,
+        # not copied only after the whole loop succeeds.  A later sample may
+        # fail or cancel; that must not erase receipts and timings already
+        # sealed for earlier samples.
+        sample_receipts: list[dict[str, Any]] = []
 
         try:
             if query.setup_sql:
@@ -287,13 +292,16 @@ class BenchmarkExecutor:
                     receipt_before_execution_ids = None
 
             last_rows: list[tuple[Any, ...]] = []
-            sample_receipts: list[dict[str, Any]] = []
             for _ in range(self._iterations):
                 rss_sampler = RssSampler(self._profile_pid)
                 rss_sampler.start()
                 start = time_module.perf_counter()
+                rows: list[tuple[Any, ...]] | None = None
+                execution_error: Exception | None = None
                 try:
                     rows = self._execute_sql(conn, query.sql, fetch=True)
+                except Exception as exc:
+                    execution_error = exc
                 finally:
                     elapsed_ms = (time_module.perf_counter() - start) * 1000.0
                     rss_sampler.stop()
@@ -303,6 +311,20 @@ class BenchmarkExecutor:
                         query_result.rss_peak_kb or 0,
                         rss_sampler.peak_kb,
                     )
+                if execution_error is not None:
+                    if self._collect_compile_receipts:
+                        sample_receipts.append({
+                            "schema_version": 1,
+                            "status": "Uncovered",
+                            "reason": (
+                                "timed execution failed before receipt: "
+                                f"{_format_error(execution_error)}"
+                            ),
+                        })
+                        query_result.receipt_associations = list(sample_receipts)
+                        query_result.receipt_association = sample_receipts[0]
+                    raise execution_error
+                assert rows is not None
                 last_rows = rows
                 if self._collect_compile_receipts:
                     sample_receipts.append(
@@ -346,6 +368,9 @@ class BenchmarkExecutor:
             query_result.explain_profile_status = "SKIP"
             query_result.explain_profile_detail = "primary query failed"
         finally:
+            if self._collect_compile_receipts:
+                query_result.receipt_associations = list(sample_receipts)
+                query_result.receipt_association = sample_receipts[0] if sample_receipts else None
             if query.teardown_sql:
                 try:
                     self._execute_script(conn, query.teardown_sql)
@@ -479,7 +504,11 @@ class BenchmarkExecutor:
             "receipt": decision.get("compile_receipt"),
             "raw": decision.get("compile_work"),
         }
-        execution_detail = {"artifact_identity": identity, "raw": execution}
+        execution_detail = {
+            "execution_id": execution_id,
+            "artifact_identity": identity,
+            "raw": execution,
+        }
         resources = execution.get("resources")
         selection = {
             "expected_class": execution.get("expected_class"),

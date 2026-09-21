@@ -148,13 +148,22 @@ def validate_receipt_association(value: Any) -> str:
     ):
         raise ReceiptContractError("resource memory bounds are inconsistent")
     completion = resources["memory_completion"]
-    if completion not in {"Guaranteed", "RuntimeCappedUnbounded"} and not (
+    valid_simple_completion = isinstance(completion, str) and completion in {
+        "Guaranteed", "RuntimeCappedUnbounded"
+    }
+    valid_known_completion = (
         isinstance(completion, dict)
         and set(completion) == {"RuntimeCappedKnown"}
         and isinstance(completion["RuntimeCappedKnown"], dict)
         and set(completion["RuntimeCappedKnown"]) == {"uncapped_memory_bytes"}
-    ):
+        and isinstance(completion["RuntimeCappedKnown"]["uncapped_memory_bytes"], int)
+        and not isinstance(completion["RuntimeCappedKnown"]["uncapped_memory_bytes"], bool)
+        and completion["RuntimeCappedKnown"]["uncapped_memory_bytes"] >= 0
+    )
+    if not valid_simple_completion and not valid_known_completion:
         raise ReceiptContractError("unknown memory completion contract")
+    if isinstance(completion, dict) and completion["RuntimeCappedKnown"]["uncapped_memory_bytes"] < resources["working_set_memory_bytes"]:
+        raise ReceiptContractError("known uncapped memory is below the working set")
     if selection.get("image") not in {"Ready", "NotReady"}:
         raise ReceiptContractError("verified receipt lacks executable-image status")
     if selection.get("terminal") not in {
@@ -358,6 +367,23 @@ def _validate_compile_receipt(value: Any, identity: dict[str, Any]) -> None:
             number = observed["Observed"]
             if not isinstance(number, int) or isinstance(number, bool) or number < 0:
                 raise ReceiptContractError(f"compile receipt has invalid {field} value")
+    stop = value["search_stop"]["Observed"]
+    search_complete = value["search_complete"]["Observed"]
+    quality_satisfied = value["quality_policy_satisfied"]["Observed"]
+    budget_limited = value["budget_limited"]["Observed"]
+    obligations = value["obligations"]["Observed"]
+    if stop == "Complete" and (
+        not search_complete or budget_limited or obligations != 0
+    ):
+        raise ReceiptContractError("Complete search stop has incomplete compile facts")
+    if search_complete and stop != "Complete":
+        raise ReceiptContractError("search_complete is true for a non-complete stop")
+    if stop == "QualityPolicySatisfied" and not quality_satisfied:
+        raise ReceiptContractError("quality stop lacks quality_policy_satisfied")
+    if budget_limited and stop not in {"BudgetLimited", "Deadline"}:
+        raise ReceiptContractError("budget_limited is inconsistent with search stop")
+    if stop == "BudgetLimited" and not budget_limited:
+        raise ReceiptContractError("BudgetLimited stop lacks budget_limited")
     compile_work = value.get("compile_work")
     if compile_work is not None:
         if not isinstance(compile_work, dict) or any(

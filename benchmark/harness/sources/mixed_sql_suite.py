@@ -160,8 +160,10 @@ class MixedSqlSuiteSource:
                 query_case=source.name,
                 arm_id=context.attempt.arm_id if context.attempt else None,
             )
+        if context.attempt is None:
+            raise ValueError("mixed SQL source requires an owned attempt")
         result_path, summary_path = reporter.write_reports(
-            payload, report_dir / "result.json", run_output=context.run_output
+            payload, context.attempt.cell_writer()
         )
         failed = bool(setup_error or teardown_error or any(s.error for s in scenarios))
         failed = failed or any(s.validation.get("result") != "PASS" for s in scenarios)

@@ -173,14 +173,19 @@ def run_check(
     for measurement, outcome in results:
         reporter.print_gate_outcome(outcome)
         reporter.append_gate_outcome_to_summary(
-            measurement.summary_path, outcome, run_output=run_output
+            measurement.summary_path,
+            outcome,
+            writer=run_output.cell_writer(
+                query_case=getattr(measurement, "query_case", None) or measurement.source.name,
+                arm_id=getattr(measurement, "arm_id", None) or measurement.source.name,
+                root=measurement.summary_path.parent,
+            ),
         )
     reporter.write_gate_report(
         gate=args.gate,
         outcomes=[outcome for _, outcome in results],
-        output_path=run_output.gate_path,
         archive_health=archive_health,
-        run_output=run_output,
+        writer=run_output.control_writer(),
     )
 
     return 1 if any(
@@ -226,8 +231,7 @@ def report_missing_auto_baseline(
     reporter.write_gate_report(
         gate=args.gate,
         outcomes=[outcome],
-        output_path=run_output.gate_path,
-        run_output=run_output,
+        writer=run_output.control_writer(),
     )
     return 1 if outcome.blocking_failed else 0
 

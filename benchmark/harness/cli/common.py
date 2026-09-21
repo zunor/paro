@@ -274,10 +274,7 @@ def _record_source_failure(attempt, source, error: Exception) -> SourceMeasureme
         f"# Source attempt failed\n\n- source: `{source.name}`\n"
         f"- status: `Failed`\n- error: `{type(error).__name__}: {error}`\n"
     )
-    if attempt.run.capacity_exceeded:
-        attempt.run.write_control_text(summary, summary_text, overwrite=False)
-    else:
-        attempt.run.write_text(summary, summary_text, overwrite=False)
+    attempt.control_writer().write_text("summary.md", summary_text, overwrite=False)
     failure = attempt.write_failure(status="Failed", error=f"{type(error).__name__}: {error}")
     attempt.seal(status="Failed", summary_path=summary, failure_path=failure)
     return SourceMeasurement(

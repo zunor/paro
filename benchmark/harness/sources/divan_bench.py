@@ -99,8 +99,10 @@ class DivanBenchSource:
                 query_case=source.name,
                 arm_id=context.attempt.arm_id if context.attempt else None,
             )
+        if context.attempt is None:
+            raise ValueError("Divan source requires an owned attempt")
         result_path, summary_path = reporter.write_reports(
-            payload, report_dir / "result.json", run_output=context.run_output
+            payload, context.attempt.cell_writer()
         )
         return SourceMeasurement(
             source=source,

@@ -12,12 +12,13 @@ second evidence store.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
+import threading
 import uuid
 from typing import Any
 
@@ -51,11 +52,25 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-def _encode_json(payload: dict[str, Any]) -> bytes:
-    """Encode one owned JSON record exactly as it will be published."""
-    return (json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode(
-        "utf-8"
-    )
+def _encode_json(payload: dict[str, Any], *, limit_bytes: int | None = None) -> bytes:
+    """Encode one owned JSON record without first building an unbounded string.
+
+    ``JSONEncoder.iterencode`` is important here: a rejected capture must not
+    allocate the complete diagnostic document just to discover that the
+    registered byte lease has already been exhausted.
+    """
+    encoder = json.JSONEncoder(indent=2, ensure_ascii=False, sort_keys=True)
+    output = bytearray()
+    for chunk in encoder.iterencode(payload):
+        encoded = chunk.encode("utf-8")
+        if limit_bytes is not None and len(output) + len(encoded) + 1 > limit_bytes:
+            raise RunOutputError(
+                f"JSON record capacity exceeded while encoding: "
+                f"> {limit_bytes} bytes"
+            )
+        output.extend(encoded)
+    output.extend(b"\n")
+    return bytes(output)
 
 
 def _write_bounded_json(
@@ -66,13 +81,188 @@ def _write_bounded_json(
     overwrite: bool,
 ) -> int:
     """Publish JSON only after enforcing the encoded UTF-8 record limit."""
-    encoded = _encode_json(payload)
+    encoded = _encode_json(payload, limit_bytes=limit_bytes)
     if len(encoded) > limit_bytes:
         raise RunOutputError(
             f"JSON record capacity exceeded: {len(encoded)} > {limit_bytes} bytes: {path}"
         )
     _write_encoded_atomically(path, encoded, overwrite=overwrite)
     return len(encoded)
+
+
+@dataclass(frozen=True)
+class PreparedWrite:
+    """An encoded, capacity-checked write waiting for publication."""
+
+    writer: Any
+    path: Path
+    encoded: bytes
+    overwrite: bool
+    replacing_bytes: int
+
+    def publish(self) -> Path:
+        return self.writer._publish(self)
+
+
+@dataclass(frozen=True)
+class CampaignRegistration:
+    """Explicit registration authority for one bounded campaign."""
+
+    run: "RunOutput"
+
+    def cell(
+        self,
+        *,
+        query_case: str,
+        arm_id: str,
+        query_cases: int,
+        sample_rows: int,
+        product_receipts: int,
+        calibration_rows: int = 0,
+        summary_captures: int = 0,
+    ) -> "CellWriter":
+        return self.run.register_cell(
+            cell_id=f"{query_case}--{arm_id}",
+            query_cases=query_cases,
+            sample_rows=sample_rows,
+            product_receipts=product_receipts,
+            calibration_rows=calibration_rows,
+            summary_captures=summary_captures,
+            query_case=query_case,
+            arm_id=arm_id,
+        )
+
+    def seal(self) -> None:
+        self.run.seal_registration()
+
+
+@dataclass(frozen=True)
+class ControlWriter:
+    """Writer for bounded lifecycle metadata, never evidence payloads."""
+
+    run: "RunOutput"
+    root: Path
+
+    def _path(self, name: str | Path) -> Path:
+        return _owned_relative_path(self.root, name, label="control output")
+
+    def prepare_json(
+        self, name: str | Path, payload: dict[str, Any], *, overwrite: bool = False
+    ) -> PreparedWrite:
+        path = self._path(name)
+        encoded = _encode_json(payload, limit_bytes=CONTROL_OUTPUT_LIMIT_BYTES)
+        replacing = path.stat().st_size if overwrite and path.exists() else 0
+        return PreparedWrite(self, path, encoded, overwrite, replacing)
+
+    def prepare_text(
+        self, name: str | Path, text: str, *, overwrite: bool = False
+    ) -> PreparedWrite:
+        path = self._path(name)
+        encoded = text.encode("utf-8")
+        if len(encoded) > CONTROL_OUTPUT_LIMIT_BYTES:
+            raise RunOutputError(
+                f"control output capacity exceeded: {len(encoded)} > "
+                f"{CONTROL_OUTPUT_LIMIT_BYTES} bytes"
+            )
+        replacing = path.stat().st_size if overwrite and path.exists() else 0
+        return PreparedWrite(self, path, encoded, overwrite, replacing)
+
+    def write_json(
+        self, name: str | Path, payload: dict[str, Any], *, overwrite: bool = False
+    ) -> Path:
+        return self.prepare_json(name, payload, overwrite=overwrite).publish()
+
+    def write_text(self, name: str | Path, text: str, *, overwrite: bool = False) -> Path:
+        return self.prepare_text(name, text, overwrite=overwrite).publish()
+
+    def _publish(self, prepared: PreparedWrite) -> Path:
+        with self.run._lock:
+            try:
+                self.run._commit_control(prepared)
+                return prepared.path
+            except RunOutputError as exc:
+                if not self.run.capacity_exceeded:
+                    self.run._mark_publication_unknown(prepared.path, exc)
+                raise
+            except Exception as exc:
+                self.run._mark_publication_unknown(prepared.path, exc)
+                raise
+
+
+@dataclass(frozen=True)
+class CellWriter:
+    """Writer bound to one registered QueryCase×ArmId cell and attempt."""
+
+    run: "RunOutput"
+    cell_id: str
+    root: Path
+
+    def _path(self, name: str | Path) -> Path:
+        return _owned_relative_path(self.root, name, label="cell output")
+
+    def prepare_json(
+        self, name: str | Path, payload: dict[str, Any], *, overwrite: bool = False
+    ) -> PreparedWrite:
+        path = self._path(name)
+        replacing = path.stat().st_size if overwrite and path.exists() else 0
+        limit = self.run._available_bytes_for_cell(
+            self.cell_id, replacing_bytes=replacing
+        )
+        try:
+            encoded = _encode_json(payload, limit_bytes=limit)
+        except RunOutputError:
+            self.run._mark_capacity_exceeded()
+            raise
+        return PreparedWrite(self, path, encoded, overwrite, replacing)
+
+    def prepare_text(
+        self, name: str | Path, text: str, *, overwrite: bool = False
+    ) -> PreparedWrite:
+        path = self._path(name)
+        encoded = text.encode("utf-8")
+        replacing = path.stat().st_size if overwrite and path.exists() else 0
+        limit = self.run._available_bytes_for_cell(
+            self.cell_id, replacing_bytes=replacing
+        )
+        if len(encoded) > limit:
+            self.run._mark_capacity_exceeded()
+            raise RunOutputError(
+                f"cell output capacity exceeded: {len(encoded)} > {limit} bytes"
+            )
+        return PreparedWrite(self, path, encoded, overwrite, replacing)
+
+    def write_json(
+        self, name: str | Path, payload: dict[str, Any], *, overwrite: bool = False
+    ) -> Path:
+        return self.prepare_json(name, payload, overwrite=overwrite).publish()
+
+    def write_text(self, name: str | Path, text: str, *, overwrite: bool = False) -> Path:
+        return self.prepare_text(name, text, overwrite=overwrite).publish()
+
+    def _publish(self, prepared: PreparedWrite) -> Path:
+        with self.run._lock:
+            try:
+                self.run._commit_cell(self.cell_id, prepared)
+                return prepared.path
+            except RunOutputError as exc:
+                if not self.run.capacity_exceeded:
+                    self.run._mark_publication_unknown(prepared.path, exc)
+                raise
+            except Exception as exc:
+                self.run._mark_publication_unknown(prepared.path, exc)
+                raise
+
+
+def _owned_relative_path(root: Path, name: str | Path, *, label: str) -> Path:
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RunOutputError(f"{label} must be a relative path inside its owner: {name}")
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError as exc:
+        raise RunOutputError(f"{label} escapes its owner: {name}") from exc
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -98,6 +288,16 @@ class AttemptOutput:
     def failure_path(self) -> Path:
         return self.root / "failure.json"
 
+    def control_writer(self) -> ControlWriter:
+        return ControlWriter(self.run, self.root)
+
+    def cell_writer(self) -> CellWriter:
+        return self.run.cell_writer(
+            query_case=self.query_case,
+            arm_id=self.arm_id,
+            root=self.root,
+        )
+
     def write_failure(self, *, status: str, error: str) -> Path:
         if status not in {"Failed", "Cancelled", "Incomplete"}:
             raise RunOutputError(f"invalid failed attempt status: {status}")
@@ -106,14 +306,9 @@ class AttemptOutput:
             raise RunOutputError(
                 f"attempt {self.attempt_id} is already terminal: {current.get('status')}"
             )
-        writer = (
-            self.run.write_control_json
-            if self.run.capacity_exceeded
-            else self.run.write_json
-        )
         error = _bounded_error_text(error)
-        writer(
-            self.failure_path,
+        self.control_writer().write_json(
+            "failure.json",
             {
                 "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
                 "run_id": self.run.run_id,
@@ -159,14 +354,10 @@ class AttemptOutput:
             "sealed_at": _now(),
         }
         # The running metadata is the one owned state machine record that may
-        # be replaced: seal() has already verified the current state and the
-        # replacement is still charged through the run writer.
-        writer = (
-            self.run.write_control_json
-            if self.run.capacity_exceeded
-            else self.run.write_json
-        )
-        writer(self.root / "attempt.json", metadata, overwrite=True)
+        # be replaced. It is control metadata, not an evidence payload, and
+        # therefore uses the explicit control writer even after evidence
+        # capacity is exhausted.
+        self.control_writer().write_json("attempt.json", metadata, overwrite=True)
         self.run._update_attempt(metadata)
 
 
@@ -179,6 +370,9 @@ class RunOutput:
     run_id: str
     root: Path
     _manifest: dict[str, Any]
+    _lock: threading.RLock = dataclass_field(
+        default_factory=threading.RLock, repr=False, compare=False
+    )
 
     @classmethod
     def create(
@@ -219,6 +413,7 @@ class RunOutput:
                 "manifest_bytes": 0,
                 "manifest_limit_bytes": MANIFEST_LIMIT_BYTES,
                 "total_limit_bytes": CAMPAIGN_TOTAL_LIMIT_BYTES,
+                "registration_sealed": False,
                 "status": "Unregistered",
             },
         }
@@ -239,6 +434,13 @@ class RunOutput:
     @property
     def gate_path(self) -> Path:
         return self.root / "gate.json"
+
+    @property
+    def registration(self) -> CampaignRegistration:
+        return CampaignRegistration(self)
+
+    def control_writer(self) -> ControlWriter:
+        return ControlWriter(self, self.root)
 
     def owned_path(self, path: Path) -> Path:
         """Return a path only when it stays inside this run's ownership tree."""
@@ -285,7 +487,9 @@ class RunOutput:
                 "failure": None,
                 "started_at": _now(),
             }
-            self.write_json(attempt_root / "attempt.json", metadata, overwrite=False)
+            ControlWriter(self, attempt_root).write_json(
+                "attempt.json", metadata, overwrite=False
+            )
             self._update_attempt(metadata)
             return attempt
         raise RunOutputError(f"too many attempts for source {source_id!r}")
@@ -304,8 +508,10 @@ class RunOutput:
             raise RunOutputError("cannot complete a run with failed, cancelled, or incomplete attempts")
         if status == "Completed" and self._manifest.get("registration", {}).get(
             "status"
-        ) == "CapacityExceeded":
-            raise RunOutputError("cannot complete a run after campaign capacity was exceeded")
+        ) in {"CapacityExceeded", "PublicationUnknown"}:
+            raise RunOutputError(
+                "cannot complete a run after capacity or publication uncertainty"
+            )
         self._manifest["status"] = status
         self._manifest["sealed_at"] = _now()
         self._persist_manifest()
@@ -314,28 +520,9 @@ class RunOutput:
     def capacity_exceeded(self) -> bool:
         return self._manifest.get("registration", {}).get("status") == "CapacityExceeded"
 
-    def write_control_json(
-        self, path: Path, payload: dict[str, Any], *, overwrite: bool = False
-    ) -> None:
-        """Write minimal terminal metadata after payload capacity is exhausted.
-
-        This path is intentionally not a second evidence writer: it is only
-        available for the state-machine metadata needed to explain why the
-        run stopped.  Once payload capacity is exceeded no new result,
-        summary, receipt, or trace may use it.
-        """
-        path = self.owned_path(path)
-        encoded = (json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-        self._charge_control_bytes(len(encoded))
-        _write_encoded_atomically(path, encoded, overwrite=overwrite)
-        self._persist_manifest()
-
-    def write_control_text(self, path: Path, text: str, *, overwrite: bool = False) -> None:
-        """Write only terminal explanation metadata after capacity refusal."""
-        path = self.owned_path(path)
-        encoded = text.encode("utf-8")
-        self._charge_control_bytes(len(encoded))
-        _write_encoded_atomically(path, encoded, overwrite=overwrite)
+    def seal_registration(self) -> None:
+        registration = self._manifest["registration"]
+        registration["registration_sealed"] = True
         self._persist_manifest()
 
     def register_cell(
@@ -349,7 +536,7 @@ class RunOutput:
         summary_captures: int = 0,
         query_case: str | None = None,
         arm_id: str = "default",
-    ) -> None:
+    ) -> CellWriter:
         """Freeze one finite campaign-cell budget before its source runs."""
         cell_id = validate_output_id(cell_id, label="cell id")
         query_case = validate_output_id(query_case or cell_id, label="query case")
@@ -357,6 +544,8 @@ class RunOutput:
         if min(query_cases, sample_rows, product_receipts, calibration_rows, summary_captures) < 0:
             raise RunOutputError("campaign registration counts must be >= 0")
         registration = self._manifest["registration"]
+        if registration.get("registration_sealed"):
+            raise RunOutputError("campaign registration is sealed after the first owned payload")
         expected_cell_id = f"{query_case}--{arm_id}"
         if cell_id != expected_cell_id:
             raise RunOutputError(
@@ -375,10 +564,17 @@ class RunOutput:
                 "arm_id": arm_id,
             }
             if all(current.get(key) == value for key, value in requested.items()):
-                return
+                return CellWriter(self, cell_id, self.root / "sources")
             raise RunOutputError(
                 f"campaign cell already registered with different contract: {cell_id}"
             )
+        cell_budget = (
+            4_096
+            + 1_024 * query_cases
+            + 2_048 * product_receipts
+            + 512 * calibration_rows
+            + 200_000 * summary_captures
+        )
         cells = [*registration["cells"], {
             "cell_id": cell_id,
             "query_case": query_case,
@@ -388,6 +584,8 @@ class RunOutput:
             "product_receipts": product_receipts,
             "calibration_rows": calibration_rows,
             "summary_captures": summary_captures,
+            "budget_bytes": cell_budget,
+            "written_bytes": 0,
         }]
         arms = len({cell["arm_id"] for cell in cells})
         queries = sum(cell["query_cases"] for cell in cells)
@@ -409,60 +607,153 @@ class RunOutput:
         registration["budget_bytes"] = budget
         registration["status"] = "WithinBudget"
         self._persist_manifest()
+        return CellWriter(self, cell_id, self.root / "sources")
 
-    def _charge_bytes(self, encoded_bytes: int) -> None:
+    def cell_writer(
+        self, *, query_case: str, arm_id: str, root: Path
+    ) -> CellWriter:
+        query_case = validate_output_id(query_case, label="query case")
+        arm_id = validate_output_id(arm_id, label="arm id")
+        cell_id = f"{query_case}--{arm_id}"
+        cell = next(
+            (
+                item
+                for item in self._manifest["registration"].get("cells", [])
+                if item.get("cell_id") == cell_id
+            ),
+            None,
+        )
+        if cell is None:
+            raise RunOutputError(f"cell is not registered: {cell_id}")
+        resolved_root = root.resolve()
+        try:
+            resolved_root.relative_to(self.root.resolve())
+        except ValueError as exc:
+            raise RunOutputError("cell writer root is outside the run") from exc
+        return CellWriter(self, cell_id, resolved_root)
+
+    def _registered_cell(self, cell_id: str) -> dict[str, Any]:
+        for cell in self._manifest["registration"].get("cells", []):
+            if cell.get("cell_id") == cell_id:
+                return cell
+        raise RunOutputError(f"cell is not registered: {cell_id}")
+
+    def _available_bytes_for_cell(
+        self, cell_id: str, *, replacing_bytes: int = 0
+    ) -> int:
         registration = self._manifest["registration"]
-        total = int(registration.get("written_bytes", 0)) + encoded_bytes
-        limit = int(registration.get("total_limit_bytes", CAMPAIGN_TOTAL_LIMIT_BYTES))
-        if total > limit:
-            registration["status"] = "CapacityExceeded"
-            registration["written_bytes"] = total
-            self._manifest["status"] = "Incomplete"
-            self._manifest["sealed_at"] = _now()
-            self._persist_manifest()
+        if registration.get("status") in {"CapacityExceeded", "PublicationUnknown"}:
             raise RunOutputError(
-                f"campaign output capacity exceeded: {total} > {limit} bytes"
+                "cell payload publication is closed after a terminal capacity/publication failure"
             )
-        registration["written_bytes"] = total
+        cell = self._registered_cell(cell_id)
+        registered = int(registration.get("budget_bytes", 0))
+        campaign_limit = int(
+            registration.get("total_limit_bytes", CAMPAIGN_TOTAL_LIMIT_BYTES)
+        )
+        limit = min(campaign_limit, registered) if registered else campaign_limit
+        available = limit - max(
+            0, int(registration.get("written_bytes", 0)) - replacing_bytes
+        )
+        available = min(
+            available,
+            int(cell.get("budget_bytes", 0))
+            - max(0, int(cell.get("written_bytes", 0)) - replacing_bytes),
+        )
+        return max(0, available)
 
-    def _charge_control_bytes(self, encoded_bytes: int) -> None:
+    def _commit_cell(self, cell_id: str, prepared: PreparedWrite) -> None:
         registration = self._manifest["registration"]
-        total = int(registration.get("control_written_bytes", 0)) + encoded_bytes
+        cell = self._registered_cell(cell_id)
+        encoded_bytes = len(prepared.encoded)
+        available = self._available_bytes_for_cell(
+            cell_id, replacing_bytes=prepared.replacing_bytes
+        )
+        if encoded_bytes > available:
+            self._mark_capacity_exceeded()
+            raise RunOutputError(
+                f"campaign output capacity exceeded: {encoded_bytes} > {available} bytes"
+            )
+        _write_encoded_atomically(
+            prepared.path, prepared.encoded, overwrite=prepared.overwrite
+        )
+        registration["written_bytes"] = max(
+            0, int(registration.get("written_bytes", 0)) - prepared.replacing_bytes
+        ) + encoded_bytes
+        cell["written_bytes"] = max(
+            0, int(cell.get("written_bytes", 0)) - prepared.replacing_bytes
+        ) + encoded_bytes
+        registration["registration_sealed"] = True
+        self._persist_manifest()
+
+    def _commit_control(self, prepared: PreparedWrite) -> None:
+        registration = self._manifest["registration"]
+        encoded_bytes = len(prepared.encoded)
+        current = int(registration.get("control_written_bytes", 0))
+        total = max(0, current - prepared.replacing_bytes) + encoded_bytes
         limit = int(registration.get("control_limit_bytes", CONTROL_OUTPUT_LIMIT_BYTES))
         if total > limit:
             raise RunOutputError(
                 f"terminal metadata capacity exceeded: {total} > {limit} bytes"
             )
+        _write_encoded_atomically(
+            prepared.path, prepared.encoded, overwrite=prepared.overwrite
+        )
         registration["control_written_bytes"] = total
+        self._persist_manifest()
 
     def _persist_manifest(self) -> None:
         registration = self._manifest.setdefault("registration", {})
         limit = int(registration.get("manifest_limit_bytes", MANIFEST_LIMIT_BYTES))
         registration["manifest_bytes"] = 0
-        encoded = _encode_json(self._manifest)
+        encoded = _encode_json(self._manifest, limit_bytes=limit)
         if len(encoded) > limit:
             raise RunOutputError(
                 f"manifest capacity exceeded: {len(encoded)} > {limit} bytes"
             )
         registration["manifest_bytes"] = len(encoded)
-        encoded = _encode_json(self._manifest)
+        encoded = _encode_json(self._manifest, limit_bytes=limit)
         if len(encoded) > limit:
             raise RunOutputError(
                 f"manifest capacity exceeded after accounting: {len(encoded)} > {limit} bytes"
             )
         _write_encoded_atomically(self.root / "manifest.json", encoded, overwrite=True)
 
-    def write_json(self, path: Path, payload: dict[str, Any], *, overwrite: bool = False) -> None:
-        path = self.owned_path(path)
-        encoded = _encode_json(payload)
-        self._charge_bytes(len(encoded))
-        _write_encoded_atomically(path, encoded, overwrite=overwrite)
+    def _mark_capacity_exceeded(self) -> None:
+        registration = self._manifest["registration"]
+        registration["status"] = "CapacityExceeded"
+        self._manifest["status"] = "Incomplete"
+        self._manifest["sealed_at"] = _now()
+        try:
+            self._persist_manifest()
+        except Exception as exc:
+            self._mark_publication_unknown(self.root / "manifest.json", exc)
+            raise
 
-    def write_text(self, path: Path, text: str, *, overwrite: bool = False) -> None:
-        path = self.owned_path(path)
-        encoded = text.encode("utf-8")
-        self._charge_bytes(len(encoded))
-        _write_encoded_atomically(path, encoded, overwrite=overwrite)
+    def _mark_publication_unknown(self, path: Path, error: Exception) -> None:
+        registration = self._manifest["registration"]
+        registration["status"] = "PublicationUnknown"
+        self._manifest["status"] = "Incomplete"
+        self._manifest["sealed_at"] = _now()
+        try:
+            self._persist_manifest()
+        except Exception:
+            pass
+        marker = self.root / "publication-unknown.json"
+        payload = {
+            "schema_version": 1,
+            "status": "PublicationUnknown",
+            "path": _relative_or_none(path, self.root),
+            "error": _bounded_error_text(f"{type(error).__name__}: {error}"),
+            "recorded_at": _now(),
+        }
+        try:
+            encoded = _encode_json(payload, limit_bytes=CONTROL_OUTPUT_LIMIT_BYTES)
+            _write_encoded_atomically(marker, encoded, overwrite=True)
+        except Exception:
+            # If the run root is unavailable, the original exception is the
+            # only truthful signal left to the caller.
+            pass
 
     def _update_attempt(self, metadata: dict[str, Any]) -> None:
         attempts = self._manifest.setdefault("attempts", [])

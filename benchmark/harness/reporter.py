@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from .executor import QueryExecutionResult, WorkloadExecutionResult
 from .performance_gate import GateOutcome
-from .run_output import RunOutput
+from .run_output import CellWriter, ControlWriter, RunOutput
 from .receipt_contract import validate_benchmark_payload, validate_summary_bytes
 from .runtime_contract import runtime_contract_payload
 
@@ -171,9 +171,9 @@ class BenchmarkReporter:
     def write_reports(
         self,
         payload: dict[str, Any],
-        output_path: Path,
+        writer: CellWriter,
         *,
-        run_output: RunOutput,
+        output_name: str = "result.json",
     ) -> tuple[Path, Path]:
         if payload.get("ownership") is not None:
             validate_benchmark_payload(
@@ -184,13 +184,10 @@ class BenchmarkReporter:
                 # ask validate_benchmark_payload(..., require_receipts=True).
                 require_receipts=False,
             )
-        run_output.write_json(output_path, payload, overwrite=False)
-        summary_path = output_path.with_name("summary.md")
-        if summary_path.exists():
-            raise FileExistsError(f"refusing to overwrite owned summary: {summary_path}")
+        output_path = writer.write_json(output_name, payload, overwrite=False)
         summary = self._render_summary_markdown(payload)
         validate_summary_bytes(summary)
-        run_output.write_text(summary_path, summary, overwrite=False)
+        summary_path = writer.write_text("summary.md", summary, overwrite=False)
         return output_path, summary_path
 
     def print_terminal_summary(self, workloads: list[WorkloadExecutionResult], report_path: Path) -> None:
@@ -284,7 +281,7 @@ class BenchmarkReporter:
         summary_path: Path,
         outcome: GateOutcome,
         *,
-        run_output: RunOutput,
+        writer: CellWriter,
     ) -> None:
         if not outcome.entries and outcome.archive_health is None:
             return
@@ -319,18 +316,16 @@ class BenchmarkReporter:
         current = summary_path.read_text(encoding="utf-8")
         updated = current + "\n".join(lines) + "\n"
         validate_summary_bytes(updated)
-        run_output.write_text(summary_path, updated, overwrite=True)
+        writer.write_text("summary.md", updated, overwrite=True)
 
     def write_gate_report(
         self,
         *,
         gate: str,
         outcomes: list[GateOutcome],
-        output_path: Path,
         archive_health: Any | None = None,
-        run_output: RunOutput,
+        writer: ControlWriter,
     ) -> Path:
-        path = output_path
         payload: dict[str, Any] = {
             "schema_version": 1,
             "gate": gate,
@@ -339,7 +334,7 @@ class BenchmarkReporter:
         }
         if archive_health is not None:
             payload["archive"] = _archive_health_payload(archive_health)
-        run_output.write_json(path, payload, overwrite=False)
+        path = writer.write_json("gate.json", payload, overwrite=False)
         return path
 
     def _print_archive_health(self, archive_health: "ArchiveHealth") -> None:

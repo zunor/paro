@@ -1,17 +1,70 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from harness.receipt_contract import ReceiptContractError, validate_benchmark_payload  # noqa: E402
 from harness.run_output import RunOutput, RunOutputError  # noqa: E402
 from harness.executor import BenchmarkExecutor  # noqa: E402
+from harness.loader import QueryDef  # noqa: E402
 
 
 class RunOutputTests(unittest.TestCase):
+    def test_failed_timed_sample_keeps_elapsed_and_previous_receipt(self) -> None:
+        class Validator:
+            def check_plan(self, query, conn):
+                return SimpleNamespace(status="PASS", detail=None)
+
+            def validate_query(self, query, rows):
+                return SimpleNamespace(status="PASS", detail=None)
+
+        class Executor(BenchmarkExecutor):
+            def __init__(self):
+                super().__init__(
+                    connection={},
+                    iterations=2,
+                    warmup=0,
+                    timeout_seconds=1,
+                    collect_memory=False,
+                    collect_compile_receipts=True,
+                )
+                self.calls = 0
+
+            def _execute_sql(self, conn, sql, *, fetch):
+                self.calls += 1
+                if self.calls == 1:
+                    return [(1,)]
+                raise RuntimeError("second sample failed")
+
+            def _snapshot_compile_execution_ids(self, conn):
+                return set()
+
+            def _collect_compile_receipt(self, conn, **kwargs):
+                return {
+                    "schema_version": 1,
+                    "status": "Verified",
+                    "sample": len(getattr(self, "receipts", [])) + 1,
+                }
+
+        executor = Executor()
+        executor.receipts = []
+        result = executor._run_query(
+            object(),
+            QueryDef(id="failure", file=Path("failure.sql"), sql="SELECT 1"),
+            Validator(),
+        )
+        self.assertEqual(len(result.samples_ms), 2)
+        self.assertTrue(all(sample >= 0 for sample in result.samples_ms))
+        self.assertEqual(len(result.receipt_associations), 2)
+        self.assertEqual(result.receipt_associations[0]["status"], "Verified")
+        self.assertEqual(result.receipt_associations[1]["status"], "Uncovered")
+        self.assertIn("second sample failed", result.error or "")
+
     def test_receipt_collector_ignores_its_own_introspection_execution(self) -> None:
         columns = [
             "name", "kind", "last_elapsed_us", "metric_value", "metric_unit",
@@ -190,15 +243,121 @@ class RunOutputTests(unittest.TestCase):
                 {"q11--control", "q11--probe"},
             )
 
+    def test_registration_seal_and_unregistered_cell_writes_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="sealed")
+            run.register_cell(
+                cell_id="q--control",
+                query_cases=1,
+                sample_rows=1,
+                product_receipts=1,
+                query_case="q",
+                arm_id="control",
+            )
+            run.registration.seal()
+            with self.assertRaises(RunOutputError):
+                run.register_cell(
+                    cell_id="q--probe",
+                    query_cases=1,
+                    sample_rows=1,
+                    product_receipts=1,
+                    query_case="q",
+                    arm_id="probe",
+                )
+            with self.assertRaises(RunOutputError):
+                run.cell_writer(query_case="missing", arm_id="control", root=run.root)
+
+    def test_replacement_is_charged_as_final_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="replace")
+            run.register_cell(
+                cell_id="q--control",
+                query_cases=1,
+                sample_rows=4,
+                product_receipts=4,
+                query_case="q",
+                arm_id="control",
+            )
+            attempt = run.begin_attempt("source", query_case="q", arm_id="control")
+            writer = attempt.cell_writer()
+            writer.write_text("payload.txt", "x" * 100)
+            writer.write_text("payload.txt", "y" * 7, overwrite=True)
+            registration = run._manifest["registration"]
+            cell = registration["cells"][0]
+            self.assertEqual(cell["written_bytes"], 7)
+            self.assertEqual(registration["written_bytes"], 7)
+
+    def test_publication_failure_becomes_explicit_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="publication")
+            run.register_cell(
+                cell_id="q--control",
+                query_cases=1,
+                sample_rows=1,
+                product_receipts=1,
+                query_case="q",
+                arm_id="control",
+            )
+            attempt = run.begin_attempt("source", query_case="q", arm_id="control")
+            original_persist = run._persist_manifest
+
+            def fail_persist() -> None:
+                raise OSError("manifest filesystem failure")
+
+            run._persist_manifest = fail_persist  # type: ignore[method-assign]
+            with self.assertRaises(OSError):
+                attempt.cell_writer().write_text("payload.txt", "payload")
+            marker = json.loads(
+                (run.root / "publication-unknown.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["status"], "PublicationUnknown")
+            self.assertEqual(run._manifest["status"], "Incomplete")
+            self.assertEqual(
+                run._manifest["registration"]["status"], "PublicationUnknown"
+            )
+            run._persist_manifest = original_persist  # type: ignore[method-assign]
+
+    def test_concurrent_cell_writers_share_one_capacity_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="parallel")
+            run.register_cell(
+                cell_id="q--control",
+                query_cases=1,
+                sample_rows=32,
+                product_receipts=32,
+                query_case="q",
+                arm_id="control",
+            )
+            attempt = run.begin_attempt("source", query_case="q", arm_id="control")
+
+            def publish(index: int) -> Path:
+                return attempt.cell_writer().write_text(f"payload-{index}.txt", "x" * 9)
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                paths = list(executor.map(publish, range(32)))
+            self.assertEqual(len(paths), 32)
+            self.assertTrue(all(path.exists() for path in paths))
+            self.assertEqual(run._manifest["registration"]["written_bytes"], 32 * 9)
+
     def test_actual_utf8_writer_quota_preserves_existing_output_and_terminal_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = RunOutput.create(Path(tmp), run_id="quota")
+            run.register_cell(
+                cell_id="quota--control",
+                query_cases=1,
+                sample_rows=2,
+                product_receipts=1,
+                query_case="quota",
+                arm_id="control",
+            )
+            attempt = run.begin_attempt("quota-source", query_case="quota", arm_id="control")
+            writer = attempt.cell_writer()
             run._manifest["registration"]["total_limit_bytes"] = 256
-            run.write_text(run.root / "kept.txt", "ok")
+            writer.write_text("kept.txt", "ok")
             with self.assertRaises(RunOutputError):
-                run.write_text(run.root / "too-large.txt", "汉字" * 200)
-            self.assertTrue((run.root / "kept.txt").exists())
-            self.assertFalse((run.root / "too-large.txt").exists())
+                writer.write_text("too-large.txt", "汉字" * 200)
+            self.assertTrue((attempt.root / "kept.txt").exists())
+            self.assertFalse((attempt.root / "too-large.txt").exists())
             manifest = json.loads((run.root / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "Incomplete")
             self.assertEqual(manifest["registration"]["status"], "CapacityExceeded")
