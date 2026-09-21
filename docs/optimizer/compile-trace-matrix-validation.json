@@ -66,6 +66,18 @@
       },
       "consumer": "shared Python v3 validator",
       "full_campaign": "not_run"
+    },
+    "cold_planning_collector_smoke": {
+      "status": "failed_before_sql",
+      "reason": "owned release server exited before the collector could issue EXPLAIN",
+      "run_roots": [
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-2-run",
+        "/tmp/paro-compile-evidence-v3-cold-select1-report-3-run"
+      ],
+      "terminal": "Incomplete",
+      "producer_output": "not_reached",
+      "normal_cell": "not_run"
     }
   },
   "not_certified": [
@@ -76,6 +88,7 @@
     "SQL expected-file parity",
     "typed physical identity for cross-run association",
     "full real producer-to-gate Detail campaign",
+    "successful benchmark cold-planning producer cell",
     "current clean workspace validation",
     "full Trace Matrix Detail producer coverage"
   ]

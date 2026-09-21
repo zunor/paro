@@ -131,6 +131,13 @@ Detail fixtures. Their SHA-256 values and the bounded evidence directory are
 recorded in `compile-trace-matrix-validation.json`; this remains a targeted
 smoke, not a complete campaign.
 
+The shared `cold_planning.py` collector was also exercised with the pinned
+release build and an immutable seed. Its owned server exited before SQL
+execution, and the collector preserved three bounded `Incomplete` RunOutput
+trees rather than emitting a success or inventing a compile receipt. This is
+useful failure-path evidence, not a successful benchmark cell; a working
+cold-planning producer-to-gate cell and a normal cell remain uncovered.
+
 The historical verification run completed the workspace tests, strict Clippy,
 benchmark unit tests, and the high-file-descriptor SQL regress harness without
 changing expected files. A new full validation is not claimed by this working
