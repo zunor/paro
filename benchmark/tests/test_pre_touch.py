@@ -65,7 +65,7 @@ class PreTouchTests(unittest.TestCase):
         evidence = collect_statement_cache_evidence(
             connection, 'SELECT 1', before_execution_ids=set())
         self.assertEqual(evidence['occurrence'], 9)
-        self.assertTrue(evidence['cache_hit'])
+        self.assertEqual(evidence['compilation'], 'CacheHit')
         with self.assertRaises(AssertionError):
             require_first_target_miss(evidence, 'SELECT 1')
 
@@ -106,10 +106,10 @@ class PreTouchTests(unittest.TestCase):
         self.assertIsNone(read_pre_touch(None))
 
     def test_target_cache_gate_cannot_be_relaxed(self):
-        good = dict(status='Verified', occurrence=9, cache_hit=False,
+        good = dict(status='Verified', occurrence=9, compilation='Executed',
                     query_fingerprint=statement_fingerprint('SELECT 2'))
         require_first_target_miss(good, 'SELECT 2')
-        for change in [dict(cache_hit=True), dict(status='uncovered'),
+        for change in [dict(compilation='CacheHit'), dict(status='uncovered'),
                        dict(status='Uncovered'), dict(query_fingerprint=0)]:
             with self.assertRaises(AssertionError):
                 require_first_target_miss(good | change, 'SELECT 2')

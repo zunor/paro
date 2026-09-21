@@ -165,7 +165,7 @@ def read_pre_touch(path: Path | None, repetitions: int = 1) -> dict[str, Any] | 
 
 def require_first_target_miss(evidence: dict[str, Any], query: str) -> None:
     if (evidence.get("status") != "Verified"
-            or evidence.get("cache_hit") is not False
+            or evidence.get("compilation") != "Executed"
             or evidence.get("query_fingerprint") != statement_fingerprint(query)):
         raise AssertionError("pre-touch did not produce an exact target cache miss")
 

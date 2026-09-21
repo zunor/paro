@@ -104,7 +104,7 @@ class CompileWorkEvidenceTest(unittest.TestCase):
         connection = types.SimpleNamespace(cursor=lambda: Cursor(rows))
         evidence = collect_statement_cache_evidence(connection, query, before_execution_ids={14})
         self.assertEqual(evidence["status"], "Verified")
-        self.assertEqual(evidence["compile_work"], {"optimizer_elapsed_us": 17})
+        self.assertEqual(evidence["compile"]["raw"], {"optimizer_elapsed_us": 17})
         self.assertEqual(evidence["statement_decision_id"], 11)
         self.assertEqual(evidence["execution_id"], 12)
 
