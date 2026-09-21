@@ -12,7 +12,8 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
 use paro_context::{
-    ArtifactIdentity, CompileEnvironmentKey, CompileReceiptSummary, StatementContext,
+    ArtifactIdentity, CompileEnvironmentKey, CompileReceiptSummary, CompiledArtifactId,
+    PlanStructureId, StatementContext,
 };
 use paro_optimizer::physical::{
     Fingerprint, PhysicalNodeKind, SearchSourceSpec, StableFingerprintBuilder,
@@ -307,9 +308,9 @@ fn artifact_identity(
     artifact.write_fingerprint(dependency_fingerprint);
     let artifact_fingerprint = artifact.finish();
     ArtifactIdentity {
-        schema_version: 1,
-        artifact: fingerprint_words(artifact_fingerprint),
-        structure: fingerprint_words(structure_fingerprint),
+        schema_version: paro_context::compile_diagnostics::IDENTITY_SCHEMA_VERSION,
+        artifact: CompiledArtifactId(fingerprint_words(artifact_fingerprint)),
+        structure: PlanStructureId(fingerprint_words(structure_fingerprint)),
         dependencies: fingerprint_words(dependency_fingerprint),
     }
 }

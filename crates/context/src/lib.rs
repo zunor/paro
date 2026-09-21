@@ -38,8 +38,9 @@ pub use attached_databases::{
     DatabaseSnapshotIdentity,
 };
 pub use compile_diagnostics::{
-    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt,
-    ExecutionTerminal, MemoryCompletionReceipt, ResourceReceipt, RECEIPT_SCHEMA_VERSION,
+    AdmissionFallback, AdmissionResult, ArtifactIdentity, CompiledArtifactId, ExecutionImageStatus,
+    ExecutionReceipt, ExecutionReceiptId, ExecutionTerminal, MemoryCompletionReceipt,
+    PlanStructureId, ResourceReceipt, RECEIPT_SCHEMA_VERSION,
 };
 pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
 pub use diagnostic_environment::{

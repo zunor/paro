@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const SCHEMA_VERSION: u32 = 2;
+/// The only current Compile Evidence wire/schema version. Older documents are
+/// historical artifacts and are intentionally rejected by every current
+/// reader; there is no compatibility decoder in the producer path.
+pub const SCHEMA_VERSION: u32 = 3;
 pub const ENCODED_LIMIT: usize = 200_000;
 pub const RETAINED_LIMIT: usize = 1 << 20;
 pub const PROCESS_LIMIT: usize = 64 << 20;
@@ -15,7 +18,8 @@ pub const MAX_CAPTURES: usize = 8;
 pub const MAX_RULES: usize = 64;
 pub const MAX_VARIANTS: usize = 16;
 pub const MAX_DETAIL_EVENTS: usize = 2_048;
-pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const RECEIPT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+pub const IDENTITY_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 // Includes fixed recorder, encoder workspace, vector and protocol copy headroom.
 const RESERVATION: usize = 2 << 20;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -167,6 +171,8 @@ pub enum DetailEvent {
     },
     CandidateChild {
         source_sequence: u64,
+        parent_event_id: u64,
+        ordinal: u32,
         event_time_us: u64,
         stage: u8,
         candidate: Option<CandidateRef>,
@@ -176,6 +182,8 @@ pub enum DetailEvent {
     },
     Fact {
         source_sequence: u64,
+        parent_event_id: u64,
+        ordinal: u32,
         event_time_us: u64,
         candidate: Option<CandidateRef>,
         group: MemoGroupRef,
@@ -297,10 +305,31 @@ pub enum ArtifactStatus {
 #[serde(deny_unknown_fields)]
 pub struct ArtifactIdentity {
     pub schema_version: u32,
-    pub artifact: [u64; 2],
-    pub structure: [u64; 2],
+    pub artifact: CompiledArtifactId,
+    pub structure: PlanStructureId,
     pub dependencies: [u64; 2],
 }
+
+/// Stable structural identity of a compiled physical plan. This is a typed
+/// identity boundary; it is not a display fingerprint and never contains an
+/// arena index, pointer, wall-clock value, cost or search-order coordinate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct PlanStructureId(pub [u64; 2]);
+
+/// Identity of the immutable compiled artifact, including its structure and
+/// dependency contract. The value is separate from the execution/admission
+/// identity of a later invocation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct CompiledArtifactId(pub [u64; 2]);
+
+/// Session-monotonic identity of one actual admission/execution receipt.
+/// This is deliberately distinct from cache occurrences and from the
+/// artifact identity; its transparent wire representation remains a u64.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct ExecutionReceiptId(pub u64);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -381,7 +410,7 @@ pub struct ResourceReceipt {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionReceipt {
     pub schema_version: u32,
-    pub execution_id: u64,
+    pub execution_id: ExecutionReceiptId,
     pub statement_decision_id: Option<u64>,
     pub artifact_identity: ArtifactIdentity,
     pub expected_class: Option<u32>,

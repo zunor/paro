@@ -11,12 +11,28 @@ from typing import Any
 from .run_output import SUMMARY_LIMIT_BYTES
 
 
-RECEIPT_ASSOCIATION_SCHEMA_VERSION = 1
-COMPILE_DOCUMENT_SCHEMA_VERSION = 2
+# One current producer/consumer contract. Historical v1/v2/v5 documents are
+# archival evidence and are intentionally rejected by this reader.
+EVIDENCE_SCHEMA_VERSION = 3
+RECEIPT_ASSOCIATION_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+COMPILE_DOCUMENT_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+BENCHMARK_CELL_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+OWNERSHIP_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 
 
 class ReceiptContractError(ValueError):
     """A result contains a malformed identity or admission association."""
+
+
+def uncovered_receipt(reason: str) -> dict[str, Any]:
+    """Create the only valid negative receipt for the current contract."""
+    if not isinstance(reason, str) or not reason:
+        raise ReceiptContractError("Uncovered receipt requires a reason")
+    return {
+        "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+        "status": "Uncovered",
+        "reason": reason,
+    }
 
 
 def validate_compile_document(value: Any, *, require_analyze: bool = False) -> str:
@@ -57,6 +73,11 @@ def validate_compile_document(value: Any, *, require_analyze: bool = False) -> s
         raise ReceiptContractError("compile document has unknown cache state")
     if value["outcome"] == "Success" and value["artifact"] != "CompiledArtifactReady":
         raise ReceiptContractError("successful compile lacks a ready artifact")
+    identity = value.get("artifact_identity")
+    if isinstance(identity, dict) and set(identity) == {"Observed"}:
+        identity = identity["Observed"]
+    if value["outcome"] == "Success":
+        _validate_identity(identity)
     execution = value["execution"]
     if execution not in {"NotExecuted", "Observed"} and not (
         isinstance(execution, dict) and ("Observed" in execution or "Uncovered" in execution)
@@ -64,7 +85,7 @@ def validate_compile_document(value: Any, *, require_analyze: bool = False) -> s
         raise ReceiptContractError("compile document has invalid execution observation")
     receipt = value.get("execution_receipt")
     if receipt is not None:
-        if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        if not isinstance(receipt, dict) or receipt.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
             raise ReceiptContractError("compile document has invalid execution receipt")
         terminal = receipt.get("terminal")
         if terminal not in {"NotExecuted", "Running", "Completed", "Failed", "Cancelled", "Dropped"}:
@@ -414,7 +435,7 @@ def _validate_execution_producer_record(
     identity: dict[str, Any],
     selection: dict[str, Any],
 ) -> None:
-    if raw.get("schema_version") != 1:
+    if raw.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
         raise ReceiptContractError("unsupported execution receipt schema version")
     if raw.get("execution_id") != execution_id:
         raise ReceiptContractError("producer execution id differs from association")
@@ -437,18 +458,29 @@ def _validate_execution_producer_record(
 def validate_benchmark_payload(payload: dict[str, Any], *, require_receipts: bool = False) -> None:
     if not isinstance(payload, dict):
         raise ReceiptContractError("benchmark payload must be an object")
-    if payload.get("version") != 3:
+    if payload.get("version") != BENCHMARK_CELL_SCHEMA_VERSION:
         raise ReceiptContractError("benchmark payload must use schema version 3")
     ownership = payload.get("ownership")
-    if not isinstance(ownership, dict) or ownership.get("schema_version") != 1:
+    if not isinstance(ownership, dict) or ownership.get("schema_version") != OWNERSHIP_SCHEMA_VERSION:
         raise ReceiptContractError("benchmark payload lacks ownership schema")
+    if payload.get("schema_version") != BENCHMARK_CELL_SCHEMA_VERSION:
+        raise ReceiptContractError("benchmark payload lacks the current cell schema")
     for field in ("campaign_id", "run_id"):
         if not isinstance(ownership.get(field), str) or not ownership[field]:
             raise ReceiptContractError(f"benchmark payload lacks ownership {field}")
     for field in ("query_case", "arm_id"):
         if not isinstance(ownership.get(field), str) or not ownership[field]:
             raise ReceiptContractError(f"benchmark payload lacks cell ownership {field}")
+    sample_ids = ownership.get("sample_ids")
+    if (
+        not isinstance(sample_ids, list)
+        or not sample_ids
+        or len(set(sample_ids)) != len(sample_ids)
+        or any(not isinstance(sample_id, str) or not sample_id for sample_id in sample_ids)
+    ):
+        raise ReceiptContractError("benchmark payload lacks unique sample_ids")
     queries = 0
+    receipt_sample_ids: list[str] = []
     for workload in payload.get("workloads", []):
         if not isinstance(workload, dict):
             raise ReceiptContractError("workload entry must be an object")
@@ -467,12 +499,38 @@ def validate_benchmark_payload(payload: dict[str, Any], *, require_receipts: boo
                 statuses = [validate_receipt_association(receipt) for receipt in receipts]
             else:
                 statuses = [validate_receipt_association(query.get("compile_receipt"))]
+            for receipt in (
+                query.get("compile_receipts")
+                if isinstance(query.get("compile_receipts"), list)
+                else [query.get("compile_receipt")]
+            ):
+                if not isinstance(receipt, dict):
+                    raise ReceiptContractError("cell receipt must be an object")
+                sample_id = receipt.get("sample_id")
+                if (
+                    not isinstance(sample_id, str)
+                    or not sample_id
+                    or receipt.get("query_case") != ownership["query_case"]
+                    or receipt.get("arm_id") != ownership["arm_id"]
+                ):
+                    raise ReceiptContractError(
+                        "cell receipt lacks its query_case/arm_id/sample_id binding"
+                    )
+                receipt_sample_ids.append(sample_id)
             if require_receipts and any(status != "Verified" for status in statuses):
                 raise ReceiptContractError(
                     f"query {query.get('id', '<unknown>')} lacks verified per-sample receipts"
                 )
     if queries == 0:
         raise ReceiptContractError("benchmark payload contains no query cells")
+    if (
+        len(receipt_sample_ids) != len(ownership["sample_ids"])
+        or len(set(receipt_sample_ids)) != len(receipt_sample_ids)
+        or set(receipt_sample_ids) != set(ownership["sample_ids"])
+    ):
+        raise ReceiptContractError(
+            "cell receipts must bind exactly once to every registered sample_id"
+        )
 
 
 def build_benchmark_cell_payload(
@@ -486,6 +544,7 @@ def build_benchmark_cell_payload(
     compile_receipts: list[dict[str, Any]],
     source_id: str | None = None,
     attempt_id: str | None = None,
+    sample_ids: list[str] | None = None,
     require_receipts: bool = False,
 ) -> dict[str, Any]:
     """Build the one cell envelope consumed by all benchmark readers.
@@ -498,25 +557,47 @@ def build_benchmark_cell_payload(
     """
     if not isinstance(compile_receipts, list) or not compile_receipts:
         raise ReceiptContractError("cell payload requires an explicit receipt list")
+    if sample_ids is None:
+        sample_ids = [
+            f"{query_case}-sample-{index:04d}"
+            for index in range(len(compile_receipts))
+        ]
+    if len(sample_ids) != len(compile_receipts) or len(set(sample_ids)) != len(sample_ids):
+        raise ReceiptContractError("sample_ids must have one unique id per receipt")
+    bound_receipts: list[dict[str, Any]] = []
+    for sample_id, receipt in zip(sample_ids, compile_receipts, strict=True):
+        if not isinstance(receipt, dict):
+            raise ReceiptContractError("cell receipt must be an object")
+        bound = dict(receipt)
+        for key, value in (
+            ("sample_id", sample_id),
+            ("query_case", query_case),
+            ("arm_id", arm_id),
+        ):
+            if key in bound and bound[key] != value:
+                raise ReceiptContractError(f"receipt {key} disagrees with cell identity")
+            bound[key] = value
+        bound_receipts.append(bound)
     payload = {
-        "version": 3,
+        "version": BENCHMARK_CELL_SCHEMA_VERSION,
         "ownership": {
-            "schema_version": 1,
+            "schema_version": OWNERSHIP_SCHEMA_VERSION,
             "campaign_id": campaign_id,
             "run_id": run_id,
             "source_id": source_id,
             "attempt_id": attempt_id,
             "query_case": query_case,
             "arm_id": arm_id,
+            "sample_ids": list(sample_ids),
         },
         "workloads": [{
             "name": workload_name,
             "queries": [{
                 "id": query_case,
-                "compile_receipts": compile_receipts,
+                    "compile_receipts": bound_receipts,
             }],
         }],
-        "schema_version": 1,
+        "schema_version": BENCHMARK_CELL_SCHEMA_VERSION,
         "query": query_payload,
     }
     validate_benchmark_payload(payload, require_receipts=require_receipts)
@@ -541,7 +622,7 @@ def _validate_identity(identity: Any) -> None:
     if (
         not isinstance(identity["schema_version"], int)
         or isinstance(identity["schema_version"], bool)
-        or identity["schema_version"] != 1
+        or identity["schema_version"] != EVIDENCE_SCHEMA_VERSION
     ):
         raise ReceiptContractError("artifact identity has an invalid schema version")
     for key in ("artifact", "structure", "dependencies"):
@@ -565,7 +646,7 @@ def _validate_receipt_fields(value: Any, *, required_identity: bool) -> dict[str
 def _validate_compile_receipt(value: Any, identity: dict[str, Any]) -> None:
     if not isinstance(value, dict):
         raise ReceiptContractError("verified association lacks the immutable compile receipt")
-    if value.get("schema_version") != 1:
+    if value.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
         raise ReceiptContractError("unsupported compile receipt schema version")
     if value.get("artifact_identity") != identity:
         raise ReceiptContractError("compile receipt identity differs from the artifact")

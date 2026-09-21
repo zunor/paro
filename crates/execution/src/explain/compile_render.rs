@@ -5,7 +5,7 @@
 use paro_context::compile_diagnostics::{
     CompileRecord, ExecutionReceipt, SealedCompileCapture, ENCODED_LIMIT,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
 struct LimitedWriter(Vec<u8>);
@@ -150,12 +150,56 @@ pub fn validate_json(
         return Err("schema/capacity profile mismatch".into());
     }
     let mut source_sequences = BTreeMap::<&'static str, u64>::new();
+    let candidate_event_ids: BTreeSet<u64> = r
+        .detail
+        .iter()
+        .filter_map(|event| match event {
+            DetailEvent::Candidate {
+                source_sequence, ..
+            } => Some(*source_sequence),
+            _ => None,
+        })
+        .collect();
+    let mut child_ordinals = BTreeSet::new();
+    let mut fact_ordinals = BTreeSet::new();
     for event in &r.detail {
         let stream = event.stream_name();
         if let Some(previous) = source_sequences.insert(stream, event.source_sequence()) {
             if event.source_sequence() <= previous {
                 return Err("detail source sequence is unordered".into());
             }
+        }
+        match event {
+            DetailEvent::CandidateChild {
+                parent_event_id,
+                ordinal,
+                ..
+            } => {
+                if !candidate_event_ids.contains(parent_event_id) {
+                    return Err("candidate child references an unknown parent event".into());
+                }
+                if !child_ordinals.insert((*parent_event_id, *ordinal)) {
+                    return Err("candidate child ordinal is not unique for its parent".into());
+                }
+            }
+            DetailEvent::Fact {
+                parent_event_id,
+                ordinal,
+                ..
+            } => {
+                if !candidate_event_ids.contains(parent_event_id) {
+                    return Err("fact references an unknown parent event".into());
+                }
+                if !fact_ordinals.insert((*parent_event_id, *ordinal)) {
+                    return Err("fact ordinal is not unique for its parent".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Observation::Observed(identity) = r.artifact_identity {
+        if identity.schema_version != IDENTITY_SCHEMA_VERSION {
+            return Err("compile artifact uses an unsupported identity schema".into());
         }
     }
     if let Some(execution) = &r.execution_receipt {
@@ -164,6 +208,11 @@ pub fn validate_json(
             || r.artifact_identity != Observation::Observed(execution.artifact_identity)
         {
             return Err("execution receipt is not bound to the sealed compile artifact".into());
+        }
+        if execution.artifact_identity.schema_version
+            != paro_context::compile_diagnostics::IDENTITY_SCHEMA_VERSION
+        {
+            return Err("execution receipt uses an unsupported artifact identity schema".into());
         }
         if execution.admission == AdmissionResult::Selected
             && (execution.actual_class.is_none()
@@ -369,7 +418,7 @@ mod tests {
         validate_json(json.as_bytes()).unwrap();
         assert!(validate_json(json.replace("NotExecuted", "NotApplicable").as_bytes()).is_err());
         assert!(validate_json(
-            json.replace("\"schema_version\":2", "\"schema_version\":1")
+            json.replace("\"schema_version\":3", "\"schema_version\":2")
                 .as_bytes()
         )
         .is_err());
@@ -384,6 +433,73 @@ mod tests {
             r.variant_count = paro_context::compile_diagnostics::Observation::Observed(1)
         });
         assert!(validate_json(render(&invalid.seal(), true).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn detail_streams_use_owned_sequences_and_typed_parent_ordinals() {
+        use paro_context::compile_diagnostics::*;
+
+        let capture = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
+        capture.detail(DetailEvent::Candidate {
+            source_sequence: 10,
+            event_time_us: 11,
+            stage: 2,
+            group: MemoGroupRef(1),
+            goal: None,
+            candidate: Some(CandidateRef(7)),
+            source: None,
+            source_child: None,
+            logical: None,
+            physical: None,
+            recipe: None,
+            rule: None,
+            expected_cost_bits: None,
+            upper_cost_bits: None,
+        });
+        capture.detail(DetailEvent::CandidateChild {
+            source_sequence: 0,
+            parent_event_id: 10,
+            ordinal: 0,
+            event_time_us: 12,
+            stage: 2,
+            candidate: Some(CandidateRef(7)),
+            child_group: MemoGroupRef(2),
+            child_candidate: CandidateRef(8),
+            goal: GoalRef {
+                required: 3,
+                grant: 4,
+                context: 5,
+            },
+        });
+        capture.detail(DetailEvent::Fact {
+            source_sequence: 0,
+            parent_event_id: 10,
+            ordinal: 0,
+            event_time_us: 13,
+            candidate: Some(CandidateRef(7)),
+            group: MemoGroupRef(1),
+            logical_fact: FingerprintRef([6, 7]),
+            statistics_snapshot: FingerprintRef([8, 9]),
+        });
+        let json = render(&capture.seal(), true);
+        validate_json(json.as_bytes()).unwrap();
+
+        let mut invalid: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let detail = invalid
+            .get_mut("detail")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        detail[1]["data"]["parent_event_id"] = serde_json::json!(999);
+        assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
+
+        let mut invalid: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let detail = invalid
+            .get_mut("detail")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        detail[1]["data"]["ordinal"] = serde_json::json!(0);
+        detail.push(detail[1].clone());
+        assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
     }
 
     #[test]
@@ -423,9 +539,9 @@ mod tests {
         use paro_context::compile_diagnostics::*;
 
         let identity = ArtifactIdentity {
-            schema_version: 1,
-            artifact: [1, 2],
-            structure: [3, 4],
+            schema_version: IDENTITY_SCHEMA_VERSION,
+            artifact: CompiledArtifactId([1, 2]),
+            structure: PlanStructureId([3, 4]),
             dependencies: [5, 6],
         };
         let resources = ResourceReceipt {
@@ -439,7 +555,7 @@ mod tests {
         };
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
-            execution_id: 7,
+            execution_id: ExecutionReceiptId(7),
             statement_decision_id: Some(4),
             artifact_identity: identity,
             expected_class: Some(2),
@@ -519,14 +635,14 @@ mod tests {
         use paro_context::compile_diagnostics::*;
 
         let identity = ArtifactIdentity {
-            schema_version: 1,
-            artifact: [101, 102],
-            structure: [103, 104],
+            schema_version: IDENTITY_SCHEMA_VERSION,
+            artifact: CompiledArtifactId([101, 102]),
+            structure: PlanStructureId([103, 104]),
             dependencies: [105, 106],
         };
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
-            execution_id: 99,
+            execution_id: ExecutionReceiptId(99),
             statement_decision_id: Some(7),
             artifact_identity: identity,
             expected_class: Some(2),

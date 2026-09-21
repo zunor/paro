@@ -8,12 +8,12 @@ use std::sync::{Arc, RwLock};
 
 use crate::compile_diagnostics::{
     AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt,
-    ExecutionTerminal, LoweringStatus, Observation, ResourceReceipt, ResourceReservationStatus,
-    SearchStop, RECEIPT_SCHEMA_VERSION,
+    ExecutionReceiptId, ExecutionTerminal, LoweringStatus, Observation, ResourceReceipt,
+    ResourceReservationStatus, SearchStop, RECEIPT_SCHEMA_VERSION,
 };
 use crate::StatementTraceSnapshot;
 
-pub const COMPILE_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const COMPILE_RECEIPT_SCHEMA_VERSION: u32 = crate::compile_diagnostics::SCHEMA_VERSION;
 const MAX_ACTIVE_EXECUTION_RECEIPTS: usize = 256;
 const MAX_ACTIVE_STATEMENT_DECISIONS: usize = 256;
 
@@ -333,7 +333,7 @@ impl SessionDiagnostics {
         let statement_decision_id = start.statement_decision_id;
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
-            execution_id,
+            execution_id: ExecutionReceiptId(execution_id),
             statement_decision_id,
             artifact_identity: start.artifact_identity,
             expected_class: start.expected_class,
@@ -549,7 +549,7 @@ impl SessionDiagnostics {
             .read()
             .unwrap()
             .iter()
-            .find(|receipt| receipt.execution_id == execution_id)
+            .find(|receipt| receipt.execution_id == ExecutionReceiptId(execution_id))
             .cloned()
     }
 
@@ -716,9 +716,9 @@ mod tests {
     fn execution_receipt_only_changes_at_a_real_terminal() {
         let diagnostics = Arc::new(SessionDiagnostics::default());
         let identity = ArtifactIdentity {
-            schema_version: 1,
-            artifact: [1, 2],
-            structure: [3, 4],
+            schema_version: crate::compile_diagnostics::IDENTITY_SCHEMA_VERSION,
+            artifact: crate::compile_diagnostics::CompiledArtifactId([1, 2]),
+            structure: crate::compile_diagnostics::PlanStructureId([3, 4]),
             dependencies: [5, 6],
         };
         let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
@@ -755,9 +755,9 @@ mod tests {
     fn selected_reservation_failure_keeps_the_real_selection() {
         let diagnostics = Arc::new(SessionDiagnostics::default());
         let identity = ArtifactIdentity {
-            schema_version: 1,
-            artifact: [21, 22],
-            structure: [23, 24],
+            schema_version: crate::compile_diagnostics::IDENTITY_SCHEMA_VERSION,
+            artifact: crate::compile_diagnostics::CompiledArtifactId([21, 22]),
+            structure: crate::compile_diagnostics::PlanStructureId([23, 24]),
             dependencies: [25, 26],
         };
         let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
@@ -801,9 +801,9 @@ mod tests {
         let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {
             statement_decision_id: None,
             artifact_identity: ArtifactIdentity {
-                schema_version: 1,
-                artifact: [41, 42],
-                structure: [43, 44],
+                schema_version: crate::compile_diagnostics::IDENTITY_SCHEMA_VERSION,
+                artifact: crate::compile_diagnostics::CompiledArtifactId([41, 42]),
+                structure: crate::compile_diagnostics::PlanStructureId([43, 44]),
                 dependencies: [45, 46],
             },
             expected_class: Some(2),
@@ -825,9 +825,9 @@ mod tests {
     fn active_receipt_capacity_is_explicit_and_does_not_grow_unboundedly() {
         let diagnostics = Arc::new(SessionDiagnostics::default());
         let identity = ArtifactIdentity {
-            schema_version: 1,
-            artifact: [1, 2],
-            structure: [3, 4],
+            schema_version: crate::compile_diagnostics::IDENTITY_SCHEMA_VERSION,
+            artifact: crate::compile_diagnostics::CompiledArtifactId([1, 2]),
+            structure: crate::compile_diagnostics::PlanStructureId([3, 4]),
             dependencies: [5, 6],
         };
         let handles: Vec<_> = (0..(MAX_ACTIVE_EXECUTION_RECEIPTS + 1))
@@ -859,9 +859,9 @@ mod tests {
             .publish_statement_cache_decision(77, false)
             .unwrap();
         let identity = ArtifactIdentity {
-            schema_version: 1,
-            artifact: [1, 2],
-            structure: [3, 4],
+            schema_version: crate::compile_diagnostics::IDENTITY_SCHEMA_VERSION,
+            artifact: crate::compile_diagnostics::CompiledArtifactId([1, 2]),
+            structure: crate::compile_diagnostics::PlanStructureId([3, 4]),
             dependencies: [5, 6],
         };
         let handles: Vec<_> = (0..MAX_ACTIVE_EXECUTION_RECEIPTS)
@@ -931,9 +931,9 @@ mod tests {
     fn dropping_one_receipt_clone_does_not_close_running_execution() {
         let diagnostics = Arc::new(SessionDiagnostics::default());
         let identity = ArtifactIdentity {
-            schema_version: 1,
-            artifact: [11, 12],
-            structure: [13, 14],
+            schema_version: crate::compile_diagnostics::IDENTITY_SCHEMA_VERSION,
+            artifact: crate::compile_diagnostics::CompiledArtifactId([11, 12]),
+            structure: crate::compile_diagnostics::PlanStructureId([13, 14]),
             dependencies: [15, 16],
         };
         let handle = diagnostics.begin_execution_receipt(ExecutionReceiptStart {

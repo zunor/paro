@@ -1159,6 +1159,12 @@ impl Optimizer {
                     BindingRef, CandidateRef, DetailEvent, FingerprintRef, GoalRef, LogicalExprRef,
                     MemoGroupRef, PhysicalExprRef, RuleRef,
                 };
+                // Child and fact records are independent producer streams.
+                // They retain the candidate event as a causal parent, but
+                // never reuse the parent's sequence as their own stream
+                // sequence.
+                let mut candidate_child_sequence = 0_u64;
+                let mut fact_sequence = 0_u64;
                 for id in extraction
                     .rule_attempts
                     .keys()
@@ -1241,9 +1247,13 @@ impl Optimizer {
                         expected_cost_bits: event.expected_cost_bits,
                         upper_cost_bits: event.upper_cost_bits,
                     });
-                    for child in &event.children {
+                    for (ordinal, child) in event.children.iter().enumerate() {
+                        let source_sequence = candidate_child_sequence;
+                        candidate_child_sequence = candidate_child_sequence.saturating_add(1);
                         capture.detail(DetailEvent::CandidateChild {
                             source_sequence,
+                            parent_event_id: event.source_sequence,
+                            ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
                             event_time_us: event.elapsed_us,
                             stage: event.stage as u8,
                             candidate: event
@@ -1258,9 +1268,13 @@ impl Optimizer {
                             },
                         });
                     }
-                    for fact in &event.facts {
+                    for (ordinal, fact) in event.facts.iter().enumerate() {
+                        let source_sequence = fact_sequence;
+                        fact_sequence = fact_sequence.saturating_add(1);
                         capture.detail(DetailEvent::Fact {
                             source_sequence,
+                            parent_event_id: event.source_sequence,
+                            ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
                             event_time_us: event.elapsed_us,
                             candidate: event
                                 .candidate
