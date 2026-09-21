@@ -188,8 +188,12 @@ behavior experiment was removed.
 
 ## Current T2/Summary-T4 validation boundary
 
-The current delivery is validated from a clean release build after the T2
-artifact/receipt, bounded Detail, and Summary-level benchmark changes.
+The historical delivery below was validated from a clean release build after
+the T2 artifact/receipt, bounded Detail, and Summary-level benchmark changes.
+The current re-op branch has since added typed quality snapshots, canonical
+physical identity, normal successful extended-Sync draining, and durable
+RunOutput publication. Those changes have their own targeted checks; they do
+not retroactively turn this historical snapshot into a full campaign result.
 Workspace check and strict all-target Clippy pass; the benchmark suite passes
 in the pinned DuckDB 1.5.5 environment, including exclusive RunId/attempt
 ownership, retry retention, receipt identity matching, cache-hit NotExecuted

@@ -34,10 +34,23 @@ grant ordinals are not cross-run identities.
 | extended Parse/Bind/Describe/Execute | known parameter types only; Describe never executes; incomplete Bind rejects |
 | cache hit | current compilation is `NotExecuted`; receipt points to original artifact receipt |
 | forced diagnostic compile | `ForcedCompile`; does not read or populate target plan cache |
-| `DETAIL` | bounded real Memo/TaskRegistry Detail in TEXT/JSON; 8,192 retained events plus `omitted_detail`; unsupported shapes remain explicit |
+| `DETAIL` | bounded real Memo/TaskRegistry Detail in TEXT/JSON; 2,048 retained events plus `omitted_detail`; unsupported shapes remain explicit |
 | DML/DDL/utility and unsupported parameter/protocol shapes | explicit unsupported/error result |
 
 ## Benchmark ownership
+
+Benchmark output is owned by a sealed `CampaignRegistration`. Every cell is
+identified by its query case and arm and writes through its `CellWriter`; the
+control metadata uses a separate `ControlWriter`. A normal or diagnostic
+collector cannot publish a payload for an unregistered cell. Captures are
+stored once and referenced by bounded path plus SHA-256 from the cell record.
+
+The shared benchmark validator checks the Rust-owned compile document before a
+sample is eligible for a verified association. A diagnostic compile capture
+without an execution receipt is retained as `Uncovered`; it cannot be turned
+into an execution result by the collector. A capacity or publication failure
+seals the attempt as incomplete and preserves earlier samples and terminal
+metadata.
 
 Every runner/gate command allocates an exclusive `RunId` below the configured
 report root. Each source invocation is registered before work under

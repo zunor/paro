@@ -55,7 +55,7 @@ The external design source is
 This repository document records the subset implemented and tested in the
 current re-op; it must not be read as `TraceMatrixReady`.
 
-## Final re-op validation snapshot
+## Historical validation snapshot
 
 The implementation gate was validated from clean-source commit
 `4f6786a65abcd9c4da8fd5de71aa57abb13d6d68` with the pinned DuckDB 1.5.5
@@ -82,3 +82,29 @@ The validation manifest is
 [`compile-trace-matrix-validation.json`](compile-trace-matrix-validation.json).
 It records the exact support boundary and deliberately leaves full Matrix,
 C2, F2, and performance claims uncertified.
+
+The later re-op commits are intentionally not folded into this table without
+a new clean validation manifest. Typed quality-detail export, canonical
+physical identity, successful extended-Sync draining, and durable RunOutput
+publication have targeted checks only; they do not retroactively certify this
+historical workspace/benchmark/regress snapshot.
+
+## Compile Evidence v2 convergence work
+
+The current re-op follow-up keeps the same ownership boundary for normal and
+diagnostic output. Corpus cells are emitted through the shared typed receipt
+contract and are owned by an explicit `QueryCase x ArmId` registration. Raw
+typed `EXPLAIN (COMPILE)` captures are written once under the owning run and
+the cell payload keeps only a bounded path, schema version, and content hash.
+Readers resolve and verify that reference before validating the Rust-owned
+document; a missing or mismatched capture is `Uncovered`, not a successful
+sample.
+
+Candidate and transformation-task Detail records now retain producer sequence
+numbers. The exporter no longer assigns source order with `enumerate()`, so
+omitted records remain represented by the producer-side omission accounting.
+
+The targeted contract tests and workspace check cover this follow-up. A fresh
+clean-source campaign, full SQL regression, strict Clippy run, and complete
+Trace Matrix gate remain required before this document can claim
+`TraceMatrixReady`, C2, F2, or a performance result.
