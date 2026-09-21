@@ -1,12 +1,21 @@
-# Bounded compile Summary and execution association (T2/T4)
+# Compile Evidence v3 Summary and execution association
 
 This is the bounded compile/execution contract, not C2/F2 admission or a
 latency claim. Existing search, grant, verification and behavior-experiment
 defaults are unchanged. Bounded Detail is delivered for the supported SQL
 COMPILE shapes; full Trace Matrix coverage is not claimed.
-The authoritative wire document is `context::compile_diagnostics::CompileDocument`;
-the renderer and validator share its Summary/Unavailable variants and schema
-version 2. Version 1 artifacts remain historical evidence, not current input.
+The authoritative current wire document is
+`context::compile_diagnostics::CompileDocument`, schema version **3**. Rust
+typed records are the semantic source; the JSON renderer, benchmark validator,
+RunOutput and gates reject v1/v2/v5 input rather than silently migrating it.
+Historical files remain opaque evidence and are never reopened by current
+readers. The v3 identity tuple separates `PlanStructureId`,
+`CompiledArtifactId` and `ExecutionReceiptId`; none is an arena id, occurrence,
+display hash or grant ordinal. The physical identity migration is not yet
+certified: several plan/spec/property payloads still use a Debug-derived
+fallback in the current working tree, so this document does not claim a stable
+cross-run `PlanStructureId` until that fallback is replaced by explicit typed
+binary encoding.
 
 ## SQL and support boundary
 
@@ -35,7 +44,7 @@ and rejects incomplete parameter environments rather than inventing values.
 | legacy EXPLAIN syntax | unchanged |
 | source-build/catalog receipt and parse time | Uncovered, never guessed |
 | actual admission/execution | attached only by the real ANALYZE execution receipt; otherwise NotExecuted |
-| response-terminal measurement | Uncovered until the response boundary (T2) |
+| response-terminal measurement | Uncovered until the response boundary |
 
 Unknown options, duplicates, conflicting FORMAT options, legacy option mixing
 and trailing FORMAT in the new syntax are rejected. Target output identity is
@@ -136,6 +145,15 @@ failure is an explicit `Uncovered` reason and does not remove a timing or slow
 sample. The run-owned output contract is documented in
 [`compile-artifact-execution-receipts.md`](compile-artifact-execution-receipts.md).
 
+TPC-DS, cold planning, D6 and attribution use the shared
+`CompileEvidenceCollector`. Normal timing remains trace-off and does not send
+EXPLAIN; diagnostic captures are separate and are joined to normal samples only
+by exact statement/artifact/execution identity. RunOutput accepts only the
+typed cell envelope, publishes bounded UTF-8 bytes under a registration lease,
+and records generation conflicts as `PublicationUnknown`. Campaign summaries
+contain references and bounded metadata, not raw Detail or a second report
+schema.
+
 ## Historical T1 validation status (before independent review)
 
 The following e1a04282-era results did not test transaction state after a
@@ -186,7 +204,7 @@ include T3 Detail; the current bounded Detail delivery and unaccepted legacy
 DiagnosticOutput/BehaviorExperiment retirement are tracked separately, and no
 behavior experiment was removed.
 
-## Current T2/Summary-T4 validation boundary
+## Current v3 validation boundary
 
 The historical delivery below was validated from a clean release build after
 the T2 artifact/receipt, bounded Detail, and Summary-level benchmark changes.
@@ -211,5 +229,8 @@ part of the fresh-directory result.
 
 This validation covers real PgWire TEXT/JSON COMPILE, known-typed extended
 parameters, one-shot ANALYZE execution, bounded Detail, receipt publication,
-and cancellation/transport ownership tests. It does not certify full Trace
-Matrix coverage, C2, F2, latency, or a 99-query performance campaign.
+and cancellation/transport ownership tests. The v3 targeted checks also cover
+old-schema rejection, producer parent/ordinal validation, RunOutput generation
+checks and the shared collector entry point. It does not certify full Trace
+Matrix coverage, C2, F2, latency, or a 99-query performance campaign. A fresh
+producer-to-gate campaign is still required before `TraceMatrixReady`.

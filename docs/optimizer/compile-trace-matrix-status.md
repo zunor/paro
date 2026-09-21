@@ -1,7 +1,8 @@
-# EXPLAIN (COMPILE) supported trace matrix
+# EXPLAIN (COMPILE) supported trace matrix — Compile Evidence v3
 
 Status: current re-op delivery. This is a support boundary and correctness
-record, not a claim that the complete optimizer Trace Matrix is ready. Search
+record, not a claim that the complete optimizer Trace Matrix is ready. The
+current producer/consumer envelope is v3; v1/v2/v5 readers reject input. Search
 policy, budget, grant selection defaults, F2 and performance targets are
 unchanged.
 
@@ -11,14 +12,15 @@ unchanged.
 | --- | --- | --- | --- |
 | simple `SELECT`/CTE `EXPLAIN (COMPILE)` TEXT | real session compiler, sealed `CompileCapture` | `crates/session/tests/explain_compile_test.rs` | Supported |
 | same document as JSON | `CompileDocument` renderer/validator | `crates/execution/src/explain/compile_render.rs` tests | Supported |
-| bounded `DETAIL` for supported SELECT/CTE | actual Memo/TaskRegistry search milestones; fixed opaque refs | session Detail test plus optimizer lifecycle-retention tests | Supported, bounded |
+| bounded `DETAIL` for supported SELECT/CTE | actual Memo/TaskRegistry search milestones; typed stream-local sequence and parent/ordinal refs | producer/renderer unit coverage; real multi-shape producer campaign pending | Targeted only; not fully certified |
 | `COMPILE, ANALYZE` | one sealed compile, real admission, one execution handle and terminal receipt | session PgWire integration and executor receipt tests | Supported |
 | extended Parse/Bind/Describe/Execute | known parameter types; Describe does not execute; incomplete Bind rejects | `prepared::extended_query` tests | Supported |
 | forced compile and cache hit | immutable compile receipt; current compile is `NotExecuted` on hit | receipt collector and contract tests | Supported |
 | selection/reservation/lowering/image/terminal | facts recorded at their real executor boundaries | execution receipt tests and typed `paro_optimizers()` rows | Supported |
 | normal benchmark sample association | exact statement/execution identity snapshot, no latest/occurrence guessing | `test_compile_work_evidence.py`, receipt contract tests | Supported; `Uncovered` is fail-closed |
-| campaign ownership | CampaignId/ArmId/QueryCase/RunId/SourceId/AttemptId; cell is QueryCase×ArmId | `test_run_output.py`, runner/gate source tests | Supported |
+| campaign ownership | CampaignId/ArmId/QueryCase/RunId/SourceId/AttemptId; cell is QueryCase×ArmId; summaries contain references only | `test_run_output.py`, runner/gate source tests | Supported, bounded |
 | bounded writer | payload, terminal-control and manifest UTF-8 limits before atomic publish | RunOutput quota and manifest-limit tests | Supported |
+| stable physical identity | intended typed structural identity boundary | current plan encoder still has a Debug-derived payload fallback | Blocked; not cross-run certified |
 
 ## Explicitly outside this boundary
 
@@ -49,6 +51,14 @@ unchanged.
 5. The run manifest and every owned result/failure/summary write are bounded
    by encoded UTF-8 bytes and published atomically. Terminal failure is never
    overwritten by a later retry.
+6. Current compile, cell and receipt documents share schema version 3. The
+   producer's Detail sequence is authoritative; Python validation is a
+   fail-closed consumer, not a second semantic producer. The physical identity
+   encoder is not certified until every identity-bearing payload uses an
+   explicit typed encoding; the current Debug fallback is an open boundary.
+7. A cell is complete only after its declared owned output/attempt state is
+   present. A result file alone is not a completion certificate; missing or
+   incompatible receipts remain `Uncovered`.
 
 The external design source is
 `/Users/linjunhong/workspace/paro-docs-design/optimizer/optimizer-trace-matrix.md`.
@@ -83,11 +93,13 @@ The validation manifest is
 It records the exact support boundary and deliberately leaves full Matrix,
 C2, F2, and performance claims uncertified.
 
-The later re-op commits are intentionally not folded into this table without
-a new clean validation manifest. Typed quality-detail export, canonical
-physical identity, successful extended-Sync draining, and durable RunOutput
-publication have targeted checks only; they do not retroactively certify this
-historical workspace/benchmark/regress snapshot.
+The later re-op commits are intentionally not folded into this historical
+table without a new clean validation manifest. This v3 work records the
+producer/consumer contract and targeted checks, but does not retroactively
+certify a complete campaign or claim `TraceMatrixReady`. In particular, the
+current working changes to the physical identity encoder remain unaccepted
+until the Debug-derived fields are replaced by typed binary encoders and the
+real producer-to-gate campaign is rerun.
 
 ## Compile Evidence v2 convergence work
 
@@ -105,15 +117,28 @@ numbers. The exporter no longer assigns source order with `enumerate()`, so
 omitted records remain represented by the producer-side omission accounting.
 
 The targeted contract tests and workspace check cover this follow-up. A fresh
-clean-source campaign, full SQL regression, strict Clippy run, and complete
-Trace Matrix gate remain required before this document can claim
-`TraceMatrixReady`, C2, F2, or a performance result.
+clean-source campaign, full SQL regression, strict Clippy run, complete Detail
+producer coverage, and the typed physical-identity boundary remain required
+before this document can claim `TraceMatrixReady`, C2, F2, or a performance
+result.
 
-The current verification run completed the workspace tests, strict Clippy,
+The historical verification run completed the workspace tests, strict Clippy,
 benchmark unit tests, and the high-file-descriptor SQL regress harness without
-changing expected files. The regress result was 177 passed and 8 existing
+changing expected files. A new full validation is not claimed by this working
+tree snapshot. The retained regress result was 177 passed and 8 existing
 failures (`agg_join_subsumption`, `agg_singleton_groups`, `explain_analyze`,
 `explain_basic`, `join_explain_advanced`, `rowset_scan_pushdown`,
 `statistics_query`, and `pgvector_topn_filter_flow`). Those failures remain
 unresolved evidence; they are not converted into a pass by the typed output
 work.
+
+## Current first blocking boundary
+
+The current Rust identity implementation still streams `Debug` formatting for
+several physical operator/specification and property payloads. The stream is
+not EXPLAIN text, but it is still presentation formatting rather than the
+required typed binary contract. Therefore the identity changes are not
+accepted as a cross-run `PlanStructureId`, and the real multi-shape
+producer-to-reader/validator campaign has not been certified. This is the
+first blocking boundary for Trace Matrix closure; no performance or C2/F2
+claim is inferred from the targeted passes.

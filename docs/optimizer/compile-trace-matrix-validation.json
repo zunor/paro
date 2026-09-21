@@ -1,13 +1,20 @@
 {
-  "schema_version": 1,
-  "source_commit": "4f6786a65abcd9c4da8fd5de71aa57abb13d6d68",
-  "scope": "T2 plus bounded T3 Detail and Summary-level T4-a/b/c/d",
+  "schema_version": 3,
+  "compile_evidence_schema_version": 3,
+  "source_commit": "49fbd05dd630add9ea33c66398adcfad6942b075",
+  "scope": "v3 producer/consumer contract, bounded Detail and Summary-level RunOutput",
+  "validation_status": "targeted_checks_only",
   "environment": {
     "duckdb_version": "1.5.5",
     "optimizer_policy_changes": false,
     "search_budget_changes": false,
     "f2_admission": "not_certified",
-    "trace_matrix_ready": false
+    "physical_identity": "blocked_debug_payload_fallback",
+    "trace_matrix_ready": false,
+    "old_schema_readers": "reject_v1_v2_v5",
+    "shared_compile_collector": true,
+    "normal_trace_mode": "off",
+    "diagnostic_detail": "separate_capture_not_part_of_normal_timing"
   },
   "gates": {
     "cargo_check_workspace_locked": "pass",
@@ -15,10 +22,11 @@
     "strict_clippy_all_targets_all_features": "pass",
     "benchmark_unittest": {
       "status": "pass",
-      "passed": 174
+      "passed": 192,
+      "skipped": 1
     },
     "sql_regress": {
-      "status": "known_differences",
+      "status": "completed_with_existing_failures",
       "passed": 177,
       "failed": 8,
       "result_mismatches": 0,
@@ -35,11 +43,27 @@
       ]
     }
   },
+  "targeted_v3_checks": {
+    "python_benchmark_tests": "pass",
+    "rust_context_execution_check": "pass",
+    "rust_optimizer_identity_check": "blocked_debug_payload_fallback",
+    "detail_parent_ordinal_validation": "added",
+    "run_output_generation_guard": "added",
+    "real_explain_compile_summary": "pass",
+    "real_explain_compile_analyze": "pass",
+    "real_pgwire_select": "pass",
+    "clean_producer_to_gate_campaign": "not_run",
+    "real_detail_shape_campaign": "not_run"
+  },
   "not_certified": [
     "full Trace Matrix coverage",
     "C2 correctness closure",
     "F2 admission",
     "Q11 or other performance target",
-    "SQL expected-file parity"
+    "SQL expected-file parity",
+    "typed physical identity for cross-run association",
+    "full real producer-to-gate Detail campaign",
+    "current clean workspace validation",
+    "full Trace Matrix Detail producer coverage"
   ]
 }
