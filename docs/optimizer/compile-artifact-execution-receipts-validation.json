@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "scope": "T2 plus Summary-level T4-a/b/c/d",
+  "tested_source": "8282841aa79318c575c3f874d8e57301797f7f1c",
+  "source_clean": true,
+  "build": {
+    "profile": "release",
+    "target": "paro-server/parod",
+    "locked": true
+  },
+  "gates": {
+    "cargo_check_workspace_all_targets_locked": "pass",
+    "cargo_clippy_workspace_all_targets_locked_d_warnings": "pass",
+    "cargo_test_workspace_locked": "pass",
+    "benchmark_unit_tests": {
+      "passed": 170,
+      "failed": 0
+    },
+    "real_pgwire_compile": {
+      "text": "pass",
+      "json": "pass",
+      "cte": "pass",
+      "known_typed_extended_parameters": "pass",
+      "analyze_single_compile_single_execution_receipt": "pass",
+      "non_analyze_admission": "NotExecuted"
+    },
+    "benchmark_receipt_smoke": {
+      "queries": 5,
+      "verified_receipts": 5,
+      "existing_plan_guard_failures": ["order/topn_large_fallback"]
+    },
+    "sql_regress_fresh_server_and_data": {
+      "passed": 177,
+      "failed": 8,
+      "skipped": 0,
+      "new_failures": 0,
+      "result_mismatches": 0,
+      "expected_files_changed": 0,
+      "failures": [
+        {"case": "aggregate/agg_join_subsumption", "class": "EXPLAIN-only plan/runtime-filter display"},
+        {"case": "aggregate/agg_singleton_groups", "class": "EXPLAIN-only plan display"},
+        {"case": "explain/explain_analyze", "class": "EXPLAIN/profiling display"},
+        {"case": "explain/explain_basic", "class": "EXPLAIN display"},
+        {"case": "join/join_explain_advanced", "class": "EXPLAIN display"},
+        {"case": "select/rowset_scan_pushdown", "class": "EXPLAIN scan/runtime-filter display"},
+        {"case": "system/statistics_query", "class": "EXPLAIN runtime-filter display"},
+        {"case": "vector/pgvector_topn_filter_flow", "class": "EXPLAIN scan-column display"}
+      ]
+    }
+  },
+  "not_run": {
+    "t3_detail": "out of scope",
+    "trace_matrix_ready": "not claimed",
+    "c2_f2": "not claimed",
+    "performance_campaign_or_baseline": "not run",
+    "99_query_performance_screen": "not run"
+  },
+  "interpretation": "Existing EXPLAIN/display differences remain failures; no SQL expected or actual was blessed."
+}

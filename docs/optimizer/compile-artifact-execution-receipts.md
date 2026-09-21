@@ -93,3 +93,6 @@ retained EXPLAIN-only failures: `agg_join_subsumption`,
 `pgvector_topn_filter_flow`. No result mismatch or expected-file update was
 accepted. The benchmark 99-query performance campaign, T3 Detail, C2 and F2
 remain outside this delivery.
+
+The machine-readable gate record is
+[`compile-artifact-execution-receipts-validation.json`](compile-artifact-execution-receipts-validation.json).
