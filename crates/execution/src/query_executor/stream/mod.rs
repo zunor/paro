@@ -15,6 +15,7 @@ use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 use paro_context::StatementCancellation;
+use paro_context::ExecutionReceiptHandle;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::query_executor::pipeline_driver::PipelineExecutionDriver;
@@ -66,6 +67,7 @@ pub struct ResultHandler {
     progress_waiter: Option<QueryOutputWaiter>,
     /// Whether the handler is closed.
     closed: bool,
+    execution_receipt: Option<ExecutionReceiptHandle>,
 }
 
 impl std::fmt::Debug for ResultHandler {
@@ -94,6 +96,7 @@ impl ResultHandler {
             query_memory_pool: None,
             progress_waiter: None,
             closed: true,
+            execution_receipt: None,
         })
     }
 
@@ -104,6 +107,24 @@ impl ResultHandler {
         execution: ProgramExecution,
         allocator: Arc<dyn Allocator>,
         query_memory_pool: Option<Arc<QueryMemoryPool>>,
+    ) -> Result<Self> {
+        Self::from_program_execution_with_receipt(
+            names,
+            types,
+            execution,
+            allocator,
+            query_memory_pool,
+            None,
+        )
+    }
+
+    pub fn from_program_execution_with_receipt(
+        names: Vec<String>,
+        types: Vec<LogicalType>,
+        execution: ProgramExecution,
+        allocator: Arc<dyn Allocator>,
+        query_memory_pool: Option<Arc<QueryMemoryPool>>,
+        execution_receipt: Option<ExecutionReceiptHandle>,
     ) -> Result<Self> {
         let output_chunk = Self::new_output_chunk(&types, allocator.clone())?;
 
@@ -137,6 +158,7 @@ impl ResultHandler {
             query_memory_pool,
             progress_waiter,
             closed: false,
+            execution_receipt,
         })
     }
 
@@ -160,7 +182,7 @@ impl ResultHandler {
             ResultOutput::FetchDriven { .. } => self.fetch_typed_streaming_output(),
             ResultOutput::Background { .. } => self.fetch_background_output(),
             ResultOutput::Closed => {
-                self.mark_closed();
+                self.mark_failed("result handler has no output source");
                 Err(paro_common::error::internal(
                     "result handler has no output source",
                 ))
@@ -193,7 +215,7 @@ impl ResultHandler {
                         .reason()
                         .unwrap_or(paro_context::StatementCancelReason::UserRequest),
                 ));
-                self.mark_closed();
+                self.mark_cancelled("background execution cancelled");
                 self.cancellation.check()?;
                 return Ok(FetchState::Exhausted);
             }
@@ -208,7 +230,11 @@ impl ResultHandler {
 
             if self.background_driver_finished()? {
                 let result = self.finish_background_driver();
-                self.mark_closed();
+                if let Err(error) = &result {
+                    self.mark_failed(error.to_string());
+                } else {
+                    self.mark_closed();
+                }
                 result?;
                 return Ok(FetchState::Exhausted);
             }
@@ -249,10 +275,31 @@ impl ResultHandler {
                 );
             }
         }
-        self.mark_closed();
+        self.mark_cancelled("result handler closed before terminal output");
     }
 
     fn mark_closed(&mut self) {
+        if let Some(receipt) = self.execution_receipt.take() {
+            receipt.complete();
+        }
+        self.closed = true;
+        self.output = ResultOutput::Closed;
+        self.detach_query_memory_pool();
+    }
+
+    pub(super) fn mark_cancelled(&mut self, error: impl Into<String>) {
+        if let Some(receipt) = self.execution_receipt.take() {
+            receipt.cancel(error);
+        }
+        self.closed = true;
+        self.output = ResultOutput::Closed;
+        self.detach_query_memory_pool();
+    }
+
+    pub(super) fn mark_failed(&mut self, error: impl Into<String>) {
+        if let Some(receipt) = self.execution_receipt.take() {
+            receipt.fail(error);
+        }
         self.closed = true;
         self.output = ResultOutput::Closed;
         self.detach_query_memory_pool();
@@ -340,6 +387,7 @@ mod tests {
             query_memory_pool: None,
             progress_waiter: None,
             closed: false,
+            execution_receipt: None,
         }
     }
 

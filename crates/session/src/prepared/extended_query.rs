@@ -18,7 +18,7 @@ use paro_execution::query_executor::compiled::{
     CompiledStatement, ExecutionRequest, ResultColumnDesc,
 };
 use paro_execution::query_executor::executor::Executor;
-use paro_parser::ast::{Expr, Statement, VariableShowStmt};
+use paro_parser::ast::{ExplainOption, Expr, Statement, VariableShowStmt};
 use paro_parser::StatementVisitor;
 use paro_planner::binder::bind::type_name::bind_logical_type;
 use std::sync::Arc;
@@ -427,6 +427,33 @@ async fn execute_bind_inner<R: ExtendedQueryResponder>(
             stmt: Box::new(statement.raw_stmt.as_ref().clone()),
             parameter_env: parameter_env.clone(),
         },
+        StatementClass::Query if compile_explain_parts(&statement.raw_stmt).is_some() => {
+            let (target, options) = compile_explain_parts(&statement.raw_stmt)
+                .expect("compile EXPLAIN guard checked");
+            let parameter_types = parameter_env
+                .logical_types()
+                .into_iter()
+                .map(|ty| ty.unwrap_or(LogicalType::Unknown))
+                .collect::<Vec<_>>();
+            if parameter_types
+                .iter()
+                .any(|ty| matches!(ty, LogicalType::Unknown))
+            {
+                return Err(paro_error::protocol_violation(
+                    "EXPLAIN (COMPILE) requires known parameter types",
+                ));
+            }
+            if !matches!(target, Statement::Query(_)) {
+                return Err(paro_error::not_supported(
+                    "EXPLAIN (COMPILE) supports query/CTE targets only",
+                ));
+            }
+            PortalKind::CompileExplain {
+                target: Box::new(target.clone()),
+                options: options.to_vec(),
+                parameter_env: parameter_env.clone(),
+            }
+        }
         StatementClass::Query => {
             let plan = select_protocol_query_plan(
                 session,
@@ -593,6 +620,21 @@ async fn execute_portal<R: ExtendedQueryResponder>(
                         execute_query_portal(session, &mut portal, execution, &message, responder)
                             .await
                     }
+                    PortalKind::CompileExplain {
+                        target,
+                        options,
+                        parameter_env,
+                    } => {
+                        execute_compile_explain_portal(
+                            session,
+                            &mut portal,
+                            *target,
+                            options,
+                            parameter_env,
+                            responder,
+                        )
+                        .await
+                    }
                     PortalKind::Materialized => Err(paro_error::internal(
                         "materialized cursor cannot enter extended query execution".to_string(),
                     )),
@@ -693,6 +735,13 @@ fn build_parse_artifacts(
     statement_trace: Option<Arc<StatementTrace>>,
 ) -> Result<(Vec<ResultColumnDesc>, Option<CompiledStatement>)> {
     match route {
+        FrontendRoute::Query(_) if compile_explain_parts(stmt).is_some() => {
+            // COMPILE is deliberately not run during Parse.  The statement
+            // entry only exposes the diagnostic row schema; actual binding,
+            // compilation, admission and optional ANALYZE happen at Execute.
+            let _ = resolve_parse_parameter_types(stmt, type_oids)?;
+            Ok((compile_explain_result_schema(), None))
+        }
         FrontendRoute::Query(_) => {
             let parameter_types = resolve_parse_parameter_types(stmt, type_oids)?;
             let snapshot = session.freeze_statement_context_with_trace(
@@ -748,6 +797,24 @@ fn utility_result_schema(cmd: &crate::dispatch::UtilityCommand) -> Vec<ResultCol
     }
 }
 
+fn compile_explain_parts(stmt: &Statement) -> Option<(&Statement, &[ExplainOption])> {
+    let Statement::Explain {
+        options: (_, options),
+        query,
+        ..
+    } = stmt
+    else {
+        return None;
+    };
+    options
+        .contains(&ExplainOption::Compile)
+        .then_some((query.as_ref(), options.as_slice()))
+}
+
+fn compile_explain_result_schema() -> Vec<ResultColumnDesc> {
+    vec![ResultColumnDesc::new("QUERY PLAN", LogicalType::Varchar)]
+}
+
 fn build_query_plan(
     session: &Session,
     snapshot: Arc<StatementContext>,
@@ -761,7 +828,15 @@ fn build_query_plan(
         if let Some(plan) =
             session.reusable_instance_query_plan(&stmt, parameter_types, snapshot.as_ref())
         {
-            session.record_statement_cache_decision(cache_query_fingerprint, true);
+            if let Some(occurrence) =
+                session.record_statement_cache_decision(cache_query_fingerprint, true)
+            {
+                snapshot.diagnostics.publish_statement_artifact(
+                    cache_query_fingerprint,
+                    occurrence,
+                    plan.artifact_identity(),
+                );
+            }
             if let Some(trace) = &statement_trace {
                 trace.record_event("compile", "plan_cache_hit");
             }
@@ -780,6 +855,13 @@ fn build_query_plan(
         trace.record_event("compile", "compiler_call_return");
     }
     let plan = compiled?;
+    if let Some(occurrence) = cache_occurrence {
+        snapshot.diagnostics.publish_statement_artifact(
+            cache_query_fingerprint,
+            occurrence,
+            plan.artifact_identity(),
+        );
+    }
     if let (Some(occurrence), Some(work)) = (cache_occurrence, plan.compile_work()) {
         snapshot.diagnostics.publish_compile_work(cache_query_fingerprint, occurrence, work);
     }
@@ -1403,8 +1485,55 @@ fn should_begin_implicit_transaction_for_portal(session: &Session, kind: &Portal
         && session.is_auto_commit()
         && matches!(
             kind,
-            PortalKind::Query(_) | PortalKind::Materialized | PortalKind::ClientCopy { .. }
+            PortalKind::Query(_)
+                | PortalKind::CompileExplain { .. }
+                | PortalKind::Materialized
+                | PortalKind::ClientCopy { .. }
         )
+}
+
+async fn execute_compile_explain_portal<R: ExtendedQueryResponder>(
+    session: &mut Session,
+    portal: &mut PortalEntry,
+    target: Statement,
+    options: Vec<ExplainOption>,
+    parameter_env: TypedParameterEnv,
+    responder: &mut R,
+) -> Result<PortalProgress> {
+    if let Some(completion) = portal.completion.clone() {
+        responder.send_command_complete(&completion).await?;
+        if let Some(trace) = active_statement_trace(session) {
+            trace.record_event("protocol", "command_complete_sent");
+        }
+        return Ok(PortalProgress::Complete(completion));
+    }
+
+    let parameter_types = parameter_env
+        .logical_types()
+        .into_iter()
+        .map(|ty| ty.unwrap_or(LogicalType::Unknown))
+        .collect::<Vec<_>>();
+    let mut sink = ResponderSink::new(responder, &portal.result_schema, &portal.result_formats);
+    session
+        .execute_compile_explain_with_parameters(
+        target,
+        &options,
+        None,
+        &parameter_types,
+        Some(&parameter_env),
+        &mut sink,
+        )
+        .await?;
+    let completion = sink
+        .last_completion()
+        .cloned()
+        .unwrap_or(StatementCompletion::Explain);
+    portal.execution_state = PortalExecutionState::Exhausted { position: 1 };
+    portal.completion = Some(completion.clone());
+    if let Some(trace) = active_statement_trace(session) {
+        trace.record_event("protocol", "command_complete_sent");
+    }
+    Ok(PortalProgress::Complete(completion))
 }
 
 async fn execute_client_copy_portal<R: ExtendedQueryResponder>(
@@ -1532,6 +1661,18 @@ impl<R: ExtendedQueryResponder> crate::result::sink::ResultSink for ResponderSin
             .await
     }
 
+    async fn push_diagnostic_chunk(
+        &mut self,
+        chunk: &Chunk,
+        _owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> Result<()> {
+        // Extended protocol writes are awaited by the responder before this
+        // adapter returns.  The diagnostic vector owner therefore remains
+        // alive through the only send, while the protocol transport owns any
+        // bytes that it buffers.  It is intentionally not retained here.
+        self.push_chunk(chunk).await
+    }
+
     async fn finish_result(&mut self, completion: &StatementCompletion) -> Result<()> {
         self.completion = Some(completion.clone());
         self.responder.send_command_complete(completion).await
@@ -1541,6 +1682,8 @@ impl<R: ExtendedQueryResponder> crate::result::sink::ResultSink for ResponderSin
         self.responder.send_error(err).await
     }
 }
+
+impl<R: ExtendedQueryResponder> crate::ProtocolResultSink for ResponderSink<'_, R> {}
 
 fn describe_variable_show(stmt: &VariableShowStmt) -> Vec<ResultColumnDesc> {
     crate::utility::settings::describe_variable_show(stmt)
@@ -1552,6 +1695,7 @@ mod tests {
     use crate::dispatch::UtilityCommand;
     use crate::result::collecting_sink::CollectingSink;
     use async_trait::async_trait;
+    use paro_context::ExecutionTerminal;
     use paro_common::runtime_value::Value;
     use paro_common::types::pg_oid::{INT4OID, NUMERICOID};
     use tokio_util::bytes::Bytes;
@@ -1939,6 +2083,86 @@ mod tests {
         .unwrap();
 
         assert_eq!(responder.rows, vec![vec!["42".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn extended_compile_explain_binds_describes_and_executes_once() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut responder = TestResponder::default();
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: Some("compile_stmt".to_string()),
+                query: "EXPLAIN (COMPILE, ANALYZE, FORMAT JSON) SELECT $1::INT + 1"
+                    .to_string(),
+                type_oids: vec![INT4OID],
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        let statement = statement_entry(&session, Some("compile_stmt")).unwrap();
+        assert_eq!(statement.result_schema.len(), 1);
+        assert_eq!(statement.result_schema[0].name, "QUERY PLAN");
+        assert!(statement.generic_plan.is_none(), "Parse must not compile the target");
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Describe(DescribeTarget::Statement(Some(
+                "compile_stmt".to_string(),
+            ))),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        assert!(responder.events.iter().any(|event| event == "row_desc:1"));
+        assert!(responder.rows.is_empty(), "Describe must not execute the target");
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Bind(BindMessage {
+                portal_name: Some("compile_portal".to_string()),
+                statement_name: Some("compile_stmt".to_string()),
+                parameter_format_codes: Vec::new(),
+                parameters: vec![Some(b"41".to_vec())],
+                result_column_format_codes: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            portal_entry(&session, Some("compile_portal")).unwrap().kind,
+            PortalKind::CompileExplain { .. }
+        ));
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Execute(ExecutePortalMessage {
+                name: Some("compile_portal".to_string()),
+                max_rows: 0,
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(responder.rows.len(), 1);
+        assert_eq!(
+            responder
+                .events
+                .iter()
+                .filter(|event| event.starts_with("complete:EXPLAIN"))
+                .count(),
+            1
+        );
+        let receipts = session.diagnostics.execution_receipts_snapshot();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].terminal, ExecutionTerminal::Completed);
+        assert!(receipts[0].actual_class.is_some());
     }
 
     #[tokio::test]

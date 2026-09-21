@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Render only the sealed target observation; never invoke planning or admission.
-use paro_context::compile_diagnostics::{ENCODED_LIMIT, SealedCompileCapture};
+use paro_context::compile_diagnostics::{
+    CompileRecord, ENCODED_LIMIT, ExecutionReceipt, SealedCompileCapture,
+};
 use std::io::{self, Write};
 
 struct LimitedWriter(Vec<u8>);
@@ -20,12 +22,25 @@ impl Write for LimitedWriter {
 }
 
 pub fn render(capture: &SealedCompileCapture, json: bool) -> String {
+    render_with_execution(capture, json, None)
+}
+
+/// Render a sealed compile record and, when ANALYZE actually ran the same
+/// compiled statement, append the immutable execution receipt.  Admission is
+/// never inferred from the portfolio fields in the compile record.
+pub fn render_with_execution(
+    capture: &SealedCompileCapture,
+    json: bool,
+    execution: Option<ExecutionReceipt>,
+) -> String {
     let mut writer = LimitedWriter(Vec::new());
     if writer.0.try_reserve_exact(ENCODED_LIMIT).is_err() {
         return unavailable(json);
     }
     let result = capture.read(|record| {
-        if json { serde_json::to_writer(&mut writer, record).map_err(io::Error::other) }
+        let mut record: CompileRecord = record.clone();
+        record.execution_receipt = execution;
+        if json { serde_json::to_writer(&mut writer, &record).map_err(io::Error::other) }
         else {
             writeln!(writer, "EXPLAIN (COMPILE) / schema {} / ForcedCompile", record.schema_version)?;
             writeln!(writer, "phase             nanoseconds (Observed / Uncovered)")?;
@@ -33,12 +48,12 @@ pub fn render(capture: &SealedCompileCapture, json: bool) -> String {
             writeln!(writer, "compiler other    {:?}\nparse             {:?}", record.compiler_other_ns, record.parse)?;
             writeln!(writer, "artifact={:?} safety={:?} stop={:?} complete={:?} obligations={:?}", record.artifact, record.safety_verified, record.search_stop, record.search_complete, record.obligations)?;
             writeln!(writer, "quality_satisfied={:?} budget_limited={:?} groups={:?} logical={:?} physical={:?}", record.quality_policy_satisfied, record.budget_limited, record.groups, record.logical_expressions, record.physical_expressions)?;
-            writeln!(writer, "input={:?} output={:?} settings={:?} memory_bytes={:?} parallel_tasks={:?}", record.input_fingerprint, record.output_identity, record.planning_settings, record.available_memory_bytes, record.available_parallel_tasks)?;
+            writeln!(writer, "input={:?} output={:?} artifact_identity={:?} settings={:?} memory_bytes={:?} parallel_tasks={:?}", record.input_fingerprint, record.output_identity, record.artifact_identity, record.planning_settings, record.available_memory_bytes, record.available_parallel_tasks)?;
             writeln!(writer, "expected_class={:?} variants={:?} selected_fingerprint={:?}", record.expected_class, record.variant_count, record.selected_fingerprint)?;
             for v in &record.variants { writeln!(writer, "variant {} fingerprint={:?} admissible_classes={}", v.ordinal,v.physical_fingerprint,v.admissible_classes)?; }
             writeln!(writer, "admission={:?} execution={:?}", record.admission, record.execution)?;
             for r in &record.rules { writeln!(writer, "rule {} binding_calls={} binding_ns={} apply_attempts={} apply_ns={} inserted={} elapsed_ns={}",r.id,r.binding_calls,r.binding_ns,r.attempts,r.elapsed_ns.saturating_sub(r.binding_ns),r.inserted,r.elapsed_ns)?; }
-            writeln!(writer, "omitted_rules={} omitted_variants={} retained_limit={} encoded_limit={} response_terminal={:?}",record.omitted_rules,record.omitted_variants,record.retained_limit,record.encoded_limit,record.response_terminal)
+            writeln!(writer, "omitted_rules={} omitted_variants={} retained_limit={} encoded_limit={} response_terminal={:?} execution_receipt={:?}",record.omitted_rules,record.omitted_variants,record.retained_limit,record.encoded_limit,record.response_terminal,record.execution_receipt)
         }
     });
     if result.is_err() {
@@ -87,6 +102,25 @@ pub fn validate_json(
         || r.variants.len() > MAX_VARIANTS
     {
         return Err("schema/capacity profile mismatch".into());
+    }
+    if let Some(execution) = &r.execution_receipt {
+        if execution.schema_version != paro_context::compile_diagnostics::RECEIPT_SCHEMA_VERSION
+            || r.artifact_identity != Observation::Observed(execution.artifact_identity)
+        {
+            return Err("execution receipt is not bound to the sealed compile artifact".into());
+        }
+        if execution.admission == AdmissionResult::Selected
+            && (execution.actual_class.is_none()
+                || execution.actual_fingerprint.is_none()
+                || execution.resources.is_none())
+        {
+            return Err("selected execution receipt lacks actual admission".into());
+        }
+        if execution.admission != AdmissionResult::Selected
+            && execution.terminal != ExecutionTerminal::NotExecuted
+        {
+            return Err("non-selected admission cannot have an execution terminal".into());
+        }
     }
     if r.rules.windows(2).any(|pair| pair[0].id >= pair[1].id)
         || r.variants
@@ -148,7 +182,8 @@ pub fn validate_json(
     }
     if r.outcome == CompileOutcome::Success
         && (r.artifact != ArtifactStatus::CompiledArtifactReady
-            || r.safety_verified != Observation::Observed(true))
+            || r.safety_verified != Observation::Observed(true)
+            || !matches!(r.artifact_identity, Observation::Observed(_)))
     {
         return Err("successful compiler record lacks a verified artifact".into());
     }

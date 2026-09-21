@@ -57,6 +57,15 @@ pub enum StatementProgram {
     Utility(UtilityProgram),
 }
 
+/// The exact selection made by portfolio admission.  This is intentionally
+/// not part of the compiled portfolio: it only exists after resources and
+/// dependencies have been checked for this execution.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionSelection {
+    pub physical_fingerprint: paro_optimizer::physical::Fingerprint,
+    pub resources: paro_optimizer::physical::ExecutionResourceContract,
+}
+
 #[derive(Debug)]
 pub struct PipelineProgram {
     pub id: PipelineId,
@@ -183,6 +192,26 @@ impl UtilityProgram {
 }
 
 impl StatementProgram {
+    pub fn expected_grant_class(&self) -> Option<u32> {
+        match self {
+            Self::Portfolio(portfolio) => portfolio
+                .grant_search
+                .as_ref()
+                .and_then(|coverage| coverage.expected_class)
+                .map(|class| class.0),
+            Self::ExplainAnalyze { target, .. } => target.expected_grant_class(),
+            Self::Pipeline { .. } | Self::Utility(_) => None,
+        }
+    }
+
+    pub fn portfolio_variant_count(&self) -> Option<usize> {
+        match self {
+            Self::Portfolio(portfolio) => Some(portfolio.variants.len()),
+            Self::ExplainAnalyze { target, .. } => target.portfolio_variant_count(),
+            Self::Pipeline { .. } | Self::Utility(_) => None,
+        }
+    }
+
     pub fn execution_resources(
         &self,
     ) -> Option<paro_optimizer::physical::ExecutionResourceContract> {
@@ -265,25 +294,75 @@ impl StatementProgram {
     where
         F: Fn(&PhysicalPlan) -> bool,
     {
+        self.admit_for_execution_with_selection(
+            available_memory_bytes,
+            available_parallel_tasks,
+            available_external_worker_slots,
+            dependency_available,
+        )
+        .map(|(program, _)| program)
+    }
+
+    pub fn admit_for_execution_with_selection<F>(
+        &self,
+        available_memory_bytes: u64,
+        available_parallel_tasks: u16,
+        available_external_worker_slots: u16,
+        dependency_available: &F,
+    ) -> Result<(Self, Option<AdmissionSelection>)>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
         match self {
-            Self::Portfolio(portfolio) => Self::from_physical_portfolio(
+            Self::Portfolio(portfolio) => {
+                let (program, selection) = Self::from_physical_portfolio_with_selection(
                 portfolio.clone(),
                 available_memory_bytes,
                 available_parallel_tasks,
                 available_external_worker_slots,
                 dependency_available,
-            ),
-            Self::ExplainAnalyze { target, spec } => Ok(Self::ExplainAnalyze {
-                target: Box::new(target.admit_for_execution(
+                )?;
+                Ok((program, Some(selection)))
+            }
+            Self::ExplainAnalyze { target, spec } => {
+                let (target, selection) = target.admit_for_execution_with_selection(
                     available_memory_bytes,
                     available_parallel_tasks,
                     available_external_worker_slots,
                     dependency_available,
-                )?),
-                spec: *spec,
-            }),
-            Self::Pipeline { .. } | Self::Utility(_) => Ok(self.clone()),
+                )?;
+                Ok((Self::ExplainAnalyze { target: Box::new(target), spec: *spec }, selection))
+            }
+            Self::Pipeline { .. } | Self::Utility(_) => Ok((self.clone(), None)),
         }
+    }
+
+    fn from_physical_portfolio_with_selection<F>(
+        portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
+        available_memory_bytes: u64,
+        available_parallel_tasks: u16,
+        available_external_worker_slots: u16,
+        dependency_available: &F,
+    ) -> Result<(Self, AdmissionSelection)>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
+        portfolio.verify()?;
+        let mut admitted = portfolio.admit(
+            available_memory_bytes,
+            available_parallel_tasks,
+            available_external_worker_slots,
+            dependency_available,
+        )?;
+        let selection = AdmissionSelection {
+            physical_fingerprint: admitted.physical_fingerprint,
+            resources: admitted.resources,
+        };
+        admitted.plan.execution_resources = Some(admitted.resources);
+        // Retain the optimizer's sharing proof. The reservation selects an
+        // operating point; it does not change which points the winner was
+        // costed for. Physical verification checks root and child contracts.
+        Ok((Self::from_physical_plan(admitted.plan)?, selection))
     }
 }
 

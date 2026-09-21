@@ -199,7 +199,7 @@ pub fn compile_statement_with_parameter_types(
     };
     if let Some(trace) = &statement_trace {
         trace.record_span("compile", "runtime_image", runtime_image_started);
-        trace.record_event("compile", "executable_image_frozen");
+        trace.record_event("compile", "compiled_artifact_ready");
     }
     debug!(
         target: targets::EXECUTOR,
@@ -257,6 +257,7 @@ pub fn compile_statement_with_parameter_types(
                 r.compiler_other_ns = Observed(total.saturating_sub(bind + opt + verify + finish));
             }
             r.artifact = paro_context::compile_diagnostics::ArtifactStatus::CompiledArtifactReady;
+            r.artifact_identity = Observed(compiled.artifact_identity());
             r.outcome = paro_context::compile_diagnostics::CompileOutcome::Success;
         });
     }

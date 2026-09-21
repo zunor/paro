@@ -1085,6 +1085,28 @@ fn populate_paro_optimizers(
                 }),
         );
         for decision in ctx.diagnostics.statement_cache_snapshot() {
+            if let Some(identity) = decision.artifact_identity {
+                for (name, value) in [
+                    ("artifact_hi", identity.artifact[0]),
+                    ("artifact_lo", identity.artifact[1]),
+                    ("structure_hi", identity.structure[0]),
+                    ("structure_lo", identity.structure[1]),
+                    ("dependencies_hi", identity.dependencies[0]),
+                    ("dependencies_lo", identity.dependencies[1]),
+                ] {
+                    entries.push(OptimizerData {
+                        name: format!(
+                            "statement_compile_receipt/{:016x}/{}/{}",
+                            decision.query_fingerprint, decision.occurrence, name
+                        ),
+                        kind: "receipt".into(),
+                        last_elapsed_us: 0,
+                        metric_value: i64::try_from(value).unwrap_or(i64::MAX),
+                        metric_unit: "identity_word".into(),
+                        invocation_count: 1,
+                    });
+                }
+            }
             let Some(work) = decision.compile_work else { continue };
             for (name, value, unit) in [
                 ("compiler_elapsed_us", work.compiler_elapsed_us, "microseconds"),
@@ -1098,6 +1120,53 @@ fn populate_paro_optimizers(
                     last_elapsed_us: 0,
                     metric_value: i64::try_from(value).unwrap_or(i64::MAX),
                     metric_unit: unit.into(),
+                    invocation_count: 1,
+                });
+            }
+        }
+        for receipt in ctx.diagnostics.execution_receipts_snapshot() {
+            let identity = receipt.artifact_identity;
+            let mut values = vec![
+                ("artifact_hi", identity.artifact[0]),
+                ("artifact_lo", identity.artifact[1]),
+                ("structure_hi", identity.structure[0]),
+                ("structure_lo", identity.structure[1]),
+                ("dependencies_hi", identity.dependencies[0]),
+                ("dependencies_lo", identity.dependencies[1]),
+                ("expected_class", u64::from(receipt.expected_class.unwrap_or(u32::MAX))),
+                ("actual_class", u64::from(receipt.actual_class.unwrap_or(u32::MAX))),
+                ("admission", match receipt.admission {
+                    paro_context::AdmissionResult::Selected => 1,
+                    paro_context::AdmissionResult::Infeasible => 2,
+                    paro_context::AdmissionResult::Failed => 3,
+                }),
+                ("terminal", match receipt.terminal {
+                    paro_context::ExecutionTerminal::NotExecuted => 0,
+                    paro_context::ExecutionTerminal::Running => 1,
+                    paro_context::ExecutionTerminal::Completed => 2,
+                    paro_context::ExecutionTerminal::Failed => 3,
+                    paro_context::ExecutionTerminal::Cancelled => 4,
+                    paro_context::ExecutionTerminal::Dropped => 5,
+                }),
+            ];
+            if let Some(fingerprint) = receipt.actual_fingerprint {
+                values.extend([("actual_fingerprint_hi", fingerprint[0]), ("actual_fingerprint_lo", fingerprint[1])]);
+            }
+            if let Some(resources) = receipt.resources {
+                values.extend([
+                    ("working_set_memory_bytes", resources.working_set_memory_bytes),
+                    ("memory_ceiling_bytes", resources.memory_ceiling_bytes),
+                    ("max_parallel_tasks", u64::from(resources.max_parallel_tasks)),
+                    ("external_worker_slots", u64::from(resources.external_worker_slots)),
+                ]);
+            }
+            for (name, value) in values {
+                entries.push(OptimizerData {
+                    name: format!("statement_execution_receipt/{}/{}", receipt.execution_id, name),
+                    kind: "receipt".into(),
+                    last_elapsed_us: 0,
+                    metric_value: i64::try_from(value).unwrap_or(i64::MAX),
+                    metric_unit: "receipt".into(),
                     invocation_count: 1,
                 });
             }

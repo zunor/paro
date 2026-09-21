@@ -3,9 +3,13 @@
 
 //! Session-owned diagnostic snapshots shared across statement contexts.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::StatementTraceSnapshot;
+use crate::compile_diagnostics::{
+    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionReceipt, ExecutionTerminal,
+    ResourceReceipt, RECEIPT_SCHEMA_VERSION,
+};
 
 /// Unit of the value exposed by one optimizer diagnostic row.
 ///
@@ -53,6 +57,7 @@ pub struct StatementCacheDecision {
     pub query_fingerprint: u64,
     pub occurrence: u64,
     pub cache_hit: bool,
+    pub artifact_identity: Option<ArtifactIdentity>,
     pub compile_work: Option<CompileWork>,
 }
 
@@ -78,6 +83,7 @@ pub struct SessionDiagnostics {
     statement_trace: RwLock<Option<StatementTraceSnapshot>>,
     statement_cache: RwLock<Vec<StatementCacheDecision>>,
     execution_work: RwLock<Vec<ExecutionWorkRecord>>,
+    execution_receipts: RwLock<Vec<ExecutionReceipt>>,
     execution_sequence: std::sync::atomic::AtomicU64,
 }
 
@@ -91,12 +97,130 @@ pub struct ExecutionWorkRecord {
     pub snapshot: paro_common::cold_work::Snapshot,
 }
 
+/// A small capability held by a real result handler.  Admission is published
+/// before the pipeline is built; the handler closes the same record when the
+/// terminal execution state is known.  Dropping the handler therefore cannot
+/// leave an apparently successful execution receipt behind.
+#[derive(Debug, Clone)]
+pub struct ExecutionReceiptHandle {
+    diagnostics: Arc<SessionDiagnostics>,
+    execution_id: u64,
+}
+
+impl ExecutionReceiptHandle {
+    pub fn execution_id(&self) -> u64 {
+        self.execution_id
+    }
+
+    pub fn complete(&self) {
+        self.finish(ExecutionTerminal::Completed, None);
+    }
+
+    pub fn fail(&self, error: impl Into<String>) {
+        self.finish(ExecutionTerminal::Failed, Some(error.into()));
+    }
+
+    pub fn cancel(&self, error: impl Into<String>) {
+        self.finish(ExecutionTerminal::Cancelled, Some(error.into()));
+    }
+
+    /// Preserve an admission failure without turning it into an execution
+    /// terminal.  An infeasible or failed admission is deliberately
+    /// `NotExecuted`; the original bounded error still belongs on the receipt.
+    pub fn record_error(&self, error: impl Into<String>) {
+        self.diagnostics
+            .record_execution_receipt_error(self.execution_id, error.into());
+    }
+
+    fn finish(&self, terminal: ExecutionTerminal, error: Option<String>) {
+        self.diagnostics
+            .finish_execution_receipt(self.execution_id, terminal, error);
+    }
+}
+
+impl Drop for ExecutionReceiptHandle {
+    fn drop(&mut self) {
+        self.diagnostics
+            .finish_execution_receipt(self.execution_id, ExecutionTerminal::Dropped, None);
+    }
+}
+
 impl SessionDiagnostics {
     pub fn publish_execution_work(&self, query_fingerprint: u64, image_id: u64, snapshot: paro_common::cold_work::Snapshot) {
         let execution_id = self.execution_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut records = self.execution_work.write().unwrap();
         records.push(ExecutionWorkRecord { query_fingerprint, execution_id, image_id, snapshot });
         if records.len() > 64 { records.remove(0); }
+    }
+
+    pub fn begin_execution_receipt(
+        self: &Arc<Self>,
+        artifact_identity: ArtifactIdentity,
+        expected_class: Option<u32>,
+        actual_class: Option<u32>,
+        actual_fingerprint: Option<[u64; 2]>,
+        resources: Option<ResourceReceipt>,
+        admission: AdmissionResult,
+        fallback: Option<AdmissionFallback>,
+    ) -> ExecutionReceiptHandle {
+        let execution_id = self.execution_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let receipt = ExecutionReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            execution_id,
+            artifact_identity,
+            expected_class,
+            actual_class,
+            actual_fingerprint,
+            resources,
+            admission,
+            fallback,
+            terminal: if admission == AdmissionResult::Selected {
+                ExecutionTerminal::Running
+            } else {
+                ExecutionTerminal::NotExecuted
+            },
+            terminal_error: None,
+        };
+        let mut receipts = self.execution_receipts.write().unwrap();
+        receipts.push(receipt);
+        if receipts.len() > 64 {
+            receipts.remove(0);
+        }
+        ExecutionReceiptHandle {
+            diagnostics: Arc::clone(self),
+            execution_id,
+        }
+    }
+
+    pub fn finish_execution_receipt(
+        &self,
+        execution_id: u64,
+        terminal: ExecutionTerminal,
+        error: Option<String>,
+    ) {
+        let mut receipts = self.execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.execution_id == execution_id) else {
+            return;
+        };
+        if receipt.terminal != ExecutionTerminal::Running {
+            return;
+        }
+        receipt.terminal = terminal;
+        receipt.terminal_error = error.map(|value| value.chars().take(256).collect());
+    }
+
+    fn record_execution_receipt_error(&self, execution_id: u64, error: String) {
+        let mut receipts = self.execution_receipts.write().unwrap();
+        let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.execution_id == execution_id) else {
+            return;
+        };
+        if receipt.terminal == ExecutionTerminal::NotExecuted {
+            receipt.terminal_error = Some(error.chars().take(256).collect());
+        }
+    }
+
+    pub fn execution_receipts_snapshot(&self) -> Vec<ExecutionReceipt> {
+        self.execution_receipts.read().unwrap().clone()
     }
     pub fn execution_work_snapshot(&self) -> Vec<ExecutionWorkRecord> {
         self.execution_work.read().unwrap().clone()
@@ -128,12 +252,27 @@ impl SessionDiagnostics {
             query_fingerprint,
             occurrence,
             cache_hit,
+            artifact_identity: None,
             compile_work: None,
         });
         if decisions.len() > MAX_DECISIONS {
             decisions.remove(0);
         }
         occurrence
+    }
+
+    pub fn publish_statement_artifact(
+        &self,
+        query: u64,
+        occurrence: u64,
+        artifact_identity: ArtifactIdentity,
+    ) {
+        let mut decisions = self.statement_cache.write().unwrap();
+        if let Some(decision) = decisions.iter_mut().find(|decision|
+            decision.query_fingerprint == query && decision.occurrence == occurrence
+        ) {
+            decision.artifact_identity = Some(artifact_identity);
+        }
     }
 
     pub fn publish_compile_work(&self, query: u64, occurrence: u64, work: CompileWork) {
@@ -170,5 +309,28 @@ mod tests {
         assert_eq!(rows[0].compile_work, Some(work));
         assert_eq!(rows[1].compile_work, None);
         assert_eq!(rows[2].compile_work, None);
+    }
+
+    #[test]
+    fn execution_receipt_only_changes_at_a_real_terminal() {
+        let diagnostics = Arc::new(SessionDiagnostics::default());
+        let identity = ArtifactIdentity {
+            schema_version: 1,
+            artifact: [1, 2],
+            structure: [3, 4],
+            dependencies: [5, 6],
+        };
+        let handle = diagnostics.begin_execution_receipt(
+            identity,
+            Some(2),
+            Some(2),
+            Some([7, 8]),
+            None,
+            AdmissionResult::Selected,
+            None,
+        );
+        assert_eq!(diagnostics.execution_receipts_snapshot()[0].terminal, ExecutionTerminal::Running);
+        handle.complete();
+        assert_eq!(diagnostics.execution_receipts_snapshot()[0].terminal, ExecutionTerminal::Completed);
     }
 }

@@ -16,7 +16,7 @@ impl ResultHandler {
         loop {
             if self.cancellation.is_cancelled() {
                 self.cleanup_typed_driver_for_cancellation();
-                self.mark_closed();
+                self.mark_cancelled("typed execution cancelled");
                 self.cancellation.check()?;
                 return Ok(None);
             }
@@ -32,7 +32,7 @@ impl ResultHandler {
                 Ok(result) => result,
                 Err(error) => {
                     self.cleanup_typed_driver_for_error(&error);
-                    self.mark_closed();
+                    self.mark_failed(error.to_string());
                     return Err(error);
                 }
             };
@@ -51,7 +51,7 @@ impl ResultHandler {
                         reason
                     ));
                     self.cleanup_typed_driver_for_error(&error);
-                    self.mark_closed();
+                    self.mark_failed(error.to_string());
                     return Err(error);
                 }
             }

@@ -1112,31 +1112,19 @@ impl Session {
         }
     }
 
-    /// Record only the cache decision when the benchmark requests a
-    /// trace-off cold-miss side channel. The decision is read after the timed
-    /// statement and therefore does not serialize a per-event trace to the
-    /// normal C1 log.
+    /// Record the bounded cache decision for every statement. This is the
+    /// normal receipt channel, not a statement-event trace, so trace-off
+    /// execution retains a small compile/admission association without
+    /// changing the target plan or forcing a diagnostic capture.
     pub(crate) fn record_statement_cache_decision(
         &self,
         query_fingerprint: u64,
         cache_hit: bool,
     ) -> Option<u64> {
-        let enabled = std::env::var("PARO_STATEMENT_CACHE_EVIDENCE")
-            .map(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "" | "0" | "false" | "off" | "no"
-                )
-            })
-            .unwrap_or(false);
-        if enabled {
-            Some(
-                self.diagnostics
-                    .publish_statement_cache_decision(query_fingerprint, cache_hit),
-            )
-        } else {
-            None
-        }
+        Some(
+            self.diagnostics
+                .publish_statement_cache_decision(query_fingerprint, cache_hit),
+        )
     }
 
     /// Hold an extended-protocol trace until Sync has completed the pipeline.

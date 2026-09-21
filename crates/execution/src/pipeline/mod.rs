@@ -14,7 +14,7 @@ mod program_test_window;
 pub mod properties;
 
 pub use program::{
-    ControlRegionKind, ControlRegionProgram, ExtensionOperatorFactory, ExtensionSinkSpec,
+    AdmissionSelection, ControlRegionKind, ControlRegionProgram, ExtensionOperatorFactory, ExtensionSinkSpec,
     ExtensionSourceSpec, ExtensionTransformSpec, OperatorRuntimeRegistry, PipelineIdMap,
     PipelineProgram, PipelineProgramBuilder, PipelineProgramIndex, PipelineProgramSet,
     StatementProgram, UtilityProgram,

@@ -11,7 +11,7 @@ use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
-use paro_context::{CompileEnvironmentKey, StatementContext};
+use paro_context::{ArtifactIdentity, CompileEnvironmentKey, StatementContext};
 use paro_optimizer::physical::{
     Fingerprint, PhysicalNodeKind, SearchSourceSpec, StableFingerprintBuilder,
 };
@@ -48,6 +48,7 @@ struct CompiledStatementImage {
     result_schema: Box<[ResultColumnDesc]>,
     parameter_types: Box<[LogicalType]>,
     compile_environment: CompileEnvironmentKey,
+    artifact_identity: ArtifactIdentity,
 }
 
 impl CompiledStatement {
@@ -57,6 +58,12 @@ impl CompiledStatement {
         parameter_types: Vec<LogicalType>,
         compile_environment: CompileEnvironmentKey,
     ) -> Self {
+        let artifact_identity = artifact_identity(
+            &program,
+            &result_schema,
+            &parameter_types,
+            &compile_environment,
+        );
         Self {
             compile_work: None,
             image: Arc::new(CompiledStatementImage {
@@ -64,6 +71,7 @@ impl CompiledStatement {
                 result_schema: result_schema.into_boxed_slice(),
                 parameter_types: parameter_types.into_boxed_slice(),
                 compile_environment,
+                artifact_identity,
             }),
         }
     }
@@ -95,6 +103,19 @@ impl CompiledStatement {
     #[inline]
     pub fn compile_environment(&self) -> &CompileEnvironmentKey {
         &self.image.compile_environment
+    }
+
+    /// Stable identity of the sealed compiler product.  This is not a pointer
+    /// identity and does not contain a process-local CandidateId or grant
+    /// ordinal; admission and execution receipts refer to this value.
+    #[inline]
+    pub fn artifact_identity(&self) -> ArtifactIdentity {
+        self.image.artifact_identity
+    }
+
+    #[inline]
+    pub fn expected_grant_class(&self) -> Option<u32> {
+        self.image.program.expected_grant_class()
     }
 
     /// Validate capabilities whose generation can move without a catalog
@@ -141,6 +162,141 @@ impl CompiledStatement {
     /// Not a stable physical fingerprint or proof of plan quality.
     pub fn diagnostic_image_identity(&self) -> u64 {
         Arc::as_ptr(&self.image) as usize as u64
+    }
+}
+
+fn fingerprint_words(fingerprint: Fingerprint) -> [u64; 2] {
+    [(fingerprint.0 >> 64) as u64, fingerprint.0 as u64]
+}
+
+fn write_dependency_map(
+    builder: &mut StableFingerprintBuilder,
+    name: &[u8],
+    values: &std::collections::BTreeMap<Fingerprint, u64>,
+) {
+    builder.write_bytes(name);
+    builder.write_u64(values.len() as u64);
+    for (key, value) in values {
+        builder.write_fingerprint(*key);
+        builder.write_u64(*value);
+    }
+}
+
+fn write_plan_dependencies(
+    builder: &mut StableFingerprintBuilder,
+    plan: &paro_optimizer::physical::PhysicalPlan,
+) {
+    let dependencies = &plan.dependencies;
+    write_dependency_map(builder, b"catalog", &dependencies.catalog_versions);
+    write_dependency_map(builder, b"statistics", &dependencies.statistics_compatibility);
+    write_dependency_map(builder, b"graph", &dependencies.graph_generations);
+    write_dependency_map(builder, b"provider", &dependencies.provider_capabilities);
+    write_dependency_map(builder, b"search", &dependencies.search_index_generations);
+    write_dependency_map(builder, b"search-planning", &dependencies.search_planning_signatures);
+    builder.write_fingerprint(dependencies.machine_calibration_revision);
+    builder.write_fingerprint(dependencies.estimator_revision);
+    write_dependency_map(builder, b"routine", &dependencies.routine_artifacts);
+    write_dependency_map(builder, b"external-runtime", &dependencies.external_runtime_profiles);
+    write_dependency_map(builder, b"model", &dependencies.model_artifacts);
+    dependencies
+        .quality_policy_revision
+        .into_iter()
+        .for_each(|value| builder.write_fingerprint(value));
+    builder.write_fingerprint(dependencies.rule_set_revision);
+    builder.write_fingerprint(dependencies.plan_stability_policy_revision);
+    builder.write_fingerprint(dependencies.optimizer_config_fingerprint);
+    builder.write_fingerprint(dependencies.physical_abi_revision);
+}
+
+fn write_program_identity(
+    structure: &mut StableFingerprintBuilder,
+    dependencies: &mut StableFingerprintBuilder,
+    program: &StatementProgram,
+) {
+    match program {
+        StatementProgram::Portfolio(portfolio) => {
+            structure.write_bytes(b"portfolio");
+            structure.write_u64(portfolio.grant_classes.len() as u64);
+            for class in &portfolio.grant_classes {
+                structure.write_u64(u64::from(class.id.0));
+                structure.write_u64(class.hard_memory_bytes);
+                structure.write_u64(u64::from(class.max_parallel_tasks));
+                structure.write_u64(match class.spill_policy {
+                    paro_optimizer::physical::SpillPolicy::Forbidden => 0,
+                    paro_optimizer::physical::SpillPolicy::Allowed => 1,
+                });
+            }
+            structure.write_u64(portfolio.variants.len() as u64);
+            for variant in &portfolio.variants {
+                structure.write_fingerprint(variant.physical_fingerprint);
+                structure.write_u64(variant.admissible_classes.len() as u64);
+                for class in &variant.admissible_classes {
+                    structure.write_u64(u64::from(class.0));
+                }
+                write_plan_dependencies(dependencies, &variant.plan);
+            }
+        }
+        StatementProgram::Pipeline { plan, .. } => {
+            structure.write_bytes(b"pipeline");
+            write_plan_dependencies(dependencies, plan);
+        }
+        StatementProgram::ExplainAnalyze { target, .. } => {
+            structure.write_bytes(b"explain-analyze");
+            write_program_identity(structure, dependencies, target);
+        }
+        StatementProgram::Utility(_) => structure.write_bytes(b"utility"),
+    }
+}
+
+fn artifact_identity(
+    program: &StatementProgram,
+    result_schema: &[ResultColumnDesc],
+    parameter_types: &[LogicalType],
+    environment: &CompileEnvironmentKey,
+) -> ArtifactIdentity {
+    let mut structure = StableFingerprintBuilder::default();
+    structure.write_bytes(b"paro.compiled-artifact.structure.v1");
+    for column in result_schema {
+        structure.write_bytes(column.name.as_bytes());
+        structure.write_bytes(column.logical_type.to_string().as_bytes());
+    }
+    for parameter in parameter_types {
+        structure.write_bytes(parameter.to_string().as_bytes());
+    }
+    let mut dependencies = StableFingerprintBuilder::default();
+    dependencies.write_bytes(b"paro.compiled-artifact.dependencies.v1");
+    dependencies.write_bytes(environment.current_database.as_bytes());
+    dependencies.write_bytes(environment.current_schema.as_bytes());
+    for entry in &environment.search_path {
+        dependencies.write_bytes(entry.catalog.as_bytes());
+        dependencies.write_bytes(entry.schema.as_bytes());
+    }
+    dependencies.write_u64(environment.visible_generation);
+    for (database, epoch) in &environment.catalog_epochs {
+        dependencies.write_u64(*database);
+        dependencies.write_u64(*epoch);
+    }
+    dependencies.write_u64(environment.planning_settings_fingerprint);
+    dependencies.write_u64(environment.compile_resources.available_memory_bytes);
+    dependencies.write_u64(u64::from(environment.compile_resources.available_parallel_tasks));
+    environment.expected_grant.iter().for_each(|grant| {
+        dependencies.write_u64(grant.index as u64);
+        dependencies.write_u64(grant.hard_memory_bytes);
+        dependencies.write_u64(u64::from(grant.max_parallel_tasks));
+    });
+    write_program_identity(&mut structure, &mut dependencies, program);
+    let structure_fingerprint = structure.finish();
+    let dependency_fingerprint = dependencies.finish();
+    let mut artifact = StableFingerprintBuilder::default();
+    artifact.write_bytes(b"paro.compiled-artifact.v1");
+    artifact.write_fingerprint(structure_fingerprint);
+    artifact.write_fingerprint(dependency_fingerprint);
+    let artifact_fingerprint = artifact.finish();
+    ArtifactIdentity {
+        schema_version: 1,
+        artifact: fingerprint_words(artifact_fingerprint),
+        structure: fingerprint_words(structure_fingerprint),
+        dependencies: fingerprint_words(dependency_fingerprint),
     }
 }
 

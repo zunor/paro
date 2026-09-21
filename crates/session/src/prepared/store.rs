@@ -12,7 +12,7 @@ use paro_context::StatementTrace;
 use paro_execution::query_executor::compiled::{
     CompiledStatement, ExecutionRequest, ResultColumnDesc,
 };
-use paro_parser::ast::Statement;
+use paro_parser::ast::{ExplainOption, Statement};
 
 use super::portal::{
     values_to_text, CursorHoldability, FormatCode, PortalExecutionState, PortalSnapshotRetention,
@@ -55,6 +55,11 @@ pub struct PreparedStatementEntry {
 #[derive(Debug, Clone)]
 pub enum PortalKind {
     Query(ExecutionRequest),
+    CompileExplain {
+        target: Box<Statement>,
+        options: Vec<ExplainOption>,
+        parameter_env: TypedParameterEnv,
+    },
     Materialized,
     Utility(Box<UtilityCommand>),
     ClientCopy {

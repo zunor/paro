@@ -14,6 +14,7 @@ pub const PROCESS_LIMIT: usize = 64 << 20;
 pub const MAX_CAPTURES: usize = 8;
 pub const MAX_RULES: usize = 64;
 pub const MAX_VARIANTS: usize = 16;
+pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
 // Includes fixed recorder, encoder workspace, vector and protocol copy headroom.
 const RESERVATION: usize = 2 << 20;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -82,6 +83,84 @@ pub enum ArtifactStatus {
     NotReady,
     CompiledArtifactReady,
 }
+
+/// Cross-process identity for an immutable compiled artifact.  The digest is
+/// deliberately separate from the structure and dependency digests so a
+/// consumer can reject a receipt whose plan shape or dependency contract was
+/// produced by another schema revision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactIdentity {
+    pub schema_version: u32,
+    pub artifact: [u64; 2],
+    pub structure: [u64; 2],
+    pub dependencies: [u64; 2],
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum AdmissionResult {
+    Selected,
+    Infeasible,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum ExecutionTerminal {
+    NotExecuted,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Dropped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum AdmissionFallback {
+    LowerResourceClass,
+    ExternalCapacity,
+    DependencyChanged,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum MemoryCompletionReceipt {
+    Guaranteed,
+    RuntimeCappedKnown { uncapped_memory_bytes: u64 },
+    RuntimeCappedUnbounded,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceReceipt {
+    pub class: u32,
+    pub minimum_memory_bytes: u64,
+    pub working_set_memory_bytes: u64,
+    pub memory_ceiling_bytes: u64,
+    pub memory_completion: MemoryCompletionReceipt,
+    pub max_parallel_tasks: u16,
+    pub external_worker_slots: u16,
+}
+
+/// The only record that may claim an actual portfolio choice.  It is created
+/// at admission, not while a portfolio is compiled or rendered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionReceipt {
+    pub schema_version: u32,
+    pub execution_id: u64,
+    pub artifact_identity: ArtifactIdentity,
+    pub expected_class: Option<u32>,
+    pub actual_class: Option<u32>,
+    pub actual_fingerprint: Option<[u64; 2]>,
+    pub resources: Option<ResourceReceipt>,
+    pub admission: AdmissionResult,
+    pub fallback: Option<AdmissionFallback>,
+    pub terminal: ExecutionTerminal,
+    pub terminal_error: Option<String>,
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CompileOutcome {
     Incomplete,
@@ -135,7 +214,7 @@ impl CompileDocument {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompileRecord {
     #[serde(flatten)]
@@ -148,6 +227,7 @@ pub struct CompileRecord {
     pub encoded_limit: usize,
     pub process_limit: usize,
     pub process_reservation: usize,
+    pub execution_receipt: Option<ExecutionReceipt>,
 }
 
 impl std::ops::Deref for CompileRecord {
@@ -170,6 +250,7 @@ pub struct CompileFields {
     pub source_build: Observation<u64>,
     pub catalog_facts: Observation<u64>,
     pub output_identity: Observation<u64>,
+    pub artifact_identity: Observation<ArtifactIdentity>,
     pub planning_settings: Observation<u64>,
     pub available_memory_bytes: Observation<u64>,
     pub available_parallel_tasks: Observation<u16>,
@@ -237,6 +318,7 @@ impl CompileCapture {
             }
         };
         let unknown = Observation::Uncovered(UncoveredReason::NotInstrumented);
+        let unknown_artifact = Observation::Uncovered(UncoveredReason::NotInstrumented);
         Some(Arc::new(Self {
             sealed: AtomicBool::new(false),
             record: Mutex::new(CompileRecord {
@@ -248,6 +330,7 @@ impl CompileCapture {
                     measurement_mode: MeasurementMode::Diagnostic,
                     input_fingerprint: unknown,
                     output_identity: unknown,
+                    artifact_identity: unknown_artifact,
                     planning_settings: unknown,
                     identity_encoding: 1,
                     source_build: unknown,
@@ -293,6 +376,7 @@ impl CompileCapture {
                 encoded_limit: ENCODED_LIMIT,
                 process_limit: PROCESS_LIMIT,
                 process_reservation: RESERVATION,
+                execution_receipt: None,
             }),
         }))
     }

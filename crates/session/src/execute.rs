@@ -537,6 +537,13 @@ impl Session {
                 return Err(e);
             }
         };
+        if let Some(occurrence) = cache_occurrence {
+            ctx.diagnostics.publish_statement_artifact(
+                statement_fingerprint(&stmt.to_string()),
+                occurrence,
+                compiled.artifact_identity(),
+            );
+        }
         if shared_plan_cache_eligible && cached_plan.is_none() {
             if let (Some(occurrence), Some(work)) = (cache_occurrence, compiled.compile_work()) {
                 ctx.diagnostics.publish_compile_work(statement_fingerprint(&stmt.to_string()), occurrence, work);

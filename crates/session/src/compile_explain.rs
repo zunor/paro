@@ -10,7 +10,11 @@ use paro_common::{
     vector::Vector,
 };
 use paro_context::{StatementOptions, compile_diagnostics::CompileCapture};
+use paro_context::ExecutionTerminal;
+use paro_execution::query_executor::compiled::ExecutionRequest;
+use paro_execution::query_executor::executor::Executor;
 use paro_parser::ast::{ExplainOption, Statement};
+use crate::prepared::typed_parameters::TypedParameterEnv;
 
 /// Own only the implicit transaction started by this request. Dropping a
 /// backpressured request must not leave it attached to the next statement.
@@ -35,14 +39,41 @@ impl Session {
         trailing_format: Option<String>,
         sink: &mut S,
     ) -> Result<()> {
+        self.execute_compile_explain_with_parameters(
+            target,
+            options,
+            trailing_format,
+            &[],
+            None,
+            sink,
+        )
+        .await
+    }
+
+    /// Execute the extended-protocol form of EXPLAIN (COMPILE).
+    ///
+    /// Parse and Bind only retain the target and its concrete parameter
+    /// environment.  This method is called from Execute, so the target is
+    /// compiled exactly once at the actual execution boundary.  ANALYZE uses
+    /// the same immutable image and bindings; it never invokes the compiler a
+    /// second time.
+    pub(crate) async fn execute_compile_explain_with_parameters<S: ProtocolResultSink>(
+        &mut self,
+        target: Statement,
+        options: &[ExplainOption],
+        trailing_format: Option<String>,
+        parameter_types: &[LogicalType],
+        parameter_env: Option<&TypedParameterEnv>,
+        sink: &mut S,
+    ) -> Result<()> {
         if trailing_format.is_some() {
             return Err(error::not_supported(
                 "EXPLAIN (COMPILE) does not accept trailing FORMAT",
             ));
         }
-        if options.contains(&ExplainOption::Analyze) || options.contains(&ExplainOption::Detail) {
+        if options.contains(&ExplainOption::Detail) {
             return Err(error::not_supported(
-                "EXPLAIN (COMPILE) currently supports non-executing Summary only",
+                "EXPLAIN (COMPILE, DETAIL) is not implemented in this phase",
             ));
         }
         if !matches!(target, Statement::Query(_)) {
@@ -71,9 +102,15 @@ impl Session {
             },
             cancellation.clone(),
         );
+        let execution_ctx = ctx.clone();
         // Calling the production compiler exactly once preserves binding, settings,
-        // verifier, budgets and cancellation. Never admit/lower/execute this artifact.
-        let result = paro_compiler::compile_statement(ctx, target);
+        // verifier, budgets and cancellation. ANALYZE admits and executes this
+        // same immutable artifact below; it never recompiles the target.
+        let result = paro_compiler::compile_statement_with_parameter_types(
+            ctx,
+            target,
+            parameter_types,
+        );
         let compiled = match result {
             Ok(compiled) => compiled,
             Err(e) => {
@@ -83,7 +120,6 @@ impl Session {
                 return Err(e);
             }
         };
-        drop(compiled);
         let Some(capture) = capture else {
             // No unaccounted fallback result buffer. The target has compiled;
             // the diagnostic request cannot retain another document. A fixed
@@ -102,7 +138,43 @@ impl Session {
             return Err(e);
         };
         let capture = capture.seal();
-        let document = paro_execution::explain::compile_render::render(&capture, json);
+        let execution_receipt = if options.contains(&ExplainOption::Analyze) {
+            let execution = match parameter_env {
+                Some(parameter_env) => {
+                    ExecutionRequest::from_typed_env(compiled.clone(), parameter_env)?
+                }
+                None => ExecutionRequest::unparameterized(compiled.clone())?,
+            };
+            let executor = Executor::new(execution_ctx);
+            let mut handler = match executor.execute(execution) {
+                Ok(handler) => handler,
+                Err(error) => {
+                    if auto {
+                        let _ = session.rollback_auto_transaction(Some(&error));
+                    }
+                    return Err(error);
+                }
+            };
+            while let Some(_chunk) = handler.fetch()? {}
+            let identity = compiled.artifact_identity();
+            session
+                .diagnostics
+                .execution_receipts_snapshot()
+                .into_iter()
+                .rev()
+                .find(|receipt| {
+                    receipt.artifact_identity == identity
+                        && receipt.terminal != ExecutionTerminal::NotExecuted
+                })
+        } else {
+            None
+        };
+        drop(compiled);
+        let document = paro_execution::explain::compile_render::render_with_execution(
+            &capture,
+            json,
+            execution_receipt,
+        );
         let send = async {
             sink.start_result(&["QUERY PLAN".into()], &[LogicalType::Varchar])
                 .await?;
