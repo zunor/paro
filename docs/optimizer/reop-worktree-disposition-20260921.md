@@ -6,7 +6,7 @@ claim.
 
 ## Active baseline
 
-`re-op` is at `1b54b432` (`docs(protocol): record bounded terminal ownership`)
+`re-op` is at `c63a2ccd` (`docs(protocol): record bounded terminal ownership`)
 with an empty index and no active tracked or untracked experiment delta. The
 production transport repair is `76cc9e0c` (`fix(protocol): bound cancelled
 terminal output`); the current commit adds only its evidence and disposition
@@ -18,7 +18,7 @@ pre-parking point is recoverable at
 ## Parked mixed-worktree material
 
 The original tracked WIP patch is retained at
-`/private/tmp/paro-reop-transport-recovery.us6Zni/unstaged.patch`.
+`/Users/linjunhong/paro-convergence-archive/20260921/reop-transport-recovery/unstaged.patch`.
 It is 111,260 bytes with SHA-256
 `6588a2df89ab0e7fefa03d4ba1baa4449db3bc9e5996423478d85da103c0c2a3`.
 The original index was empty; the empty staged patch is retained at
@@ -26,7 +26,7 @@ The original index was empty; the empty staged patch is retained at
 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
 
 The 83 untracked historical files were moved, not deleted, to
-`/private/tmp/paro-reop-transport-recovery.us6Zni/parked-evidence-20260921/`.
+`/Users/linjunhong/paro-convergence-archive/20260921/reop-transport-recovery/parked-evidence-20260921/`.
 Their original manifest is `untracked.sha256` (SHA-256
 `0fc146428863a7f581458db7865fffb463596eaf1fcdf240e8f6296580f796e0`), and
 all 83 hashes were rechecked after the move. The parked material is not added
@@ -52,7 +52,7 @@ is by the recorded worktree path and HEAD, or by the branch/ref shown.
 
 | Path | Size | State / HEAD | Recovery and disposition |
 | --- | ---: | --- | --- |
-| `/Users/linjunhong/workspace/paro` | 3,666,704 KiB | active `re-op` / `7f0f5251`, clean | Daily baseline; retain. |
+| `/Users/linjunhong/workspace/paro` | 3,666,704 KiB | active `re-op` / `c63a2ccd`, clean | Daily baseline; retain. |
 | `/private/tmp/paro-convergence-20260920` | 164,775,480 KiB | clean branch `codex/optimizer-convergence-20260920` / `7f0f5251` | Existing clean validation tree; retain until transport evidence is independently archived, then a user-approved target-only cleanup is possible. |
 | `/private/tmp/paro-convergence-c2-control-20260920` | 1,800,188 KiB | clean branch / `f450d93c` | C2 control evidence tree; retain. |
 | `/private/tmp/paro-convergence-f2-parent` | 46,895,452 KiB | clean detached / `22d39fda` | Not an ancestor of re-op; retain as unique F2 material. |
@@ -61,7 +61,7 @@ is by the recorded worktree path and HEAD, or by the branch/ref shown.
 | `/private/tmp/paro-q11-chain-control-clean` | 1,790,904 KiB | clean detached / `99ef4f31` | Clean comparison tree; retain. |
 | `/private/tmp/paro-struct-clean` | 30,035,048 KiB | dirty detached / `d3097038` | Concurrent experiment; untouched, restore only through its owner. |
 | `/private/tmp/paro-nchain-clean` | 785,500 KiB | clean detached / `d4557653` | Historical evidence tree; retain. |
-| `/private/tmp/paro-reop-transport-recovery.us6Zni` | 218,608 KiB | recovery archive | Contains patches, manifests, and parked evidence; retain until the user approves archival cleanup. |
+| `/private/tmp/paro-reop-transport-recovery.us6Zni` | 218,608 KiB | recovery archive | Legacy temporary recovery location; retain until the user approves archival cleanup. |
 | `/private/tmp/paro-transport-regress-final.U6jewj` | 9,840 KiB | fresh validation data only | Rebuildable SQL-regress data; retained for this receipt, no source or unique evidence. |
 | `/private/tmp/paro-transport-regress-final2.J2BVi0` | 9,840 KiB | fresh validation data only | Rebuildable SQL-regress data; retained for this receipt, no source or unique evidence. |
 
@@ -83,4 +83,6 @@ empty staged patch has SHA-256
 tracked portion is additionally reconstructible from
 `refs/codex/recovery/reop-wip-tracked-20260921`; the parked 83-file evidence
 manifest remains outside production Git. The temporary originals and other
-worktrees were not deleted.
+worktrees were not deleted. The durable archive's former self-referential
+manifest is retained as `archive.sha256.legacy`; the active `archive.sha256`
+uses relative paths, excludes itself, and was rechecked after the repair.
