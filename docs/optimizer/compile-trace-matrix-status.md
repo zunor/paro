@@ -12,7 +12,7 @@ unchanged.
 | --- | --- | --- | --- |
 | simple `SELECT`/CTE `EXPLAIN (COMPILE)` TEXT | real session compiler, sealed `CompileCapture` | `crates/session/tests/explain_compile_test.rs` | Supported |
 | same document as JSON | `CompileDocument` renderer/validator | `crates/execution/src/explain/compile_render.rs` tests | Supported |
-| bounded `DETAIL` for supported SELECT/CTE | actual Memo/TaskRegistry search milestones; typed stream-local sequence and parent/ordinal refs | producer/renderer unit coverage; real multi-shape producer campaign pending | Targeted only; not fully certified |
+| bounded `DETAIL` for supported SELECT/CTE | actual Memo/TaskRegistry search milestones; typed stream-local sequence and parent/ordinal refs | producer/renderer unit coverage; six-shape real PgWire smoke passed, full campaign pending | Targeted only; not fully certified |
 | `COMPILE, ANALYZE` | one sealed compile, real admission, one execution handle and terminal receipt | session PgWire integration and executor receipt tests | Supported |
 | extended Parse/Bind/Describe/Execute | known parameter types; Describe does not execute; incomplete Bind rejects | `prepared::extended_query` tests | Supported |
 | forced compile and cache hit | immutable compile receipt; current compile is `NotExecuted` on hit | receipt collector and contract tests | Supported |
