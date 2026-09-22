@@ -183,6 +183,28 @@ class RunOutputTests(unittest.TestCase):
             self.assertEqual(cell["accepted_attempt_id"], attempt.attempt_id)
             self.assertEqual(cell["attempts"][0]["attempt_index"], 0)
 
+    def test_run_finalize_completed_rejects_unaccepted_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="unaccepted")
+            run.register_cell(
+                cell_id="q--normal",
+                query_cases=1,
+                sample_rows=1,
+                product_receipts=1,
+                query_case="q",
+                arm_id="normal",
+            )
+            run.registration.seal()
+            attempt = run.begin_attempt("source", query_case="q", arm_id="normal")
+            payload = self.cell_payload(
+                "q", "normal", campaign_id=run.campaign_id, run_id=run.run_id,
+                source_id=attempt.source_id, attempt_id=attempt.attempt_id,
+            )
+            attempt.cell_writer().write_json("result.json", payload)
+            attempt.seal(status="Completed")
+            with self.assertRaises(RunOutputError):
+                run.finalize(status="Completed")
+
     def test_dual_arm_99_query_registration_stays_within_manifest_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = RunOutput.create(Path(tmp), run_id="tpcds-99")

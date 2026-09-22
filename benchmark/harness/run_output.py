@@ -666,6 +666,7 @@ class CampaignSummary:
                         "result": item.get("result"),
                         "summary": item.get("summary"),
                         "failure": item.get("failure"),
+                        "metadata": item.get("metadata"),
                     }
                     for item in attempts
                 ],
@@ -1018,6 +1019,21 @@ class RunOutput:
             attempt.get("status") != "Completed" for attempt in self._manifest.get("attempts", [])
         ):
             raise RunOutputError("cannot complete a run with failed, cancelled, or incomplete attempts")
+        if status == "Completed":
+            for cell in self._manifest.get("registration", {}).get("cells", []):
+                accepted = cell.get("accepted_attempt_id")
+                if not isinstance(accepted, str) or not accepted:
+                    raise RunOutputError(
+                        f"cannot complete a run without an accepted attempt for {cell.get('cell_id')}"
+                    )
+                if not any(
+                    attempt.get("attempt_id") == accepted
+                    and attempt.get("status") == "Completed"
+                    for attempt in self._manifest.get("attempts", [])
+                ):
+                    raise RunOutputError(
+                        f"accepted attempt is not completed for {cell.get('cell_id')}"
+                    )
         if status == "Completed" and self._manifest.get("registration", {}).get(
             "status"
         ) in {"CapacityExceeded", "PublicationUnknown"}:

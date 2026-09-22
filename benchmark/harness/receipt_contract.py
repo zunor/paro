@@ -593,6 +593,15 @@ def validate_campaign_summary(summary: Any, manifest: dict[str, Any] | None = No
     if not isinstance(cells, list):
         raise ReceiptContractError("campaign summary cells must be a list")
     seen: set[str] = set()
+
+    def valid_owned_path(value: Any, *, required: bool = False) -> bool:
+        if value is None:
+            return not required
+        if not isinstance(value, str) or not value or value.startswith("/"):
+            return False
+        parts = value.replace("\\", "/").split("/")
+        return ".." not in parts and all(part not in {"", "."} for part in parts)
+
     for cell in cells:
         if not isinstance(cell, dict):
             raise ReceiptContractError("campaign summary cell must be an object")
@@ -632,6 +641,11 @@ def validate_campaign_summary(summary: Any, manifest: dict[str, Any] | None = No
             attempt_ids.add(attempt_id)
             if attempt.get("status") == "Completed":
                 completed_attempt_ids.add(attempt_id)
+            for path_field in ("result", "summary", "failure", "metadata"):
+                if not valid_owned_path(attempt.get(path_field), required=path_field == "metadata"):
+                    raise ReceiptContractError(
+                        f"campaign summary has invalid owned attempt path: {path_field}"
+                    )
         if accepted_attempt_id is not None and accepted_attempt_id not in completed_attempt_ids:
             raise ReceiptContractError("accepted attempt is not a completed attempt in the cell")
     if manifest is not None:
@@ -652,6 +666,22 @@ def validate_campaign_summary(summary: Any, manifest: dict[str, Any] | None = No
             )
             if summary_cell.get("accepted_attempt_id") != manifest_cell.get("accepted_attempt_id"):
                 raise ReceiptContractError("campaign summary accepted attempt differs from registration")
+            manifest_attempts = [
+                item for item in (manifest or {}).get("attempts", [])
+                if item.get("query_case") == manifest_cell.get("query_case")
+                and item.get("arm_id") == manifest_cell.get("arm_id")
+            ]
+            summary_attempts = summary_cell.get("attempts", [])
+            if {
+                (item.get("attempt_id"), item.get("attempt_index"), item.get("status"),
+                 item.get("result"), item.get("summary"), item.get("failure"))
+                for item in summary_attempts
+            } != {
+                (item.get("attempt_id"), item.get("attempt_index"), item.get("status"),
+                 item.get("result"), item.get("summary"), item.get("failure"))
+                for item in manifest_attempts
+            }:
+                raise ReceiptContractError("campaign summary attempt index differs from manifest")
 
 
 def build_benchmark_cell_payload(
