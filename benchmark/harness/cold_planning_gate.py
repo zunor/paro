@@ -19,6 +19,7 @@ try:
         EVIDENCE_SCHEMA_VERSION,
         ReceiptContractError,
         validate_benchmark_payload,
+        validate_campaign_summary,
         validate_compile_document,
     )
 except ImportError:  # pragma: no cover - documented script invocation
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - documented script invocation
         EVIDENCE_SCHEMA_VERSION,
         ReceiptContractError,
         validate_benchmark_payload,
+        validate_campaign_summary,
         validate_compile_document,
     )
 
@@ -71,6 +73,10 @@ def load_run_output_report(path: Path) -> tuple[dict[str, Any], Path]:
         raise ValueError("unsupported RunOutput schema version")
     if manifest.get("status") != "Completed":
         raise ValueError(f"RunOutput is not completed: {manifest.get('status')!r}")
+    try:
+        validate_campaign_summary(_owned_json(root, "campaign.json"), manifest)
+    except (OSError, ValueError, ReceiptContractError) as error:
+        raise ValueError(f"CampaignSummary does not match the sealed manifest: {error}") from error
     registration = manifest.get("registration")
     cells = registration.get("cells") if isinstance(registration, dict) else None
     if not isinstance(cells, list) or not cells:

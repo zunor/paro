@@ -592,6 +592,51 @@ def validate_benchmark_payload(payload: dict[str, Any], *, require_receipts: boo
         )
 
 
+def validate_campaign_summary(summary: Any, manifest: dict[str, Any] | None = None) -> None:
+    """Validate the bounded campaign index emitted by :class:`CampaignSummary`."""
+    if not isinstance(summary, dict) or summary.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise ReceiptContractError("unsupported campaign summary schema")
+    if summary.get("kind") != "CampaignSummary":
+        raise ReceiptContractError("campaign summary has the wrong producer kind")
+    for field in ("campaign_id", "run_id", "status", "registration_status"):
+        if field not in summary:
+            raise ReceiptContractError(f"campaign summary lacks {field}")
+    cells = summary.get("cells")
+    if not isinstance(cells, list):
+        raise ReceiptContractError("campaign summary cells must be a list")
+    seen: set[str] = set()
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise ReceiptContractError("campaign summary cell must be an object")
+        cell_id = cell.get("cell_id")
+        if not isinstance(cell_id, str) or not cell_id or cell_id in seen:
+            raise ReceiptContractError("campaign summary has duplicate or invalid cell id")
+        seen.add(cell_id)
+        if not isinstance(cell.get("sample_ids"), list):
+            raise ReceiptContractError("campaign summary cell lacks sample ids")
+        for field in ("declared_samples", "declared_receipts", "declared_captures"):
+            if not isinstance(cell.get(field), int) or isinstance(cell[field], bool) or cell[field] < 0:
+                raise ReceiptContractError(f"campaign summary has invalid {field}")
+        attempts = cell.get("attempts")
+        if not isinstance(attempts, list):
+            raise ReceiptContractError("campaign summary cell lacks attempt index")
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or not isinstance(attempt.get("status"), str):
+                raise ReceiptContractError("campaign summary has malformed attempt")
+    if manifest is not None:
+        if summary.get("campaign_id") != manifest.get("campaign_id") \
+                or summary.get("run_id") != manifest.get("run_id"):
+            raise ReceiptContractError("campaign summary identity differs from manifest")
+        if summary.get("status") != manifest.get("status"):
+            raise ReceiptContractError("campaign summary status differs from manifest")
+        registration = manifest.get("registration")
+        if not isinstance(registration, dict) or summary.get("registration_status") != registration.get("status"):
+            raise ReceiptContractError("campaign summary registration status differs from manifest")
+        manifest_cells = {cell.get("cell_id") for cell in registration.get("cells", [])}
+        if seen != manifest_cells:
+            raise ReceiptContractError("campaign summary cell index differs from registration")
+
+
 def build_benchmark_cell_payload(
     *,
     campaign_id: str,
