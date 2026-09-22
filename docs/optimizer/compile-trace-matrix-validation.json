@@ -6,7 +6,7 @@
   "source_tree_dirty_reason": "The smoke binary retained the separately preserved mixed WIP paths; this is targeted evidence, not a clean-campaign certification.",
   "scope": "v3 producer/consumer contract, bounded Detail and Summary-level RunOutput",
   "validation_status": "targeted_checks_only",
-  "current_reop_head": "7f8bf19f",
+  "current_reop_head": "86d13c27",
   "current_mixed_worktree_paths": 73,
   "current_mixed_worktree_diff_sha256": "b2283462f61a6b7501ee481dd107f93e90e20280a1774162e723dc243f646fda",
   "environment": {
