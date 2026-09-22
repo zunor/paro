@@ -4,7 +4,7 @@
 use paro_common::error::{self as paro_error, Result};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 pub trait StatementTimeoutDriver: Send + Sync {
@@ -52,6 +52,7 @@ pub struct StatementCancellation {
     connection_token: CancellationToken,
     statement_token: CancellationToken,
     statement_timeout: Option<Duration>,
+    timeout_started: Instant,
     cancel_reason: Arc<OnceLock<StatementCancelReason>>,
     timeout_driver: Arc<dyn StatementTimeoutDriver>,
     /// Keeps the timeout task alive until the last cancellation handle drops.
@@ -98,19 +99,38 @@ impl StatementCancellation {
         cancel_reason: Arc<OnceLock<StatementCancelReason>>,
         timeout_driver: Arc<dyn StatementTimeoutDriver>,
     ) -> Self {
+        Self::from_parts_at(
+            connection_token,
+            statement_token,
+            statement_timeout,
+            cancel_reason,
+            timeout_driver,
+            Instant::now(),
+        )
+    }
+
+    fn from_parts_at(
+        connection_token: CancellationToken,
+        statement_token: CancellationToken,
+        statement_timeout: Option<Duration>,
+        cancel_reason: Arc<OnceLock<StatementCancelReason>>,
+        timeout_driver: Arc<dyn StatementTimeoutDriver>,
+        timeout_started: Instant,
+    ) -> Self {
         let timeout_lifetime = Arc::new(TimeoutLifetime::new());
         if let Some(timeout) = statement_timeout {
             timeout_driver.arm(
                 &statement_token,
                 &cancel_reason,
                 &timeout_lifetime.token,
-                timeout,
+                timeout.saturating_sub(timeout_started.elapsed()),
             );
         }
         Self {
             connection_token,
             statement_token,
             statement_timeout,
+            timeout_started,
             cancel_reason,
             timeout_driver,
             _timeout_lifetime: timeout_lifetime,
@@ -119,16 +139,29 @@ impl StatementCancellation {
 
     pub fn child_execution_attempt(&self) -> Self {
         let statement_token = self.statement_token.child_token();
-        Self::from_parts(
+        Self::from_parts_at(
             self.connection_token.clone(),
             statement_token,
             self.statement_timeout,
             self.cancel_reason.clone(),
             self.timeout_driver.clone(),
+            self.timeout_started,
         )
     }
 
     pub fn is_cancelled(&self) -> bool {
+        // Synchronous compilation must not depend on the async timer task
+        // being polled. The driver wakes waiters; this clock owns the deadline.
+        if !self.statement_token.is_cancelled()
+            && self
+                .statement_timeout
+                .is_some_and(|limit| self.timeout_started.elapsed() >= limit)
+        {
+            let _ = self
+                .cancel_reason
+                .set(StatementCancelReason::StatementTimeout);
+            self.statement_token.cancel();
+        }
         self.statement_token.is_cancelled()
     }
 
@@ -167,6 +200,28 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn synchronous_checks_enforce_deadline_without_a_timer_driver() {
+        let cancellation =
+            StatementCancellation::new(CancellationToken::new(), Some(Duration::ZERO));
+        let error = cancellation.check().unwrap_err();
+        assert!(error.is(paro_common::error::codes::operator::STATEMENT_TIMEOUT));
+        assert!(!cancellation.connection_cancelled());
+    }
+
+    #[test]
+    fn execution_retry_inherits_the_statement_clock() {
+        let mut cancellation =
+            StatementCancellation::new(CancellationToken::new(), Some(Duration::from_secs(1)));
+        cancellation.timeout_started = Instant::now() - Duration::from_secs(2);
+        let retry = cancellation.child_execution_attempt();
+        assert_eq!(retry.timeout_started, cancellation.timeout_started);
+        assert!(retry
+            .check()
+            .unwrap_err()
+            .is(paro_common::error::codes::operator::STATEMENT_TIMEOUT));
+    }
 
     #[derive(Default)]
     struct RecordingTimeoutDriver {

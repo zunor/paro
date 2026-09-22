@@ -564,7 +564,9 @@ async fn cancelled_declare_cursor_does_not_poison_future_cursor_scope() {
         "INSERT INTO cursor_cancel_t VALUES (1), (2), (3)",
     )
     .await;
-    exec_ok(&mut session, &mut sink, "SET statement_timeout = 1").await;
+    // This test injects cancellation through ToggleTimeoutDriver. Do not race
+    // normal setup/cleanup against a real 1 ms monotonic statement deadline.
+    exec_ok(&mut session, &mut sink, "SET statement_timeout = 60000").await;
 
     driver.enable();
     let err = exec_err(
@@ -607,7 +609,8 @@ async fn cancelled_fetch_keeps_cursor_cleanup_paths_usable() {
         "INSERT INTO cursor_fetch_cancel_t VALUES (1), (2), (3)",
     )
     .await;
-    exec_ok(&mut session, &mut sink, "SET statement_timeout = 1").await;
+    // The driver injects the timeout at FETCH; setup must not expire first.
+    exec_ok(&mut session, &mut sink, "SET statement_timeout = 60000").await;
     exec_ok(
         &mut session,
         &mut sink,
