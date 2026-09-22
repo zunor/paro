@@ -36,8 +36,8 @@ pub mod rules;
 pub mod scalar;
 mod scalar_lowering;
 pub mod tasks;
-pub(crate) use scalar_lowering::expression_fingerprint;
 pub(crate) use scalar_lowering::BindingCatalog;
+pub(crate) use scalar_lowering::{encode_value, physical_expression_fingerprint};
 pub mod verifier;
 
 pub use budget::{BudgetDecision, SearchBudget, SearchLedger};

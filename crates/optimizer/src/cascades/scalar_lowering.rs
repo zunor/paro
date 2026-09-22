@@ -925,6 +925,41 @@ pub(crate) fn expression_fingerprint(expression: &Expression) -> Fingerprint {
     fingerprints[&expression.allocation_identity()]
 }
 
+/// Physical evaluation identity preserves child order and multiplicity. Domain
+/// proofs intentionally flatten AND/OR as sets; using that normalization for
+/// execution would erase short-circuit order and repeated volatile operands.
+pub(crate) fn physical_expression_fingerprint(expression: &Expression) -> Fingerprint {
+    let mut pending = vec![(expression, false)];
+    let mut fingerprints = HashMap::<ExpressionIdentity, Fingerprint>::new();
+    while let Some((current, visited)) = pending.pop() {
+        if fingerprints.contains_key(&current.allocation_identity()) {
+            continue;
+        }
+        if !visited {
+            pending.push((current, true));
+            ExpressionIterator::enumerate_children(current, |child| pending.push((child, false)));
+            continue;
+        }
+        let mut builder = StableFingerprintBuilder::default();
+        builder.write_bytes(b"paro.physical-expression.v1");
+        super::scalar::encode_logical_type(&mut builder, &current.return_type());
+        if let Expression::Conjunction(conjunction) = current {
+            builder.write_u64(match conjunction.conjunction_type {
+                ConjunctionType::And => 4,
+                ConjunctionType::Or => 5,
+            });
+            builder.write_u64(conjunction.children.len() as u64);
+            for child in &conjunction.children {
+                builder.write_fingerprint(expression_child_fingerprint(&fingerprints, child));
+            }
+        } else {
+            encode_expression_node_fingerprint(&mut builder, current, &fingerprints);
+        }
+        fingerprints.insert(current.allocation_identity(), builder.finish());
+    }
+    fingerprints[&expression.allocation_identity()]
+}
+
 fn expression_child_fingerprint(
     fingerprints: &HashMap<ExpressionIdentity, Fingerprint>,
     expression: &Expression,

@@ -92,6 +92,12 @@ pub enum PhysicalIdentityError {
         node: PhysicalPlanNodeId,
         dependency: u32,
     },
+    /// No typed identity schema has been declared for this implementation.
+    /// Identity generation must fail closed instead of assigning a shared
+    /// placeholder to semantically different physical payloads.
+    UnsupportedKind {
+        kind: &'static str,
+    },
 }
 
 impl fmt::Display for PhysicalIdentityError {
@@ -104,6 +110,10 @@ impl fmt::Display for PhysicalIdentityError {
             Self::MissingAuxiliaryDependency { node, dependency } => write!(
                 formatter,
                 "physical identity node {node:?} references missing auxiliary dependency {dependency}"
+            ),
+            Self::UnsupportedKind { kind } => write!(
+                formatter,
+                "physical identity has no typed canonical encoder for {kind}"
             ),
         }
     }
@@ -312,7 +322,7 @@ impl PhysicalPlan {
             let node = self.node(*id);
             builder.write_u64(canonical as u64);
             builder.write_bytes(node.kind.name().as_bytes());
-            write_canonical_kind(self, *id, &mut builder);
+            write_canonical_kind(self, *id, &mut builder)?;
             write_row_type(&mut builder, &node.output);
             let children = self.child_ids(&node.children);
             builder.write_u64(children.len() as u64);
@@ -440,14 +450,17 @@ impl PhysicalPlan {
                 .iter()
                 .filter(|edge| edge.consumer == id)
                 .map(|edge| {
-                    (
+                    Ok((
                         edge_kind_key(edge.kind),
-                        self.local_identity_key(edge.producer),
+                        self.local_identity_key(edge.producer)?,
                         edge.producer,
-                    )
+                    ))
                 })
-                .collect::<Vec<_>>();
-            producers.sort_unstable_by_key(|(kind, local, producer)| (*kind, *local, *producer));
+                .collect::<Result<Vec<_>, PhysicalIdentityError>>()?;
+            // Do not use the arena id as a tie breaker. Equal typed payloads
+            // are interchangeable; an arena id would make otherwise equal
+            // plans differ across extraction runs.
+            producers.sort_unstable_by_key(|(kind, local, _)| (*kind, *local));
             for (_, _, producer) in producers.into_iter().rev() {
                 stack.push((producer, false));
             }
@@ -458,13 +471,16 @@ impl PhysicalPlan {
         Ok(order)
     }
 
-    fn local_identity_key(&self, id: PhysicalPlanNodeId) -> Fingerprint {
+    fn local_identity_key(
+        &self,
+        id: PhysicalPlanNodeId,
+    ) -> Result<Fingerprint, PhysicalIdentityError> {
         let node = self.node(id);
         let mut builder = StableFingerprintBuilder::default();
         builder.write_bytes(node.kind.name().as_bytes());
-        write_canonical_kind(self, id, &mut builder);
+        write_canonical_kind(self, id, &mut builder)?;
         write_row_type(&mut builder, &node.output);
-        builder.finish()
+        Ok(builder.finish())
     }
 
     pub fn format_explain_text_with_spec(&self, spec: &ExplainSpec) -> String {
@@ -1027,7 +1043,7 @@ fn write_canonical_kind(
     plan: &PhysicalPlan,
     id: PhysicalPlanNodeId,
     builder: &mut StableFingerprintBuilder,
-) {
+) -> Result<(), PhysicalIdentityError> {
     let node = plan.node(id);
     builder.write_bytes(b"physical-kind-explain-schema.v1");
     builder.write_bytes(node.kind.name().as_bytes());
@@ -1037,11 +1053,15 @@ fn write_canonical_kind(
         builder.write_bytes(property.label.as_bytes());
         write_explain_value(builder, &property.value);
     }
-    write_semantic_kind_fields(builder, &node.kind);
+    write_semantic_kind_fields(builder, &node.kind)?;
+    Ok(())
 }
 
-fn write_semantic_kind_fields(builder: &mut StableFingerprintBuilder, kind: &PhysicalNodeKind) {
-    use crate::cascades::expression_fingerprint;
+fn write_semantic_kind_fields(
+    builder: &mut StableFingerprintBuilder,
+    kind: &PhysicalNodeKind,
+) -> Result<(), PhysicalIdentityError> {
+    use crate::cascades::physical_expression_fingerprint as expression_fingerprint;
 
     fn write_expressions<'a>(
         builder: &mut StableFingerprintBuilder,
@@ -1095,10 +1115,46 @@ fn write_semantic_kind_fields(builder: &mut StableFingerprintBuilder, kind: &Phy
             write_expressions(builder, spec.runtime_filter_expressions.iter());
             builder.write_u64(spec.predicate.is_some() as u64);
             if let Some(predicate) = &spec.predicate {
-                builder
-                    .write_bytes(format_predicate_tree(predicate, spec.table.as_ref()).as_bytes());
+                super::predicate_identity::encode_predicate(
+                    builder,
+                    predicate,
+                    crate::cascades::encode_value,
+                );
             }
             builder.write_u64(spec.table.base.base.object_id.raw());
+        }
+        PhysicalNodeKind::Values(spec) => {
+            builder.write_u64(16);
+            builder.write_u64(spec.table_index as u64);
+            match &spec.relation_alias {
+                Some(alias) => {
+                    builder.write_u64(1);
+                    builder.write_bytes(alias.as_bytes());
+                }
+                None => builder.write_u64(0),
+            }
+            builder.write_u64(spec.expressions.len() as u64);
+            for row in &spec.expressions {
+                builder.write_u64(row.len() as u64);
+                for expression in row {
+                    builder.write_fingerprint(expression_fingerprint(expression));
+                }
+            }
+            write_strings(builder, spec.output_names.iter());
+            write_hashed_slice(builder, b"values-output-types", &spec.output_types);
+        }
+        PhysicalNodeKind::ExpressionScan(spec) => {
+            builder.write_u64(17);
+            builder.write_u64(spec.table_index as u64);
+            builder.write_u64(spec.expressions.len() as u64);
+            for row in &spec.expressions {
+                builder.write_u64(row.len() as u64);
+                for expression in row {
+                    builder.write_fingerprint(expression_fingerprint(expression));
+                }
+            }
+            write_strings(builder, spec.output_names.iter());
+            write_hashed_slice(builder, b"expression-scan-output-types", &spec.output_types);
         }
         PhysicalNodeKind::Limit(spec) => {
             builder.write_u64(4);
@@ -1232,20 +1288,25 @@ fn write_semantic_kind_fields(builder: &mut StableFingerprintBuilder, kind: &Phy
             builder.write_bytes(spec.op.to_string().as_bytes());
             builder.write_u64(spec.all as u64);
         }
+        PhysicalNodeKind::DummyScan(_) | PhysicalNodeKind::EmptyResult(_) => {
+            builder.write_u64(15);
+        }
         _ => {
-            // Every variant still has a versioned, schema-backed identity via
-            // the EXPLAIN projection above. The explicit tags above cover the
-            // variants whose hidden payload is not rendered as a property.
-            builder.write_u64(0);
+            return Err(PhysicalIdentityError::UnsupportedKind { kind: kind.name() });
         }
     }
+    Ok(())
 }
 
 fn write_join_conditions(builder: &mut StableFingerprintBuilder, conditions: &[JoinCondition]) {
     builder.write_u64(conditions.len() as u64);
     for condition in conditions {
-        builder.write_fingerprint(crate::cascades::expression_fingerprint(&condition.left));
-        builder.write_fingerprint(crate::cascades::expression_fingerprint(&condition.right));
+        builder.write_fingerprint(crate::cascades::physical_expression_fingerprint(
+            &condition.left,
+        ));
+        builder.write_fingerprint(crate::cascades::physical_expression_fingerprint(
+            &condition.right,
+        ));
         builder.write_u64(match condition.comparison {
             JoinComparisonType::Equal => 0,
             JoinComparisonType::NotEqual => 1,
@@ -3181,7 +3242,8 @@ fn format_search_predicate(
 mod identity_tests {
     use super::*;
     use crate::physical::cost::MemoryCompletion;
-    use crate::physical::specs::DummyScanSpec;
+    use crate::physical::identity::{MutationBarrierId, SnapshotId};
+    use crate::physical::specs::{DummyScanSpec, MutationInputSpoolSpec};
     use crate::physical::{InlinePlanChildren, ResourceGrantClassId};
     use crate::physical::{OperatorLabel, RowType};
     use paro_common::types::LogicalType;
@@ -3282,6 +3344,35 @@ mod identity_tests {
         assert_eq!(
             invalid_edge.structural_identity_fingerprint(),
             Err(PhysicalIdentityError::InvalidEdge)
+        );
+    }
+
+    #[test]
+    fn structural_identity_fails_closed_for_unencoded_operator_payloads() {
+        let mut nodes = PhysicalPlanNodeArena::default();
+        let root = nodes.push(PhysicalPlanNode {
+            id: PhysicalPlanNodeId::INVALID,
+            output: RowType::new(Vec::new(), Vec::new()),
+            cardinality: None,
+            kind: PhysicalNodeKind::MutationInputSpool(MutationInputSpoolSpec {
+                barrier: MutationBarrierId::new(0),
+                targets: Default::default(),
+                snapshot: SnapshotId::new(0),
+            }),
+            children: PlanChildren::Empty,
+            label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "values"),
+        });
+        let plan = PhysicalPlan::new(
+            root,
+            nodes,
+            PlanChildrenArena::default(),
+            PlanPropertyMap::default(),
+        );
+        assert_eq!(
+            plan.structural_identity_fingerprint(),
+            Err(PhysicalIdentityError::UnsupportedKind {
+                kind: "MUTATION_INPUT_SPOOL"
+            })
         );
     }
 }

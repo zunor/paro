@@ -18,6 +18,7 @@ pub mod node;
 pub mod objective;
 pub mod plan;
 pub mod portfolio;
+mod predicate_identity;
 pub mod properties;
 pub mod requirements;
 pub mod resources;
