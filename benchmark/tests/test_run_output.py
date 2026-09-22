@@ -183,6 +183,37 @@ class RunOutputTests(unittest.TestCase):
             self.assertEqual(cell["accepted_attempt_id"], attempt.attempt_id)
             self.assertEqual(cell["attempts"][0]["attempt_index"], 0)
 
+    def test_dual_arm_99_query_registration_stays_within_manifest_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="tpcds-99")
+            for index in range(99):
+                query_case = f"q{index + 1:02d}"
+                for arm_id in ("control", "probe"):
+                    run.register_cell(
+                        cell_id=f"{query_case}--{arm_id}",
+                        query_cases=1,
+                        sample_rows=2,
+                        product_receipts=2,
+                        attempts=2,
+                        query_case=query_case,
+                        arm_id=arm_id,
+                    )
+            run.registration.seal()
+            for index in range(99):
+                query_case = f"q{index + 1:02d}"
+                for arm_id in ("control", "probe"):
+                    run.begin_attempt(
+                        f"tpcds-{query_case}-{arm_id}",
+                        query_case=query_case,
+                        arm_id=arm_id,
+                    )
+            manifest = json.loads((run.root / "manifest.json").read_text())
+            self.assertEqual(len(manifest["registration"]["cells"]), 198)
+            self.assertLess(
+                manifest["registration"]["manifest_bytes"],
+                manifest["registration"]["manifest_limit_bytes"],
+            )
+
     def test_cell_payload_must_match_registered_identity_and_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = CampaignOutput.create(
