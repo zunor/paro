@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Render only the sealed target observation; never invoke planning or admission.
-use paro_context::compile_diagnostics::{CompileRecord, ExecutionReceipt, SealedCompileCapture, ENCODED_LIMIT};
+use paro_context::compile_diagnostics::{
+    CompileRecord, ExecutionReceipt, SealedCompileCapture, ENCODED_LIMIT,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 

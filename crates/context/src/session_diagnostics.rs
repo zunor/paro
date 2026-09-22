@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
 use crate::compile_diagnostics::{
-    AdmissionFallback, AdmissionReceiptId, AdmissionResult, ArtifactIdentity,
-    ExecutionImageStatus, ExecutionReceipt, ExecutionReceiptId, ExecutionTerminal, LoweringStatus,
-    Observation, ResourceReceipt, SelectionIdentity,
-    ResourceReservationStatus, SearchStop, RECEIPT_SCHEMA_VERSION,
+    AdmissionFallback, AdmissionReceiptId, AdmissionResult, ArtifactIdentity, ExecutionImageStatus,
+    ExecutionReceipt, ExecutionReceiptId, ExecutionTerminal, LoweringStatus, Observation,
+    ResourceReceipt, ResourceReservationStatus, SearchStop, SelectionIdentity,
+    RECEIPT_SCHEMA_VERSION,
 };
 use crate::StatementTraceSnapshot;
 
@@ -341,7 +341,7 @@ impl SessionDiagnostics {
                     artifact: start.artifact_identity.artifact,
                     grant_class: Some(grant_class),
                     physical_fingerprint: Some(physical_fingerprint),
-                }
+                },
             ),
             statement_decision_id,
             artifact_identity: start.artifact_identity,
