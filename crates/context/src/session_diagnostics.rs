@@ -124,6 +124,10 @@ pub struct SessionDiagnostics {
     /// live execution silently unupdatable.
     execution_receipts: RwLock<Vec<ExecutionReceipt>>,
     active_execution_receipts: RwLock<std::collections::BTreeMap<u64, ExecutionReceipt>>,
+    /// Admission is a decision boundary, not an execution occurrence.  Keep
+    /// its allocator independent so retries and rejected executions cannot
+    /// accidentally make the two identities aliases.
+    admission_sequence: std::sync::atomic::AtomicU64,
     execution_sequence: std::sync::atomic::AtomicU64,
     statement_sequence: std::sync::atomic::AtomicU64,
     statement_decision_capacity_exceeded: std::sync::atomic::AtomicU64,
@@ -331,11 +335,14 @@ impl SessionDiagnostics {
         let execution_id = self
             .execution_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let admission_id = self
+            .admission_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let statement_decision_id = start.statement_decision_id;
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             execution_id: ExecutionReceiptId(execution_id),
-            admission_receipt_id: AdmissionReceiptId(execution_id),
+            admission_receipt_id: AdmissionReceiptId(admission_id),
             selection_identity: start.actual_class.zip(start.actual_fingerprint).map(
                 |(grant_class, physical_fingerprint)| SelectionIdentity {
                     artifact: start.artifact_identity.artifact,
