@@ -27,7 +27,11 @@ blessing, or history cleanup.
 4. Before collection, register EvidenceId, source and binary identities,
    DuckDB identity from `benchmark/requirements.txt` plus the actual runtime,
    SQL/data seed, resource envelope, process-block/sample counts, and timer
-   boundaries. Discover current collector flags from `--help`.
+   boundaries. Record the effective optional-search deadline and budget source
+   (`PARO_DIAGNOSTIC_SEARCH_STOP_MS`, config, or an explicit `SearchBudget`);
+   if the receipt does not expose it, preserve the process/config value in the
+   manifest rather than inferring it from a source default. Discover current
+   collector flags from `--help`.
 5. Use `benchmark/corpora/tpcds_compare.py` for normal measurements. C1 is
    target occurrence 0 in a fresh process with a verified cache miss; keep
    trace-off C1, warm, and diagnostics in separate cohorts. Validate complete
