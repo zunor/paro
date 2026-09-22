@@ -6,6 +6,9 @@
   "source_tree_dirty_reason": "The smoke binary retained the separately preserved mixed WIP paths; this is targeted evidence, not a clean-campaign certification.",
   "scope": "v3 producer/consumer contract, bounded Detail and Summary-level RunOutput",
   "validation_status": "targeted_checks_only",
+  "current_reop_head": "7f8bf19f",
+  "current_mixed_worktree_paths": 73,
+  "current_mixed_worktree_diff_sha256": "b2283462f61a6b7501ee481dd107f93e90e20280a1774162e723dc243f646fda",
   "environment": {
     "duckdb_version": "1.5.5",
     "optimizer_policy_changes": false,
@@ -24,8 +27,9 @@
     "strict_clippy_all_targets_all_features": "pass",
     "benchmark_unittest": {
       "status": "pass",
-      "passed": 194,
-      "skipped": 1
+      "passed": 200,
+      "skipped": 0,
+      "performance_gate_note": "unit tests report missing temporary auto baseline; no performance conclusion"
     },
     "sql_regress": {
       "status": "completed_with_existing_failures",
@@ -51,6 +55,8 @@
     "rust_optimizer_identity_check": "blocked_debug_payload_fallback",
     "detail_parent_ordinal_validation": "added",
     "run_output_generation_guard": "added",
+    "explicit_attempt_acceptance": "pass",
+    "dual_arm_99_query_registration": "pass_registration_and_attempt_index_only",
     "real_explain_compile_summary": "pass",
     "real_explain_compile_analyze": "pass",
     "real_pgwire_select": "pass",
@@ -116,5 +122,6 @@
     "full benchmark cold-planning campaign",
     "current clean workspace validation",
     "full Trace Matrix Detail producer coverage"
+    ,"full 99-query dual-arm producer-to-gate campaign"
   ]
 }
