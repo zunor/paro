@@ -77,3 +77,41 @@ only an internal CTE display-ID change and the deliberately changed settings
 inventory; those two expectations are reviewed individually. Other expected
 files are not regenerated. Final checks and fresh post-fix results are recorded
 in the delivery report, separately from these exploratory observations.
+
+### Clean-source post-fix pilot
+
+Source `9d8674ff`, release binary SHA-256
+`f6e66ce4f888904a49b2882c4c900beab546432a8a46f4f26837395ed06cba98`.
+The four cells each have two fresh normal blocks and one separate diagnostic
+block. All completed, with verified cold misses and full typed result checks.
+The matrix is exploratory, sequential between cells, and does not certify
+causal improvements, tails or parity. Compiler values below come from normal
+statement receipts, not diagnostic client time.
+
+| Query / verifier | Compiler samples (ms) | Paro C1 median (ms) | DuckDB C1 median (ms) |
+| --- | --- | --- | --- |
+| Q11 / on | 71.610, 70.960 | 187.106 | 52.570 |
+| Q04 / on | 703.065, 691.958 | 895.328 | 107.841 |
+| Q74 / on | 76.472, 78.340 | 172.733 | 77.323 |
+| Q11 / off | 69.318, 71.429 | 183.312 | 51.252 |
+
+Q11 still performs 1,467 cost syntheses versus 384 in the historical replay;
+disabling additional verification alone does not recover the historical fast
+path. Safe normalization and quality handoff are migrated, but the historical
+portfolio optimization remains unimplemented. Further work must preserve typed
+identity, grant fallback and admission ownership rather than reintroduce its
+old closure. Q04's much larger remaining search is also a separate performance
+problem, not evidence that this migration restored the entire chain profile.
+
+Final validation: workspace tests and strict Clippy pass; benchmark tests
+228 pass; regress harness tests 103 pass and one skip. Full SQL regression is
+167 passed / 18 failed, with the same failure-file set as the pre-migration
+control. This is not an all-green SQL gate; the remaining expected outputs
+were not blessed. A real 100 ms statement timeout interrupts budgeted Q04,
+returns the existing Paro SQLSTATE `57P06`, and permits the connection to run
+another statement. Cancellation remains cooperative, not hard realtime.
+
+Bounded campaign artifacts and the pre-run registration are retained under
+`benchmark/evidence/optimizer-migration/20260923/`. The seed and earlier
+negative runs remain outside Git; no historical worktree or user dataset was
+deleted by this migration.
