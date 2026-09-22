@@ -32,6 +32,51 @@ fn encode_json_bounded<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
     Ok(writer.0)
 }
 
+/// Count escaped wire bytes without materializing another diagnostic buffer.
+/// Keep a source-ordered prefix: dropping arbitrary events can strand child
+/// references whose parent event was discarded.
+fn fit_detail(record: &mut CompileRecord) -> io::Result<()> {
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| io::Error::other("compile size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn size(value: &impl serde::Serialize) -> io::Result<usize> {
+        let mut counter = Counter(0);
+        serde_json::to_writer(&mut counter, value).map_err(io::Error::other)?;
+        Ok(counter.0)
+    }
+    let mut events = std::mem::take(&mut record.detail);
+    let prior_omitted = record.omitted_encoding_detail;
+    // Reserve enough digits for the worst-case omission count before sizing
+    // the mandatory summary, receipts and terminal state.
+    record.omitted_encoding_detail = prior_omitted.saturating_add(events.len() as u64);
+    let mut available = ENCODED_LIMIT
+        .checked_sub(size(record)?)
+        .ok_or_else(|| io::Error::other("compile summary capacity"))?;
+    let mut retained = 0;
+    for event in &events {
+        let bytes = size(event)?.saturating_add(usize::from(retained != 0));
+        let Some(remainder) = available.checked_sub(bytes) else {
+            break;
+        };
+        available = remainder;
+        retained += 1;
+    }
+    record.omitted_encoding_detail = prior_omitted.saturating_add((events.len() - retained) as u64);
+    events.truncate(retained);
+    record.detail = events;
+    Ok(())
+}
+
 pub fn render(capture: &SealedCompileCapture, json: bool) -> String {
     render_with_execution(capture, json, None)
 }
@@ -65,15 +110,10 @@ pub fn render_with_execution_level(
             // are not.  Trim only optional events when the sealed document is
             // larger than the wire lease, instead of replacing an executed
             // ANALYZE result with an Unavailable/NotExecuted document.
-            let mut encoded = encode_json_bounded(&record);
-            if encoded.is_err() && !record.detail.is_empty() {
-                record.omitted_encoding_detail = record
-                    .omitted_encoding_detail
-                    .saturating_add(record.detail.len() as u64);
-                record.detail.clear();
-                encoded = encode_json_bounded(&record);
+            if !record.detail.is_empty() {
+                fit_detail(&mut record)?;
             }
-            writer.write_all(&encoded?)
+            writer.write_all(&encode_json_bounded(&record)?)
         } else {
             writeln!(writer, "EXPLAIN (COMPILE) / schema {} / ForcedCompile", record.schema_version)?;
             writeln!(writer, "phase             nanoseconds (Observed / Uncovered)")?;
@@ -428,6 +468,41 @@ pub fn validate_json(
 mod tests {
     use super::*;
     use paro_context::compile_diagnostics::CompileCapture;
+    #[test]
+    fn wire_capacity_retains_a_valid_detail_prefix() {
+        use paro_context::compile_diagnostics::*;
+        let capture = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
+        for source_sequence in 0..MAX_DETAIL_EVENTS as u64 {
+            capture.detail(DetailEvent::Quality {
+                source_sequence,
+                event_time_us: source_sequence,
+                candidate: None,
+                goal: None,
+                completed: 0,
+                not_applicable: 0,
+                missing_evidence: 0,
+                suspended: 0,
+                missing_facts: 1,
+                missing_bundles: Box::new([1]),
+                missing_fact_kinds: Box::new([1]),
+                policy_satisfied: false,
+            });
+        }
+        let sealed = capture.seal();
+        let retained = sealed.read(|record| record.detail.len());
+        let json = render(&sealed, true);
+        let CompileDocument::Summary(record) = validate_json(json.as_bytes()).unwrap() else {
+            panic!("capacity must preserve the summary");
+        };
+        assert!(!record.detail.is_empty());
+        assert!(record.detail.len() < retained);
+        assert_eq!(
+            record.detail.len() + record.omitted_encoding_detail as usize,
+            retained
+        );
+        assert!(json.len() <= ENCODED_LIMIT);
+        assert_eq!(sealed.read(|record| record.detail.len()), retained);
+    }
     #[test]
     fn schema_and_capacity_rejects_fabricated_execution() {
         let capture = CompileCapture::try_start().unwrap();
