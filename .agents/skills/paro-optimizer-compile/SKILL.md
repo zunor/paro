@@ -38,6 +38,11 @@ blessing, or history cleanup.
    candidates, grant, quality state, and stop reason. `SearchIncomplete` or
    `BudgetLimited` is not `ProofComplete`; fingerprints locate plans but do not
    prove equivalence. Detail time is never C1.
+   A historical arm may predate the typed `COMPILE` protocol. In that case a
+   plain `EXPLAIN` is an exploratory fallback only: record the protocol and
+   source mismatch, keep its plan text/timing in a separate cell, and mark the
+   arm `Uncovered`/`Incomparable` for receipt, search-state, and C1 claims. Do
+   not infer typed counters or pair its wall time with a normal C1 sample.
 7. Run registered Q04, Q11, and Q74 cells with identical resources and source
    policy. Preserve slow samples, failures, missing receipts, and unsupported
    modes. Report `Uncovered`, `Incomparable`, or `NotCertified` instead of
