@@ -4,6 +4,12 @@ This is the bounded compile/execution contract, not C2/F2 admission or a
 latency claim. Existing search, grant, verification and behavior-experiment
 defaults are unchanged. Bounded Detail is delivered for the supported SQL
 COMPILE shapes; full Trace Matrix coverage is not claimed.
+
+Cell retry selection is explicit in v3: each attempt carries a producer-owned
+`attempt_index`, and the cell carries one sealed `accepted_attempt_id`. Gates
+consume only that accepted completed attempt; failed, cancelled, incomplete
+and unaccepted attempts remain retained evidence. No reader uses latest,
+occurrence, or array position to infer acceptance.
 The authoritative current wire document is
 `context::compile_diagnostics::CompileDocument`, schema version **3**. Rust
 typed records are the semantic source; the JSON renderer, benchmark validator,

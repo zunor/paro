@@ -20,6 +20,7 @@ unchanged.
 | normal benchmark sample association | exact statement/execution identity snapshot, no latest/occurrence guessing | `test_compile_work_evidence.py`, receipt contract tests | Supported; `Uncovered` is fail-closed |
 | campaign ownership | CampaignId/ArmId/QueryCase/RunId/SourceId/AttemptId; cell is QueryCase×ArmId; summaries contain references only | `test_run_output.py`, runner/gate source tests | Supported, bounded |
 | typed campaign finalization | producer `CampaignSummary`, sealed manifest identity/status agreement, explicit omitted count/bytes on registration or payload capacity failure | `test_run_output.py`, `cold_planning_gate.py` | Supported, bounded |
+| retry acceptance | every attempt has an explicit `attempt_index`; a cell records one producer-selected `accepted_attempt_id`; gates never select by latest, occurrence, or list order | `test_run_output.py`, `cold_planning_gate.py`, receipt contract validation | Supported, bounded |
 | admission/selection receipt identity | independently allocated `AdmissionReceiptId` and `SelectionIdentity`, checked against artifact/class/fingerprint at render time | `compile_render` and context receipt tests | Supported for current receipt schema |
 | bounded writer | payload, terminal-control and manifest UTF-8 limits before atomic publish; capacity seals registration and rejects later writes | RunOutput quota, manifest-limit, and post-capacity rejection tests | Supported |
 | stable physical identity | intended typed structural identity boundary | current plan encoder still has a Debug-derived payload fallback | Blocked; not cross-run certified |
@@ -61,6 +62,9 @@ unchanged.
 7. A cell is complete only after its declared owned output/attempt state is
    present. A result file alone is not a completion certificate; missing or
    incompatible receipts remain `Uncovered`.
+8. Retry attempts are retained independently. Only an explicitly accepted,
+   completed attempt can satisfy a cell; failed, cancelled, incomplete and
+   unaccepted attempts remain evidence and cannot be silently replaced.
 
 The external design source is
 `/Users/linjunhong/workspace/paro-docs-design/optimizer/optimizer-trace-matrix.md`.
