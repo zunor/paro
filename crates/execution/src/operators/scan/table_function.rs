@@ -1132,7 +1132,7 @@ fn populate_paro_optimizers(
                 metric_unit: "receipt".into(),
                 invocation_count: 1,
                 record_type: "execution_receipt".into(),
-                record_id: receipt.execution_id,
+                record_id: receipt.execution_id.0,
                 payload_json: Some(
                     serde_json::to_string(&receipt).unwrap_or_else(|_| "null".into()),
                 ),
