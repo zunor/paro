@@ -133,6 +133,21 @@ already satisfies it.
 
 ## Completion vocabulary
 
+`optimizer_search_policy` is a validated session setting included in planning
+cache identity. The SQL default, `quality`, permits handoff only after the
+selected candidate satisfies the quality policy and executable verification.
+`budgeted` continues optional exploration subject to the same search budgets.
+Neither setting implies exhaustive search. Embedders without session settings
+default to budgeted search and may explicitly supply `SearchBudget.search_policy`.
+The former `PARO_QUALITY_POLICY_HANDOFF` environment switch is not an alias.
+
+Materialized CTE necessary-domain normalization is shared by both policies,
+before Memo construction. It accounts for nested producer references and uses
+definition-column identities and the shared domain-transfer contract. Consumer
+residuals remain in place. Quality evidence inspects the selected producer and
+consumer choices, not the rule name that introduced a filter. Predicate-domain
+coverage alone proves neither minimum stored width nor join-search completion.
+
 ~~~text
 Semantic correctness / safety
     independent of
@@ -346,7 +361,7 @@ Keep this README short-lived-data free:
 - Register finite volume limits before collection. For A arms, Q query cases,
   N cells and D Summary captures, manifest budget M is
   32,000 + 1,024*(A+Q+N+D) bytes. Per-cell budget T_i is
-  4,096 + 1,024*S_i + 2,048*P_i + 512*R_i: S_i counts scheduled timing/error
+  4,096 + 1,024*S_i + 4,096*P_i + 512*R_i: S_i counts scheduled timing/error
   rows including warm/retries, P_i bounds artifact/candidate receipts, and R_i
   bounds registered scalar calibration rows, never events. README is bounded
   at 20,000 bytes; each Summary at 200,000. Total registered budget

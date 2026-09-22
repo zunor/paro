@@ -66,7 +66,7 @@ source execution using:
 
 ```
 M = 32000 + 1024 * (A + Q + N + D)
-T_i = 4096 + 1024*S_i + 2048*P_i + 512*R_i
+T_i = 4096 + 1024*S_i + 4096*P_i + 512*R_i
 B = M + 20000 + sum(T_i) + 200000*D <= 64 MiB
 ```
 
