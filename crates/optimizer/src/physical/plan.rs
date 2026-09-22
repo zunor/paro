@@ -6,6 +6,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write};
+use std::hash::{Hash, Hasher};
 
 use super::children::{PlanChildren, PlanChildrenArena};
 use super::dependencies::PlanDependencies;
@@ -279,7 +280,7 @@ impl PhysicalPlan {
     /// explicit so a consumer never treats a later encoding as compatible.
     pub fn structural_identity_fingerprint(&self) -> Result<Fingerprint, PhysicalIdentityError> {
         let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.physical-plan-structure.v3.typed-canonical");
+        builder.write_bytes(b"paro.physical-plan-structure.v4.typed-canonical");
 
         // The traversal is iterative on purpose.  Physical plans can contain
         // long unary spines and a fingerprint must not depend on recursion
@@ -311,7 +312,7 @@ impl PhysicalPlan {
             let node = self.node(*id);
             builder.write_u64(canonical as u64);
             builder.write_bytes(node.kind.name().as_bytes());
-            write_debug_value(&mut builder, &node.kind);
+            write_canonical_kind(self, *id, &mut builder);
             write_row_type(&mut builder, &node.output);
             let children = self.child_ids(&node.children);
             builder.write_u64(children.len() as u64);
@@ -320,11 +321,23 @@ impl PhysicalPlan {
             }
             if let Some(properties) = self.properties.get(*id) {
                 builder.write_u64(1);
-                write_debug_value(&mut builder, &properties.required_from_parent);
-                write_debug_value(&mut builder, &properties.provided);
-                write_debug_value(&mut builder, &properties.characteristics);
-                write_debug_value(&mut builder, &properties.region_owner);
-                write_debug_value(&mut builder, &properties.owned_artifacts);
+                write_hashed(
+                    &mut builder,
+                    b"required-properties",
+                    &properties.required_from_parent,
+                );
+                write_hashed(&mut builder, b"provided-properties", &properties.provided);
+                write_hashed(
+                    &mut builder,
+                    b"characteristics",
+                    &properties.characteristics,
+                );
+                write_optional_fingerprint(&mut builder, properties.region_owner);
+                write_hashed_slice(
+                    &mut builder,
+                    b"owned-artifacts",
+                    &properties.owned_artifacts,
+                );
                 let mut dependencies = properties
                     .auxiliary_dependencies
                     .iter()
@@ -376,7 +389,7 @@ impl PhysicalPlan {
                 builder.write_fingerprint(fingerprint);
             }
         }
-        write_debug_value(&mut builder, &self.dependencies);
+        write_hashed(&mut builder, b"plan-dependencies", &self.dependencies);
         Ok(builder.finish())
     }
 
@@ -449,7 +462,7 @@ impl PhysicalPlan {
         let node = self.node(id);
         let mut builder = StableFingerprintBuilder::default();
         builder.write_bytes(node.kind.name().as_bytes());
-        write_debug_value(&mut builder, &node.kind);
+        write_canonical_kind(self, id, &mut builder);
         write_row_type(&mut builder, &node.output);
         builder.finish()
     }
@@ -900,24 +913,386 @@ fn write_logical_type(builder: &mut StableFingerprintBuilder, logical_type: &Log
     }
 }
 
-struct CanonicalFmtWriter<'a> {
+/// Hash adapter used only for fields whose Rust representation already has a
+/// value-semantic `Hash` implementation.  The adapter deliberately encodes
+/// primitive writes through `StableFingerprintBuilder`, so it never inherits
+/// the platform-dependent byte order or hasher state of `DefaultHasher`.
+struct CanonicalHasher<'a> {
     builder: &'a mut StableFingerprintBuilder,
 }
 
-impl fmt::Write for CanonicalFmtWriter<'_> {
-    fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.builder.write_bytes(value.as_bytes());
-        Ok(())
+impl Hasher for CanonicalHasher<'_> {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.builder.write_bytes(bytes);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.builder.write_u64(u64::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.builder.write_u64(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.builder.write_u64(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.builder.write_u64(value);
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.builder.write_bytes(&value.to_le_bytes());
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.builder.write_u64(value as u64);
+    }
+
+    fn write_i8(&mut self, value: i8) {
+        self.builder.write_i64(i64::from(value));
+    }
+
+    fn write_i16(&mut self, value: i16) {
+        self.builder.write_i64(i64::from(value));
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.builder.write_i64(i64::from(value));
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.builder.write_i64(value);
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.builder.write_bytes(&value.to_le_bytes());
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.builder.write_i64(value as i64);
     }
 }
 
-fn write_debug_value<T: fmt::Debug + ?Sized>(builder: &mut StableFingerprintBuilder, value: &T) {
-    let mut writer = CanonicalFmtWriter { builder };
-    // Transitional fallback only.  It avoids a temporary plan-sized String,
-    // but Debug formatting is not a certified typed identity encoding.  The
-    // physical identity gate must remain blocked until every payload reaching
-    // this helper has an explicit versioned encoder.
-    let _ = fmt::write(&mut writer, format_args!("{value:?}"));
+fn write_hashed<T: Hash>(builder: &mut StableFingerprintBuilder, tag: &[u8], value: &T) {
+    builder.write_bytes(tag);
+    value.hash(&mut CanonicalHasher { builder });
+}
+
+/// Hash a sequence with its cardinality in the transcript.  The standard
+/// `Hash` implementation for slices is intentionally not used directly here:
+/// it is allowed to omit the length, while the identity contract must
+/// distinguish `[a, b]` from `[a, b, c]` even when the common prefix hashes to
+/// the same byte stream.
+fn write_hashed_slice<T: Hash>(builder: &mut StableFingerprintBuilder, tag: &[u8], values: &[T]) {
+    builder.write_bytes(tag);
+    builder.write_u64(values.len() as u64);
+    for value in values {
+        value.hash(&mut CanonicalHasher { builder });
+    }
+}
+
+fn write_index_matrix(builder: &mut StableFingerprintBuilder, tag: &[u8], values: &[Box<[usize]>]) {
+    builder.write_bytes(tag);
+    builder.write_u64(values.len() as u64);
+    for row in values {
+        builder.write_u64(row.len() as u64);
+        for value in row {
+            builder.write_u64(*value as u64);
+        }
+    }
+}
+
+fn write_optional_fingerprint(builder: &mut StableFingerprintBuilder, value: Option<Fingerprint>) {
+    match value {
+        Some(value) => {
+            builder.write_u64(1);
+            builder.write_fingerprint(value);
+        }
+        None => builder.write_u64(0),
+    }
+}
+
+/// Encode the physical payload through the public, bounded EXPLAIN value
+/// model.  Unlike the old Debug fallback this is an explicit schema: no
+/// pointer, arena id, allocator address, or formatter-specific struct dump is
+/// part of the identity.  The operator-specific EXPLAIN property builders are
+/// the single semantic projection shared by human and machine consumers.
+fn write_canonical_kind(
+    plan: &PhysicalPlan,
+    id: PhysicalPlanNodeId,
+    builder: &mut StableFingerprintBuilder,
+) {
+    let node = plan.node(id);
+    builder.write_bytes(b"physical-kind-explain-schema.v1");
+    builder.write_bytes(node.kind.name().as_bytes());
+    let properties = collect_explain_properties(plan, id, node);
+    builder.write_u64(properties.len() as u64);
+    for property in properties {
+        builder.write_bytes(property.label.as_bytes());
+        write_explain_value(builder, &property.value);
+    }
+    write_semantic_kind_fields(builder, &node.kind);
+}
+
+fn write_semantic_kind_fields(builder: &mut StableFingerprintBuilder, kind: &PhysicalNodeKind) {
+    use crate::cascades::expression_fingerprint;
+
+    fn write_expressions<'a>(
+        builder: &mut StableFingerprintBuilder,
+        expressions: impl IntoIterator<Item = &'a paro_planner::expression::Expression>,
+    ) {
+        let expressions = expressions.into_iter().collect::<Vec<_>>();
+        builder.write_u64(expressions.len() as u64);
+        for expression in expressions {
+            builder.write_fingerprint(expression_fingerprint(expression));
+        }
+    }
+
+    fn write_strings(
+        builder: &mut StableFingerprintBuilder,
+        values: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
+        let values = values.into_iter().collect::<Vec<_>>();
+        builder.write_u64(values.len() as u64);
+        for value in values {
+            builder.write_bytes(value.as_ref().as_bytes());
+        }
+    }
+
+    match kind {
+        PhysicalNodeKind::Filter(spec) => {
+            builder.write_u64(1);
+            write_expressions(builder, spec.expressions.iter());
+            write_hashed_slice(builder, b"projection-map", &spec.projection_map);
+        }
+        PhysicalNodeKind::Project(spec) => {
+            builder.write_u64(2);
+            write_expressions(builder, spec.expressions.iter());
+            write_strings(builder, spec.output_names.iter());
+            builder.write_u64(spec.visible_count as u64);
+        }
+        PhysicalNodeKind::RowsetScan(spec) => {
+            builder.write_u64(3);
+            builder.write_u64(spec.table_index as u64);
+            builder.write_u64(spec.emit_row_id as u64);
+            write_hashed_slice(
+                builder,
+                b"column-projection",
+                spec.column_projection.columns(),
+            );
+            write_hashed_slice(
+                builder,
+                b"value-projections",
+                spec.column_projection.value_projections(),
+            );
+            write_expressions(builder, spec.residual_predicates.iter());
+            write_expressions(builder, spec.runtime_filter_expressions.iter());
+            builder.write_u64(spec.predicate.is_some() as u64);
+            if let Some(predicate) = &spec.predicate {
+                builder
+                    .write_bytes(format_predicate_tree(predicate, spec.table.as_ref()).as_bytes());
+            }
+            builder.write_u64(spec.table.base.base.object_id.raw());
+        }
+        PhysicalNodeKind::Limit(spec) => {
+            builder.write_u64(4);
+            if let Some(limit) = &spec.limit {
+                builder.write_u64(1);
+                builder.write_fingerprint(expression_fingerprint(limit));
+            } else {
+                builder.write_u64(0);
+            }
+            if let Some(offset) = &spec.offset {
+                builder.write_u64(1);
+                builder.write_fingerprint(expression_fingerprint(offset));
+            } else {
+                builder.write_u64(0);
+            }
+        }
+        PhysicalNodeKind::Sort(spec) => {
+            builder.write_u64(5);
+            builder.write_u64(spec.orders.len() as u64);
+            for order in &spec.orders {
+                builder.write_fingerprint(expression_fingerprint(&order.expression));
+                builder.write_u64(order.ascending as u64);
+                builder.write_u64(order.nulls_first as u64);
+            }
+            write_hashed_slice(builder, b"sort-projection", &spec.projection_map);
+        }
+        PhysicalNodeKind::TopN(spec) => {
+            builder.write_u64(6);
+            builder.write_u64(spec.orders.len() as u64);
+            for order in &spec.orders {
+                builder.write_fingerprint(expression_fingerprint(&order.expression));
+                builder.write_u64(order.ascending as u64);
+                builder.write_u64(order.nulls_first as u64);
+            }
+            write_hashed_slice(builder, b"topn-projection", &spec.projection_map);
+            builder.write_u64(spec.limit as u64);
+            builder.write_u64(spec.offset as u64);
+        }
+        PhysicalNodeKind::HashJoin(spec) => {
+            builder.write_u64(7);
+            builder.write_bytes(spec.join_type.to_string().as_bytes());
+            builder.write_u64(match spec.anti_join_mode {
+                paro_planner::operator::join::AntiJoinMode::Regular => 0,
+                paro_planner::operator::join::AntiJoinMode::NullAware => 1,
+            });
+            match spec.mark_semantics {
+                paro_planner::operator::join::MarkJoinSemantics::NotMark => builder.write_u64(0),
+                paro_planner::operator::join::MarkJoinSemantics::TwoValued => builder.write_u64(1),
+                paro_planner::operator::join::MarkJoinSemantics::ThreeValuedFrom(index) => {
+                    builder.write_u64(2);
+                    builder.write_u64(index as u64);
+                }
+            }
+            write_join_conditions(builder, &spec.key_conditions);
+            write_join_conditions(builder, &spec.build_residual_conditions);
+            write_hashed_slice(builder, b"hash-left-projection", &spec.left_projection);
+            write_hashed_slice(
+                builder,
+                b"hash-build-projection",
+                &spec.build_input_projection,
+            );
+            builder.write_u64(spec.build_output_count as u64);
+            builder.write_u64(spec.build_keys_unique as u64);
+            builder.write_u64(spec.probe_residual_count as u64);
+            if let Some(runtime_filter) = &spec.runtime_filter {
+                builder.write_u64(1);
+                builder.write_fingerprint(runtime_filter.artifact);
+                write_hashed_slice(
+                    builder,
+                    b"runtime-filter-conditions",
+                    &runtime_filter.condition_indices,
+                );
+            } else {
+                builder.write_u64(0);
+            }
+        }
+        PhysicalNodeKind::NestedLoopJoin(spec) => {
+            builder.write_u64(8);
+            builder.write_bytes(spec.join_type.to_string().as_bytes());
+            write_join_conditions(builder, &spec.conditions);
+            write_expressions(builder, spec.arbitrary_condition.iter());
+            write_hashed_slice(builder, b"nested-left-projection", &spec.left_projection);
+            write_hashed_slice(builder, b"nested-right-projection", &spec.right_projection);
+        }
+        PhysicalNodeKind::Aggregate(spec) => {
+            builder.write_u64(9);
+            builder.write_u64(spec.grouping_key_count as u64);
+            builder.write_u64(spec.initial_lookup_hash_key_count as u64);
+            write_expressions(builder, spec.projection_exprs.iter());
+            write_expressions(builder, spec.groups.iter());
+            write_expressions(builder, spec.aggregates.iter());
+            write_hashed_slice(builder, b"group-key-encodings", &spec.group_key_encodings);
+            write_index_matrix(builder, b"grouping-sets", &spec.grouping_sets);
+            write_index_matrix(builder, b"grouping-functions", &spec.grouping_functions);
+            write_index_matrix(builder, b"aggregate-inputs", &spec.aggregate_inputs);
+            write_hashed_slice(builder, b"aggregate-filters", &spec.aggregate_filters);
+            write_index_matrix(builder, b"aggregate-orders", &spec.aggregate_orders);
+            write_expressions(builder, spec.having_filter.iter());
+        }
+        PhysicalNodeKind::Window(spec) => {
+            builder.write_u64(10);
+            builder.write_u64(spec.window_index as u64);
+            builder.write_u64(spec.input_width as u64);
+            builder.write_u64(spec.expressions.len() as u64);
+            for expression in &spec.expressions {
+                builder.write_fingerprint(expression_fingerprint(
+                    &paro_planner::expression::Expression::Window(expression.clone().into()),
+                ));
+            }
+        }
+        PhysicalNodeKind::MaterializedCte(spec) => {
+            builder.write_u64(11);
+            builder.write_u64(spec.cte_index as u64);
+            builder.write_u64(spec.ref_count as u64);
+            write_strings(builder, spec.column_names.iter());
+        }
+        PhysicalNodeKind::RecursiveCte(spec) => {
+            builder.write_u64(12);
+            builder.write_u64(spec.cte_index as u64);
+            builder.write_u64(spec.union_all as u64);
+            write_strings(builder, spec.column_names.iter());
+        }
+        PhysicalNodeKind::CteScan(spec) => {
+            builder.write_u64(13);
+            builder.write_u64(spec.cte_index as u64);
+            builder.write_u64(spec.table_index as u64);
+        }
+        PhysicalNodeKind::SetOperation(spec) => {
+            builder.write_u64(14);
+            builder.write_u64(spec.table_index as u64);
+            builder.write_bytes(spec.op.to_string().as_bytes());
+            builder.write_u64(spec.all as u64);
+        }
+        _ => {
+            // Every variant still has a versioned, schema-backed identity via
+            // the EXPLAIN projection above. The explicit tags above cover the
+            // variants whose hidden payload is not rendered as a property.
+            builder.write_u64(0);
+        }
+    }
+}
+
+fn write_join_conditions(builder: &mut StableFingerprintBuilder, conditions: &[JoinCondition]) {
+    builder.write_u64(conditions.len() as u64);
+    for condition in conditions {
+        builder.write_fingerprint(crate::cascades::expression_fingerprint(&condition.left));
+        builder.write_fingerprint(crate::cascades::expression_fingerprint(&condition.right));
+        builder.write_u64(match condition.comparison {
+            JoinComparisonType::Equal => 0,
+            JoinComparisonType::NotEqual => 1,
+            JoinComparisonType::LessThan => 2,
+            JoinComparisonType::GreaterThan => 3,
+            JoinComparisonType::LessThanOrEqual => 4,
+            JoinComparisonType::GreaterThanOrEqual => 5,
+            JoinComparisonType::NotDistinctFrom => 6,
+            JoinComparisonType::DistinctFrom => 7,
+        });
+    }
+}
+
+fn write_explain_value(builder: &mut StableFingerprintBuilder, value: &ExplainValue) {
+    match value {
+        ExplainValue::String(value) => {
+            builder.write_u64(0);
+            builder.write_bytes(value.as_bytes());
+        }
+        ExplainValue::Integer(value) => {
+            builder.write_u64(1);
+            builder.write_i64(*value);
+        }
+        ExplainValue::Unsigned(value) => {
+            builder.write_u64(2);
+            builder.write_u64(*value);
+        }
+        ExplainValue::Float(value) => {
+            builder.write_u64(3);
+            builder.write_u64(value.to_bits());
+        }
+        ExplainValue::Bool(value) => {
+            builder.write_u64(4);
+            builder.write_u64(*value as u64);
+        }
+        ExplainValue::Bytes(value) => {
+            builder.write_u64(5);
+            builder.write_u64(*value);
+        }
+        ExplainValue::List(values) => {
+            builder.write_u64(6);
+            builder.write_u64(values.len() as u64);
+            for value in values {
+                write_explain_value(builder, value);
+            }
+        }
+    }
 }
 
 fn edge_kind_key(kind: PhysicalEdgeKind) -> (u64, Option<Fingerprint>) {
@@ -1169,7 +1544,7 @@ fn collect_explain_properties(
             push_string_property(
                 &mut properties,
                 "Direction",
-                format!("{:?}", spec.direction),
+                expand_direction_name(spec.direction).to_string(),
             );
             if spec.min_hops != 1 || spec.max_hops != 1 {
                 push_string_property(
@@ -1185,7 +1560,7 @@ fn collect_explain_properties(
             push_string_property(
                 &mut properties,
                 "Direction",
-                format!("{:?}", spec.direction),
+                expand_direction_name(spec.direction).to_string(),
             );
             push_string_property(
                 &mut properties,
@@ -1376,6 +1751,43 @@ fn push_aggregate_properties(
     }
 }
 
+fn expand_direction_name(direction: paro_planner::operator::ExpandDirection) -> &'static str {
+    match direction {
+        paro_planner::operator::ExpandDirection::Forward => "forward",
+        paro_planner::operator::ExpandDirection::Backward => "backward",
+        paro_planner::operator::ExpandDirection::Both => "both",
+    }
+}
+
+fn search_capability_state_name(
+    state: &paro_storage::search::SearchCapabilityState,
+) -> &'static str {
+    match state {
+        paro_storage::search::SearchCapabilityState::Queryable => "queryable",
+        paro_storage::search::SearchCapabilityState::NotQueryable { reason } => match reason {
+            paro_storage::search::SearchNotQueryableReason::CoverageIncomplete => {
+                "not_queryable:coverage_incomplete"
+            }
+            paro_storage::search::SearchNotQueryableReason::TailOverBudget => {
+                "not_queryable:tail_over_budget"
+            }
+            paro_storage::search::SearchNotQueryableReason::FreshnessRequired => {
+                "not_queryable:freshness_required"
+            }
+            paro_storage::search::SearchNotQueryableReason::ProviderDisabled => {
+                "not_queryable:provider_disabled"
+            }
+        },
+    }
+}
+
+fn search_request_mode_name(mode: &paro_storage::search::SearchRequestMode) -> String {
+    match mode {
+        paro_storage::search::SearchRequestMode::Filter => "filter".to_string(),
+        paro_storage::search::SearchRequestMode::TopK { limit } => format!("top_k:{limit}"),
+    }
+}
+
 fn push_search_token_properties(properties: &mut Vec<ExplainProperty>, token: &CapabilityToken) {
     push_string_property(
         properties,
@@ -1391,7 +1803,7 @@ fn push_search_token_properties(properties: &mut Vec<ExplainProperty>, token: &C
     push_string_property(
         properties,
         "Search Capability",
-        format!("{:?}", token.capability_state),
+        search_capability_state_name(&token.capability_state).to_string(),
     );
 }
 
@@ -1631,7 +2043,7 @@ fn push_fulltext_search_properties(
         "Column",
         table_column_name(spec.table.as_ref(), spec.column_id),
     );
-    push_string_property(properties, "Mode", format!("{:?}", spec.mode));
+    push_string_property(properties, "Mode", search_request_mode_name(&spec.mode));
     push_search_filter_properties(
         properties,
         spec.predicate.as_ref(),

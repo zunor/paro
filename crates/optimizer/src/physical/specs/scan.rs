@@ -163,7 +163,7 @@ impl RowsetScanMaterialization {
 /// An empty projection means that only row cardinality is requested. Reading
 /// every table column is represented by listing every column explicitly at the
 /// logical scan boundary, so no layer has to guess what an empty list means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowsetColumnValueProjection {
     Stored,
     MatchedUtf8Prefix { byte_width: usize },

@@ -36,6 +36,7 @@ pub mod rules;
 pub mod scalar;
 mod scalar_lowering;
 pub mod tasks;
+pub(crate) use scalar_lowering::expression_fingerprint;
 pub(crate) use scalar_lowering::BindingCatalog;
 pub mod verifier;
 

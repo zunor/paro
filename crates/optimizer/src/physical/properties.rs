@@ -16,7 +16,7 @@ use crate::physical::requirements::{ProvidedProperties, RequiredProperties};
 pub type ExecutionColumnId = usize;
 pub type MemoryBytes = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PhysicalGrantContract {
     /// The selected node's algorithm and price are grant-independent. An
     /// admissible-set id belongs to Memo search, not to this executable proof.
@@ -41,7 +41,7 @@ impl PhysicalGrantContract {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanOrigin {
     Direct,
     Memo,
@@ -64,7 +64,7 @@ pub struct OwnedAuxiliaryArtifact {
     pub kind: AuxiliaryArtifactKind,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct PhysicalCharacteristics {
     pub blocking: bool,
     pub spillable: bool,

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::physical::identity::Fingerprint;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct PlanDependencies {
     pub catalog_versions: BTreeMap<Fingerprint, u64>,
     pub statistics_compatibility: BTreeMap<Fingerprint, u64>,

@@ -14,7 +14,7 @@ use super::SpillExecutionPolicy;
 /// Logical expressions and operator output retain their SQL types. Only the
 /// rows owned by the aggregate operator use this representation, allowing
 /// hashing and equality checks to operate on compact fixed-width values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GroupKeyEncoding {
     Identity,
     PackedString {
