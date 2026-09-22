@@ -29,20 +29,20 @@ PROJECTION  (rows=2)
   Cardinality: [2, 2, 2]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=2)
-    Sort Key: public.explain_cardinality_case.score DESC NULLS FIRST, id ASC NULLS LAST
-    Limit: 2
-    Cardinality: [2, 2, 2]
-    Output Schema: id INTEGER
-    ->  PROJECTION  (rows=4)
-      Output: id, score
-      Cardinality: [2, 4, 6]
-      Output Schema: id INTEGER, public.explain_cardinality_case.score INTEGER
-      ->  ROWSET_SCAN on public.explain_cardinality_case  (rows=4)
-        Column IDs: 0, 1
-        Columns: id, score
-        Pushed Predicate: score >= 20
-        Cardinality: [2, 4, 6]
-        Output Schema: public.explain_cardinality_case.id INTEGER, public.explain_cardinality_case.score INTEGER
+        Sort Key: public.explain_cardinality_case.score DESC NULLS FIRST, id ASC NULLS LAST
+        Limit: 2
+        Cardinality: [2, 2, 2]
+        Output Schema: id INTEGER
+        ->  PROJECTION  (rows=4)
+              Output: id, score
+              Cardinality: [2, 4, 6]
+              Output Schema: id INTEGER, public.explain_cardinality_case.score INTEGER
+              ->  ROWSET_SCAN on public.explain_cardinality_case  (rows=4)
+                    Column IDs: 0, 1
+                    Columns: id, score
+                    Pushed Predicate: score >= 20
+                    Cardinality: [2, 4, 6]
+                    Output Schema: public.explain_cardinality_case.id INTEGER, public.explain_cardinality_case.score INTEGER
 
 -- @query json
 -- @normalize explain_logical_ids

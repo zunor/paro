@@ -68,15 +68,15 @@ QUERY PLAN
 PROJECTION  (rows=1000)
   Output: l.id
   ->  HASH_JOIN  (rows=1000)
-    Join Type: SEMI
-    Build Index: integer_build_time
-    Join Condition: l.id = r.id
-    ->  ROWSET_SCAN on public.spill_h_join_l l  (rows=1000)
-      Column IDs: 0
-      Columns: id
-    ->  ROWSET_SCAN on public.spill_h_join_r r  (rows=1000)
-      Column IDs: 0
-      Columns: id
+        Join Type: SEMI
+        Build Index: integer_build_time
+        Join Condition: l.id = r.id
+        ->  ROWSET_SCAN on public.spill_h_join_l l  (rows=1000)
+              Column IDs: 0
+              Columns: id
+        ->  ROWSET_SCAN on public.spill_h_join_r r  (rows=1000)
+              Column IDs: 0
+              Columns: id
 
 SET temp_directory = DEFAULT;
 SET

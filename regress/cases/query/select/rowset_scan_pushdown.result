@@ -57,13 +57,13 @@ PROJECTION  (rows=1)
   Cardinality: [1, 1, 1]
   Output Schema: "COUNT(*)" BIGINT
   ->  AGGREGATE  (rows=1)
-    Aggregates: count_star(*)
-    Cardinality: [1, 1, 1]
-    Output Schema: aggregate_state_1 BIGINT
-    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-      Pushed Predicate: k = 3
-      Cardinality: [3, 6, 10]
-      Output Schema: (none)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+              Pushed Predicate: k = 3
+              Cardinality: [3, 6, 10]
+              Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT payload FROM rowset_pushdown_case WHERE k = 3;
@@ -73,12 +73,12 @@ PROJECTION  (rows=6)
   Cardinality: [3, 6, 10]
   Output Schema: payload VARCHAR
   ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-    Column IDs: 4
-    Columns: payload
-    Pushed Predicate: k = 3
-    Late Materialize: auto
-    Cardinality: [3, 6, 10]
-    Output Schema: public.rowset_pushdown_case.payload VARCHAR
+        Column IDs: 4
+        Columns: payload
+        Pushed Predicate: k = 3
+        Late Materialize: auto
+        Cardinality: [3, 6, 10]
+        Output Schema: public.rowset_pushdown_case.payload VARCHAR
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
@@ -88,13 +88,13 @@ PROJECTION  (rows=1)
   Cardinality: [1, 1, 1]
   Output Schema: "COUNT(*)" BIGINT
   ->  AGGREGATE  (rows=1)
-    Aggregates: count_star(*)
-    Cardinality: [1, 1, 1]
-    Output Schema: aggregate_state_1 BIGINT
-    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
-      Pushed Predicate: k < 5 AND k >= 2
-      Cardinality: [9, 19, 29]
-      Output Schema: (none)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
+              Pushed Predicate: k < 5 AND k >= 2
+              Cardinality: [9, 19, 29]
+              Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k IN (1, 4, 9);
@@ -104,13 +104,13 @@ PROJECTION  (rows=1)
   Cardinality: [1, 1, 1]
   Output Schema: "COUNT(*)" BIGINT
   ->  AGGREGATE  (rows=1)
-    Aggregates: count_star(*)
-    Cardinality: [1, 1, 1]
-    Output Schema: aggregate_state_1 BIGINT
-    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
-      Pushed Predicate: k IN (1, 4, 9)
-      Cardinality: [9, 19, 29]
-      Output Schema: (none)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
+              Pushed Predicate: k IN (1, 4, 9)
+              Cardinality: [9, 19, 29]
+              Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE nullable_k IS NULL;
@@ -120,13 +120,13 @@ PROJECTION  (rows=1)
   Cardinality: [1, 1, 1]
   Output Schema: "COUNT(*)" BIGINT
   ->  AGGREGATE  (rows=1)
-    Aggregates: count_star(*)
-    Cardinality: [1, 1, 1]
-    Output Schema: aggregate_state_1 BIGINT
-    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-      Pushed Predicate: nullable_k IS NULL
-      Cardinality: [3, 6, 10]
-      Output Schema: (none)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+              Pushed Predicate: nullable_k IS NULL
+              Cardinality: [3, 6, 10]
+              Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*)
@@ -167,19 +167,19 @@ PROJECTION  (rows=5)
   Cardinality: [5, 5, 5]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=5)
-    Sort Key: public.rowset_pushdown_case.score ASC NULLS LAST
-    Limit: 5
-    Cardinality: [5, 5, 5]
-    Output Schema: id INTEGER
-    ->  PROJECTION  (rows=64)
-      Output: id, score
-      Cardinality: [64, 64, 64]
-      Output Schema: id INTEGER, public.rowset_pushdown_case.score INTEGER
-      ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=64)
-        Column IDs: 0, 3
-        Columns: id, score
-        Cardinality: [64, 64, 64]
-        Output Schema: public.rowset_pushdown_case.id INTEGER, public.rowset_pushdown_case.score INTEGER
+        Sort Key: public.rowset_pushdown_case.score ASC NULLS LAST
+        Limit: 5
+        Cardinality: [5, 5, 5]
+        Output Schema: id INTEGER
+        ->  PROJECTION  (rows=64)
+              Output: id, score
+              Cardinality: [64, 64, 64]
+              Output Schema: id INTEGER, public.rowset_pushdown_case.score INTEGER
+              ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=64)
+                    Column IDs: 0, 3
+                    Columns: id, score
+                    Cardinality: [64, 64, 64]
+                    Output Schema: public.rowset_pushdown_case.id INTEGER, public.rowset_pushdown_case.score INTEGER
 
 DROP TABLE rowset_pushdown_dim;
 DROP TABLE
@@ -313,21 +313,21 @@ ROW_FETCH  (rows=3)
   Cardinality: [3, 3, 3]
   Output Schema: id INTEGER, prefix VARCHAR, wide VARCHAR
   ->  TOP_N  (rows=3)
-    Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
-    Limit: 3
-    Cardinality: [3, 3, 3]
-    Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
-    ->  PROJECTION  (rows=1000)
-      Output: id, __matched_prefix_1_2, rowid
-      Cardinality: [500, 1000, 1501]
-      Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
-      ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=1000)
-        Column IDs: 0, 1
-        Columns: id, __matched_prefix_1_2, rowid
-        Pushed Predicate: phone HAS PREFIX IN ("13", "31")
-        Late Materialize: auto
-        Cardinality: [500, 1000, 1501]
+        Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
+        Limit: 3
+        Cardinality: [3, 3, 3]
         Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
+        ->  PROJECTION  (rows=1000)
+              Output: id, __matched_prefix_1_2, rowid
+              Cardinality: [500, 1000, 1501]
+              Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
+              ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=1000)
+                    Column IDs: 0, 1
+                    Columns: id, __matched_prefix_1_2, rowid
+                    Pushed Predicate: phone HAS PREFIX IN ("13", "31")
+                    Late Materialize: auto
+                    Cardinality: [500, 1000, 1501]
+                    Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
 
 SELECT id, substring(phone FROM 1 FOR 2) AS prefix, wide
 FROM matched_prefix_late_payload_case

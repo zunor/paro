@@ -28,33 +28,33 @@ MATERIALIZED_CTE  (rows=0)
   Reference Count: 3
   ->  VALUES  (rows=5)
   ->  ORDER_BY  (rows=0)
-    Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
-    ->  PROJECTION  (rows=0)
-      Output: p.id, p.peer_id, a.total
-      ->  HASH_JOIN  (rows=0)
-        Join Type: INNER
-        Join Condition: a.grp = p.grp
-        ->  PROJECTION  (rows=3)
-          Output: grp, total
-          ->  AGGREGATE  (rows=3)
-            Group Key: base.grp
-            Aggregates: sum(base.amount)
-            ->  CTE_SCAN  (rows=5)
-              CTE Index: 0
-              Table Index: 25
-        ->  PROJECTION  (rows=1)
-          Output: id, peer_id, grp
-          ->  FILTER  (rows=1)
-            Filter: r.id > l.id
-            ->  HASH_JOIN  (rows=3)
-              Join Type: INNER
-              Join Condition: l.grp = r.grp
-              ->  CTE_SCAN  (rows=5)
-                CTE Index: 0
-                Table Index: 16
-              ->  CTE_SCAN  (rows=5)
-                CTE Index: 0
-                Table Index: 17
+        Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
+        ->  PROJECTION  (rows=0)
+              Output: p.id, p.peer_id, a.total
+              ->  HASH_JOIN  (rows=0)
+                    Join Type: INNER
+                    Join Condition: a.grp = p.grp
+                    ->  PROJECTION  (rows=3)
+                          Output: grp, total
+                          ->  AGGREGATE  (rows=3)
+                                Group Key: base.grp
+                                Aggregates: sum(base.amount)
+                                ->  CTE_SCAN  (rows=5)
+                                      CTE Index: 0
+                                      Table Index: 25
+                    ->  PROJECTION  (rows=1)
+                          Output: id, peer_id, grp
+                          ->  FILTER  (rows=1)
+                                Filter: r.id > l.id
+                                ->  HASH_JOIN  (rows=3)
+                                      Join Type: INNER
+                                      Join Condition: l.grp = r.grp
+                                      ->  CTE_SCAN  (rows=5)
+                                            CTE Index: 0
+                                            Table Index: 16
+                                      ->  CTE_SCAN  (rows=5)
+                                            CTE Index: 0
+                                            Table Index: 17
 
 -- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE

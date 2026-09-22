@@ -16,21 +16,21 @@ QUERY PLAN
 ORDER_BY  (rows=60)
   Sort Key: t.x ASC NULLS LAST, s.value ASC NULLS LAST
   ->  PROJECTION  (rows=60)
-    Output: t.x, s.value
-    ->  DELIM_JOIN  (rows=60)
-      ->  PROJECTION  (rows=3)
-        Output: x
-        ->  VALUES  (rows=3)
-      ->  HASH_JOIN
-        Join Type: INNER
-        Join Condition: t.x IS NOT DISTINCT FROM x
-        ->  DELIM_SCAN
-        ->  EXTERNAL_TABLE  (rows=200)
-          ->  PROJECTION  (rows=2)
-            Output: __external_arg_1, x
-            ->  CROSS_PRODUCT  (rows=2)
-              ->  DUMMY_SCAN  (rows=1)
-              ->  DELIM_SCAN  (rows=2)
+        Output: t.x, s.value
+        ->  DELIM_JOIN  (rows=60)
+              ->  PROJECTION  (rows=3)
+                    Output: x
+                    ->  VALUES  (rows=3)
+              ->  HASH_JOIN
+                    Join Type: INNER
+                    Join Condition: t.x IS NOT DISTINCT FROM x
+                    ->  DELIM_SCAN
+                    ->  EXTERNAL_TABLE  (rows=200)
+                          ->  PROJECTION  (rows=2)
+                                Output: __external_arg_1, x
+                                ->  CROSS_PRODUCT  (rows=2)
+                                      ->  DUMMY_SCAN  (rows=1)
+                                      ->  DELIM_SCAN  (rows=2)
 
 DROP FUNCTION py_scale(INTEGER);
 DROP FUNCTION

@@ -16,11 +16,11 @@ QUERY PLAN
 ORDER_BY  (rows=2)
   Sort Key: py_explain(v) ASC NULLS LAST
   ->  PROJECTION  (rows=2)
-    Output: py_explain(v)
-    ->  EXTERNAL_PROJECT  (rows=2)
-      ->  PROJECTION  (rows=2)
-        Output: v
-        ->  VALUES  (rows=2)
+        Output: py_explain(v)
+        ->  EXTERNAL_PROJECT  (rows=2)
+              ->  PROJECTION  (rows=2)
+                    Output: v
+                    ->  VALUES  (rows=2)
 
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_routine_ids,explain_external_runtime,explain_logical_ids
 EXPLAIN ANALYZE

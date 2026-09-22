@@ -74,21 +74,21 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: d.payload, row_count, total_amount, kept_amount
   ->  AGGREGATE  (rows=2)
-    Group Key: d.payload
-    Aggregates: count_partial_merge(count_star(*)), sum_partial_merge(sum(f.amount)), sum_partial_merge(sum(f.amount) FILTER (WHERE f.keep))
-    ->  HASH_JOIN  (rows=4)
-      Join Type: INNER
-      Build Index: integer_build_time
-      Join Condition: f.key_a = d.key_a
-      ->  AGGREGATE  (rows=5)
-        Group Key: f.key_a
-        Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
-        ->  ROWSET_SCAN on public.agg_defer_fact f  (rows=12000)
-          Column IDs: 0, 2, 3
-          Columns: key_a, amount, keep
-      ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)
-        Column IDs: 0, 1
-        Columns: key_a, payload
+        Group Key: d.payload
+        Aggregates: count_partial_merge(count_star(*)), sum_partial_merge(sum(f.amount)), sum_partial_merge(sum(f.amount) FILTER (WHERE f.keep))
+        ->  HASH_JOIN  (rows=4)
+              Join Type: INNER
+              Build Index: integer_build_time
+              Join Condition: f.key_a = d.key_a
+              ->  AGGREGATE  (rows=5)
+                    Group Key: f.key_a
+                    Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
+                    ->  ROWSET_SCAN on public.agg_defer_fact f  (rows=12000)
+                          Column IDs: 0, 2, 3
+                          Columns: key_a, amount, keep
+              ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)
+                    Column IDs: 0, 1
+                    Columns: key_a, payload
 
 SELECT
     d.payload,

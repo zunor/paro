@@ -114,16 +114,16 @@ QUERY PLAN
 ORDER_BY  (rows=2)
   Sort Key: rn ASC NULLS LAST
   ->  PROJECTION  (rows=2)
-    Output: category, sum_x, rn
-    ->  WINDOW  (rows=2)
-      ->  PROJECTION  (rows=2)
-        Output: category, sum_x
-        ->  AGGREGATE  (rows=2)
-          Group Key: agg_m_values.category
-          Aggregates: sum(agg_m_values.x)
-          ->  PROJECTION  (rows=4)
-            Output: category, x
-            ->  VALUES  (rows=4)
+        Output: category, sum_x, rn
+        ->  WINDOW  (rows=2)
+              ->  PROJECTION  (rows=2)
+                    Output: category, sum_x
+                    ->  AGGREGATE  (rows=2)
+                          Group Key: agg_m_values.category
+                          Aggregates: sum(agg_m_values.x)
+                          ->  PROJECTION  (rows=4)
+                                Output: category, x
+                                ->  VALUES  (rows=4)
 
 DROP TABLE IF EXISTS agg_m_dim;
 DROP TABLE

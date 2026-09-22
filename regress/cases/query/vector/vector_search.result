@@ -33,13 +33,13 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: l2_distance(public.items.emb, [1, 1, 1]) ASC NULLS LAST
-    Limit: 2
-    ->  PROJECTION  (rows=4)
-      Output: id, l2_distance(public.items.emb, [1, 1, 1])
-      ->  ROWSET_SCAN on public.items  (rows=4)
-        Column IDs: 0, 1
-        Columns: id, emb
+        Sort Key: l2_distance(public.items.emb, [1, 1, 1]) ASC NULLS LAST
+        Limit: 2
+        ->  PROJECTION  (rows=4)
+              Output: id, l2_distance(public.items.emb, [1, 1, 1])
+              ->  ROWSET_SCAN on public.items  (rows=4)
+                    Column IDs: 0, 1
+                    Columns: id, emb
 
 SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 id
@@ -96,13 +96,13 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: l2_distance(public.indexed_items.emb, [1, 1, 1]) ASC NULLS LAST
-    Limit: 2
-    ->  PROJECTION  (rows=2048)
-      Output: id, l2_distance(public.indexed_items.emb, [1, 1, 1])
-      ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
-        Column IDs: 0, 2
-        Columns: id, emb
+        Sort Key: l2_distance(public.indexed_items.emb, [1, 1, 1]) ASC NULLS LAST
+        Limit: 2
+        ->  PROJECTION  (rows=2048)
+              Output: id, l2_distance(public.indexed_items.emb, [1, 1, 1])
+              ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
+                    Column IDs: 0, 2
+                    Columns: id, emb
 
 RESET vector_search_objective;
 RESET
@@ -216,13 +216,13 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: cosine_distance(public.indexed_items.emb, [1, 0, 0]) ASC NULLS LAST
-    Limit: 2
-    ->  PROJECTION  (rows=2048)
-      Output: id, cosine_distance(public.indexed_items.emb, [1, 0, 0])
-      ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
-        Column IDs: 0, 2
-        Columns: id, emb
+        Sort Key: cosine_distance(public.indexed_items.emb, [1, 0, 0]) ASC NULLS LAST
+        Limit: 2
+        ->  PROJECTION  (rows=2048)
+              Output: id, cosine_distance(public.indexed_items.emb, [1, 0, 0])
+              ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
+                    Column IDs: 0, 2
+                    Columns: id, emb
 
 SELECT id FROM indexed_items
 ORDER BY emb <=> '[1.0, 0.0, 0.0]', id LIMIT 2;
