@@ -290,6 +290,8 @@ class BoundResult:
     @staticmethod
     def _check_wire_schema(column, engine):
         from tpcds_result_contract import PARO_EXACT_TYPES, duckdb_schema
+        if engine not in ("paro", "duckdb"):
+            raise ResultContractError(f"unknown result engine identity: {engine!r}")
         if engine == "duckdb":
             derived = duckdb_schema([(column.name, column.engine_type)])[0].logical_type
             if derived != column.logical_type:

@@ -339,6 +339,22 @@ def _validate_seed_files(root: Path) -> None:
         # another user's database. Special files are not a persistent snapshot.
         if path.is_symlink() or not (path.is_file() or path.is_dir()):
             raise ValueError(f"benchmark seed contains a link or special file: {path}")
+    # Copying bytes does not relocate persistent database roots. An absolute
+    # catalog path would let recovery mutate the source seed before the final
+    # checksum detects it. Only root-relative, managed catalogs are admitted;
+    # rebuild old seeds through normal SQL rather than patching binary metadata.
+    catalog_path = root / "instance" / "meta" / "catalog.json"
+    if catalog_path.exists():
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        if catalog.get("format_version") != 1 or not isinstance(catalog.get("databases"), list):
+            raise ValueError("unsupported benchmark seed catalog format")
+        for database in catalog["databases"]:
+            storage = database.get("storage_dir")
+            if not isinstance(storage, str) or not storage:
+                raise ValueError("benchmark seed catalog lacks a managed storage path")
+            path = Path(storage)
+            if path.is_absolute() or ".." in path.parts or path.parts[:1] != ("databases",):
+                raise ValueError("benchmark seed storage path is not root-relative; rebuild the seed")
 
 
 @dataclass(frozen=True)
@@ -615,6 +631,8 @@ class ManagedParoServer:
             raise ValueError(f"Paro server binary is not executable: {self.binary}")
         if not self.data_dir.is_dir():
             raise ValueError(f"Paro data directory does not exist: {self.data_dir}")
+        if self.input_snapshot is not None:
+            _validate_seed_files(self.data_dir)
         host, port_text = self.listen.rsplit(":", 1)
         port = int(port_text)
         try:
@@ -655,7 +673,7 @@ class ManagedParoServer:
             [
                 str(self.binary),
                 "--data-dir",
-                str(self.data_dir),
+                ".",
                 "--listen",
                 self.listen,
                 "--max-memory",
@@ -667,7 +685,9 @@ class ManagedParoServer:
             ],
             stdout=self._log if self._log is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
-            cwd=self.binary.parent,
+            # Persist root-relative paths for newly loaded seeds, and resolve
+            # those paths within this process's private copy on every restart.
+            cwd=self.data_dir,
             env=environment,
         )
         deadline = time.monotonic() + 30

@@ -272,6 +272,18 @@ class RunOutputTests(unittest.TestCase):
                     query_case="q11", arm_id="normal", payload=payload
                 )
 
+    def test_missing_cell_payload_seals_campaign_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "campaign.json", source_id="collector",
+                cells=[{"query_case": "q", "arm_id": "normal", "query_cases": 1,
+                        "sample_rows": 1, "product_receipts": 1}],
+            )
+            output.finish(status="Completed")
+            manifest = json.loads((output.run.root / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "Incomplete")
+            self.assertEqual(output.attempts[("q", "normal")].status, "Incomplete")
+
     def test_campaign_failure_does_not_rewrite_previous_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = CampaignOutput.create(

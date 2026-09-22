@@ -176,6 +176,9 @@ Current actions are:
 Notes:
 
 - `restart` only works against a local Paro listener (`localhost` / `127.0.0.1`).
+- The runner preserves the listener's working directory, including relative
+  data/config paths. If it cannot establish that directory, it rejects the
+  restart before stopping the server; it never substitutes the checkout root.
 - Runtime profiles live under `[runtime_profiles.<name>]` in `regress/config.toml`.
 - Profile-managed environment keys are cleared before each restart, so switching back to `profile=default` returns to a clean runtime state.
 - `connect` preserves the current connection target unless you override fields such as `user`, `database`, `host`, `port`, or `password`.

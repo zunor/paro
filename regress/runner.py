@@ -798,6 +798,7 @@ def _restart_server(conn: Any, config: RunnerConfig, *, options: Mapping[str, st
     connection = _connection_target_from_active(conn, config)
     listener_pid = _discover_listener_pid(config.port)
     command = _discover_process_command(listener_pid)
+    working_directory = _discover_process_cwd(listener_pid)
 
     try:
         conn.close()
@@ -812,7 +813,7 @@ def _restart_server(conn: Any, config: RunnerConfig, *, options: Mapping[str, st
     try:
         process = subprocess.Popen(
             shlex.split(command),
-            cwd=config.root_dir.parent,
+            cwd=working_directory,
             env=_build_runtime_profile_env(config, profile),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -961,6 +962,21 @@ def _discover_process_command(pid: int) -> str:
     if result.returncode != 0 or not command:
         raise ExecutionError(f"failed to inspect Paro command line for pid {pid}")
     return command
+
+
+def _discover_process_cwd(pid: int) -> Path:
+    """Preserve relative storage/config paths before terminating the owner."""
+    proc_path = Path(f"/proc/{pid}/cwd")
+    if proc_path.exists():
+        return proc_path.resolve(strict=True)
+    result = subprocess.run(
+        ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+        check=False, capture_output=True, text=True,
+    )
+    paths = [Path(line[1:]) for line in result.stdout.splitlines() if line.startswith("n")]
+    if result.returncode != 0 or len(paths) != 1 or not paths[0].is_absolute() or not paths[0].is_dir():
+        raise ExecutionError(f"failed to inspect working directory for pid {pid}")
+    return paths[0]
 
 
 def _wait_for_process_exit(pid: int, *, timeout_seconds: float) -> None:

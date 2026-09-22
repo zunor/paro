@@ -15,7 +15,8 @@ from benchmark_evidence import (  # noqa: E402
     hierarchical_abba_ratio,
     paired_order_balanced_ratio,
 )
-from tpcds_compare import hierarchical_cold_ratio  # noqa: E402
+from tpcds_compare import hierarchical_cold_ratio, normal_cell_evidence, configure_paro  # noqa: E402
+from bound_result_contract import BoundResult  # noqa: E402
 from tpcds_result_contract import (  # noqa: E402
     ColumnContract,
     ResultContractError,
@@ -29,6 +30,46 @@ from tpcds_result_contract import (  # noqa: E402
 
 
 class TpcdsResultContractTests(unittest.TestCase):
+    def test_verifier_and_search_policy_are_explicit_runtime_settings(self) -> None:
+        from unittest.mock import MagicMock
+        for verify, literal in (("on", "true"), ("off", "false")):
+            connection = MagicMock()
+            args = SimpleNamespace(optimizer_verify=verify, optimizer_search_policy="quality",
+                                   threads=4, memory_limit="2GB", statement_timeout_seconds=30)
+            configure_paro(connection, args)
+            statements = [call.args[0].as_string() for call in
+                          connection.cursor.return_value.__enter__.return_value.execute.call_args_list]
+            self.assertEqual(statements[0], f"SET optimizer_verify = {literal}")
+            self.assertEqual(statements[1], "SET optimizer_search_policy = 'quality'")
+
+    def test_engine_identity_is_not_a_diagnostic_label(self) -> None:
+        schema = duckdb_schema([("x", "VARCHAR")])[0]
+        BoundResult._check_wire_schema(schema, "duckdb")
+        with self.assertRaisesRegex(ResultContractError, "unknown result engine identity"):
+            BoundResult._check_wire_schema(schema, "duckdb cold statement")
+
+    def test_normal_cell_retains_cold_and_warm_receipts_once(self) -> None:
+        cold = {"status": "Uncovered", "reason": "cold"}
+        warm = {"status": "Uncovered", "reason": "warm"}
+        source = {"process_blocks": [{"cold_miss_evidence": cold,
+                   "paro_receipt_associations": [warm], "paro_ms": [1.5]}],
+                  "cold_statement": {"cold_miss_evidence": {"samples": [cold]},
+                    "normal_receipt_coverage": {"associations": [warm]}}}
+        payload, receipts = normal_cell_evidence(source, 2)
+        self.assertEqual(receipts, [cold, warm])
+        self.assertEqual(payload["process_blocks"][0]["cold_receipt_index"], 0)
+        self.assertEqual(payload["process_blocks"][0]["warm_receipt_indices"], [1])
+        self.assertNotIn("cold_miss_evidence", payload["process_blocks"][0])
+        self.assertEqual(source["process_blocks"][0]["cold_miss_evidence"], cold)
+        with self.assertRaisesRegex(ValueError, "exceed registered"):
+            normal_cell_evidence(source, 1)
+
+    def test_failed_cell_preserves_error_and_registered_missing_samples(self) -> None:
+        payload, receipts = normal_cell_evidence({"status": "failed", "error": "query failed"}, 4)
+        self.assertEqual(payload["error"], "query failed")
+        self.assertEqual(len(receipts), 4)
+        self.assertTrue(all(item["status"] == "Uncovered" for item in receipts))
+
     def test_schema_identity_ignores_engine_specific_qualifier_display(self) -> None:
         paro = paro_schema(
             [SimpleNamespace(name="dt.d_year", type_code=20, precision=None, scale=None)]

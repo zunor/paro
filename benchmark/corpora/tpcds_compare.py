@@ -75,6 +75,8 @@ ORDER BY table_name, constraint_name, ordinal_position
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-data-dir", type=Path, required=True)
+    parser.add_argument("--optimizer-search-policy", choices=("quality", "budgeted"), default="quality")
+    parser.add_argument("--optimizer-verify", choices=("on", "off"), default="on")
     parser.add_argument("--listen", default="127.0.0.1:6432")
     parser.add_argument("--database", default="postgres")
     parser.add_argument("--user", default="paro")
@@ -166,10 +168,15 @@ def read_pre_touch(path: Path | None, repetitions: int = 1) -> dict[str, Any] | 
             "repetitions": repetitions}
 
 
+def is_target_cache_miss(evidence: dict[str, Any], query: str) -> bool:
+    return (evidence.get("status") == "Verified"
+            and evidence.get("compilation") == "Executed"
+            and evidence.get("compile", {}).get("cache_hit") is False
+            and evidence.get("query_fingerprint") == f"{statement_fingerprint(query):016x}")
+
+
 def require_first_target_miss(evidence: dict[str, Any], query: str) -> None:
-    if (evidence.get("status") != "Verified"
-            or evidence.get("compilation") != "Executed"
-            or evidence.get("query_fingerprint") != statement_fingerprint(query)):
+    if not is_target_cache_miss(evidence, query):
         raise AssertionError("pre-touch did not produce an exact target cache miss")
 
 
@@ -468,7 +475,8 @@ class DuckDBProcess:
 
 def configure_paro(connection: psycopg.Connection[Any], args: argparse.Namespace) -> None:
     with connection.cursor() as cursor:
-        cursor.execute("SET optimizer_verify = true")
+        cursor.execute(sql.SQL("SET optimizer_verify = {}").format(sql.Literal(args.optimizer_verify == "on")))
+        cursor.execute(sql.SQL("SET optimizer_search_policy = {}").format(sql.Literal(args.optimizer_search_policy)))
         cursor.execute(sql.SQL("SET threads = {}").format(sql.Literal(args.threads)))
         cursor.execute(
             sql.SQL("SET memory_limit = {}").format(sql.Literal(args.memory_limit))
@@ -651,6 +659,38 @@ def metadata_inventory_from_rows(
     return sorted(inventory, key=lambda item: (item["table"], item["columns"], item["kind"]))
 
 
+def normal_cell_evidence(result: dict[str, Any], sample_count: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Store each cold/warm receipt once, referenced by its block coordinate."""
+    payload = dict(result)
+    receipts = []
+    blocks = []
+    for block in result.get("process_blocks", []):
+        compact = dict(block)
+        compact["cold_receipt_index"] = len(receipts)
+        receipts.append(compact.pop("cold_miss_evidence"))
+        warm = compact.pop("paro_receipt_associations")
+        compact["warm_receipt_indices"] = list(range(len(receipts), len(receipts) + len(warm)))
+        receipts.extend(warm)
+        blocks.append(compact)
+    if len(receipts) > sample_count:
+        raise ValueError("collected receipts exceed registered normal samples")
+    receipts.extend(uncovered_receipt(result.get("error", "sample was not collected"))
+                    for _ in range(sample_count - len(receipts)))
+    payload["process_blocks"] = blocks
+    cold = dict(payload.get("cold_statement", {}))
+    coverage = dict(cold.get("normal_receipt_coverage", {}))
+    coverage.pop("associations", None)
+    cold["normal_receipt_coverage"] = coverage
+    miss = dict(cold.get("cold_miss_evidence", {}))
+    miss.pop("samples", None)
+    cold["cold_miss_evidence"] = miss
+    payload["cold_statement"] = cold
+    # Aliases of warmup_and_steady_state/cold_statement, not distinct samples.
+    for alias in ("paro", "duckdb", "crossover", "cold_crossover", "diagnostic_cohort"):
+        payload.pop(alias, None)
+    return payload, receipts
+
+
 def paro_metadata_inventory(connection: psycopg.Connection[Any]) -> list[dict[str, Any]]:
     with connection.cursor() as cursor:
         cursor.execute(CONSTRAINTS_SQL)
@@ -788,7 +828,8 @@ def main() -> int:
             "samples_per_engine": (
                 args.process_blocks * args.measurement_rounds_per_process * 2
             ),
-            "optimizer_verify": True,
+            "optimizer_verify": args.optimizer_verify == "on",
+            "optimizer_search_policy": args.optimizer_search_policy,
             "planning_dop": 1,
             "execution_dop": args.threads,
             "cohorts": {
@@ -892,9 +933,6 @@ def main() -> int:
                 "PARO_DIAGNOSTIC_SEARCH_STOP_MS": os.environ.get(
                     "PARO_DIAGNOSTIC_SEARCH_STOP_MS"
                 ),
-                "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
-                    "PARO_QUALITY_POLICY_HANDOFF"
-                ),
                 "PARO_CERTIFIED_GROUP_PRUNING": os.environ.get(
                     "PARO_CERTIFIED_GROUP_PRUNING"
                 ),
@@ -958,7 +996,7 @@ def main() -> int:
     }
 
     query_cases = [f"{number:02d}" for number in range(args.start, args.end + 1)]
-    normal_rows = args.process_blocks * args.measurement_rounds_per_process * 2
+    normal_rows = args.process_blocks * (1 + args.measurement_rounds_per_process * 2)
     output = CampaignOutput.create(
         args.report,
         source_id="tpcds_compare",
@@ -978,6 +1016,9 @@ def main() -> int:
         ],
     )
 
+    output.control.write_json("inputs.json", {
+        key: value for key, value in report.items() if key != "queries"
+    })
     failures = 0
     output_errors: dict[tuple[str, str], str] = {}
     binary_result = args.paro_result_format == "binary"
@@ -998,9 +1039,6 @@ def main() -> int:
                 threads=args.threads,
                 statement_trace=False,
                 optimizer_environment={
-                    "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
-                        "PARO_QUALITY_POLICY_HANDOFF"
-                    ),
                     "PARO_STRONG_INCUMBENT_EXPERIMENT": None,
                     "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": None,
                     "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": None,
@@ -1063,6 +1101,7 @@ def main() -> int:
             cold_samples: dict[str, list[float]] = {"paro": [], "duckdb": []}
             sample_digests: dict[str, list[str]] = {"paro": [], "duckdb": []}
             blocks: list[dict[str, Any]] = []
+            result["process_blocks"] = blocks
             rng = random.Random(args.random_seed + query_number * 1_000_003)
             for block_number in range(args.process_blocks):
                 block_server_context = isolated_paro_server(
@@ -1075,9 +1114,6 @@ def main() -> int:
                     statement_trace=False,
                     cache_evidence=True,
                     optimizer_environment={
-                        "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
-                            "PARO_QUALITY_POLICY_HANDOFF"
-                        ),
                         "PARO_STRONG_INCUMBENT_EXPERIMENT": (
                             "1" if args.strong_incumbent_c1 else None
                         ),
@@ -1123,7 +1159,7 @@ def main() -> int:
                                 )
                             else:
                                 rows, sample_schema, elapsed_ms = duck_process.execute(query)
-                            validate_sample(f"{engine} cold statement", rows, sample_schema)
+                            validate_sample(engine, rows, sample_schema)
                             cold_samples[engine].append(elapsed_ms)
                             cold_statement_ms[engine] = round(elapsed_ms, 6)
                             if engine == "paro":
@@ -1138,10 +1174,10 @@ def main() -> int:
                         # Additional warmups are deliberately outside both timed scopes.
                         for _ in range(args.warmups_per_process - 1):
                             validate_sample(
-                                "paro warmup", *run_paro(paro, query, binary_result)
+                                "paro", *run_paro(paro, query, binary_result)
                             )
                             duck_rows, duck_schema_sample, _ = duck_process.execute(query)
-                            validate_sample("duckdb warmup", duck_rows, duck_schema_sample)
+                            validate_sample("duckdb", duck_rows, duck_schema_sample)
 
                         round_orders = []
                         for _ in range(args.measurement_rounds_per_process):
@@ -1163,12 +1199,17 @@ def main() -> int:
                             "cold_miss_evidence": cold_cache_evidence,
                             "measurement_round_orders": round_orders,
                             "paro_ms": [],
-                            "paro_receipt_associations": [],
+                            "paro_receipt_associations": [
+                                uncovered_receipt("registered warm sample has not completed")
+                                for _ in range(args.measurement_rounds_per_process * 2)
+                            ],
                             "paro_execution_work": [],
                             "duckdb_ms": [],
                             "paro_server": block_server.identity(),
                             "duckdb_process": duck_process.identity,
                         }
+                        blocks.append(block)
+                        warm_receipt_index = 0
                         for order in round_orders:
                             for engine in order:
                                 if engine == "paro":
@@ -1185,13 +1226,12 @@ def main() -> int:
                                 sample_digests[engine].append(digest)
                                 block[f"{engine}_ms"].append(round(elapsed_ms, 6))
                                 if engine == "paro":
-                                    block["paro_receipt_associations"].append(
-                                        collect_statement_cache_evidence(
+                                    block["paro_receipt_associations"][warm_receipt_index] = collect_statement_cache_evidence(
                                             paro,
                                             query,
                                             before_execution_ids=before_execution_ids,
-                                        )
                                     )
+                                    warm_receipt_index += 1
                                     if os.environ.get("PARO_COLD_WORK_EVIDENCE") == "1":
                                         block["paro_execution_work"].append(
                                             collect_execution_work(
@@ -1209,7 +1249,6 @@ def main() -> int:
                         "EXPLAIN (COMPILE) is diagnostic-only and would change C1"
                     ),
                 }
-                blocks.append(block)
 
             diagnostic_blocks: list[dict[str, Any]] = []
             for diagnostic_block_number in range(args.diagnostic_process_blocks):
@@ -1223,9 +1262,6 @@ def main() -> int:
                     statement_trace=False,
                     cache_evidence=True,
                     optimizer_environment={
-                        "PARO_QUALITY_POLICY_HANDOFF": os.environ.get(
-                            "PARO_QUALITY_POLICY_HANDOFF"
-                        ),
                         "PARO_STRONG_INCUMBENT_EXPERIMENT": (
                             "1" if args.diagnostic_strong_incumbent else None
                         ),
@@ -1262,7 +1298,7 @@ def main() -> int:
                             diagnostic_paro, query, binary_result
                         )
                         validate_sample(
-                            "diagnostic Paro", diagnostic_rows, diagnostic_schema
+                            "paro", diagnostic_rows, diagnostic_schema
                         )
                         if pre_touch:
                             require_first_target_miss(
@@ -1348,8 +1384,7 @@ def main() -> int:
                 "status": (
                     "Verified"
                     if all(
-                        item.get("cold_miss_evidence", {}).get("status") == "Verified"
-                        and not item["cold_miss_evidence"].get("cache_hit", True)
+                        is_target_cache_miss(item.get("cold_miss_evidence", {}), query)
                         for item in blocks
                     )
                     else "Uncovered"
@@ -1440,13 +1475,18 @@ def main() -> int:
             )
         except Exception as error:
             failures += 1
-            result.update(status="failed", error=f"{type(error).__name__}: {error}")
+            result.update(status="failed", error=f"{type(error).__name__}: {error}",
+                          failure_traceback=traceback.format_exc())
+            # Report the originating failure before publishing its envelope;
+            # archive validation must never hide the query/collection error.
+            print(f"TPC-DS {query_id}: collection failed: {result['error']}", flush=True)
         report["queries"].append(result)
         report["passed"] = len(report["queries"]) - failures
         report["failed"] = failures
         report["faster_than_duckdb"] = sum(
             item.get("faster_than_duckdb", False) for item in report["queries"]
         )
+        normal_payload, normal_receipts = normal_cell_evidence(result, normal_rows)
         output.publish_cell_json(
             query_case=query_id,
             arm_id="normal",
@@ -1456,13 +1496,8 @@ def main() -> int:
                 query_case=query_id,
                 arm_id="normal",
                 workload_name="tpcds",
-                query_payload=result,
-                compile_receipts=result.get("cold_statement", {})
-                .get("normal_receipt_coverage", {})
-                .get("associations", [])
-                or [{
-                    **uncovered_receipt("normal sample receipt association is absent"),
-                }],
+                query_payload=normal_payload,
+                compile_receipts=normal_receipts,
                 source_id=output.attempts[(query_id, "normal")].source_id,
                 attempt_id=output.attempts[(query_id, "normal")].attempt_id,
             ),

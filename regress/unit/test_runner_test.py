@@ -10,6 +10,26 @@ from harness.executor import ExecutionResult, QueryOutput
 from harness.parser import Block
 
 
+def test_restart_discovers_original_cwd_without_splitting_spaces(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    owned = tmp_path / "owned data"
+    owned.mkdir()
+    monkeypatch.setattr(Path, "exists", lambda path: False)
+    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=f"p123\nfcwd\nn{owned}\n"))
+    assert runner._discover_process_cwd(123) == owned
+
+
+def test_restart_rejects_missing_cwd_before_stopping_server(monkeypatch):
+    from types import SimpleNamespace
+    import pytest
+    monkeypatch.setattr(Path, "exists", lambda path: False)
+    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=1, stdout=""))
+    with pytest.raises(runner.ExecutionError, match="working directory"):
+        runner._discover_process_cwd(123)
+
+
 def test_optimizer_verifier_is_reapplied_to_each_connection(tmp_path, monkeypatch):
     from types import SimpleNamespace
     (tmp_path / "config.toml").write_text("[connection]\n[test]\n")

@@ -107,10 +107,12 @@ class PreTouchTests(unittest.TestCase):
 
     def test_target_cache_gate_cannot_be_relaxed(self):
         good = dict(status='Verified', occurrence=9, compilation='Executed',
-                    query_fingerprint=statement_fingerprint('SELECT 2'))
+                    compile={'cache_hit': False},
+                    query_fingerprint=f"{statement_fingerprint('SELECT 2'):016x}")
         require_first_target_miss(good, 'SELECT 2')
         for change in [dict(compilation='CacheHit'), dict(status='uncovered'),
-                       dict(status='Uncovered'), dict(query_fingerprint=0)]:
+                       dict(status='Uncovered'), dict(query_fingerprint=0),
+                       dict(compile={}), dict(compile={'cache_hit': True})]:
             with self.assertRaises(AssertionError):
                 require_first_target_miss(good | change, 'SELECT 2')
 

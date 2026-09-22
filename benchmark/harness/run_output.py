@@ -81,7 +81,10 @@ def _cell_budget_bytes(
         4_096
         + 1_024 * query_cases
         + 1_024 * sample_rows
-        + 2_048 * product_receipts
+        # A v3 association retains compile, admission and execution payloads.
+        # Real producer receipts exceed 2 KiB even with compact JSON. Reserve
+        # their typed envelope, without multiplying the logical receipt count.
+        + 4_096 * product_receipts
         + 512 * calibration_rows
         + 200_000 * summary_captures
         + 256 * attempts
@@ -107,7 +110,9 @@ def _encode_json(payload: dict[str, Any], *, limit_bytes: int | None = None) -> 
     allocate the complete diagnostic document just to discover that the
     registered byte lease has already been exhausted.
     """
-    encoder = json.JSONEncoder(indent=2, ensure_ascii=False, sort_keys=True)
+    # Machine-owned evidence has one canonical compact representation. Pretty
+    # indentation scales with receipt nesting, not with retained information.
+    encoder = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False, sort_keys=True)
     output = bytearray()
     for chunk in encoder.iterencode(payload):
         encoded = chunk.encode("utf-8")
@@ -822,7 +827,8 @@ class CampaignOutput:
                 )
         terminal_status = (
             "Incomplete"
-            if self.run._manifest.get("status") == "Incomplete"
+            if any(attempt.status != "Completed" for attempt in self.attempts.values())
+            or self.run._manifest.get("status") == "Incomplete"
             or self.run._manifest.get("registration", {}).get("status")
             in {"CapacityExceeded", "PublicationUnknown"}
             else status

@@ -190,7 +190,8 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
                 host, port = args.listen.rsplit(":", 1)
                 with psycopg.connect(host=host, port=int(port), dbname=args.database,
                                      user=args.user, autocommit=True, connect_timeout=10) as connection:
-                    connection.execute("SET optimizer_verify=true")
+                    connection.execute(sql.SQL("SET optimizer_verify={}").format(sql.Literal(args.optimizer_verify == "on")))
+                    connection.execute(sql.SQL("SET optimizer_search_policy={}").format(sql.Literal(args.optimizer_search_policy)))
                     connection.execute(sql.SQL("SET threads={}").format(sql.Literal(args.threads)))
                     connection.execute(sql.SQL("SET memory_limit={}").format(sql.Literal(args.memory_limit)))
                     connection.execute(sql.SQL("SET statement_timeout={}").format(
@@ -261,6 +262,8 @@ def main() -> int:
     parser.add_argument("--user", default="paro")
     parser.add_argument("--process-blocks", type=int, default=5)
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--optimizer-search-policy", choices=("quality", "budgeted"), default="quality")
+    parser.add_argument("--optimizer-verify", choices=("on", "off"), default="on")
     parser.add_argument("--memory-limit", default="2GB")
     parser.add_argument("--watchdog-seconds", type=int, default=30)
     parser.add_argument("--rss-limit-mb", type=int, default=2048)
@@ -293,6 +296,8 @@ def main() -> int:
                      "samples": []} for path in args.query],
     }
     report["configuration"].update({
+        "optimizer_search_policy": args.optimizer_search_policy,
+        "optimizer_verify": args.optimizer_verify == "on",
         "planning_dop": 1,
         "execution_dop": args.threads,
         "resource_envelope": {

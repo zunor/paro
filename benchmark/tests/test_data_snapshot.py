@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,20 @@ from tpcds_compare import verify_measurement_inputs
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_absolute_catalog_roots_are_rejected_before_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog = root / "instance" / "meta" / "catalog.json"
+            catalog.parent.mkdir(parents=True)
+            for storage in [str(root / "databases" / "db-1"), "../outside", "databases/../outside"]:
+                catalog.write_text(json.dumps({"format_version": 1, "databases": [{"storage_dir": storage}]}))
+                with self.assertRaisesRegex(ValueError, "not root-relative"):
+                    ImmutableDataSeed.capture(root)
+            catalog.write_text(json.dumps({"format_version": 1, "databases": [{"storage_dir": "./databases/db-1"}]}))
+            seed = ImmutableDataSeed.capture(root)
+            with seed.snapshot() as snapshot:
+                self.assertEqual(tree_digest(snapshot.path), seed.sha256)
+
     def test_process_local_writes_do_not_change_the_seed_or_the_next_process(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
