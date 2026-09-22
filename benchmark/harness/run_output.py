@@ -473,6 +473,9 @@ class AttemptOutput:
             "campaign_id": self.run.campaign_id,
             "source_id": self.source_id,
             "attempt_id": self.attempt_id,
+            "attempt_index": self.run._attempt_index(
+                query_case=self.query_case, arm_id=self.arm_id, attempt_id=self.attempt_id
+            ),
             "query_case": self.query_case,
             "arm_id": self.arm_id,
             "status": status,
@@ -487,6 +490,21 @@ class AttemptOutput:
         # capacity is exhausted.
         self._lifecycle_writer().write_json("attempt.json", metadata, overwrite=True)
         self.run._update_attempt(metadata)
+
+    def accept(self) -> None:
+        """Explicitly accept this completed attempt for its cell.
+
+        Selection is a producer decision, not an inference from list order or
+        recency.  An attempt can only be accepted after its own terminal
+        record is sealed successfully.
+        """
+        if self.status != "Completed":
+            raise RunOutputError("only a completed attempt can be accepted")
+        self.run.accept_attempt(
+            query_case=self.query_case,
+            arm_id=self.arm_id,
+            attempt_id=self.attempt_id,
+        )
 
 
 @dataclass
@@ -588,6 +606,7 @@ class CorpusOutput:
             error = error or "declared samples and receipts are not complete"
         if status == "Completed":
             self.attempt.seal(status=status, result_path=self.result_path, summary_path=self.summary_path)
+            self.attempt.accept()
         else:
             failure = None
             if error is not None:
@@ -637,10 +656,12 @@ class CampaignSummary:
                 "sample_ids": cell.get("sample_ids", []),
                 "declared_receipts": cell.get("product_receipts"),
                 "declared_captures": cell.get("summary_captures"),
+                "accepted_attempt_id": cell.get("accepted_attempt_id"),
                 "attempts": [
                     {
                         "source_id": item.get("source_id"),
                         "attempt_id": item.get("attempt_id"),
+                        "attempt_index": item.get("attempt_index"),
                         "status": item.get("status"),
                         "result": item.get("result"),
                         "summary": item.get("summary"),
@@ -781,6 +802,7 @@ class CampaignOutput:
                     if attempt.summary_path.exists()
                     else None,
                 )
+                attempt.accept()
             else:
                 terminal = "Incomplete" if status == "Completed" else status
                 failure = None
@@ -931,6 +953,9 @@ class RunOutput:
                 "run_id": self.run_id,
                 "source_id": source_id,
                 "attempt_id": attempt_id,
+                "attempt_index": self._attempt_index(
+                    query_case=query_case, arm_id=arm_id, attempt_id=attempt_id
+                ),
                 "query_case": query_case,
                 "arm_id": arm_id,
                 "status": "Running",
@@ -945,6 +970,41 @@ class RunOutput:
             self._update_attempt(metadata)
             return attempt
         raise RunOutputError(f"too many attempts for source {source_id!r}")
+
+    def _attempt_index(self, *, query_case: str, arm_id: str, attempt_id: str) -> int:
+        indexes = [
+            int(item["attempt_index"])
+            for item in self._manifest.get("attempts", [])
+            if item.get("query_case") == query_case
+            and item.get("arm_id") == arm_id
+            and isinstance(item.get("attempt_index"), int)
+            and item.get("attempt_id") != attempt_id
+        ]
+        return max(indexes, default=-1) + 1
+
+    def accept_attempt(self, *, query_case: str, arm_id: str, attempt_id: str) -> None:
+        """Seal the producer's explicit retry decision for one cell."""
+        with self._lock:
+            cell = self._registered_cell(f"{query_case}--{arm_id}")
+            attempt = next(
+                (
+                    item
+                    for item in self._manifest.get("attempts", [])
+                    if item.get("attempt_id") == attempt_id
+                    and item.get("query_case") == query_case
+                    and item.get("arm_id") == arm_id
+                ),
+                None,
+            )
+            if attempt is None:
+                raise RunOutputError("cannot accept an unknown cell attempt")
+            if attempt.get("status") != "Completed":
+                raise RunOutputError("only a completed attempt can be accepted")
+            existing = cell.get("accepted_attempt_id")
+            if existing is not None and existing != attempt_id:
+                raise RunOutputError("cell already has a different accepted attempt")
+            cell["accepted_attempt_id"] = attempt_id
+            self._persist_manifest()
 
     def finalize(self, *, status: str) -> None:
         if status not in {"Completed", "Failed", "Cancelled", "Incomplete"}:
@@ -1059,6 +1119,7 @@ class RunOutput:
             "calibration_rows": calibration_rows,
             "summary_captures": summary_captures,
             "attempts": attempts,
+            "accepted_attempt_id": None,
             "sample_ids": sample_ids,
             "budget_bytes": cell_budget,
             "written_bytes": 0,
@@ -1388,6 +1449,7 @@ class RunOutput:
         entry = {
             "source_id": source_id,
             "attempt_id": attempt_id,
+            "attempt_index": metadata.get("attempt_index"),
             "query_case": metadata.get("query_case"),
             "arm_id": metadata.get("arm_id"),
             "status": metadata.get("status"),

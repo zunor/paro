@@ -96,9 +96,16 @@ def load_run_output_report(path: Path) -> tuple[dict[str, Any], Path]:
             if attempt.get("query_case") == cell.get("query_case")
             and attempt.get("arm_id") == cell.get("arm_id")
         ]
-        if len(cell_attempts) != 1:
-            raise ValueError("cold-planning gate cannot guess among cell attempts")
-        attempt = cell_attempts[0]
+        accepted_attempt_id = cell.get("accepted_attempt_id")
+        if not isinstance(accepted_attempt_id, str) or not accepted_attempt_id:
+            raise ValueError("cold-planning cell has no explicit accepted attempt")
+        matching = [
+            attempt for attempt in cell_attempts
+            if attempt.get("attempt_id") == accepted_attempt_id
+        ]
+        if len(matching) != 1:
+            raise ValueError("cold-planning cell accepted attempt is missing or ambiguous")
+        attempt = matching[0]
         if attempt.get("status") != "Completed" or not isinstance(attempt.get("result"), str):
             raise ValueError("cold-planning cell attempt is not completed")
         payload = _owned_json(root, attempt["result"])

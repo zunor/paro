@@ -153,6 +153,36 @@ class RunOutputTests(unittest.TestCase):
             self.assertEqual(len(manifest["registration"]["cells"]), 2)
             self.assertTrue((output.run.root / "campaign.json").exists())
 
+    def test_campaign_summary_records_explicit_accepted_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "retry.json",
+                source_id="collector",
+                cells=[{
+                    "query_case": "q",
+                    "arm_id": "normal",
+                    "query_cases": 1,
+                    "sample_rows": 1,
+                    "product_receipts": 1,
+                }],
+            )
+            attempt = output.attempts[("q", "normal")]
+            output.publish_cell_json(
+                query_case="q",
+                arm_id="normal",
+                payload=self.cell_payload(
+                    "q", "normal", campaign_id=output.run.campaign_id,
+                    run_id=output.run.run_id,
+                    source_id=attempt.source_id,
+                    attempt_id=attempt.attempt_id,
+                ),
+            )
+            output.finish(status="Completed")
+            summary = json.loads((output.run.root / "campaign.json").read_text())
+            cell = summary["cells"][0]
+            self.assertEqual(cell["accepted_attempt_id"], attempt.attempt_id)
+            self.assertEqual(cell["attempts"][0]["attempt_index"], 0)
+
     def test_cell_payload_must_match_registered_identity_and_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = CampaignOutput.create(

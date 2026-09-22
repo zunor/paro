@@ -602,15 +602,38 @@ def validate_campaign_summary(summary: Any, manifest: dict[str, Any] | None = No
         seen.add(cell_id)
         if not isinstance(cell.get("sample_ids"), list):
             raise ReceiptContractError("campaign summary cell lacks sample ids")
+        accepted_attempt_id = cell.get("accepted_attempt_id")
+        if accepted_attempt_id is not None and (
+            not isinstance(accepted_attempt_id, str) or not accepted_attempt_id
+        ):
+            raise ReceiptContractError("campaign summary has invalid accepted attempt")
         for field in ("declared_samples", "declared_receipts", "declared_captures"):
             if not isinstance(cell.get(field), int) or isinstance(cell[field], bool) or cell[field] < 0:
                 raise ReceiptContractError(f"campaign summary has invalid {field}")
         attempts = cell.get("attempts")
         if not isinstance(attempts, list):
             raise ReceiptContractError("campaign summary cell lacks attempt index")
+        attempt_ids: set[str] = set()
+        completed_attempt_ids: set[str] = set()
         for attempt in attempts:
             if not isinstance(attempt, dict) or not isinstance(attempt.get("status"), str):
                 raise ReceiptContractError("campaign summary has malformed attempt")
+            attempt_id = attempt.get("attempt_id")
+            attempt_index = attempt.get("attempt_index")
+            if (
+                not isinstance(attempt_id, str)
+                or not attempt_id
+                or attempt_id in attempt_ids
+                or not isinstance(attempt_index, int)
+                or isinstance(attempt_index, bool)
+                or attempt_index < 0
+            ):
+                raise ReceiptContractError("campaign summary has invalid attempt identity")
+            attempt_ids.add(attempt_id)
+            if attempt.get("status") == "Completed":
+                completed_attempt_ids.add(attempt_id)
+        if accepted_attempt_id is not None and accepted_attempt_id not in completed_attempt_ids:
+            raise ReceiptContractError("accepted attempt is not a completed attempt in the cell")
     if manifest is not None:
         if summary.get("campaign_id") != manifest.get("campaign_id") \
                 or summary.get("run_id") != manifest.get("run_id"):
@@ -623,6 +646,12 @@ def validate_campaign_summary(summary: Any, manifest: dict[str, Any] | None = No
         manifest_cells = {cell.get("cell_id") for cell in registration.get("cells", [])}
         if seen != manifest_cells:
             raise ReceiptContractError("campaign summary cell index differs from registration")
+        for manifest_cell in registration.get("cells", []):
+            summary_cell = next(
+                item for item in cells if item.get("cell_id") == manifest_cell.get("cell_id")
+            )
+            if summary_cell.get("accepted_attempt_id") != manifest_cell.get("accepted_attempt_id"):
+                raise ReceiptContractError("campaign summary accepted attempt differs from registration")
 
 
 def build_benchmark_cell_payload(
