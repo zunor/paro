@@ -93,6 +93,9 @@ impl BudgetDimension {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchBudget {
+    /// Explicit embedding override; otherwise the statement's typed setting
+    /// supplies the policy before Memo construction.
+    pub search_policy: Option<paro_context::OptimizerSearchPolicy>,
     /// Isolation ceiling, not a latency tuning knob. It includes incumbent
     /// construction; only optional work stops at this deadline. `None` is
     /// useful for exhaustive oracles and controlled profiling.
@@ -158,6 +161,7 @@ pub struct SearchBudget {
 impl Default for SearchBudget {
     fn default() -> Self {
         Self {
+            search_policy: None,
             // This is an explicitly opt-in diagnostic override.  It is read
             // at budget construction so the benchmark can run a real
             // stop-and-execute process without changing the production
@@ -186,10 +190,12 @@ impl Default for SearchBudget {
             max_child_frontier_combinations_per_group: 4_096,
             // P1 sensitivity experiment only: truncation still records its
             // ordinary search obligation. This is never a completeness mode.
-            max_winner_frontier_candidates_per_goal: std::env::var("PARO_DIAGNOSTIC_FRONTIER_WIDTH")
-                .ok()
-                .and_then(|value| diagnostic_frontier_width(&value))
-                .unwrap_or(256),
+            max_winner_frontier_candidates_per_goal: std::env::var(
+                "PARO_DIAGNOSTIC_FRONTIER_WIDTH",
+            )
+            .ok()
+            .and_then(|value| diagnostic_frontier_width(&value))
+            .unwrap_or(256),
             max_join_connected_pairs: 65_536,
             max_join_exact_relations: 12,
             join_beam_width: 64,
@@ -226,9 +232,15 @@ mod diagnostic_width_tests {
             assert_eq!(super::diagnostic_frontier_width(value), None);
         }
         for width in [1, 2, 4, 8, 256] {
-            assert_eq!(super::diagnostic_frontier_width(&width.to_string()), Some(width));
+            assert_eq!(
+                super::diagnostic_frontier_width(&width.to_string()),
+                Some(width)
+            );
         }
-        assert_eq!(super::diagnostic_frontier_width("unbounded"), Some(u32::MAX));
+        assert_eq!(
+            super::diagnostic_frontier_width("unbounded"),
+            Some(u32::MAX)
+        );
     }
 }
 

@@ -38,16 +38,16 @@ pub use attached_databases::{
     DatabaseSnapshotIdentity,
 };
 pub use compile_diagnostics::{
-    AdmissionFallback, AdmissionReceiptId, AdmissionResult, ArtifactIdentity,
-    CompiledArtifactId, ExecutionImageStatus, ExecutionReceipt, ExecutionReceiptId,
-    ExecutionTerminal, MemoryCompletionReceipt, PlanStructureId, ResourceReceipt,
-    SelectionIdentity, RECEIPT_SCHEMA_VERSION,
+    AdmissionFallback, AdmissionReceiptId, AdmissionResult, ArtifactIdentity, CompiledArtifactId,
+    ExecutionImageStatus, ExecutionReceipt, ExecutionReceiptId, ExecutionTerminal,
+    MemoryCompletionReceipt, PlanStructureId, ResourceReceipt, SelectionIdentity,
+    RECEIPT_SCHEMA_VERSION,
 };
 pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
 pub use diagnostic_environment::{
     initialize_diagnostic_environment, snapshot as diagnostic_environment,
 };
-pub use effective_settings::EffectiveSettings;
+pub use effective_settings::{EffectiveSettings, OptimizerSearchPolicy};
 pub use execution_resources::ExecutionResources;
 pub use memory_governance::{
     QueryMemoryBudgetSpec, QueryMemoryCoordinator, QueryMemoryRegistration, QueryMemoryTarget,

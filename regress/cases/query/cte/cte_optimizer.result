@@ -28,7 +28,7 @@ MATERIALIZED_CTE  (rows=1)
               ->  FILTER  (rows=1)
                     Filter: nums.v > 1
                     ->  CTE_SCAN  (rows=1)
-                          CTE Index: 9
+                          CTE Index: 0
                           Table Index: 8
 
 EXPLAIN

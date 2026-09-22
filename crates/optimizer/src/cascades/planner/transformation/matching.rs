@@ -1847,6 +1847,12 @@ fn enumerate_pattern_bindings(
             active: &mut BTreeSet<GroupId>,
             scope: PatternScope,
         ) -> Result<Vec<(PatternOperand, Fingerprint)>> {
+            // Shared DAG revisits may reuse an existing PatternRead without
+            // admitting new ledger work. They still consume wall time: a
+            // negative match must not hide cancellation behind read reuse.
+            if !self.admit_work(0)? {
+                return Ok(Vec::new());
+            }
             if let Some(cancellation) = self.cancellation {
                 cancellation.check()?;
             }
@@ -1954,7 +1960,7 @@ fn enumerate_pattern_bindings(
                     }
                     result.push(candidate);
                 }
-                if self.limited && result.len() == self.limit {
+                if self.limited {
                     break;
                 }
             }
@@ -1981,6 +1987,9 @@ fn enumerate_pattern_bindings(
             active: &mut BTreeSet<GroupId>,
             scope: PatternScope,
         ) -> Result<Vec<(PatternOperand, Fingerprint)>> {
+            if !self.admit_work(0)? {
+                return Ok(Vec::new());
+            }
             if let Some(cancellation) = self.cancellation {
                 cancellation.check()?;
             }
@@ -2582,8 +2591,8 @@ mod failure_tests;
 
 #[cfg(test)]
 mod tests {
-    use crate::cascades::rules::ReadScope;
     use super::*;
+    use crate::cascades::rules::ReadScope;
 
     fn deferral_dispatch_input() -> OptimizationInput {
         use paro_common::types::LogicalType;
@@ -2726,17 +2735,15 @@ mod tests {
             expression,
             &state,
         ));
-        assert!(
-            cached_negative_root_reads(
-                PlannerTransformation::AggregateDimensionDeferral,
-                input.root,
-                expression.id,
-                &input.memo,
-                &state,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(cached_negative_root_reads(
+            PlannerTransformation::AggregateDimensionDeferral,
+            input.root,
+            expression.id,
+            &input.memo,
+            &state,
+        )
+        .unwrap()
+        .is_none());
         let bindings = scoped_pattern_bindings(
             PlannerTransformation::AggregateDimensionDeferral,
             input.root,
@@ -2921,12 +2928,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(
-            before
-                .reads
-                .iter()
-                .all(|read| read.is_current(&input.memo).unwrap())
-        );
+        assert!(before
+            .reads
+            .iter()
+            .all(|read| read.is_current(&input.memo).unwrap()));
         let after = enumerate_pattern_bindings(
             input.root,
             expression,
@@ -3282,6 +3287,30 @@ mod tests {
             memo.group(root).unwrap().statistics_snapshot_fingerprint()
         );
         assert!(read.is_current(&memo).unwrap());
+    }
+
+    #[test]
+    fn expired_optional_matching_is_limited_without_charging_work() {
+        let mut budget = SearchBudget::default();
+        budget.optional_time_limit = Some(std::time::Duration::ZERO);
+        let mut memo = Memo::new(budget);
+        let (root, expression) = add_expression(&mut memo, 7001, vec![]);
+        memo.control().begin_optional();
+        let bindings = pattern_bindings(
+            root,
+            expression,
+            &memo,
+            memo.budget(),
+            BudgetDimension::RuleWorkPerGroup,
+            None,
+        )
+        .unwrap();
+        assert!(bindings.bindings.is_empty());
+        assert!(matches!(
+            bindings.completion,
+            PatternEnumerationCompletion::BudgetLimited { .. }
+        ));
+        assert!(memo.control().deadline_reached());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! Construction of optimizer Query IR and Memo groups from bound plans.
 
 mod boundary;
-mod domain_transfer;
+pub(crate) mod domain_transfer;
 mod quality_domain;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -27,8 +27,8 @@ use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
 use crate::aggregate::{
-    dimension_deferral, dimension_sharing, input_materialization,
-    join_subsumption, late_payload, post_reduction,
+    dimension_deferral, dimension_sharing, input_materialization, join_subsumption, late_payload,
+    post_reduction,
 };
 use crate::context::SharedColumnStatistics;
 use crate::filter::pushdown::FilterPushdown;
@@ -70,8 +70,8 @@ use super::properties::{
 };
 use super::quality::{
     AggregateRegionWitness, BundleCapability, BundleFact, NativeQualityEvidence,
-    NativeQualityShape, QualityCandidateNode, QualityCandidatePreflight,
-    QualityEvidenceProvider, QualityPolicyStatus,
+    NativeQualityShape, QualityCandidateNode, QualityCandidatePreflight, QualityEvidenceProvider,
+    QualityPolicyStatus,
 };
 use super::region::{
     FacetCriticality, RegionArtifactDependencyContract, RegionArtifactKind, RegionBoundaryEndpoint,
@@ -304,7 +304,8 @@ fn quality_node<'a>(
     reference: ChildWinnerRef,
 ) -> Option<&'a QualityCandidateNode> {
     let node = nodes.get(&reference.candidate).copied()?;
-    (node.reference.group == reference.group && node.reference.goal == reference.goal).then_some(node)
+    (node.reference.group == reference.group && node.reference.goal == reference.goal)
+        .then_some(node)
 }
 
 struct QualityCandidateInspection {
@@ -346,7 +347,6 @@ fn inspect_quality_candidate(
     let mut shape = NativeQualityShape::default();
     let mut cte_producers = BTreeSet::new();
     let mut cte_consumers = BTreeSet::new();
-    let mut cte_producer_witnesses = BTreeSet::new();
     let mut has_filter = false;
     let mut has_get = false;
     let mut has_join = false;
@@ -413,7 +413,8 @@ fn inspect_quality_candidate(
                 has_join_region |= winner.joint_cost_proof.is_some();
                 shape.joins = shape.joins.saturating_add(1);
                 if winner.joint_cost_proof.is_some() {
-                    shape.join_region_witness_nodes = shape.join_region_witness_nodes.saturating_add(1);
+                    shape.join_region_witness_nodes =
+                        shape.join_region_witness_nodes.saturating_add(1);
                 }
             }
             LogicalOperatorType::Aggregate => {
@@ -422,9 +423,10 @@ fn inspect_quality_candidate(
             }
             LogicalOperatorType::CTERef => {
                 has_cte_consumer = true;
-                if let LogicalOperator::CTERef(cte) = &state.payloads.logical[logical.payload.index()]
-                    .semantic_template
-                    .operator
+                if let LogicalOperator::CTERef(cte) = &state.payloads.logical
+                    [logical.payload.index()]
+                .semantic_template
+                .operator
                 {
                     cte_consumers.insert(cte.cte_index);
                 }
@@ -441,16 +443,6 @@ fn inspect_quality_candidate(
                 };
                 if let Some(cte_index) = cte_index {
                     cte_producers.insert(cte_index);
-                    if selected_rules.iter().any(|rule| {
-                        matches!(
-                            *rule,
-                            CTE_DEMAND_PUSHDOWN_RULE
-                                | CTE_FILTER_PUSHDOWN_RULE
-                                | CTE_PARTITIONED_MATERIALIZATION_RULE
-                        )
-                    }) {
-                        cte_producer_witnesses.insert(cte_index);
-                    }
                 }
             }
             LogicalOperatorType::Order | LogicalOperatorType::TopN => has_ordering = true,
@@ -491,6 +483,8 @@ fn inspect_quality_candidate(
     if nodes.is_empty() {
         return Ok(None);
     }
+    // Rule provenance is not a selected producer property.
+    let cte_producer_witnesses = quality_domain::cte_domain_witnesses(memo, &nodes, state);
     Ok(Some(QualityCandidateInspection {
         nodes: nodes.into_boxed_slice(),
         rules,
@@ -580,8 +574,7 @@ fn selected_aggregate_region_shape_refs(
         shape.joins = 1;
     }
     for child in node.children.iter().copied() {
-        let child_shape =
-            selected_aggregate_region_shape_refs(memo, state, child, nodes, visited);
+        let child_shape = selected_aggregate_region_shape_refs(memo, state, child, nodes, visited);
         shape.aggregates = shape.aggregates.saturating_add(child_shape.aggregates);
         shape.joins = shape.joins.saturating_add(child_shape.joins);
         shape.decomposed |= child_shape.decomposed;
@@ -777,11 +770,7 @@ fn selected_aggregate_region_witnesses_refs(
                             return None;
                         }
                         let fact_fingerprint = collect_quality_region_fact_fingerprint(
-                            memo,
-                            reference,
-                            arm,
-                            goal,
-                            nodes,
+                            memo, reference, arm, goal, nodes,
                         )?;
                         let union_winner = memo.resolve_child_winner(reference)?;
                         let union_physical = memo.physical_expr(node.physical)?;
@@ -954,16 +943,7 @@ fn planner_quality_preflight(
     if winner.provided.satisfies(required) {
         facts.insert(BundleFact::OutputDemand);
     }
-    let has_any = |candidates: &[RuleId]| candidates.iter().any(|rule| rules.contains(rule));
-    if pending_domain_transfers.is_empty()
-        && has_filter
-        && has_get
-        && has_any(&[
-            PREDICATE_TRANSFER_RULE,
-            KEY_DOMAIN_TRANSFER_RULE,
-            CTE_FILTER_PUSHDOWN_RULE,
-        ])
-    {
+    if pending_domain_transfers.is_empty() && has_filter && has_get {
         facts.insert(BundleFact::PredicateDomain);
     }
     if has_join && has_join_region {
@@ -1035,8 +1015,7 @@ fn planner_quality_preflight(
                 || !facts.contains(&BundleFact::PredicateDomain)
         }
         BundleCapability::SmallJoin => {
-            !facts.contains(&BundleFact::OutputDemand)
-                || !facts.contains(&BundleFact::JoinRegion)
+            !facts.contains(&BundleFact::OutputDemand) || !facts.contains(&BundleFact::JoinRegion)
         }
         BundleCapability::SharedAggregate => {
             !facts.contains(&BundleFact::AggregateDecomposition)
@@ -1049,8 +1028,9 @@ fn planner_quality_preflight(
         }
         // The current built-in policy has no ordering or graph bundle.  Keep
         // the conservative fallback for a caller that installs such a policy.
-        BundleCapability::LargeJoin | BundleCapability::Ordering | BundleCapability::GraphProvider =>
-            false,
+        BundleCapability::LargeJoin
+        | BundleCapability::Ordering
+        | BundleCapability::GraphProvider => false,
     });
     if capabilities.is_empty() || !built_in_bundle_has_missing_fact {
         return Ok(None);
@@ -1448,6 +1428,7 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         let mut facts = BTreeSet::new();
         #[derive(Default)]
         struct QualityWalk {
+            nodes: Vec<QualityCandidateNode>,
             choices: Vec<Fingerprint>,
             rules: BTreeSet<RuleId>,
             shape: NativeQualityShape,
@@ -1474,12 +1455,13 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             walk: &mut QualityWalk,
         ) -> Result<()> {
             let QualityWalk {
+                nodes,
                 choices,
                 rules,
                 shape,
                 cte_producers,
                 cte_consumers,
-                cte_producer_witnesses,
+                cte_producer_witnesses: _,
                 has_filter,
                 has_get,
                 has_join,
@@ -1536,6 +1518,12 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
                 return Ok(());
             }
             choices.push(frozen_choice_fingerprint(frozen));
+            nodes.push(QualityCandidateNode {
+                reference: frozen.reference,
+                logical: frozen.logical.id,
+                physical: frozen.physical.id,
+                children: frozen.winner.children.clone(),
+            });
             let selected_rules = selected_payload_rule_proofs(&frozen.logical, metadata);
             if metadata.origin_rule.is_some() && selected_rules.is_empty() {
                 // The sidecar says this payload came from a rule, but the
@@ -1591,16 +1579,6 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
                     };
                     if let Some(cte_index) = cte_index {
                         cte_producers.insert(cte_index);
-                        if selected_rules.iter().any(|rule| {
-                            matches!(
-                                *rule,
-                                CTE_DEMAND_PUSHDOWN_RULE
-                                    | CTE_FILTER_PUSHDOWN_RULE
-                                    | CTE_PARTITIONED_MATERIALIZATION_RULE
-                            )
-                        }) {
-                            cte_producer_witnesses.insert(cte_index);
-                        }
                     }
                 }
                 LogicalOperatorType::Order | LogicalOperatorType::TopN => *has_ordering = true,
@@ -1628,6 +1606,8 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             ..QualityWalk::default()
         };
         visit(frozen, &state, &mut walk)?;
+        walk.cte_producer_witnesses =
+            quality_domain::cte_domain_witnesses(memo, &walk.nodes, &state);
         let QualityWalk {
             choices,
             rules,
@@ -1652,7 +1632,6 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             return Ok(None);
         }
 
-        let has_any = |candidates: &[RuleId]| candidates.iter().any(|rule| rules.contains(rule));
         if frozen.winner.provided.satisfies(required) {
             facts.insert(BundleFact::OutputDemand);
         }
@@ -1660,15 +1639,7 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         else {
             return Ok(None);
         };
-        if pending_domain_transfers.is_empty()
-            && has_filter
-            && has_get
-            && has_any(&[
-                PREDICATE_TRANSFER_RULE,
-                KEY_DOMAIN_TRANSFER_RULE,
-                CTE_FILTER_PUSHDOWN_RULE,
-            ])
-        {
+        if pending_domain_transfers.is_empty() && has_filter && has_get {
             facts.insert(BundleFact::PredicateDomain);
         }
         if has_join && has_join_region {
@@ -2382,7 +2353,8 @@ impl OptimizationInput {
     }
 
     pub fn optimize(mut self, grant_classes: &[ResourceGrantClass]) -> Result<OptimizationOutput> {
-        let preparation_partition = crate::work_partition::enter(crate::work_partition::Bucket::Pre);
+        let preparation_partition =
+            crate::work_partition::enter(crate::work_partition::Bucket::Pre);
         if grant_classes.is_empty() {
             return Err(paro_error::internal(
                 "planner optimization requires at least one resource grant class",
@@ -2414,8 +2386,8 @@ impl OptimizationInput {
             self.force_spill,
         )?;
         let mut engine = CascadesEngine::new(self.memo, registry);
-        let quality_handoff = std::env::var_os("PARO_QUALITY_POLICY_HANDOFF")
-            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let quality_handoff = engine.memo().budget().search_policy
+            == Some(paro_context::OptimizerSearchPolicy::QualityCoverage);
         if quality_handoff {
             engine.set_quality_policy_handoff_enabled(true);
             engine.set_quality_evidence_provider(Arc::new(PlannerQualityEvidenceProvider {
@@ -2527,7 +2499,9 @@ impl OptimizationInput {
             capture_level,
             Some(paro_context::compile_diagnostics::CaptureLevel::Detail)
         );
-        engine.set_rule_work_profile_enabled(paro_context::StatementTrace::enabled() || detail_capture);
+        engine.set_rule_work_profile_enabled(
+            paro_context::StatementTrace::enabled() || detail_capture,
+        );
         if capture_level.is_some() {
             engine.observe_compile_rule_work();
         }
@@ -3647,8 +3621,7 @@ impl MemoBuilder {
             usize::from(memo.budget().max_composite_region_groups),
             memo.budget().max_mandatory_region_groups as usize,
         )?;
-        let dropped_optional: BTreeSet<_> =
-            regions.dropped_optional_facets().collect();
+        let dropped_optional: BTreeSet<_> = regions.dropped_optional_facets().collect();
         for (payload, pending) in pending_region_facets {
             let operator = metadata.get_mut(&payload).ok_or_else(|| {
                 paro_error::internal("planning-region binding lost operator metadata")

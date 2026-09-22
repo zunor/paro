@@ -10,6 +10,104 @@
 
 use super::*;
 
+/// Certify the consumer predicate demand against the exact selected producer,
+/// not the rule which constructed it. Every selected incoming consumer edge
+/// participates; an unfiltered use requires the full domain. This certificate
+/// covers predicates, not minimal storage width or join-search completion.
+pub(super) fn cte_domain_witnesses(
+    memo: &Memo,
+    nodes: &[QualityCandidateNode],
+    state: &PlannerTransformState,
+) -> BTreeSet<usize> {
+    let map = nodes
+        .iter()
+        .map(|node| (node.reference.candidate, node))
+        .collect::<BTreeMap<_, _>>();
+    let mut parents = BTreeMap::<CandidateId, Vec<&QualityCandidateNode>>::new();
+    for parent in nodes {
+        for child in &parent.children {
+            parents.entry(child.candidate).or_default().push(parent);
+        }
+    }
+    let operator = |node: &QualityCandidateNode| {
+        memo.logical_expr(node.logical)
+            .and_then(|logical| state.payloads.logical.get(logical.payload.index()))
+            .map(|payload| &payload.semantic_template.operator)
+    };
+    let mut witnessed = BTreeSet::new();
+    for producer in nodes {
+        let Some(LogicalOperator::MaterializedCTE(cte)) = operator(producer) else {
+            continue;
+        };
+        let Some(producer_child) = producer.children.first().copied() else {
+            continue;
+        };
+        let mut references = Vec::new();
+        let mut unrestricted = false;
+        let mut invalid = false;
+        let mut found = false;
+        for consumer in nodes {
+            let Some(LogicalOperator::CTERef(reference)) = operator(consumer) else {
+                continue;
+            };
+            if reference.cte_index != cte.cte_index {
+                continue;
+            }
+            found = true;
+            let mut incoming = false;
+            for parent in parents
+                .get(&consumer.reference.candidate)
+                .into_iter()
+                .flatten()
+            {
+                for child in &parent.children {
+                    if *child != consumer.reference {
+                        continue;
+                    }
+                    incoming = true;
+                    if let Some(LogicalOperator::Filter(filter)) = operator(parent) {
+                        // Filter has one exact input; its output projection
+                        // does not change the input namespace of predicates.
+                        match crate::cte::normalize::filtered_cte_ref(
+                            reference,
+                            filter,
+                            &cte.output_columns,
+                        ) {
+                            Some(filtered) => references.push(filtered),
+                            None => invalid = true,
+                        }
+                    } else {
+                        unrestricted = true;
+                    }
+                }
+            }
+            unrestricted |= !incoming;
+        }
+        if !found || invalid {
+            continue;
+        }
+        if unrestricted {
+            // No finite union of the other consumers' filters can restrict
+            // this producer. No pushdown is required by the predicate policy.
+            witnessed.insert(cte.cte_index);
+            continue;
+        }
+        let bindings = cte
+            .output_columns
+            .iter()
+            .map(|column| column.binding)
+            .collect::<Vec<_>>();
+        if let Some(expected) =
+            crate::cte::predicate_domain::derive_producer_predicates(references, &bindings)
+        {
+            if selected_consumes_ref(&map, producer_child, memo, &expected, state) {
+                witnessed.insert(cte.cte_index);
+            }
+        }
+    }
+    witnessed
+}
+
 fn is_column_domain(expression: &Expression) -> bool {
     domain_transfer::is_local_domain(expression)
 }
@@ -164,9 +262,12 @@ fn selected_consumes(
             .flat_map(&normalized_terms)
             .collect::<Vec<_>>();
         uncovered.retain(|predicate| {
-            !enforced
-                .iter()
-                .any(|expression| expression.equals(predicate))
+            !enforced.iter().any(|expression| {
+                crate::cte::predicate_domain::predicate_domains_equal(
+                    std::slice::from_ref(expression),
+                    std::slice::from_ref(predicate),
+                )
+            })
         });
         if uncovered.is_empty() {
             return true;
@@ -361,17 +462,15 @@ pub(super) fn pending_transfers_for_refs(
             if metadata.child_layouts.len() != child_node.children.len() {
                 return None;
             }
-            let projection_is_graph_chain = if matches!(
-                child_operator,
-                LogicalOperator::Projection(_)
-            ) {
-                let [input] = child_node.children.as_ref() else {
-                    return None;
+            let projection_is_graph_chain =
+                if matches!(child_operator, LogicalOperator::Projection(_)) {
+                    let [input] = child_node.children.as_ref() else {
+                        return None;
+                    };
+                    selected_is_graph_chain_ref(&nodes, *input, memo, state)?
+                } else {
+                    false
                 };
-                selected_is_graph_chain_ref(&nodes, *input, memo, state)?
-            } else {
-                false
-            };
             let owner_fenced = filter
                 .expressions
                 .iter()
@@ -386,13 +485,7 @@ pub(super) fn pending_transfers_for_refs(
                 )?;
                 advances |= !owner_fenced
                     && transferable
-                    && !selected_transfer_consumed_ref(
-                        &nodes,
-                        *child,
-                        memo,
-                        predicate,
-                        state,
-                    );
+                    && !selected_transfer_consumed_ref(&nodes, *child, memo, predicate, state);
             }
             if advances {
                 pending.push(reference.candidate);
@@ -439,7 +532,8 @@ fn ref_node<'a>(
     reference: ChildWinnerRef,
 ) -> Option<&'a QualityCandidateNode> {
     let node = nodes.get(&reference.candidate).copied()?;
-    (node.reference.group == reference.group && node.reference.goal == reference.goal).then_some(node)
+    (node.reference.group == reference.group && node.reference.goal == reference.goal)
+        .then_some(node)
 }
 
 fn selected_is_graph_chain_ref(
@@ -559,9 +653,12 @@ fn selected_consumes_ref(
             .flat_map(&normalized_terms)
             .collect::<Vec<_>>();
         uncovered.retain(|predicate| {
-            !enforced
-                .iter()
-                .any(|expression| expression.equals(predicate))
+            !enforced.iter().any(|expression| {
+                crate::cte::predicate_domain::predicate_domains_equal(
+                    std::slice::from_ref(expression),
+                    std::slice::from_ref(predicate),
+                )
+            })
         });
         if uncovered.is_empty() {
             return true;
@@ -1163,11 +1260,9 @@ mod tests {
 
     #[test]
     fn fenced_owner_and_adjacent_filter_do_not_hide_descendant_transfers() {
-        assert!(
-            volatile_predicate()
-                .evaluation_properties()
-                .is_reorder_fence()
-        );
+        assert!(volatile_predicate()
+            .evaluation_properties()
+            .is_reorder_fence());
         for adjacent in [false, true] {
             let child = branch(0, false, false);
             let plan = if adjacent {
@@ -1218,11 +1313,9 @@ mod tests {
         let leaf = &inner.children[0];
         let mut state = state.write().unwrap();
         assert_eq!(selected_is_graph_chain(outer, &state), Some(false));
-        assert!(
-            pending_transfers(&root, &state)
-                .unwrap()
-                .contains(&root.reference.candidate)
-        );
+        assert!(pending_transfers(&root, &state)
+            .unwrap()
+            .contains(&root.reference.candidate));
 
         state.payloads.logical[leaf.logical.payload.index()]
             .semantic_template
@@ -1243,21 +1336,17 @@ mod tests {
         )));
         assert_eq!(selected_is_graph_chain(leaf, &state), Some(true));
         assert_eq!(selected_is_graph_chain(outer, &state), Some(true));
-        assert!(
-            !pending_transfers(&root, &state)
-                .unwrap()
-                .contains(&root.reference.candidate)
-        );
+        assert!(!pending_transfers(&root, &state)
+            .unwrap()
+            .contains(&root.reference.candidate));
 
         state.payloads.logical[outer.logical.payload.index()]
             .semantic_template
             .operator = LogicalOperator::EmptyResult(EmptyResult { child: () });
         assert_eq!(selected_is_graph_chain(outer, &state), Some(true));
-        assert!(
-            !pending_transfers(&root, &state)
-                .unwrap()
-                .contains(&root.reference.candidate)
-        );
+        assert!(!pending_transfers(&root, &state)
+            .unwrap()
+            .contains(&root.reference.candidate));
         let mut broken = outer.as_ref().clone();
         broken.children = Box::new([]);
         assert_eq!(selected_is_graph_chain(&broken, &state), None);
@@ -1294,21 +1383,17 @@ mod tests {
         )));
         assert_eq!(selected_is_graph_chain(inner, &state), Some(true));
         assert_eq!(selected_is_graph_chain(outer, &state), Some(true));
-        assert!(
-            !pending_transfers(&root, &state)
-                .unwrap()
-                .contains(&root.reference.candidate)
-        );
+        assert!(!pending_transfers(&root, &state)
+            .unwrap()
+            .contains(&root.reference.candidate));
 
         state.payloads.logical[outer.logical.payload.index()]
             .semantic_template
             .operator = detached(projected(input(0, 1), 0, column(0, 0)));
         assert_eq!(selected_is_graph_chain(outer, &state), Some(false));
-        assert!(
-            pending_transfers(&root, &state)
-                .unwrap()
-                .contains(&root.reference.candidate)
-        );
+        assert!(pending_transfers(&root, &state)
+            .unwrap()
+            .contains(&root.reference.candidate));
     }
 
     #[test]
@@ -1438,11 +1523,9 @@ mod tests {
             )));
         let (_, state, root) = frozen(filtered(union, vec![equal(30, 0)]));
         let mut state = state.write().unwrap();
-        assert!(
-            pending_transfers(&root, &state)
-                .unwrap()
-                .contains(&root.reference.candidate)
-        );
+        assert!(pending_transfers(&root, &state)
+            .unwrap()
+            .contains(&root.reference.candidate));
         let child_payload = root.children[0].logical.payload;
         let metadata = state.metadata.remove(&child_payload).unwrap();
         assert!(pending_transfers(&root, &state).is_none());
@@ -1629,12 +1712,14 @@ mod tests {
     fn consumption_accepts_safe_and_coverage_but_not_or_or_weaker_domains() {
         let and = conjunction(ConjunctionType::And, vec![equal(0, 0), equal(0, 1)]);
         let or = conjunction(ConjunctionType::Or, vec![equal(0, 0), equal(0, 1)]);
+        let reordered_or = conjunction(ConjunctionType::Or, vec![equal(0, 1), equal(0, 0)]);
         for (enforced, requested, expected) in [
             (vec![and.clone()], vec![equal(0, 0)], true),
             (vec![equal(0, 0), equal(0, 1)], vec![and.clone()], true),
             (vec![or.clone()], vec![equal(0, 0)], false),
             (vec![equal(0, 0)], vec![and], false),
-            (vec![or.clone()], vec![or], true),
+            (vec![or.clone()], vec![or.clone()], true),
+            (vec![reordered_or], vec![or], true),
         ] {
             let (_, state, root) = frozen(filtered(input(0, 2), enforced));
             assert_eq!(

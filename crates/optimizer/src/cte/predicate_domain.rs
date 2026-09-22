@@ -10,6 +10,55 @@ use paro_planner::visitor::LogicalOperatorVisitor;
 
 use crate::expression::binding_replacer::{ColumnBindingReplacer, ReplacementBinding};
 
+/// Consumer join enumeration can change the order/association of a necessary
+/// boolean domain. That is not a new restriction. Compare the AND/OR sets
+/// structurally, retaining exact leaf equality (never hash-only equality).
+/// Only total, reorderable predicates are admitted to CTE domains upstream.
+pub(crate) fn predicate_domains_equal(left: &[Expression], right: &[Expression]) -> bool {
+    fn equal(left: &Expression, right: &Expression) -> bool {
+        match (left, right) {
+            (Expression::Conjunction(left), Expression::Conjunction(right))
+                if left.conjunction_type == right.conjunction_type =>
+            {
+                fn flatten(
+                    expressions: &[Expression],
+                    kind: paro_planner::expression::ConjunctionType,
+                ) -> Vec<&Expression> {
+                    let mut pending = expressions.iter().collect::<Vec<_>>();
+                    let mut leaves = Vec::new();
+                    while let Some(expression) = pending.pop() {
+                        if let Expression::Conjunction(conjunction) = expression {
+                            if conjunction.conjunction_type == kind {
+                                pending.extend(conjunction.children.iter());
+                                continue;
+                            }
+                        }
+                        leaves.push(expression);
+                    }
+                    leaves
+                }
+                fn dedup<'a>(expressions: Vec<&'a Expression>) -> Vec<&'a Expression> {
+                    let mut unique: Vec<&Expression> = Vec::with_capacity(expressions.len());
+                    for expression in expressions {
+                        if !unique.iter().any(|candidate| expression.equals(candidate)) {
+                            unique.push(expression);
+                        }
+                    }
+                    unique
+                }
+                let a = dedup(flatten(&left.children, left.conjunction_type));
+                let b = dedup(flatten(&right.children, right.conjunction_type));
+                a.len() == b.len()
+                    && a.iter().all(|a| b.iter().any(|b| a.equals(b)))
+                    && b.iter().all(|b| a.iter().any(|a| b.equals(a)))
+            }
+            _ => left.equals(right),
+        }
+    }
+    left.iter().all(|a| right.iter().any(|b| equal(a, b)))
+        && right.iter().all(|b| left.iter().any(|a| equal(a, b)))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct FilteredCTERef {
     pub(crate) old_bindings: Vec<ColumnBinding>,

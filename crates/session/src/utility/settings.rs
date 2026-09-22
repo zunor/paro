@@ -169,6 +169,17 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
         apply_effective: apply_noop,
     },
     SettingDescriptor {
+        name: "optimizer_search_policy",
+        category: "Query Tuning",
+        description: "Stop at verified quality coverage or continue budgeted search",
+        vartype: "string",
+        context: "user",
+        unit: None,
+        default_value: |_| Value::Varchar("quality".into()),
+        parse_value: parse_optimizer_search_policy,
+        apply_effective: apply_noop,
+    },
+    SettingDescriptor {
         name: "rowset_scan_pushdown",
         category: "Query Tuning",
         description: "Enable rowset predicate pushdown and late materialization",
@@ -574,6 +585,17 @@ fn parse_disabled_optimizer_rules(_session: &Session, values: &[String]) -> Resu
     };
     paro_optimizer::cascades::rules::validate_transformation_rule_names(&value)?;
     Ok(Value::Varchar(value))
+}
+
+fn parse_optimizer_search_policy(session: &Session, values: &[String]) -> Result<Value> {
+    let Value::Varchar(value) = parse_string_value(session, values)? else {
+        unreachable!("string parser returned a non-string setting value")
+    };
+    Ok(Value::Varchar(
+        paro_context::OptimizerSearchPolicy::parse(&value)?
+            .as_str()
+            .into(),
+    ))
 }
 
 fn parse_vector_search_objective(_session: &Session, values: &[String]) -> Result<Value> {
@@ -1033,6 +1055,39 @@ mod tests {
             session.effective_setting("vector_search_objective"),
             Some(&Value::Varchar("exact".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn optimizer_search_policy_is_a_validated_session_setting() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = crate::Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        for (value, accepted) in [("budgeted", true), ("QUALITY", true), ("chain", false)] {
+            let before = session
+                .effective_setting("optimizer_search_policy")
+                .cloned();
+            let stmt = match paro_parser::parse(&format!("SET optimizer_search_policy = '{value}'"))
+                .unwrap()
+                .remove(0)
+                .stmt
+            {
+                paro_parser::ast::Statement::VariableSet(stmt) => stmt,
+                _ => unreachable!(),
+            };
+            let result = execute_variable_set(&mut session, &stmt, &mut sink).await;
+            assert_eq!(result.is_ok(), accepted);
+            if accepted {
+                assert_eq!(
+                    session.effective_setting("optimizer_search_policy"),
+                    Some(&Value::Varchar(value.to_ascii_lowercase()))
+                );
+            } else {
+                assert_eq!(
+                    session.effective_setting("optimizer_search_policy"),
+                    before.as_ref()
+                );
+            }
+        }
     }
 
     #[test]

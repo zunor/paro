@@ -8,6 +8,7 @@
 //! changes ownership while retaining that exact producer group.
 
 use super::*;
+use crate::cte::predicate_domain::predicate_domains_equal;
 use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{ColumnRefExpression, ComparisonType};
 use paro_planner::operator::{CTERef, MaterializedCTE, Projection};
@@ -161,55 +162,6 @@ fn binding_domain_fingerprint(definition: usize, domains: &[CteDomainProof]) -> 
         builder.write_fingerprint(fingerprint);
     }
     builder.finish()
-}
-
-/// Consumer join enumeration can change the order/association of a necessary
-/// boolean domain. That is not a new restriction. Compare the AND/OR sets
-/// structurally, retaining exact leaf equality (never hash-only equality).
-/// Only total, reorderable predicates are admitted to CTE domains upstream.
-fn predicate_domains_equal(left: &[Expression], right: &[Expression]) -> bool {
-    fn equal(left: &Expression, right: &Expression) -> bool {
-        match (left, right) {
-            (Expression::Conjunction(left), Expression::Conjunction(right))
-                if left.conjunction_type == right.conjunction_type =>
-            {
-                fn flatten(
-                    expressions: &[Expression],
-                    kind: paro_planner::expression::ConjunctionType,
-                ) -> Vec<&Expression> {
-                    let mut pending = expressions.iter().collect::<Vec<_>>();
-                    let mut leaves = Vec::new();
-                    while let Some(expression) = pending.pop() {
-                        if let Expression::Conjunction(conjunction) = expression {
-                            if conjunction.conjunction_type == kind {
-                                pending.extend(conjunction.children.iter());
-                                continue;
-                            }
-                        }
-                        leaves.push(expression);
-                    }
-                    leaves
-                }
-                fn dedup<'a>(expressions: Vec<&'a Expression>) -> Vec<&'a Expression> {
-                    let mut unique: Vec<&Expression> = Vec::with_capacity(expressions.len());
-                    for expression in expressions {
-                        if !unique.iter().any(|candidate| expression.equals(candidate)) {
-                            unique.push(expression);
-                        }
-                    }
-                    unique
-                }
-                let a = dedup(flatten(&left.children, left.conjunction_type));
-                let b = dedup(flatten(&right.children, right.conjunction_type));
-                a.len() == b.len()
-                    && a.iter().all(|a| b.iter().any(|b| a.equals(b)))
-                    && b.iter().all(|b| a.iter().any(|a| b.equals(a)))
-            }
-            _ => left.equals(right),
-        }
-    }
-    left.iter().all(|a| right.iter().any(|b| equal(a, b)))
-        && right.iter().all(|b| left.iter().any(|a| equal(a, b)))
 }
 
 #[derive(Debug, Clone)]
@@ -790,12 +742,10 @@ mod tests {
         let (input, requirement, plan, _) =
             bind_requirement(owner(consumers), PlannerTransformation::CteFilterPushdown);
         let state = input.planner_state.read().unwrap();
-        assert!(
-            requirement
-                .restrict_predicate_domain(plan.plan, &input.memo, &state)
-                .unwrap()
-                .is_none()
-        );
+        assert!(requirement
+            .restrict_predicate_domain(plan.plan, &input.memo, &state)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -892,12 +842,10 @@ mod tests {
             ),
         );
         let original_holes = plan.group_holes.clone();
-        assert!(
-            requirement
-                .inline(plan.plan, &mut plan.group_holes, &input.bind_context)
-                .unwrap()
-                .is_none()
-        );
+        assert!(requirement
+            .inline(plan.plan, &mut plan.group_holes, &input.bind_context)
+            .unwrap()
+            .is_none());
         assert_eq!(plan.group_holes, original_holes);
     }
 
@@ -1122,12 +1070,10 @@ mod tests {
         assert_eq!(inlined.output_layout(), original_layout);
         assert_eq!(holes.len(), 2);
         assert!(holes.values().all(|group| *group == requirement.producer));
-        assert!(
-            inlined
-                .children()
-                .iter()
-                .all(|child| matches!(child.operator, LogicalOperator::Projection(_)))
-        );
+        assert!(inlined
+            .children()
+            .iter()
+            .all(|child| matches!(child.operator, LogicalOperator::Projection(_))));
     }
 
     #[test]
@@ -2802,7 +2748,7 @@ impl CteRequirement {
         memo: &Memo,
         state: &PlannerTransformState,
     ) -> Result<Option<(OwnedLogicalPlan, CteDomainProof)>> {
-        use crate::cte::predicate_domain::{FilteredCTERef, derive_producer_predicates};
+        use crate::cte::predicate_domain::{derive_producer_predicates, FilteredCTERef};
         let LogicalOperator::MaterializedCTE(cte) = &mut plan.operator else {
             return Err(paro_error::internal("CTE requirement lost its owner"));
         };

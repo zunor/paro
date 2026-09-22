@@ -84,6 +84,7 @@ disabled_optimizer_rules	(empty)	Comma-separated optimizer transformation names 
 force_external	false	Force spill-capable operators onto external paths
 max_temp_directory_size	unlimited	Maximum size of the temporary spill directory
 memory_limit	1GB	Maximum memory available to the current session
+optimizer_search_policy	quality	Stop at verified quality coverage or continue budgeted search
 optimizer_verify	true	Enable optimizer verification outside debug builds
 parallel_scheduler	true	Enable the worker-pool pipeline scheduler for morsel-capable pipelines
 paro_diagnostic/PARO_CERTIFIED_GROUP_PRUNING	<unset>	Effective process-start diagnostic environment (read-only)
@@ -105,7 +106,6 @@ paro_diagnostic/PARO_DIAGNOSTIC_STRUCTURAL_QUALITY_EVIDENCE	<unset>	Effective pr
 paro_diagnostic/PARO_DIAGNOSTIC_WORK_PARTITION	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_DISABLE_PROTECTED_INCUMBENT	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_EXPORT_STRONG_INCUMBENT	<unset>	Effective process-start diagnostic environment (read-only)
-paro_diagnostic/PARO_QUALITY_POLICY_HANDOFF	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_QUALITY_PREFLIGHT	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_STATEMENT_CACHE_EVIDENCE	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_STATEMENT_TRACE	<unset>	Effective process-start diagnostic environment (read-only)

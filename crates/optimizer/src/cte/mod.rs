@@ -4,4 +4,5 @@
 mod deep_copy;
 pub mod inlining;
 pub(crate) mod iteration;
+pub(crate) mod normalize;
 pub(crate) mod predicate_domain;

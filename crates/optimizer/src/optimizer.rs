@@ -478,6 +478,9 @@ impl Optimizer {
         // remains installed for observation, while counter updates are scoped
         // to this synchronous compiler operation so execution pays no tax.
         let _allocation_metrics = paro_common::allocator::begin_allocation_metrics();
+        if self.budget.search_policy.is_none() {
+            self.budget.search_policy = Some(self.ctx.session.settings.optimizer_search_policy()?);
+        }
         self.budget.disable_transformations_by_name(
             self.ctx.session.settings.disabled_optimizer_rules(),
         )?;
@@ -1118,10 +1121,16 @@ impl Optimizer {
             );
             search_counters.insert(
                 "search_deadline_reached",
-                u64::from(extraction.search_summary.obligations.iter().any(|obligation| {
-                    obligation.reason
-                        == crate::cascades::budget::SearchIncompleteReason::Deadline
-                })),
+                u64::from(
+                    extraction
+                        .search_summary
+                        .obligations
+                        .iter()
+                        .any(|obligation| {
+                            obligation.reason
+                                == crate::cascades::budget::SearchIncompleteReason::Deadline
+                        }),
+                ),
             );
             capture.update(|record| {
                 record.groups = Observed(extraction.search_summary.groups);
@@ -2434,6 +2443,9 @@ impl Optimizer {
 
         let budget = &self.budget;
         let config_values = [
+            u64::from(
+                budget.search_policy == Some(paro_context::OptimizerSearchPolicy::QualityCoverage),
+            ),
             u64::from(budget.max_optional_groups_per_initial_group),
             u64::from(budget.max_optional_composition_groups_per_initial_group),
             u64::from(budget.max_optional_logical_exprs_per_group),
@@ -2576,6 +2588,7 @@ impl Optimizer {
         plan = CTEInlining::new(&self.ctx.bind_context)
             .single_reference_defaults()
             .optimize_plan(plan);
+        plan = crate::cte::normalize::normalize(plan)?;
         // Mandatory substitution creates fresh filter/projection/set
         // boundaries. Canonicalize predicate placement before Query IR
         // construction just as Memo does for optional multi-consumer choices.
@@ -3110,14 +3123,20 @@ mod resource_operating_point_tests {
             for tasks in [0, 1, 2, 4, 8] {
                 context.compile_resources = paro_context::CompileResources::capture(memory, tasks);
                 let key = context.compile_environment_key();
-                let selected = context.compile_resources.expected_grant(
-                    1024, 4, budget.max_grant_classes,
-                );
+                let selected =
+                    context
+                        .compile_resources
+                        .expected_grant(1024, 4, budget.max_grant_classes);
                 assert_eq!(key.expected_grant, selected);
-                let actual = classes.iter()
-                    .filter(|class| class.hard_memory_bytes <= memory as u64
-                        && usize::from(class.max_parallel_tasks) <= tasks)
-                    .max_by_key(|class| (class.max_parallel_tasks, class.hard_memory_bytes, class.id));
+                let actual = classes
+                    .iter()
+                    .filter(|class| {
+                        class.hard_memory_bytes <= memory as u64
+                            && usize::from(class.max_parallel_tasks) <= tasks
+                    })
+                    .max_by_key(|class| {
+                        (class.max_parallel_tasks, class.hard_memory_bytes, class.id)
+                    });
                 assert_eq!(
                     selected.map(|class| class.index),
                     actual.map(|class| class.id.index())

@@ -27,6 +27,102 @@ use super::*;
 
 mod native_runtime_filter;
 
+#[test]
+fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
+    use paro_planner::expression::{ComparisonExpression, ComparisonType};
+    fn fixture(normalized: bool) -> OwnedLogicalPlan {
+        let producer =
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                0,
+                vec![vec![Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                )]],
+                vec!["k".into()],
+                vec![LogicalType::Integer],
+            )));
+        let consumer = OwnedLogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
+            9,
+            10,
+            "c".into(),
+            vec!["k".into()],
+            vec![LogicalType::Integer],
+        )));
+        let predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(10, 0), LogicalType::Integer)
+                        .into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        );
+        let consumer = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            consumer,
+            vec![predicate],
+        )));
+        let plan =
+            OwnedLogicalPlan::synthetic(LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+                9,
+                "c".into(),
+                vec!["k".into()],
+                vec![LogicalType::Integer],
+                CTEMaterialize::Materialized,
+                producer,
+                consumer,
+            )));
+        if normalized {
+            crate::cte::normalize::normalize(plan).unwrap()
+        } else {
+            plan
+        }
+    }
+    for normalized in [false, true] {
+        let mut input = MemoBuilder::build(
+            fixture(normalized),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        input.root_goal.grant = GrantGoalKey::Class(test_grant_classes()[0].id);
+        let state = input.planner_state.clone();
+        let mut registry = ImplementationRegistry::default();
+        implementation::register_implementations(
+            &mut registry,
+            state.clone(),
+            Arc::new(
+                test_grant_classes()
+                    .into_iter()
+                    .map(|class| (class.id, class))
+                    .collect(),
+            ),
+            input.calibration.clone(),
+            input.force_spill,
+        )
+        .unwrap();
+        let mut engine = CascadesEngine::new(input.memo, registry);
+        engine.prime_grant_context(test_grant_classes()).unwrap();
+        let winner = engine
+            .optimize(input.root, input.root_goal, input.mode)
+            .unwrap();
+        let reference = ChildWinnerRef {
+            group: input.root,
+            goal: input.root_goal,
+            candidate: winner.candidate,
+        };
+        let state = state.read().unwrap();
+        let inspected = inspect_quality_candidate(engine.memo(), reference, &state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.cte_producer_witnesses.contains(&9), normalized);
+        // Initial/normalization provenance alone never supplies the property.
+        assert!(inspected.rules.is_empty());
+    }
+}
+
 pub(super) fn test_grant_classes() -> [ResourceGrantClass; 1] {
     [ResourceGrantClass {
         id: super::super::ids::ResourceGrantClassId(0),
@@ -353,13 +449,12 @@ fn scan_work_evidence_does_not_require_analyze_catalog_statistics() {
     let LogicalOperator::Get(get) = &scan.operator else {
         unreachable!()
     };
-    assert!(
-        get.table
-            .as_ref()
-            .unwrap()
-            .statistics()
-            .is_none_or(|statistics| statistics.row_count == 0)
-    );
+    assert!(get
+        .table
+        .as_ref()
+        .unwrap()
+        .statistics()
+        .is_none_or(|statistics| statistics.row_count == 0));
     let facts = planner_cost_facts(
         &scan,
         &HashMap::new(),
@@ -735,30 +830,42 @@ fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
         let session = crate::subquery::partition_aggregate_tests::setup_session();
         let binder = Binder::new(session.clone());
         let bind_context = binder.bind_context.clone();
-        let constant = |n| Expression::Constant(ConstantExpression::new(
-            Value::Integer(n), LogicalType::Integer,
-        ).into());
+        let constant = |n| {
+            Expression::Constant(
+                ConstantExpression::new(Value::Integer(n), LogicalType::Integer).into(),
+            )
+        };
         let leaf = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
-                0, (0..128).map(|n| vec![constant(n), constant(128 - n)]).collect(),
+                0,
+                (0..128)
+                    .map(|n| vec![constant(n), constant(128 - n)])
+                    .collect(),
                 vec!["id".into(), "hidden_score".into()],
                 vec![LogicalType::Integer, LogicalType::Integer],
             )),
         );
-        let mut order = paro_planner::operator::Order::new(leaf, vec![
-            paro_planner::binder::ir::OrderByNode {
-                expression: Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 1), LogicalType::Integer,
-                ).into()),
-                ascending: false, nulls_first: false,
-            },
-        ]);
+        let mut order = paro_planner::operator::Order::new(
+            leaf,
+            vec![paro_planner::binder::ir::OrderByNode {
+                expression: Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 1), LogicalType::Integer).into(),
+                ),
+                ascending: false,
+                nulls_first: false,
+            }],
+        );
         order.projection_map = paro_planner::operator::ProjectionMap::new(vec![0]);
         let ordered = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Order(order));
-        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Limit(Box::new(
-            paro_planner::operator::Limit::new(ordered, Some(constant(3)), Some(constant(offset))),
-        )));
+        let plan = OwnedLogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Limit(Box::new(paro_planner::operator::Limit::new(
+                ordered,
+                Some(constant(3)),
+                Some(constant(offset)),
+            ))),
+        );
         let context = crate::context::OptimizationContext::new(session, bind_context);
         let input = MemoBuilder::build_with_search(
             vec![LogicalAlternative {
@@ -766,8 +873,11 @@ fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
                 source: AlternativeOrigin::Baseline,
                 column_stats: Arc::new(HashMap::new()),
             }],
-            &binder, SearchBudget::default(), &context,
-        ).unwrap();
+            &binder,
+            SearchBudget::default(),
+            &context,
+        )
+        .unwrap();
         let grants = [0, 1, 2].map(|id| ResourceGrantClass {
             id: ResourceGrantClassId(id),
             hard_memory_bytes: 16 << 20,
@@ -775,9 +885,21 @@ fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
             max_parallel_tasks: 1,
         });
         let optimized = input.optimize(&grants).unwrap();
-        assert!(optimized.rule_insertions.get(&TOP_N_INTRODUCTION_RULE)
-            .copied().unwrap_or(0) > 0, "{:#?}", optimized.rule_work_profile);
-        let variant = optimized.variants.iter().find(|v| v.class == ResourceGrantClassId(2)).unwrap();
+        assert!(
+            optimized
+                .rule_insertions
+                .get(&TOP_N_INTRODUCTION_RULE)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "{:#?}",
+            optimized.rule_work_profile
+        );
+        let variant = optimized
+            .variants
+            .iter()
+            .find(|v| v.class == ResourceGrantClassId(2))
+            .unwrap();
         let winner = &variant.plan;
         assert_eq!(winner.get_column_bindings(), vec![ColumnBinding::new(0, 0)]);
         // Generation and selection are separate contracts. This VALUES
@@ -832,10 +954,16 @@ fn planner_cross_product_keeps_verified_grant_when_another_is_unresolved() {
     let output = input.optimize(&grants).unwrap();
     assert_eq!(output.variants.len(), 1);
     assert_eq!(output.variants[0].class, ResourceGrantClassId(0));
-    assert!(output.variants[0].contracts.get(&output.variants[0].plan.id).is_some());
+    assert!(output.variants[0]
+        .contracts
+        .get(&output.variants[0].plan.id)
+        .is_some());
     let coverage = output.grant_search.unwrap();
     assert_eq!(coverage.expected_class, Some(ResourceGrantClassId(2)));
-    assert_eq!(coverage.unresolved_classes, BTreeSet::from([ResourceGrantClassId(2)]));
+    assert_eq!(
+        coverage.unresolved_classes,
+        BTreeSet::from([ResourceGrantClassId(2)])
+    );
 }
 
 #[test]
@@ -1308,29 +1436,23 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
 
     let enabled = optimize(SearchBudget::default());
     assert_eq!(selected_join_type(&enabled), JoinType::Semi);
-    assert!(
-        enabled
-            .rule_attempts
-            .get(&MARK_JOIN_TO_SEMI_RULE)
-            .is_some_and(|attempts| *attempts > 0)
-    );
-    assert!(
-        enabled
-            .rule_insertions
-            .get(&MARK_JOIN_TO_SEMI_RULE)
-            .is_some_and(|insertions| *insertions > 0)
-    );
+    assert!(enabled
+        .rule_attempts
+        .get(&MARK_JOIN_TO_SEMI_RULE)
+        .is_some_and(|attempts| *attempts > 0));
+    assert!(enabled
+        .rule_insertions
+        .get(&MARK_JOIN_TO_SEMI_RULE)
+        .is_some_and(|insertions| *insertions > 0));
 
     let mut disabled_budget = SearchBudget::default();
     disabled_budget.disable_transformation(MARK_JOIN_TO_SEMI_RULE);
     let disabled = optimize(disabled_budget);
     assert_eq!(selected_join_type(&disabled), JoinType::Mark);
     assert!(!disabled.rule_attempts.contains_key(&MARK_JOIN_TO_SEMI_RULE));
-    assert!(
-        !disabled
-            .rule_insertions
-            .contains_key(&MARK_JOIN_TO_SEMI_RULE)
-    );
+    assert!(!disabled
+        .rule_insertions
+        .contains_key(&MARK_JOIN_TO_SEMI_RULE));
 }
 
 fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
@@ -1350,19 +1472,35 @@ fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
 #[test]
 fn composite_equality_runtime_filter_has_identity_without_single_column_ndv() {
     let bind_context = BindContext::new();
-    let reference = |index| Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into());
-    let two_columns = |index, oid, name, rows| OwnedLogicalPlan::synthetic(
-        LogicalOperator::Projection(Projection::new(index + 2,
-            test_base_get(index, oid, name, rows), vec![reference(0), reference(0)])));
-    let mut plan = OwnedLogicalPlan::new(&bind_context,
-        LogicalOperator::Join(Join::comparison(JoinType::Inner,
+    let reference =
+        |index| Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into());
+    let two_columns = |index, oid, name, rows| {
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            index + 2,
+            test_base_get(index, oid, name, rows),
+            vec![reference(0), reference(0)],
+        )))
+    };
+    let mut plan = OwnedLogicalPlan::new(
+        &bind_context,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
             two_columns(0, 991, "composite_build", 16),
             two_columns(1, 992, "composite_probe", 128),
-            vec![JoinCondition::equality(reference(0), reference(0)),
-                 JoinCondition::equality(reference(1), reference(1))])));
+            vec![
+                JoinCondition::equality(reference(0), reference(0)),
+                JoinCondition::equality(reference(1), reference(1)),
+            ],
+        )),
+    );
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(16));
-    let facts = planner_cost_facts(&plan, &HashMap::new(), &BindingCatalog::default(),
-        paro_storage::rowset::scan_cost::ScanAccessCostModel::default()).unwrap();
+    let facts = planner_cost_facts(
+        &plan,
+        &HashMap::new(),
+        &BindingCatalog::default(),
+        paro_storage::rowset::scan_cost::ScanAccessCostModel::default(),
+    )
+    .unwrap();
     assert!(facts.runtime_filter_build_domain_column.is_none());
     assert!(facts.runtime_filter_build_left_domain_column.is_none());
     assert!(facts.runtime_filter_build_key.is_some());
@@ -1376,17 +1514,26 @@ fn composite_equality_runtime_filter_has_identity_without_single_column_ndv() {
 
 #[test]
 fn runtime_filter_facet_does_not_alias_distinct_relation_owners() {
-    let facet = |owner| planner_region_facet(
-        RegionFacetKind::RuntimeFilter, FacetCriticality::Optional,
-        Fingerprint(77), Fingerprint(78), owner,
-        std::iter::once(owner).collect());
+    let facet = |owner| {
+        planner_region_facet(
+            RegionFacetKind::RuntimeFilter,
+            FacetCriticality::Optional,
+            Fingerprint(77),
+            Fingerprint(78),
+            owner,
+            std::iter::once(owner).collect(),
+        )
+    };
     let a = facet(GroupId(0));
     let b = facet(GroupId(1));
     assert_ne!(a.fingerprint, b.fingerprint);
     assert_eq!(a.fingerprint, facet(GroupId(0)).fingerprint);
     let forest = RegionForest::normalize([a.clone(), b.clone()], 1, 8).unwrap();
     assert!(forest.deferred_facets.is_empty());
-    assert_ne!(forest.region_for_facet(a.fingerprint), forest.region_for_facet(b.fingerprint));
+    assert_ne!(
+        forest.region_for_facet(a.fingerprint),
+        forest.region_for_facet(b.fingerprint)
+    );
 }
 
 pub(super) fn test_base_get(
@@ -2011,12 +2158,10 @@ fn nested_filters_share_one_ordered_source_work_lane() {
     assert_eq!(lane.source_rows, 20_000);
     assert_eq!(lane.retentions.len(), 2);
     assert_eq!(lane.filters.len(), 2);
-    assert!(
-        lanes
-            .iter()
-            .filter(|lane| lane.source != WorkSourceId(0))
-            .all(|lane| lane.filters.is_empty())
-    );
+    assert!(lanes
+        .iter()
+        .filter(|lane| lane.source != WorkSourceId(0))
+        .all(|lane| lane.filters.is_empty()));
     let inner_lane = inner
         .winner
         .source_work

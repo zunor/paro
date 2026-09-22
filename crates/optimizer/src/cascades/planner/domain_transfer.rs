@@ -30,9 +30,9 @@ use paro_planner::operator::{
 /// cross; it is different from a valid operator for which one predicate is
 /// simply not movable.
 #[derive(Debug, Clone, Default)]
-pub(super) struct OperatorDomainTransfer {
-    pub(super) child_predicates: Box<[Box<[Expression]>]>,
-    pub(super) remaining: Box<[Expression]>,
+pub(crate) struct OperatorDomainTransfer {
+    pub(crate) child_predicates: Box<[Box<[Expression]>]>,
+    pub(crate) remaining: Box<[Expression]>,
     /// Residuals whose necessary-domain coverage is not established. They
     /// must not be certified as a legal barrier merely because routing stops.
     pub(super) unsupported: bool,
@@ -138,10 +138,7 @@ impl DomainFixedPoint {
 
     pub(super) fn rollback(&mut self, checkpoint: usize) {
         while self.order.len() > checkpoint {
-            let visit = self
-                .order
-                .pop()
-                .expect("domain fixed-point length checked");
+            let visit = self.order.pop().expect("domain fixed-point length checked");
             self.seen.remove(&visit);
         }
     }
@@ -391,7 +388,7 @@ fn join_shape_is_transferable<Child>(
 }
 
 /// Route predicates through one exact logical operator.
-pub(super) fn transfer_predicates<Child>(
+pub(crate) fn transfer_predicates<Child>(
     operator: &LogicalOperator<Child>,
     child_layouts: &[&LogicalOutputLayout],
     predicates: &[Expression],
