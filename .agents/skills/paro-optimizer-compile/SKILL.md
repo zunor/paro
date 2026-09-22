@@ -9,10 +9,10 @@ Use this skill for optimizer design, chain replay, and compile-latency evidence.
 It complements `paro-evidence`; it does not authorize baseline updates, result
 blessing, or history cleanup.
 
-1. Inspect the selected checkout's `HEAD`, status, and diff. Keep `re-op`
-   clean. For historical chain replay use one detached temporary worktree; for
-   porting work branch from the current `re-op`. Never reset or copy unrelated
-   user changes.
+1. Inspect every selected checkout's `HEAD`, status, and diff. Keep `re-op`
+   clean. Comparisons may keep one small source worktree per arm (for example,
+   current `re-op` plus a detached historical chain replay); for porting work
+   branch from current `re-op`. Never reset or copy unrelated user changes.
 2. Reuse one `CARGO_TARGET_DIR` sequentially for all source builds; never build
    worktrees concurrently. Reuse `benchmark/.venv` and the immutable TPC-DS
    seed. Save each binary with its source/build identity before rebuilding.
