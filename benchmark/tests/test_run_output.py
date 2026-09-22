@@ -928,6 +928,41 @@ class RunOutputTests(unittest.TestCase):
             with self.assertRaises(RunOutputError):
                 run.finalize(status="Completed")
 
+    def test_capacity_terminal_closes_registration_and_records_omission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = RunOutput.create(Path(tmp), run_id="capacity-registration")
+            run.register_cell(
+                cell_id="q--control",
+                query_cases=1,
+                sample_rows=1,
+                product_receipts=1,
+                query_case="q",
+                arm_id="control",
+            )
+            attempt = run.begin_attempt("source", query_case="q", arm_id="control")
+            run._manifest["registration"]["total_limit_bytes"] = 64
+            with self.assertRaises(RunOutputError):
+                attempt.cell_writer().write_text("too-large.txt", "x" * 200)
+
+            registration = run._manifest["registration"]
+            self.assertEqual(registration["status"], "CapacityExceeded")
+            self.assertEqual(run._manifest["status"], "Incomplete")
+            self.assertEqual(registration["omitted_count"], 1)
+            self.assertGreater(registration["omitted_bytes"], 0)
+            with self.assertRaises(RunOutputError):
+                run.register_cell(
+                    cell_id="q--probe",
+                    query_cases=1,
+                    sample_rows=1,
+                    product_receipts=1,
+                    query_case="q",
+                    arm_id="probe",
+                )
+            with self.assertRaises(RunOutputError):
+                run.cell_writer(query_case="q", arm_id="control", root=run.root).write_text(
+                    "after.txt", "late"
+                )
+
     def test_manifest_is_published_through_a_bounded_utf8_writer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = RunOutput.create(Path(tmp), run_id="manifest")

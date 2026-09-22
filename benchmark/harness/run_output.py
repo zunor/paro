@@ -44,6 +44,15 @@ class RunOutputError(ValueError):
     """The requested output identity cannot be safely allocated."""
 
 
+class CapacityExceededError(RunOutputError):
+    """A bounded record did not fit in its registered byte lease."""
+
+    def __init__(self, message: str, *, attempted_bytes: int, limit_bytes: int):
+        super().__init__(message)
+        self.attempted_bytes = attempted_bytes
+        self.limit_bytes = limit_bytes
+
+
 def _default_sample_ids(query_case: str, sample_rows: int) -> list[str]:
     return [f"{query_case}-sample-{index:04d}" for index in range(sample_rows)]
 
@@ -103,9 +112,11 @@ def _encode_json(payload: dict[str, Any], *, limit_bytes: int | None = None) -> 
     for chunk in encoder.iterencode(payload):
         encoded = chunk.encode("utf-8")
         if limit_bytes is not None and len(output) + len(encoded) + 1 > limit_bytes:
-            raise RunOutputError(
+            raise CapacityExceededError(
                 f"JSON record capacity exceeded while encoding: "
-                f"> {limit_bytes} bytes"
+                f"> {limit_bytes} bytes",
+                attempted_bytes=len(output) + len(encoded) + 1,
+                limit_bytes=limit_bytes,
             )
         output.extend(encoded)
     output.extend(b"\n")
@@ -300,8 +311,10 @@ class CellWriter:
         )
         try:
             encoded = _encode_json(payload, limit_bytes=limit)
-        except RunOutputError:
-            self.run._mark_capacity_exceeded()
+        except CapacityExceededError as error:
+            self.run._mark_capacity_exceeded(
+                omitted_bytes=max(0, error.attempted_bytes - error.limit_bytes)
+            )
             raise
         return PreparedWrite(
             self, path, encoded, overwrite, replacing,
@@ -320,7 +333,7 @@ class CellWriter:
             self.cell_id, replacing_bytes=replacing
         )
         if len(encoded) > limit:
-            self.run._mark_capacity_exceeded()
+            self.run._mark_capacity_exceeded(omitted_bytes=len(encoded) - limit)
             raise RunOutputError(
                 f"cell output capacity exceeded: {len(encoded)} > {limit} bytes"
             )
@@ -961,6 +974,12 @@ class RunOutput:
 
     def seal_registration(self) -> None:
         registration = self._manifest["registration"]
+        if registration.get("status") in {
+            "CapacityExceeded", "PublicationUnknown"
+        }:
+            raise RunOutputError(
+                "cannot seal registration after a terminal capacity/publication failure"
+            )
         registration["registration_sealed"] = True
         self._persist_manifest()
 
@@ -985,7 +1004,9 @@ class RunOutput:
         if min(query_cases, sample_rows, product_receipts, calibration_rows, summary_captures, attempts) < 0:
             raise RunOutputError("campaign registration counts must be >= 0")
         registration = self._manifest["registration"]
-        if registration.get("registration_sealed"):
+        if registration.get("registration_sealed") or registration.get("status") in {
+            "CapacityExceeded", "PublicationUnknown"
+        }:
             raise RunOutputError("campaign registration is sealed after the first owned payload")
         expected_cell_id = f"{query_case}--{arm_id}"
         if cell_id != expected_cell_id:
@@ -1069,12 +1090,9 @@ class RunOutput:
             + 200_000 * captures
         )
         if budget > CAMPAIGN_TOTAL_LIMIT_BYTES:
-            registration["omitted_count"] = int(registration.get("omitted_count", 0)) + 1
-            registration["omitted_bytes"] = int(registration.get("omitted_bytes", 0)) + budget - CAMPAIGN_TOTAL_LIMIT_BYTES
-            registration["status"] = "CapacityExceeded"
-            self._manifest["status"] = "Incomplete"
-            self._manifest["sealed_at"] = _now()
-            self._persist_manifest()
+            self._mark_capacity_exceeded(
+                omitted_bytes=budget - CAMPAIGN_TOTAL_LIMIT_BYTES
+            )
             raise RunOutputError(
                 f"campaign registration exceeds {CAMPAIGN_TOTAL_LIMIT_BYTES} bytes: {budget}"
             )
@@ -1235,7 +1253,7 @@ class RunOutput:
             cell_id, replacing_bytes=prepared.replacing_bytes
         )
         if encoded_bytes > available:
-            self._mark_capacity_exceeded()
+            self._mark_capacity_exceeded(omitted_bytes=encoded_bytes - available)
             raise RunOutputError(
                 f"campaign output capacity exceeded: {encoded_bytes} > {available} bytes"
             )
@@ -1302,8 +1320,12 @@ class RunOutput:
             )
         _write_encoded_atomically(self.root / "manifest.json", encoded, overwrite=True)
 
-    def _mark_capacity_exceeded(self) -> None:
+    def _mark_capacity_exceeded(self, *, omitted_bytes: int = 0) -> None:
         registration = self._manifest["registration"]
+        registration["omitted_count"] = int(registration.get("omitted_count", 0)) + 1
+        registration["omitted_bytes"] = int(registration.get("omitted_bytes", 0)) + max(
+            0, int(omitted_bytes)
+        )
         registration["status"] = "CapacityExceeded"
         self._manifest["status"] = "Incomplete"
         self._manifest["sealed_at"] = _now()
