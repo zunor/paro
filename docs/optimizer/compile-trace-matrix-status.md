@@ -19,6 +19,8 @@ unchanged.
 | selection/reservation/lowering/image/terminal | facts recorded at their real executor boundaries | execution receipt tests and typed `paro_optimizers()` rows | Supported |
 | normal benchmark sample association | exact statement/execution identity snapshot, no latest/occurrence guessing | `test_compile_work_evidence.py`, receipt contract tests | Supported; `Uncovered` is fail-closed |
 | campaign ownership | CampaignId/ArmId/QueryCase/RunId/SourceId/AttemptId; cell is QueryCase×ArmId; summaries contain references only | `test_run_output.py`, runner/gate source tests | Supported, bounded |
+| typed campaign finalization | producer `CampaignSummary`, sealed manifest identity/status agreement, explicit omitted count on registration capacity failure | `test_run_output.py`, `cold_planning_gate.py` | Supported, bounded |
+| admission/selection receipt identity | distinct `AdmissionReceiptId` and `SelectionIdentity`, checked against artifact/class/fingerprint at render time | `compile_render` and context receipt tests | Supported for current receipt schema |
 | bounded writer | payload, terminal-control and manifest UTF-8 limits before atomic publish | RunOutput quota and manifest-limit tests | Supported |
 | stable physical identity | intended typed structural identity boundary | current plan encoder still has a Debug-derived payload fallback | Blocked; not cross-run certified |
 
@@ -163,3 +165,9 @@ accepted as a cross-run `PlanStructureId`, and the full producer-to-reader/
 gate campaign has not been certified. This is the first blocking boundary for
 Trace Matrix closure; no performance or C2/F2 claim is inferred from the
 targeted passes.
+
+The 2026-09-22 follow-up commits `85716f62`, `d5c2cad7`, `3c82d7cb`, and
+`4e7f38b0` close the typed campaign finalization, external Observation parsing,
+sealed CampaignSummary gate check, and admission/selection receipt identity
+boundaries. They do not waive the physical canonical-encoder blocker or create
+new campaign evidence.

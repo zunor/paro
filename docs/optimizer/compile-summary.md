@@ -217,6 +217,14 @@ in the pinned DuckDB 1.5.5 environment, including exclusive RunId/attempt
 ownership, retry retention, receipt identity matching, cache-hit NotExecuted
 state, and the bounded manifest/writer path.
 
+Campaign finalization emits a typed `CampaignSummary` only. The gate checks
+its campaign/run identity, registration status, cell index and terminal state
+against the sealed manifest; free-text control summaries are not evidence.
+Registration capacity failures persist `CapacityExceeded` with an explicit
+omitted count before failing. Execution receipts separately carry
+`AdmissionReceiptId` and `SelectionIdentity`, and the renderer checks the
+selection against the actual artifact, grant class and physical fingerprint.
+
 The fresh-directory SQL regression run reports 177 passed and eight existing
 EXPLAIN-only differences. The eight are retained as failures and classified as
 plan/display contracts: `agg_join_subsumption`, `agg_singleton_groups`,
