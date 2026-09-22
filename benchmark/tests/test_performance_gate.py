@@ -1065,6 +1065,7 @@ staging_until = "2026-06-30"
                 result_path=measurement.result_path,
                 summary_path=measurement.summary_path,
             )
+            attempt.accept()
             run.finalize(status="Completed")
 
         self.assertFalse(measurement.failed)
