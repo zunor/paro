@@ -22,14 +22,6 @@ COMPILE_DOCUMENT_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 BENCHMARK_CELL_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 OWNERSHIP_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 MAX_SEARCH_COUNTERS = 256
-EXTERNAL_OBSERVATION_MARKERS = {
-    "NotExecuted",
-    "Observed",
-    "Uncovered",
-    "Failed",
-    "Cancelled",
-    "CapacityLimited",
-}
 
 
 class ReceiptContractError(ValueError):
@@ -47,7 +39,7 @@ def uncovered_receipt(reason: str) -> dict[str, Any]:
     }
 
 
-def _valid_observation(value: Any, *, allow_not_executed: bool = True) -> bool:
+def _valid_observation(value: Any) -> bool:
     """Recognise the Rust externally-tagged Observation enum.
 
     The producer owns the payload semantics.  The benchmark boundary only
@@ -55,19 +47,17 @@ def _valid_observation(value: Any, *, allow_not_executed: bool = True) -> bool:
     execution failure as an uncovered or not-executed result.
     """
     if isinstance(value, str):
-        return value == "NotExecuted" if allow_not_executed else False
+        return value in {"NotExecuted", "NotApplicable"}
     if not isinstance(value, dict) or len(value) != 1:
         return False
     marker, payload = next(iter(value.items()))
-    if marker not in EXTERNAL_OBSERVATION_MARKERS:
-        return False
-    if marker == "NotExecuted":
-        return allow_not_executed and payload is None
     if marker == "Observed":
-        return payload is not None
-    # The Rust enum carries a structured error/omission payload for these
-    # states.  Keep the check deliberately shallow and lossless.
-    return isinstance(payload, (dict, str))
+        # CompileFields.execution and UnavailableDocument.target_execution
+        # are Observation<u64>, not arbitrary JSON observations.
+        return type(payload) is int and 0 <= payload < 1 << 64
+    return marker == "Uncovered" and isinstance(payload, str) and payload in {
+        "NotInstrumented", "FutureBoundary", "Capacity"
+    }
 
 
 def validate_compile_document(value: Any, *, require_analyze: bool = False) -> str:
@@ -87,9 +77,7 @@ def validate_compile_document(value: Any, *, require_analyze: bool = False) -> s
             raise ReceiptContractError("unavailable compile document lacks compile outcome")
         if value.get("reason") not in {"Capacity", "ProcessCapacity"}:
             raise ReceiptContractError("unavailable compile document has unknown reason")
-        if value.get("target_execution") not in {"NotExecuted", "NotApplicable"} \
-                and not (isinstance(value.get("target_execution"), dict)
-                         and "Uncovered" in value["target_execution"]):
+        if not _valid_observation(value.get("target_execution")):
             raise ReceiptContractError("unavailable compile document has invalid execution state")
         if require_analyze:
             raise ReceiptContractError("ANALYZE document is unavailable")

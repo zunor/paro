@@ -520,6 +520,24 @@ mod tests {
     }
 
     #[test]
+    fn observation_wire_fixture_matches_rust_producer() {
+        use paro_context::compile_diagnostics::{Observation, UncoveredReason};
+        let values: [Observation<u64>; 7] = [
+            Observation::NotExecuted,
+            Observation::NotApplicable,
+            Observation::Observed(0),
+            Observation::Observed(u64::MAX),
+            Observation::Uncovered(UncoveredReason::NotInstrumented),
+            Observation::Uncovered(UncoveredReason::FutureBoundary),
+            Observation::Uncovered(UncoveredReason::Capacity),
+        ];
+        assert_eq!(
+            serde_json::to_string(&values).unwrap(),
+            r#"["NotExecuted","NotApplicable",{"Observed":0},{"Observed":18446744073709551615},{"Uncovered":"NotInstrumented"},{"Uncovered":"FutureBoundary"},{"Uncovered":"Capacity"}]"#
+        );
+    }
+
+    #[test]
     fn unavailable_and_terminal_consistency_share_the_reader() {
         use paro_context::compile_diagnostics::*;
         assert!(matches!(

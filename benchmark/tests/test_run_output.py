@@ -91,17 +91,24 @@ class RunOutputTests(unittest.TestCase):
         }
         for marker in (
             "NotExecuted",
-            {"Observed": {"value": 1}},
+            "NotApplicable",
+            {"Observed": 1},
+            {"Uncovered": "NotInstrumented"},
+            {"Uncovered": "FutureBoundary"},
+            {"Uncovered": "Capacity"},
+        ):
+            document = {**base, "execution": marker}
+            self.assertEqual(validate_compile_document(document), "Summary")
+
+        for invalid in (
+            {"Observed": None},
             {"Uncovered": {"reason": "not captured"}},
             {"Failed": {"error": "compile failed"}},
             {"Cancelled": {"reason": "client"}},
             {"CapacityLimited": {"omitted_count": 2}},
         ):
-            document = {**base, "execution": marker}
-            self.assertEqual(validate_compile_document(document), "Summary")
-
-        with self.assertRaises(ReceiptContractError):
-            validate_compile_document({**base, "execution": {"Observed": None}})
+            with self.assertRaises(ReceiptContractError):
+                validate_compile_document({**base, "execution": invalid})
         with self.assertRaises(ReceiptContractError):
             validate_compile_document({**base, "execution": {"Unknown": {}}})
 
