@@ -89,14 +89,8 @@ class RunOutputTests(unittest.TestCase):
             "search_counters": [],
             "omitted_search_counters": 0,
         }
-        for marker in (
-            "NotExecuted",
-            "NotApplicable",
-            {"Observed": 1},
-            {"Uncovered": "NotInstrumented"},
-            {"Uncovered": "FutureBoundary"},
-            {"Uncovered": "Capacity"},
-        ):
+        fixture_path = Path(__file__).parents[1] / "fixtures" / "compile-summary" / "rust-observation-v3.json"
+        for marker in json.loads(fixture_path.read_text(encoding="utf-8")):
             document = {**base, "execution": marker}
             self.assertEqual(validate_compile_document(document), "Summary")
 
