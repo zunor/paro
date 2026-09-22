@@ -1512,12 +1512,6 @@ def main() -> int:
             print(f"TPC-DS {query_id}: failed: {result['error']}", flush=True)
 
     output.publish_campaign_summary()
-    output.control.write_text(
-        "TPC-DS Compile Evidence campaign\n"
-        f"queries={len(report['queries'])}\n"
-        f"status={'Incomplete' if failures else 'Completed'}\n",
-        overwrite=True,
-    )
     output.finish(
         status="Incomplete" if failures else "Completed",
         errors=output_errors,

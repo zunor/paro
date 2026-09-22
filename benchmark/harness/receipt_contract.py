@@ -22,6 +22,14 @@ COMPILE_DOCUMENT_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 BENCHMARK_CELL_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 OWNERSHIP_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 MAX_SEARCH_COUNTERS = 256
+EXTERNAL_OBSERVATION_MARKERS = {
+    "NotExecuted",
+    "Observed",
+    "Uncovered",
+    "Failed",
+    "Cancelled",
+    "CapacityLimited",
+}
 
 
 class ReceiptContractError(ValueError):
@@ -37,6 +45,29 @@ def uncovered_receipt(reason: str) -> dict[str, Any]:
         "status": "Uncovered",
         "reason": reason,
     }
+
+
+def _valid_observation(value: Any, *, allow_not_executed: bool = True) -> bool:
+    """Recognise the Rust externally-tagged Observation enum.
+
+    The producer owns the payload semantics.  The benchmark boundary only
+    checks the tag and preserves its payload; it must not reinterpret an
+    execution failure as an uncovered or not-executed result.
+    """
+    if isinstance(value, str):
+        return value == "NotExecuted" if allow_not_executed else False
+    if not isinstance(value, dict) or len(value) != 1:
+        return False
+    marker, payload = next(iter(value.items()))
+    if marker not in EXTERNAL_OBSERVATION_MARKERS:
+        return False
+    if marker == "NotExecuted":
+        return allow_not_executed and payload is None
+    if marker == "Observed":
+        return payload is not None
+    # The Rust enum carries a structured error/omission payload for these
+    # states.  Keep the check deliberately shallow and lossless.
+    return isinstance(payload, (dict, str))
 
 
 def validate_compile_document(value: Any, *, require_analyze: bool = False) -> str:
@@ -109,9 +140,7 @@ def validate_compile_document(value: Any, *, require_analyze: bool = False) -> s
     if value["outcome"] == "Success":
         _validate_identity(identity)
     execution = value["execution"]
-    if execution not in {"NotExecuted", "Observed"} and not (
-        isinstance(execution, dict) and ("Observed" in execution or "Uncovered" in execution)
-    ):
+    if not _valid_observation(execution):
         raise ReceiptContractError("compile document has invalid execution observation")
     receipt = value.get("execution_receipt")
     if receipt is not None:

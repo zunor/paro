@@ -78,6 +78,33 @@ class RunOutputTests(unittest.TestCase):
             with self.assertRaises(ReceiptContractError):
                 validate_compile_document(invalid)
 
+    def test_compile_document_accepts_rust_external_observation_markers(self) -> None:
+        base = {
+            "schema_version": 3,
+            "outcome": "Success",
+            "artifact": "CompiledArtifactReady",
+            "cache": "ForcedCompile",
+            "admission": "NotExecuted",
+            "artifact_identity": {"Observed": {"schema_version": 3, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
+            "search_counters": [],
+            "omitted_search_counters": 0,
+        }
+        for marker in (
+            "NotExecuted",
+            {"Observed": {"value": 1}},
+            {"Uncovered": {"reason": "not captured"}},
+            {"Failed": {"error": "compile failed"}},
+            {"Cancelled": {"reason": "client"}},
+            {"CapacityLimited": {"omitted_count": 2}},
+        ):
+            document = {**base, "execution": marker}
+            self.assertEqual(validate_compile_document(document), "Summary")
+
+        with self.assertRaises(ReceiptContractError):
+            validate_compile_document({**base, "execution": {"Observed": None}})
+        with self.assertRaises(ReceiptContractError):
+            validate_compile_document({**base, "execution": {"Unknown": {}}})
+
     def test_campaign_output_seals_each_registered_query_arm_cell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = CampaignOutput.create(
@@ -656,6 +683,29 @@ class RunOutputTests(unittest.TestCase):
                     query_case="oversized",
                     arm_id="default",
                 )
+            manifest = json.loads((run.root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "Incomplete")
+            self.assertEqual(manifest["registration"]["status"], "CapacityExceeded")
+            self.assertEqual(manifest["registration"]["omitted_count"], 1)
+
+    def test_campaign_summary_is_typed_json_without_free_text_control_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = CampaignOutput.create(
+                Path(tmp) / "campaign.json",
+                source_id="collector",
+                cells=[{
+                    "query_case": "q",
+                    "arm_id": "normal",
+                    "query_cases": 1,
+                    "sample_rows": 1,
+                    "product_receipts": 1,
+                }],
+            )
+            output.publish_campaign_summary()
+            campaign = json.loads((output.run.root / "campaign.json").read_text())
+            self.assertEqual(campaign["kind"], "CampaignSummary")
+            self.assertEqual(campaign["schema_version"], 3)
+            self.assertFalse((output.run.root / "summary.md").exists())
 
     def test_manifest_index_supports_a_ninety_nine_query_campaign(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

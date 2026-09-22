@@ -58,6 +58,27 @@ def _validate_sample_ids(sample_ids: list[str], *, sample_rows: int) -> list[str
     return list(sample_ids)
 
 
+def _cell_budget_bytes(
+    *,
+    query_cases: int,
+    sample_rows: int,
+    product_receipts: int,
+    calibration_rows: int,
+    summary_captures: int,
+    attempts: int,
+) -> int:
+    """Charge every registered unit through one deterministic formula."""
+    return (
+        4_096
+        + 1_024 * query_cases
+        + 1_024 * sample_rows
+        + 2_048 * product_receipts
+        + 512 * calibration_rows
+        + 200_000 * summary_captures
+        + 256 * attempts
+    )
+
+
 def validate_output_id(value: str, *, label: str) -> str:
     if not isinstance(value, str) or not _ID_RE.fullmatch(value):
         raise RunOutputError(
@@ -168,6 +189,7 @@ class CampaignRegistration:
         product_receipts: int,
         calibration_rows: int = 0,
         summary_captures: int = 0,
+        attempts: int = 1,
         sample_ids: list[str] | None = None,
     ) -> "CellWriter":
         return self.run.register_cell(
@@ -177,6 +199,7 @@ class CampaignRegistration:
             product_receipts=product_receipts,
             calibration_rows=calibration_rows,
             summary_captures=summary_captures,
+            attempts=attempts,
             sample_ids=sample_ids,
             query_case=query_case,
             arm_id=arm_id,
@@ -572,6 +595,68 @@ class CorpusOutput:
         self.run.finalize(status=terminal_status)
 
 
+@dataclass(frozen=True)
+class CampaignSummary:
+    """The bounded, typed campaign index written by the producer."""
+
+    schema_version: int
+    campaign_id: str
+    run_id: str
+    status: str | None
+    registration_status: str | None
+    cells: tuple[dict[str, Any], ...]
+
+    @classmethod
+    def from_run(cls, run: "RunOutput") -> "CampaignSummary":
+        cells: list[dict[str, Any]] = []
+        for cell in run._manifest.get("registration", {}).get("cells", []):
+            attempts = [
+                metadata
+                for metadata in run._manifest.get("attempts", [])
+                if metadata.get("query_case") == cell.get("query_case")
+                and metadata.get("arm_id") == cell.get("arm_id")
+            ]
+            cells.append({
+                "cell_id": cell["cell_id"],
+                "query_case": cell.get("query_case"),
+                "arm_id": cell.get("arm_id"),
+                "declared_samples": cell.get("sample_rows"),
+                "sample_ids": cell.get("sample_ids", []),
+                "declared_receipts": cell.get("product_receipts"),
+                "declared_captures": cell.get("summary_captures"),
+                "attempts": [
+                    {
+                        "source_id": item.get("source_id"),
+                        "attempt_id": item.get("attempt_id"),
+                        "status": item.get("status"),
+                        "result": item.get("result"),
+                        "summary": item.get("summary"),
+                        "failure": item.get("failure"),
+                    }
+                    for item in attempts
+                ],
+            })
+        return cls(
+            schema_version=RUN_SUMMARY_SCHEMA_VERSION,
+            campaign_id=run.campaign_id,
+            run_id=run.run_id,
+            status=run._manifest.get("status"),
+            registration_status=run._manifest.get("registration", {}).get("status"),
+            cells=tuple(cells),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": "CampaignSummary",
+            "campaign_id": self.campaign_id,
+            "run_id": self.run_id,
+            "status": self.status,
+            "registration_status": self.registration_status,
+            "cells": list(self.cells),
+        }
+
+
 @dataclass
 class CampaignOutput:
     """Typed output boundary for a multi-cell corpus collector.
@@ -630,6 +715,7 @@ class CampaignOutput:
         self.run._validate_payload_owner(attempt, payload)
         return attempt.cell_writer().write_json("result.json", payload, overwrite=True)
 
+
     def publish_capture_text(
         self, *, query_case: str, arm_id: str, name: str, text: str
     ) -> Path:
@@ -649,44 +735,7 @@ class CampaignOutput:
         unbounded report or a second, incompatible campaign schema into the
         control plane.
         """
-        cells: list[dict[str, Any]] = []
-        for cell in self.run._manifest.get("registration", {}).get("cells", []):
-            cell_id = cell["cell_id"]
-            attempts = [
-                metadata
-                for metadata in self.run._manifest.get("attempts", [])
-                if metadata.get("query_case") == cell.get("query_case")
-                and metadata.get("arm_id") == cell.get("arm_id")
-            ]
-            cells.append({
-                "cell_id": cell_id,
-                "query_case": cell.get("query_case"),
-                "arm_id": cell.get("arm_id"),
-                "declared_samples": cell.get("sample_rows"),
-                "sample_ids": cell.get("sample_ids", []),
-                "declared_receipts": cell.get("product_receipts"),
-                "declared_captures": cell.get("summary_captures"),
-                "attempts": [
-                    {
-                        "source_id": item.get("source_id"),
-                        "attempt_id": item.get("attempt_id"),
-                        "status": item.get("status"),
-                        "result": item.get("result"),
-                        "summary": item.get("summary"),
-                        "failure": item.get("failure"),
-                    }
-                    for item in attempts
-                ],
-            })
-        payload = {
-            "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
-            "kind": "CampaignSummary",
-            "campaign_id": self.run.campaign_id,
-            "run_id": self.run.run_id,
-            "status": self.run._manifest.get("status"),
-            "registration_status": self.run._manifest.get("registration", {}).get("status"),
-            "cells": cells,
-        }
+        payload = CampaignSummary.from_run(self.run).to_payload()
         writer = ControlWriter(self.run, self.run.root, allow_terminal=allow_terminal)
         return writer.write_json("campaign.json", payload, overwrite=True)
 
@@ -799,6 +848,8 @@ class RunOutput:
                 "control_written_bytes": 0,
                 "control_limit_bytes": CONTROL_OUTPUT_LIMIT_BYTES,
                 "manifest_bytes": 0,
+                "omitted_count": 0,
+                "omitted_bytes": 0,
                 "manifest_limit_bytes": MANIFEST_LIMIT_BYTES,
                 "total_limit_bytes": CAMPAIGN_TOTAL_LIMIT_BYTES,
                 "registration_sealed": False,
@@ -922,6 +973,7 @@ class RunOutput:
         product_receipts: int,
         calibration_rows: int = 0,
         summary_captures: int = 0,
+        attempts: int = 1,
         sample_ids: list[str] | None = None,
         query_case: str | None = None,
         arm_id: str = "default",
@@ -930,7 +982,7 @@ class RunOutput:
         cell_id = validate_output_id(cell_id, label="cell id")
         query_case = validate_output_id(query_case or cell_id, label="query case")
         arm_id = validate_output_id(arm_id, label="arm id")
-        if min(query_cases, sample_rows, product_receipts, calibration_rows, summary_captures) < 0:
+        if min(query_cases, sample_rows, product_receipts, calibration_rows, summary_captures, attempts) < 0:
             raise RunOutputError("campaign registration counts must be >= 0")
         registration = self._manifest["registration"]
         if registration.get("registration_sealed"):
@@ -955,21 +1007,26 @@ class RunOutput:
                 "product_receipts": product_receipts,
                 "calibration_rows": calibration_rows,
                 "summary_captures": summary_captures,
+                "attempts": attempts,
                 "query_case": query_case,
                 "arm_id": arm_id,
                 "sample_ids": sample_ids,
             }
-            if all(current.get(key) == value for key, value in requested.items()):
+            if all(
+                (current.get(key, 1) if key == "attempts" else current.get(key)) == value
+                for key, value in requested.items()
+            ):
                 return CellWriter(self, cell_id, self.root / "sources")
             raise RunOutputError(
                 f"campaign cell already registered with different contract: {cell_id}"
             )
-        cell_budget = (
-            4_096
-            + 1_024 * query_cases
-            + 2_048 * product_receipts
-            + 512 * calibration_rows
-            + 200_000 * summary_captures
+        cell_budget = _cell_budget_bytes(
+            query_cases=query_cases,
+            sample_rows=sample_rows,
+            product_receipts=product_receipts,
+            calibration_rows=calibration_rows,
+            summary_captures=summary_captures,
+            attempts=attempts,
         )
         cells = [*registration["cells"], {
             "cell_id": cell_id,
@@ -980,6 +1037,7 @@ class RunOutput:
             "product_receipts": product_receipts,
             "calibration_rows": calibration_rows,
             "summary_captures": summary_captures,
+            "attempts": attempts,
             "sample_ids": sample_ids,
             "budget_bytes": cell_budget,
             "written_bytes": 0,
@@ -989,14 +1047,34 @@ class RunOutput:
         captures = sum(cell["summary_captures"] for cell in cells)
         manifest_bytes = 32_000 + 1_024 * (arms + queries + len(cells) + captures)
         cells_bytes = sum(
-            4_096
-            + 1_024 * cell["sample_rows"]
-            + 2_048 * cell["product_receipts"]
-            + 512 * cell["calibration_rows"]
+            _cell_budget_bytes(
+                query_cases=cell["query_cases"],
+                sample_rows=cell["sample_rows"],
+                product_receipts=cell["product_receipts"],
+                calibration_rows=cell["calibration_rows"],
+                summary_captures=cell["summary_captures"],
+                attempts=cell.get("attempts", 1),
+            )
             for cell in cells
         )
-        budget = manifest_bytes + 20_000 + cells_bytes + 200_000 * captures
+        attempts_total = sum(int(cell.get("attempts", 1)) for cell in cells)
+        sample_rows_total = sum(int(cell["sample_rows"]) for cell in cells)
+        budget = (
+            manifest_bytes
+            + 20_000
+            + cells_bytes
+            + 256 * len(cells)
+            + 256 * attempts_total
+            + 256 * sample_rows_total
+            + 200_000 * captures
+        )
         if budget > CAMPAIGN_TOTAL_LIMIT_BYTES:
+            registration["omitted_count"] = int(registration.get("omitted_count", 0)) + 1
+            registration["omitted_bytes"] = int(registration.get("omitted_bytes", 0)) + budget - CAMPAIGN_TOTAL_LIMIT_BYTES
+            registration["status"] = "CapacityExceeded"
+            self._manifest["status"] = "Incomplete"
+            self._manifest["sealed_at"] = _now()
+            self._persist_manifest()
             raise RunOutputError(
                 f"campaign registration exceeds {CAMPAIGN_TOTAL_LIMIT_BYTES} bytes: {budget}"
             )
