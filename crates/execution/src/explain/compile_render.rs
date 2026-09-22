@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Render only the sealed target observation; never invoke planning or admission.
-use paro_context::compile_diagnostics::{
-    CompileRecord, ExecutionReceipt, SealedCompileCapture, ENCODED_LIMIT,
-};
+use paro_context::compile_diagnostics::{CompileRecord, ExecutionReceipt, SealedCompileCapture, ENCODED_LIMIT};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
@@ -224,7 +222,8 @@ pub fn validate_json(
         if execution.admission == AdmissionResult::Selected
             && (execution.actual_class.is_none()
                 || execution.actual_fingerprint.is_none()
-                || execution.resources.is_none())
+                || execution.resources.is_none()
+                || execution.selection_identity.is_none())
         {
             return Err("selected execution receipt lacks actual admission".into());
         }
@@ -260,6 +259,7 @@ pub fn validate_json(
         if execution.admission != AdmissionResult::Selected
             && (execution.actual_class.is_some()
                 || execution.actual_fingerprint.is_some()
+                || execution.selection_identity.is_some()
                 || execution.resources.is_some()
                 || execution.reservation != ResourceReservationStatus::NotRequired
                 || execution.lowering != LoweringStatus::NotStarted
@@ -267,6 +267,14 @@ pub fn validate_json(
                 || execution.image != ExecutionImageStatus::NotReady)
         {
             return Err("non-selected receipt claims an actual resource or image".into());
+        }
+        if let Some(selection) = execution.selection_identity {
+            if selection.artifact != execution.artifact_identity.artifact
+                || selection.grant_class != execution.actual_class
+                || selection.physical_fingerprint != execution.actual_fingerprint
+            {
+                return Err("selection identity does not match actual admission".into());
+            }
         }
         if execution.admission != AdmissionResult::Selected
             && execution.terminal != ExecutionTerminal::NotExecuted
@@ -563,6 +571,12 @@ mod tests {
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             execution_id: ExecutionReceiptId(7),
+            admission_receipt_id: AdmissionReceiptId(7),
+            selection_identity: Some(SelectionIdentity {
+                artifact: identity.artifact,
+                grant_class: Some(2),
+                physical_fingerprint: Some([7, 8]),
+            }),
             statement_decision_id: Some(4),
             artifact_identity: identity,
             expected_class: Some(2),
@@ -650,6 +664,12 @@ mod tests {
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             execution_id: ExecutionReceiptId(99),
+            admission_receipt_id: AdmissionReceiptId(99),
+            selection_identity: Some(SelectionIdentity {
+                artifact: identity.artifact,
+                grant_class: Some(2),
+                physical_fingerprint: Some([107, 108]),
+            }),
             statement_decision_id: Some(7),
             artifact_identity: identity,
             expected_class: Some(2),

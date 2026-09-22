@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
 use crate::compile_diagnostics::{
-    AdmissionFallback, AdmissionResult, ArtifactIdentity, ExecutionImageStatus, ExecutionReceipt,
-    ExecutionReceiptId, ExecutionTerminal, LoweringStatus, Observation, ResourceReceipt,
+    AdmissionFallback, AdmissionReceiptId, AdmissionResult, ArtifactIdentity,
+    ExecutionImageStatus, ExecutionReceipt, ExecutionReceiptId, ExecutionTerminal, LoweringStatus,
+    Observation, ResourceReceipt, SelectionIdentity,
     ResourceReservationStatus, SearchStop, RECEIPT_SCHEMA_VERSION,
 };
 use crate::StatementTraceSnapshot;
@@ -334,6 +335,14 @@ impl SessionDiagnostics {
         let receipt = ExecutionReceipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             execution_id: ExecutionReceiptId(execution_id),
+            admission_receipt_id: AdmissionReceiptId(execution_id),
+            selection_identity: start.actual_class.zip(start.actual_fingerprint).map(
+                |(grant_class, physical_fingerprint)| SelectionIdentity {
+                    artifact: start.artifact_identity.artifact,
+                    grant_class: Some(grant_class),
+                    physical_fingerprint: Some(physical_fingerprint),
+                }
+            ),
             statement_decision_id,
             artifact_identity: start.artifact_identity,
             expected_class: start.expected_class,
@@ -423,6 +432,11 @@ impl SessionDiagnostics {
         receipt.admission = AdmissionResult::Selected;
         receipt.actual_class = actual_class;
         receipt.actual_fingerprint = actual_fingerprint;
+        receipt.selection_identity = Some(SelectionIdentity {
+            artifact: receipt.artifact_identity.artifact,
+            grant_class: actual_class,
+            physical_fingerprint: actual_fingerprint,
+        });
         receipt.resources = resources;
         receipt.fallback = fallback;
         receipt.reservation = if receipt.resources.is_some() {

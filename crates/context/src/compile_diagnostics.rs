@@ -335,12 +335,31 @@ pub struct PlanStructureId(pub [u64; 2]);
 #[serde(transparent)]
 pub struct CompiledArtifactId(pub [u64; 2]);
 
+/// Identity of the admission decision/receipt, distinct from the execution
+/// handle and from the immutable artifact.  The value is allocated at the
+/// admission boundary, not inferred from a portfolio ordinal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct AdmissionReceiptId(pub u64);
+
 /// Session-monotonic identity of one actual admission/execution receipt.
 /// This is deliberately distinct from cache occurrences and from the
 /// artifact identity; its transparent wire representation remains a u64.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct ExecutionReceiptId(pub u64);
+
+/// The selected physical variant in the resource context that admitted it.
+/// This is intentionally separate from both the structure/artifact identity
+/// and the lifecycle ids; a resource fallback may change this value without
+/// changing the compiled artifact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionIdentity {
+    pub artifact: CompiledArtifactId,
+    pub grant_class: Option<u32>,
+    pub physical_fingerprint: Option<[u64; 2]>,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -422,6 +441,8 @@ pub struct ResourceReceipt {
 pub struct ExecutionReceipt {
     pub schema_version: u32,
     pub execution_id: ExecutionReceiptId,
+    pub admission_receipt_id: AdmissionReceiptId,
+    pub selection_identity: Option<SelectionIdentity>,
     pub statement_decision_id: Option<u64>,
     pub artifact_identity: ArtifactIdentity,
     pub expected_class: Option<u32>,
