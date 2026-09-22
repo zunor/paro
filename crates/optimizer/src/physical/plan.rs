@@ -98,6 +98,10 @@ pub enum PhysicalIdentityError {
     UnsupportedKind {
         kind: &'static str,
     },
+    /// Two auxiliary producers have the same local key but no canonical
+    /// ordering proof. Refuse to manufacture a cross-run identity from arena
+    /// allocation order.
+    AmbiguousAuxiliaryOrder,
 }
 
 impl fmt::Display for PhysicalIdentityError {
@@ -114,6 +118,9 @@ impl fmt::Display for PhysicalIdentityError {
             Self::UnsupportedKind { kind } => write!(
                 formatter,
                 "physical identity has no typed canonical encoder for {kind}"
+            ),
+            Self::AmbiguousAuxiliaryOrder => formatter.write_str(
+                "physical identity has ambiguous auxiliary producer ordering",
             ),
         }
     }
@@ -461,6 +468,12 @@ impl PhysicalPlan {
             // are interchangeable; an arena id would make otherwise equal
             // plans differ across extraction runs.
             producers.sort_unstable_by_key(|(kind, local, _)| (*kind, *local));
+            if producers
+                .windows(2)
+                .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1)
+            {
+                return Err(PhysicalIdentityError::AmbiguousAuxiliaryOrder);
+            }
             for (_, _, producer) in producers.into_iter().rev() {
                 stack.push((producer, false));
             }
