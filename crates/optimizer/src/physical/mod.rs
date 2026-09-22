@@ -33,7 +33,7 @@ pub use identity::*;
 pub use ids::{PhysicalPlanNodeId, PlanChildrenId};
 pub use node::{OperatorLabel, PhysicalPlanNode};
 pub use objective::ObjectiveProfile;
-pub use plan::{PhysicalPlan, PhysicalPlanNodeArena};
+pub use plan::{PhysicalIdentityError, PhysicalPlan, PhysicalPlanNodeArena};
 pub use portfolio::*;
 pub use properties::*;
 pub use requirements::{ProvidedProperties, RequiredProperties};

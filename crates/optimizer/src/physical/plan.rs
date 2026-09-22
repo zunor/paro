@@ -81,6 +81,33 @@ pub struct PhysicalPlan {
     pub execution_resources: Option<ExecutionResourceContract>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhysicalIdentityError {
+    InvalidRoot,
+    InvalidEdge,
+    InvalidChild,
+    Cycle,
+    MissingAuxiliaryDependency {
+        node: PhysicalPlanNodeId,
+        dependency: u32,
+    },
+}
+
+impl fmt::Display for PhysicalIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRoot => formatter.write_str("physical identity has an invalid root"),
+            Self::InvalidEdge => formatter.write_str("physical identity has an invalid edge"),
+            Self::InvalidChild => formatter.write_str("physical identity has an invalid child"),
+            Self::Cycle => formatter.write_str("physical identity graph contains a cycle"),
+            Self::MissingAuxiliaryDependency { node, dependency } => write!(
+                formatter,
+                "physical identity node {node:?} references missing auxiliary dependency {dependency}"
+            ),
+        }
+    }
+}
+
 impl PhysicalPlan {
     pub fn new(
         root: PhysicalPlanNodeId,
@@ -250,16 +277,28 @@ impl PhysicalPlan {
     /// explain representation carries operator payloads while the tree
     /// carries child topology and output layout.  Keep the domain/version
     /// explicit so a consumer never treats a later encoding as compatible.
-    pub fn structural_identity_fingerprint(&self) -> Fingerprint {
+    pub fn structural_identity_fingerprint(&self) -> Result<Fingerprint, PhysicalIdentityError> {
         let mut builder = StableFingerprintBuilder::default();
         builder.write_bytes(b"paro.physical-plan-structure.v3.typed-canonical");
 
         // The traversal is iterative on purpose.  Physical plans can contain
         // long unary spines and a fingerprint must not depend on recursion
         // depth or arena allocation order.
-        let order = self
-            .canonical_postorder()
-            .expect("physical plan identity cannot canonicalize an invalid graph");
+        let order = self.canonical_postorder()?;
+        for (node, properties) in self.properties.iter() {
+            for dependency in &properties.auxiliary_dependencies {
+                if self
+                    .edges
+                    .get(super::edges::PhysicalEdgeId(*dependency))
+                    .is_none()
+                {
+                    return Err(PhysicalIdentityError::MissingAuxiliaryDependency {
+                        node,
+                        dependency: *dependency,
+                    });
+                }
+            }
+        }
         let canonical_ids = order
             .iter()
             .enumerate()
@@ -338,12 +377,12 @@ impl PhysicalPlan {
             }
         }
         write_debug_value(&mut builder, &self.dependencies);
-        builder.finish()
+        Ok(builder.finish())
     }
 
-    fn canonical_postorder(&self) -> Option<Vec<PhysicalPlanNodeId>> {
+    fn canonical_postorder(&self) -> Result<Vec<PhysicalPlanNodeId>, PhysicalIdentityError> {
         if self.root == PhysicalPlanNodeId::INVALID || self.nodes.get(self.root).is_none() {
-            return None;
+            return Err(PhysicalIdentityError::InvalidRoot);
         }
         if self.edges.iter().any(|edge| {
             edge.producer == PhysicalPlanNodeId::INVALID
@@ -351,7 +390,7 @@ impl PhysicalPlan {
                 || self.nodes.get(edge.producer).is_none()
                 || self.nodes.get(edge.consumer).is_none()
         }) {
-            return None;
+            return Err(PhysicalIdentityError::InvalidEdge);
         }
         let mut order = Vec::new();
         let mut visited = BTreeSet::new();
@@ -359,7 +398,7 @@ impl PhysicalPlan {
         let mut stack = vec![(self.root, false)];
         while let Some((id, expanded)) = stack.pop() {
             if id == PhysicalPlanNodeId::INVALID || self.nodes.get(id).is_none() {
-                return None;
+                return Err(PhysicalIdentityError::InvalidChild);
             }
             if expanded {
                 visiting.remove(&id);
@@ -367,7 +406,7 @@ impl PhysicalPlan {
                 continue;
             }
             if visiting.contains(&id) {
-                return None;
+                return Err(PhysicalIdentityError::Cycle);
             }
             if !visited.insert(id) {
                 continue;
@@ -378,7 +417,7 @@ impl PhysicalPlan {
             if self.child_ids(&node.children).iter().any(|child| {
                 *child == PhysicalPlanNodeId::INVALID || self.nodes.get(*child).is_none()
             }) {
-                return None;
+                return Err(PhysicalIdentityError::InvalidChild);
             }
             for child in self.child_ids(&node.children).iter().rev() {
                 stack.push((*child, false));
@@ -401,9 +440,9 @@ impl PhysicalPlan {
             }
         }
         if !visiting.is_empty() {
-            return None;
+            return Err(PhysicalIdentityError::Cycle);
         }
-        Some(order)
+        Ok(order)
     }
 
     fn local_identity_key(&self, id: PhysicalPlanNodeId) -> Fingerprint {
@@ -2769,8 +2808,8 @@ mod identity_tests {
         let left = dummy_plan(false, "left presentation", "value");
         let right = dummy_plan(true, "right presentation", "value");
         assert_eq!(
-            left.structural_identity_fingerprint(),
-            right.structural_identity_fingerprint()
+            left.structural_identity_fingerprint().unwrap(),
+            right.structural_identity_fingerprint().unwrap()
         );
     }
 
@@ -2779,8 +2818,8 @@ mod identity_tests {
         let left = dummy_plan(false, "same", "left");
         let right = dummy_plan(false, "same", "right");
         assert_ne!(
-            left.structural_identity_fingerprint(),
-            right.structural_identity_fingerprint()
+            left.structural_identity_fingerprint().unwrap(),
+            right.structural_identity_fingerprint().unwrap()
         );
     }
 
@@ -2807,8 +2846,8 @@ mod identity_tests {
             external_worker_slots: 0,
         });
         assert_eq!(
-            left.structural_identity_fingerprint(),
-            right.structural_identity_fingerprint()
+            left.structural_identity_fingerprint().unwrap(),
+            right.structural_identity_fingerprint().unwrap()
         );
     }
 
@@ -2817,10 +2856,10 @@ mod identity_tests {
         let mut cyclic = dummy_plan(false, "same", "value");
         cyclic.nodes.get_mut(cyclic.root).unwrap().children =
             PlanChildren::Inline(InlinePlanChildren::new(&[cyclic.root]));
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cyclic.structural_identity_fingerprint();
-        }))
-        .is_err());
+        assert_eq!(
+            cyclic.structural_identity_fingerprint(),
+            Err(PhysicalIdentityError::Cycle)
+        );
 
         let mut invalid_edge = dummy_plan(false, "same", "value");
         invalid_edge.edges.push(
@@ -2828,9 +2867,9 @@ mod identity_tests {
             PhysicalPlanNodeId::INVALID,
             PhysicalEdgeKind::Data,
         );
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            invalid_edge.structural_identity_fingerprint();
-        }))
-        .is_err());
+        assert_eq!(
+            invalid_edge.structural_identity_fingerprint(),
+            Err(PhysicalIdentityError::InvalidEdge)
+        );
     }
 }

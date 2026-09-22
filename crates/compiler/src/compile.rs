@@ -262,7 +262,7 @@ pub fn compile_statement_with_parameter_types(
             .collect(),
         parameter_types.to_vec(),
         ctx.compile_environment_key(),
-    );
+    )?;
     if let Some(capture) = &ctx.options.compile_capture {
         use std::hash::{Hash, Hasher};
         let mut identity = std::collections::hash_map::DefaultHasher::new();
