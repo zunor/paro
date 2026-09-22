@@ -542,8 +542,9 @@ impl PhysicalPlan {
         child_prefix: bool,
         out: &mut String,
     ) {
-        for _ in 0..depth {
-            out.push_str("  ");
+        let operator_indent = Self::explain_operator_indent(depth);
+        for _ in 0..operator_indent {
+            out.push(' ');
         }
         if child_prefix {
             out.push_str("->  ");
@@ -563,10 +564,10 @@ impl PhysicalPlan {
         depth: usize,
         out: &mut String,
     ) {
-        let property_depth = depth + 1;
+        let property_indent = Self::explain_property_indent(depth);
         let mut write_property = |line: String| {
-            for _ in 0..property_depth {
-                out.push_str("  ");
+            for _ in 0..property_indent {
+                out.push(' ');
             }
             let _ = writeln!(out, "{line}");
         };
@@ -589,6 +590,25 @@ impl PhysicalPlan {
             if let Some(output_schema) = output_schema {
                 write_property(output_schema);
             }
+        }
+    }
+
+    /// MatrixOne-compatible text layout: the first child starts two columns
+    /// below its parent, while each subsequent child starts at the parent's
+    /// property continuation column. This keeps `->` on the operator line
+    /// instead of making it look like a property prefix.
+    fn explain_operator_indent(depth: usize) -> usize {
+        match depth {
+            0 => 0,
+            depth => 2usize.saturating_add(depth.saturating_sub(1).saturating_mul(6)),
+        }
+    }
+
+    fn explain_property_indent(depth: usize) -> usize {
+        if depth == 0 {
+            2
+        } else {
+            Self::explain_operator_indent(depth) + 6
         }
     }
 
@@ -2592,6 +2612,18 @@ mod expression_format_tests {
                 assert!(formatter.format(&normal).starts_with("sum(amount) "));
             }
         }
+    }
+
+    #[test]
+    fn explain_text_uses_matrixone_operator_and_property_columns() {
+        assert_eq!(PhysicalPlan::explain_operator_indent(0), 0);
+        assert_eq!(PhysicalPlan::explain_operator_indent(1), 2);
+        assert_eq!(PhysicalPlan::explain_operator_indent(2), 8);
+        assert_eq!(PhysicalPlan::explain_operator_indent(3), 14);
+
+        assert_eq!(PhysicalPlan::explain_property_indent(0), 2);
+        assert_eq!(PhysicalPlan::explain_property_indent(1), 8);
+        assert_eq!(PhysicalPlan::explain_property_indent(2), 14);
     }
 }
 
