@@ -65,6 +65,9 @@ unchanged.
 8. Retry attempts are retained independently. Only an explicitly accepted,
    completed attempt can satisfy a cell; failed, cancelled, incomplete and
    unaccepted attempts remain evidence and cannot be silently replaced.
+9. `RunOutput.finalize("Completed")` rechecks every registered cell and its
+   accepted attempt under the manifest lock. A sealed attempt alone is not a
+   campaign completion certificate.
 
 The external design source is
 `/Users/linjunhong/workspace/paro-docs-design/optimizer/optimizer-trace-matrix.md`.
