@@ -220,10 +220,16 @@ state, and the bounded manifest/writer path.
 Campaign finalization emits a typed `CampaignSummary` only. The gate checks
 its campaign/run identity, registration status, cell index and terminal state
 against the sealed manifest; free-text control summaries are not evidence.
-Registration capacity failures persist `CapacityExceeded` with an explicit
-omitted count before failing. Execution receipts separately carry
+Registration and payload capacity failures persist `CapacityExceeded` with
+explicit omitted count and bytes, seal registration, and reject later cell or
+payload writes. Execution receipts separately carry an independently allocated
 `AdmissionReceiptId` and `SelectionIdentity`, and the renderer checks the
 selection against the actual artifact, grant class and physical fingerprint.
+
+Invalid physical identity graphs now return a structured compiler error instead
+of panicking, including cycles, invalid edges, invalid children, and missing
+auxiliary dependency edges. This is a safety boundary only; the physical
+identity payload still has an outstanding typed-encoder blocker below.
 
 The fresh-directory SQL regression run reports 177 passed and eight existing
 EXPLAIN-only differences. The eight are retained as failures and classified as

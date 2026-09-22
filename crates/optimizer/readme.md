@@ -178,6 +178,11 @@ timing from `paro_optimizers()`, display text, arena ids or occurrence numbers.
 Current readers reject older evidence schemas, and missing identity joins remain
 `Uncovered` rather than being guessed.
 
+Invalid physical identity graphs are rejected with a structured error before
+artifact construction. This does not certify the identity: replacing the
+remaining Debug-derived payload path with a complete typed canonical encoder is
+still required before cross-run `PlanStructureId` reuse.
+
 Summary is the default; bounded Detail is an opt-in T3 surface for supported
 COMPILE targets. It retains fixed opaque references from the real Memo and
 TaskRegistry lifecycle and reports overflow explicitly; it is not the complete
