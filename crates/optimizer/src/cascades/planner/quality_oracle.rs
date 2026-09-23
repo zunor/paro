@@ -380,7 +380,7 @@ pub(super) fn frozen_quality_evidence(
             reference: frozen.reference,
             logical: frozen.logical.id,
             physical: frozen.physical.id,
-            children: frozen.winner.children.clone(),
+            children: Arc::from(frozen.winner.children.as_ref()),
         });
         let selected_rules = selected_payload_rule_proofs(&frozen.logical, metadata);
         if metadata.origin_rule.is_some() && selected_rules.is_empty() {

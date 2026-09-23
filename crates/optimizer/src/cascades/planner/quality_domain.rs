@@ -34,25 +34,23 @@ pub(super) fn cte_domain_witnesses(
     nodes: &[QualityCandidateNode],
     state: &PlannerTransformState,
 ) -> BTreeSet<usize> {
-    cte_domain_witnesses_with_properties(memo, nodes, state, None)
+    let Some(root) = nodes.first() else {
+        return BTreeSet::new();
+    };
+    let Some(dag) = selected_dag::SelectedDag::from_nodes(root.reference, Arc::from(nodes)) else {
+        return BTreeSet::new();
+    };
+    cte_domain_witnesses_with_properties(memo, &dag, state, None)
 }
 
 pub(super) fn cte_domain_witnesses_with_properties(
     memo: &Memo,
-    nodes: &[QualityCandidateNode],
+    dag: &selected_dag::SelectedDag,
     state: &PlannerTransformState,
     mut properties: Option<&mut quality_properties::SelectedQualityProperties>,
 ) -> BTreeSet<usize> {
-    let map = nodes
-        .iter()
-        .map(|node| (node.reference.candidate, node))
-        .collect::<BTreeMap<_, _>>();
-    let mut parents = BTreeMap::<CandidateId, Vec<&QualityCandidateNode>>::new();
-    for parent in nodes {
-        for child in &parent.children {
-            parents.entry(child.candidate).or_default().push(parent);
-        }
-    }
+    let nodes = dag.nodes.as_ref();
+    let map = dag.node_map();
     let operator = |node: &QualityCandidateNode| {
         memo.logical_expr(node.logical)
             .and_then(|logical| state.payloads.logical.get(logical.payload.index()))
@@ -77,10 +75,8 @@ pub(super) fn cte_domain_witnesses_with_properties(
                 Some(LogicalOperator::CTERef(reference)) if reference.cte_index == cte.cte_index)
                 })
                 .map(|consumer| {
-                    let mut incoming = parents
-                        .get(&consumer.reference.candidate)
-                        .into_iter()
-                        .flatten()
+                    let mut incoming = dag
+                        .incoming(consumer.reference.candidate)
                         .map(|parent| properties.revision(parent.reference.candidate))
                         .collect::<Vec<_>>();
                     incoming.sort_unstable();
@@ -120,12 +116,8 @@ pub(super) fn cte_domain_witnesses_with_properties(
             }
             found = true;
             let mut incoming = false;
-            for parent in parents
-                .get(&consumer.reference.candidate)
-                .into_iter()
-                .flatten()
-            {
-                for child in &parent.children {
+            for parent in dag.incoming(consumer.reference.candidate) {
+                for child in parent.children.iter() {
                     if *child != consumer.reference {
                         continue;
                     }

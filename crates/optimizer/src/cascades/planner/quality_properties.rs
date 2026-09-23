@@ -12,6 +12,9 @@ use super::*;
 struct NodeProperties {
     node: QualityCandidateNode,
     read: PatternRead,
+    // Group merging rewrites expression keys even when the candidate's
+    // immutable child references and output facts remain unchanged.
+    logical_children: Box<[GroupId]>,
     children: Box<[u64]>,
     revision: u64,
     choice: Fingerprint,
@@ -27,6 +30,7 @@ struct NodeProperties {
 /// completed property, and does not publish a partially refreshed node.
 #[derive(Debug, Default)]
 pub(super) struct SelectedQualityProperties {
+    pub(super) dag: selected_dag::SelectedDagStore,
     nodes: BTreeMap<CandidateId, NodeProperties>,
     next_revision: u64,
     pub(super) cte_domains: quality_domain::CteDomainProperties,
@@ -38,49 +42,65 @@ impl SelectedQualityProperties {
     pub(super) fn refresh(
         &mut self,
         memo: &Memo,
-        root: ChildWinnerRef,
-        nodes: &[QualityCandidateNode],
+        dag: &selected_dag::SelectedDag,
         state: &PlannerTransformState,
     ) -> Result<bool> {
-        let nodes = quality_node_map(nodes);
-        // Explicit postorder handles shared DAGs and rejects a cycle rather
-        // than overflowing the native stack or reusing an unfinished entry.
-        let mut stack = vec![(root, false)];
-        let mut active = BTreeSet::new();
-        let mut complete = BTreeSet::new();
-        while let Some((reference, exit)) = stack.pop() {
-            let Some(node) = quality_node(&nodes, reference) else {
-                return Ok(false);
-            };
-            if complete.contains(&reference.candidate) {
+        // Observe facts, not the whole payload graph. Mark affected ancestors
+        // through the selected incoming edges; unrelated branches retain their
+        // properties. Structural DAG ordering/cycle checks are construction work.
+        let mut reads = Vec::with_capacity(dag.nodes.len());
+        let mut dirty = vec![false; dag.nodes.len()];
+        let mut pending = Vec::new();
+        for (index, node) in dag.nodes.iter().enumerate() {
+            let read = PatternRead::facts_from_group(memo, node.reference.group)?;
+            let current = self
+                .nodes
+                .get(&node.reference.candidate)
+                .is_some_and(|previous| {
+                    previous.node == *node
+                        && previous.read == read
+                        && memo.logical_expr(node.logical).is_some_and(|logical| {
+                            logical.key.children == previous.logical_children
+                        })
+                        && previous.children.len() == node.children.len()
+                        && node.children.iter().zip(previous.children.iter()).all(
+                            |(child, revision)| {
+                                self.nodes
+                                    .get(&child.candidate)
+                                    .is_some_and(|child| child.revision == *revision)
+                            },
+                        )
+                });
+            if !current {
+                pending.push(index);
+            }
+            reads.push(read);
+        }
+        while let Some(index) = pending.pop() {
+            if std::mem::replace(&mut dirty[index], true) {
                 continue;
             }
-            if !exit {
-                if !active.insert(reference.candidate) {
-                    return Ok(false);
-                }
-                stack.push((reference, true));
-                stack.extend(node.children.iter().rev().map(|child| (*child, false)));
+            pending.extend(dag.parents[index].iter().copied());
+        }
+        self.reuses = self
+            .reuses
+            .saturating_add(dirty.iter().filter(|dirty| !**dirty).count() as u64);
+        if !dirty.iter().any(|dirty| *dirty) {
+            return Ok(true);
+        }
+        let nodes = dag.node_map();
+        for &index in &dag.postorder {
+            if !dirty[index] {
                 continue;
             }
-            active.remove(&reference.candidate);
-            let read = PatternRead::facts_from_group(memo, reference.group)?;
+            let node = &dag.nodes[index];
+            let reference = node.reference;
+            let read = reads[index];
             let children = node
                 .children
                 .iter()
                 .map(|child| self.nodes[&child.candidate].revision)
-                .collect::<Box<[_]>>();
-            if self
-                .nodes
-                .get(&reference.candidate)
-                .is_some_and(|previous| {
-                    previous.node == *node && previous.read == read && previous.children == children
-                })
-            {
-                self.reuses = self.reuses.saturating_add(1);
-                complete.insert(reference.candidate);
-                continue;
-            }
+                .collect();
             let Some(logical) = memo.logical_expr(node.logical) else {
                 return Ok(false);
             };
@@ -103,7 +123,7 @@ impl SelectedQualityProperties {
             // These counts are used only as existence predicates for a region.
             // Diagnostic occurrence counts are computed from the unique-node
             // inspection, not by summing shared descendants twice.
-            for child in &node.children {
+            for child in node.children.iter() {
                 let properties = &self.nodes[&child.candidate];
                 aggregate.aggregates |= properties.aggregate.aggregates;
                 aggregate.joins |= properties.aggregate.joins;
@@ -125,7 +145,7 @@ impl SelectedQualityProperties {
                     };
                     if let LogicalOperator::Join(Join::Comparison(join_operator)) = join_operator {
                         if !join_operator.conditions.is_empty() && join.children.len() == 2 {
-                            for partial in &join.children {
+                            for partial in join.children.iter() {
                                 let Some(partial) =
                                     quality_node(&nodes, *partial).and_then(operator_of)
                                 else {
@@ -150,6 +170,7 @@ impl SelectedQualityProperties {
                 NodeProperties {
                     node: node.clone(),
                     read,
+                    logical_children: logical.key.children.clone(),
                     children,
                     revision,
                     choice: candidate_choice_fingerprint(reference, winner, logical, physical),
@@ -160,7 +181,6 @@ impl SelectedQualityProperties {
                 },
             );
             self.builds = self.builds.saturating_add(1);
-            complete.insert(reference.candidate);
         }
         Ok(true)
     }

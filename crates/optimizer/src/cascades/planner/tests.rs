@@ -155,6 +155,10 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
         assert_eq!(properties.cte_domains.builds, domain_builds);
         assert!(properties.reuses > 0);
         assert!(properties.cte_domains.reuses > 0);
+        assert!(
+            Arc::ptr_eq(&actual.nodes, &again.nodes),
+            "same selected root must share its view"
+        );
         // The same exact candidate must refresh after a real fact mutation.
         // Only that node and its ancestors are re-derived, not its siblings.
         let changed = actual
@@ -198,6 +202,10 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
                 .unwrap()
         );
         assert!(properties.builds > builds);
+        assert!(
+            Arc::ptr_eq(&actual.nodes, &refreshed.nodes),
+            "fact refresh must not reconstruct immutable choices"
+        );
         assert!(properties.builds - builds < actual.nodes.len() as u64);
         for (candidate, revision) in unchanged {
             assert_eq!(properties.revision(candidate), revision);
@@ -208,10 +216,8 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
             .iter_mut()
             .find(|node| node.reference == reference)
             .unwrap();
-        root_node.children = vec![reference].into_boxed_slice();
-        assert!(!properties
-            .refresh(engine.memo(), reference, &invalid, &state)
-            .unwrap());
+        root_node.children = Arc::from([reference]);
+        assert!(selected_dag::SelectedDag::from_nodes(reference, invalid.into()).is_none());
     }
 }
 

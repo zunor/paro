@@ -184,7 +184,7 @@ pub struct QualityCandidateNode {
     pub reference: ChildWinnerRef,
     pub logical: LogicalExprId,
     pub physical: PhysicalExprId,
-    pub children: Box<[ChildWinnerRef]>,
+    pub children: std::sync::Arc<[ChildWinnerRef]>,
 }
 
 /// Exact selected-choice properties and the fact dependencies used to derive
@@ -192,7 +192,7 @@ pub struct QualityCandidateNode {
 /// not be certified. There is no second frozen-tree quality implementation.
 #[derive(Debug, Clone)]
 pub struct SelectedQualityEvidence {
-    pub nodes: Box<[QualityCandidateNode]>,
+    pub nodes: std::sync::Arc<[QualityCandidateNode]>,
     pub reads: ReadSet,
     pub evidence: NativeQualityEvidence,
 }

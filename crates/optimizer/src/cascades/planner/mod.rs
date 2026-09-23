@@ -9,6 +9,7 @@ mod quality_domain;
 #[cfg(test)]
 mod quality_oracle;
 mod quality_properties;
+mod selected_dag;
 #[cfg(test)]
 use quality_oracle::*;
 
@@ -289,7 +290,7 @@ fn quality_node<'a>(
 }
 
 struct QualityCandidateInspection {
-    nodes: Box<[QualityCandidateNode]>,
+    nodes: Arc<[QualityCandidateNode]>,
     rules: BTreeSet<RuleId>,
     shape: NativeQualityShape,
     cte_producers: BTreeSet<usize>,
@@ -321,9 +322,9 @@ fn inspect_quality_candidate(
     state: &PlannerTransformState,
     properties: &mut quality_properties::SelectedQualityProperties,
 ) -> Result<Option<QualityCandidateInspection>> {
-    let mut nodes = Vec::new();
-    let mut seen = BTreeMap::<CandidateId, (GroupId, OptimizationGoal)>::new();
-    let mut pending = vec![root];
+    let Some(dag) = properties.dag.select(memo, root) else {
+        return Ok(None);
+    };
     let mut rules = BTreeSet::new();
     let mut shape = NativeQualityShape::default();
     let mut cte_producers = BTreeSet::new();
@@ -339,13 +340,8 @@ fn inspect_quality_candidate(
     let mut has_graph = false;
     let mut has_dependent = false;
     let mut groups = BTreeSet::new();
-    while let Some(reference) = pending.pop() {
-        if let Some(previous) = seen.get(&reference.candidate) {
-            if *previous != (reference.group, reference.goal) {
-                return Ok(None);
-            }
-            continue;
-        }
+    for node in dag.nodes.iter() {
+        let reference = node.reference;
         let Some(winner) = memo.resolve_child_winner(reference) else {
             return Ok(None);
         };
@@ -362,6 +358,9 @@ fn inspect_quality_candidate(
             return Ok(None);
         };
         if physical.id != winner.expression
+            || physical.id != node.physical
+            || logical.id != node.logical
+            || winner.children.as_ref() != node.children.as_ref()
             || physical.key.children != logical.key.children
             || (winner.joint_cost_proof.is_none()
                 && winner.children.len() != logical.key.children.len())
@@ -462,27 +461,19 @@ fn inspect_quality_candidate(
             {
                 return Ok(None);
             }
-            pending.push(child);
         }
-        seen.insert(reference.candidate, (reference.group, reference.goal));
-        nodes.push(QualityCandidateNode {
-            reference,
-            logical: logical.id,
-            physical: physical.id,
-            children: winner.children.clone(),
-        });
     }
-    if nodes.is_empty() {
+    if dag.nodes.is_empty() {
         return Ok(None);
     }
     // Rule provenance is not a selected producer property.
-    if !properties.refresh(memo, root, &nodes, state)? {
+    if !properties.refresh(memo, &dag, state)? {
         return Ok(None);
     }
     let cte_producer_witnesses =
-        quality_domain::cte_domain_witnesses_with_properties(memo, &nodes, state, Some(properties));
+        quality_domain::cte_domain_witnesses_with_properties(memo, &dag, state, Some(properties));
     Ok(Some(QualityCandidateInspection {
-        nodes: nodes.into_boxed_slice(),
+        nodes: dag.nodes.clone(),
         rules,
         shape,
         cte_producers,

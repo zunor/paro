@@ -545,11 +545,11 @@ impl crate::cascades::quality::QualityEvidenceProvider for QualityPreflightProbe
             .logical_expr(physical.key.logical)
             .expect("probe physical expression has a logical expression");
         Ok(Some(crate::cascades::quality::SelectedQualityEvidence {
-            nodes: Box::new([crate::cascades::quality::QualityCandidateNode {
+            nodes: Arc::from([crate::cascades::quality::QualityCandidateNode {
                 reference,
                 logical: logical.id,
                 physical: physical.id,
-                children: winner.children.clone(),
+                children: Arc::from(winner.children.as_ref()),
             }]),
             reads: self.reads.clone(),
             evidence: crate::cascades::quality::NativeQualityEvidence {
