@@ -119,7 +119,16 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
             inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
                 .unwrap()
                 .unwrap();
-        assert_eq!(inspected.cte_producer_witnesses.contains(&9), normalized);
+        assert_eq!(
+            quality_domain::cte_domain_witnesses_with_properties(
+                engine.memo(),
+                &inspected.dag,
+                &state,
+                Some(&mut properties),
+            )
+            .contains(&9),
+            normalized
+        );
         // Initial/normalization provenance alone never supplies the property.
         assert!(inspected.rules.is_empty());
         let frozen = engine.memo().freeze_candidate_tree(reference).unwrap();
@@ -363,6 +372,56 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
                 &winner,
                 &state,
                 &mut properties,
+                &super::super::quality::QualityBundleRegistry::default()
+            )
+            .unwrap()
+            .unwrap()
+            .evidence,
+            refreshed.evidence
+        );
+        // Failure at a later node does not erase completed independent local
+        // contracts, but it must never publish a complete candidate certificate.
+        let blocked_node = actual.nodes.last().unwrap();
+        let blocked_payload = engine
+            .memo()
+            .logical_expr(blocked_node.logical)
+            .unwrap()
+            .payload;
+        let previous_origin = state.metadata[&blocked_payload].origin_rule;
+        state
+            .metadata
+            .get_mut(&blocked_payload)
+            .unwrap()
+            .origin_rule = Some(RuleId(999));
+        let mut partial = quality_properties::SelectedQualityProperties::default();
+        assert!(
+            inspect_quality_candidate(engine.memo(), reference, &state, &mut partial)
+                .unwrap()
+                .is_none()
+        );
+        let completed_locals = partial.contract_builds;
+        assert!(completed_locals > 0);
+        assert!(
+            inspect_quality_candidate(engine.memo(), reference, &state, &mut partial)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            partial.contract_builds, completed_locals,
+            "a root-level miss cannot discard already completed local work"
+        );
+        state
+            .metadata
+            .get_mut(&blocked_payload)
+            .unwrap()
+            .origin_rule = previous_origin;
+        assert_eq!(
+            planner_quality_evidence(
+                engine.memo(),
+                reference,
+                &winner,
+                &state,
+                &mut partial,
                 &super::super::quality::QualityBundleRegistry::default()
             )
             .unwrap()

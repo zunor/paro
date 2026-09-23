@@ -286,7 +286,6 @@ struct QualityCandidateInspection {
     shape: NativeQualityShape,
     cte_producers: BTreeSet<usize>,
     cte_consumers: BTreeSet<usize>,
-    cte_producer_witnesses: BTreeSet<usize>,
     has_filter: bool,
     has_get: bool,
     has_join: bool,
@@ -380,8 +379,6 @@ fn inspect_quality_candidate(
             shape.runtime_filter_joins = shape.runtime_filter_joins.saturating_add(1);
         }
     }
-    let cte_producer_witnesses =
-        quality_domain::cte_domain_witnesses_with_properties(memo, &dag, state, Some(properties));
     Ok(Some(QualityCandidateInspection {
         reads: properties.fact_reads(&dag.nodes),
         nodes: dag.nodes.clone(),
@@ -390,7 +387,6 @@ fn inspect_quality_candidate(
         shape,
         cte_producers,
         cte_consumers,
-        cte_producer_witnesses,
         has_filter,
         has_get,
         has_join,
@@ -632,7 +628,6 @@ fn planner_quality_evidence(
         mut shape,
         cte_producers,
         cte_consumers,
-        cte_producer_witnesses,
         has_filter,
         has_get,
         has_join,
@@ -697,9 +692,20 @@ fn planner_quality_evidence(
         && has_cte_producer
         && !cte_consumers.is_empty()
         && cte_consumers.is_subset(&cte_producers)
-        && cte_producers.is_subset(&cte_producer_witnesses)
     {
-        facts.insert(BundleFact::CteConsumerDemand);
+        // This is a demanded property, not unconditional inspection work.
+        // Missing predicate-domain evidence has already returned None above;
+        // computing CTE coverage for that incomplete candidate cannot inform
+        // policy certification or quality production.
+        let witnesses = quality_domain::cte_domain_witnesses_with_properties(
+            memo,
+            &dag,
+            state,
+            Some(properties),
+        );
+        if cte_producers.is_subset(&witnesses) {
+            facts.insert(BundleFact::CteConsumerDemand);
+        }
     }
     if has_aggregate || has_join {
         facts.insert(BundleFact::NullSemantics);

@@ -113,10 +113,15 @@ impl LocalContract {
 struct NodeProperties {
     node: QualityCandidateNode,
     contract: LocalContract,
+    choice: Fingerprint,
+    derived: Option<DerivedProperties>,
+}
+
+#[derive(Debug)]
+struct DerivedProperties {
     read: PatternRead,
     children: Box<[u64]>,
     revision: u64,
-    choice: Fingerprint,
     aggregate: SelectedAggregateRegionShape,
     contains_union: bool,
     is_union: bool,
@@ -130,7 +135,8 @@ struct NodeProperties {
 /// No frontier membership or cost is stored here. Candidate identities are
 /// query-local and never reused; retained entries are bounded by the same
 /// winner archive which owns the exact choices. A failed derivation is not a
-/// completed property, and does not publish a partially refreshed node.
+/// completed property. A completed local contract may outlive an incomplete
+/// parent; subtree properties are published only after their children finish.
 #[derive(Debug, Default)]
 pub(super) struct SelectedQualityProperties {
     pub(super) dag: selected_dag::SelectedDagStore,
@@ -156,7 +162,6 @@ impl SelectedQualityProperties {
         let mut reads = Vec::with_capacity(dag.nodes.len());
         let mut dirty = vec![false; dag.nodes.len()];
         let mut pending = Vec::new();
-        let mut contracts = Vec::with_capacity(dag.nodes.len());
         for (index, node) in dag.nodes.iter().enumerate() {
             let Some(winner) = memo.resolve_child_winner(node.reference) else {
                 return Ok(false);
@@ -196,7 +201,7 @@ impl SelectedQualityProperties {
                 }
             }
             // Every referenced child is also a reachable DAG node and is
-            // resolved by this loop before any properties are published.
+            // resolved by this loop before any subtree properties are published.
             let join_region = winner.joint_cost_proof.is_some();
             let contract_current =
                 self.nodes
@@ -211,9 +216,8 @@ impl SelectedQualityProperties {
                                 join_region,
                             )
                     });
-            let contract = if contract_current {
+            if contract_current {
                 self.contract_reuses = self.contract_reuses.saturating_add(1);
-                None
             } else {
                 let Some(contract) =
                     LocalContract::derive(logical, physical, metadata, payload, state, join_region)
@@ -221,30 +225,42 @@ impl SelectedQualityProperties {
                     return Ok(false);
                 };
                 self.contract_builds = self.contract_builds.saturating_add(1);
-                Some(contract)
-            };
+                self.nodes.insert(
+                    node.reference.candidate,
+                    NodeProperties {
+                        node: node.clone(),
+                        contract,
+                        choice: candidate_choice_fingerprint(
+                            node.reference,
+                            winner,
+                            logical,
+                            physical,
+                        ),
+                        derived: None,
+                    },
+                );
+            }
             let read = PatternRead::facts_from_group(memo, node.reference.group)?;
-            let current = contract_current
-                && self
-                    .nodes
-                    .get(&node.reference.candidate)
-                    .is_some_and(|previous| {
-                        previous.node == *node
-                            && previous.read == read
-                            && previous.children.len() == node.children.len()
-                            && node.children.iter().zip(previous.children.iter()).all(
-                                |(child, revision)| {
-                                    self.nodes
-                                        .get(&child.candidate)
-                                        .is_some_and(|child| child.revision == *revision)
-                                },
-                            )
-                    });
+            let current = self
+                .nodes
+                .get(&node.reference.candidate)
+                .and_then(|node| node.derived.as_ref())
+                .is_some_and(|previous| {
+                    previous.read == read
+                        && previous.children.len() == node.children.len()
+                        && node.children.iter().zip(previous.children.iter()).all(
+                            |(child, revision)| {
+                                self.nodes
+                                    .get(&child.candidate)
+                                    .and_then(|node| node.derived.as_ref())
+                                    .is_some_and(|child| child.revision == *revision)
+                            },
+                        )
+                });
             if !current {
                 pending.push(index);
             }
             reads.push(read);
-            contracts.push(contract);
         }
         while let Some(index) = pending.pop() {
             if std::mem::replace(&mut dirty[index], true) {
@@ -269,15 +285,9 @@ impl SelectedQualityProperties {
             let children = node
                 .children
                 .iter()
-                .map(|child| self.nodes[&child.candidate].revision)
+                .map(|child| self.derived(child.candidate).revision)
                 .collect();
             let Some(logical) = memo.logical_expr(node.logical) else {
-                return Ok(false);
-            };
-            let Some(physical) = memo.physical_expr(node.physical) else {
-                return Ok(false);
-            };
-            let Some(winner) = memo.resolve_child_winner(reference) else {
                 return Ok(false);
             };
             let Some(payload) = state.payloads.logical.get(logical.payload.index()) else {
@@ -294,7 +304,7 @@ impl SelectedQualityProperties {
             // Diagnostic occurrence counts are computed from the unique-node
             // inspection, not by summing shared descendants twice.
             for child in node.children.iter() {
-                let properties = &self.nodes[&child.candidate];
+                let properties = self.derived(child.candidate);
                 aggregate.aggregates |= properties.aggregate.aggregates;
                 aggregate.joins |= properties.aggregate.joins;
                 aggregate.decomposed |= properties.aggregate.decomposed;
@@ -335,42 +345,33 @@ impl SelectedQualityProperties {
                 .checked_add(1)
                 .ok_or_else(|| paro_error::internal("selected property revision exhausted"))?;
             self.next_revision = revision;
-            let choice = if contracts[index].is_none() {
-                self.nodes[&reference.candidate].choice
-            } else {
-                candidate_choice_fingerprint(reference, winner, logical, physical)
-            };
-            let contract = contracts[index]
-                .take()
-                .or_else(|| {
-                    self.nodes
-                        .remove(&reference.candidate)
-                        .map(|previous| previous.contract)
-                })
-                .ok_or_else(|| paro_error::internal("selected local contract missing"))?;
-            self.nodes.insert(
-                reference.candidate,
-                NodeProperties {
-                    node: node.clone(),
-                    contract,
-                    read,
-                    children,
-                    revision,
-                    choice,
-                    aggregate,
-                    contains_union,
-                    is_union,
-                    pending_domain,
-                    region_facts: BTreeMap::new(),
-                },
-            );
+            self.nodes
+                .get_mut(&reference.candidate)
+                .ok_or_else(|| paro_error::internal("selected local contract missing"))?
+                .derived = Some(DerivedProperties {
+                read,
+                children,
+                revision,
+                aggregate,
+                contains_union,
+                is_union,
+                pending_domain,
+                region_facts: BTreeMap::new(),
+            });
             self.builds = self.builds.saturating_add(1);
         }
         Ok(true)
     }
 
     pub(super) fn revision(&self, candidate: CandidateId) -> u64 {
-        self.nodes[&candidate].revision
+        self.derived(candidate).revision
+    }
+
+    fn derived(&self, candidate: CandidateId) -> &DerivedProperties {
+        self.nodes[&candidate]
+            .derived
+            .as_ref()
+            .expect("selected subtree properties are consumed after postorder refresh")
     }
 
     pub(super) fn contract(&self, candidate: CandidateId) -> &LocalContract {
@@ -383,7 +384,7 @@ impl SelectedQualityProperties {
         ReadSet::new(
             nodes
                 .iter()
-                .map(|node| self.nodes[&node.reference.candidate].read),
+                .map(|node| self.derived(node.reference.candidate).read),
         )
     }
 
@@ -394,7 +395,14 @@ impl SelectedQualityProperties {
         goal: OptimizationGoal,
         nodes: &selected_dag::QualityNodeMap<'_>,
     ) -> Option<Fingerprint> {
-        if let Some(fingerprint) = self.nodes.get(&root.candidate)?.region_facts.get(&goal) {
+        if let Some(fingerprint) = self
+            .nodes
+            .get(&root.candidate)?
+            .derived
+            .as_ref()?
+            .region_facts
+            .get(&goal)
+        {
             return Some(*fingerprint);
         }
         // An arm enumerated from this root is already in its closure. The
@@ -402,6 +410,8 @@ impl SelectedQualityProperties {
         let fingerprint = collect_quality_region_fact_fingerprint(memo, root, root, goal, nodes)?;
         self.nodes
             .get_mut(&root.candidate)?
+            .derived
+            .as_mut()?
             .region_facts
             .insert(goal, fingerprint);
         Some(fingerprint)
@@ -412,15 +422,15 @@ impl SelectedQualityProperties {
     }
 
     pub(super) fn aggregate_shape(&self, candidate: CandidateId) -> SelectedAggregateRegionShape {
-        self.nodes[&candidate].aggregate
+        self.derived(candidate).aggregate
     }
 
     pub(super) fn is_union(&self, candidate: CandidateId) -> bool {
-        self.nodes[&candidate].is_union
+        self.derived(candidate).is_union
     }
 
     pub(super) fn contains_union(&self, candidate: CandidateId) -> bool {
-        self.nodes[&candidate].contains_union
+        self.derived(candidate).contains_union
     }
 
     pub(super) fn pending_transfers(
@@ -429,7 +439,7 @@ impl SelectedQualityProperties {
     ) -> Option<Box<[CandidateId]>> {
         let mut pending = Vec::new();
         for node in nodes {
-            if self.nodes[&node.reference.candidate].pending_domain? {
+            if self.derived(node.reference.candidate).pending_domain? {
                 pending.push(node.reference.candidate);
             }
         }

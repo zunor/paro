@@ -135,6 +135,9 @@ already satisfies it.
   statistics. Canonical child bindings and exact-result guarantees remain live
   checks. A fact refresh reuses the immutable choice identity, not an old fact
   certificate; it must not rebuild another graph just to inspect capabilities.
+  Completed local contracts survive an incomplete parent, but do not imply
+  completed subtree properties. Derive CTE coverage only after prerequisite
+  domain evidence exists and the selected candidate can consume that fact.
 - Parent runtime filters, shared producers and phase composition can change
   child ordering. A local scalar winner is not always sufficient.
 - Continuation pruning is a partial order, while ObjectiveProfile provides
