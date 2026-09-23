@@ -6,6 +6,7 @@ EXPLAIN SELECT 1;
 EXPLAIN (VERBOSE) SELECT 1;
 
 -- @query json
+-- @normalize explain_logical_ids
 EXPLAIN SELECT 1 FORMAT JSON;
 
 DROP TABLE IF EXISTS explain_topn_rt;
@@ -44,6 +45,7 @@ FROM explain_piecewise_left AS l
 JOIN explain_piecewise_right AS r ON l.id < r.id;
 
 -- @query json
+-- @normalize explain_logical_ids
 EXPLAIN
 SELECT *
 FROM explain_piecewise_left AS l
@@ -73,6 +75,7 @@ FROM explain_sort_range_left AS l
 LEFT JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi;
 
 -- @query json
+-- @normalize explain_logical_ids
 EXPLAIN
 SELECT *
 FROM explain_sort_range_left AS l

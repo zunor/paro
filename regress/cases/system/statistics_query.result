@@ -47,22 +47,22 @@ PROJECTION  (rows=1)
   Cardinality: [1, 1, 1]
   Output Schema: "b.payload" VARCHAR, "s.id" INTEGER
   ->  HASH_JOIN  (rows=1)
-    Join Type: INNER
-    Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=1ace450314601561e2d315a64e9f4813
-    Build Index: integer_build_time
-    Join Condition: b.id = s.id
-    Cardinality: [1, 1, 1]
-    Output Schema: b.payload VARCHAR, s.id INTEGER
-    ->  ROWSET_SCAN on public.stats_big b  (rows=5)
-      Column IDs: 0, 1
-      Columns: id, payload
-      Cardinality: [5, 5, 5]
-      Output Schema: b.id INTEGER, b.payload VARCHAR
-    ->  ROWSET_SCAN on public.stats_small s  (rows=1)
-      Column IDs: 0
-      Columns: id
-      Cardinality: [1, 1, 1]
-      Output Schema: s.id INTEGER
+        Join Type: INNER
+        Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=339c9fa8da5e94472d6a002ae703c7f8
+        Build Index: integer_build_time
+        Join Condition: b.id = s.id
+        Cardinality: [1, 1, 1]
+        Output Schema: b.payload VARCHAR, s.id INTEGER
+        ->  ROWSET_SCAN on public.stats_big b  (rows=5)
+              Column IDs: 0, 1
+              Columns: id, payload
+              Cardinality: [5, 5, 5]
+              Output Schema: b.id INTEGER, b.payload VARCHAR
+        ->  ROWSET_SCAN on public.stats_small s  (rows=1)
+              Column IDs: 0
+              Columns: id
+              Cardinality: [1, 1, 1]
+              Output Schema: s.id INTEGER
 
 SELECT s.id, b.payload
 FROM stats_small AS s

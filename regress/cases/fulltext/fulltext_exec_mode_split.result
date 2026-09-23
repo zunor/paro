@@ -24,13 +24,13 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  FULLTEXT_SCAN on public.ft_exec_mode_split  (rows=1)
-    Search Definition: <search-definition-id>
-    Search Generation: <search-generation-id>
-    Search Root: <search-root-id>
-    Search Capability: Queryable
-    Search Candidate: full text
-    Column: content
-    Mode: Filter
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: queryable
+        Search Candidate: full text
+        Column: content
+        Mode: filter
 
 -- @normalize explain_search_ids
 EXPLAIN
@@ -46,13 +46,13 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  FULLTEXT_SCAN on public.ft_exec_mode_split  (rows=1)
-    Search Definition: <search-definition-id>
-    Search Generation: <search-generation-id>
-    Search Root: <search-root-id>
-    Search Capability: Queryable
-    Search Candidate: full text
-    Column: content
-    Mode: TopK { limit: 2 }
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: queryable
+        Search Candidate: full text
+        Column: content
+        Mode: top_k:2
 
 SELECT id
 FROM ft_exec_mode_split

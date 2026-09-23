@@ -68,20 +68,20 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: gt.person_name, gt.company_name, gt.city_name
   ->  GRAPH_PROJECT  (rows=2)
-    Output: person_name, company_name, city_name
-    ->  GRAPH_EXPAND  (rows=2)
-      Graph: start_graph
-      Edge Label: worksat
-      Direction: Backward
-      ->  GRAPH_EXPAND  (rows=1)
-        Graph: start_graph
-        Edge Label: locatedin
-        Direction: Forward
-        ->  GRAPH_SCAN  (rows=1)
-          Graph: start_graph
-          Vertex Label: company
-          Table: ssp_company
-          Filter: <pushed down>
+        Output: person_name, company_name, city_name
+        ->  GRAPH_EXPAND  (rows=2)
+              Graph: start_graph
+              Edge Label: worksat
+              Direction: backward
+              ->  GRAPH_EXPAND  (rows=1)
+                    Graph: start_graph
+                    Edge Label: locatedin
+                    Direction: forward
+                    ->  GRAPH_SCAN  (rows=1)
+                          Graph: start_graph
+                          Vertex Label: company
+                          Table: ssp_company
+                          Filter: <pushed down>
 
 SELECT * FROM GRAPH_TABLE(start_graph
     MATCH (p:Person)-[w:WorksAt]->(c:Company WHERE c.name = 'Acme')-[l:LocatedIn]->(city:City)

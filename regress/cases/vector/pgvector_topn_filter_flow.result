@@ -40,15 +40,15 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: l1_distance(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
-    Limit: 2
-    ->  PROJECTION  (rows=2)
-      Output: id, l1_distance(public.vector_topn_case.emb, [1, 0, 0])
-      ->  ROWSET_SCAN on public.vector_topn_case  (rows=2)
-        Column IDs: 0, 2
-        Columns: id, emb
-        Pushed Predicate: category = 'x'
-        Late Materialize: auto
+        Sort Key: l1_distance(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
+        Limit: 2
+        ->  PROJECTION  (rows=2)
+              Output: id, l1_distance(public.vector_topn_case.emb, [1, 0, 0])
+              ->  ROWSET_SCAN on public.vector_topn_case  (rows=2)
+                    Column IDs: 0, 2
+                    Columns: id, emb
+                    Pushed Predicate: category = 'x'
+                    Late Materialize: auto
 
 SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]', id LIMIT 2;
 id

@@ -46,20 +46,21 @@ FROM join_explain_piecewise_l AS l
 JOIN join_explain_piecewise_r AS r ON l.id < r.id;
 
 -- @query json
+-- @normalize explain_logical_ids
 EXPLAIN
 SELECT l.id, r.id
 FROM join_explain_piecewise_l AS l
 JOIN join_explain_piecewise_r AS r ON l.id < r.id
 FORMAT JSON;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.id, r.id
 FROM join_explain_piecewise_l AS l
 JOIN join_explain_piecewise_r AS r ON l.id < r.id;
 
 -- @query json
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.id, r.id
 FROM join_explain_piecewise_l AS l
@@ -89,20 +90,21 @@ FROM join_explain_sort_range_l AS l
 LEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi;
 
 -- @query json
+-- @normalize explain_logical_ids
 EXPLAIN
 SELECT l.x, r.lo, r.hi
 FROM join_explain_sort_range_l AS l
 LEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi
 FORMAT JSON;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.x, r.lo, r.hi
 FROM join_explain_sort_range_l AS l
 LEFT JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi;
 
 -- @query json
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.x, r.lo, r.hi
 FROM join_explain_sort_range_l AS l
@@ -131,28 +133,28 @@ SELECT l.k, r.payload
 FROM join_explain_hash_l AS l
 LEFT JOIN join_explain_hash_r AS r ON l.k = r.k;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.k, r.payload
 FROM join_explain_hash_l AS l
 LEFT JOIN join_explain_hash_r AS r ON l.k = r.k;
 
 -- @query json
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.k, r.payload
 FROM join_explain_hash_l AS l
 LEFT JOIN join_explain_hash_r AS r ON l.k = r.k
 FORMAT JSON;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.k
 FROM join_explain_hash_l AS l
 SEMI JOIN join_explain_hash_r AS r ON l.k IS NOT DISTINCT FROM r.k;
 
 -- @query json
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.k
 FROM join_explain_hash_l AS l
@@ -178,14 +180,14 @@ SET max_temp_directory_size = '256MB';
 SET force_external = true;
 SET threads = 1;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.k
 FROM join_explain_spill_l AS l
 LEFT JOIN join_explain_spill_r AS r ON l.k = r.k;
 
 -- @query json
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT l.k
 FROM join_explain_spill_l AS l

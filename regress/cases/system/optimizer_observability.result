@@ -58,24 +58,24 @@ PROJECTION  (rows=1)
   Cardinality: [0, 1, 1]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=1)
-    Sort Key: bm25(public.obs_docs.title, 'graph') DESC NULLS FIRST, id ASC NULLS LAST
-    Limit: 2
-    Cardinality: [0, 1, 1]
-    Output Schema: id INTEGER
-    ->  PROJECTION  (rows=1)
-      Output: id, bm25(public.obs_docs.title, 'graph')
-      Cardinality: [0, 1, 1]
-      Output Schema: id INTEGER, expression_2 FLOAT
-      ->  FULLTEXT_SCAN on public.obs_docs  (rows=1)
-        Search Definition: <search-definition-id>
-        Search Generation: <search-generation-id>
-        Search Root: <search-root-id>
-        Search Capability: Queryable
-        Search Candidate: full text
-        Column: title
-        Mode: Filter
+        Sort Key: bm25(public.obs_docs.title, 'graph') DESC NULLS FIRST, id ASC NULLS LAST
+        Limit: 2
         Cardinality: [0, 1, 1]
-        Output Schema: public.obs_docs.id INTEGER, public.obs_docs.title VARCHAR
+        Output Schema: id INTEGER
+        ->  PROJECTION  (rows=1)
+              Output: id, bm25(public.obs_docs.title, 'graph')
+              Cardinality: [0, 1, 1]
+              Output Schema: id INTEGER, expression_2 FLOAT
+              ->  FULLTEXT_SCAN on public.obs_docs  (rows=1)
+                    Search Definition: <search-definition-id>
+                    Search Generation: <search-generation-id>
+                    Search Root: <search-root-id>
+                    Search Capability: queryable
+                    Search Candidate: full text
+                    Column: title
+                    Mode: filter
+                    Cardinality: [0, 1, 1]
+                    Output Schema: public.obs_docs.id INTEGER, public.obs_docs.title VARCHAR
 
 DROP TABLE obs_docs;
 DROP TABLE

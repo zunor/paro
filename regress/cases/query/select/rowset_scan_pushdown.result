@@ -138,26 +138,26 @@ PROJECTION  (rows=1)
   Cardinality: [1, 1, 1]
   Output Schema: "COUNT(*)" BIGINT
   ->  AGGREGATE  (rows=1)
-    Aggregates: count_star(*)
-    Cardinality: [1, 1, 1]
-    Output Schema: aggregate_state_1 BIGINT
-    ->  HASH_JOIN  (rows=19)
-      Join Type: INNER
-      Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=7c33b538f8f822eea63c3dd24eb3dc62
-      Build Index: integer_build_time
-      Join Condition: c.k = d.k
-      Cardinality: [10, 19, 29]
-      Output Schema: (none)
-      ->  ROWSET_SCAN on public.rowset_pushdown_case c  (rows=64)
-        Column IDs: 1
-        Columns: k
-        Cardinality: [64, 64, 64]
-        Output Schema: c.k INTEGER
-      ->  ROWSET_SCAN on public.rowset_pushdown_dim d  (rows=3)
-        Column IDs: 0
-        Columns: k
-        Cardinality: [3, 3, 3]
-        Output Schema: d.k INTEGER
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  HASH_JOIN  (rows=19)
+              Join Type: INNER
+              Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=6a676810f14b006143d6301ea62ff8d5
+              Build Index: integer_build_time
+              Join Condition: c.k = d.k
+              Cardinality: [10, 19, 29]
+              Output Schema: (none)
+              ->  ROWSET_SCAN on public.rowset_pushdown_case c  (rows=64)
+                    Column IDs: 1
+                    Columns: k
+                    Cardinality: [64, 64, 64]
+                    Output Schema: c.k INTEGER
+              ->  ROWSET_SCAN on public.rowset_pushdown_dim d  (rows=3)
+                    Column IDs: 0
+                    Columns: k
+                    Cardinality: [3, 3, 3]
+                    Output Schema: d.k INTEGER
 
 EXPLAIN (VERBOSE)
 SELECT id FROM rowset_pushdown_case ORDER BY score ASC LIMIT 5;
@@ -270,25 +270,25 @@ PROJECTION  (rows=3)
   Cardinality: [3, 3, 3]
   Output Schema: phone VARCHAR, wide VARCHAR
   ->  ROW_FETCH  (rows=3)
-    Output: phone, wide
-    Sources: 1
-    Cardinality: [3, 3, 3]
-    Output Schema: phone VARCHAR, wide VARCHAR
-    ->  TOP_N  (rows=3)
-      Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
-      Limit: 3
-      Cardinality: [3, 3, 3]
-      Output Schema: __late_rowid_6 BIGINT
-      ->  PROJECTION  (rows=3333)
-        Output: id, rowid
-        Cardinality: [1666, 3333, 5000]
-        Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
-        ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
-          Column IDs: 0
-          Columns: id, rowid
-          Pushed Predicate: phone IN ('13x', '31y')
-          Cardinality: [1666, 3333, 5000]
-          Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
+        Output: phone, wide
+        Sources: 1
+        Cardinality: [3, 3, 3]
+        Output Schema: phone VARCHAR, wide VARCHAR
+        ->  TOP_N  (rows=3)
+              Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
+              Limit: 3
+              Cardinality: [3, 3, 3]
+              Output Schema: __late_rowid_6 BIGINT
+              ->  PROJECTION  (rows=3333)
+                    Output: id, rowid
+                    Cardinality: [1666, 3333, 5000]
+                    Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
+                    ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
+                          Column IDs: 0
+                          Columns: id, rowid
+                          Pushed Predicate: phone IN ('13x', '31y')
+                          Cardinality: [1666, 3333, 5000]
+                          Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
 
 SELECT phone, wide
 FROM matched_prefix_late_payload_case
