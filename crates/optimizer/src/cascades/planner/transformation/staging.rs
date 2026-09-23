@@ -606,7 +606,6 @@ pub(super) struct StagingTarget {
     pub(super) budget_class: TransformationBudgetClass,
     pub(super) input_context: OptimizationContextId,
     pub(super) child_context: OptimizationContextId,
-    pub(super) refined_cardinality_kind: Option<CardinalityRecipeKind>,
 }
 
 pub(super) struct StagingRegionRequirements {
@@ -634,7 +633,6 @@ pub(super) fn stage_transformed_expression(
                 budget_class,
                 input_context,
                 child_context,
-                refined_cardinality_kind,
             },
         regions:
             StagingRegionRequirements {
@@ -703,7 +701,6 @@ pub(super) fn stage_transformed_expression(
         inherited_runtime_filter_facet: Option<Fingerprint>,
         node_context: OptimizationContextId,
         target_child_context: Option<OptimizationContextId>,
-        refined_cardinality_kind: Option<CardinalityRecipeKind>,
     }
 
     fn resolve_group_hole_reference(
@@ -801,7 +798,6 @@ pub(super) fn stage_transformed_expression(
             inherited_runtime_filter_facet,
             node_context,
             target_child_context,
-            refined_cardinality_kind,
         } = request;
         let (id, stats, semantic_operator, settled_layout, source_proofs, resident) = match input {
             NodeStagingInput::Settled {
@@ -1123,19 +1119,18 @@ pub(super) fn stage_transformed_expression(
         let mut cardinality =
             derive_group_cardinality(&semantic_operator, &key.children, &stats, logical_identity);
         if let Some(target) = target {
-            cardinality = if let Some(kind) = refined_cardinality_kind {
-                cardinality.with_kind(kind)
-            } else {
-                let target = memo.canonical_group(target);
-                memo.group(target)
-                    .ok_or_else(|| {
-                        paro_error::internal(
-                            "shape-only transformation targets an unknown cardinality group",
-                        )
-                    })?
-                    .cardinality
-                    .clone()
-            };
+            // Equivalence proves the same relation, not a new observation.
+            // Another tree shape cannot promote or widen the group estimate
+            // because its rule belongs to a refinement allowlist. New child
+            // relations derive their estimates above; column/constraint facts
+            // merge separately, and hard bounds constrain the group estimate.
+            cardinality = memo
+                .group(memo.canonical_group(target))
+                .ok_or_else(|| {
+                    paro_error::internal("transformation targets an unknown cardinality group")
+                })?
+                .cardinality
+                .clone();
         }
 
         if target.is_none() {
@@ -1194,12 +1189,7 @@ pub(super) fn stage_transformed_expression(
                 // domain. Equivalent facts intersect at the group boundary;
                 // no payload-local snapshot is allowed to freeze the older
                 // estimate.
-                memo.update_group_facts(group, |existing, existing_cardinality| {
-                    existing.merge_equivalent_facts(&logical_properties)?;
-                    *existing_cardinality =
-                        std::mem::take(existing_cardinality).canonical_with(cardinality.clone());
-                    Ok(())
-                })?;
+                memo.merge_derived_group_facts(group, &logical_properties, cardinality.clone())?;
                 return Ok(Some((
                     NodeState {
                         id,
@@ -1916,9 +1906,6 @@ pub(super) fn stage_transformed_expression(
                                 child_context
                             },
                             target_child_context: is_root.then_some(child_context),
-                            refined_cardinality_kind: is_root
-                                .then_some(refined_cardinality_kind)
-                                .flatten(),
                         },
                         child_states,
                     )?
@@ -2063,9 +2050,6 @@ pub(super) fn stage_transformed_expression(
                                 child_context
                             },
                             target_child_context: is_root.then_some(child_context),
-                            refined_cardinality_kind: is_root
-                                .then_some(refined_cardinality_kind)
-                                .flatten(),
                         },
                         child_states,
                     )?
@@ -2299,7 +2283,6 @@ mod tests {
                     budget_class: TransformationBudgetClass::Local,
                     input_context: OptimizationContextId(0),
                     child_context: OptimizationContextId(0),
-                    refined_cardinality_kind: None,
                 },
                 regions: StagingRegionRequirements {
                     preserved_facet: None,
@@ -2354,7 +2337,6 @@ mod tests {
                     budget_class: TransformationBudgetClass::Local,
                     input_context: OptimizationContextId(0),
                     child_context: OptimizationContextId(0),
-                    refined_cardinality_kind: None,
                 },
                 regions: StagingRegionRequirements {
                     preserved_facet: None,
@@ -2434,7 +2416,6 @@ mod tests {
                     budget_class: TransformationBudgetClass::Local,
                     input_context: OptimizationContextId(0),
                     child_context: OptimizationContextId(0),
-                    refined_cardinality_kind: None,
                 },
                 regions: StagingRegionRequirements {
                     preserved_facet: None,
@@ -2521,7 +2502,6 @@ mod tests {
                     budget_class: TransformationBudgetClass::Local,
                     input_context: OptimizationContextId(0),
                     child_context: OptimizationContextId(0),
-                    refined_cardinality_kind: None,
                 },
                 regions: StagingRegionRequirements {
                     preserved_facet: None,
@@ -2586,7 +2566,6 @@ mod tests {
                         budget_class: TransformationBudgetClass::Local,
                         input_context: OptimizationContextId(0),
                         child_context: OptimizationContextId(0),
-                        refined_cardinality_kind: None,
                     },
                     regions: StagingRegionRequirements {
                         preserved_facet: None,
@@ -2671,7 +2650,6 @@ mod tests {
                     budget_class: TransformationBudgetClass::Local,
                     input_context: OptimizationContextId(0),
                     child_context: OptimizationContextId(0),
-                    refined_cardinality_kind: None,
                 },
                 regions: StagingRegionRequirements {
                     preserved_facet: None,
@@ -2749,7 +2727,6 @@ mod tests {
                                 budget_class: TransformationBudgetClass::Local,
                                 input_context: OptimizationContextId(1),
                                 child_context: OptimizationContextId(1),
-                                refined_cardinality_kind: None,
                             },
                             regions: StagingRegionRequirements {
                                 preserved_facet: None,
@@ -2784,7 +2761,7 @@ mod tests {
             test_base_get(2, 30_003, "second_dimension", 30),
             20,
         );
-        let transformed = equality_join(
+        let mut transformed = equality_join(
             equality_join(
                 test_base_get(0, 30_001, "fact", 20_000),
                 test_base_get(2, 30_003, "second_dimension", 30),
@@ -2793,9 +2770,15 @@ mod tests {
             test_base_get(1, 30_002, "first_dimension", 20),
             20,
         );
+        // A different legal enumeration can carry a different local estimate.
+        // Its equivalence proof does not certify that estimate as a stronger
+        // group fact, even for JoinRegionEnumeration (formerly allowlisted).
+        transformed.stats.estimated_cardinality =
+            Some(paro_planner::plan::CardinalityEstimate::exact(999));
         let mut input =
             MemoBuilder::build(baseline, BindContext::new(), SearchBudget::default()).unwrap();
         let root = input.root;
+        let root_cardinality = input.memo.group(root).unwrap().cardinality.clone();
         let state = input.planner_state.clone();
         state.write().unwrap().session = Some(TestStatementContextBuilder::minimal().build());
         let mut transaction = TransformContext::new(&mut input.memo, root);
@@ -2821,9 +2804,6 @@ mod tests {
                                 budget_class: TransformationBudgetClass::Local,
                                 input_context: OptimizationContextId(0),
                                 child_context: OptimizationContextId(0),
-                                refined_cardinality_kind: Some(
-                                    CardinalityRecipeKind::ConstraintRefined,
-                                ),
                             },
                             regions: StagingRegionRequirements {
                                 preserved_facet: None,
@@ -2840,6 +2820,12 @@ mod tests {
             )
             .unwrap()
             .expect("reordered join should stage");
+
+        assert_eq!(staged.cardinality, root_cardinality);
+        assert_eq!(
+            transaction.memo().group(root).unwrap().cardinality,
+            root_cardinality
+        );
 
         let planner_state = state.read().unwrap();
         let metadata = planner_state

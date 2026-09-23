@@ -185,21 +185,6 @@ impl PlannerTransformation {
             Self::ScalarAggregateWindow => SCALAR_AGGREGATE_WINDOW_RULE,
         }
     }
-
-    /// Only proof-producing rewrites may replace the group's canonical
-    /// statistics recipe. Shape-only alternatives keep the normalized recipe
-    /// so enumeration cannot vote estimates up or down.
-    const fn cardinality_recipe_kind(self) -> Option<CardinalityRecipeKind> {
-        match self {
-            Self::CteInline
-            | Self::CteDemandPushdown
-            | Self::CteFilterPushdown
-            | Self::JoinRegionEnumeration
-            | Self::AggregateJoinSubsumption
-            | Self::JoinElimination => Some(CardinalityRecipeKind::ConstraintRefined),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1600,9 +1585,6 @@ impl TransformationRule for PlannerTransformationRule {
                                 budget_class: self.budget_class(),
                                 input_context,
                                 child_context,
-                                refined_cardinality_kind: self
-                                    .transformation
-                                    .cardinality_recipe_kind(),
                             },
                             regions: StagingRegionRequirements {
                                 preserved_facet: preserved_region_facet,

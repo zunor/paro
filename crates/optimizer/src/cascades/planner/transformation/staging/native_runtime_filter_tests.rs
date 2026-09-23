@@ -287,7 +287,6 @@ mod native_staging_rf_oracle {
                                 budget_class: TransformationBudgetClass::Local,
                                 input_context: source.input_context,
                                 child_context: source.child_context,
-                                refined_cardinality_kind: None,
                             },
                             regions: StagingRegionRequirements {
                                 preserved_facet: source.required_region_facet,

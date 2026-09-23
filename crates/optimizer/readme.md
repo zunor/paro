@@ -73,6 +73,11 @@ already satisfies it.
 - Relation facts and statistics have an explicit owner and revision.
   Inserting an equivalent alternative must not “vote” for a different
   cardinality using arrival order or a smaller fingerprint.
+  Equivalent-publication merges retain the estimate for unchanged facts;
+  transformed roots inherit their target relation's estimate. Explicit
+  statistics refreshes and new constraints remain separate fact updates, and
+  true group merges still combine peer uncertainty. A rule's identity or
+  equivalence proof alone is not a new statistics observation.
 - Observed evidence, estimated points, proven bounds and unknown values are
   different. Missing information must not silently become one row.
 - Cardinality measurements must match the estimate's node, port, occurrence,

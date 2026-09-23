@@ -345,8 +345,8 @@ pub enum CardinalityRecipeKind {
     Statistics,
     /// An exact row-count dependency on a row-preserving input group.
     RowPreservingInput,
-    /// A rewrite whose equivalence proof exposes stronger relational-domain
-    /// information to the estimator (for example aggregate subsumption).
+    /// An estimator consuming an explicit relational constraint. A rewrite
+    /// name or equivalence proof alone is not this statistical evidence.
     ConstraintRefined,
     /// A joint estimator over an associative region.
     JoinRegion,
@@ -355,8 +355,9 @@ pub enum CardinalityRecipeKind {
 /// Canonical, expression-independent cardinality estimate for one Memo group.
 ///
 /// `recipe` identifies relational estimation evidence, not a physical winner.
-/// Shape-only alternatives inherit the current group recipe; a transformation
-/// may refine it only through an explicitly declared [`CardinalityRecipeKind`].
+/// Equivalent alternatives inherit the current group recipe. New relational
+/// facts and explicit statistics refreshes own changes to that recipe; the
+/// transformation's rule identity is never estimator evidence.
 /// A true group merge combines peer uncertainty deterministically, so estimates
 /// cannot depend on rule scheduling or the eventual physical winner.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2202,6 +2203,52 @@ impl Memo {
         })
     }
 
+    /// Publish a derived equivalent relation, not a new statistics observation.
+    /// Repeated derivations of the same fact set do not vote on its estimate.
+    /// Explicit statistics refreshes use `update_group_facts`; true group
+    /// merges retain their deterministic uncertainty merge.
+    pub(crate) fn merge_derived_group_facts(
+        &mut self,
+        id: GroupId,
+        incoming: &LogicalProperties,
+        cardinality: GroupCardinality,
+    ) -> Result<GroupFactChange> {
+        let id = self.canonical_group(id);
+        let group = self.group(id).ok_or_else(|| {
+            paro_error::internal("derived fact publication references an unknown group")
+        })?;
+        if group.logical_properties == *incoming
+            && (group.cardinality.range.is_some() || !group.cardinality.inputs.is_empty())
+        {
+            // This is not a write: avoid both the rollback snapshot and the
+            // merge's temporary copy on the common identical-facts path.
+            return Ok(GroupFactChange {
+                group: id,
+                logical_changed: false,
+                statistics_changed: false,
+            });
+        }
+        self.update_group_facts(id, |existing, estimate| {
+            let before = existing.clone();
+            existing.merge_equivalent_facts(incoming)?;
+            if estimate.range.is_none() && estimate.inputs.is_empty() {
+                *estimate = cardinality;
+            } else if *existing != before {
+                // A complete stronger snapshot replaces the older estimate;
+                // incomparable fact sets retain uncertainty, never hash-rank
+                // competing estimates or elect by rule insertion order.
+                *estimate = if existing == incoming
+                    && (cardinality.range.is_some() || !cardinality.inputs.is_empty())
+                {
+                    cardinality
+                } else {
+                    std::mem::take(estimate).canonical_with(cardinality)
+                };
+            }
+            Ok(())
+        })
+    }
+
     /// Escape hatch retained for test fixtures and the Memo verifier.  Hot
     /// production paths must use [`Self::update_group_facts`] or the explicit
     /// structural/frontier APIs above.
@@ -2748,11 +2795,7 @@ impl Memo {
             )?,
             None => self.insert_logical(target, key, payload, proof)?,
         };
-        self.update_group_facts(target, |existing, existing_cardinality| {
-            existing.merge_equivalent_facts(&logical_properties)?;
-            *existing_cardinality = std::mem::take(existing_cardinality).canonical_with(cardinality);
-            Ok(())
-        })?;
+        self.merge_derived_group_facts(target, &logical_properties, cardinality)?;
         Ok(logical)
     }
 

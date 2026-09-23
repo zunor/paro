@@ -285,6 +285,124 @@ fn typed_fact_update_rolls_back_values_and_keeps_write_journal_precise() {
 }
 
 #[test]
+fn equivalent_derivations_do_not_vote_but_statistics_refresh_still_invalidates() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let properties = LogicalProperties::default();
+    let original = GroupCardinality::new(
+        Fingerprint(90),
+        CardinalityRecipeKind::Statistics,
+        80,
+        100,
+        120,
+    );
+    let group = memo.create_group(schema(1), properties.clone(), original.clone());
+    let parent = memo.create_group(
+        schema(1),
+        properties.clone(),
+        GroupCardinality::inherit(Fingerprint(91), group),
+    );
+    let before = memo.local_statistics_fingerprint(parent);
+    let source_before = memo.local_statistics_fingerprint(group);
+    let checkpoint = memo.transformation_savepoint();
+    // Neither a lower fingerprint, a different tree estimate nor a stronger
+    // looking recipe kind constitutes a new observation of this relation.
+    for expected in [1, 10_000, 30, 1] {
+        let change = memo
+            .merge_derived_group_facts(
+                group,
+                &properties,
+                GroupCardinality::new(
+                    Fingerprint(1),
+                    CardinalityRecipeKind::JoinRegion,
+                    expected,
+                    expected,
+                    expected,
+                ),
+            )
+            .unwrap();
+        assert!(!change.logical_changed && !change.statistics_changed);
+        assert_eq!(memo.group(group).unwrap().cardinality, original);
+        assert_eq!(memo.local_statistics_fingerprint(parent), before);
+    }
+    memo.rollback_transformation(checkpoint).unwrap();
+    assert!(memo.take_transformation_written_groups().is_empty());
+    // The explicit statistics owner can refresh rows even when the column
+    // facts did not change. Derived-publication dedup must not intercept it.
+    let change = memo
+        .update_group_facts(group, |_, cardinality| {
+            *cardinality = GroupCardinality::new(
+                Fingerprint(92),
+                CardinalityRecipeKind::Statistics,
+                160,
+                200,
+                240,
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(!change.logical_changed && change.statistics_changed);
+    assert_eq!(memo.cardinality_estimate(parent), Some((160, 200, 240)));
+    assert_ne!(memo.local_statistics_fingerprint(group), source_before);
+    assert_eq!(
+        memo.cardinality_dependencies(parent).collect::<Vec<_>>(),
+        vec![(group, false)]
+    );
+    // The dependency read, not recursive mutation of every parent snapshot,
+    // invalidates a consumer. Its local row-preserving recipe is unchanged.
+    assert_eq!(memo.local_statistics_fingerprint(parent), before);
+}
+
+#[test]
+fn derived_fact_refinement_preserves_constraints_dependencies_and_rollback() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let properties = LogicalProperties::default();
+    let original = GroupCardinality::new(
+        Fingerprint(10),
+        CardinalityRecipeKind::Statistics,
+        10,
+        20,
+        40,
+    );
+    let group = memo.create_group(schema(1), properties.clone(), original.clone());
+    let original_fingerprint = memo.local_statistics_fingerprint(group);
+    let checkpoint = memo.transformation_savepoint();
+    let tighter = LogicalProperties {
+        maximum_cardinality: Some(4),
+        ..properties.clone()
+    };
+    let estimate =
+        GroupCardinality::new(Fingerprint(20), CardinalityRecipeKind::Statistics, 0, 3, 8);
+    let change = memo
+        .merge_derived_group_facts(group, &tighter, estimate.clone())
+        .unwrap();
+    assert!(change.logical_changed && change.statistics_changed);
+    assert_eq!(memo.group(group).unwrap().cardinality, estimate);
+    assert_eq!(memo.cardinality_estimate(group), Some((0, 3, 4)));
+    // Republishing the old/weaker relation must not erase the new fact.
+    let change = memo
+        .merge_derived_group_facts(group, &properties, original.clone())
+        .unwrap();
+    assert!(!change.logical_changed && !change.statistics_changed);
+    assert_eq!(memo.cardinality_estimate(group), Some((0, 3, 4)));
+    memo.rollback_transformation(checkpoint).unwrap();
+    assert_eq!(memo.group(group).unwrap().cardinality, original);
+    assert_eq!(memo.group(group).unwrap().logical_properties, properties);
+    assert_eq!(
+        memo.local_statistics_fingerprint(group),
+        original_fingerprint
+    );
+
+    let unknown = memo.create_group(schema(1), properties.clone(), GroupCardinality::default());
+    let inherited = GroupCardinality::inherit(Fingerprint(30), group);
+    let change = memo
+        .merge_derived_group_facts(unknown, &properties, inherited.clone())
+        .unwrap();
+    assert!(change.statistics_changed);
+    assert_eq!(memo.group(unknown).unwrap().cardinality, inherited);
+    assert_eq!(memo.cardinality_estimate(unknown), Some((10, 20, 40)));
+}
+
+#[test]
 fn logical_insertion_contract_lowers_facts_inside_the_transaction() {
     let mut memo = Memo::new(SearchBudget::default());
     let group = memo.create_group(
