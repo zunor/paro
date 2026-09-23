@@ -1408,7 +1408,9 @@ pub struct CascadesEngine {
     quality_frontier_candidate_skip_count: u64,
     quality_frontier_certified_count: u64,
     quality_frontier_policy_rejection_count: u64,
-    quality_frontier_fact_signatures: BTreeMap<u16, u64>,
+    /// Count and first observation time for each exact fact combination.
+    /// At most 2^8 entries; reuses the quality decision's existing clock read.
+    quality_frontier_fact_signatures: BTreeMap<u16, (u64, u64)>,
     /// The last read cursor used to evaluate each immutable candidate. This
     /// is an evaluation cursor, not a certificate cache: a current cursor
     /// suppresses only another check with the same fact dependencies; a
@@ -3730,10 +3732,11 @@ impl CascadesEngine {
             let fact_signature = evidence_value.facts.iter().fold(0_u16, |signature, fact| {
                 signature | (1_u16 << fact.stable_tag())
             });
-            *self
+            let fact_observation = self
                 .quality_frontier_fact_signatures
                 .entry(fact_signature)
-                .or_default() += 1;
+                .or_insert((0, coverage_elapsed_us));
+            fact_observation.0 = fact_observation.0.saturating_add(1);
             self.note_rule_root_consumed(&evidence_value.selected_rules);
             let Some(certificate) = certificate else {
                 self.quality_frontier_policy_rejection_count = self
@@ -6853,12 +6856,52 @@ impl CascadesEngine {
             self.quality_frontier_fact_signatures
                 .iter()
                 .filter(|(signature, _)| **signature & mask == mask)
-                .map(|(_, count)| *count)
+                .map(|(_, (count, _))| *count)
                 .sum()
         };
+        let first_fact_observation = |mask: u16| {
+            self.quality_frontier_fact_signatures
+                .iter()
+                .filter(|(signature, _)| **signature & mask == mask)
+                .map(|(_, (_, first_us))| *first_us)
+                .min()
+        };
+        for (name, mask) in [
+            (
+                "quality_frontier_first_predicate_domain_us",
+                fact_bit(super::quality::BundleFact::PredicateDomain),
+            ),
+            (
+                "quality_frontier_first_join_region_us",
+                fact_bit(super::quality::BundleFact::JoinRegion),
+            ),
+            (
+                "quality_frontier_first_join_and_aggregate_us",
+                fact_bit(super::quality::BundleFact::JoinRegion)
+                    | fact_bit(super::quality::BundleFact::AggregateDecomposition),
+            ),
+            (
+                "quality_frontier_first_join_aggregate_predicate_us",
+                fact_bit(super::quality::BundleFact::JoinRegion)
+                    | fact_bit(super::quality::BundleFact::AggregateDecomposition)
+                    | fact_bit(super::quality::BundleFact::PredicateDomain),
+            ),
+        ] {
+            if let Some(first_us) = first_fact_observation(mask) {
+                counters.insert(name, first_us);
+            }
+        }
         counters.insert(
             "quality_frontier_has_join_region_count",
             fact_count(fact_bit(super::quality::BundleFact::JoinRegion)),
+        );
+        counters.insert(
+            "quality_frontier_has_predicate_domain_count",
+            fact_count(fact_bit(super::quality::BundleFact::PredicateDomain)),
+        );
+        counters.insert(
+            "quality_frontier_has_cte_consumer_demand_count",
+            fact_count(fact_bit(super::quality::BundleFact::CteConsumerDemand)),
         );
         counters.insert(
             "quality_frontier_has_aggregate_decomposition_count",

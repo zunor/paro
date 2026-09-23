@@ -66,6 +66,33 @@ mod grant_capacity;
 mod grant_lazy;
 
 #[test]
+fn quality_fact_observation_requires_same_candidate_combination() {
+    use crate::cascades::quality::BundleFact;
+    let bit = |fact: BundleFact| 1_u16 << fact.stable_tag();
+    let mut engine = CascadesEngine::new(
+        Memo::new(super::super::budget::SearchBudget::default()),
+        ImplementationRegistry::default(),
+    );
+    engine
+        .quality_frontier_fact_signatures
+        .insert(bit(BundleFact::JoinRegion), (3, 5));
+    engine
+        .quality_frontier_fact_signatures
+        .insert(bit(BundleFact::AggregateDecomposition), (2, 7));
+    let counters = engine.search_work_counters();
+    assert_eq!(counters["quality_frontier_first_join_region_us"], 5);
+    assert!(!counters.contains_key("quality_frontier_first_join_and_aggregate_us"));
+    engine.quality_frontier_fact_signatures.insert(
+        bit(BundleFact::JoinRegion) | bit(BundleFact::AggregateDecomposition),
+        (4, 11),
+    );
+    let counters = engine.search_work_counters();
+    assert_eq!(counters["quality_frontier_has_join_region_count"], 7);
+    assert_eq!(counters["quality_frontier_first_join_and_aggregate_us"], 11);
+    assert!(!counters.contains_key("quality_frontier_first_join_aggregate_predicate_us"));
+}
+
+#[test]
 fn streaming_task_supply_is_inherited_from_the_child_pipeline() {
     let calibration = MachineCalibrationBundle::default();
     let mut child = cost(10.0);
