@@ -718,22 +718,21 @@ fn selected_aggregate_region_witnesses_refs(
     Some(witnesses)
 }
 
-/// Inspect one exact Memo winner using only immutable references.  This is a
-/// conservative preflight: it derives the same candidate-bound evidence as
-/// the complete frozen-DAG provider, but it does not allocate a frozen tree,
-/// run the winner verifier, or clone logical/physical payloads.  The complete
-/// provider remains the final handoff oracle and is called only after this
-/// preflight reports that the quality policy can be satisfied.
+/// Derive local facts once from exact immutable choices. The policy demands
+/// a complete root choice manifest only when no applicable local fact is
+/// missing. Until then, region coverage describes progress, not a completed
+/// certificate. Final executable verification remains an independent step.
 fn planner_quality_evidence(
     memo: &Memo,
     reference: ChildWinnerRef,
     winner: &super::memo::Winner,
-    goal: OptimizationGoal,
     state: &PlannerTransformState,
     properties: &mut quality_properties::SelectedQualityProperties,
+    policy: &super::quality::QualityBundleRegistry,
 ) -> Result<Option<SelectedQualityEvidence>> {
     let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityEvidence);
-    if winner.candidate != reference.candidate || reference.goal != goal {
+    let goal = reference.goal;
+    if winner.candidate != reference.candidate {
         return Ok(None);
     }
     let Some(required) = memo.required(goal.required) else {
@@ -849,13 +848,15 @@ fn planner_quality_evidence(
 
     let mut choices = Vec::new();
     let node_map = quality_node_map(&nodes);
-    if !collect_quality_node_choices(
-        reference,
-        &node_map,
-        &mut choices,
-        &mut BTreeSet::new(),
-        properties,
-    ) {
+    if policy.claims_are_ready(&capabilities, &facts)
+        && !collect_quality_node_choices(
+            reference,
+            &node_map,
+            &mut choices,
+            &mut BTreeSet::new(),
+            properties,
+        )
+    {
         return Ok(None);
     }
     let mut region = StableFingerprintBuilder::default();
@@ -969,6 +970,7 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         reference: ChildWinnerRef,
         winner: &super::memo::Winner,
         goal: OptimizationGoal,
+        policy: &super::quality::QualityBundleRegistry,
     ) -> Result<Option<SelectedQualityEvidence>> {
         let state = self
             .state
@@ -979,14 +981,31 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
             .lock()
             .map_err(|_| paro_error::internal("selected quality properties poisoned"))?;
         let result =
-            planner_quality_evidence(memo, reference, winner, goal, &state, &mut properties)?;
+            planner_quality_evidence(memo, reference, winner, &state, &mut properties, policy)?;
         #[cfg(test)]
         if let Some(actual) = &result {
             // Keep the independent frozen-DAG walk as an oracle in every
             // production-provider integration test, never in release search.
             let frozen = memo.freeze_candidate_tree(reference)?;
             let expected = frozen_quality_evidence(memo, reference, &frozen, goal, &state)?;
-            assert_eq!(Some(&actual.evidence), expected.as_ref());
+            let expected = expected.expect("inspectable choices have frozen oracle evidence");
+            if actual.evidence.choices.is_empty() {
+                assert!(
+                    !policy.claims_are_ready(&actual.evidence.capabilities, &actual.evidence.facts)
+                );
+                assert_eq!(actual.evidence.facts, expected.facts);
+                assert_eq!(
+                    actual.evidence.aggregate_regions,
+                    expected.aggregate_regions
+                );
+                assert_eq!(
+                    actual.evidence.pending_domain_transfers,
+                    expected.pending_domain_transfers
+                );
+                assert_eq!(actual.evidence.shape, expected.shape);
+            } else {
+                assert_eq!(actual.evidence, expected);
+            }
         }
         Ok(result)
     }

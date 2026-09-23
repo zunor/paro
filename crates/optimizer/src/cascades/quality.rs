@@ -219,6 +219,7 @@ pub trait QualityEvidenceProvider: std::fmt::Debug {
         reference: ChildWinnerRef,
         winner: &Winner,
         goal: OptimizationGoal,
+        policy: &QualityBundleRegistry,
     ) -> Result<Option<SelectedQualityEvidence>>;
 
     /// Construct transport only for the missing domain request chosen by the
@@ -427,6 +428,26 @@ impl QualityBundleRegistry {
 
     pub fn state(&self, id: BundleId) -> Option<BundleState> {
         self.bundles.get(&id).map(|bundle| bundle.state)
+    }
+
+    /// Whether all applicable bundles have their local facts. This is only
+    /// demand for the complete selected-choice manifest, never a certificate:
+    /// `evaluate_native_candidate` must still validate each region against it.
+    /// Keep applicability here rather than duplicating built-in policy in the
+    /// planner or constructing a root manifest for a known blocked candidate.
+    pub fn claims_are_ready(
+        &self,
+        capabilities: &BTreeSet<BundleCapability>,
+        facts: &BTreeSet<BundleFact>,
+    ) -> bool {
+        self.bundles.values().all(|bundle| {
+            !bundle
+                .spec
+                .required_capabilities
+                .iter()
+                .all(|c| capabilities.contains(c))
+                || bundle.spec.required_facts.iter().all(|f| facts.contains(f))
+        })
     }
 
     pub fn result(&self, id: BundleId) -> Option<&BundleResult> {
@@ -730,6 +751,45 @@ mod tests {
             candidate: Some(CandidateId(4)),
             aggregate_regions: Box::new([aggregate_region(CandidateId(4), &[Fingerprint(5)])]),
         }
+    }
+
+    #[test]
+    fn claim_readiness_uses_registered_demand_but_never_certifies_coverage() {
+        let mut registry = QualityBundleRegistry::default();
+        registry.register_builtin_f1_f4().unwrap();
+        let mut value = input(
+            [BundleCapability::SharedAggregate],
+            [
+                BundleFact::AggregateDecomposition,
+                BundleFact::NullSemantics,
+            ],
+        );
+        assert!(!registry.claims_are_ready(&value.capabilities, &value.facts));
+        value.facts.insert(BundleFact::CteConsumerDemand);
+        assert!(registry.claims_are_ready(&value.capabilities, &value.facts));
+        value.choices = Box::new([]);
+        assert!(matches!(
+            registry.evaluate(BundleId(3), &value, 1).unwrap(),
+            BundleResult::MissingEvidence { .. }
+        ));
+        assert!(registry
+            .p_ready_certificate(QualityPolicyId::new(1))
+            .is_none());
+        registry
+            .register(QualityBundleSpec::new(
+                BundleId(9),
+                1,
+                [BundleCapability::SharedAggregate],
+                [BundleFact::OrderingDemand],
+                50,
+            ))
+            .unwrap();
+        assert!(!registry.claims_are_ready(&value.capabilities, &value.facts));
+        value.facts.insert(BundleFact::OrderingDemand);
+        assert!(registry.claims_are_ready(&value.capabilities, &value.facts));
+        value.capabilities.clear();
+        value.facts.clear();
+        assert!(registry.claims_are_ready(&value.capabilities, &value.facts));
     }
 
     #[test]

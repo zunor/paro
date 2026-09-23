@@ -535,6 +535,7 @@ impl crate::cascades::quality::QualityEvidenceProvider for QualityPreflightProbe
         reference: ChildWinnerRef,
         winner: &Winner,
         _: OptimizationGoal,
+        _: &crate::cascades::quality::QualityBundleRegistry,
     ) -> Result<Option<crate::cascades::quality::SelectedQualityEvidence>> {
         self.preflight_calls.fetch_add(1, Ordering::Relaxed);
         let physical = memo

@@ -3573,7 +3573,13 @@ impl CascadesEngine {
                 continue;
             }
             self.quality_preflight_count = self.quality_preflight_count.saturating_add(1);
-            let evaluation = provider.evaluate(&self.memo, reference, &winner, goal)?;
+            let evaluation = provider.evaluate(
+                &self.memo,
+                reference,
+                &winner,
+                goal,
+                &self.quality_bundles,
+            )?;
             let reads = match &evaluation {
                 Some(evaluation) => evaluation.reads.clone(),
                 None => self.winner_fact_reads(root, &winner)?,

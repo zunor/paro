@@ -131,9 +131,9 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
             engine.memo(),
             reference,
             &winner,
-            input.root_goal,
             &state,
             &mut properties,
+            &super::super::quality::QualityBundleRegistry::default(),
         )
         .unwrap()
         .unwrap();
@@ -144,9 +144,9 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
             engine.memo(),
             reference,
             &winner,
-            input.root_goal,
             &state,
             &mut properties,
+            &super::super::quality::QualityBundleRegistry::default(),
         )
         .unwrap()
         .unwrap();
@@ -184,9 +184,9 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
             engine.memo(),
             reference,
             &winner,
-            input.root_goal,
             &state,
             &mut properties,
+            &super::super::quality::QualityBundleRegistry::default(),
         )
         .unwrap()
         .unwrap();
