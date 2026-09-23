@@ -24,6 +24,9 @@ compile observer; normal traces are off. Separate one Detail capture per cell.
 Two rounds of control/probe, each with three independent fresh normal process
 blocks per query (six samples/arm/query), one measured cold and one measured
 warm occurrence, 10,000 block bootstrap replicates. No concurrent workloads.
+Round seeds are 2026092305 and 2026092306; visit Q04/Q11/Q74 in each C/P/C/P
+batch. Control may use 9536a4df (this registration only) with the same code as
+df6627ea. Use clean detached control/re-op probe sequentially in this checkout.
 Retain every valid slow sample and failure. This is a directional pilot, not
 formal parity/non-inferiority certification. A >10% warm or compiler median
 regression requires investigation; no sample is removed because it is slow.

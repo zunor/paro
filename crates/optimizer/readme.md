@@ -86,6 +86,10 @@ already satisfies it.
   bag multiplicity, evaluation count, volatility and errors matter.
 - A projection or wrapper is not proof that a rewrite is safe across an outer
   join, aggregate, CTE or recursive boundary.
+- Local canonical laws share the postorder construction boundary in
+  `construction.rs`; nonlocal substitutions and predicate routing keep their
+  ordered barriers. Scalar-root reuse requires a live immutable allocation
+  witness, not a stale address or an assumption that a pass ran previously.
 - Relation facts and statistics have an explicit owner and revision.
   Inserting an equivalent alternative must not “vote” for a different
   cardinality using arrival order or a smaller fingerprint.
@@ -115,8 +119,16 @@ already satisfies it.
   task cursor and pending cost/completion work for an exact `(group, goal)`.
   TaskRegistry owns lifecycle and proofs; reverse indexes route notifications.
   A redirect merges pending work but invalidates pre-merge completion.
+  A current ReadSet observation borrows the immutable Memo through registry
+  lookup. It is not a durable freshness bit; resident and published evidence
+  still retain revision-sensitive dependencies.
 - A winner retains exact child choices. Frontier pruning must not invalidate
   archived choices still referenced by a parent or frozen candidate.
+- Selected quality DAGs share immutable edge lists and retain only the current
+  root's transitive view. Facts invalidate affected ancestors through selected
+  incoming edges; redirects also invalidate changed expression keys. Caching
+  every candidate's expanded closure would recreate quadratic storage. None
+  of this replaces current payload checks or final executable verification.
 - Parent runtime filters, shared producers and phase composition can change
   child ordering. A local scalar winner is not always sufficient.
 - Continuation pruning is a partial order, while ObjectiveProfile provides
