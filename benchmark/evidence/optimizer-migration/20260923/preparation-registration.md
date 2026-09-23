@@ -66,3 +66,14 @@ Bound all 12 maintained RunOutputs and referenced captures to 16MiB total;
 archive no ordinary server logs or duplicate raw trace streams. Run optimizer
 and workspace tests, strict Clippy, benchmark tests and high-FD SQL regress.
 No expected-result changes are part of these performance interventions.
+
+## Post-collection fixture-contract amendment
+
+The initial full SQL run found two allocation-number-only profile mismatches.
+Apply the existing `explain_logical_ids` alpha-renaming contract to the three
+affected EXPLAIN ANALYZE blocks in `fulltext_score_identity` and
+`select_topn_fallback_spill`, including their expected-side normalize headers.
+Do not regenerate or alter expected SQL, operator/plan text, scores, rows or
+numeric id payloads. This test-contract amendment preserves shared-node
+identity and does not change the registered binaries, matrix samples,
+performance gates or the recorded negative result.
