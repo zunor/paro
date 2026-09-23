@@ -54,3 +54,17 @@ Bound exploratory plus final RunOutputs/captures to 20MiB. Keep no routine
 server logs or duplicated event streams. Require affected oracle/engine tests,
 full optimizer/workspace tests, strict Clippy, benchmark and high-FD SQL regress.
 No expected-result regeneration or baseline blessing is authorized by this pilot.
+
+## Exploratory collector amendment
+
+The first post-stage-2 Q04 cold-planning capture compiled successfully, but its
+cell writer refused a record above its registered 10,578-byte limit. Preserve
+that CapacityExceeded result; it is not a timing gate pass. Before replacement
+collection, select the existing TPC-DS collector for the three exploratory
+cells: one normal fresh block/one warmup/one ABBA round plus one independent
+Detail block each. The extra normal blocks are exploratory and are not pooled
+into final control/probe samples. Keep the original final sampling contract.
+
+Removing the superseded preflight implementation also removes its unused
+process diagnostic setting. The single matching expected setting row is
+deleted explicitly; no plan/result baseline is regenerated or blessed.
