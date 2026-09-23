@@ -6,6 +6,7 @@ use super::*;
 #[test]
 fn local_bound_preparation_requires_a_live_pruning_request() {
     let (mut engine, root, goal) = engine(0);
+    engine.terminal_bound_goals.insert((root, goal));
     let mut recipe = recipe(Box::new([]));
     recipe.task_supply = TaskSupplyContract::Serial;
     recipe.cost_composition = CostComposition::Sequential;
@@ -24,6 +25,38 @@ fn local_bound_preparation_requires_a_live_pruning_request() {
         .recipe_is_provably_worse(root, goal, &recipe)
         .unwrap();
     assert!(recipe.certified_local_work.get().is_some());
+}
+
+#[test]
+fn scalar_bound_does_not_prune_parent_responses_or_quality_candidates() {
+    let (mut engine, root, goal) = strong_tree_engine();
+    engine.set_certified_group_pruning_enabled(true);
+    engine.optimize(root, goal, SearchMode::Memo).unwrap();
+    let child = engine
+        .memo
+        .logical_expr(engine.memo.group(root).unwrap().logical_exprs()[0])
+        .unwrap()
+        .key
+        .children[0];
+    let mut recipe = recipe(Box::new([]));
+    recipe.local_cost = cost(1_000_000.0);
+    recipe.task_supply = TaskSupplyContract::Serial;
+    recipe.cost_composition = CostComposition::Sequential;
+    // Even an enormous child-local latency is not a proof for every parent
+    // continuation. This guard is independent of its current scalar winner.
+    assert!(!engine
+        .recipe_is_provably_worse(child, goal, &recipe)
+        .unwrap());
+    assert!(recipe.certified_local_work.get().is_none());
+    engine.set_quality_policy_handoff_enabled(true);
+    assert!(!engine
+        .recipe_is_provably_worse(root, goal, &recipe)
+        .unwrap());
+    assert!(recipe.certified_local_work.get().is_none());
+    engine.set_quality_policy_handoff_enabled(false);
+    assert!(engine
+        .recipe_is_provably_worse(root, goal, &recipe)
+        .unwrap());
 }
 
 #[test]
@@ -74,6 +107,48 @@ fn unsupported_parent_requirement_does_not_prepare_children() {
         .unwrap()
         .physical_exprs()
         .is_empty());
+}
+
+#[test]
+fn former_terminal_goal_reopens_its_skipped_recipes_when_used_as_a_child() {
+    let (mut engine, root, goal) = strong_tree_engine();
+    let child = engine
+        .memo
+        .logical_expr(engine.memo.group(root).unwrap().logical_exprs()[0])
+        .unwrap()
+        .key
+        .children[0];
+    engine
+        .registry
+        .register_implementation(TreeImplementation {
+            id: ImplementationId(44),
+            operator: Fingerprint(100),
+            child: None,
+            child_row_goal: None,
+            local_score: 1_000_000.0,
+            mandatory: false,
+        })
+        .unwrap();
+    engine.set_certified_group_pruning_enabled(true);
+    engine.optimize(child, goal, SearchMode::Direct).unwrap();
+    assert!(engine.certified_recipe_prune_count > 0);
+    let skipped = *engine
+        .recipes
+        .keys()
+        .find(|(physical, _, _)| {
+            engine
+                .memo
+                .physical_expr(*physical)
+                .unwrap()
+                .key
+                .implementation
+                == ImplementationId(44)
+        })
+        .unwrap();
+    assert!(!engine.child_combination_states.contains_key(&skipped));
+
+    engine.optimize(root, goal, SearchMode::Direct).unwrap();
+    assert!(!engine.child_combination_states[&skipped].priced.is_empty());
 }
 
 #[test]

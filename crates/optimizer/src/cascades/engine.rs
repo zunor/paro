@@ -1137,6 +1137,7 @@ struct PhysicalCompletionProof {
 /// a correctness condition.
 #[derive(Debug, Default, Clone, Copy)]
 struct CertifiedBoundDiagnostics {
+    continuation_unsupported: u64,
     no_incumbent: u64,
     local_interval_uncertain: u64,
     child_completion_missing: u64,
@@ -1288,6 +1289,9 @@ pub struct CascadesEngine {
     /// tracing part of normal C1; callers opt in only after model/oracle
     /// admission.
     certified_group_pruning_enabled: bool,
+    /// Scalar cutoffs are valid only for terminal objectives. A child goal
+    /// retains operating points for its parents, not just its local minimum.
+    terminal_bound_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     /// A recursive physical task can publish a child response before the
     /// enclosing interleave task returns.  Keep the exact changed keys until
     /// the drain boundary so direct consumers are still woken even when the
@@ -1553,6 +1557,7 @@ impl CascadesEngine {
             physical_subproblems: BTreeMap::new(),
             physical_completion_proofs: BTreeMap::new(),
             certified_group_pruning_enabled: false,
+            terminal_bound_goals: BTreeSet::new(),
             physical_response_notifications: BTreeSet::new(),
             physical_goals: BTreeMap::new(),
             physical_quality_demanded_groups: BTreeSet::new(),
@@ -3896,6 +3901,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         mode: SearchMode,
     ) -> Result<Winner> {
+        self.set_terminal_bound_goals(root, std::iter::once(goal))?;
         self.begin_diagnostic_profile(root, std::iter::once(goal));
         // CascadesEngine is also usable with a hand-built Memo. Seal at the
         // actual phase boundary rather than relying on one particular builder
@@ -4233,6 +4239,7 @@ impl CascadesEngine {
             })
             .collect::<Vec<_>>();
         self.begin_diagnostic_profile(root, checkpoint_goals.iter().copied());
+        self.set_terminal_bound_goals(root, checkpoint_goals.iter().copied())?;
         if mode == SearchMode::Memo {
             let phase = self.memo.control().incumbent_phase();
             let work_phase = crate::work_partition::phase(crate::work_partition::Phase::Mandatory);
@@ -6671,6 +6678,10 @@ impl CascadesEngine {
                 strong_incumbent_active_count,
             ),
             (
+                "certified_bound_continuation_unsupported_count",
+                self.certified_bound_diagnostics.continuation_unsupported,
+            ),
+            (
                 "certified_bound_no_incumbent_count",
                 self.certified_bound_diagnostics.no_incumbent,
             ),
@@ -8795,6 +8806,49 @@ impl CascadesEngine {
         Ok(Some(proof))
     }
 
+    fn set_terminal_bound_goals(
+        &mut self,
+        root: GroupId,
+        goals: impl IntoIterator<Item = OptimizationGoal>,
+    ) -> Result<()> {
+        let root = self.memo.canonical_group(root);
+        let goals = goals.into_iter().map(|goal| (root, goal)).collect();
+        if self.terminal_bound_goals != goals && self.certified_recipe_prune_count > 0 {
+            // A caller may optimize another root in the same Memo. A former
+            // terminal response must then be rebuilt as a continuation
+            // frontier, including recipes skipped by the earlier scalar
+            // cutoff. Exact cached prices remain valid; closure does not.
+            self.task_registry.invalidate_physical_tasks()?;
+            self.physical_completion_proofs.clear();
+            for state in self.physical_subproblems.values_mut() {
+                state.full_recost = state.next_recipe_sequence > 0;
+                state.completion_pending = false;
+            }
+        }
+        self.terminal_bound_goals = goals;
+        Ok(())
+    }
+
+    /// A scalar objective cutoff cannot remove a child operating point:
+    /// parents can prefer another work/span, memory or RF response. Nor is a
+    /// cheap executable incumbent an upper bound for an additional quality
+    /// predicate it has not satisfied. Keep these domains open until a bound
+    /// certificate explicitly covers the missing continuation/quality law.
+    fn admits_scalar_cutoff(&mut self, group: GroupId, goal: OptimizationGoal) -> bool {
+        let admitted = !self.quality_handoff_enabled
+            && self.terminal_bound_goals.iter().any(|(root, root_goal)| {
+                *root_goal == goal
+                    && self.memo.canonical_group(*root) == self.memo.canonical_group(group)
+            });
+        if !admitted {
+            self.certified_bound_diagnostics.continuation_unsupported = self
+                .certified_bound_diagnostics
+                .continuation_unsupported
+                .saturating_add(1);
+        }
+        admitted
+    }
+
     /// Prove a recipe cannot beat the incumbent from complete child
     /// subproblems. This intentionally covers only the additive, unfiltered
     /// latency contract. Sideways filters, source response and phase overlap
@@ -8807,6 +8861,9 @@ impl CascadesEngine {
         location: BoundCheckLocation,
     ) -> Result<Option<bool>> {
         if self.mandatory_only || !self.certified_group_pruning_enabled {
+            return Ok(None);
+        }
+        if !self.admits_scalar_cutoff(group, goal) {
             return Ok(None);
         }
         self.strong_incumbent_bound_request_count =
@@ -8986,6 +9043,9 @@ impl CascadesEngine {
         recipe: &CostRecipe,
     ) -> Result<bool> {
         if self.mandatory_only || !self.certified_group_pruning_enabled {
+            return Ok(false);
+        }
+        if !self.admits_scalar_cutoff(group, goal) {
             return Ok(false);
         }
         self.strong_incumbent_bound_request_count =
