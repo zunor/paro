@@ -206,6 +206,8 @@ pub struct SelectedQualityEvidence {
 /// executable verification and freezing only after policy certification.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct QualityPropertyWork {
+    pub contract_builds: u64,
+    pub contract_reuses: u64,
     pub node_builds: u64,
     pub node_reuses: u64,
     pub cte_builds: u64,

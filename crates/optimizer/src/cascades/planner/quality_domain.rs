@@ -486,7 +486,7 @@ pub(super) fn selected_transfer_bindings(
 pub(super) fn pending_transfer_for_ref(
     memo: &Memo,
     reference: ChildWinnerRef,
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
     state: &PlannerTransformState,
 ) -> Option<bool> {
     let node = ref_node(nodes, reference)?;
@@ -550,10 +550,7 @@ pub(super) fn selected_transfer_bindings_for_refs(
     nodes: &[QualityCandidateNode],
     state: &PlannerTransformState,
 ) -> Box<[PatternBinding]> {
-    let nodes = nodes
-        .iter()
-        .map(|node| (node.reference.candidate, node))
-        .collect::<BTreeMap<_, _>>();
+    let nodes = selected_dag::QualityNodeMap::from_nodes(nodes);
     let mut bindings = Vec::new();
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
@@ -575,16 +572,16 @@ pub(super) fn selected_transfer_bindings_for_refs(
 }
 
 fn ref_node<'a>(
-    nodes: &'a BTreeMap<CandidateId, &'a QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'a>,
     reference: ChildWinnerRef,
 ) -> Option<&'a QualityCandidateNode> {
-    let node = nodes.get(&reference.candidate).copied()?;
+    let node = nodes.get(&reference.candidate)?;
     (node.reference.group == reference.group && node.reference.goal == reference.goal)
         .then_some(node)
 }
 
 fn selected_is_graph_chain_ref(
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
     mut reference: ChildWinnerRef,
     memo: &Memo,
     state: &PlannerTransformState,
@@ -612,7 +609,7 @@ fn selected_is_graph_chain_ref(
 }
 
 fn selected_routes_consumed_ref(
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
     reference: ChildWinnerRef,
     memo: &Memo,
     routed: &domain_transfer::OperatorDomainTransfer,
@@ -639,7 +636,7 @@ fn selected_routes_consumed_ref(
 }
 
 fn selected_consumes_ref(
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
     reference: ChildWinnerRef,
     memo: &Memo,
     predicates: &[Expression],
@@ -727,7 +724,7 @@ fn selected_consumes_ref(
 }
 
 fn selected_transfer_consumed_ref(
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
     reference: ChildWinnerRef,
     memo: &Memo,
     predicate: &Expression,
@@ -762,7 +759,7 @@ fn selected_transfer_consumed_ref(
 }
 
 fn selected_transfer_binding_ref(
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
     reference: ChildWinnerRef,
     memo: &Memo,
     state: &PlannerTransformState,
@@ -805,7 +802,7 @@ fn selected_transfer_binding_ref(
 }
 
 fn selected_transfer_path_operand_ref(
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
     reference: ChildWinnerRef,
     memo: &Memo,
     predicates: &[Expression],

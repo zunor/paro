@@ -735,7 +735,7 @@ pub(super) struct ResolvedRuntimeFilterSource {
     pub(super) multiplicity: RuntimeFilterProbeMultiplicity,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PlannerImplementationSet {
     pub(super) baseline: PhysicalImplementationFlavor,
     pub(super) perfect_hash_aggregate: bool,

@@ -8,6 +8,33 @@
 
 use super::*;
 
+/// A borrowed lookup over the one selected-DAG index. Standalone producers
+/// (including the independent oracle) may own an index, but property consumers
+/// never materialize another map for the same graph.
+pub(super) struct QualityNodeMap<'a> {
+    nodes: &'a [QualityCandidateNode],
+    index: std::borrow::Cow<'a, BTreeMap<CandidateId, usize>>,
+}
+
+impl<'a> QualityNodeMap<'a> {
+    pub fn from_nodes(nodes: &'a [QualityCandidateNode]) -> Self {
+        Self {
+            nodes,
+            index: std::borrow::Cow::Owned(
+                nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, node)| (node.reference.candidate, i))
+                    .collect(),
+            ),
+        }
+    }
+
+    pub fn get(&self, candidate: &CandidateId) -> Option<&'a QualityCandidateNode> {
+        self.index.get(candidate).map(|index| &self.nodes[*index])
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct SelectedDag {
     pub root: ChildWinnerRef,
@@ -25,11 +52,11 @@ impl SelectedDag {
             .flat_map(|index| self.parents[*index].iter())
             .map(|index| &self.nodes[*index])
     }
-    pub fn node_map(&self) -> BTreeMap<CandidateId, &QualityCandidateNode> {
-        self.index
-            .iter()
-            .map(|(id, index)| (*id, &self.nodes[*index]))
-            .collect()
+    pub fn node_map(&self) -> QualityNodeMap<'_> {
+        QualityNodeMap {
+            nodes: &self.nodes,
+            index: std::borrow::Cow::Borrowed(&self.index),
+        }
     }
 
     /// Also used by the malformed-graph tests, independently of Memo import.
@@ -173,6 +200,16 @@ mod tests {
             BTreeSet::from([CandidateId::new(1), CandidateId::new(2)])
         );
         assert_eq!(dag.postorder.last(), Some(&0));
+        let lookup = dag.node_map();
+        assert!(matches!(lookup.index, std::borrow::Cow::Borrowed(_)));
+        assert!(std::ptr::eq(
+            lookup.get(&CandidateId::new(3)).unwrap(),
+            &dag.nodes[3]
+        ));
+        assert!(quality_node(&lookup, reference(3)).is_some());
+        let mut wrong_goal = reference(3);
+        wrong_goal.goal.row_goal = super::super::super::memo::RowGoal::AtMost(1);
+        assert!(quality_node(&lookup, wrong_goal).is_none());
     }
 
     #[test]

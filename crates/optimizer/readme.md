@@ -129,6 +129,12 @@ already satisfies it.
   incoming edges; redirects also invalidate changed expression keys. Caching
   every candidate's expanded closure would recreate quadratic storage. None
   of this replaces current payload checks or final executable verification.
+  All property consumers borrow this graph's one index. Local executable
+  contracts belong to the property owner: exact keys, proof lineage, payload
+  ownership and implementation availability guard reuse independently of
+  statistics. Canonical child bindings and exact-result guarantees remain live
+  checks. A fact refresh reuses the immutable choice identity, not an old fact
+  certificate; it must not rebuild another graph just to inspect capabilities.
 - Parent runtime filters, shared producers and phase composition can change
   child ordering. A local scalar winner is not always sufficient.
 - Continuation pruning is a partial order, while ObjectiveProfile provides

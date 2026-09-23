@@ -8,13 +8,112 @@
 
 use super::*;
 
+/// The local executable contract is independent of statistics and of the
+/// ancestor which asks for it. Exact dependency values, not a fingerprint or
+/// an apply audit, guard reuse. Published candidate choices and logical payloads
+/// are immutable; Memo expression keys/proofs and implementation availability
+/// are not (group merge, proof publication, RF withdrawal and rollback).
+#[derive(Debug)]
+pub(super) struct LocalContract {
+    logical: super::super::memo::LogicalExprKey,
+    physical: super::super::memo::PhysicalExprKey,
+    owner: LogicalPayloadId,
+    payload: Arc<PlannerPhysicalPayload>,
+    proofs: BTreeSet<EquivalenceProof>,
+    selected_proofs: Box<[EquivalenceProof]>,
+    origin: Option<RuleId>,
+    implementations: state::PlannerImplementationSet,
+    search: Option<(PhysicalPayloadId, Fingerprint)>,
+    pub operator: LogicalOperatorType,
+    pub rules: BTreeSet<RuleId>,
+    pub cte: Option<usize>,
+    pub join_region: bool,
+    pub runtime_filter: bool,
+}
+
+impl LocalContract {
+    fn is_current(
+        &self,
+        logical: &super::super::memo::LogicalExpr,
+        physical: &super::super::memo::PhysicalExpr,
+        metadata: &PlannerOperatorMetadata,
+        payload: &Arc<PlannerPhysicalPayload>,
+        join_region: bool,
+    ) -> bool {
+        self.logical == logical.key
+            && self.physical == physical.key
+            && self.owner == logical.payload
+            && Arc::ptr_eq(&self.payload, payload)
+            && self.proofs == logical.proofs
+            && self.selected_proofs == metadata.selected_proofs
+            && self.origin == metadata.origin_rule
+            && self.implementations == metadata.implementations
+            && self.operator == metadata.operator_type
+            && self.join_region == join_region
+            && self.search
+                == metadata
+                    .search
+                    .as_ref()
+                    .map(|s| (s.payload, s.payload_fingerprint))
+    }
+
+    fn derive(
+        logical: &super::super::memo::LogicalExpr,
+        physical: &super::super::memo::PhysicalExpr,
+        metadata: &PlannerOperatorMetadata,
+        payload: Arc<PlannerPhysicalPayload>,
+        state: &PlannerTransformState,
+        join_region: bool,
+    ) -> Option<Self> {
+        if !selected_physical_contract_is_exact(logical, physical, metadata, &payload) {
+            return None;
+        }
+        let rules: BTreeSet<_> = selected_payload_rule_proofs(logical, metadata).collect();
+        if metadata.origin_rule.is_some() && rules.is_empty() {
+            return None;
+        }
+        let operator = &state
+            .payloads
+            .logical
+            .get(logical.payload.index())?
+            .semantic_template
+            .operator;
+        let cte = match operator {
+            LogicalOperator::CTERef(cte) => Some(cte.cte_index),
+            LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
+            LogicalOperator::RecursiveCTE(cte) => Some(cte.cte_index),
+            _ => None,
+        };
+        Some(Self {
+            logical: logical.key.clone(),
+            physical: physical.key.clone(),
+            owner: logical.payload,
+            payload,
+            proofs: logical.proofs.clone(),
+            selected_proofs: metadata.selected_proofs.clone(),
+            origin: metadata.origin_rule,
+            implementations: metadata.implementations,
+            search: metadata
+                .search
+                .as_ref()
+                .map(|s| (s.payload, s.payload_fingerprint)),
+            operator: metadata.operator_type,
+            rules,
+            cte,
+            join_region,
+            runtime_filter: matches!(
+                physical.key.implementation,
+                PLANNER_HASH_JOIN_RUNTIME_FILTER | PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER
+            ),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct NodeProperties {
     node: QualityCandidateNode,
+    contract: LocalContract,
     read: PatternRead,
-    // Group merging rewrites expression keys even when the candidate's
-    // immutable child references and output facts remain unchanged.
-    logical_children: Box<[GroupId]>,
     children: Box<[u64]>,
     revision: u64,
     choice: Fingerprint,
@@ -40,6 +139,8 @@ pub(super) struct SelectedQualityProperties {
     pub(super) cte_domains: quality_domain::CteDomainProperties,
     pub(super) builds: u64,
     pub(super) reuses: u64,
+    pub(super) contract_builds: u64,
+    pub(super) contract_reuses: u64,
 }
 
 impl SelectedQualityProperties {
@@ -55,30 +156,95 @@ impl SelectedQualityProperties {
         let mut reads = Vec::with_capacity(dag.nodes.len());
         let mut dirty = vec![false; dag.nodes.len()];
         let mut pending = Vec::new();
+        let mut contracts = Vec::with_capacity(dag.nodes.len());
         for (index, node) in dag.nodes.iter().enumerate() {
+            let Some(winner) = memo.resolve_child_winner(node.reference) else {
+                return Ok(false);
+            };
+            let Some(physical) = memo.physical_expr(winner.expression) else {
+                return Ok(false);
+            };
+            let Some(logical) = memo.logical_expr(physical.key.logical) else {
+                return Ok(false);
+            };
+            let Some(metadata) = state.metadata.get(&logical.payload) else {
+                return Ok(false);
+            };
+            let Some(payload) = state.payloads.get_physical(physical.payload) else {
+                return Ok(false);
+            };
+            if physical.id != winner.expression
+                || physical.id != node.physical
+                || logical.id != node.logical
+                || winner.children.as_ref() != node.children.as_ref()
+                || winner.provided.result_guarantee != ResultGuarantee::Exact
+                || metadata.provided.result_guarantee != ResultGuarantee::Exact
+            {
+                return Ok(false);
+            }
+            // Canonical representatives are live dependencies. Do not cache a
+            // group redirect, or allocate an expected-group vector per visit.
+            let boundaries = winner.joint_cost_proof.as_ref().map(|p| &p.boundary_goals);
+            let arity = boundaries.map_or(logical.key.children.len(), |b| b.len());
+            if arity != node.children.len() {
+                return Ok(false);
+            }
+            for (i, child) in node.children.iter().enumerate() {
+                let expected = boundaries.map_or_else(|| logical.key.children[i], |b| b[i].0);
+                if memo.canonical_group(child.group) != memo.canonical_group(expected) {
+                    return Ok(false);
+                }
+            }
+            // Every referenced child is also a reachable DAG node and is
+            // resolved by this loop before any properties are published.
+            let join_region = winner.joint_cost_proof.is_some();
+            let contract_current =
+                self.nodes
+                    .get(&node.reference.candidate)
+                    .is_some_and(|previous| {
+                        previous.node == *node
+                            && previous.contract.is_current(
+                                logical,
+                                physical,
+                                metadata,
+                                &payload,
+                                join_region,
+                            )
+                    });
+            let contract = if contract_current {
+                self.contract_reuses = self.contract_reuses.saturating_add(1);
+                None
+            } else {
+                let Some(contract) =
+                    LocalContract::derive(logical, physical, metadata, payload, state, join_region)
+                else {
+                    return Ok(false);
+                };
+                self.contract_builds = self.contract_builds.saturating_add(1);
+                Some(contract)
+            };
             let read = PatternRead::facts_from_group(memo, node.reference.group)?;
-            let current = self
-                .nodes
-                .get(&node.reference.candidate)
-                .is_some_and(|previous| {
-                    previous.node == *node
-                        && previous.read == read
-                        && memo.logical_expr(node.logical).is_some_and(|logical| {
-                            logical.key.children == previous.logical_children
-                        })
-                        && previous.children.len() == node.children.len()
-                        && node.children.iter().zip(previous.children.iter()).all(
-                            |(child, revision)| {
-                                self.nodes
-                                    .get(&child.candidate)
-                                    .is_some_and(|child| child.revision == *revision)
-                            },
-                        )
-                });
+            let current = contract_current
+                && self
+                    .nodes
+                    .get(&node.reference.candidate)
+                    .is_some_and(|previous| {
+                        previous.node == *node
+                            && previous.read == read
+                            && previous.children.len() == node.children.len()
+                            && node.children.iter().zip(previous.children.iter()).all(
+                                |(child, revision)| {
+                                    self.nodes
+                                        .get(&child.candidate)
+                                        .is_some_and(|child| child.revision == *revision)
+                                },
+                            )
+                    });
             if !current {
                 pending.push(index);
             }
             reads.push(read);
+            contracts.push(contract);
         }
         while let Some(index) = pending.pop() {
             if std::mem::replace(&mut dirty[index], true) {
@@ -169,15 +335,28 @@ impl SelectedQualityProperties {
                 .checked_add(1)
                 .ok_or_else(|| paro_error::internal("selected property revision exhausted"))?;
             self.next_revision = revision;
+            let choice = if contracts[index].is_none() {
+                self.nodes[&reference.candidate].choice
+            } else {
+                candidate_choice_fingerprint(reference, winner, logical, physical)
+            };
+            let contract = contracts[index]
+                .take()
+                .or_else(|| {
+                    self.nodes
+                        .remove(&reference.candidate)
+                        .map(|previous| previous.contract)
+                })
+                .ok_or_else(|| paro_error::internal("selected local contract missing"))?;
             self.nodes.insert(
                 reference.candidate,
                 NodeProperties {
                     node: node.clone(),
+                    contract,
                     read,
-                    logical_children: logical.key.children.clone(),
                     children,
                     revision,
-                    choice: candidate_choice_fingerprint(reference, winner, logical, physical),
+                    choice,
                     aggregate,
                     contains_union,
                     is_union,
@@ -194,12 +373,26 @@ impl SelectedQualityProperties {
         self.nodes[&candidate].revision
     }
 
+    pub(super) fn contract(&self, candidate: CandidateId) -> &LocalContract {
+        &self.nodes[&candidate].contract
+    }
+
+    pub(super) fn fact_reads(&self, nodes: &[QualityCandidateNode]) -> ReadSet {
+        // These reads were checked by refresh under this same immutable Memo
+        // borrow. Re-reading group facts cannot strengthen the certificate.
+        ReadSet::new(
+            nodes
+                .iter()
+                .map(|node| self.nodes[&node.reference.candidate].read),
+        )
+    }
+
     pub(super) fn region_fact_fingerprint(
         &mut self,
         memo: &Memo,
         root: ChildWinnerRef,
         goal: OptimizationGoal,
-        nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+        nodes: &selected_dag::QualityNodeMap<'_>,
     ) -> Option<Fingerprint> {
         if let Some(fingerprint) = self.nodes.get(&root.candidate)?.region_facts.get(&goal) {
             return Some(*fingerprint);

@@ -265,25 +265,22 @@ fn candidate_choice_fingerprint(
     choice.finish()
 }
 
-fn quality_node_map<'a>(
-    nodes: &'a [QualityCandidateNode],
-) -> BTreeMap<CandidateId, &'a QualityCandidateNode> {
-    nodes
-        .iter()
-        .map(|node| (node.reference.candidate, node))
-        .collect()
+#[cfg(test)]
+fn quality_node_map(nodes: &[QualityCandidateNode]) -> selected_dag::QualityNodeMap<'_> {
+    selected_dag::QualityNodeMap::from_nodes(nodes)
 }
 
 fn quality_node<'a>(
-    nodes: &'a BTreeMap<CandidateId, &'a QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'a>,
     reference: ChildWinnerRef,
 ) -> Option<&'a QualityCandidateNode> {
-    let node = nodes.get(&reference.candidate).copied()?;
+    let node = nodes.get(&reference.candidate)?;
     (node.reference.group == reference.group && node.reference.goal == reference.goal)
         .then_some(node)
 }
 
 struct QualityCandidateInspection {
+    dag: Arc<selected_dag::SelectedDag>,
     nodes: Arc<[QualityCandidateNode]>,
     rules: BTreeSet<RuleId>,
     shape: NativeQualityShape,
@@ -300,16 +297,12 @@ struct QualityCandidateInspection {
     has_ordering: bool,
     has_graph: bool,
     has_dependent: bool,
-    groups: BTreeSet<GroupId>,
+    reads: ReadSet,
 }
 
-/// Inspect the selected candidate and build its immutable reference graph in
-/// one pass.  The old preflight first validated every node and then walked the
-/// same nodes again to derive capabilities, rules and shapes.  That made the
-/// purportedly cheap path pay two Memo/payload lookups before it even reached
-/// the local domain and aggregate checks.  This pass keeps the exact identity
-/// and contract checks, but records the inspection summary while each node is
-/// already hot.
+/// Query the selected graph's locally owned properties. Capability/diagnostic
+/// counts visit unique nodes (not occurrences); contract validation and semantic
+/// derivation have a single owner and are not repeated for each new ancestor.
 fn inspect_quality_candidate(
     memo: &Memo,
     root: ChildWinnerRef,
@@ -319,6 +312,9 @@ fn inspect_quality_candidate(
     let Some(dag) = properties.dag.select(memo, root) else {
         return Ok(None);
     };
+    if dag.nodes.is_empty() || !properties.refresh(memo, &dag, state)? {
+        return Ok(None);
+    }
     let mut rules = BTreeSet::new();
     let mut shape = NativeQualityShape::default();
     let mut cte_producers = BTreeSet::new();
@@ -333,48 +329,12 @@ fn inspect_quality_candidate(
     let mut has_ordering = false;
     let mut has_graph = false;
     let mut has_dependent = false;
-    let mut groups = BTreeSet::new();
     for node in dag.nodes.iter() {
         let reference = node.reference;
-        let Some(winner) = memo.resolve_child_winner(reference) else {
-            return Ok(None);
-        };
-        let Some(physical) = memo.physical_expr(winner.expression) else {
-            return Ok(None);
-        };
-        let Some(logical) = memo.logical_expr(physical.key.logical) else {
-            return Ok(None);
-        };
-        let Some(metadata) = state.metadata.get(&logical.payload) else {
-            return Ok(None);
-        };
-        let Some(physical_payload) = state.payloads.get_physical(physical.payload) else {
-            return Ok(None);
-        };
-        if physical.id != winner.expression
-            || physical.id != node.physical
-            || logical.id != node.logical
-            || winner.children.as_ref() != node.children.as_ref()
-            || physical.key.children != logical.key.children
-            || (winner.joint_cost_proof.is_none()
-                && winner.children.len() != logical.key.children.len())
-            || !selected_physical_contract_is_exact(logical, physical, metadata, &physical_payload)
-        {
-            return Ok(None);
-        }
-        groups.insert(memo.canonical_group(reference.group));
+        let contract = properties.contract(reference.candidate);
         shape.nodes = shape.nodes.saturating_add(1);
-        let mut selected_rules = selected_payload_rule_proofs(logical, metadata).peekable();
-        if metadata.origin_rule.is_some() && selected_rules.peek().is_none() {
-            return Ok(None);
-        }
-        rules.extend(selected_rules);
-        if winner.provided.result_guarantee != ResultGuarantee::Exact
-            || metadata.provided.result_guarantee != ResultGuarantee::Exact
-        {
-            return Ok(None);
-        }
-        match metadata.operator_type {
+        rules.extend(contract.rules.iter().copied());
+        match contract.operator {
             LogicalOperatorType::Filter | LogicalOperatorType::FullTextFilterScan => {
                 has_filter = true
             }
@@ -385,9 +345,9 @@ fn inspect_quality_candidate(
             | LogicalOperatorType::AnyJoin
             | LogicalOperatorType::CrossProduct => {
                 has_join = true;
-                has_join_region |= winner.joint_cost_proof.is_some();
+                has_join_region |= contract.join_region;
                 shape.joins = shape.joins.saturating_add(1);
-                if winner.joint_cost_proof.is_some() {
+                if contract.join_region {
                     shape.join_region_witness_nodes =
                         shape.join_region_witness_nodes.saturating_add(1);
                 }
@@ -398,25 +358,13 @@ fn inspect_quality_candidate(
             }
             LogicalOperatorType::CTERef => {
                 has_cte_consumer = true;
-                if let LogicalOperator::CTERef(cte) = &state.payloads.logical
-                    [logical.payload.index()]
-                .semantic_template
-                .operator
-                {
-                    cte_consumers.insert(cte.cte_index);
+                if let Some(cte) = contract.cte {
+                    cte_consumers.insert(cte);
                 }
             }
             LogicalOperatorType::MaterializedCTE | LogicalOperatorType::RecursiveCTE => {
                 has_cte_producer = true;
-                let cte_index = match &state.payloads.logical[logical.payload.index()]
-                    .semantic_template
-                    .operator
-                {
-                    LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
-                    LogicalOperator::RecursiveCTE(cte) => Some(cte.cte_index),
-                    _ => None,
-                };
-                if let Some(cte_index) = cte_index {
+                if let Some(cte_index) = contract.cte {
                     cte_producers.insert(cte_index);
                 }
             }
@@ -428,46 +376,16 @@ fn inspect_quality_candidate(
             | LogicalOperatorType::CreatePropertyGraph => has_graph = true,
             _ => {}
         }
-        if matches!(
-            physical.key.implementation,
-            PLANNER_HASH_JOIN_RUNTIME_FILTER | PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER
-        ) {
+        if contract.runtime_filter {
             shape.runtime_filter_joins = shape.runtime_filter_joins.saturating_add(1);
         }
-        // A region implementation has an explicit physical boundary which
-        // need not be the binary logical root's immediate children. The final
-        // WinnerVerifier independently replays its JointCostProof. Do not
-        // discard that executable DAG as if it were an ordinary local recipe.
-        let expected_groups: Vec<_> = match &winner.joint_cost_proof {
-            Some(proof) => proof
-                .boundary_goals
-                .iter()
-                .map(|(group, _)| *group)
-                .collect(),
-            None => logical.key.children.to_vec(),
-        };
-        if expected_groups.len() != winner.children.len() {
-            return Ok(None);
-        }
-        for (child, expected_group) in winner.children.iter().copied().zip(expected_groups) {
-            if memo.canonical_group(child.group) != memo.canonical_group(expected_group)
-                || memo.resolve_child_winner(child).is_none()
-            {
-                return Ok(None);
-            }
-        }
-    }
-    if dag.nodes.is_empty() {
-        return Ok(None);
-    }
-    // Rule provenance is not a selected producer property.
-    if !properties.refresh(memo, &dag, state)? {
-        return Ok(None);
     }
     let cte_producer_witnesses =
         quality_domain::cte_domain_witnesses_with_properties(memo, &dag, state, Some(properties));
     Ok(Some(QualityCandidateInspection {
+        reads: properties.fact_reads(&dag.nodes),
         nodes: dag.nodes.clone(),
+        dag,
         rules,
         shape,
         cte_producers,
@@ -483,13 +401,12 @@ fn inspect_quality_candidate(
         has_ordering,
         has_graph,
         has_dependent,
-        groups,
     }))
 }
 
 fn collect_quality_node_choices(
     reference: ChildWinnerRef,
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
     choices: &mut Vec<Fingerprint>,
     visited: &mut BTreeSet<CandidateId>,
     properties: &quality_properties::SelectedQualityProperties,
@@ -513,14 +430,14 @@ fn collect_quality_region_fact_fingerprint(
     root: ChildWinnerRef,
     arm: ChildWinnerRef,
     goal: OptimizationGoal,
-    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    nodes: &selected_dag::QualityNodeMap<'_>,
 ) -> Option<Fingerprint> {
     let mut facts = BTreeMap::new();
     let mut visited = BTreeSet::new();
     fn visit(
         memo: &Memo,
         reference: ChildWinnerRef,
-        nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+        nodes: &selected_dag::QualityNodeMap<'_>,
         facts: &mut BTreeMap<GroupId, (Fingerprint, Fingerprint)>,
         visited: &mut BTreeSet<CandidateId>,
     ) -> bool {
@@ -571,18 +488,17 @@ fn collect_quality_region_fact_fingerprint(
 fn selected_aggregate_region_witnesses_refs(
     memo: &Memo,
     root: ChildWinnerRef,
-    nodes: &[QualityCandidateNode],
+    nodes: &selected_dag::QualityNodeMap<'_>,
     goal: OptimizationGoal,
     properties: &mut quality_properties::SelectedQualityProperties,
 ) -> Option<Vec<AggregateRegionWitness>> {
-    let nodes = quality_node_map(nodes);
     let mut witnesses = Vec::new();
     let mut path = Vec::new();
     fn visit_union(
         memo: &Memo,
         reference: ChildWinnerRef,
         region_root: (CandidateId, OptimizationGoal),
-        nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+        nodes: &selected_dag::QualityNodeMap<'_>,
         path: &mut Vec<u32>,
         witnesses: &mut Vec<AggregateRegionWitness>,
         properties: &mut quality_properties::SelectedQualityProperties,
@@ -656,7 +572,7 @@ fn selected_aggregate_region_witnesses_refs(
         memo,
         root,
         (root.candidate, goal),
-        &nodes,
+        nodes,
         &mut path,
         &mut witnesses,
         properties,
@@ -665,7 +581,7 @@ fn selected_aggregate_region_witnesses_refs(
         let shape = properties.aggregate_shape(root.candidate);
         if shape.aggregates > 0 {
             let anchor_choice = properties.choice(root.candidate);
-            let fact_fingerprint = properties.region_fact_fingerprint(memo, root, goal, &nodes)?;
+            let fact_fingerprint = properties.region_fact_fingerprint(memo, root, goal, nodes)?;
             let mut region = StableFingerprintBuilder::default();
             region.write_bytes(b"paro.quality.aggregate-region.root.v2");
             region.write_u64(root.candidate.index() as u64);
@@ -710,6 +626,7 @@ fn planner_quality_evidence(
         return Ok(None);
     };
     let QualityCandidateInspection {
+        dag,
         nodes,
         rules,
         mut shape,
@@ -726,16 +643,10 @@ fn planner_quality_evidence(
         has_ordering,
         has_graph,
         has_dependent,
-        groups,
+        reads,
     } = inspection;
     let mut capabilities = BTreeSet::new();
     let mut facts = BTreeSet::new();
-    let reads = ReadSet::new(
-        groups
-            .into_iter()
-            .map(|group| PatternRead::facts_from_group(memo, group))
-            .collect::<Result<Vec<_>>>()?,
-    );
     // Domain and aggregate-region inspection is only meaningful for a bundle
     // whose capability can actually make it applicable.  The previous
     // preflight ran both selected-DAG walks for every frontier entry, even for
@@ -759,9 +670,13 @@ fn planner_quality_evidence(
         facts.insert(BundleFact::JoinRegion);
     }
     let aggregate_regions = if has_aggregate {
-        let Some(regions) =
-            selected_aggregate_region_witnesses_refs(memo, reference, &nodes, goal, properties)
-        else {
+        let Some(regions) = selected_aggregate_region_witnesses_refs(
+            memo,
+            reference,
+            &dag.node_map(),
+            goal,
+            properties,
+        ) else {
             return Ok(None);
         };
         regions
@@ -813,7 +728,7 @@ fn planner_quality_evidence(
     }
 
     let mut choices = Vec::new();
-    let node_map = quality_node_map(&nodes);
+    let node_map = dag.node_map();
     if policy.claims_are_ready(&capabilities, &facts)
         && !collect_quality_node_choices(
             reference,
@@ -923,6 +838,8 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
     fn property_work(&self) -> Option<super::quality::QualityPropertyWork> {
         let properties = self.properties.lock().ok()?;
         Some(super::quality::QualityPropertyWork {
+            contract_builds: properties.contract_builds,
+            contract_reuses: properties.contract_reuses,
             node_builds: properties.builds,
             node_reuses: properties.reuses,
             cte_builds: properties.cte_domains.builds,

@@ -6959,6 +6959,8 @@ impl CascadesEngine {
             .and_then(|provider| provider.property_work())
         {
             counters.extend([
+                ("quality_contract_builds", work.contract_builds),
+                ("quality_contract_reuses", work.contract_reuses),
                 ("quality_property_node_builds", work.node_builds),
                 ("quality_property_node_reuses", work.node_reuses),
                 ("quality_property_cte_builds", work.cte_builds),

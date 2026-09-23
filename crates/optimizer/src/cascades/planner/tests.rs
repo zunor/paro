@@ -113,7 +113,7 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
             goal: input.root_goal,
             candidate: winner.candidate,
         };
-        let state = state.read().unwrap();
+        let mut state = state.write().unwrap();
         let mut properties = quality_properties::SelectedQualityProperties::default();
         let inspected =
             inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
@@ -139,6 +139,7 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
         .unwrap();
         assert_eq!(actual.evidence, expected, "normalized={normalized}");
         let builds = properties.builds;
+        let contract_builds = properties.contract_builds;
         let domain_builds = properties.cte_domains.builds;
         let region_before = properties
             .region_fact_fingerprint(
@@ -174,6 +175,8 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
         .unwrap();
         assert_eq!(again.evidence, expected);
         assert_eq!(properties.builds, builds);
+        assert_eq!(properties.contract_builds, contract_builds);
+        assert!(properties.contract_reuses > 0);
         assert_eq!(properties.cte_domains.builds, domain_builds);
         assert!(properties.reuses > 0);
         assert!(properties.cte_domains.reuses > 0);
@@ -224,6 +227,10 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
                 .unwrap()
         );
         assert!(properties.builds > builds);
+        assert_eq!(
+            properties.contract_builds, contract_builds,
+            "statistics are not an implementation-contract dependency"
+        );
         let region_after = properties
             .region_fact_fingerprint(
                 engine.memo(),
@@ -244,6 +251,125 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
         for (candidate, revision) in unchanged {
             assert_eq!(properties.revision(candidate), revision);
         }
+        // A live payload's implementation contract can be withdrawn without a
+        // fact revision. Cached properties must fail closed and recover after
+        // restoration, just as the independent frozen traversal does.
+        let root_logical = engine
+            .memo()
+            .logical_expr(
+                engine
+                    .memo()
+                    .physical_expr(winner.expression)
+                    .unwrap()
+                    .key
+                    .logical,
+            )
+            .unwrap();
+        let root_payload = root_logical.payload;
+        let original = state.metadata[&root_payload].provided.result_guarantee;
+        state
+            .metadata
+            .get_mut(&root_payload)
+            .unwrap()
+            .provided
+            .result_guarantee =
+            ResultGuarantee::ApproximateAllowed(crate::physical::QualityPolicyId(1));
+        assert!(
+            inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
+                .unwrap()
+                .is_none()
+        );
+        state
+            .metadata
+            .get_mut(&root_payload)
+            .unwrap()
+            .provided
+            .result_guarantee = original;
+        assert!(
+            inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
+                .unwrap()
+                .is_some()
+        );
+        // An origin marker without an equivalence proof must not reuse a
+        // previously accepted local contract. Restoring it restores the same
+        // independently checked evidence, not an unconditional cached success.
+        state.metadata.get_mut(&root_payload).unwrap().origin_rule = Some(RuleId(999));
+        assert!(
+            inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
+                .unwrap()
+                .is_none()
+        );
+        state.metadata.get_mut(&root_payload).unwrap().origin_rule = None;
+        let restored = planner_quality_evidence(
+            engine.memo(),
+            reference,
+            &winner,
+            &state,
+            &mut properties,
+            &super::super::quality::QualityBundleRegistry::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.evidence, refreshed.evidence);
+        // The generic implementation dispatch depends on metadata's baseline
+        // flavor. A change must rederive its contract even at the same facts.
+        let implementation = state.metadata[&root_payload].implementations.baseline;
+        assert_eq!(implementation, PhysicalImplementationFlavor::Structural);
+        state
+            .metadata
+            .get_mut(&root_payload)
+            .unwrap()
+            .implementations
+            .baseline = PhysicalImplementationFlavor::HashJoin;
+        assert!(
+            inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(properties.contract_builds, contract_builds + 1);
+        state
+            .metadata
+            .get_mut(&root_payload)
+            .unwrap()
+            .implementations
+            .baseline = implementation;
+        assert!(
+            inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(properties.contract_builds, contract_builds + 2);
+        // New selected provenance is a live local input, unlike apply audit.
+        state
+            .metadata
+            .get_mut(&root_payload)
+            .unwrap()
+            .selected_proofs =
+            Box::new([EquivalenceProof::TransformationDescendant { rule: RuleId(999) }]);
+        let changed = inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
+            .unwrap()
+            .unwrap();
+        assert!(changed.rules.contains(&RuleId(999)));
+        assert_eq!(properties.contract_builds, contract_builds + 3);
+        state
+            .metadata
+            .get_mut(&root_payload)
+            .unwrap()
+            .selected_proofs = Box::new([]);
+        assert_eq!(
+            planner_quality_evidence(
+                engine.memo(),
+                reference,
+                &winner,
+                &state,
+                &mut properties,
+                &super::super::quality::QualityBundleRegistry::default()
+            )
+            .unwrap()
+            .unwrap()
+            .evidence,
+            refreshed.evidence
+        );
         // A truncated or cyclic choice graph cannot borrow a cached success.
         let mut invalid = actual.nodes.to_vec();
         let root_node = invalid
