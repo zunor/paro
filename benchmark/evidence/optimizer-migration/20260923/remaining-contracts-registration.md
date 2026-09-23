@@ -71,3 +71,21 @@ cap 16 MiB, well below the 64 MiB standard ceiling; no raw trace floods or
 server logs in Git. Run workspace tests, strict Clippy, benchmark unit tests
 and high-FD SQL regress. Compare the failure set and actual bytes with the
 pre-task 18-failure control; never update expected output in this task.
+
+## Receipt-coverage correction (before replacement collection)
+
+The first launch omitted `PARO_COMPILE_WORK_EVIDENCE=1`. Its normal receipts
+prove SQL/cache/admission association but correctly have `compile_work: null`.
+Those samples remain valid C1 observations and are retained as compiler
+Uncovered; no diagnostic timer is substituted and no history is overwritten.
+The queued run was stopped after the active query completed when this omission
+was detected. This is a collection configuration error, not a query failure.
+
+Run the same six registered cells once under distinct `work-q*-{off,on}` run
+identities with **PARO_COMPILE_WORK_EVIDENCE=1**. This is the existing bounded
+normal-observation switch, not Detail or statement tracing. The same switch
+was enabled in the historical normal compiler receipts. Record its effective
+value and observer scope in each input manifest; do not claim zero overhead.
+Keep all other inputs, sample counts and thresholds unchanged, and do not pool
+the covered and uncovered cohorts. One replacement per cell, not retries chosen
+by observed timings. Binary/source-code content is unchanged by this amendment.
