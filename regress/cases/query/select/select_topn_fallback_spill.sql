@@ -36,7 +36,8 @@ LIMIT 5 OFFSET 6000;
 SET temp_directory = '/tmp/paro_regress_topn_spill';
 SET force_external = true;
 
--- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes
+-- Allocation ids are query-local; preserve their equality, not their numbers.
+-- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT id
 FROM topn_fallback_spill_case

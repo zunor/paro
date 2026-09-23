@@ -22,7 +22,8 @@ ORDER BY score DESC, id;
 CREATE INDEX score_identity_index ON score_identity USING GIN (to_tsvector('simple', content));
 
 -- Execution coverage is separate from scores and selected result membership.
--- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes
+-- Allocation ids are query-local; preserve their equality, not their numbers.
+-- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT id FROM score_identity
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
@@ -42,7 +43,7 @@ ORDER BY ts_rank(to_tsvector('simple', content),
                  plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
 
 -- Cover density has its own document-local identity and executable provider.
--- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT id FROM score_identity
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
