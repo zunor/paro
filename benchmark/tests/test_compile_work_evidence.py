@@ -108,6 +108,28 @@ class CompileWorkEvidenceTest(unittest.TestCase):
         self.assertEqual(evidence["statement_decision_id"], 11)
         self.assertEqual(evidence["execution_id"], 12)
 
+        # A quality handoff may follow a locally exhausted optional budget.
+        # This is valid incomplete search, not a missing/corrupt receipt.
+        payload = json.loads(rows[0][-1])
+        payload["compile_receipt"]["budget_limited"] = {"Observed": True}
+        payload["compile_receipt"]["obligations"] = {"Observed": 1}
+        rows[0] = typed_row("statement_cache", 11, payload)
+        evidence = collect_statement_cache_evidence(connection, query, before_execution_ids={14})
+        self.assertEqual(evidence["status"], "Verified")
+        self.assertEqual(evidence["compile"]["raw"], {"optimizer_elapsed_us": 17})
+        self.assertFalse(evidence["compile"]["receipt"]["search_complete"]["Observed"])
+
+        payload["compile_receipt"]["obligations"] = {"Observed": 0}
+        rows[0] = typed_row("statement_cache", 11, payload)
+        evidence = collect_statement_cache_evidence(connection, query, before_execution_ids={14})
+        self.assertEqual(evidence["status"], "Uncovered")
+
+        payload["compile_receipt"]["obligations"] = {"Observed": 1}
+        payload["compile_receipt"]["search_stop"] = {"Observed": "Complete"}
+        rows[0] = typed_row("statement_cache", 11, payload)
+        evidence = collect_statement_cache_evidence(connection, query, before_execution_ids={14})
+        self.assertEqual(evidence["status"], "Uncovered")
+
     def test_disabled_collection_is_missing_not_zero(self):
         query = "SELECT 1"
         fp = statement_fingerprint(query)

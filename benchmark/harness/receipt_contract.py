@@ -860,8 +860,15 @@ def _validate_compile_receipt(value: Any, identity: dict[str, Any]) -> None:
         raise ReceiptContractError("search_complete is true for a non-complete stop")
     if stop == "QualityPolicySatisfied" and not quality_satisfied:
         raise ReceiptContractError("quality stop lacks quality_policy_satisfied")
-    if budget_limited and stop not in {"BudgetLimited", "Deadline"}:
+    # The budget flag describes unresolved work, not necessarily the selected
+    # stop policy. The engine may satisfy quality after some optional task has
+    # exhausted its budget, or terminate its diagnostic obligation lane first.
+    if budget_limited and stop not in {
+        "BudgetLimited", "Deadline", "QualityPolicySatisfied", "Incomplete"
+    }:
         raise ReceiptContractError("budget_limited is inconsistent with search stop")
+    if budget_limited and obligations == 0:
+        raise ReceiptContractError("budget_limited lacks an outstanding obligation")
     if stop == "BudgetLimited" and not budget_limited:
         raise ReceiptContractError("BudgetLimited stop lacks budget_limited")
     compile_work = value.get("compile_work")
