@@ -224,6 +224,7 @@ impl ReadSet {
     }
 
     pub fn is_current(&self, memo: &Memo) -> Result<bool> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
         self.reads
             .iter()
             .try_fold(true, |current, read| Ok(current && read.is_current(memo)?))
@@ -640,6 +641,7 @@ impl TaskRegistry {
         reads: ReadSet,
         memo: &Memo,
     ) -> Result<TaskRequest> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
         let intent = canonicalize_task_intent(memo, intent);
         let reads = canonicalize_read_set(memo, reads);
         self.request_with_current_reads(intent, reads, Some(memo))
@@ -971,6 +973,7 @@ impl TaskRegistry {
         memo: &Memo,
         reads: ReadSet,
     ) -> Result<()> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
         if !matches!(self.state(task), Some(TaskState::Running)) {
             return Err(paro_error::internal(
                 "only a running task may replace its read set",

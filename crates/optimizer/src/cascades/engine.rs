@@ -1202,8 +1202,7 @@ pub struct CascadesEngine {
     /// Continuation metadata is kept beside, rather than inside, the legacy
     /// binding queue.  The queue remains the existing quality lane; this map
     /// supplies exact reads and context when a queued binding is dispatched.
-    quality_pending_domain_continuations:
-        BTreeMap<OptimizationGoal, Vec<DomainContinuation>>,
+    quality_pending_domain_continuations: BTreeMap<OptimizationGoal, Vec<DomainContinuation>>,
     quality_active_forced_transform_goal: Option<OptimizationGoal>,
     quality_active_domain_continuation: Option<DomainContinuation>,
     /// Reverse index for incrementally closing transformation dependencies.
@@ -1416,7 +1415,8 @@ pub struct CascadesEngine {
     /// suppresses only another check with the same fact dependencies; a
     /// stale cursor reopens the candidate and lets the provider rebuild its
     /// exact local proof.
-    quality_evaluated_candidates: BTreeMap<(OptimizationGoal, CandidateId), super::tasks::ReadSetId>,
+    quality_evaluated_candidates:
+        BTreeMap<(OptimizationGoal, CandidateId), super::tasks::ReadSetId>,
     quality_frontier_max_aggregates: u32,
     quality_frontier_max_runtime_filters: u32,
     quality_frontier_max_aggregate_regions: u32,
@@ -1547,7 +1547,8 @@ impl CascadesEngine {
             child_combination_recompute_count: 0,
             child_combination_cost_synthesis_count: 0,
             diagnostic_cost_phase_times: (std::env::var_os("PARO_DIAGNOSTIC_COST_PHASE_TIMES")
-                .as_deref() == Some(std::ffi::OsStr::new("1")))
+                .as_deref()
+                == Some(std::ffi::OsStr::new("1")))
             .then(|| Arc::new(CostPhaseTimes::default())),
             child_combination_frontier_recheck_count: 0,
             child_combination_budget_rejection_count: 0,
@@ -3383,11 +3384,7 @@ impl CascadesEngine {
     /// applicable to more than one goal.
     fn note_physical_implementation_change(&mut self, group: GroupId) {
         let group = self.memo.canonical_group(group);
-        let goals = self
-            .physical_goals
-            .get(&group)
-            .cloned()
-            .unwrap_or_default();
+        let goals = self.physical_goals.get(&group).cloned().unwrap_or_default();
         for goal in goals {
             self.mark_physical_parents_dirty((group, goal));
             self.physical_response_notifications.insert((group, goal));
@@ -3408,9 +3405,8 @@ impl CascadesEngine {
                     .physical_related_goal_notification_count
                     .saturating_add(1);
             } else {
-                self.physical_merged_notification_count = self
-                    .physical_merged_notification_count
-                    .saturating_add(1);
+                self.physical_merged_notification_count =
+                    self.physical_merged_notification_count.saturating_add(1);
             }
         }
     }
@@ -3426,9 +3422,8 @@ impl CascadesEngine {
                     .physical_completion_notification_count
                     .saturating_add(1);
             } else {
-                self.physical_merged_notification_count = self
-                    .physical_merged_notification_count
-                    .saturating_add(1);
+                self.physical_merged_notification_count =
+                    self.physical_merged_notification_count.saturating_add(1);
             }
         }
     }
@@ -3498,9 +3493,8 @@ impl CascadesEngine {
                     .saturating_add(1);
             }
             QualityCheckOrigin::Checkpoint => {
-                self.quality_handoff_checkpoint_call_count = self
-                    .quality_handoff_checkpoint_call_count
-                    .saturating_add(1);
+                self.quality_handoff_checkpoint_call_count =
+                    self.quality_handoff_checkpoint_call_count.saturating_add(1);
             }
         }
         if !self.quality_handoff_enabled
@@ -3545,9 +3539,8 @@ impl CascadesEngine {
                 .and_then(|read_id| self.task_registry.read_set(read_id))
                 .is_some_and(|reads| reads.is_current(&self.memo).is_ok_and(|current| current))
             {
-                self.quality_frontier_candidate_skip_count = self
-                    .quality_frontier_candidate_skip_count
-                    .saturating_add(1);
+                self.quality_frontier_candidate_skip_count =
+                    self.quality_frontier_candidate_skip_count.saturating_add(1);
                 continue;
             }
             // A planner provider may inspect the immutable selected path
@@ -3577,7 +3570,8 @@ impl CascadesEngine {
                 None => {
                     let frozen = self.freeze_grant_winner(root, class, goal, winner.clone())?;
                     let reference = frozen.frozen.reference;
-                    let evidence = provider.evidence(&self.memo, reference, &frozen.frozen, goal)?;
+                    let evidence =
+                        provider.evidence(&self.memo, reference, &frozen.frozen, goal)?;
                     frozen_winner = Some(frozen);
                     evidence
                 }
@@ -3599,16 +3593,14 @@ impl CascadesEngine {
             )?;
             if preflight.is_some() {
                 if certificate.is_some() {
-                    self.quality_preflight_ready_count = self
-                        .quality_preflight_ready_count
-                        .saturating_add(1);
+                    self.quality_preflight_ready_count =
+                        self.quality_preflight_ready_count.saturating_add(1);
                 } else {
                     self.quality_preflight_policy_rejection_count = self
                         .quality_preflight_policy_rejection_count
                         .saturating_add(1);
-                    self.quality_freeze_avoided_count = self
-                        .quality_freeze_avoided_count
-                        .saturating_add(1);
+                    self.quality_freeze_avoided_count =
+                        self.quality_freeze_avoided_count.saturating_add(1);
                 }
             }
             // A cheap policy pass is only a precondition for freezing.  The
@@ -3622,9 +3614,8 @@ impl CascadesEngine {
                 let Some(full_evidence) =
                     provider.evidence(&self.memo, reference, &frozen.frozen, goal)?
                 else {
-                    self.quality_preflight_missing_count = self
-                        .quality_preflight_missing_count
-                        .saturating_add(1);
+                    self.quality_preflight_missing_count =
+                        self.quality_preflight_missing_count.saturating_add(1);
                     self.quality_candidate_missing_evidence_count = self
                         .quality_candidate_missing_evidence_count
                         .saturating_add(1);
@@ -3926,10 +3917,12 @@ impl CascadesEngine {
         let mut incumbent = None;
         if mode == SearchMode::Memo {
             let phase = self.memo.control().incumbent_phase();
+            let work_phase = crate::work_partition::phase(crate::work_partition::Phase::Mandatory);
             self.mandatory_only = true;
             let baseline = self.optimize_group(root, goal);
             self.mandatory_only = false;
             drop(phase);
+            drop(work_phase);
             baseline?;
             self.record_search_checkpoints(root);
             super::verifier::MemoVerifier::verify(&self.memo, None)?;
@@ -3951,6 +3944,7 @@ impl CascadesEngine {
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
             }
             self.reset_cost_epoch()?;
+            let _work_phase = crate::work_partition::phase(crate::work_partition::Phase::Optional);
             self.optional_search_started =
                 self.collect_rule_work_profile || self.quality_handoff_enabled;
             // The archived mandatory incumbent remains the safe plan for this
@@ -4004,6 +3998,8 @@ impl CascadesEngine {
     }
 
     fn reset_cost_epoch(&mut self) -> Result<()> {
+        let _partition =
+            crate::work_partition::enter(crate::work_partition::Bucket::PhaseTransition);
         self.quality_production_requests.clear();
         self.quality_forced_transform_bindings.clear();
         self.quality_active_forced_transform_binding = None;
@@ -4242,10 +4238,12 @@ impl CascadesEngine {
         self.begin_diagnostic_profile(root, checkpoint_goals.iter().copied());
         if mode == SearchMode::Memo {
             let phase = self.memo.control().incumbent_phase();
+            let work_phase = crate::work_partition::phase(crate::work_partition::Phase::Mandatory);
             self.mandatory_only = true;
             let incumbent = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
             self.mandatory_only = false;
             drop(phase);
+            drop(work_phase);
             self.record_search_checkpoints(root);
             // Missing candidates are represented by an empty/partial result,
             // never an error. Every implementation, verifier and cancellation
@@ -4400,6 +4398,7 @@ impl CascadesEngine {
         incumbent: Result<GrantOptimization>,
         optional_started: &mut bool,
     ) -> Result<GrantOptimization> {
+        let _work_phase = crate::work_partition::phase(crate::work_partition::Phase::Optional);
         self.memo.control().begin_optional();
         if !self.memo.control().checkpoint()? {
             self.governor
@@ -4803,9 +4802,7 @@ impl CascadesEngine {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
         for (group, changed_goal) in changed_subproblems {
             let group = self.memo.canonical_group(group);
-            if !self
-                .physical_parents
-                .contains_key(&(group, changed_goal))
+            if !self.physical_parents.contains_key(&(group, changed_goal))
                 && self
                     .physical_goals
                     .get(&group)
@@ -4857,9 +4854,8 @@ impl CascadesEngine {
                     .physical_direct_consumer_enqueue_count
                     .saturating_add(1);
             } else {
-                self.physical_merged_notification_count = self
-                    .physical_merged_notification_count
-                    .saturating_add(1);
+                self.physical_merged_notification_count =
+                    self.physical_merged_notification_count.saturating_add(1);
             }
         }
     }
@@ -4909,9 +4905,8 @@ impl CascadesEngine {
             let response_after = self.physical_response_snapshot(group, goal);
             let response_changed = response_before != response_after;
             if !response_changed {
-                self.physical_response_unchanged_count = self
-                    .physical_response_unchanged_count
-                    .saturating_add(1);
+                self.physical_response_unchanged_count =
+                    self.physical_response_unchanged_count.saturating_add(1);
             }
             // The outer snapshot catches changes made by this top-level task;
             // the staged set also contains responses published by recursive
@@ -5775,7 +5770,8 @@ impl CascadesEngine {
                     );
                 }
                 let insertion = (|| -> Result<TransformationInsertion> {
-                    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Insert);
+                    let _partition =
+                        crate::work_partition::enter(crate::work_partition::Bucket::Insert);
                     let mut inserted_groups = BTreeSet::new();
                     let mut inserted_expressions = Vec::new();
                     for output in outputs {
@@ -6163,7 +6159,9 @@ impl CascadesEngine {
         &self.rule_binding_work
     }
 
-    pub fn observe_compile_rule_work(&mut self) { self.collect_compile_rule_work = true; }
+    pub fn observe_compile_rule_work(&mut self) {
+        self.collect_compile_rule_work = true;
+    }
 
     pub fn rule_allocated_bytes(&self) -> &BTreeMap<RuleId, u64> {
         &self.rule_allocated_bytes
@@ -6424,7 +6422,8 @@ impl CascadesEngine {
             ),
             (
                 "quality_domain_continuation_first_us",
-                self.quality_domain_continuation_first_us.unwrap_or_default(),
+                self.quality_domain_continuation_first_us
+                    .unwrap_or_default(),
             ),
             (
                 "quality_domain_continuation_last_us",
@@ -7763,6 +7762,7 @@ impl CascadesEngine {
     /// a newly published child winner creates a new evaluation without
     /// making every unchanged recursive visit resumable.
     fn physical_read_set(&self, group: GroupId, goal: OptimizationGoal) -> Result<ReadSet> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
         let group = self.memo.canonical_group(group);
         self.memo
             .group(group)
@@ -7781,9 +7781,7 @@ impl CascadesEngine {
         if let Some(children) = self.physical_read_dependencies.get(&(group, goal)) {
             for (child, child_goal) in children.iter().copied() {
                 reads.push(PatternRead::physical_from_group(
-                    &self.memo,
-                    child,
-                    child_goal,
+                    &self.memo, child, child_goal,
                 )?);
             }
         }
@@ -7816,6 +7814,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         previous: Option<&PhysicalTaskState>,
     ) -> Result<(ReadSet, bool)> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
         let group = self.memo.canonical_group(group);
         self.memo
             .group(group)
@@ -7910,18 +7909,16 @@ impl CascadesEngine {
             && !implementation_phase_changed
             && !self.physical_dirty_recipes.contains_key(&cache_key)
             && !completion_pending
-            && resident_state
-                .as_ref()
-                .is_some_and(|entry| {
-                    next_recipe_sequence <= entry.recipe_cursor
-                        && (entry.complete
-                            || (self.preserve_incomplete_physical
-                                && !self.physical_interleave_step_mode))
-                        && entry
-                            .reads
-                            .is_current(&self.memo)
-                            .is_ok_and(|current| current)
-                });
+            && resident_state.as_ref().is_some_and(|entry| {
+                next_recipe_sequence <= entry.recipe_cursor
+                    && (entry.complete
+                        || (self.preserve_incomplete_physical
+                            && !self.physical_interleave_step_mode))
+                    && entry
+                        .reads
+                        .is_current(&self.memo)
+                        .is_ok_and(|current| current)
+            });
         if fast_reuse {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
             return Ok(());
@@ -7938,7 +7935,8 @@ impl CascadesEngine {
         let (requested_read_set, read_set_changed) =
             self.physical_read_set_incremental(group, goal, resident_state.as_ref())?;
         if read_set_changed {
-            self.physical_readset_rebuild_count = self.physical_readset_rebuild_count.saturating_add(1);
+            self.physical_readset_rebuild_count =
+                self.physical_readset_rebuild_count.saturating_add(1);
         }
         let read_set = requested_read_set.clone();
         let mut new_evaluation = false;
@@ -8138,9 +8136,8 @@ impl CascadesEngine {
                 dirty_recipes.as_ref(),
             )
         {
-            self.physical_completion_only_resume_count = self
-                .physical_completion_only_resume_count
-                .saturating_add(1);
+            self.physical_completion_only_resume_count =
+                self.physical_completion_only_resume_count.saturating_add(1);
         }
         if resume_candidate {
             if !has_recipe_work && !completion_pending {
@@ -8197,8 +8194,8 @@ impl CascadesEngine {
             };
             self.task_registry
                 .complete_current(task, &self.memo, outcome)?;
-            let cache_complete = !self.preserve_incomplete_physical
-                && self.memo.search_obligations_empty();
+            let cache_complete =
+                !self.preserve_incomplete_physical && self.memo.search_obligations_empty();
             self.note_physical_completion_change(group, goal, cache_complete);
             self.physical_task_cache.insert(
                 cache_key,
@@ -8304,8 +8301,8 @@ impl CascadesEngine {
                 // exact post-child ReadSet before publication; otherwise a
                 // later parent could either miss a child change or retain a
                 // provisional pre-child snapshot.
-                let (post_child_reads, _post_readset_changed) = self
-                    .physical_read_set_incremental(group, goal, resident_state.as_ref())?;
+                let (post_child_reads, _post_readset_changed) =
+                    self.physical_read_set_incremental(group, goal, resident_state.as_ref())?;
                 if post_child_reads != requested_read_set {
                     self.physical_readset_rebuild_count =
                         self.physical_readset_rebuild_count.saturating_add(1);
@@ -9303,13 +9300,11 @@ impl CascadesEngine {
             self.physical_recipe_reprocess_count =
                 self.physical_recipe_reprocess_count.saturating_add(1);
             if sequence < recipe_cursor {
-                self.physical_recipe_repeat_process_count = self
-                    .physical_recipe_repeat_process_count
-                    .saturating_add(1);
+                self.physical_recipe_repeat_process_count =
+                    self.physical_recipe_repeat_process_count.saturating_add(1);
             } else {
-                self.physical_recipe_first_process_count = self
-                    .physical_recipe_first_process_count
-                    .saturating_add(1);
+                self.physical_recipe_first_process_count =
+                    self.physical_recipe_first_process_count.saturating_add(1);
             }
             if !self.memo.control().checkpoint()? {
                 break;
@@ -9722,7 +9717,8 @@ impl CascadesEngine {
                 if pending_retry {
                     combination_state.budget_rejected.remove(&child_ids);
                 }
-                let kernel_partition = crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
+                let kernel_partition =
+                    crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
                 let kernel_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 0);
                 child_costs.clear();
                 child_fingerprints.clear();
@@ -9736,8 +9732,10 @@ impl CascadesEngine {
                     // handles, not a duplicate winner tree.
                     let mut child_source_work_refs =
                         SmallVec::<[&[SourceWork]; 8]>::with_capacity(child_frontier_count);
-                    for (candidate, (child, child_goal)) in
-                        child_ids.iter().copied().zip(recipe.child_goals.iter().copied())
+                    for (candidate, (child, child_goal)) in child_ids
+                        .iter()
+                        .copied()
+                        .zip(recipe.child_goals.iter().copied())
                     {
                         let winner = self
                             .memo

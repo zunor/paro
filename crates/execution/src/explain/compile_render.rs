@@ -461,6 +461,13 @@ pub fn validate_json(
     } else if r.outcome == CompileOutcome::Success {
         return Err("successful compiler record lacks phase accounting".into());
     }
+    if let Observation::Observed(work) = r.optimizer_work {
+        if !work.is_closed()
+            || matches!(r.optimizer_ns, Observation::Observed(ns) if ns != work.total_ns)
+        {
+            return Err("optimizer work accounting does not close".into());
+        }
+    }
     Ok(document)
 }
 

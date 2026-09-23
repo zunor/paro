@@ -3,41 +3,13 @@
 use std::{cell::RefCell, marker::PhantomData, rc::Rc, time::Instant};
 mod b3;
 pub(crate) use b3::{
-    cache_site, local_lookup, native_refresh, native_refresh_node, rule, staging_payload, settled_node, CacheSite, MissKind,
+    cache_site, local_lookup, native_refresh, native_refresh_node, rule, settled_node,
+    staging_payload, CacheSite, MissKind,
 };
 
-#[derive(Clone, Copy)]
-#[repr(usize)]
-pub enum Bucket {
-    Pre,
-    Agenda,
-    Match,
-    Apply,
-    Insert,
-    Schedule,
-    Recipe,
-    Subproblem,
-    Kernel,
-    Admission,
-    Publish,
-    Quality,
-    Finish,
-    QualityEvidence,
-    QualityDomain,
-    QualityProduction,
-    QualityFreeze,
-    QualityReads,
-    NativeConstruct,
-    Statistics,
-    OwnedRewrite,
-    Settlement,
-    Staging,
-    SemanticGuard,
-    Rollback,
-    Encoding,
-    Unclassified,
-}
-const N: usize = 27;
+use paro_context::compile_diagnostics::work::{OptimizerWork, WorkEntry};
+pub use paro_context::compile_diagnostics::work::{WorkKind as Bucket, WorkPhase as Phase};
+const N: usize = Bucket::ALL.len();
 const NAMES: [&str; N] = [
     "B0_pre",
     "B1_agenda",
@@ -65,6 +37,9 @@ const NAMES: [&str; N] = [
     "B3f_semantic_guard",
     "B3g_rollback",
     "B3h_encoding_validation",
+    "dependencies",
+    "phase_transition",
+    "physical_lowering",
     "unclassified",
 ];
 struct Ledger {
@@ -73,6 +48,8 @@ struct Ledger {
     current: usize,
     ns: [u64; N],
     entries: [u64; N],
+    phase: Phase,
+    phase_ns: [u64; 3],
     b3: b3::Attribution,
 }
 impl Ledger {
@@ -80,6 +57,7 @@ impl Ledger {
         let previous = self.current;
         let elapsed = now - self.cursor;
         self.ns[previous] += elapsed;
+        self.phase_ns[self.phase as usize] += elapsed;
         self.b3.account(previous, elapsed);
         self.cursor = now;
         self.current = next;
@@ -148,12 +126,49 @@ impl Drop for Scope {
         }
     }
 }
+
+pub struct PhaseScope {
+    previous: Option<(u64, Phase)>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+pub fn phase(next: Phase) -> PhaseScope {
+    let previous = SLOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let generation = slot.generation;
+        let ledger = slot.ledger.as_mut()?;
+        ledger.change(ledger.now(), ledger.current);
+        let previous = ledger.phase;
+        ledger.phase = next;
+        Some((generation, previous))
+    });
+    PhaseScope {
+        previous,
+        _not_send: PhantomData,
+    }
+}
+
+impl Drop for PhaseScope {
+    fn drop(&mut self) {
+        if let Some((generation, previous)) = self.previous {
+            SLOT.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.generation == generation {
+                    if let Some(ledger) = slot.ledger.as_mut() {
+                        ledger.change(ledger.now(), ledger.current);
+                        ledger.phase = previous;
+                    }
+                }
+            });
+        }
+    }
+}
 pub struct Invocation {
     generation: u64,
     _not_send: PhantomData<Rc<()>>,
 }
-pub fn begin(start: Instant) -> Invocation {
-    let enabled = std::env::var_os("PARO_DIAGNOSTIC_WORK_PARTITION").is_some();
+pub fn begin(start: Instant, detail: bool) -> Invocation {
+    let enabled = detail || std::env::var_os("PARO_DIAGNOSTIC_WORK_PARTITION").is_some();
     let generation = SLOT.with(|slot| {
         let mut slot = slot.borrow_mut();
         slot.generation += 1;
@@ -163,6 +178,8 @@ pub fn begin(start: Instant) -> Invocation {
             current: Bucket::Unclassified as usize,
             ns: [0; N],
             entries: [0; N],
+            phase: Phase::OutsideSearch,
+            phase_ns: [0; 3],
             b3: Default::default(),
         });
         slot.generation
@@ -206,6 +223,20 @@ impl Drop for Invocation {
     }
 }
 impl Report {
+    pub fn snapshot(&self) -> OptimizerWork {
+        OptimizerWork {
+            total_ns: self.total_ns,
+            buckets: std::array::from_fn(|i| WorkEntry {
+                kind: Bucket::ALL[i],
+                exclusive_ns: self.ledger.ns[i],
+                entries: self.ledger.entries[i],
+            }),
+            outside_search_ns: self.ledger.phase_ns[Phase::OutsideSearch as usize],
+            mandatory_ns: self.ledger.phase_ns[Phase::Mandatory as usize],
+            optional_ns: self.ledger.phase_ns[Phase::Optional as usize],
+        }
+    }
+
     /// Called after the optimizer interval, but inside diagnostic compiler/C1.
     pub fn write(self, statement: &str, success: bool) -> std::io::Result<()> {
         use std::io::Write;
@@ -237,7 +268,7 @@ impl Report {
 mod tests {
     use super::*;
     fn invocation() -> Invocation {
-        let invocation = begin(Instant::now());
+        let invocation = begin(Instant::now(), true);
         SLOT.with(|slot| {
             slot.borrow_mut().ledger = Some(Ledger {
                 start: Instant::now(),
@@ -245,6 +276,8 @@ mod tests {
                 current: N - 1,
                 ns: [0; N],
                 entries: [0; N],
+                phase: Phase::OutsideSearch,
+                phase_ns: [0; 3],
                 b3: Default::default(),
             })
         });
@@ -289,6 +322,8 @@ mod tests {
             current: N - 1,
             ns: [0; N],
             entries: [0; N],
+            phase: Phase::OutsideSearch,
+            phase_ns: [0; 3],
             b3: Default::default(),
         };
         ledger.change(5, 5);
@@ -300,6 +335,32 @@ mod tests {
         assert_eq!(ledger.ns[5], 11);
         assert_eq!(ledger.ns[2], 4);
         assert_eq!(ledger.ns.iter().sum::<u64>(), 23);
+        assert_eq!(ledger.phase_ns.iter().sum::<u64>(), 23);
+    }
+
+    #[test]
+    fn phase_projection_and_work_partition_cover_the_same_interval() {
+        let invocation = invocation();
+        {
+            let _phase = phase(Phase::Mandatory);
+            let _work = enter(Bucket::Dependencies);
+            {
+                let _phase = phase(Phase::Optional);
+                let _work = enter(Bucket::Kernel);
+            }
+        }
+        let report = invocation.finish(Instant::now()).unwrap().snapshot();
+        assert_eq!(
+            report.total_ns,
+            report.buckets.iter().map(|b| b.exclusive_ns).sum::<u64>()
+        );
+        assert_eq!(
+            report.total_ns,
+            report.outside_search_ns + report.mandatory_ns + report.optional_ns
+        );
+        for (i, row) in report.buckets.iter().enumerate() {
+            assert_eq!(row.kind as usize, i);
+        }
     }
 
     #[test]

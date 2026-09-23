@@ -96,6 +96,33 @@ def validate_compile_document(value: Any, *, require_analyze: bool = False) -> s
         raise ReceiptContractError("compile document has unknown cache state")
     if value["outcome"] == "Success" and value["artifact"] != "CompiledArtifactReady":
         raise ReceiptContractError("successful compile lacks a ready artifact")
+    work = value.get("optimizer_work", {})
+    if isinstance(work, dict) and set(work) == {"Observed"}:
+        work = work["Observed"]
+        if not isinstance(work, dict) or set(work) != {
+            "total_ns", "buckets", "outside_search_ns", "mandatory_ns", "optional_ns"
+        }:
+            raise ReceiptContractError("malformed optimizer work accounting")
+        buckets = work["buckets"]
+        if not isinstance(buckets, list) or not 0 < len(buckets) <= 64:
+            raise ReceiptContractError("invalid optimizer work bucket count")
+        names = set()
+        for bucket in buckets:
+            if not isinstance(bucket, dict) or set(bucket) != {"kind", "exclusive_ns", "entries"}:
+                raise ReceiptContractError("malformed optimizer work bucket")
+            if not isinstance(bucket["kind"], str) or bucket["kind"] in names:
+                raise ReceiptContractError("duplicate optimizer work bucket")
+            names.add(bucket["kind"])
+            if any(type(bucket[k]) is not int or bucket[k] < 0 for k in ("exclusive_ns", "entries")):
+                raise ReceiptContractError("invalid optimizer work measurement")
+        if any(type(work[k]) is not int or work[k] < 0 for k in (
+            "total_ns", "outside_search_ns", "mandatory_ns", "optional_ns"
+        )) or sum(b["exclusive_ns"] for b in buckets) != work["total_ns"] or sum(
+            work[k] for k in ("outside_search_ns", "mandatory_ns", "optional_ns")
+        ) != work["total_ns"]:
+            raise ReceiptContractError("optimizer work accounting does not close")
+        if value.get("optimizer_ns") != {"Observed": work["total_ns"]}:
+            raise ReceiptContractError("optimizer work interval mismatch")
     counters = value.get("search_counters")
     omitted_counters = value.get("omitted_search_counters")
     if not isinstance(counters, list) or len(counters) > MAX_SEARCH_COUNTERS:

@@ -90,13 +90,25 @@ pub fn compile_statement_with_parameter_types(
     );
 
     let optimizer_started = Instant::now();
-    let partition = paro_optimizer::work_partition::begin(optimizer_started);
+    let partition = paro_optimizer::work_partition::begin(
+        optimizer_started,
+        ctx.options.compile_capture.as_ref().is_some_and(|capture| {
+            capture.level() == paro_context::compile_diagnostics::CaptureLevel::Detail
+        }),
+    );
     paro_optimizer::cascades::memo::diagnostic_snapshot::clear();
     let mut optimizer = paro_optimizer::Optimizer::new(planner.binder, ctx.clone());
     let optimized = match optimizer.optimize(logical_plan) {
         Ok(plan) => plan,
         Err(error) => {
             if let Some(report) = partition.finish(Instant::now()) {
+                if let Some(capture) = &ctx.options.compile_capture {
+                    capture.update(|r| {
+                        r.optimizer_work = paro_context::compile_diagnostics::Observation::Observed(
+                            report.snapshot(),
+                        )
+                    });
+                }
                 let _ = report.write(&statement_tag, false);
             }
             if let Some(trace) = &statement_trace {
@@ -141,6 +153,12 @@ pub fn compile_statement_with_parameter_types(
         tracing::warn!(%error, "frontier diagnostic snapshot write failed");
     }
     if let Some(report) = partition_report {
+        if let Some(capture) = &ctx.options.compile_capture {
+            capture.update(|r| {
+                r.optimizer_work =
+                    paro_context::compile_diagnostics::Observation::Observed(report.snapshot())
+            });
+        }
         if let Err(error) = report.write(&statement_tag, true) {
             tracing::warn!(%error, "optimizer work partition write failed");
         }

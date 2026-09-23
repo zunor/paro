@@ -2358,6 +2358,8 @@ impl Optimizer {
         grant_classes: &[ResourceGrantClass],
         grant_search: Option<crate::physical::GrantSearchCoverage>,
     ) -> Result<PhysicalPlanPortfolio> {
+        let _partition =
+            crate::work_partition::enter(crate::work_partition::Bucket::PhysicalLowering);
         let class_map = grant_classes
             .iter()
             .map(|class| (class.id, *class))

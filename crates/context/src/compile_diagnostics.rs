@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub mod work;
+
 /// The only current Compile Evidence wire/schema version. Older documents are
 /// historical artifacts and are intentionally rejected by every current
 /// reader; there is no compatibility decoder in the producer path.
@@ -568,6 +570,7 @@ pub struct CompileFields {
     pub parse: Observation<u64>,
     pub bind_ns: Observation<u64>,
     pub optimizer_ns: Observation<u64>,
+    pub optimizer_work: Observation<work::OptimizerWork>,
     pub verify_ns: Observation<u64>,
     pub finish_ns: Observation<u64>,
     pub compiler_ns: Observation<u64>,
@@ -657,6 +660,7 @@ impl CompileCapture {
                     parse: unknown,
                     bind_ns: unknown,
                     optimizer_ns: unknown,
+                    optimizer_work: Observation::Uncovered(UncoveredReason::NotInstrumented),
                     verify_ns: unknown,
                     finish_ns: unknown,
                     compiler_ns: unknown,

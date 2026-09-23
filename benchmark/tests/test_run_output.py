@@ -106,6 +106,26 @@ class RunOutputTests(unittest.TestCase):
         with self.assertRaises(ReceiptContractError):
             validate_compile_document({**base, "execution": {"Unknown": {}}})
 
+    def test_optimizer_work_projections_must_close_without_double_counting(self) -> None:
+        document = {
+            "schema_version": 3, "outcome": "Incomplete", "artifact": "NotReady",
+            "cache": "ForcedCompile", "admission": "NotExecuted", "execution": "NotExecuted",
+            "search_counters": [], "omitted_search_counters": 0,
+            "optimizer_ns": {"Observed": 17},
+        }
+        work = {
+            "total_ns": 17,
+            "buckets": [{"kind": "Dependencies", "exclusive_ns": 10, "entries": 2},
+                        {"kind": "Unclassified", "exclusive_ns": 7, "entries": 0}],
+            "outside_search_ns": 2, "mandatory_ns": 4, "optional_ns": 11,
+        }
+        document["optimizer_work"] = {"Observed": work}
+        self.assertEqual(validate_compile_document(document), "Summary")
+        for key in ("total_ns", "mandatory_ns", "optional_ns", "outside_search_ns"):
+            invalid = {**document, "optimizer_work": {"Observed": {**work, key: work[key] + 1}}}
+            with self.assertRaises(ReceiptContractError):
+                validate_compile_document(invalid)
+
     def test_campaign_output_seals_each_registered_query_arm_cell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = CampaignOutput.create(
