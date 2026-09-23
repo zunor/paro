@@ -58,7 +58,7 @@ fn arena_extractor_materializes_computed_window_arguments_once() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&window)
+        .extract(window)
         .expect("computed window arguments should lower through one input projection");
     let root = plan.node(plan.root);
     let PhysicalNodeKind::Window(spec) = &root.kind else {
@@ -112,7 +112,7 @@ fn arena_extractor_preserves_independent_volatile_window_arguments() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&window)
+        .extract(window)
         .expect("volatile window arguments should remain independent");
     let root = plan.node(plan.root);
     let [project_id] = plan.child_ids(&root.children) else {

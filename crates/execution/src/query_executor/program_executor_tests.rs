@@ -77,7 +77,7 @@ fn execute_program_uses_compiled_parameter_bindings() {
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let plan = Arc::new(extractor.extract(&logical).expect("physical plan"));
+    let plan = Arc::new(extractor.extract(logical).expect("physical plan"));
     let mut lowerer = PipelineLowerer::new(plan.as_ref());
     let graph = Arc::new(
         lowerer
@@ -1051,7 +1051,7 @@ fn assert_pipeline_count_at_least(statement: &StatementProgram, expected: usize)
 
 fn statement_from_logical(logical: OwnedLogicalPlan) -> StatementProgram {
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let plan = Arc::new(extractor.extract(&logical).expect("physical plan"));
+    let plan = Arc::new(extractor.extract(logical).expect("physical plan"));
     let mut lowerer = PipelineLowerer::new(plan.as_ref());
     let graph = Arc::new(
         lowerer

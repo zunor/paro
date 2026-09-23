@@ -469,7 +469,9 @@ impl ComparisonJoin {
             .filter(|c| !Self::is_hash_equality(c.comparison))
             .count()
     }
+}
 
+impl<Child: crate::plan::LogicalInput> ComparisonJoin<Child> {
     /// Get the output types for this join.
     pub fn get_types(&self) -> Vec<LogicalType> {
         let left_types = project_types(&self.left.types(), &self.left_projection_map);
@@ -535,7 +537,9 @@ impl AnyJoin {
             right_projection_map,
         }
     }
+}
 
+impl<Child: crate::plan::LogicalInput> AnyJoin<Child> {
     /// Get the output types for this join.
     pub fn get_types(&self) -> Vec<LogicalType> {
         let left_types = project_types(&self.left.types(), &self.left_projection_map);
@@ -580,7 +584,9 @@ impl CrossProduct {
             build_side_constraint: JoinBuildSideConstraint::Either,
         }
     }
+}
 
+impl<Child: crate::plan::LogicalInput> CrossProduct<Child> {
     /// Get the output types for this cross product.
     pub fn get_types(&self) -> Vec<LogicalType> {
         let mut types = self.left.types();

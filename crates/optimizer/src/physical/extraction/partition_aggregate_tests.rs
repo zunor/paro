@@ -50,7 +50,7 @@ fn lower_full_partition_window(function: AggregateFunction) -> PhysicalPlan {
     );
 
     PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&window)
+        .extract(window)
         .expect("lower full-partition aggregate window")
 }
 

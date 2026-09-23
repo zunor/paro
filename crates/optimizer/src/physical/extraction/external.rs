@@ -7,7 +7,7 @@ use crate::physical::ExternalRoutineDescriptor;
 impl PhysicalPlanExtractor {
     pub(crate) fn lower_external_project(
         &mut self,
-        project: &LogicalExternalProject,
+        project: &LogicalExternalProject<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(project.child.as_ref())?;
         let input_names = align_output_names(
@@ -39,7 +39,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_external_table(
         &mut self,
-        table: &LogicalExternalTable,
+        table: &LogicalExternalTable<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = table
             .child

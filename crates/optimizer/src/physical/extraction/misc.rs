@@ -16,7 +16,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_window(
         &mut self,
-        window: &LogicalWindow,
+        window: &LogicalWindow<SelectedChild>,
         implementation: crate::physical::PhysicalImplementationFlavor,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         for expression in &window.expressions {
@@ -157,7 +157,9 @@ impl PhysicalPlanExtractor {
     }
 }
 
-pub(crate) fn supports_partition_aggregate_window(window: &LogicalWindow) -> bool {
+pub(crate) fn supports_partition_aggregate_window<Child: paro_planner::plan::LogicalInput>(
+    window: &LogicalWindow<Child>,
+) -> bool {
     let output_names = (0..window.get_types().len())
         .map(|index| format!("window_output_{index}"))
         .collect();
@@ -229,8 +231,8 @@ fn materialize_window_input(expression: &mut Expression, inputs: &mut Vec<Expres
 /// bound, unordered aggregate over the same partition domain, and
 /// every frame must cover that domain completely. Unsupported modifiers keep
 /// the ordinary window implementation as the preserving fallback.
-fn lower_partition_aggregate_window_spec(
-    window: &LogicalWindow,
+fn lower_partition_aggregate_window_spec<Child: paro_planner::plan::LogicalInput>(
+    window: &LogicalWindow<Child>,
     output_names: Vec<String>,
 ) -> Result<Option<PartitionAggregateWindowSpec>> {
     let Some(first) = window.expressions.first() else {
@@ -319,7 +321,7 @@ fn lower_partition_aggregate_window_spec(
         state_output_projection: Box::new([]),
         estimated_input_rows: window
             .child
-            .stats
+            .node_stats()
             .estimated_cardinality
             .map(|estimate| estimate.expected),
         projection_exprs: projection_exprs.into_boxed_slice(),

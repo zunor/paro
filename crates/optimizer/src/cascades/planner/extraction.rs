@@ -1,9 +1,10 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Winner extraction from Memo expressions into verified planner trees.
+//! Frozen winner extraction into immutable selected occurrences for lowering.
 
 use super::*;
+use crate::physical::selected::{SelectedChild, SelectedNode};
 
 fn current_region_for_proof<'a>(
     memo: &'a Memo,
@@ -136,14 +137,14 @@ type WinnerContractMap =
 type WinnerEnforcerMap =
     std::collections::HashMap<paro_planner::plan::PlanNodeId, Box<[ExtractedEnforcerContract]>>;
 pub(super) struct ExtractedWinnerTree {
-    plan: OwnedLogicalPlan,
+    plan: SelectedChild,
     contracts: WinnerContractMap,
     enforcers: WinnerEnforcerMap,
     output_columns: Box<[ColumnId]>,
 }
 
 pub(super) struct PresentedWinnerTree {
-    pub(super) plan: OwnedLogicalPlan,
+    pub(super) plan: SelectedChild,
     pub(super) contracts: WinnerContractMap,
     pub(super) enforcers: WinnerEnforcerMap,
     pub(super) physical_fingerprint: Fingerprint,
@@ -265,6 +266,7 @@ pub(super) fn extract_frozen_planner_tree(
             goal: OptimizationGoal,
             frozen: Arc<crate::cascades::memo::FrozenCandidate>,
             occurrence: Fingerprint,
+            anchor: Option<Option<paro_planner::plan::CardinalityEstimate>>,
         },
         Build(Box<BuildTask>),
     }
@@ -274,8 +276,9 @@ pub(super) fn extract_frozen_planner_tree(
         goal,
         frozen,
         occurrence: Fingerprint(0),
+        anchor: None,
     }];
-    let mut plans = Vec::new();
+    let mut plans: Vec<SelectedChild> = Vec::new();
     let mut contracts = std::collections::HashMap::new();
     let mut extracted_enforcers = std::collections::HashMap::new();
     let mut root_output_columns = None;
@@ -286,6 +289,7 @@ pub(super) fn extract_frozen_planner_tree(
                 goal,
                 frozen,
                 occurrence,
+                anchor,
             } => {
                 if frozen.reference.group != memo.canonical_group(group)
                     || frozen.reference.goal != goal
@@ -428,6 +432,28 @@ pub(super) fn extract_frozen_planner_tree(
                     region_owner,
                     owned_artifacts,
                 };
+                // Equivalent child expressions can carry different ranking
+                // estimates. Propagate the parent's final row domain through
+                // row-preserving edges before building immutable children.
+                let output_estimate = anchor.unwrap_or_else(|| {
+                    memo.cardinality_estimate(group)
+                        .map(
+                            |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
+                                min,
+                                expected,
+                                max,
+                            },
+                        )
+                });
+                let passthrough = match operator_metadata.operator_type {
+                    LogicalOperatorType::Projection
+                    | LogicalOperatorType::RowFetch
+                    | LogicalOperatorType::ExternalProject
+                    | LogicalOperatorType::Order
+                    | LogicalOperatorType::Window => Some(0),
+                    LogicalOperatorType::MaterializedCTE => Some(1),
+                    _ => None,
+                };
                 tasks.push(Task::Build(Box::new(BuildTask {
                     logical: frozen.logical.clone(),
                     payload: physical.payload,
@@ -437,13 +463,7 @@ pub(super) fn extract_frozen_planner_tree(
                     enforcer_cost_input: winner.enforcer_cost_input,
                     base_contract,
                     final_contract,
-                    output_estimate: memo.cardinality_estimate(group).map(
-                        |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
-                            min,
-                            expected,
-                            max,
-                        },
-                    ),
+                    output_estimate,
                 })));
                 for (ordinal, child) in frozen.children.iter().enumerate().rev() {
                     tasks.push(Task::Visit {
@@ -451,6 +471,7 @@ pub(super) fn extract_frozen_planner_tree(
                         goal: child.reference.goal,
                         frozen: child.clone(),
                         occurrence: child_occurrence(occurrence, ordinal),
+                        anchor: (passthrough == Some(ordinal)).then_some(output_estimate),
                     });
                 }
             }
@@ -477,7 +498,7 @@ pub(super) fn extract_frozen_planner_tree(
                     .payloads
                     .get_physical(payload)
                     .ok_or_else(|| paro_error::internal("unknown planner physical payload"))?;
-                let mut children = children.into_iter();
+                let mut boundaries = children.iter().map(|child| child.boundary());
                 let mut plan = match &payload.template {
                     PlannerPhysicalTemplate::Logical(logical)
                     | PlannerPhysicalTemplate::OrderedFilter { logical, .. } => state
@@ -488,17 +509,12 @@ pub(super) fn extract_frozen_planner_tree(
                             paro_error::internal("physical payload lost its logical semantics")
                         })?
                         .semantic_template
-                        .instantiate(bind_context.next_plan_id(), &mut children)?,
+                        .instantiate(bind_context.next_plan_id(), &mut boundaries)?,
                     PlannerPhysicalTemplate::Executable(template) => {
-                        duplicate_plan_preserving_indices(template, bind_context.shared().as_ref())
-                            .try_map_children(|_| {
-                                children.next().ok_or_else(|| {
-                                    paro_error::internal("physical extraction lost a child plan")
-                                })
-                            })?
+                        template.instantiate(bind_context.next_plan_id(), &mut boundaries)?
                     }
                 };
-                if children.next().is_some() {
+                if boundaries.next().is_some() {
                     return Err(paro_error::internal(
                         "physical extraction produced excess child plans",
                     ));
@@ -545,7 +561,7 @@ pub(super) fn extract_frozen_planner_tree(
                         );
                     }
                 }
-                anchor_output_cardinality(&mut plan, output_estimate);
+                plan.stats.estimated_cardinality = output_estimate;
                 contracts.insert(plan.id, base_contract.clone());
                 let mut provided = base_contract.provided;
                 let mut cumulative_cost = base_contract.cost;
@@ -622,7 +638,7 @@ pub(super) fn extract_frozen_planner_tree(
                 if tasks.is_empty() {
                     root_output_columns = Some(output_columns);
                 }
-                plans.push(plan);
+                plans.push(SelectedNode::from_local(plan, children, true)?);
             }
         }
     }
@@ -631,11 +647,9 @@ pub(super) fn extract_frozen_planner_tree(
             "physical extraction did not produce exactly one root",
         ));
     }
-    // Winner extraction substitutes equivalent child expressions and freezes
-    // physical projection maps. Rebuild every positional uniqueness witness
-    // once, on that final tree, before physical lowering is allowed to turn a
-    // catalog proof into an execution contract.
-    let plan = crate::statistics::unique_keys::refresh_unique_keys(plans.pop().unwrap())?;
+    // Layout, local verification, uniqueness and slots were completed once
+    // per selected occurrence. There is no final owned-tree refresh/export.
+    let plan = plans.pop().unwrap();
     Ok(ExtractedWinnerTree {
         plan,
         contracts,
@@ -664,40 +678,6 @@ fn artifact_instance(definition: Fingerprint, occurrence: Fingerprint) -> Finger
 #[cfg(test)]
 #[path = "extraction/occurrence_tests.rs"]
 mod occurrence_tests;
-
-/// A physical winner may use a different equivalent child expression from
-/// the one named by the group's canonical estimation recipe. Anchor the
-/// selected row-preserving chain to the group estimate so EXPLAIN and later
-/// physical lowering cannot publish contradictory cardinalities for nodes
-/// that provably emit the same row domain.
-fn anchor_output_cardinality(
-    plan: &mut OwnedLogicalPlan,
-    estimate: Option<paro_planner::plan::CardinalityEstimate>,
-) {
-    plan.stats.estimated_cardinality = estimate;
-    let passthrough_child = match &plan.operator {
-        LogicalOperator::Projection(_)
-        | LogicalOperator::RowFetch(_)
-        | LogicalOperator::ExternalProject(_)
-        | LogicalOperator::Order(_)
-        | LogicalOperator::Window(_) => Some(0),
-        LogicalOperator::MaterializedCTE(_) => Some(1),
-        _ => None,
-    };
-    let Some(target) = passthrough_child else {
-        return;
-    };
-    let mut ordinal = 0;
-    let _ = plan.visit_children_mut(|child| {
-        if ordinal == target {
-            anchor_output_cardinality(child, estimate);
-            std::ops::ControlFlow::Break(())
-        } else {
-            ordinal += 1;
-            std::ops::ControlFlow::Continue(())
-        }
-    });
-}
 
 pub(super) fn extract_physical_enforcer(
     child: &OwnedLogicalPlan,
@@ -851,9 +831,12 @@ pub(super) fn enforce_result_presentation(
         })
         .collect::<Result<Vec<_>>>()?;
     let child_id = child.id;
-    let projection =
-        LogicalProjection::new(bind_context.generate_table_index(), child, expressions)
-            .with_visible_names(presentation.names.to_vec());
+    let projection = LogicalProjection::new(
+        bind_context.generate_table_index(),
+        child.boundary(),
+        expressions,
+    )
+    .with_visible_names(presentation.names.to_vec());
     let mut plan = OwnedLogicalPlan::new(bind_context, LogicalOperator::Projection(projection));
     if let Some(child_stats) = plan.children().first().map(|child| child.stats.clone()) {
         plan.stats.inherit_cardinality_from(&child_stats);
@@ -904,7 +887,7 @@ pub(super) fn enforce_result_presentation(
         },
     );
     Ok(PresentedWinnerTree {
-        plan,
+        plan: SelectedNode::from_local(plan, vec![child], true)?,
         contracts,
         enforcers,
         physical_fingerprint,

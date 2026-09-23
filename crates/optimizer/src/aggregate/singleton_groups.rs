@@ -279,7 +279,7 @@ mod tests {
         .with_winner_contracts(variant.contracts.clone())
         .with_enforcer_contracts(variant.enforcers.clone())
         .requiring_winner_contracts()
-        .extract(&variant.plan)
+        .extract_selected(&variant.plan)
         .expect("lower selected singleton implementation");
         assert!(matches!(
             physical.node(physical.root).kind,

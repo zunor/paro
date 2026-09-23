@@ -87,7 +87,7 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
     let logical = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&logical)
+        .extract(logical)
         .expect("stale hint must lower conservatively");
 
     assert!(matches!(

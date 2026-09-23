@@ -37,7 +37,7 @@ pub(crate) fn can_use_perfect_hash_aggregate<Child>(
     plan_perfect_hash_aggregate(aggregate, groups, aggregate_exprs)
 }
 
-pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
+pub(crate) fn logical_name<Child>(op: &LogicalOperator<Child>) -> &'static str {
     match op {
         LogicalOperator::Get(_) => "GET",
         LogicalOperator::BoundReference(_) => "BOUND_REFERENCE",
@@ -87,14 +87,14 @@ pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
     }
 }
 
-pub(crate) fn is_read_csv_table_function(plan: &OwnedLogicalPlan) -> bool {
+pub(crate) fn is_read_csv_table_function(plan: &SelectedNode) -> bool {
     matches!(
         &plan.operator,
         LogicalOperator::TableFunctionGet(get) if get.function.name.eq_ignore_ascii_case("read_csv")
     )
 }
 
-pub(crate) fn physical_output_row_type(logical: &OwnedLogicalPlan) -> Result<RowType> {
+pub(crate) fn physical_output_row_type(logical: &SelectedNode) -> Result<RowType> {
     let types = logical.types();
     let visible_names = logical.output_names();
     let names = align_output_names(visible_names.clone(), types.len(), "logical output")?;
@@ -103,7 +103,7 @@ pub(crate) fn physical_output_row_type(logical: &OwnedLogicalPlan) -> Result<Row
 }
 
 pub(crate) fn physical_output_row_type_for_kind(
-    logical: &OwnedLogicalPlan,
+    logical: &SelectedNode,
     kind: &PhysicalNodeKind,
     child_outputs: &[&RowType],
 ) -> Result<RowType> {
@@ -196,7 +196,7 @@ pub(crate) fn physical_output_row_type_for_kind(
 }
 
 fn physical_column_identities(
-    logical: &OwnedLogicalPlan,
+    logical: &SelectedNode,
     kind: &PhysicalNodeKind,
     child_outputs: &[&RowType],
     output: &RowType,
@@ -614,7 +614,7 @@ fn search_projection_identity(
 }
 
 fn logical_row_fetch_column_name(
-    logical: &OwnedLogicalPlan,
+    logical: &SelectedNode,
     table_index: usize,
     column_id: u32,
 ) -> Option<String> {
@@ -722,7 +722,7 @@ pub(crate) fn project_by_index<T: Clone>(
 }
 
 pub(crate) fn project_output_names(
-    input: &OwnedLogicalPlan,
+    input: &SelectedNode,
     projection_map: &[usize],
     label: &str,
 ) -> Result<Vec<String>> {
@@ -730,14 +730,14 @@ pub(crate) fn project_output_names(
     project_by_index(&names, projection_map, label)
 }
 
-pub(crate) fn hash_join_left_projection(join: &ComparisonJoin) -> Vec<usize> {
+pub(crate) fn hash_join_left_projection(join: &ComparisonJoin<SelectedChild>) -> Vec<usize> {
     match join.join_type {
         JoinType::RightSemi | JoinType::RightAnti => Vec::new(),
         _ => join.left_projection_map.to_indices(join.left.types().len()),
     }
 }
 
-pub(crate) fn hash_join_right_projection(join: &ComparisonJoin) -> Vec<usize> {
+pub(crate) fn hash_join_right_projection(join: &ComparisonJoin<SelectedChild>) -> Vec<usize> {
     match join.join_type {
         JoinType::Semi | JoinType::Anti | JoinType::Mark => Vec::new(),
         _ => join
@@ -746,7 +746,9 @@ pub(crate) fn hash_join_right_projection(join: &ComparisonJoin) -> Vec<usize> {
     }
 }
 
-pub(crate) fn comparison_join_output_names(join: &ComparisonJoin) -> Result<Vec<String>> {
+pub(crate) fn comparison_join_output_names(
+    join: &ComparisonJoin<SelectedChild>,
+) -> Result<Vec<String>> {
     let left_projection = hash_join_left_projection(join);
     let right_projection = hash_join_right_projection(join);
     let left_names = project_output_names(
@@ -794,14 +796,14 @@ pub(crate) fn is_hash_join_comparison(comparison: JoinComparisonType) -> bool {
     )
 }
 
-pub(crate) fn nlj_left_projection(join: &ComparisonJoin) -> Vec<usize> {
+pub(crate) fn nlj_left_projection(join: &ComparisonJoin<SelectedChild>) -> Vec<usize> {
     match join.join_type {
         JoinType::RightSemi | JoinType::RightAnti => Vec::new(),
         _ => join.left_projection_map.to_indices(join.left.types().len()),
     }
 }
 
-pub(crate) fn nlj_right_projection(join: &ComparisonJoin) -> Vec<usize> {
+pub(crate) fn nlj_right_projection(join: &ComparisonJoin<SelectedChild>) -> Vec<usize> {
     match join.join_type {
         JoinType::Semi | JoinType::Anti | JoinType::Mark => Vec::new(),
         _ => join
@@ -841,14 +843,14 @@ pub(crate) fn explain_line_expression(line: impl Into<String>) -> Box<[Expressio
     )])
 }
 
-pub(crate) fn is_graph_chain(plan: &OwnedLogicalPlan) -> bool {
+pub(crate) fn is_graph_chain(plan: &SelectedNode) -> bool {
     matches!(
         &plan.operator,
         LogicalOperator::GraphScan(_) | LogicalOperator::GraphExpand(_)
     )
 }
 
-pub(crate) fn extract_graph_name_from_logical(plan: &OwnedLogicalPlan) -> Option<String> {
+pub(crate) fn extract_graph_name_from_logical(plan: &SelectedNode) -> Option<String> {
     match &plan.operator {
         LogicalOperator::GraphScan(scan) => Some(scan.graph_name.clone()),
         LogicalOperator::GraphExpand(expand) => {
@@ -858,7 +860,7 @@ pub(crate) fn extract_graph_name_from_logical(plan: &OwnedLogicalPlan) -> Option
     }
 }
 
-pub(crate) fn extract_schema_name_from_logical(plan: &OwnedLogicalPlan) -> Option<String> {
+pub(crate) fn extract_schema_name_from_logical(plan: &SelectedNode) -> Option<String> {
     match &plan.operator {
         LogicalOperator::GraphScan(scan) => Some(scan.schema_name.clone()),
         LogicalOperator::GraphExpand(expand) => {
@@ -876,7 +878,7 @@ pub(crate) struct GraphChainLayout {
     pub(crate) rowid_cols: HashMap<usize, usize>,
 }
 
-pub(crate) fn build_graph_chain_layout(plan: &OwnedLogicalPlan) -> Result<GraphChainLayout> {
+pub(crate) fn build_graph_chain_layout(plan: &SelectedNode) -> Result<GraphChainLayout> {
     match &plan.operator {
         LogicalOperator::GraphScan(scan) => {
             let mut layout = GraphChainLayout {
@@ -920,7 +922,7 @@ pub(crate) fn build_graph_chain_layout(plan: &OwnedLogicalPlan) -> Result<GraphC
 }
 
 pub(crate) fn build_rowid_mappings_from_logical(
-    plan: &OwnedLogicalPlan,
+    plan: &SelectedNode,
     schema_name: &str,
 ) -> Result<Vec<GraphRowFetchMapping>> {
     let layout = build_graph_chain_layout(plan)?;
@@ -930,7 +932,7 @@ pub(crate) fn build_rowid_mappings_from_logical(
 }
 
 pub(crate) fn collect_rowid_mappings_from_logical(
-    plan: &OwnedLogicalPlan,
+    plan: &SelectedNode,
     schema_name: &str,
     layout: &GraphChainLayout,
     mappings: &mut Vec<GraphRowFetchMapping>,
@@ -1005,16 +1007,13 @@ pub(crate) fn collect_rowid_mappings_from_logical(
     }
 }
 
-pub(crate) fn collect_graph_filters_from_logical(plan: &OwnedLogicalPlan) -> Vec<Expression> {
+pub(crate) fn collect_graph_filters_from_logical(plan: &SelectedNode) -> Vec<Expression> {
     let mut filters = Vec::new();
     collect_graph_filters_recursive(plan, &mut filters);
     filters
 }
 
-pub(crate) fn collect_graph_filters_recursive(
-    plan: &OwnedLogicalPlan,
-    filters: &mut Vec<Expression>,
-) {
+pub(crate) fn collect_graph_filters_recursive(plan: &SelectedNode, filters: &mut Vec<Expression>) {
     match &plan.operator {
         LogicalOperator::GraphScan(_) => {}
         LogicalOperator::GraphExpand(expand) => {
@@ -1061,7 +1060,7 @@ pub(crate) fn graph_expand_output_row_type(
     (names, types)
 }
 
-pub(crate) fn graph_hop_range(expand: &LogicalGraphExpand) -> Result<(u64, u64)> {
+pub(crate) fn graph_hop_range(expand: &LogicalGraphExpand<SelectedChild>) -> Result<(u64, u64)> {
     match &expand.quantifier {
         Some(paro_parser::ast::PathQuantifier::Bounded { lower, upper }) => {
             Ok((*lower, upper.unwrap_or(*lower)))
@@ -1073,7 +1072,7 @@ pub(crate) fn graph_hop_range(expand: &LogicalGraphExpand) -> Result<(u64, u64)>
 }
 
 pub(crate) fn collect_union_all_row_literals(
-    setop: &LogicalSetOperation,
+    setop: &LogicalSetOperation<SelectedChild>,
 ) -> Result<Option<Vec<Box<[Expression]>>>> {
     let mut rows = Vec::new();
     if collect_row_literal_plan(setop.left.as_ref(), setop.types.len(), &mut rows)?
@@ -1085,7 +1084,7 @@ pub(crate) fn collect_union_all_row_literals(
 }
 
 pub(crate) fn collect_row_literal_plan(
-    plan: &OwnedLogicalPlan,
+    plan: &SelectedNode,
     output_width: usize,
     rows: &mut Vec<Box<[Expression]>>,
 ) -> Result<bool> {
@@ -1161,6 +1160,7 @@ mod output_name_tests {
         )
         .with_visible_names(vec!["visible".to_string()]);
         let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
+        let plan = SelectedNode::from_owned(plan).unwrap();
 
         assert_eq!(
             project_output_names(&plan, &[1], "hidden projection").unwrap(),

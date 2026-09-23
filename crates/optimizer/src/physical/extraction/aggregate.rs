@@ -14,7 +14,7 @@ use paro_planner::operator::{DistinctType, GroupInputMultiplicity};
 use paro_storage::statistics::{NumericStats, StringStats};
 
 fn plan_group_key_encodings(
-    aggregate: &LogicalAggregate,
+    aggregate: &LogicalAggregate<SelectedChild>,
     group_indices: &[usize],
 ) -> Box<[GroupKeyEncoding]> {
     let supports_physical_keys = aggregate.aggregates.iter().all(|expression| {
@@ -70,7 +70,9 @@ struct DependentGroupLayout {
     state_output_projection: Vec<usize>,
 }
 
-fn plan_dependent_groups(aggregate: &LogicalAggregate) -> Option<DependentGroupLayout> {
+fn plan_dependent_groups(
+    aggregate: &LogicalAggregate<SelectedChild>,
+) -> Option<DependentGroupLayout> {
     if aggregate.groups.len() < 2
         || !aggregate.grouping_functions.is_empty()
         || !aggregate.has_plain_grouping_domain()
@@ -446,7 +448,7 @@ fn split_strict_conditional_input(expression: Expression) -> (Expression, Option
 impl PhysicalPlanExtractor {
     pub(crate) fn lower_aggregate(
         &mut self,
-        aggregate: &LogicalAggregate,
+        aggregate: &LogicalAggregate<SelectedChild>,
         implementation: crate::physical::PhysicalImplementationFlavor,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         self.lower_aggregate_with_having(aggregate, Box::new([]), implementation)
@@ -454,7 +456,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_aggregate_with_having(
         &mut self,
-        aggregate: &LogicalAggregate,
+        aggregate: &LogicalAggregate<SelectedChild>,
         having_filter: Box<[Expression]>,
         implementation: crate::physical::PhysicalImplementationFlavor,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
@@ -634,7 +636,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_distinct(
         &mut self,
-        distinct: &LogicalDistinct,
+        distinct: &LogicalDistinct<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if distinct.distinct_type != DistinctType::Distinct {
             return self.reject_unimplemented(
@@ -700,7 +702,7 @@ impl PhysicalPlanExtractor {
 /// probe irreversibly promotes flat lookup to the complete key. Statistics
 /// therefore affect only bounded startup work, never physical semantics.
 fn plan_initial_lookup_hash_key_count(
-    aggregate: &LogicalAggregate,
+    aggregate: &LogicalAggregate<SelectedChild>,
     group_indices: &[usize],
 ) -> usize {
     if group_indices.len() <= 1 || !aggregate.grouping_sets.is_empty() {
@@ -754,14 +756,18 @@ fn hash_aggregate_spill_supported(spec: &AggregateSpec) -> bool {
 /// Pure admission predicate shared by Memo registration and physical
 /// extraction. The proof is revalidated against the final aggregate payload;
 /// a stale annotation therefore never creates a physical candidate.
-pub(crate) fn supports_singleton_aggregate_projection(aggregate: &LogicalAggregate) -> bool {
+pub(crate) fn supports_singleton_aggregate_projection<Child: paro_planner::plan::LogicalChild>(
+    aggregate: &LogicalAggregate<Child>,
+) -> bool {
     matches!(
         &aggregate.group_input_multiplicity,
         GroupInputMultiplicity::AtMostOne(proof) if proof.is_valid_for(aggregate)
     ) && singleton_group_projection(aggregate).is_ok()
 }
 
-fn singleton_group_projection(aggregate: &LogicalAggregate) -> Result<Vec<Expression>> {
+fn singleton_group_projection<Child>(
+    aggregate: &LogicalAggregate<Child>,
+) -> Result<Vec<Expression>> {
     if !aggregate.has_plain_grouping_domain()
         || aggregate.post_reduction.is_some()
         || !aggregate.grouping_functions.is_empty()
@@ -839,7 +845,7 @@ fn singleton_group_projection(aggregate: &LogicalAggregate) -> Result<Vec<Expres
 }
 
 fn lower_post_aggregate_reduction(
-    aggregate: &LogicalAggregate,
+    aggregate: &LogicalAggregate<SelectedChild>,
 ) -> Result<Option<PostAggregateReductionSpec>> {
     aggregate.verify_post_reduction()?;
     let Some(reduction) = &aggregate.post_reduction else {

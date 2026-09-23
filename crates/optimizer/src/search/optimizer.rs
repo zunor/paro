@@ -1,6 +1,8 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use paro_planner::plan::{LogicalInput, LogicalPlanRead};
+
 use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -200,13 +202,13 @@ impl SearchOptimizer {
     /// when a sequential expression wins. A plain relational scan is not a
     /// negative search observation: adding a provider cannot create a legal
     /// alternative unless the statement carries a matching search intent.
-    pub(crate) fn planning_observation_tables(
-        plan: &OwnedLogicalPlan,
+    pub(crate) fn planning_observation_tables<P: LogicalPlanRead>(
+        plan: &P,
     ) -> Result<Vec<std::sync::Arc<paro_catalog::entry::TableCatalogEntry>>> {
         let mut tables = std::collections::BTreeMap::new();
         let mut pending = vec![plan];
         while let Some(plan) = pending.pop() {
-            let observed_get = match &plan.operator {
+            let observed_get = match plan.operator() {
                 LogicalOperator::TopN(topn) => extract_topn_pattern(topn)
                     .map(|pattern| {
                         let observes = extract_vector_intent(
@@ -223,7 +225,7 @@ impl SearchOptimizer {
                     })
                     .transpose()?
                     .flatten(),
-                LogicalOperator::Filter(filter) => match &filter.child.operator {
+                LogicalOperator::Filter(filter) => match filter.child.operator() {
                     LogicalOperator::Get(get) => filter
                         .expressions
                         .iter()
@@ -241,7 +243,8 @@ impl SearchOptimizer {
             if let Some(table) = observed_get.and_then(Get::get_table) {
                 tables.insert(table.object_id().raw(), table.clone());
             }
-            pending.extend(plan.children());
+            plan.operator()
+                .visit_child_links(&mut |child| pending.push(&**child));
         }
         Ok(tables.into_values().collect())
     }
@@ -852,25 +855,27 @@ struct TopNPattern<'a, C = Box<OwnedLogicalPlan>> {
     order_expr: &'a Expression,
 }
 
-fn extract_topn_pattern(topn: &TopN) -> Option<TopNPattern<'_>> {
+fn extract_topn_pattern<C: paro_planner::plan::LogicalChild>(
+    topn: &TopN<C>,
+) -> Option<TopNPattern<'_, C>> {
     if topn.offset != 0 || topn.orders.len() != 1 {
         return None;
     }
-    let projection = match &topn.child.operator {
+    let projection = match topn.child.operator() {
         LogicalOperator::Projection(projection) => projection,
         _ => return None,
     };
     let order_expr_idx = order_expression_index(&topn.orders[0].expression)?;
     let order_expr = projection.expressions.get(order_expr_idx)?;
-    let get_plan = find_get_plan(projection.child.as_ref())?;
-    let LogicalOperator::Get(get) = &get_plan.operator else {
+    let get_plan = find_get_plan(&*projection.child)?;
+    let LogicalOperator::Get(get) = get_plan.operator() else {
         return None;
     };
     Some(TopNPattern {
         topn,
         projection,
-        get_stats: &get_plan.stats,
-        filters: collect_filters(projection.child.as_ref()),
+        get_stats: get_plan.node_stats(),
+        filters: collect_filters(&*projection.child),
         get,
         order_expr_idx,
         order_expr,
@@ -885,14 +890,14 @@ fn order_expression_index(expr: &Expression) -> Option<usize> {
     }
 }
 
-fn find_get_plan(mut plan: &OwnedLogicalPlan) -> Option<&OwnedLogicalPlan> {
+fn find_get_plan<P: LogicalPlanRead>(mut plan: &P) -> Option<&P> {
     loop {
-        match &plan.operator {
+        match plan.operator() {
             LogicalOperator::Filter(filter) => {
                 if !filter.projection_map.is_all() {
                     return None;
                 }
-                plan = filter.child.as_ref();
+                plan = &*filter.child;
             }
             LogicalOperator::Get(_) => return Some(plan),
             _ => return None,
@@ -900,13 +905,13 @@ fn find_get_plan(mut plan: &OwnedLogicalPlan) -> Option<&OwnedLogicalPlan> {
     }
 }
 
-fn collect_filters(mut plan: &OwnedLogicalPlan) -> Vec<Expression> {
+fn collect_filters<P: LogicalPlanRead>(mut plan: &P) -> Vec<Expression> {
     let mut filters = Vec::new();
-    while let LogicalOperator::Filter(filter) = &plan.operator {
+    while let LogicalOperator::Filter(filter) = plan.operator() {
         filters.extend(filter.expressions.iter().cloned());
-        plan = filter.child.as_ref();
+        plan = &*filter.child;
     }
-    debug_assert!(matches!(plan.operator, LogicalOperator::Get(_)));
+    debug_assert!(matches!(plan.operator(), LogicalOperator::Get(_)));
     filters
 }
 

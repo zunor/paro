@@ -132,13 +132,6 @@ pub(super) fn test_grant_classes() -> [ResourceGrantClass; 1] {
     }]
 }
 
-/// Memo winners are logical bindings, not executable vector positions. Tests
-/// which continue into physical extraction must use the production boundary.
-fn physical_input(mut plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
-    crate::physical::slot_assignment::assign_expression_slots(&mut plan.operator).unwrap();
-    plan
-}
-
 #[test]
 fn quality_rule_evidence_comes_from_selected_proofs_not_apply_audit() {
     let logical = LogicalExpr {
@@ -1291,7 +1284,7 @@ fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
-            .extract(&physical_input(optimized.plan))
+            .extract_selected(&optimized.plan)
             .unwrap();
     assert!(matches!(
         physical.node(physical.root).kind,
@@ -1425,7 +1418,7 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
     }
 
     fn selected_join_type(output: &OptimizationOutput) -> JoinType {
-        fn find(plan: &OwnedLogicalPlan) -> Option<JoinType> {
+        fn find(plan: &crate::physical::selected::SelectedNode) -> Option<JoinType> {
             if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
                 return Some(join.join_type);
             }
@@ -1748,7 +1741,7 @@ fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
-            .extract(&physical_input(optimized.plan))
+            .extract_selected(&optimized.plan)
             .unwrap();
     crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
     assert!(physical.edges.iter().any(|edge| matches!(
@@ -1786,7 +1779,7 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
     let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
-            .extract(&logical)
+            .extract(logical)
             .unwrap();
     let [probe, _] = physical.child_ids(&physical.node(physical.root).children) else {
         panic!("outer hash join must be binary");
@@ -1828,7 +1821,7 @@ fn semi_join_preserved_probe_keeps_runtime_filter_consumer_lineage() {
     let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
-            .extract(&logical)
+            .extract(logical)
             .unwrap();
     let [probe, _] = physical.child_ids(&physical.node(physical.root).children) else {
         panic!("outer hash join must be binary");
@@ -1870,7 +1863,7 @@ fn left_outer_preserved_probe_keeps_runtime_filter_consumer_lineage() {
     let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
-            .extract(&logical)
+            .extract(logical)
             .unwrap();
     let [probe, _] = physical.child_ids(&physical.node(physical.root).children) else {
         panic!("outer hash join must be binary");
@@ -1957,7 +1950,7 @@ fn nested_runtime_filter_input(
 /// Return (source identity, physical occurrence), after checking executable
 /// contracts. Equal source IDs alone must not hide two separate scan nodes.
 fn nested_runtime_filter_consumers(
-    plan: OwnedLogicalPlan,
+    plan: crate::physical::selected::SelectedChild,
     contracts: WinnerPhysicalContracts,
     enforcers: ExtractedEnforcerContracts,
 ) -> Vec<(usize, usize)> {
@@ -1966,7 +1959,7 @@ fn nested_runtime_filter_consumers(
             .with_winner_contracts(contracts)
             .with_enforcer_contracts(enforcers)
             .requiring_winner_contracts()
-            .extract(&physical_input(plan))
+            .extract_selected(&plan)
             .unwrap();
     crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
     let mut consumers = physical
@@ -2273,7 +2266,7 @@ fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
-            .extract(&physical_input(optimized.plan))
+            .extract_selected(&optimized.plan)
             .unwrap();
     crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
     let edges = physical
@@ -2340,7 +2333,7 @@ fn build_left_semi_join_filters_every_union_all_probe_source() {
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
-            .extract(&physical_input(optimized.plan))
+            .extract_selected(&optimized.plan)
             .unwrap();
     crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
     assert_eq!(
@@ -2399,7 +2392,7 @@ fn global_sort_enforcer_is_extracted_as_an_executable_plan_node() {
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
-            .extract(&physical_input(optimized.plan))
+            .extract_selected(&optimized.plan)
             .unwrap();
     assert!(matches!(
         physical.node(physical.root).kind,

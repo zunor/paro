@@ -43,6 +43,7 @@ use super::node::{OperatorLabel, PhysicalPlanNode};
 use super::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use super::properties::PlanPropertyMap;
 use super::row_type::{ColumnIdentity, RowType};
+use super::selected::{SelectedChild, SelectedNode};
 use super::specs::{
     AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ClassicIeJoinSpec,
     CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec, CteScanSpec, DeleteSpec,
@@ -197,7 +198,12 @@ impl PhysicalPlanExtractor {
         self
     }
 
-    pub fn extract(&mut self, logical: &OwnedLogicalPlan) -> Result<PhysicalPlan> {
+    pub fn extract(&mut self, logical: OwnedLogicalPlan) -> Result<PhysicalPlan> {
+        let selected = SelectedNode::from_owned(logical)?;
+        self.extract_selected(&selected)
+    }
+
+    pub(crate) fn extract_selected(&mut self, logical: &SelectedNode) -> Result<PhysicalPlan> {
         self.arena = PhysicalPlanNodeArena::default();
         self.children = PlanChildrenArena::default();
         self.properties = PlanPropertyMap::default();
@@ -217,7 +223,7 @@ impl PhysicalPlanExtractor {
         Ok(plan)
     }
 
-    fn extract_node(&mut self, logical: &OwnedLogicalPlan) -> Result<PhysicalPlanNodeId> {
+    fn extract_node(&mut self, logical: &SelectedNode) -> Result<PhysicalPlanNodeId> {
         let winner_contract = self.winner_contracts.get(&logical.id);
         if self.require_winner_contracts && winner_contract.is_none() {
             return Err(paro_error::internal(format!(
@@ -489,7 +495,7 @@ impl PhysicalPlanExtractor {
 
     fn apply_extracted_enforcers(
         &mut self,
-        logical: &OwnedLogicalPlan,
+        logical: &SelectedNode,
         mut child: PhysicalPlanNodeId,
     ) -> Result<PhysicalPlanNodeId> {
         let Some(enforcers) = self.enforcer_contracts.get(&logical.id).cloned() else {

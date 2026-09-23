@@ -129,7 +129,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_empty_result(
         &mut self,
-        empty: &LogicalEmptyResult,
+        empty: &LogicalEmptyResult<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(empty.child.as_ref())?;
         Ok((PhysicalNodeKind::EmptyResult(EmptyResultSpec), vec![child]))
@@ -137,7 +137,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_filter(
         &mut self,
-        filter: &LogicalFilter,
+        filter: &LogicalFilter<SelectedChild>,
         filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         // These are deterministic post-winner canonicalizations. They preserve
@@ -192,8 +192,8 @@ impl PhysicalPlanExtractor {
     /// it owns the final carrier shape.
     fn lower_aggregate_filter(
         &mut self,
-        filter: &LogicalFilter,
-        aggregate: &LogicalAggregate,
+        filter: &LogicalFilter<SelectedChild>,
+        aggregate: &LogicalAggregate<SelectedChild>,
         having_filter: Box<[Expression]>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let aggregate_width = aggregate.returned_types.len();
@@ -265,7 +265,7 @@ impl PhysicalPlanExtractor {
 
     fn lower_filter_over_get(
         &mut self,
-        filter: &LogicalFilter,
+        filter: &LogicalFilter<SelectedChild>,
         get: &Get,
         filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
@@ -317,7 +317,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_project(
         &mut self,
-        project: &LogicalProjection,
+        project: &LogicalProjection<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(project.child.as_ref())?;
         let spec = ProjectSpec {
@@ -335,7 +335,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_limit(
         &mut self,
-        limit: &LogicalLimit,
+        limit: &LogicalLimit<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(limit.child.as_ref())?;
         let spec = LimitSpec {
@@ -348,7 +348,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_topn(
         &mut self,
-        topn: &LogicalTopN,
+        topn: &LogicalTopN<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(topn.child.as_ref())?;
         let child_types = topn.child.types();
@@ -370,7 +370,7 @@ impl PhysicalPlanExtractor {
     pub(crate) fn lower_search_scan(
         &mut self,
         scan: &LogicalSearchScan,
-        logical: &OwnedLogicalPlan,
+        logical: &SelectedNode,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let table =
             scan.get.get_table().cloned().ok_or_else(|| {
@@ -469,7 +469,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_order(
         &mut self,
-        order: &LogicalOrder,
+        order: &LogicalOrder<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(order.child.as_ref())?;
         let child_types = order.child.types();
@@ -981,7 +981,7 @@ fn rowset_value_projection(
 }
 
 fn estimated_filter_selectivity(
-    filter: &LogicalFilter,
+    filter: &LogicalFilter<SelectedChild>,
     filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
 ) -> Option<f64> {
     let input = filter.child.stats.estimated_cardinality?.expected;

@@ -106,7 +106,7 @@ struct PlanShapeEvidence {
     max_output_width: u64,
 }
 
-fn plan_shape_evidence(plan: &OwnedLogicalPlan) -> PlanShapeEvidence {
+fn plan_shape_evidence<P: paro_planner::plan::LogicalPlanRead>(plan: &P) -> PlanShapeEvidence {
     let mut evidence = PlanShapeEvidence::default();
     let mut pending = vec![plan];
     while let Some(node) = pending.pop() {
@@ -114,7 +114,7 @@ fn plan_shape_evidence(plan: &OwnedLogicalPlan) -> PlanShapeEvidence {
         evidence.max_output_width = evidence
             .max_output_width
             .max(node.output_layout().len() as u64);
-        match node.operator.op_type() {
+        match node.operator().op_type() {
             LogicalOperatorType::Get
             | LogicalOperatorType::TableFunctionGet
             | LogicalOperatorType::SearchScan
@@ -148,7 +148,8 @@ fn plan_shape_evidence(plan: &OwnedLogicalPlan) -> PlanShapeEvidence {
             }
             _ => {}
         }
-        pending.extend(node.children());
+        node.operator()
+            .visit_child_links(&mut |child| pending.push(&**child));
     }
     evidence
 }
@@ -362,7 +363,7 @@ fn record_variant_evidence(
         variant.physical_fingerprint,
     );
     record_cost_evidence(trace, prefix, variant.cost);
-    record_plan_shape(trace, prefix, plan_shape_evidence(&variant.plan));
+    record_plan_shape(trace, prefix, plan_shape_evidence(variant.plan.as_ref()));
     let mut runtime_filter_contracts = 0_u64;
     let mut spill_contracts = 0_u64;
     for contract in variant.contracts.values() {
@@ -2132,19 +2133,10 @@ impl Optimizer {
             },
             paro_common::allocator::allocated_bytes_since(search_phase_allocated),
         );
-        let phase_started = Instant::now();
-        let phase_allocated = paro_common::allocator::thread_allocated_bytes();
-        for variant in &extraction.variants {
-            verify_physical_planner_invariants(&variant.plan.operator)?;
-        }
-        self.ctx.profiler.record(
-            OptimizerComponent::WinnerVerification,
-            phase_started.elapsed(),
-        );
-        self.ctx.profiler.record_component_allocation(
-            OptimizerComponent::WinnerVerification,
-            paro_common::allocator::allocated_bytes_since(phase_allocated),
-        );
+        // Selected occurrences were locally verified during their post-order
+        // construction; their child schemas and scalar slots are immutable.
+        // That work is included in PhysicalExtraction, not an empty timer
+        // labelled as a second independent verification pass.
         let phase_started = Instant::now();
         let phase_allocated = paro_common::allocator::thread_allocated_bytes();
         let mut variants = extraction.variants.into_vec();
@@ -2235,11 +2227,7 @@ impl Optimizer {
         }
         let child_contract = extracted_root_contract(variant)?.clone();
         let child_estimate = variant.plan.stats.estimated_cardinality;
-        let child = std::mem::replace(
-            &mut variant.plan,
-            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
-        );
-        let mut statement = layer.attach(child);
+        let mut statement = layer.attach(variant.plan.boundary());
         if let Some(cardinality) = layer.result_cardinality() {
             statement.stats.estimated_cardinality = Some(cardinality);
         }
@@ -2255,7 +2243,11 @@ impl Optimizer {
         if let Some(write) = layer.write_contract() {
             Arc::make_mut(&mut variant.write_contracts).insert(statement.id, write.clone());
         }
-        variant.plan = statement;
+        variant.plan = crate::physical::selected::SelectedNode::from_local(
+            statement,
+            vec![variant.plan.clone()],
+            true,
+        )?;
         variant.physical_fingerprint = physical_fingerprint;
         variant.cost = cost;
         Ok(())
@@ -2267,11 +2259,7 @@ impl Optimizer {
         explain: &ExplainEnvelope,
     ) -> Result<()> {
         let child_contract = extracted_root_contract(variant)?.clone();
-        let child = std::mem::replace(
-            &mut variant.plan,
-            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
-        );
-        let plan = explain.attach(child);
+        let plan = explain.attach(variant.plan.boundary());
         let local_cost = self.statement_local_cost(100, None)?;
         let cost = child_contract.cost.sequential(local_cost)?;
         let mut fingerprint = StableFingerprintBuilder::default();
@@ -2288,7 +2276,11 @@ impl Optimizer {
             plan.id,
             statement_contract(child_contract.grant, physical_fingerprint, cost),
         );
-        variant.plan = plan;
+        variant.plan = crate::physical::selected::SelectedNode::from_local(
+            plan,
+            vec![variant.plan.clone()],
+            true,
+        )?;
         variant.physical_fingerprint = physical_fingerprint;
         variant.cost = cost;
         Ok(())
@@ -2334,7 +2326,7 @@ impl Optimizer {
                 scan_access_cost: Default::default(),
                 dependency_template: self.plan_dependency_template_for(&logical)?,
             })
-            .extract(&logical)?;
+            .extract(logical)?;
             let root = plan.properties.get(plan.root).ok_or_else(|| {
                 paro_common::error::internal("utility physical plan has no root contract")
             })?;
@@ -2365,7 +2357,7 @@ impl Optimizer {
             .map(|class| (class.id, *class))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut class_plans = Vec::with_capacity(variants.len());
-        for mut variant in variants {
+        for variant in variants {
             let grant = class_map.get(&variant.class).ok_or_else(|| {
                 paro_common::error::internal(
                     "planner extraction references an unknown resource grant class",
@@ -2397,8 +2389,7 @@ impl Optimizer {
                 ));
             }
             let max_memory = usize::try_from(grant.hard_memory_bytes).unwrap_or(usize::MAX);
-            crate::physical::slot_assignment::assign_expression_slots(&mut variant.plan.operator)?;
-            let dependency_template = self.plan_dependency_template_for(&variant.plan)?;
+            let dependency_template = self.plan_dependency_template_for(variant.plan.as_ref())?;
             let plan = PhysicalPlanExtractor::new(ExtractionContext {
                 force_external: self.ctx.session.limits.force_external,
                 grant_spill_policy: grant.spill_policy,
@@ -2412,7 +2403,7 @@ impl Optimizer {
             .with_enforcer_contracts(variant.enforcers)
             .with_statement_write_contracts(variant.write_contracts)
             .requiring_winner_contracts()
-            .extract(&variant.plan)?;
+            .extract_selected(&variant.plan)?;
             let fingerprint = plan.portfolio_fingerprint(variant.physical_fingerprint)?;
             class_plans.push((variant.class, plan, fingerprint, variant.cost));
         }
@@ -2505,9 +2496,9 @@ impl Optimizer {
         }
     }
 
-    fn plan_dependency_template_for(
+    fn plan_dependency_template_for<P: paro_planner::plan::LogicalPlanRead>(
         &self,
-        plan: &OwnedLogicalPlan,
+        plan: &P,
     ) -> Result<crate::physical::PlanDependencies> {
         fn graph_key(id: &GraphId) -> Fingerprint {
             let mut fingerprint = StableFingerprintBuilder::default();
@@ -2516,12 +2507,12 @@ impl Optimizer {
             fingerprint.finish()
         }
 
-        fn collect(
+        fn collect<P: paro_planner::plan::LogicalPlanRead>(
             optimizer: &Optimizer,
-            plan: &OwnedLogicalPlan,
+            plan: &P,
             dependencies: &mut crate::physical::PlanDependencies,
         ) {
-            if let LogicalOperator::GraphScan(scan) = &plan.operator {
+            if let LogicalOperator::GraphScan(scan) = plan.operator() {
                 let id = GraphId::new(
                     optimizer.ctx.session.current_database(),
                     &scan.schema_name,
@@ -2533,9 +2524,8 @@ impl Optimizer {
                         .insert(graph_key(&id), snapshot.generation_id());
                 }
             }
-            for child in plan.children() {
-                collect(optimizer, child, dependencies);
-            }
+            plan.operator()
+                .visit_child_links(&mut |child| collect(optimizer, &**child, dependencies));
         }
 
         let mut dependencies = self.plan_dependency_template();

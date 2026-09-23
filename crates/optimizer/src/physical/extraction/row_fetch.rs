@@ -8,8 +8,8 @@ use super::*;
 impl PhysicalPlanExtractor {
     pub(crate) fn lower_row_fetch(
         &mut self,
-        fetch: &LogicalRowFetch,
-        project: Option<&LogicalProjection>,
+        fetch: &LogicalRowFetch<SelectedChild>,
+        project: Option<&LogicalProjection<SelectedChild>>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(fetch.child.as_ref())?;
         let mut mappings = Vec::with_capacity(fetch.sources.len());

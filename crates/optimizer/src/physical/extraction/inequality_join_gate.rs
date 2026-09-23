@@ -14,8 +14,8 @@ const SORT_RANGE_JOIN_VERY_LARGE_SELECTIVITY_LIMIT: f64 = 0.90;
 const CLASSIC_IE_JOIN_MIN_INPUT_PAIRS: u128 = SORT_RANGE_JOIN_DENSE_INPUT_PAIRS;
 const CLASSIC_IE_JOIN_SELECTIVITY_LIMIT: f64 = SORT_RANGE_JOIN_SPARSE_SELECTIVITY_LIMIT;
 
-pub(crate) fn is_classic_ie_join_candidate(
-    join: &ComparisonJoin,
+pub(crate) fn is_classic_ie_join_candidate<Child: paro_planner::plan::LogicalChild>(
+    join: &ComparisonJoin<Child>,
     join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
 ) -> bool {
     join.join_type == JoinType::Inner
@@ -24,8 +24,8 @@ pub(crate) fn is_classic_ie_join_candidate(
         && classic_ie_join_selectivity_passes_gate(join, join_cardinality)
 }
 
-pub(crate) fn is_sort_range_join_candidate(
-    join: &ComparisonJoin,
+pub(crate) fn is_sort_range_join_candidate<Child: paro_planner::plan::LogicalChild>(
+    join: &ComparisonJoin<Child>,
     join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
 ) -> bool {
     sort_range_join_conditions_pass_gate(&join.conditions)
@@ -76,13 +76,13 @@ fn sort_range_join_key_kind(logical_type: &LogicalType) -> Option<SortRangeJoinK
     }
 }
 
-fn sort_range_join_cardinality_passes_gate(
-    join: &ComparisonJoin,
+fn sort_range_join_cardinality_passes_gate<Child: paro_planner::plan::LogicalChild>(
+    join: &ComparisonJoin<Child>,
     join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
 ) -> bool {
     let (Some(left), Some(right), Some(output)) = (
-        join.left.stats.estimated_cardinality,
-        join.right.stats.estimated_cardinality,
+        join.left.node_stats().estimated_cardinality,
+        join.right.node_stats().estimated_cardinality,
         join_cardinality,
     ) else {
         return true;
@@ -99,13 +99,13 @@ fn sort_range_join_cardinality_passes_gate(
     selectivity <= sort_range_join_selectivity_limit(input_pairs)
 }
 
-fn classic_ie_join_selectivity_passes_gate(
-    join: &ComparisonJoin,
+fn classic_ie_join_selectivity_passes_gate<Child: paro_planner::plan::LogicalChild>(
+    join: &ComparisonJoin<Child>,
     join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
 ) -> bool {
     if let (Some(left), Some(right), Some(output)) = (
-        join.left.stats.estimated_cardinality,
-        join.right.stats.estimated_cardinality,
+        join.left.node_stats().estimated_cardinality,
+        join.right.node_stats().estimated_cardinality,
         join_cardinality,
     ) {
         let input_pairs = (left.expected as u128).saturating_mul(right.expected as u128);
@@ -120,7 +120,9 @@ fn classic_ie_join_selectivity_passes_gate(
     classic_ie_join_column_stats_passes_gate(join)
 }
 
-fn classic_ie_join_shared_right_bound_shape(join: &ComparisonJoin) -> bool {
+fn classic_ie_join_shared_right_bound_shape<Child: paro_planner::plan::LogicalChild>(
+    join: &ComparisonJoin<Child>,
+) -> bool {
     let [first, second] = join.conditions.as_slice() else {
         return false;
     };
@@ -147,15 +149,15 @@ fn classic_ie_join_shared_right_bound_shape(join: &ComparisonJoin) -> bool {
         )
 }
 
-fn classic_ie_join_column_stats_passes_gate(join: &ComparisonJoin) -> bool {
+fn classic_ie_join_column_stats_passes_gate<Child: paro_planner::plan::LogicalChild>(
+    join: &ComparisonJoin<Child>,
+) -> bool {
     let mut predicates = Vec::with_capacity(join.conditions.len());
     for condition in &join.conditions {
-        let Some(left) = sort_range_column_stats_for_expr(join.left.as_ref(), &condition.left)
-        else {
+        let Some(left) = sort_range_column_stats_for_expr(&*join.left, &condition.left) else {
             return false;
         };
-        let Some(right) = sort_range_column_stats_for_expr(join.right.as_ref(), &condition.right)
-        else {
+        let Some(right) = sort_range_column_stats_for_expr(&*join.right, &condition.right) else {
             return false;
         };
         predicates.push(SortRangePredicateStats {
@@ -185,15 +187,15 @@ fn classic_ie_join_column_stats_passes_gate_for_predicates(
     selectivity <= CLASSIC_IE_JOIN_SELECTIVITY_LIMIT
 }
 
-fn sort_range_join_column_stats_passes_gate(join: &ComparisonJoin) -> bool {
+fn sort_range_join_column_stats_passes_gate<Child: paro_planner::plan::LogicalChild>(
+    join: &ComparisonJoin<Child>,
+) -> bool {
     let mut predicates = Vec::with_capacity(join.conditions.len());
     for condition in &join.conditions {
-        let Some(left) = sort_range_column_stats_for_expr(join.left.as_ref(), &condition.left)
-        else {
+        let Some(left) = sort_range_column_stats_for_expr(&*join.left, &condition.left) else {
             return true;
         };
-        let Some(right) = sort_range_column_stats_for_expr(join.right.as_ref(), &condition.right)
-        else {
+        let Some(right) = sort_range_column_stats_for_expr(&*join.right, &condition.right) else {
             return true;
         };
         predicates.push(SortRangePredicateStats {
@@ -420,8 +422,8 @@ fn probability_of(condition: bool) -> f64 {
     }
 }
 
-fn sort_range_column_stats_for_expr(
-    plan: &OwnedLogicalPlan,
+fn sort_range_column_stats_for_expr<P: paro_planner::plan::LogicalPlanRead>(
+    plan: &P,
     expression: &Expression,
 ) -> Option<SortRangeColumnStats> {
     let Expression::Reference(reference) = expression else {
@@ -430,11 +432,11 @@ fn sort_range_column_stats_for_expr(
     sort_range_column_stats_for_output(plan, reference.index)
 }
 
-fn sort_range_column_stats_for_output(
-    plan: &OwnedLogicalPlan,
+fn sort_range_column_stats_for_output<P: paro_planner::plan::LogicalPlanRead>(
+    plan: &P,
     output_idx: usize,
 ) -> Option<SortRangeColumnStats> {
-    match &plan.operator {
+    match plan.operator() {
         LogicalOperator::Get(get) => sort_range_get_column_stats(get, output_idx),
         LogicalOperator::Filter(filter) => {
             let child_idx = projected_child_index(
@@ -442,14 +444,14 @@ fn sort_range_column_stats_for_output(
                 filter.child.types().len(),
                 output_idx,
             )?;
-            sort_range_column_stats_for_output(filter.child.as_ref(), child_idx)
+            sort_range_column_stats_for_output(&*filter.child, child_idx)
         }
         LogicalOperator::Projection(project) => {
             let expression = project.expressions.get(output_idx)?;
-            sort_range_column_stats_for_expr(project.child.as_ref(), expression)
+            sort_range_column_stats_for_expr(&*project.child, expression)
         }
         LogicalOperator::Limit(limit) => {
-            sort_range_column_stats_for_output(limit.child.as_ref(), output_idx)
+            sort_range_column_stats_for_output(&*limit.child, output_idx)
         }
         LogicalOperator::Order(order) => {
             let child_idx = projected_child_index(
@@ -457,12 +459,12 @@ fn sort_range_column_stats_for_output(
                 order.child.types().len(),
                 output_idx,
             )?;
-            sort_range_column_stats_for_output(order.child.as_ref(), child_idx)
+            sort_range_column_stats_for_output(&*order.child, child_idx)
         }
         LogicalOperator::TopN(topn) => {
             let child_idx =
                 projected_child_index(&topn.projection_map, topn.child.types().len(), output_idx)?;
-            sort_range_column_stats_for_output(topn.child.as_ref(), child_idx)
+            sort_range_column_stats_for_output(&*topn.child, child_idx)
         }
         _ => None,
     }

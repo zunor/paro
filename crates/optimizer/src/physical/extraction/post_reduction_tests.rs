@@ -491,7 +491,7 @@ fn lower_aggregate(
     crate::physical::slot_assignment::assign_expression_slots(&mut root.operator)
         .expect("resolve post-reduction domains");
     let plan = PhysicalPlanExtractor::new(context)
-        .extract(&root)
+        .extract(root)
         .expect("lower post-reduction aggregate");
     let aggregate_id = if matches!(plan.node(plan.root).kind, PhysicalNodeKind::Aggregate(_)) {
         plan.root

@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use crate::expression::Expression;
 use crate::operator::{ColumnBinding, LogicalOperator};
-use crate::plan::OwnedLogicalPlan;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
@@ -74,15 +73,17 @@ pub struct Get {
 /// non-NULL statistics or a declared unique key) can therefore be checked at
 /// their use site without mistaking a join's NULL-extended output for the
 /// stored column.
-pub fn binding_preserving_get(plan: &OwnedLogicalPlan) -> Option<&Get> {
-    match &plan.operator {
-        LogicalOperator::Get(get) => Some(get),
-        LogicalOperator::Filter(filter) => binding_preserving_get(filter.child.as_ref()),
-        LogicalOperator::Order(order) => binding_preserving_get(order.child.as_ref()),
-        LogicalOperator::TopN(topn) => binding_preserving_get(topn.child.as_ref()),
-        LogicalOperator::Limit(limit) => binding_preserving_get(limit.child.as_ref()),
-        LogicalOperator::ExternalProject(project) => binding_preserving_get(project.child.as_ref()),
-        _ => None,
+pub fn binding_preserving_get<P: crate::plan::LogicalPlanRead>(mut plan: &P) -> Option<&Get> {
+    loop {
+        plan = match plan.operator() {
+            LogicalOperator::Get(get) => return Some(get),
+            LogicalOperator::Filter(filter) => &*filter.child,
+            LogicalOperator::Order(order) => &*order.child,
+            LogicalOperator::TopN(topn) => &*topn.child,
+            LogicalOperator::Limit(limit) => &*limit.child,
+            LogicalOperator::ExternalProject(project) => &*project.child,
+            _ => return None,
+        };
     }
 }
 

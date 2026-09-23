@@ -48,7 +48,7 @@ fn query_extraction_rejects_a_node_without_a_winner_contract() {
 
     let error = PhysicalPlanExtractor::new(ExtractionContext::default())
         .requiring_winner_contracts()
-        .extract(&logical)
+        .extract(logical)
         .expect_err("query extraction must never invent an implicit physical implementation");
 
     assert!(error.to_string().contains("no verified winner contract"));
@@ -90,7 +90,7 @@ fn physical_rewrite_composes_consecutive_projects() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&outer)
+        .extract(outer)
         .unwrap();
     let PhysicalNodeKind::Project(project) = &plan.node(plan.root).kind else {
         panic!("expected project root");
@@ -137,7 +137,7 @@ fn project_alias_does_not_rename_its_scan_input() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&project)
+        .extract(project)
         .unwrap();
     let explain = plan.format_explain_text_with_spec(&ExplainSpec::default());
 
@@ -195,7 +195,7 @@ fn explain_size_is_bounded_for_deep_project_filter_chains() {
             }
 
             let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
-                .extract(&plan)
+                .extract(plan)
                 .unwrap();
             let explain = physical.format_explain_text_with_spec(&ExplainSpec::default());
 
@@ -247,7 +247,7 @@ fn explain_parenthesizes_mixed_boolean_conjunctions() {
     );
 
     let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&filter)
+        .extract(filter)
         .unwrap();
     let explain = physical.format_explain_text_with_spec(&ExplainSpec::default());
 
@@ -296,7 +296,7 @@ fn physical_rewrite_preserves_computed_expression_multiplicity() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&outer)
+        .extract(outer)
         .unwrap();
     let [child] = plan.node(plan.root).children.as_slice(&plan.children) else {
         panic!("expected unary project");
@@ -335,7 +335,7 @@ fn arena_extractor_builds_streaming_subset_without_runtime_objects() {
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let plan = extractor.extract(&limit).expect("subset should lower");
+    let plan = extractor.extract(limit).expect("subset should lower");
 
     assert_eq!(plan.nodes.len(), 4);
     assert!(matches!(
@@ -365,7 +365,7 @@ fn arena_extractor_lowers_distinct_to_hash_aggregate() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
-        .extract(&distinct)
+        .extract(distinct)
         .expect("DISTINCT should lower to typed aggregate");
 
     let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
@@ -413,7 +413,7 @@ fn aggregate_uses_lossless_fixed_width_keys_for_bounded_strings() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
-        .extract(&aggregate)
+        .extract(aggregate)
         .expect("aggregate should lower");
     let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
         panic!("expected aggregate root");
@@ -458,7 +458,7 @@ fn aggregate_packs_inline_strings_when_fixed_keys_preserve_row_width() {
     let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&aggregate)
+        .extract(aggregate)
         .expect("aggregate should lower");
     let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
         panic!("expected aggregate root");
@@ -511,7 +511,7 @@ fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
-        .extract(&aggregate)
+        .extract(aggregate)
         .expect("aggregate should lower");
     let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
         panic!("expected aggregate root");
@@ -560,7 +560,7 @@ fn aggregate_requires_complete_bounds_for_offset_keys() {
 
         let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
         let plan = extractor
-            .extract(&aggregate)
+            .extract(aggregate)
             .expect("aggregate should lower");
         let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
             panic!("expected aggregate root");
@@ -633,7 +633,7 @@ fn aggregate_materializes_proven_dependent_groups_as_states() {
     let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&aggregate)
+        .extract(aggregate)
         .expect("aggregate should lower");
     let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
         panic!("expected aggregate root");
@@ -698,7 +698,7 @@ fn arena_extractor_fuses_aggregate_only_having_into_aggregate_emit() {
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let plan = extractor.extract(&having).expect("HAVING should lower");
+    let plan = extractor.extract(having).expect("HAVING should lower");
 
     let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
         panic!("aggregate-only HAVING should be fused into aggregate emit");
@@ -762,7 +762,7 @@ fn aggregate_having_fusion_preserves_an_independent_output_projection() {
     let having = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let plan = extractor.extract(&having).expect("HAVING should lower");
+    let plan = extractor.extract(having).expect("HAVING should lower");
 
     let PhysicalNodeKind::Project(project) = &plan.node(plan.root).kind else {
         panic!("projected HAVING should retain an explicit output projection");
@@ -823,7 +823,7 @@ fn arena_extractor_pushes_filter_predicates_into_rowset_scan() {
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let physical = extractor.extract(&plan).expect("filter should lower");
+    let physical = extractor.extract(plan).expect("filter should lower");
 
     let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
         panic!("fully pushed filter should lower to rowset scan root");
@@ -860,7 +860,7 @@ fn zero_column_rowset_projection_never_enables_late_materialization() {
     plan.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(1));
 
     let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&plan)
+        .extract(plan)
         .expect("zero-column filter should lower");
     let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
         panic!("fully pushed zero-column filter should lower to rowset scan");
@@ -890,7 +890,7 @@ fn rowset_scan_materialization_policy_uses_estimated_filter_density() {
             filtered_rows,
         ));
         let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
-            .extract(&plan)
+            .extract(plan)
             .expect("filter should lower");
         let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
             panic!("fully pushed filter should lower to rowset scan");
@@ -920,7 +920,7 @@ fn arena_extractor_can_disable_rowset_scan_pushdown() {
         rowset_scan_pushdown: false,
         ..ExtractionContext::default()
     });
-    let physical = extractor.extract(&plan).expect("filter should lower");
+    let physical = extractor.extract(plan).expect("filter should lower");
 
     let PhysicalNodeKind::Filter(_) = &physical.node(physical.root).kind else {
         panic!("disabled pushdown should keep a filter root");
@@ -961,7 +961,7 @@ fn arena_extractor_keeps_residual_filter_above_pushed_rowset_scan() {
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let physical = extractor.extract(&plan).expect("filter should lower");
+    let physical = extractor.extract(plan).expect("filter should lower");
 
     let PhysicalNodeKind::Filter(spec) = &physical.node(physical.root).kind else {
         panic!("residual expression should keep a filter root");
@@ -989,7 +989,7 @@ fn arena_extractor_pushes_get_runtime_filters_into_rowset_scan() {
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(get)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let physical = extractor.extract(&plan).expect("get should lower");
+    let physical = extractor.extract(plan).expect("get should lower");
 
     let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
         panic!("expected rowset scan");
@@ -1068,7 +1068,7 @@ fn arena_extractor_hands_graph_expand_filters_to_graph_project() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
-        .extract(&project)
+        .extract(project)
         .expect("graph project should own graph expand filters");
 
     let PhysicalNodeKind::GraphProject(project_spec) = &plan.node(plan.root).kind else {
@@ -1140,7 +1140,7 @@ fn arena_extractor_lowers_graph_path_functions_with_path_history() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let physical = extractor
-        .extract(&plan)
+        .extract(plan)
         .expect("path functions should lower with path history enabled");
 
     let PhysicalNodeKind::GraphExpand(spec) = &physical.node(physical.root).kind else {
@@ -1188,7 +1188,7 @@ fn arena_extractor_lowers_single_join_to_typed_hash_path() {
     );
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
-        .extract(&join)
+        .extract(join)
         .expect("single join should lower to typed hash join");
 
     let PhysicalNodeKind::HashJoin(spec) = &plan.node(plan.root).kind else {
@@ -1269,7 +1269,7 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
         .with_winner_contracts(Arc::new(contracts))
-        .extract(&join)
+        .extract(join)
         .expect("auxiliary runtime-filter winner should lower");
     let PhysicalNodeKind::HashJoin(spec) = &plan.node(plan.root).kind else {
         panic!("expected hash join root");
@@ -1361,7 +1361,7 @@ fn build_left_runtime_filter_keeps_artifact_ownership_on_the_hash_join() {
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
         .with_winner_contracts(Arc::new(contracts))
-        .extract(&join)
+        .extract(join)
         .expect("build-left runtime-filter winner should lower");
     let PhysicalNodeKind::HashJoin(spec) = &plan.node(plan.root).kind else {
         panic!("build-left output layout should belong to the hash join");
@@ -1447,6 +1447,9 @@ fn build_left_output_permutation_covers_every_reversible_join_type() {
             unreachable!()
         };
         let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+        let join = join
+            .try_map_child_links(&mut |child| SelectedNode::from_owned(*child))
+            .unwrap();
         let (kind, children) = extractor
             .lower_comparison_hash_join_build_left(&join)
             .expect("every reversible join should support build-left lowering");
@@ -1524,7 +1527,7 @@ fn join_qualifiers_survive_wrapped_scans() {
         rowset_scan_pushdown: false,
         ..ExtractionContext::default()
     });
-    let physical = extractor.extract(&join).unwrap();
+    let physical = extractor.extract(join).unwrap();
     let explain = physical.format_explain_text_with_spec(&ExplainSpec::default());
 
     assert!(explain.contains("Join Condition: l.a = r.a"), "{explain}");
@@ -1596,13 +1599,13 @@ fn arena_extractor_lowers_search_scan_with_planned_token() {
     };
     intent.score_mode = FullTextScoreMode::CorpusBm25V1;
     assert!(PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&wrong)
+        .extract(wrong)
         .unwrap_err()
         .to_string()
         .contains("logical scoring contract"));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let physical = extractor.extract(&plan).expect("search scan should lower");
+    let physical = extractor.extract(plan).expect("search scan should lower");
 
     let PhysicalNodeKind::FullTextSearch(spec) = &physical.node(physical.root).kind else {
         panic!("search scan should lower to fulltext source");
@@ -1685,7 +1688,7 @@ fn arena_extractor_projects_derived_values_from_the_canonical_search_score() {
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::SearchScan(Box::new(search)));
 
     let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&plan)
+        .extract(plan)
         .expect("derived search score should lower through a projection");
 
     let PhysicalNodeKind::Project(project) = &physical.node(physical.root).kind else {

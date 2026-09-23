@@ -16,6 +16,7 @@ use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
 use paro_planner::binder::context::BindContext;
+#[cfg(test)]
 use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::binder::Binder;
@@ -2171,7 +2172,9 @@ fn stage_search_implementation(
         planner_operator_cost(&plan, 0, output_rows_hard_upper, &[], scan_access_cost)?;
     let cost_facts = planner_cost_facts(&plan, column_stats, binding_ids, scan_access_cost)?;
     plan.stats = NodeStats::default();
-    let payload = payloads.push_physical(PlannerPhysicalTemplate::Executable(Box::new(plan)));
+    let payload = payloads.push_physical(PlannerPhysicalTemplate::Executable(Box::new(
+        paro_planner::plan::arena::LogicalPlanNode::from_shell(plan),
+    )));
     Ok(PlannerSearchImplementationMetadata {
         payload,
         payload_fingerprint,
@@ -2975,7 +2978,7 @@ impl SearchSummary {
 #[derive(Debug)]
 pub struct OptimizedVariant {
     pub class: super::ids::ResourceGrantClassId,
-    pub plan: OwnedLogicalPlan,
+    pub(crate) plan: crate::physical::selected::SelectedChild,
     pub(crate) contracts: WinnerPhysicalContracts,
     pub(crate) enforcers: ExtractedEnforcerContracts,
     pub(crate) write_contracts: crate::physical::StatementWriteContracts,

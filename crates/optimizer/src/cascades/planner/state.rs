@@ -98,7 +98,7 @@ pub(super) enum PlannerPhysicalTemplate {
         logical: LogicalPayloadId,
         order: super::predicate_order::PredicateOrder,
     },
-    Executable(Box<OwnedLogicalPlan>),
+    Executable(Box<paro_planner::plan::arena::LogicalPlanNode<()>>),
 }
 
 #[derive(Debug)]

@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use paro_planner::plan::LogicalPlanRead;
 
 impl PhysicalPlanExtractor {
     pub(crate) fn lower_join(
         &mut self,
-        join: &Join,
+        join: &Join<SelectedChild>,
         join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
         implementation: crate::physical::PhysicalImplementationFlavor,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
@@ -142,7 +143,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_comparison_join(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
         join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if join.anti_join_mode == AntiJoinMode::NullAware
@@ -194,7 +195,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_nested_loop_join(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(join.left.as_ref())?;
         let right = self.extract_node(join.right.as_ref())?;
@@ -228,7 +229,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_sort_range_join(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(join.left.as_ref())?;
         let right = self.extract_node(join.right.as_ref())?;
@@ -269,7 +270,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_classic_ie_join(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(join.left.as_ref())?;
         let right = self.extract_node(join.right.as_ref())?;
@@ -310,7 +311,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_any_join(
         &mut self,
-        any: &paro_planner::operator::join::AnyJoin,
+        any: &paro_planner::operator::join::AnyJoin<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if !supports_typed_hash_join_type(any.join_type) {
             return self.reject_unimplemented(
@@ -351,7 +352,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_cross_product(
         &mut self,
-        cross: &CrossProduct,
+        cross: &CrossProduct<SelectedChild>,
         spill_policy: SpillExecutionPolicy,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(cross.left.as_ref())?;
@@ -379,7 +380,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_comparison_hash_join(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(join.left.as_ref())?;
         let right = self.extract_node(join.right.as_ref())?;
@@ -448,7 +449,7 @@ impl PhysicalPlanExtractor {
     /// `[logical left, logical right]` contract during result construction.
     pub(crate) fn lower_comparison_hash_join_build_left(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let probe = self.extract_node(join.right.as_ref())?;
         let build = self.extract_node(join.left.as_ref())?;
@@ -547,7 +548,7 @@ impl PhysicalPlanExtractor {
     /// reduction while the preserved relation is stored once.
     fn try_lower_reduction_cascade(
         &mut self,
-        root: &ComparisonJoin,
+        root: &ComparisonJoin<SelectedChild>,
     ) -> Result<Option<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)>> {
         let mut joins = Vec::new();
         let mut current = root;
@@ -873,7 +874,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_comparison_delim_join(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if join.duplicate_eliminated_columns.is_empty() {
             return self.reject_unimplemented(
@@ -972,7 +973,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn push_wrapped_hash_join(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
         left: PhysicalPlanNodeId,
         right: PhysicalPlanNodeId,
     ) -> Result<PhysicalPlanNodeId> {
@@ -1057,7 +1058,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn push_wrapped_nlj(
         &mut self,
-        join: &ComparisonJoin,
+        join: &ComparisonJoin<SelectedChild>,
         left: PhysicalPlanNodeId,
         right: PhysicalPlanNodeId,
     ) -> Result<PhysicalPlanNodeId> {
@@ -1192,7 +1193,7 @@ struct ReductionScanBranch<'a> {
 }
 
 impl<'a> ReductionScanBranch<'a> {
-    fn inspect(plan: &'a OwnedLogicalPlan) -> Option<Self> {
+    fn inspect(plan: &'a SelectedNode) -> Option<Self> {
         match &plan.operator {
             LogicalOperator::Get(get) => {
                 let output_column_ids = (0..get.returned_types.len())
@@ -1496,7 +1497,7 @@ fn same_reduction_key_expression(left: &Expression, right: &Expression) -> bool 
 }
 
 fn partition_hash_join_conditions(
-    join: &ComparisonJoin,
+    join: &ComparisonJoin<SelectedChild>,
 ) -> (Box<[JoinCondition]>, Box<[JoinCondition]>) {
     let (keys, residuals): (Vec<_>, Vec<_>) = join
         .conditions
@@ -1511,8 +1512,8 @@ fn partition_hash_join_conditions(
 /// tracing a column back to a base-table declaration. The shared proof tracks
 /// duplicate-preserving projections, windows, aggregates, and key-preserving
 /// joins; ordinary equality supplies the required NULL rejection.
-fn hash_join_build_keys_are_declared_unique(
-    build: &OwnedLogicalPlan,
+fn hash_join_build_keys_are_declared_unique<P: paro_planner::plan::LogicalInput>(
+    build: &P,
     key_conditions: &[JoinCondition],
 ) -> bool {
     if key_conditions.is_empty()
@@ -1526,7 +1527,12 @@ fn hash_join_build_keys_are_declared_unique(
         .iter()
         .map(|condition| &condition.right)
         .collect::<Vec<_>>();
-    crate::statistics::unique_keys::expressions_cover_catalog_unique_key(build, &expressions)
+    crate::statistics::unique_keys::expressions_cover_key_in_layout(
+        &build.output_layout(),
+        &build.node_stats().unique_keys,
+        &expressions,
+        Some(paro_planner::plan::UniqueKeyProvenance::CatalogEnforced),
+    )
 }
 
 /// Produce a speculative execution hint from the current storage snapshot.
@@ -1534,7 +1540,7 @@ fn hash_join_build_keys_are_declared_unique(
 /// concurrent builder invalidates itself on any runtime domain/count drift and
 /// hash-join finish falls back to the canonical retained-row path.
 fn plan_build_time_integer_join_index(
-    build: &OwnedLogicalPlan,
+    build: &SelectedNode,
     key_conditions: &[JoinCondition],
 ) -> Option<BuildTimeIntegerJoinIndexSpec> {
     let [condition] = key_conditions else {
@@ -1563,8 +1569,8 @@ fn plan_build_time_integer_join_index(
 /// while catalog constraints and storage statistics use physical column ids.
 /// Keeping this translation here makes uniqueness an explicit property of a
 /// transparent unary carrier rather than an accident of expression bindings.
-fn resolve_base_get_column<'a>(
-    build: &'a OwnedLogicalPlan,
+fn resolve_base_get_column<'a, P: LogicalPlanRead>(
+    build: &'a P,
     expression: &Expression,
 ) -> Option<(&'a paro_planner::operator::Get, usize)> {
     match expression {
@@ -1578,11 +1584,11 @@ fn resolve_base_get_column<'a>(
     }
 }
 
-fn resolve_base_get_output(
-    build: &OwnedLogicalPlan,
+fn resolve_base_get_output<P: LogicalPlanRead>(
+    build: &P,
     output_index: usize,
 ) -> Option<(&paro_planner::operator::Get, usize)> {
-    match &build.operator {
+    match build.operator() {
         LogicalOperator::Get(get) => Some((get, get.stored_column(output_index)?)),
         LogicalOperator::Filter(filter) => {
             let child_index = filter
@@ -1590,12 +1596,15 @@ fn resolve_base_get_output(
                 .to_indices(filter.child.types().len())
                 .get(output_index)
                 .copied()?;
-            resolve_base_get_output(&filter.child, child_index)
+            resolve_base_get_output(&*filter.child, child_index)
         }
         LogicalOperator::Projection(projection)
-            if !matches!(projection.child.operator, LogicalOperator::RowFetch(_)) =>
+            if !matches!(projection.child.operator(), LogicalOperator::RowFetch(_)) =>
         {
-            resolve_base_get_column(&projection.child, projection.expressions.get(output_index)?)
+            resolve_base_get_column(
+                &*projection.child,
+                projection.expressions.get(output_index)?,
+            )
         }
         LogicalOperator::Order(order) => {
             let child_index = order
@@ -1603,16 +1612,16 @@ fn resolve_base_get_output(
                 .to_indices(order.child.types().len())
                 .get(output_index)
                 .copied()?;
-            resolve_base_get_output(&order.child, child_index)
+            resolve_base_get_output(&*order.child, child_index)
         }
-        LogicalOperator::Limit(limit) => resolve_base_get_output(&limit.child, output_index),
+        LogicalOperator::Limit(limit) => resolve_base_get_output(&*limit.child, output_index),
         LogicalOperator::TopN(topn) => {
             let child_index = topn
                 .projection_map
                 .to_indices(topn.child.types().len())
                 .get(output_index)
                 .copied()?;
-            resolve_base_get_output(&topn.child, child_index)
+            resolve_base_get_output(&*topn.child, child_index)
         }
         LogicalOperator::Join(Join::Comparison(join))
             if join.join_type == JoinType::Inner
@@ -1621,51 +1630,51 @@ fn resolve_base_get_output(
         {
             let left_projection = join.left_projection_map.to_indices(join.left.types().len());
             if let Some(&child_index) = left_projection.get(output_index) {
-                return resolve_base_get_output(&join.left, child_index);
+                return resolve_base_get_output(&*join.left, child_index);
             }
             let right_output = output_index.checked_sub(left_projection.len())?;
             let right_projection = join
                 .right_projection_map
                 .to_indices(join.right.types().len());
-            resolve_base_get_output(&join.right, *right_projection.get(right_output)?)
+            resolve_base_get_output(&*join.right, *right_projection.get(right_output)?)
         }
         _ => None,
     }
 }
 
-fn resolve_bound_get_column(
-    build: &OwnedLogicalPlan,
+fn resolve_bound_get_column<P: LogicalPlanRead>(
+    build: &P,
     table_index: usize,
     column_index: usize,
 ) -> Option<(&paro_planner::operator::Get, usize)> {
-    match &build.operator {
+    match build.operator() {
         LogicalOperator::Get(get) if get.table_index == table_index => {
             Some((get, get.stored_column(column_index)?))
         }
         LogicalOperator::Filter(filter) => {
-            resolve_bound_get_column(&filter.child, table_index, column_index)
+            resolve_bound_get_column(&*filter.child, table_index, column_index)
         }
         LogicalOperator::Projection(projection)
-            if !matches!(projection.child.operator, LogicalOperator::RowFetch(_)) =>
+            if !matches!(projection.child.operator(), LogicalOperator::RowFetch(_)) =>
         {
-            resolve_bound_get_column(&projection.child, table_index, column_index)
+            resolve_bound_get_column(&*projection.child, table_index, column_index)
         }
         LogicalOperator::Order(order) => {
-            resolve_bound_get_column(&order.child, table_index, column_index)
+            resolve_bound_get_column(&*order.child, table_index, column_index)
         }
         LogicalOperator::Limit(limit) => {
-            resolve_bound_get_column(&limit.child, table_index, column_index)
+            resolve_bound_get_column(&*limit.child, table_index, column_index)
         }
         LogicalOperator::TopN(topn) => {
-            resolve_bound_get_column(&topn.child, table_index, column_index)
+            resolve_bound_get_column(&*topn.child, table_index, column_index)
         }
         LogicalOperator::Join(Join::Comparison(join))
             if join.join_type == JoinType::Inner
                 && join.duplicate_eliminated_columns.is_empty()
                 && !join.delim_flipped =>
         {
-            let left = resolve_bound_get_column(&join.left, table_index, column_index);
-            let right = resolve_bound_get_column(&join.right, table_index, column_index);
+            let left = resolve_bound_get_column(&*join.left, table_index, column_index);
+            let right = resolve_bound_get_column(&*join.right, table_index, column_index);
             match (left, right) {
                 (Some(column), None) | (None, Some(column)) => Some(column),
                 // A binding namespace must identify exactly one source in a

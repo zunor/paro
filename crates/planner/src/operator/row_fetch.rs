@@ -50,7 +50,9 @@ impl RowFetch {
             child: Box::new(child),
         }
     }
+}
 
+impl<Child: crate::plan::LogicalInput> RowFetch<Child> {
     pub fn output_names(&self) -> Vec<String> {
         let mut names = self.child.output_names();
         for source in &self.sources {

@@ -9,7 +9,7 @@ impl PhysicalPlanExtractor {
     pub(crate) fn lower_insert(
         &mut self,
         logical_id: paro_planner::plan::PlanNodeId,
-        insert: &LogicalInsert,
+        insert: &LogicalInsert<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(insert.child.as_ref())?;
         let spec = InsertSpec {
@@ -26,7 +26,7 @@ impl PhysicalPlanExtractor {
     pub(crate) fn lower_delete(
         &mut self,
         logical_id: paro_planner::plan::PlanNodeId,
-        delete: &LogicalDelete,
+        delete: &LogicalDelete<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(delete.child.as_ref())?;
         let child_width = self
@@ -70,7 +70,7 @@ impl PhysicalPlanExtractor {
     pub(crate) fn lower_update(
         &mut self,
         logical_id: paro_planner::plan::PlanNodeId,
-        update: &LogicalUpdate,
+        update: &LogicalUpdate<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(update.child.as_ref())?;
         let Some(child_node) = self.arena.get(child) else {
@@ -215,7 +215,7 @@ impl PhysicalPlanExtractor {
 
     pub(crate) fn lower_copy_to(
         &mut self,
-        copy: &LogicalCopyTo,
+        copy: &LogicalCopyTo<SelectedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(copy.child.as_ref())?;
         let spec = CopyToFileSpec {

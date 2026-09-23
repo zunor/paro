@@ -35,7 +35,9 @@ impl Window {
             child: Box::new(child),
         }
     }
+}
 
+impl<Child: crate::plan::LogicalInput> Window<Child> {
     /// Get the output types.
     /// Window functions append their results to the child's output.
     pub fn get_types(&self) -> Vec<LogicalType> {

@@ -628,7 +628,7 @@ fn dummy_and_empty_sources_are_single_task() {
     let ctx = BindContext::new();
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let dummy = extractor
-        .extract(&OwnedLogicalPlan::new(&ctx, LogicalOperator::DummyScan))
+        .extract(OwnedLogicalPlan::new(&ctx, LogicalOperator::DummyScan))
         .unwrap();
     let mut dummy_lowerer = PipelineLowerer::new(&dummy);
     let dummy_graph = dummy_lowerer.lower_to_pipeline_graph(dummy.root).unwrap();
@@ -653,7 +653,7 @@ fn dummy_and_empty_sources_are_single_task() {
     );
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let empty = extractor
-        .extract(&OwnedLogicalPlan::new(
+        .extract(OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::EmptyResult(EmptyResult::new(values)),
         ))
@@ -734,5 +734,5 @@ fn physical_extraction_rejects_unimplemented_nodes_before_lowering() {
         )),
     );
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    assert!(extractor.extract(&distinct).is_err());
+    assert!(extractor.extract(distinct).is_err());
 }

@@ -50,6 +50,7 @@ pub(crate) mod aggregate_planning;
 
 pub mod extraction;
 mod rewrite;
+pub(crate) mod selected;
 
 pub use extraction::{ExtractionContext, PhysicalPlanExtractor};
 

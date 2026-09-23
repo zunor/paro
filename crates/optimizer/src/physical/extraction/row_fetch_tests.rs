@@ -65,7 +65,7 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let mut physical = extractor
-        .extract(&logical)
+        .extract(logical)
         .expect("late row-fetch should lower");
 
     let PhysicalNodeKind::RowFetch(spec) = &physical.node(physical.root).kind else {
@@ -127,7 +127,7 @@ fn lowers_row_fetch_without_projection_parent() {
         .expect("standalone row-fetch bindings resolve");
 
     let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&logical)
+        .extract(logical)
         .expect("standalone row-fetch should lower");
     let PhysicalNodeKind::RowFetch(spec) = &physical.node(physical.root).kind else {
         panic!("expected standalone row-fetch root");

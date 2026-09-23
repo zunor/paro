@@ -99,7 +99,9 @@ impl GraphExpand {
             child: Box::new(child),
         }
     }
+}
 
+impl<Child: crate::plan::LogicalInput> GraphExpand<Child> {
     /// Physical carrier types produced by this expand.
     ///
     /// An expand preserves its child's carrier columns, appends edge rowid and

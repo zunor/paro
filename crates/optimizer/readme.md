@@ -30,6 +30,19 @@ is legitimate; repeated whole-tree transport inside search is not the target
 architecture. Remaining bridges must be assessed by their ownership and
 semantic contract, not merely by whether a type is called “owned”.
 
+Physical tasks retain immutable, shared ReadSet/dependency snapshots. Opening
+optional implementations invalidates coverage/completion, not the exact prices
+of unchanged child choices. Facts, requirements, calibration and grant contexts
+still control reuse. A retained mandatory winner remains an incumbent; it does
+not certify that a child's optional domain has been visited or completed.
+
+Frozen winners lower through immutable selected occurrences with cached output
+layouts and assigned scalar slots ([selected.rs](src/physical/selected.rs)).
+Local verification and positional-key replay happen once, bottom-up. Only
+single-node shells with boundary references adapt existing scalar contracts;
+query extraction must not rebuild a descendant-owned binder tree. Fusion and
+dependency discovery share the planner's read-only input/structure interfaces.
+
 ## Source map
 
 Paths below are relative to this crate.
@@ -176,6 +189,12 @@ producer details, but the public compile record is typed, bounded and sealed.
 Later admission/execution receipts extend that record without reopening it.
 The benchmark consumer uses the same versioned identities and keeps missing
 associations explicit.
+
+Detail's `optimizer_work` exposes exclusive work buckets and an orthogonal
+mandatory/optional/outside phase projection. Each independently sums to the
+same measured optimizer interval; adding both projections double-counts it.
+Collection is fixed-size and observer-only. Normal compiler receipts, not
+Detail's instrumented durations, determine performance.
 
 The public entry point is `EXPLAIN (COMPILE, FORMAT JSON)`, with TEXT rendered
 from the same typed record. Query/CTE targets support Summary and

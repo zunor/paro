@@ -39,7 +39,7 @@ fn arena_extractor_names_hidden_order_columns() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
-        .extract(&order)
+        .extract(order)
         .expect("hidden order columns should receive physical names");
 
     let root = plan.node(plan.root);
@@ -109,7 +109,7 @@ fn arena_extractor_names_hidden_window_child_columns() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
-        .extract(&window)
+        .extract(window)
         .expect("window child hidden columns should receive physical names");
 
     let root = plan.node(plan.root);
@@ -165,7 +165,7 @@ fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&window)
+        .extract(window)
         .expect("lower whole-partition aggregate window");
     let PhysicalNodeKind::PartitionAggregateWindow(spec) = &plan.node(plan.root).kind else {
         panic!("expected sort-free partition aggregate window");
@@ -222,7 +222,7 @@ fn composite_varlen_partition_keys_lower_to_sort_free_breaker() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&window)
+        .extract(window)
         .expect("lower composite varlen partition window");
     let PhysicalNodeKind::PartitionAggregateWindow(spec) = &plan.node(plan.root).kind else {
         panic!("expected sort-free partition aggregate window");
@@ -270,7 +270,7 @@ fn bigint_partition_key_lowers_to_typed_sort_free_breaker() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&window)
+        .extract(window)
         .expect("lower BIGINT partition aggregate window");
     let PhysicalNodeKind::PartitionAggregateWindow(spec) = &plan.node(plan.root).kind else {
         panic!("expected typed BIGINT partition aggregate window");
@@ -330,7 +330,7 @@ fn ordered_full_partition_aggregate_keeps_the_semantic_window_fallback() {
     );
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(&window)
+        .extract(window)
         .expect("lower ordered aggregate window");
     assert!(matches!(
         plan.node(plan.root).kind,
@@ -369,7 +369,7 @@ fn arena_extractor_lowers_row_literal_union_all_to_values() {
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
-        .extract(&union)
+        .extract(union)
         .expect("row-literal UNION ALL should lower to values");
 
     let PhysicalNodeKind::Values(spec) = &plan.node(plan.root).kind else {

@@ -15,6 +15,96 @@ use paro_common::types::LogicalType;
 use crate::binder::context::BindContext;
 use crate::operator::{ColumnBinding, LogicalOperator, LogicalOutputLayout};
 
+/// Read-only output contract for operator-local algorithms. Child ownership
+/// (binder tree, selected occurrence, or another immutable view) is not part
+/// of type derivation or cardinality-based implementation admission.
+pub trait LogicalInput {
+    fn output_layout(&self) -> std::borrow::Cow<'_, LogicalOutputLayout>;
+    fn types(&self) -> Vec<LogicalType>;
+    fn output_names(&self) -> Vec<String>;
+    fn get_column_bindings(&self) -> Vec<ColumnBinding>;
+    fn node_stats(&self) -> &NodeStats;
+}
+
+/// Immutable structural access used by dependency discovery and diagnostics.
+/// Consumers need not recover binder ownership to inspect an exact plan.
+pub trait LogicalPlanRead: LogicalInput + Sized {
+    type Child: LogicalChild<Plan = Self>;
+    fn operator(&self) -> &LogicalOperator<Self::Child>;
+}
+
+pub trait LogicalChild: LogicalInput + std::ops::Deref<Target = Self::Plan> + Sized {
+    type Plan: LogicalPlanRead<Child = Self>;
+}
+
+impl<P: LogicalPlanRead<Child = Box<P>>> LogicalChild for Box<P> {
+    type Plan = P;
+}
+impl<P: LogicalPlanRead<Child = std::sync::Arc<P>>> LogicalChild for std::sync::Arc<P> {
+    type Plan = P;
+}
+
+impl LogicalPlanRead for OwnedLogicalPlan {
+    type Child = Box<Self>;
+    fn operator(&self) -> &LogicalOperator<Self::Child> {
+        &self.operator
+    }
+}
+
+impl LogicalInput for OwnedLogicalPlan {
+    fn output_layout(&self) -> std::borrow::Cow<'_, LogicalOutputLayout> {
+        std::borrow::Cow::Owned(self.output_layout())
+    }
+    fn types(&self) -> Vec<LogicalType> {
+        self.types()
+    }
+    fn output_names(&self) -> Vec<String> {
+        self.output_names()
+    }
+    fn get_column_bindings(&self) -> Vec<ColumnBinding> {
+        self.get_column_bindings()
+    }
+    fn node_stats(&self) -> &NodeStats {
+        &self.stats
+    }
+}
+
+impl<T: LogicalInput + ?Sized> LogicalInput for Box<T> {
+    fn output_layout(&self) -> std::borrow::Cow<'_, LogicalOutputLayout> {
+        self.as_ref().output_layout()
+    }
+    fn types(&self) -> Vec<LogicalType> {
+        self.as_ref().types()
+    }
+    fn output_names(&self) -> Vec<String> {
+        self.as_ref().output_names()
+    }
+    fn get_column_bindings(&self) -> Vec<ColumnBinding> {
+        self.as_ref().get_column_bindings()
+    }
+    fn node_stats(&self) -> &NodeStats {
+        self.as_ref().node_stats()
+    }
+}
+
+impl<T: LogicalInput + ?Sized> LogicalInput for std::sync::Arc<T> {
+    fn output_layout(&self) -> std::borrow::Cow<'_, LogicalOutputLayout> {
+        self.as_ref().output_layout()
+    }
+    fn types(&self) -> Vec<LogicalType> {
+        self.as_ref().types()
+    }
+    fn output_names(&self) -> Vec<String> {
+        self.as_ref().output_names()
+    }
+    fn get_column_bindings(&self) -> Vec<ColumnBinding> {
+        self.as_ref().get_column_bindings()
+    }
+    fn node_stats(&self) -> &NodeStats {
+        self.as_ref().node_stats()
+    }
+}
+
 /// Stable node identifier within a planning session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlanNodeId(pub u32);

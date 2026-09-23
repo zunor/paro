@@ -517,17 +517,20 @@ mod tests {
                     let Expression::Comparison(comparison) = &filter.expressions[0] else {
                         panic!("comparison")
                     };
-                    let column = [comparison.left.as_ref(), comparison.right.as_ref()]
+                    let slot = [comparison.left.as_ref(), comparison.right.as_ref()]
                         .into_iter()
                         .find_map(|expression| {
-                            if let Expression::ColumnRef(column) = expression {
-                                Some(column)
+                            if let Expression::Reference(slot) = expression {
+                                Some(slot)
                             } else {
                                 None
                             }
                         })
-                        .expect("native comparison column");
-                    assert_eq!(column.binding, expected_binding);
+                        .expect("selected comparison slot");
+                    assert_eq!(
+                        filter.child.layout().bindings()[slot.index],
+                        expected_binding
+                    );
                     found = true;
                 }
                 Ok(())

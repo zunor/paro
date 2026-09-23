@@ -10,7 +10,7 @@ use crate::expression::{AggregateType, Expression, ExpressionIterator, Expressio
 use crate::operator::{
     binding_preserving_get, ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
-use crate::plan::OwnedLogicalPlan;
+use crate::plan::{LogicalPlanRead, OwnedLogicalPlan};
 use paro_catalog::entry::{CatalogEntry, CatalogObjectId, ConstraintType};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -68,7 +68,10 @@ impl SingletonGroupProof {
     /// rechecked, along with the grouping domain, join direction, predicates,
     /// partial grouping keys, and aggregate laws must still match the current
     /// tree before physical lowering may erase the hash aggregate.
-    pub fn is_valid_for(&self, aggregate: &Aggregate) -> bool {
+    pub fn is_valid_for<Child: crate::plan::LogicalChild>(
+        &self,
+        aggregate: &Aggregate<Child>,
+    ) -> bool {
         if self.null_free_key_columns.is_empty()
             || aggregate.post_reduction.is_some()
             || aggregate.aggregates.is_empty()
@@ -76,7 +79,7 @@ impl SingletonGroupProof {
         {
             return false;
         }
-        let LogicalOperator::Join(Join::Comparison(join)) = &aggregate.child.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = aggregate.child.operator() else {
             return false;
         };
         if join.join_type != JoinType::Left
@@ -91,7 +94,7 @@ impl SingletonGroupProof {
         {
             return false;
         }
-        let Some(preserved) = binding_preserving_get(join.left.as_ref()) else {
+        let Some(preserved) = binding_preserving_get(&*join.left) else {
             return false;
         };
         let Some(preserved_table) = preserved.table.as_ref() else {
@@ -100,20 +103,20 @@ impl SingletonGroupProof {
         if preserved_table.object_id() != self.preserved_table {
             return false;
         }
-        let LogicalOperator::Aggregate(partial) = &join.right.operator else {
+        let LogicalOperator::Aggregate(partial) = join.right.operator() else {
             return false;
         };
         if !partial.has_plain_grouping_domain() || partial.post_reduction.is_some() {
             return false;
         }
 
-        let Some(child_layout) = InputLayout::new(aggregate.child.as_ref()) else {
+        let Some(child_layout) = InputLayout::new(&*aggregate.child) else {
             return false;
         };
-        let Some(left_layout) = InputLayout::new(join.left.as_ref()) else {
+        let Some(left_layout) = InputLayout::new(&*join.left) else {
             return false;
         };
-        let Some(right_layout) = InputLayout::new(join.right.as_ref()) else {
+        let Some(right_layout) = InputLayout::new(&*join.right) else {
             return false;
         };
         let group_bindings = aggregate
@@ -225,7 +228,7 @@ struct InputLayout {
 }
 
 impl InputLayout {
-    fn new(input: &OwnedLogicalPlan) -> Option<Self> {
+    fn new(input: &impl crate::plan::LogicalInput) -> Option<Self> {
         let bindings = input.get_column_bindings();
         let types = input.types();
         (bindings.len() == types.len()).then_some(Self { bindings, types })

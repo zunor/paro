@@ -73,7 +73,9 @@ impl Distinct {
             child: Box::new(child),
         }
     }
+}
 
+impl<Child: crate::plan::LogicalInput> Distinct<Child> {
     /// Get the output types (same as child).
     pub fn get_types(&self) -> Vec<LogicalType> {
         self.child.types()

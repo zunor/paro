@@ -165,6 +165,7 @@ pub(crate) fn expressions_cover_unique_key(
 
 /// Stronger proof used only by execution strategies that diagnose a duplicate
 /// as a violated storage invariant rather than a planner-quality miss.
+#[cfg(test)]
 pub(crate) fn expressions_cover_catalog_unique_key(
     plan: &OwnedLogicalPlan,
     expressions: &[&Expression],
@@ -198,7 +199,7 @@ pub(crate) fn expressions_cover_unique_key_from_facts(
     expressions_cover_key_in_layout(layout, keys, expressions, None)
 }
 
-fn expressions_cover_key_in_layout(
+pub(crate) fn expressions_cover_key_in_layout(
     layout: &paro_planner::operator::LogicalOutputLayout,
     keys: &[UniqueKey],
     expressions: &[&Expression],
