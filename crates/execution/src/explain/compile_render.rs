@@ -507,6 +507,9 @@ mod tests {
     fn schema_and_capacity_rejects_fabricated_execution() {
         let capture = CompileCapture::try_start().unwrap();
         let json = render(&capture.seal(), true);
+        // The encoded document owns its bytes. Keep at most one capture per
+        // rendering test so parallel fixtures respect the real process quota.
+        drop(capture);
         validate_json(json.as_bytes()).unwrap();
         assert!(validate_json(json.replace("NotExecuted", "NotApplicable").as_bytes()).is_err());
         assert!(validate_json(
@@ -635,6 +638,7 @@ mod tests {
             r.budget_limited = Observation::Observed(true);
         });
         assert!(validate_json(render(&capture.seal(), true).as_bytes()).is_err());
+        drop(capture);
         let capture = CompileCapture::try_start().unwrap();
         capture.update(|r| {
             r.outcome = CompileOutcome::Success;
@@ -702,6 +706,7 @@ mod tests {
             record.compiler_other_ns = Observation::Observed(0);
         });
         let json = render_with_execution(&capture.seal(), true, Some(receipt.clone()));
+        drop(capture);
         validate_json(json.as_bytes()).unwrap();
 
         let mut invalid = serde_json::from_str::<serde_json::Value>(&json).unwrap();
