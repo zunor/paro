@@ -67,7 +67,7 @@ pub struct OptimizerProfiler {
     rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     component_allocated_bytes: BTreeMap<OptimizerComponent, u64>,
     counters: BTreeMap<String, u64>,
-    physical_search: crate::cascades::memo::PhysicalSearchProfile,
+    physical_search: Option<crate::cascades::memo::PhysicalSearchProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +87,7 @@ pub struct OptimizerProfileSnapshot {
     pub rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     pub component_allocated_bytes: BTreeMap<OptimizerComponent, u64>,
     pub counters: BTreeMap<String, u64>,
-    pub physical_search: crate::cascades::memo::PhysicalSearchProfile,
+    pub physical_search: Option<crate::cascades::memo::PhysicalSearchProfile>,
 }
 
 impl OptimizerProfiler {
@@ -107,7 +107,7 @@ impl OptimizerProfiler {
             .insert(component, allocated_bytes);
     }
 
-    pub fn snapshot(&self) -> OptimizerProfileSnapshot {
+    pub fn into_snapshot(self) -> OptimizerProfileSnapshot {
         OptimizerProfileSnapshot {
             entries: OptimizerComponent::ALL
                 .into_iter()
@@ -120,14 +120,14 @@ impl OptimizerProfiler {
                     }
                 })
                 .collect(),
-            rule_insertions: self.rule_insertions.clone(),
-            rule_elapsed: self.rule_elapsed.clone(),
-            rule_allocated_bytes: self.rule_allocated_bytes.clone(),
-            rule_budget_exhaustions: self.rule_budget_exhaustions.clone(),
-            component_allocated_bytes: self.component_allocated_bytes.clone(),
-            rule_attempts: self.rule_attempts.clone(),
-            counters: self.counters.clone(),
-            physical_search: self.physical_search.clone(),
+            rule_insertions: self.rule_insertions,
+            rule_elapsed: self.rule_elapsed,
+            rule_allocated_bytes: self.rule_allocated_bytes,
+            rule_budget_exhaustions: self.rule_budget_exhaustions,
+            component_allocated_bytes: self.component_allocated_bytes,
+            rule_attempts: self.rule_attempts,
+            counters: self.counters,
+            physical_search: self.physical_search,
         }
     }
 
@@ -151,8 +151,8 @@ impl OptimizerProfiler {
         self.rule_budget_exhaustions = exhausted;
     }
 
-    pub fn record_search_summary(&mut self, summary: &crate::cascades::SearchSummary) {
-        self.physical_search = summary.physical_search.clone();
+    pub fn record_search_summary(&mut self, mut summary: crate::cascades::SearchSummary) {
+        self.physical_search = summary.physical_search.take();
         self.counters.insert(
             "search_complete".to_string(),
             u64::from(summary.is_complete()),
@@ -305,7 +305,16 @@ pub fn publish_optimizer_profile_snapshot(
                 invocation_count: 0,
             }),
     );
-    entries.extend(physical_search_diagnostics(&snapshot.physical_search));
+    if let Some(profile) = snapshot.physical_search {
+        // These two fixed counters are already in every normal summary.
+        entries.extend(
+            physical_search_diagnostics(&profile)
+                .into_iter()
+                .filter(|entry| {
+                    entry.name != "memo_group_merge_count" && entry.name != "physical_goal_count"
+                }),
+        );
+    }
     diagnostics.publish_optimizer(entries);
 }
 
@@ -490,7 +499,7 @@ mod tests {
             OptimizerComponent::MemoExploration,
             Duration::from_micros(7),
         );
-        let snapshot = profiler.snapshot();
+        let snapshot = profiler.into_snapshot();
         assert_eq!(snapshot.entries.len(), OptimizerComponent::ALL.len());
         let memo = snapshot
             .entries
@@ -504,7 +513,7 @@ mod tests {
     #[test]
     fn search_completion_is_published_as_an_explicit_counter() {
         let mut profiler = OptimizerProfiler::default();
-        profiler.record_search_summary(&crate::cascades::SearchSummary {
+        profiler.record_search_summary(crate::cascades::SearchSummary {
             groups: 1,
             logical_expressions: 1,
             physical_expressions: 1,
@@ -515,7 +524,7 @@ mod tests {
             obligations: Box::new([]),
             physical_search: Default::default(),
         });
-        let snapshot = profiler.snapshot();
+        let snapshot = profiler.into_snapshot();
         assert_eq!(snapshot.counters.get("search_complete"), Some(&0));
         assert_eq!(snapshot.counters.get("budget_exhaustion_group"), Some(&1));
         assert_eq!(
@@ -534,7 +543,7 @@ mod tests {
         profiler.record_rule_allocated_bytes(BTreeMap::from([(rule, 8192)]));
         profiler.record_rule_budget_exhaustions(BTreeMap::from([(rule, 3)]));
 
-        let snapshot = profiler.snapshot();
+        let snapshot = profiler.into_snapshot();
         assert_eq!(snapshot.rule_attempts.get(&rule), Some(&7));
         assert_eq!(snapshot.rule_insertions.get(&rule), Some(&2));
         assert_eq!(
@@ -551,7 +560,7 @@ mod tests {
         profiler.record_component_allocation(OptimizerComponent::MemoExploration, 4096);
         assert_eq!(
             profiler
-                .snapshot()
+                .into_snapshot()
                 .component_allocated_bytes
                 .get(&OptimizerComponent::MemoExploration),
             Some(&4096)
@@ -563,7 +572,7 @@ mod tests {
         let diagnostics = SessionDiagnostics::default();
         let mut profiler = OptimizerProfiler::default();
         profiler.record_rule_insertions(BTreeMap::from([(RuleId(7), 3)]));
-        publish_optimizer_profile_snapshot(&diagnostics, profiler.snapshot());
+        publish_optimizer_profile_snapshot(&diagnostics, profiler.into_snapshot());
         let row = diagnostics
             .optimizer_snapshot()
             .into_iter()

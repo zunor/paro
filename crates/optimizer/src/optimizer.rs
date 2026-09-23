@@ -500,7 +500,7 @@ impl Optimizer {
                     OptimizedStatement::Physical(self.extract_utility(*utility, &grant_classes)?);
                 publish_optimizer_profile_snapshot(
                     self.ctx.session.diagnostics.as_ref(),
-                    self.ctx.profiler.snapshot(),
+                    std::mem::take(&mut self.ctx.profiler).into_snapshot(),
                 );
                 debug!(
                     target: targets::OPTIMIZER,
@@ -537,13 +537,13 @@ impl Optimizer {
                     (graph_plan, None)
                 };
             let canonical = self.canonicalize_query(graph_plan)?;
-            let (baseline_input, distinct_input) = fork_plan_preserving_indices(
-                canonical,
-                self.binder.bind_context.shared().as_ref(),
-            )?;
+            let (baseline_input, distinct_input) =
+                distinct_decomposition::fork_candidate(canonical, &self.binder.bind_context)?;
             let baseline = self.settle_relational_baseline(baseline_input)?;
-            let distinct_feasibility_candidate =
-                self.distinct_aggregate_feasibility_candidate(distinct_input)?;
+            let distinct_feasibility_candidate = distinct_input
+                .map(|input| self.distinct_aggregate_feasibility_candidate(input))
+                .transpose()?
+                .flatten();
             alternatives.push(baseline.into_alternative(if index == 0 {
                 AlternativeOrigin::Baseline
             } else {
@@ -1452,24 +1452,6 @@ impl Optimizer {
                 .copied()
                 .unwrap_or(0);
         }
-        self.ctx
-            .profiler
-            .record_rule_attempts(extraction.rule_attempts.clone());
-        self.ctx
-            .profiler
-            .record_rule_insertions(extraction.rule_insertions.clone());
-        self.ctx
-            .profiler
-            .record_rule_elapsed(extraction.rule_elapsed.clone());
-        self.ctx
-            .profiler
-            .record_rule_allocated_bytes(extraction.rule_allocated_bytes.clone());
-        self.ctx
-            .profiler
-            .record_rule_budget_exhaustions(extraction.rule_budget_exhaustions.clone());
-        self.ctx
-            .profiler
-            .record_search_summary(&extraction.search_summary);
         if let Some(trace) = self.ctx.session.statement_trace() {
             let summary = &extraction.search_summary;
             for (variant_ordinal, variant) in extraction.variants.iter().enumerate() {
@@ -2119,6 +2101,26 @@ impl Optimizer {
                 },
             );
         }
+        // All capture/trace readers have finished. Transfer diagnostics once;
+        // publishing the session summary must not clone the retained matrix.
+        self.ctx
+            .profiler
+            .record_rule_attempts(extraction.rule_attempts);
+        self.ctx
+            .profiler
+            .record_rule_insertions(extraction.rule_insertions);
+        self.ctx
+            .profiler
+            .record_rule_elapsed(extraction.rule_elapsed);
+        self.ctx
+            .profiler
+            .record_rule_allocated_bytes(extraction.rule_allocated_bytes);
+        self.ctx
+            .profiler
+            .record_rule_budget_exhaustions(extraction.rule_budget_exhaustions);
+        self.ctx
+            .profiler
+            .record_search_summary(extraction.search_summary);
         self.ctx.profiler.record(
             match mode {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
@@ -2175,7 +2177,7 @@ impl Optimizer {
         if !observes_optimizer_diagnostics {
             publish_optimizer_profile_snapshot(
                 self.ctx.session.diagnostics.as_ref(),
-                self.ctx.profiler.snapshot(),
+                std::mem::take(&mut self.ctx.profiler).into_snapshot(),
             );
         }
         debug!(

@@ -3,6 +3,77 @@
 
 use super::*;
 
+#[test]
+fn enforcement_preparation_is_goal_local_and_does_not_cache_feasibility() {
+    use super::super::super::properties::{
+        NullOrder, OrderingKey, OrderingScope, RequiredOrdering, SortDirection,
+    };
+    let (mut engine, root, goal) = engine(0);
+    engine.optimize_group(root, goal).unwrap();
+    let mut required = required();
+    required.ordering = OrderingRequirement::Ordered(RequiredOrdering {
+        keys: Box::new([OrderingKey {
+            column: ColumnId(0),
+            direction: SortDirection::Asc,
+            nulls: NullOrder::Last,
+            collation: None,
+        }]),
+        scope: OrderingScope::Global,
+    });
+    let sorted_goal = OptimizationGoal {
+        required: engine.memo.intern_required(required).unwrap(),
+        ..goal
+    };
+    engine.optimize_group(root, sorted_goal).unwrap();
+    let unsorted = engine
+        .recipes
+        .iter()
+        .find(|((_, g, _), _)| *g == goal)
+        .unwrap()
+        .1;
+    assert!(unsorted
+        .enforcement
+        .get()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .steps
+        .is_empty());
+    let ((physical, _, _), sorted) = engine
+        .recipes
+        .iter()
+        .find(|((_, g, _), _)| *g == sorted_goal)
+        .unwrap();
+    let (physical, sorted) = (*physical, Arc::clone(sorted));
+    let builds = engine.physical_enforcement_builds;
+    let enforced = engine
+        .prepare_enforcement(physical, sorted_goal, &sorted)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(enforced.steps.as_ref(), [EnforcerStep::Sort(_)]));
+    let input = EnforcerCostInput {
+        hard_memory_bytes: 0,
+        spill_policy: SpillPolicy::Forbidden,
+        ..EnforcerCostInput::unbounded(CompactRange::point(100.0).unwrap(), 8)
+    };
+    assert!(
+        enforcer_cost(&enforced.steps, input, engine.memo.calibration())
+            .unwrap()
+            .is_none()
+    );
+    assert!(enforcer_cost(
+        &enforced.steps,
+        EnforcerCostInput {
+            spill_policy: SpillPolicy::Allowed,
+            ..input
+        },
+        engine.memo.calibration()
+    )
+    .unwrap()
+    .is_some());
+    assert_eq!(engine.physical_enforcement_builds, builds);
+}
+
 fn recipe(children: Box<[(GroupId, OptimizationGoal)]>) -> CostRecipe {
     CostRecipe {
         sequence: 0,
@@ -27,6 +98,7 @@ fn recipe(children: Box<[(GroupId, OptimizationGoal)]>) -> CostRecipe {
         region: None,
         certified_local_work: None,
         immutable_cost_identity: OnceLock::new(),
+        enforcement: OnceLock::new(),
     }
 }
 

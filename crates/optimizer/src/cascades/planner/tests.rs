@@ -815,6 +815,53 @@ fn memo_round_trip_derives_layout_after_winner_selection() {
 }
 
 #[test]
+fn only_explicit_detail_collects_the_physical_diagnostic_matrix() {
+    use paro_context::compile_diagnostics::{CaptureLevel, CompileCapture};
+    let mut previous = None;
+    for level in [
+        None,
+        Some(CaptureLevel::Summary),
+        Some(CaptureLevel::Detail),
+    ] {
+        let bind = BindContext::new();
+        let input = MemoBuilder::build(
+            OwnedLogicalPlan::dummy_scan(&bind),
+            bind,
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let mut session = paro_context::TestStatementContextBuilder::minimal().build();
+        Arc::get_mut(&mut session).unwrap().options.compile_capture =
+            level.map(|level| CompileCapture::try_start_with_level(level).unwrap());
+        input.planner_state.write().unwrap().session = Some(session);
+        let grants = [ResourceGrantClass {
+            id: ResourceGrantClassId(2),
+            ..test_grant_classes()[0]
+        }];
+        let output = input.optimize(&grants).unwrap();
+        let summary = output.search_summary;
+        assert_eq!(
+            summary.physical_search.is_some(),
+            level == Some(CaptureLevel::Detail)
+        );
+        assert!(summary.work_counters["physical_goal_count"] > 0);
+        let observed = (
+            summary.is_complete(),
+            summary.groups,
+            summary.logical_expressions,
+            summary.physical_expressions,
+            summary.work_counters["physical_goal_count"],
+            output.variants[0].physical_fingerprint,
+            output.variants[0].cost,
+        );
+        if let Some(previous) = &previous {
+            assert_eq!(&observed, previous, "collection must not change search");
+        }
+        previous = Some(observed);
+    }
+}
+
+#[test]
 fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
     // Production Memo -> mandatory/optional -> frozen winner -> extraction.
     // The semantic ORDER template erases its projection map, but the target

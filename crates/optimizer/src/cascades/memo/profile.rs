@@ -8,6 +8,17 @@
 
 use super::*;
 
+/// Fixed-size session observability. Ordinary compilation never allocates
+/// rows for individual goals or walks archived source-work payloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhysicalSearchSummary {
+    pub group_merges: u64,
+    pub goals: u64,
+    pub candidates: u64,
+    pub largest_frontier: u64,
+    pub truncations: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PhysicalSearchProfile {
     pub group_merges: u64,
@@ -35,8 +46,31 @@ pub struct PhysicalFrontierProfile {
 }
 
 impl Memo {
-    pub fn physical_search_profile(&self) -> PhysicalSearchProfile {
+    pub fn physical_search_summary(&self) -> PhysicalSearchSummary {
         diagnostic_snapshot::capture(self);
+        let mut summary = PhysicalSearchSummary {
+            group_merges: self.group_merges,
+            ..PhysicalSearchSummary::default()
+        };
+        for group in &self.groups {
+            if self.canonical_group(group.id) != group.id {
+                continue;
+            }
+            for frontier in group.winner_frontiers.values() {
+                summary.goals += 1;
+                summary.candidates += frontier.candidates.len() as u64;
+                summary.largest_frontier = summary
+                    .largest_frontier
+                    .max(frontier.candidates.len() as u64);
+                summary.truncations += frontier.truncations;
+            }
+        }
+        summary
+    }
+
+    /// Explicit Detail inspection only. Absence in a normal profile means
+    /// not collected, never an empty search or zero retained payload bytes.
+    pub fn physical_search_profile(&self) -> PhysicalSearchProfile {
         let mut archived = vec![(0_u64, 0_u64); self.groups.len()];
         let mut source_payloads = std::collections::HashSet::new();
         for candidate in &self.winner_candidates {

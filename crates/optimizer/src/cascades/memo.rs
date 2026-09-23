@@ -28,9 +28,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) const UNTYPED_LOGICAL_OPERATOR_TAG: u64 = u64::MAX;
 
-mod profile;
 pub mod diagnostic_snapshot;
-pub use profile::{PhysicalFrontierProfile, PhysicalGroupProfile, PhysicalSearchProfile};
+mod profile;
+pub use profile::{
+    PhysicalFrontierProfile, PhysicalGroupProfile, PhysicalSearchProfile, PhysicalSearchSummary,
+};
 
 /// A physical costing/scheduling epoch observes one frozen logical fact set.
 /// Old exact candidates remain replayable, but cannot seed new fact decisions.

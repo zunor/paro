@@ -2786,6 +2786,23 @@ impl OptimizationInput {
             }
         }
         let mut work_counters = engine.search_work_counters();
+        let physical_summary = engine.memo().physical_search_summary();
+        work_counters.extend([
+            ("memo_group_merge_count", physical_summary.group_merges),
+            ("physical_goal_count", physical_summary.goals),
+            (
+                "physical_frontier_candidate_count",
+                physical_summary.candidates,
+            ),
+            (
+                "physical_largest_frontier",
+                physical_summary.largest_frontier,
+            ),
+            (
+                "physical_frontier_truncation_count",
+                physical_summary.truncations,
+            ),
+        ]);
         {
             let state = self
                 .planner_state
@@ -2883,7 +2900,7 @@ impl OptimizationInput {
             exhaustion_events: engine.memo().exhaustion_counts(),
             obligations: engine.memo().search_obligations(),
             work_counters,
-            physical_search: engine.memo().physical_search_profile(),
+            physical_search: detail_capture.then(|| engine.memo().physical_search_profile()),
         };
         Ok(OptimizationOutput {
             grant_search,
@@ -2962,7 +2979,9 @@ pub struct SearchSummary {
     pub exhaustion_events: BTreeMap<BudgetDimension, u64>,
     pub obligations: Box<[super::budget::SearchObligation]>,
     pub work_counters: BTreeMap<&'static str, u64>,
-    pub physical_search: super::memo::PhysicalSearchProfile,
+    /// Only explicit Detail capture owns the per-goal matrix. Summary
+    /// counters and completion evidence above are always available.
+    pub physical_search: Option<super::memo::PhysicalSearchProfile>,
 }
 
 impl SearchSummary {

@@ -534,6 +534,11 @@ struct CostRecipe {
     /// grant and calibration remain separate live inputs to combination identity;
     /// resuming a recipe does not hash its unchanged source-work payload again.
     immutable_cost_identity: OnceLock<Fingerprint>,
+    /// The recipe key fixes both the immutable physical properties and the
+    /// interned requirement. Resumes share this geometry, not its price:
+    /// calibration, row/grant inputs and active frontier membership remain
+    /// subject to their existing cost-context checks.
+    enforcement: OnceLock<Option<super::enforcer::EnforcedPlan>>,
 }
 
 /// Exact query-local identity for one child-frontier combination. The budget
@@ -1293,6 +1298,8 @@ pub struct CascadesEngine {
     physical_subproblem_requests: u64,
     physical_subproblem_reuses: u64,
     physical_subproblem_evaluations: u64,
+    physical_enforcement_builds: u64,
+    physical_enforcement_reuses: u64,
     physical_stale_retries: u64,
     physical_implementation_requests: u64,
     /// Goal-scoped invalidation accounting. These counters are diagnostic
@@ -1540,6 +1547,8 @@ impl CascadesEngine {
             physical_subproblem_requests: 0,
             physical_subproblem_reuses: 0,
             physical_subproblem_evaluations: 0,
+            physical_enforcement_builds: 0,
+            physical_enforcement_reuses: 0,
             physical_stale_retries: 0,
             physical_implementation_requests: 0,
             physical_unrelated_goal_invalidation_count: 0,
@@ -6274,6 +6283,14 @@ impl CascadesEngine {
                 "physical_subproblem_evaluation_count",
                 self.physical_subproblem_evaluations,
             ),
+            (
+                "physical_enforcement_build_count",
+                self.physical_enforcement_builds,
+            ),
+            (
+                "physical_enforcement_reuse_count",
+                self.physical_enforcement_reuses,
+            ),
             ("physical_stale_retry_count", self.physical_stale_retries),
             (
                 "physical_implementation_request_count",
@@ -7732,6 +7749,7 @@ impl CascadesEngine {
                 region: candidate.region,
                 certified_local_work,
                 immutable_cost_identity: OnceLock::new(),
+                enforcement: OnceLock::new(),
             }));
             true
         } else {
@@ -9257,6 +9275,37 @@ impl CascadesEngine {
         }
     }
 
+    fn prepare_enforcement<'recipe>(
+        &mut self,
+        physical: PhysicalExprId,
+        goal: OptimizationGoal,
+        recipe: &'recipe CostRecipe,
+    ) -> Result<Option<&'recipe super::enforcer::EnforcedPlan>> {
+        if recipe.enforcement.get().is_some() {
+            self.physical_enforcement_reuses = self.physical_enforcement_reuses.saturating_add(1);
+        } else {
+            let provided = &self
+                .memo
+                .physical_expr(physical)
+                .ok_or_else(|| {
+                    paro_error::internal("unknown physical expression during enforcement")
+                })?
+                .provided;
+            let required = self
+                .memo
+                .required(goal.required)
+                .ok_or_else(|| paro_error::internal("optimization goal has unknown properties"))?;
+            let enforced = self
+                .enforcement
+                .canonical_baseline(provided.clone(), required)?;
+            // Failure is not a prepared result. A legal but unsupported
+            // conversion is, and need not be constructed again on resume.
+            let _ = recipe.enforcement.set(enforced);
+            self.physical_enforcement_builds = self.physical_enforcement_builds.saturating_add(1);
+        }
+        Ok(recipe.enforcement.get().and_then(Option::as_ref))
+    }
+
     fn optimize_group_inner(
         &mut self,
         subproblem: (GroupId, OptimizationGoal),
@@ -9270,11 +9319,6 @@ impl CascadesEngine {
         if enumerate_local_implementations {
             self.enumerate_implementations(group, goal)?;
         }
-        let required = self
-            .memo
-            .required(goal.required)
-            .ok_or_else(|| paro_error::internal("optimization goal has unknown properties"))?
-            .clone();
         // The recipe key is physical-expression first. Walk only the physical
         // expressions owned by this group and use bounded BTree ranges instead
         // of scanning the global recipe table for every (group, goal).
@@ -9282,18 +9326,25 @@ impl CascadesEngine {
             .memo
             .group(group)
             .ok_or_else(|| paro_error::internal("unknown group during recipe lookup"))?
-            .physical_exprs()
-            .to_vec();
+            .physical_exprs();
         let mut recipes = Vec::new();
-        for &physical in &physical_exprs {
+        for &physical in physical_exprs {
             recipes.extend(
                 self.recipes
                     .range(
                         (physical, goal, Fingerprint::default())
                             ..=(physical, goal, Fingerprint(u128::MAX)),
                     )
-                    .map(|((physical, _, fingerprint), recipe)| {
-                        (recipe.sequence, *physical, *fingerprint, Arc::clone(recipe))
+                    .filter_map(|((physical, _, fingerprint), recipe)| {
+                        let pending = match dirty_recipes {
+                            Some(dirty) => {
+                                recipe.sequence >= recipe_cursor
+                                    || dirty.contains(&(*physical, *fingerprint))
+                            }
+                            None => recipe.sequence >= recipe_start,
+                        };
+                        pending
+                            .then(|| (recipe.sequence, *physical, *fingerprint, Arc::clone(recipe)))
                     }),
             );
         }
@@ -9308,15 +9359,6 @@ impl CascadesEngine {
         let mut optimized_children = BTreeSet::<(GroupId, OptimizationGoal)>::new();
 
         for (sequence, physical, recipe_fingerprint, recipe) in recipes {
-            let recipe_is_dirty =
-                dirty_recipes.is_some_and(|dirty| dirty.contains(&(physical, recipe_fingerprint)));
-            if dirty_recipes.is_some() {
-                if sequence < recipe_cursor && !recipe_is_dirty {
-                    continue;
-                }
-            } else if sequence < recipe_start {
-                continue;
-            }
             self.physical_recipe_reprocess_count =
                 self.physical_recipe_reprocess_count.saturating_add(1);
             if sequence < recipe_cursor {
@@ -9410,20 +9452,13 @@ impl CascadesEngine {
                     children_feasible = false;
                     break;
                 }
-                let frontier_candidates = frontier
-                    .candidates()
-                    .iter()
-                    .map(|winner| ChildWinnerRef {
-                        group: child,
-                        goal: child_goal,
-                        candidate: winner.candidate,
-                    })
-                    .collect::<Vec<_>>();
-                frontier_out.reserve(frontier_candidates.len());
-                frontier_out.extend(frontier_candidates.iter().copied());
-                frontier_out.sort_unstable_by_key(|child| child.candidate);
+                frontier_out.extend(frontier.candidates().iter().map(|winner| ChildWinnerRef {
+                    group: child,
+                    goal: child_goal,
+                    candidate: winner.candidate,
+                }));
                 if self.collect_rule_work_profile {
-                    for child_reference in frontier_candidates {
+                    for child_reference in frontier_out.iter().copied() {
                         let stage = CandidateLifecycleStage::ChildReady;
                         if self.candidate_lifecycle_slot_available(stage) {
                             self.note_candidate_lifecycle(CandidateLifecycleEvent {
@@ -9450,6 +9485,7 @@ impl CascadesEngine {
                         }
                     }
                 }
+                frontier_out.sort_unstable_by_key(|child| child.candidate);
             }
             if !children_feasible {
                 if child_yielded {
@@ -9470,23 +9506,9 @@ impl CascadesEngine {
                 }
                 continue;
             }
-            // Enforcement depends only on the physical expression and the
-            // parent requirement.  It is invariant across every child
-            // frontier combination; compute it once per recipe instead of
-            // cloning properties and rebuilding the baseline for each
-            // proposal.
-            let physical_properties = self
-                .memo
-                .physical_expr(physical)
-                .ok_or_else(|| {
-                    paro_error::internal("unknown physical expression during enforcement")
-                })?
-                .provided
-                .clone();
-            let Some(enforced) = self
-                .enforcement
-                .canonical_baseline(physical_properties, &required)?
-            else {
+            // Geometry is immutable for this recipe/goal; its price below
+            // still uses the current calibration and exact resource input.
+            let Some(enforced) = self.prepare_enforcement(physical, goal, &recipe)? else {
                 tracing::debug!(
                     target: "paro::optimizer",
                     memo_group = group.index(),
@@ -9608,7 +9630,7 @@ impl CascadesEngine {
                         .admit_cached_child_combination(
                             (group, goal, physical),
                             &recipe,
-                            &enforced,
+                            enforced,
                             &mut combination_state,
                             &children,
                             true,
@@ -9682,7 +9704,7 @@ impl CascadesEngine {
                         .admit_cached_child_combination(
                             (group, goal, physical),
                             &recipe,
-                            &enforced,
+                            enforced,
                             &mut combination_state,
                             &child_ids,
                             false,
@@ -9892,7 +9914,7 @@ impl CascadesEngine {
                     .admit_cached_child_combination(
                         (group, goal, physical),
                         &recipe,
-                        &enforced,
+                        enforced,
                         &mut combination_state,
                         &child_ids,
                         false,
@@ -9956,7 +9978,7 @@ impl CascadesEngine {
                         .admit_cached_child_combination(
                             (group, goal, physical),
                             &recipe,
-                            &enforced,
+                            enforced,
                             &mut combination_state,
                             &children,
                             true,

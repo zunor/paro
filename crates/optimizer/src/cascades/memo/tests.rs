@@ -1098,6 +1098,13 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
     assert_eq!(merged.group_merges, 1);
     assert_eq!(merged.groups.len(), 1);
     assert_eq!(merged.groups[0].archived_candidates, 16);
+    let summary = memo.physical_search_summary();
+    assert_eq!(summary.group_merges, merged.group_merges);
+    assert_eq!(summary.goals, merged.frontiers.len() as u64);
+    assert_eq!(
+        summary.candidates, 0,
+        "cleared frontiers are not the archive"
+    );
 }
 
 #[test]

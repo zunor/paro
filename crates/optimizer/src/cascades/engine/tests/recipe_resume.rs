@@ -8,6 +8,30 @@
 use super::*;
 
 #[test]
+fn exact_recipe_resume_reuses_enforcement_without_certifying_completion() {
+    let (mut engine, root, child, goal) = resume_engine(false);
+    engine.mandatory_only = true;
+    engine.optimize_group(root, goal).unwrap();
+    let built = engine.physical_enforcement_builds;
+    let reused = engine.physical_enforcement_reuses;
+    assert!(built > 0);
+    let cost = engine.memo.group(root).unwrap().winner(goal).unwrap().cost;
+    engine.mandatory_only = false;
+    engine.open_optional_implementation_domain().unwrap();
+    assert!(engine.physical_task_cache[&(root, goal)].mandatory_only);
+    assert!(engine.physical_task_cache[&(child, goal)].mandatory_only);
+    assert!(engine.memo.group(root).unwrap().winner(goal).is_none());
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(engine.physical_enforcement_builds, built);
+    assert!(engine.physical_enforcement_reuses > reused);
+    assert_eq!(
+        engine.memo.group(root).unwrap().winner(goal).unwrap().cost,
+        cost
+    );
+    assert!(!engine.physical_task_cache[&(root, goal)].mandatory_only);
+}
+
+#[test]
 fn retained_prices_do_not_publish_mixtures_with_unvisited_optional_children() {
     let (mut engine, root, goal) = strong_tree_engine();
     let child = engine

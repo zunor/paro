@@ -199,6 +199,20 @@ same measured optimizer interval; adding both projections double-counts it.
 Collection is fixed-size and observer-only. Normal compiler receipts, not
 Detail's instrumented durations, determine performance.
 
+Normal compilation publishes fixed summary counters, completion/quality
+evidence and the compile receipt. Only explicit Detail constructs per-group
+and per-frontier diagnostic rows or accounts archived source payloads. Missing
+detail is not an empty frontier or zero bytes. Completed profiles transfer
+ownership into their session snapshot; session inspection must not force a
+second matrix construction or clone.
+
+Preparation follows the same demand boundary: a DISTINCT feasibility fork
+requires the decomposition owner's read-only eligibility proof. An eligible
+fork remains mandatory even when optional search is exhausted. Physical recipes
+own immutable enforcement geometry for their exact provided/required properties;
+resuming a recipe reuses that geometry but still validates its live cost context,
+resource feasibility and active child responses. Prepared is not complete.
+
 The public entry point is `EXPLAIN (COMPILE, FORMAT JSON)`, with TEXT rendered
 from the same typed record. Query/CTE targets support Summary and
 `COMPILE, ANALYZE`; simple and known-typed extended executions use one compile

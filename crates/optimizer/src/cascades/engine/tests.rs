@@ -369,6 +369,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
             physical_fingerprint: Fingerprint(91),
             certified_local_work: None,
             immutable_cost_identity: OnceLock::new(),
+            enforcement: OnceLock::new(),
             region: Some(RegionCandidateContract {
                 // RegionId is an ephemeral forest position. The facet
                 // fingerprint is the stable recipe identity after runtime
