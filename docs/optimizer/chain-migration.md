@@ -135,11 +135,15 @@ order checks. No budget or quality condition is weakened. These figures are
 not an all-query latency guarantee or a same-batch causal speedup estimate.
 
 An external Go build overlapped the final six seconds of Q11/off; the original
-samples are retained and cannot certify isolated performance. A separately
-registered additional same-code cell is pending host availability. The target
-is approximately 12 ms, not a claim that the 12.420 ms median passes a strict
-<=12.000 ms gate. Search remains QualityPolicySatisfied + SearchIncomplete.
-There is no new ProofComplete or first-statement parity claim.
+samples are retained and cannot certify isolated performance. After the other
+builds stopped, the separately registered five-block same-binary cell on clean
+`re-op` (`c41441db`) produced compiler samples 12.626, 12.694, 14.034, 12.583,
+13.965 ms: median **12.694 ms**, P90 **14.034 ms**. Its optimizer median is
+11.835 ms, a different boundary. C1 is 137.513 ms versus DuckDB 54.434 ms.
+The approximately-12-ms historical scale is restored, but a strict compiler
+<=12.000 ms gate is not passed. Search remains QualityPolicySatisfied +
+SearchIncomplete. There is no new ProofComplete or first-statement parity
+claim, and no slower sample is removed or pooled into another cohort.
 
 Workspace tests: 6,906 passed (optimizer 1,369); strict Clippy and benchmark's
 206 tests pass. High-FD verifier-on SQL regress remains 167/18; all 18 actual

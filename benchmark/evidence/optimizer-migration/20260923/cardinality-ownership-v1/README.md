@@ -67,13 +67,40 @@ baseline had 1,467 syntheses / 121 groups; the candidate has 420 syntheses /
 same-candidate join/aggregate/predicate evidence at 10.646 ms, with no missing
 quality facts. This diagnostic timestamp is not the normal compiler result.
 
+## Registered post-interference cell
+
+Source `c41441db`, clean `re-op`; the binary SHA-256 is unchanged. Switching
+back to re-op caused Cargo to rebuild identical sources. The collector was
+paused **before any sampling** while that build and the other task's Go
+build/lint finished; build duration is not a compiler sample. No known
+build/lint process was running immediately before resuming or after the cell
+finished. The user paused the other builds; this task did not signal them.
+
+`quiet-q11-off-run` contains the registered five fresh blocks, not a selected
+subset or a pool with the prior campaign:
+
+- Compiler samples: **12.626, 12.694, 14.034, 12.583, 13.965 ms**.
+  Median **12.694 ms**, P90 **14.034 ms**.
+- Optimizer median **11.835 ms**. It is not substituted for the compiler
+  boundary to manufacture a <=12 ms result.
+- All five perform 420 cost syntheses; all results (90 rows), types, bag/order,
+  cold misses, receipts and the maintained campaign validators pass.
+- C1 median **137.513 ms**, warm **79.324 ms**; DuckDB C1 **54.434 ms**.
+  There is no first-statement parity or powered warm/tail certification.
+- QualityPolicySatisfied + SearchIncomplete; no ProofComplete.
+
+The historical approximately-12-ms scale is restored with current ownership,
+identity and correctness contracts. A strict compile <=12.000 ms target is
+**not** achieved. These are finite host observations, not a latency guarantee.
+Both earlier cohorts and all of their slower samples remain archived.
+
 ## Validation and remaining failures
 
 - `make test`: 6,906 passed, zero failed, 85 ignored; optimizer 1,369 passed.
 - Strict workspace Clippy passed. `make -C benchmark test`: 206 passed.
 - Release build passed; all Q04/Q11/Q74 samples passed complete typed result,
   bag and required-order checks (6 / 90 / 92 rows respectively).
-- Maintained campaign/receipt/document validators passed all four archived
+- Maintained campaign/receipt/document validators passed all five archived
   runs. Diagnostic EXPLAIN is NotExecuted and has no execution receipt; this
   is not silently relabeled a Verified normal observation.
 - High-FD, verifier-on SQL regress: 167 passed / 18 failed. The failure-file
