@@ -106,7 +106,7 @@ impl<'a> PlanEnumerator<'a> {
             let cardinality = self.cost_model.get_cardinality(&set);
             let risk_cardinality = self.cost_model.get_risk_cardinality(&set);
             let materialization_cardinality = self.cost_model.get_materialization_cardinality(&set);
-            let node = DPJoinNode::leaf(
+            let mut node = DPJoinNode::leaf(
                 set.clone(),
                 self.cost_model.payload_width(set.as_ref()),
                 cardinality,
@@ -114,6 +114,7 @@ impl<'a> PlanEnumerator<'a> {
                 materialization_cardinality,
             );
 
+            node.cardinality_provenance = self.cost_model.relation_provenance(i);
             self.plans.insert(set, vec![node]);
         }
     }

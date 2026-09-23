@@ -1076,7 +1076,7 @@ impl StatisticsGathering {
             .and_then(|table| table.get_storage())
             .and_then(|storage| storage.total_rows().ok())
             .map(|rows| rows.max(1))
-            .unwrap_or_else(|| default_table_cardinality(ctx))
+            .unwrap_or_else(|| default_table_cardinality(Some(ctx.session)))
     }
 }
 
@@ -1564,8 +1564,8 @@ fn fallback_group_distinct(child_rows: u64) -> u64 {
     ((child_rows.max(1) as f64).sqrt().ceil() as u64).max(1)
 }
 
-fn default_table_cardinality(ctx: &CardinalityInputs<'_>) -> usize {
-    match ctx.session.get_setting("default_table_cardinality") {
+pub(crate) fn default_table_cardinality(session: Option<&paro_context::StatementContext>) -> usize {
+    match session.and_then(|session| session.get_setting("default_table_cardinality")) {
         Some(Value::BigInt(v)) if *v > 0 => *v as usize,
         Some(Value::Integer(v)) if *v > 0 => *v as usize,
         _ => 1000,

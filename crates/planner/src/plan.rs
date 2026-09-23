@@ -61,6 +61,8 @@ impl CardinalityEstimate {
 /// tree cut loses that information.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CardinalityProvenance {
+    /// A ranking prior, not a measured or derived relation estimate.
+    Unknown,
     #[default]
     Statistics,
     JoinGraph,
@@ -147,15 +149,21 @@ impl NodeStats {
     }
 
     /// Replace the complete row-count contract as one coherent update.
+    /// A ranking prior belongs to the enumerator, not to published relation
+    /// facts. Reconstructing a join with an unknown input must retain that
+    /// absence instead of exporting the prior as an exact estimate.
     pub fn set_cardinality(
         &mut self,
         estimate: CardinalityEstimate,
         provenance: CardinalityProvenance,
         materialization_risk_cardinality: Option<u64>,
     ) {
-        self.estimated_cardinality = Some(estimate);
+        self.estimated_cardinality =
+            (provenance != CardinalityProvenance::Unknown).then_some(estimate);
         self.cardinality_provenance = provenance;
-        self.materialization_risk_cardinality = materialization_risk_cardinality;
+        self.materialization_risk_cardinality = (provenance != CardinalityProvenance::Unknown)
+            .then_some(materialization_risk_cardinality)
+            .flatten();
     }
 
     /// Carry join-graph row estimates across a row-preserving wrapper.
@@ -570,6 +578,26 @@ impl Drop for OwnedLogicalPlan {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ranking_prior_is_not_exported_as_relation_cardinality() {
+        use super::{CardinalityEstimate, CardinalityProvenance, NodeStats};
+        let mut stats = NodeStats::default();
+        stats.set_cardinality(
+            CardinalityEstimate::exact(1000),
+            CardinalityProvenance::Unknown,
+            Some(1000),
+        );
+        assert!(stats.estimated_cardinality.is_none());
+        assert!(stats.materialization_risk_cardinality.is_none());
+        let mut wrapper = NodeStats::default();
+        wrapper.inherit_cardinality_from(&stats);
+        assert!(wrapper.estimated_cardinality.is_none());
+        assert_eq!(
+            wrapper.cardinality_provenance,
+            CardinalityProvenance::Unknown
+        );
+    }
+
     use super::*;
     use crate::operator::{EmptyResult, ExpressionGet, Join};
 

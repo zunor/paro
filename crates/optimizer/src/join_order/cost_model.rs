@@ -13,6 +13,7 @@ use crate::join_order::query_graph::{JoinEdgeOrientation, JoinPredicateSet};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::RelationStats;
 use paro_planner::expression::Expression;
+use paro_planner::plan::CardinalityProvenance;
 use std::sync::Arc;
 
 /// A node in the dynamic programming join plan.
@@ -43,6 +44,7 @@ pub(crate) struct DPJoinNode {
     /// throughout DP enumeration; logical plans quantize it only once when the
     /// chosen tree is reconstructed.
     pub cardinality: f64,
+    pub cardinality_provenance: CardinalityProvenance,
     /// Cardinality used for risk-adjusted work costing.
     pub risk_cardinality: f64,
     /// Conservative cardinality used only if this subtree is selected as an
@@ -101,6 +103,7 @@ impl DPJoinNode {
             build_side: JoinBuildSide::Right,
             cost: 0.0,
             cardinality,
+            cardinality_provenance: CardinalityProvenance::Statistics,
             risk_cardinality,
             materialization_cardinality,
             materialization_is_reduction_bound: false,
@@ -137,6 +140,13 @@ impl DPJoinNode {
             build_side: estimate.build_side,
             cost: estimate.breakdown.total(),
             cardinality: estimate.cardinality,
+            cardinality_provenance: if left.cardinality_provenance == CardinalityProvenance::Unknown
+                || right.cardinality_provenance == CardinalityProvenance::Unknown
+            {
+                CardinalityProvenance::Unknown
+            } else {
+                CardinalityProvenance::JoinGraph
+            },
             risk_cardinality: estimate.risk_cardinality,
             materialization_cardinality: estimate.materialization_cardinality,
             materialization_is_reduction_bound: estimate.materialization_is_reduction_bound,
@@ -159,6 +169,7 @@ pub(crate) struct CostModel {
     relation_materialization_cardinalities: Vec<usize>,
     relation_widths: Vec<usize>,
     relation_control_regions: Vec<bool>,
+    relation_provenances: Vec<CardinalityProvenance>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -290,6 +301,7 @@ impl CostModel {
             relation_materialization_cardinalities: Vec::new(),
             relation_widths: Vec::new(),
             relation_control_regions: Vec::new(),
+            relation_provenances: Vec::new(),
         }
     }
 
@@ -303,6 +315,7 @@ impl CostModel {
         self.relation_materialization_cardinalities.clear();
         self.relation_widths.clear();
         self.relation_control_regions.clear();
+        self.relation_provenances.clear();
     }
 
     /// Initialize the cost model with relation statistics.
@@ -351,6 +364,14 @@ impl CostModel {
             .iter()
             .map(|stats| stats.contains_control_region)
             .collect();
+        self.relation_provenances = relation_stats
+            .iter()
+            .map(|stats| stats.cardinality_provenance)
+            .collect();
+    }
+
+    pub(crate) fn relation_provenance(&self, relation: usize) -> CardinalityProvenance {
+        self.relation_provenances[relation]
     }
 
     pub(crate) fn init_equivalent_relations(
@@ -1145,6 +1166,7 @@ mod tests {
             build_side: JoinBuildSide::Right,
             cost: 100.0,
             cardinality: 1000.0,
+            cardinality_provenance: CardinalityProvenance::Statistics,
             risk_cardinality: 1000.0,
             materialization_cardinality: 1000.0,
             materialization_is_reduction_bound: false,
@@ -1164,6 +1186,7 @@ mod tests {
             build_side: JoinBuildSide::Right,
             cost: 50.0,
             cardinality: 500.0,
+            cardinality_provenance: CardinalityProvenance::Statistics,
             risk_cardinality: 500.0,
             materialization_cardinality: 500.0,
             materialization_is_reduction_bound: false,
@@ -1209,6 +1232,21 @@ mod tests {
         assert!(join_node.cost > 0.0);
         assert!(join_node.cardinality > 0.0);
         assert_eq!(join_node.set.count(), 2);
+    }
+
+    #[test]
+    fn unknown_ranking_prior_is_not_promoted_by_join_composition() {
+        let mut sets = JoinRelationSetManager::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
+        let mut unknown = RelationStats::with_cardinality(1000);
+        unknown.cardinality_provenance = CardinalityProvenance::Unknown;
+        model.init_cost_model(&mut sets, &[unknown, RelationStats::with_cardinality(50)]);
+        let mut left = leaf(&mut model, sets.get_relation(0));
+        left.cardinality_provenance = model.relation_provenance(0);
+        let right = leaf(&mut model, sets.get_relation(1));
+        let join = model.compute_cost_and_create_node(&left, &right, &mut sets, None);
+        assert!(join.cardinality > 1.0);
+        assert_eq!(join.cardinality_provenance, CardinalityProvenance::Unknown);
     }
 
     #[test]

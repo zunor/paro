@@ -69,6 +69,8 @@ pub struct RelationStats {
     pub materialization_distinct_count: HashMap<ColumnBinding, DistinctCount>,
     /// Estimated cardinality (row count).
     pub cardinality: usize,
+    /// Ranking priors must remain distinguishable from relation evidence.
+    pub cardinality_provenance: paro_planner::plan::CardinalityProvenance,
     /// Risk-adjusted cardinality used only to rank join orders.
     ///
     /// This remains separate from `cardinality`: uncertain predicates must
@@ -101,6 +103,7 @@ impl RelationStats {
             column_distinct_count: HashMap::new(),
             materialization_distinct_count: HashMap::new(),
             cardinality: 1,
+            cardinality_provenance: paro_planner::plan::CardinalityProvenance::Unknown,
             risk_cardinality: 1,
             materialization_cardinality: 1,
             estimated_payload_width: 1,
@@ -115,6 +118,7 @@ impl RelationStats {
     pub fn with_cardinality(cardinality: usize) -> Self {
         Self {
             cardinality,
+            cardinality_provenance: paro_planner::plan::CardinalityProvenance::Statistics,
             risk_cardinality: cardinality,
             materialization_cardinality: cardinality,
             stats_initialized: true,

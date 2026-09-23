@@ -275,7 +275,7 @@ pub(super) fn try_native_enumeration_with_cache_key(
             return Ok(Vec::new());
         }
         seen_tables.extend(atom.tables.iter().copied());
-        let stats = native_relation_stats(atom, &mut column_stats);
+        let stats = native_relation_stats(atom, memo, facts, state, &mut column_stats);
         relation_manager.add_relation_shape(atom.tables.iter().copied(), stats);
     }
     let region_outputs = layouts
@@ -633,22 +633,45 @@ fn comparison_type(comparison: JoinComparisonType) -> ComparisonType {
 
 fn native_relation_stats(
     atom: &NativeJoinAtom,
+    memo: &Memo,
+    facts: &boundary::BoundarySnapshot,
+    state: &PlannerTransformState,
     column_stats: &mut HashMap<paro_planner::operator::ColumnBinding, Arc<ColumnStatistics>>,
 ) -> RelationStats {
-    let cardinality = atom
-        .stats
-        .estimated_cardinality
-        .map(|estimate| usize::try_from(estimate.expected.max(1)).unwrap_or(usize::MAX))
-        .unwrap_or(1)
-        .max(1);
+    // Memo holes are read from the same resolved snapshot used by the graph
+    // cache identity and its ReadSet. A stale transport annotation may not
+    // override the relation owner, nor substitute for an unknown owner fact.
+    let estimate = match &atom.child {
+        NativeChild::MemoGroup { group, .. } => facts.cardinality(memo, *group),
+        _ if atom.stats.cardinality_provenance != CardinalityProvenance::Unknown => {
+            atom.stats.estimated_cardinality
+        }
+        _ => None,
+    };
+    let cardinality = estimate.map_or_else(
+        || crate::statistics::gathering::default_table_cardinality(state.session.as_deref()),
+        |estimate| usize::try_from(estimate.expected).unwrap_or(usize::MAX),
+    );
     let mut stats = RelationStats::with_cardinality(cardinality);
-    stats.risk_cardinality = atom
-        .stats
-        .materialization_risk_cardinality
-        .unwrap_or(cardinality as u64)
-        .try_into()
-        .unwrap_or(usize::MAX)
+    stats.cardinality_provenance = if estimate.is_some() {
+        CardinalityProvenance::Statistics
+    } else {
+        CardinalityProvenance::Unknown
+    };
+    stats.risk_cardinality = estimate
+        .map(|rows| usize::try_from(rows.max).unwrap_or(usize::MAX))
+        .unwrap_or(cardinality)
         .max(cardinality);
+    // A locally constructed atom can carry a separate materialization-risk
+    // witness. Preserve it; only a Memo hole replaces transport annotations
+    // with the authoritative boundary snapshot.
+    if !matches!(atom.child, NativeChild::MemoGroup { .. }) {
+        if let Some(risk) = atom.stats.materialization_risk_cardinality {
+            stats.risk_cardinality = stats
+                .risk_cardinality
+                .max(usize::try_from(risk).unwrap_or(usize::MAX));
+        }
+    }
     stats.materialization_cardinality = stats.risk_cardinality;
     stats.estimated_payload_width =
         crate::join::build_probe_side::estimate_row_payload_width(atom.layout.types());
@@ -821,7 +844,7 @@ fn rebuild_native_join(
     let mut stats = NodeStats::default();
     stats.set_cardinality(
         CardinalityEstimate::exact(quantize_native_cardinality(node.cardinality)),
-        CardinalityProvenance::JoinGraph,
+        node.cardinality_provenance,
         Some(quantize_native_cardinality(
             node.materialization_cardinality,
         )),
@@ -1025,6 +1048,66 @@ mod tests {
             native,
             native_identity(&mut input.memo, &state, input.root, &bindings[0].root)
         );
+    }
+
+    #[test]
+    fn memo_atom_uses_owner_evidence_not_a_stale_shell_or_one_row_default() {
+        for known in [false, true] {
+            let plan = scan(0);
+            let layout = Arc::new(plan.output_layout());
+            let mut input =
+                MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+            input.memo.group_mut(input.root).unwrap().cardinality = if known {
+                GroupCardinality::new(
+                    Fingerprint(991),
+                    CardinalityRecipeKind::Statistics,
+                    271,
+                    271,
+                    271,
+                )
+            } else {
+                GroupCardinality::unknown(Fingerprint(991), CardinalityRecipeKind::Statistics)
+            };
+            let state = input.planner_state.read().unwrap();
+            let mut ctx = TransformContext::new(&mut input.memo, input.root);
+            let facts = boundary::BoundarySnapshot::read(
+                &mut ctx,
+                &state,
+                &PatternOperand::Group(input.root),
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .unwrap();
+            let child = NativeChild::memo_group(
+                ctx.memo(),
+                &state,
+                &facts,
+                input.root,
+                &layout,
+                Arc::from(["k".to_owned()]),
+            )
+            .unwrap();
+            let atom = NativeJoinAtom {
+                child,
+                layout: layout.as_ref().clone(),
+                tables: [0].into_iter().collect(),
+                stats: NodeStats {
+                    estimated_cardinality: Some(CardinalityEstimate::exact(1)),
+                    ..Default::default()
+                },
+            };
+            let stats =
+                native_relation_stats(&atom, ctx.memo(), &facts, &state, &mut HashMap::new());
+            assert_eq!(stats.cardinality, if known { 271 } else { 1000 });
+            assert_eq!(
+                stats.cardinality_provenance,
+                if known {
+                    CardinalityProvenance::Statistics
+                } else {
+                    CardinalityProvenance::Unknown
+                }
+            );
+        }
     }
 
     #[test]

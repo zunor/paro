@@ -23,7 +23,7 @@ use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType, JoinCondition,
     JoinType, LogicalOperator,
 };
-use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, OwnedLogicalPlan};
+use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan};
 use paro_storage::statistics::{ColumnStatistics, DistinctProvenance, NumericStats};
 use tracing::debug;
 
@@ -978,7 +978,7 @@ impl JoinOrderOptimizer {
     fn set_reconstructed_cardinality(plan: &mut OwnedLogicalPlan, node: &DPJoinNode) {
         plan.stats.set_cardinality(
             Self::join_cardinality_estimate(node.cardinality),
-            CardinalityProvenance::JoinGraph,
+            node.cardinality_provenance,
             Some(Self::quantize_cardinality(node.materialization_cardinality)),
         );
     }
@@ -1051,7 +1051,7 @@ impl JoinOrderOptimizer {
             OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
         result.stats.inherit_cardinality_from(&child_stats);
         result.stats.estimated_cardinality = estimated_cardinality;
-        result.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+        result.stats.cardinality_provenance = child_stats.cardinality_provenance;
         result
     }
 

@@ -131,6 +131,9 @@ pub(super) fn derive_group_cardinality<Child>(
         return GroupCardinality::inherit(recipe, input);
     }
     let kind = match stats.cardinality_provenance {
+        paro_planner::plan::CardinalityProvenance::Unknown => {
+            return GroupCardinality::unknown(recipe, CardinalityRecipeKind::Statistics);
+        }
         paro_planner::plan::CardinalityProvenance::Statistics => CardinalityRecipeKind::Statistics,
         paro_planner::plan::CardinalityProvenance::JoinGraph => CardinalityRecipeKind::JoinRegion,
     };
