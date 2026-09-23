@@ -151,3 +151,22 @@ outputs are byte-identical to the pre-recovery control, without expected
 updates. Full format/header checks retain unrelated baseline violations.
 The [bounded evidence and registration](../../benchmark/evidence/optimizer-migration/20260923/cardinality-ownership-v1/README.md)
 record all samples, negative interventions and remaining validation limits.
+
+### Remaining historical contracts
+
+`03937e99` and `5106bffe` migrate authoritative native join cardinality and
+construction-time coalescing of total, layout-preserving restrictions.
+Unknown DP priors remain unknown facts; evaluation/layout/context barriers
+remain opaque. Deferred extraction of unselected physical variants is still
+not delivered: it requires a typed recipe/dependency/verification boundary,
+not restoration of the historical binder closure.
+
+The registered five-block verifier-off matrix retains Q11's approximately
+12-ms scale (compiler median 12.510 ms, P90 15.173 ms); Q04 is 19.150 ms and
+Q74 65.957 ms. Synthesis counts remain 810 / 420 / 1,065 and no new causal
+speedup is established. Full typed results pass; all stops remain
+QualityPolicySatisfied + SearchIncomplete. Normal timing and bounded Detail
+are separate. Background host activity, metadata asymmetry and sample size
+preclude parity/tail certification. The initial missing-compile-observer
+cohort is retained as compiler Uncovered, not silently replaced or backfilled.
+See [the complete matrix and delivery boundary](../../benchmark/evidence/optimizer-migration/20260923/remaining-contracts-v1/README.md).

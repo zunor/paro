@@ -33,7 +33,7 @@ blessing, or history cleanup.
    manifest rather than inferring it from a source default. Discover current
    collector flags from `--help`.
    Normal compile timing currently requires `PARO_COMPILE_WORK_EVIDENCE=1`
-   (`context/session_diagnostics.rs`). Register this bounded observer and check
+   (`crates/context/src/session_diagnostics.rs`). Register this observer and check
    the first completed cell's cold receipts for non-null `compile_work` before
    continuing a matrix. A missing field is compiler `Uncovered`, not zero;
    retain valid C1 data and register any replacement cohort separately. Do not
