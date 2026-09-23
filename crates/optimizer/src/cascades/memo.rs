@@ -909,6 +909,15 @@ struct FrontierInsertion {
     published: Option<Arc<Winner>>,
 }
 
+/// Frontier membership is distinct from immutable candidate ownership. A
+/// coverage restart can admit the same allocation without pricing or copying
+/// its child/proof payload again. New losers still allocate no archive entry.
+impl AsRef<Winner> for Winner {
+    fn as_ref(&self) -> &Winner {
+        self
+    }
+}
+
 impl WinnerFrontier {
     pub fn selected(&self) -> Option<&Winner> {
         self.candidates.first().map(Arc::as_ref)
@@ -1016,22 +1025,23 @@ impl WinnerFrontier {
     fn insert_with_limit(
         &mut self,
         goal: OptimizationGoal,
-        winner: Winner,
+        proposal: impl AsRef<Winner> + Into<Arc<Winner>>,
         limit: usize,
     ) -> FrontierInsertion {
+        let winner = proposal.as_ref();
         self.proposals = self.proposals.saturating_add(1);
         let old_selected = self.selected().map(|entry| entry.physical_fingerprint);
 
         if self.candidates.iter().any(|incumbent| {
             match winner_continuation_cmp(
                 incumbent,
-                &winner,
+                winner,
                 &self.filterable_sources,
                 goal.objective,
             ) {
                 Some(std::cmp::Ordering::Less) => true,
                 Some(std::cmp::Ordering::Equal) => {
-                    winner_tie_break(incumbent) <= winner_tie_break(&winner)
+                    winner_tie_break(incumbent) <= winner_tie_break(winner)
                 }
                 _ => false,
             }
@@ -1041,14 +1051,14 @@ impl WinnerFrontier {
 
         self.candidates.retain(|incumbent| {
             match winner_continuation_cmp(
-                &winner,
+                winner,
                 incumbent,
                 &self.filterable_sources,
                 goal.objective,
             ) {
                 Some(std::cmp::Ordering::Less) => false,
                 Some(std::cmp::Ordering::Equal) => {
-                    winner_tie_break(&winner) >= winner_tie_break(incumbent)
+                    winner_tie_break(winner) >= winner_tie_break(incumbent)
                 }
                 _ => true,
             }
@@ -1057,8 +1067,8 @@ impl WinnerFrontier {
         // as a stable full sort would, without sorting the whole frontier for
         // every costed proposal or moving its large inline Winner payloads.
         let position = self.candidates.partition_point(|incumbent| {
-            !compare_objective(incumbent, &winner, goal.objective)
-                .then_with(|| winner_tie_break(incumbent).cmp(&winner_tie_break(&winner)))
+            !compare_objective(incumbent, winner, goal.objective)
+                .then_with(|| winner_tie_break(incumbent).cmp(&winner_tie_break(winner)))
                 .is_gt()
         });
         let limit = limit.max(1);
@@ -1066,7 +1076,7 @@ impl WinnerFrontier {
         self.high_water = self.high_water.max(self.candidates.len().saturating_add(1));
         self.truncations = self.truncations.saturating_add(u64::from(truncated));
         let published = (position < limit).then(|| {
-            let winner = Arc::new(winner);
+            let winner = proposal.into();
             self.candidates.insert(position, Arc::clone(&winner));
             winner
         });
@@ -1486,6 +1496,23 @@ impl Memo {
 
     pub(crate) fn cost_epoch(&self) -> CostEpoch {
         self.cost_epoch
+    }
+
+    /// Open a new coverage response without invalidating exact prices or
+    /// archived CandidateIds. A response becomes visible again when its
+    /// recipe has visited the new domain and re-admitted it. Revisions remain
+    /// monotone so an old read cursor cannot alias a later frontier.
+    pub(crate) fn reopen_frontier_coverage(&mut self) -> Result<()> {
+        for group in &mut self.groups {
+            for goal in group.winner_frontiers.keys() {
+                let revision = group.physical_frontier_versions.entry(*goal).or_default();
+                *revision = revision
+                    .checked_add(1)
+                    .ok_or_else(|| paro_error::internal("Memo physical goal revision overflow"))?;
+            }
+            group.winner_frontiers.clear();
+        }
+        Ok(())
     }
 
     pub(crate) fn cost_epoch_value(&self) -> u64 {
@@ -2955,6 +2982,24 @@ impl Memo {
         goal: OptimizationGoal,
         mut winner: Winner,
     ) -> Result<bool> {
+        winner.candidate = CandidateId::new(self.winner_candidates.len());
+        self.record_winner_proposal(group, goal, winner)
+    }
+
+    pub(crate) fn reactivate_winner(&mut self, reference: ChildWinnerRef) -> Result<bool> {
+        let winner = self
+            .resolve_child_winner_arc(reference)
+            .ok_or_else(|| paro_error::internal("frontier replay lost its resident candidate"))?;
+        self.record_winner_proposal(reference.group, reference.goal, winner)
+    }
+
+    fn record_winner_proposal(
+        &mut self,
+        group: GroupId,
+        goal: OptimizationGoal,
+        proposal: impl AsRef<Winner> + Into<Arc<Winner>>,
+    ) -> Result<bool> {
+        let winner = proposal.as_ref();
         winner.local_cost.validate()?;
         winner.cost.validate()?;
         let required = self
@@ -3002,7 +3047,7 @@ impl Memo {
         // A rejected proposal cannot yet have a parent reference; once an ID
         // escapes, its single immutable allocation remains in the archive even
         // after later frontier pruning or a group merge.
-        winner.candidate = CandidateId::new(self.winner_candidates.len());
+        let is_new = winner.candidate.index() == self.winner_candidates.len();
         let physical_fingerprint = winner.physical_fingerprint;
         let frontier_limit = self.budget.max_winner_frontier_candidates_per_goal.max(1) as usize;
         self.winner_proposals = self.winner_proposals.saturating_add(1);
@@ -3015,13 +3060,13 @@ impl Memo {
                 let mut frontier = WinnerFrontier::default();
                 // Only a new frontier owns a separate demand set.
                 frontier.filterable_sources = context.filterable_sources.clone();
-                let insertion = frontier.insert_with_limit(goal, winner, frontier_limit);
+                let insertion = frontier.insert_with_limit(goal, proposal, frontier_limit);
                 entry.insert(frontier);
                 insertion
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => entry
                 .get_mut()
-                .insert_with_limit(goal, winner, frontier_limit),
+                .insert_with_limit(goal, proposal, frontier_limit),
         };
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
         let frontier_changed =
@@ -3032,7 +3077,7 @@ impl Memo {
                 winner_frontier_budget_witness(group, goal, physical_fingerprint),
             );
         }
-        if let Some(winner) = insertion.published {
+        if let Some(winner) = insertion.published.filter(|_| is_new) {
             self.winner_candidates.push(WinnerCandidate {
                 group,
                 goal,

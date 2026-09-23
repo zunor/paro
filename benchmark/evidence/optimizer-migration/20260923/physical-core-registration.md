@@ -38,3 +38,18 @@ with exact unit/entry-point tests: merge, rollback, CTE producer fact changes,
 mandatory-to-optional coverage, low-grant fallback, and independently selected
 non-best child choices. Full workspace tests, strict Clippy and high-FD SQL
 regress follow; existing failures must be compared, never blessed.
+
+## Registered correction after the four arms
+
+The coverage arm retained active mandatory frontiers as well as prices. Q11
+then evaluated 21 quality candidates rather than one and synthesized 448
+combinations rather than 420; normal compiler regressed. Retain those negative
+samples. Before another measurement, register a `reopened` arm with the same
+five-block matrix/envelope: preserve immutable prices and CandidateIds, but
+reopen frontier membership as recipes visit optional coverage. No added budget
+or suppressed optional implementation. Unit tests must demonstrate unchanged
+candidate allocation/price reuse, newly discovered optional leaf improvements,
+and executable archived fallback when optional work is interrupted. Compare
+both the original control and the preceding selected-lowering arm, including
+plan identities and all three queries; do not present it as an independent
+lowering-only comparison.

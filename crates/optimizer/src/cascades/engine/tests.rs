@@ -2651,13 +2651,14 @@ fn deadline_mid_attempt_rolls_back_and_extracts_the_archived_incumbent() {
     let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
     assert_eq!(engine.memo.group_count(), 1);
     assert_eq!(winner.physical_fingerprint, Fingerprint(10));
-    assert_eq!(
-        engine.memo.group(group).unwrap().winner(goal).unwrap().candidate,
-        winner.candidate,
-        "opening optional coverage must preserve the valid mandatory price"
+    assert!(
+        engine.memo.group(group).unwrap().winner(goal).is_none(),
+        "a fallback price is not a published response in the new coverage domain"
     );
-    assert!(engine.physical_completion_proofs.is_empty(),
-        "the retained candidate is not proof of optional search completion");
+    assert!(
+        engine.physical_completion_proofs.is_empty(),
+        "the retained candidate is not proof of optional search completion"
+    );
     let archived = engine
         .memo
         .resolve_child_winner(ChildWinnerRef {

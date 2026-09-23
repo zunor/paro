@@ -562,8 +562,8 @@ enum CombinationAdmission {
     /// retain the candidate.  This remains an incomplete frontier result,
     /// not a proof that the combination was never useful.
     FrontierTruncated,
-    /// The candidate was published into the Memo winner archive.  Replaying
-    /// it would allocate a second CandidateId, so it is never re-published.
+    /// The candidate has been admitted in the current coverage response.
+    /// Reopening coverage retains its archive identity and exact price.
     Published,
 }
 
@@ -579,6 +579,7 @@ struct CostedChildCombination {
     source_work: Box<[SourceWork]>,
     physical_fingerprint: Fingerprint,
     admission: CombinationAdmission,
+    candidate: Option<CandidateId>,
 }
 
 /// A resumable Cartesian-product cursor whose ordering is only a traversal
@@ -670,6 +671,7 @@ impl StableCombinationCursor {
 #[derive(Debug, Default)]
 struct ChildCombinationState {
     cost_context: Option<Fingerprint>,
+    coverage_pending: bool,
     active_frontiers: Box<[Box<[CandidateId]>]>,
     base_cursor: Option<StableCombinationCursor>,
     delta_cursors: Vec<StableCombinationCursor>,
@@ -688,6 +690,22 @@ impl ChildCombinationState {
         mandatory_children: Option<Box<[CandidateId]>>,
     ) {
         self.cost_context = Some(cost_context);
+        self.priced.clear();
+        self.resource_rejected.clear();
+        self.budget_rejected.clear();
+        self.reopen_coverage(frontiers, parent_frontier_revision, mandatory_children);
+    }
+
+    /// Prices depend on facts/resources/recipe, not the implementation domain.
+    /// Revisit response membership using those same prices and permanent IDs.
+    /// Budget and resource rejections retain their distinct contracts.
+    fn reopen_coverage(
+        &mut self,
+        frontiers: Box<[Box<[CandidateId]>]>,
+        parent_frontier_revision: u64,
+        mandatory_children: Option<Box<[CandidateId]>>,
+    ) {
+        self.coverage_pending = false;
         self.active_frontiers = frontiers.clone();
         self.base_cursor = Some(StableCombinationCursor::new(
             frontiers,
@@ -695,9 +713,9 @@ impl ChildCombinationState {
             mandatory_children,
         ));
         self.delta_cursors.clear();
-        self.priced.clear();
-        self.resource_rejected.clear();
-        self.budget_rejected.clear();
+        for price in self.priced.values_mut() {
+            price.admission = CombinationAdmission::Pending;
+        }
         self.parent_frontier_revision = parent_frontier_revision;
     }
 
@@ -4010,7 +4028,14 @@ impl CascadesEngine {
         self.protect_current_winners()?;
         // Prices, CandidateIds and recipe cursors belong to their exact cost
         // context, not to an exploration phase. In particular this transition
-        // must not increment CostEpoch or discard the mandatory frontier.
+        // must not increment CostEpoch or discard mandatory prices. Active
+        // responses have a narrower lifetime: re-admit them as their recipes
+        // visit the newly opened domain, rather than publishing combinations
+        // of old parent responses and partially visited optional children.
+        self.memo.reopen_frontier_coverage()?;
+        for state in self.child_combination_states.values_mut() {
+            state.coverage_pending = true;
+        }
         self.grant_sensitivity.clear();
         // Completion has a different lifetime: a closed mandatory domain does
         // not prove closure after optional implementations become eligible.
@@ -9173,29 +9198,51 @@ impl CascadesEngine {
                     .group(group)
                     .map(|group| group.physical_frontier_version(goal))
                     .unwrap_or_default();
-                let joint_cost_proof =
-                    build_joint_cost_proof(&self.memo, group, recipe, cached.local_cost)?;
-                let child_refs = child_combination_refs(children, &recipe.child_goals)?;
-                let winner = Winner {
-                    candidate: CandidateId::INVALID,
-                    expression: physical,
-                    children: child_refs,
-                    enforcers: enforced.steps.clone(),
-                    enforcer_cost_input: recipe.enforcer_cost_input,
-                    provided: enforced.provided.clone(),
-                    local_cost: cached.local_cost,
-                    source_filter_apply_cost: recipe.source_filter_apply_cost,
-                    cost_composition: recipe.cost_composition.clone(),
-                    cost: cached.cost,
-                    source_work: cached.source_work.clone(),
-                    physical_fingerprint: cached.physical_fingerprint,
-                    joint_cost_proof,
-                };
-                let published_before = self.memo.published_winner_count();
-                let selected_changed = self.memo.record_winner(group, goal, winner)?;
-                let published_candidate = (self.memo.published_winner_count() > published_before)
-                    .then(|| CandidateId::new(published_before as usize));
-                cached.admission = if self.memo.published_winner_count() > published_before {
+                let (selected_changed, published_candidate) =
+                    if let Some(candidate) = cached.candidate {
+                        let selected_changed = self.memo.reactivate_winner(ChildWinnerRef {
+                            group,
+                            goal,
+                            candidate,
+                        })?;
+                        let retained = self
+                            .memo
+                            .group(group)
+                            .and_then(|group| group.winner_frontier(goal))
+                            .is_some_and(|frontier| {
+                                frontier
+                                    .candidates()
+                                    .iter()
+                                    .any(|entry| entry.candidate == candidate)
+                            });
+                        (selected_changed, retained.then_some(candidate))
+                    } else {
+                        let joint_cost_proof =
+                            build_joint_cost_proof(&self.memo, group, recipe, cached.local_cost)?;
+                        let child_refs = child_combination_refs(children, &recipe.child_goals)?;
+                        let winner = Winner {
+                            candidate: CandidateId::INVALID,
+                            expression: physical,
+                            children: child_refs,
+                            enforcers: enforced.steps.clone(),
+                            enforcer_cost_input: recipe.enforcer_cost_input,
+                            provided: enforced.provided.clone(),
+                            local_cost: cached.local_cost,
+                            source_filter_apply_cost: recipe.source_filter_apply_cost,
+                            cost_composition: recipe.cost_composition.clone(),
+                            cost: cached.cost,
+                            source_work: cached.source_work.clone(),
+                            physical_fingerprint: cached.physical_fingerprint,
+                            joint_cost_proof,
+                        };
+                        let published_before = self.memo.published_winner_count();
+                        let selected_changed = self.memo.record_winner(group, goal, winner)?;
+                        let candidate = (self.memo.published_winner_count() > published_before)
+                            .then(|| CandidateId::new(published_before as usize));
+                        (selected_changed, candidate)
+                    };
+                cached.candidate = published_candidate.or(cached.candidate);
+                cached.admission = if published_candidate.is_some() {
                     CombinationAdmission::Published
                 } else {
                     CombinationAdmission::FrontierTruncated
@@ -9334,21 +9381,6 @@ impl CascadesEngine {
                 }
                 child_yielded |=
                     self.physical_interleave_step_mode && self.physical_interleave_step_yielded;
-                if child_yielded
-                    && self
-                        .physical_task_cache
-                        .get(&(child, child_goal))
-                        .is_some_and(|entry| entry.mandatory_only != self.mandatory_only)
-                {
-                    // A retained price is usable as an incumbent, but does
-                    // not mean this child's newly opened implementation
-                    // domain has even been visited. Resume the parent after
-                    // that first visit instead of manufacturing every mixture
-                    // of refreshed children and untouched mandatory siblings.
-                    // This is not a completion barrier: once visited, an
-                    // incomplete child's published prefix remains consumable.
-                    return Ok(Some(sequence));
-                }
                 let Some(frontier) = self
                     .memo
                     .group(child)
@@ -9536,6 +9568,17 @@ impl CascadesEngine {
                             .map(|child| child.candidate)
                             .collect::<Vec<_>>()
                             .into_boxed_slice(),
+                    ),
+                );
+            } else if combination_state.coverage_pending {
+                combination_state.reopen_coverage(
+                    current_frontier_ids.clone(),
+                    parent_frontier_revision,
+                    Some(
+                        baseline_child_selections
+                            .iter()
+                            .map(|child| child.candidate)
+                            .collect(),
                     ),
                 );
             } else {
@@ -9842,6 +9885,7 @@ impl CascadesEngine {
                         source_work,
                         physical_fingerprint: fingerprint,
                         admission: CombinationAdmission::Pending,
+                        candidate: None,
                     },
                 );
                 let (frontier_changed, selected_changed, published_candidate) = self

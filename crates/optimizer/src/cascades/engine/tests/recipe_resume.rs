@@ -54,16 +54,15 @@ fn retained_prices_do_not_publish_mixtures_with_unvisited_optional_children() {
     engine.physical_interleave_step_yielded = true;
     engine.optimize_group(root, goal).unwrap();
     assert_eq!(engine.child_combination_cost_synthesis_count, before);
-    assert_eq!(
-        engine
-            .memo
-            .group(root)
-            .unwrap()
-            .winner(goal)
-            .unwrap()
-            .candidate,
-        candidate
-    );
+    assert!(engine.memo.group(root).unwrap().winner(goal).is_none());
+    assert!(engine
+        .memo
+        .resolve_child_winner(ChildWinnerRef {
+            group: root,
+            goal,
+            candidate
+        })
+        .is_some());
     assert!(engine.physical_task_cache[&(child, goal)].mandatory_only);
     assert!(!engine.physical_task_cache[&(root, goal)].complete);
     engine.physical_interleave_step_mode = false;
@@ -187,6 +186,14 @@ fn opening_optional_domain_keeps_exact_prices_but_reopens_coverage() {
         .collect::<Vec<_>>();
     let synthesized = engine.child_combination_cost_synthesis_count;
     let published = engine.memo.published_winner_count();
+    let resident = engine
+        .memo
+        .resolve_child_winner_arc(ChildWinnerRef {
+            group: root,
+            goal,
+            candidate,
+        })
+        .unwrap();
     let mandatory_domain = engine.physical_search_domain(root, goal).unwrap();
     engine.mandatory_only = false;
     engine.open_optional_implementation_domain().unwrap();
@@ -196,6 +203,10 @@ fn opening_optional_domain_keeps_exact_prices_but_reopens_coverage() {
         mandatory_domain
     );
     assert!(engine.physical_completion_proofs.is_empty());
+    assert!(engine.memo.group(root).unwrap().winner(goal).is_none());
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(engine.child_combination_cost_synthesis_count, synthesized);
+    assert_eq!(engine.memo.published_winner_count(), published);
     assert_eq!(
         engine
             .memo
@@ -206,9 +217,18 @@ fn opening_optional_domain_keeps_exact_prices_but_reopens_coverage() {
             .candidate,
         candidate
     );
-    engine.optimize_group(root, goal).unwrap();
-    assert_eq!(engine.child_combination_cost_synthesis_count, synthesized);
-    assert_eq!(engine.memo.published_winner_count(), published);
+    let replayed = engine
+        .memo
+        .resolve_child_winner_arc(ChildWinnerRef {
+            group: root,
+            goal,
+            candidate,
+        })
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&resident, &replayed),
+        "coverage replay must retain the original allocation"
+    );
     assert_eq!(
         engine
             .memo

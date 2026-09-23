@@ -35,6 +35,9 @@ optional implementations invalidates coverage/completion, not the exact prices
 of unchanged child choices. Facts, requirements, calibration and grant contexts
 still control reuse. A retained mandatory winner remains an incumbent; it does
 not certify that a child's optional domain has been visited or completed.
+The immutable archive and price cache survive that transition, while active
+frontier membership reopens. Re-admission reuses the original candidate
+allocation; it is not another pricing pass or proof of full search completion.
 
 Frozen winners lower through immutable selected occurrences with cached output
 layouts and assigned scalar slots ([selected.rs](src/physical/selected.rs)).
