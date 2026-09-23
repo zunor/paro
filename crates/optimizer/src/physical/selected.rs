@@ -86,6 +86,22 @@ impl SelectedNode {
         children: Vec<SelectedChild>,
         replay_keys: bool,
     ) -> Result<SelectedChild> {
+        // Validate arity and boundary ownership before any layout helper can
+        // index a child. Full descendant trees are not accepted by this seam.
+        let mut inputs = children.iter();
+        let mut inputs_match = true;
+        local.operator.visit_child_links(&mut |boundary| {
+            inputs_match &= inputs.next().is_some_and(|child| {
+                matches!(boundary.operator, LogicalOperator::BoundReference(_))
+                    && boundary.id == child.id
+                    && boundary.output_layout() == child.layout
+            });
+        });
+        if !inputs_match || inputs.next().is_some() {
+            return Err(paro_error::internal(
+                "selected shell has mismatched input contracts",
+            ));
+        }
         let child_layouts = children
             .iter()
             .map(|child| child.layout())
@@ -120,15 +136,11 @@ impl SelectedNode {
         }
         let mut children = children.into_iter();
         let (id, stats, operator) = local.into_parts();
-        let operator = operator.try_map_child_links(&mut |boundary| {
+        let operator = operator.try_map_child_links(&mut |boundary| -> Result<SelectedChild> {
             let child = children
                 .next()
                 .ok_or_else(|| paro_error::internal("selected shell is missing a child"))?;
-            if boundary.id != child.id || boundary.operator.output_layout() != child.layout {
-                return Err(paro_error::internal(
-                    "selected shell child contract changed before lowering",
-                ));
-            }
+            debug_assert_eq!(boundary.id, child.id);
             Ok(child)
         })?;
         if children.next().is_some() {
@@ -283,6 +295,11 @@ mod tests {
         let local =
             OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(other, vec![])));
         assert!(SelectedNode::from_local(local, vec![child], true).is_err());
+        let local = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+            vec![],
+        )));
+        assert!(SelectedNode::from_local(local, vec![], true).is_err());
     }
 
     #[test]
