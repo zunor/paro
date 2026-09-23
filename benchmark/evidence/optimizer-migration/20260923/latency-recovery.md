@@ -1,7 +1,10 @@
 # Q11 latency recovery: candidate co-occurrence boundary
 
-Status: incomplete. This investigation does not restore the historical 12 ms
-latency and does not certify parity or search completeness.
+This is the initial counter-only investigation. It did not restore the
+historical latency. The subsequent [cardinality ownership recovery](cardinality-ownership-v1/README.md)
+returns Q11 to approximately 12 ms; it does not certify parity, a strict
+<=12 ms gate or search completeness. Keep the earlier observations below
+separate from that implementation and its clean-source cells.
 
 ## Same-seed historical bridge
 
@@ -40,7 +43,8 @@ the test rejects cross-candidate conjunction of facts.
 
 Mandatory-to-optional coverage repair `513e4da1` restores previously omitted
 legal physical alternatives. It is a concrete semantic difference from the
-historical build, not yet a quantified explanation of the Q11 gap. Do not
+historical build. A later phase-only historical probe still compiled in
+11.955 / 12.455 ms, disproving it as the dominant explanation of the gap. Do not
 disable it or treat mandatory completion as optional completion to reproduce
 12 ms. Keep safe incumbent reuse distinct from completion proofs.
 

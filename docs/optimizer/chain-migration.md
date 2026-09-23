@@ -115,3 +115,35 @@ Bounded campaign artifacts and the pre-run registration are retained under
 `benchmark/evidence/optimizer-migration/20260923/`. The seed and earlier
 negative runs remain outside Git; no historical worktree or user dataset was
 deleted by this migration.
+
+### Cardinality-owner recovery
+
+Implementation `bbf9c699` closes a missing historical contract without copying
+the old estimator election or diagnostic flags. Equivalent logical members
+inherit their relation's estimate; publishing another tree is not a new
+statistics observation. A fact-owner merge ignores same-fact estimate votes,
+accepts genuine stronger facts, and leaves explicit statistics refresh,
+dependency invalidation, hard bounds, rollback and true group-merge uncertainty
+intact. The rewrite-name refinement allowlist is removed.
+
+The coupled change reduces Q11 from 1,467 to 420 cost syntheses and from 121 to
+53 groups under the unchanged quality policy. Clean-source Q11 five-block
+compiler medians are 14.006 ms with the optional verifier on and 12.420 ms off
+(historical timing configuration); Q04 / Q74 verifier-on two-block medians are
+20.002 / 64.001 ms. Every measured query passes complete typed result, bag and
+order checks. No budget or quality condition is weakened. These figures are
+not an all-query latency guarantee or a same-batch causal speedup estimate.
+
+An external Go build overlapped the final six seconds of Q11/off; the original
+samples are retained and cannot certify isolated performance. A separately
+registered additional same-code cell is pending host availability. The target
+is approximately 12 ms, not a claim that the 12.420 ms median passes a strict
+<=12.000 ms gate. Search remains QualityPolicySatisfied + SearchIncomplete.
+There is no new ProofComplete or first-statement parity claim.
+
+Workspace tests: 6,906 passed (optimizer 1,369); strict Clippy and benchmark's
+206 tests pass. High-FD verifier-on SQL regress remains 167/18; all 18 actual
+outputs are byte-identical to the pre-recovery control, without expected
+updates. Full format/header checks retain unrelated baseline violations.
+The [bounded evidence and registration](../../benchmark/evidence/optimizer-migration/20260923/cardinality-ownership-v1/README.md)
+record all samples, negative interventions and remaining validation limits.
