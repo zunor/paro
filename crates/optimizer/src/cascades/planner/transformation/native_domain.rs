@@ -1583,6 +1583,105 @@ pub(super) type RefreshedNativeStatistics = (
     HashMap<PlanNodeId, ResidentNodeContract>,
 );
 
+/// Narrow transport outputs without changing source bindings, cardinality or
+/// source evidence. Remap layout-dependent uniqueness below. Late-payload/TopN
+/// rewrites are row-domain preserving below their
+/// explicit reduction; rebuilding their statistics is a separate operation.
+/// Memo holes keep their immutable interface, and Get keeps all predicate
+/// inputs. A narrowed Filter map lets extraction omit predicate-only columns
+/// from the rowset output after evaluating the pushed predicate.
+pub(super) fn prune_output_demands(
+    mut shell: NativeShell,
+    state: &PlannerTransformState,
+    memo: &Memo,
+) -> Result<Option<NativeShell>> {
+    use super::settlement::demand;
+    let original = shell.layouts()?;
+    let mut wanted = vec![BTreeSet::new(); shell.nodes.len()];
+    wanted[shell.root].extend(original[shell.root].bindings().iter().copied());
+    for index in (0..shell.nodes.len()).rev() {
+        if !memo.control().checkpoint()? {
+            return Ok(None);
+        }
+        let operator = &shell.nodes[index].operator;
+        let (execution, positional) = demand::execution_demand(operator, &wanted[index]);
+        let mut ordinal = 0;
+        operator.visit_child_links(&mut |child| {
+            if let NativeChild::Node(child) = child {
+                let all = demand::child_needs_full_row(operator, ordinal, positional);
+                wanted[*child].extend(
+                    original[*child]
+                        .bindings()
+                        .iter()
+                        .filter(|binding| all || execution.contains(binding))
+                        .copied(),
+                );
+            }
+            ordinal += 1;
+        });
+    }
+    let mut completed = Vec::<LogicalOutputLayout>::with_capacity(shell.nodes.len());
+    let mut completed_keys =
+        Vec::<Vec<paro_planner::plan::UniqueKey>>::with_capacity(shell.nodes.len());
+    let mut scan_bindings = demand::ScanBindings::new();
+    for (index, node) in shell.nodes.iter_mut().enumerate() {
+        if !memo.control().checkpoint()? {
+            return Ok(None);
+        }
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        let mut child_keys = Vec::new();
+        node.operator.visit_child_links(&mut |child| match child {
+            NativeChild::Node(child) => {
+                before.push(original[*child].clone());
+                after.push(completed[*child].clone());
+                child_keys.push(completed_keys[*child].clone());
+            }
+            NativeChild::MemoGroup { layout, stats, .. }
+            | NativeChild::Group { layout, stats, .. } => {
+                before.push(layout.clone());
+                after.push(layout.clone());
+                child_keys.push(stats.unique_keys.clone());
+            }
+        });
+        if !matches!(&node.operator, LogicalOperator::Get(_)) {
+            let identities = after
+                .iter()
+                .map(|layout| {
+                    layout
+                        .bindings()
+                        .iter()
+                        .map(|binding| (*binding, *binding))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            let operator = std::mem::replace(&mut node.operator, LogicalOperator::DummyScan);
+            (node.operator, _) = demand::apply_operator(
+                operator,
+                demand::Inputs {
+                    old_carriers: &original[index],
+                    before: &before,
+                    after: &after,
+                    children: &identities,
+                },
+                &wanted[index],
+                &mut scan_bindings,
+                &state.bind_context,
+            )?;
+        }
+        let layout = node.operator.output_layout_from_children(&after);
+        node.stats.unique_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
+            &node.operator,
+            &layout,
+            &after.iter().collect::<Vec<_>>(),
+            &child_keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        );
+        completed_keys.push(node.stats.unique_keys.clone());
+        completed.push(layout);
+    }
+    Ok(Some(shell))
+}
+
 pub(super) fn refresh_statistics(
     mut shell: NativeShell,
     state: &mut PlannerTransformState,

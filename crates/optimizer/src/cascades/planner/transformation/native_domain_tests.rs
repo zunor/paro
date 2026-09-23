@@ -153,6 +153,71 @@ fn rebound_columns(shell: &NativeShell) -> Vec<Vec<ColumnBinding>> {
 }
 
 #[test]
+fn output_demand_preserves_row_facts_and_predicate_inputs() {
+    use paro_planner::binder::ir::OrderByNode;
+    use paro_planner::operator::{ProjectionMap, TopN};
+    let mut filtered = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+        boundary(1, 10, &[0, 1, 2]),
+        vec![equal(10, 2)],
+    )));
+    filtered.stats.estimated_cardinality = Some(CardinalityEstimate::exact(7));
+    let mut topn = TopN::new(
+        filtered,
+        vec![OrderByNode {
+            expression: column(10, 1),
+            ascending: true,
+            nulls_first: false,
+        }],
+        2,
+        0,
+    );
+    topn.projection_map = ProjectionMap::new(vec![0]);
+    let shell = native(OwnedLogicalPlan::synthetic(LogicalOperator::TopN(topn)));
+    let rows = shell
+        .nodes
+        .iter()
+        .map(|node| node.stats.estimated_cardinality)
+        .collect::<Vec<_>>();
+    let input = MemoBuilder::build(
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+        BindContext::new(),
+        SearchBudget::default(),
+    )
+    .unwrap();
+    let result = prune_output_demands(shell, &input.planner_state.read().unwrap(), &input.memo)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        result
+            .nodes
+            .iter()
+            .map(|node| node.stats.estimated_cardinality)
+            .collect::<Vec<_>>(),
+        rows
+    );
+    let LogicalOperator::Filter(filter) = &result.nodes[0].operator else {
+        unreachable!()
+    };
+    assert_eq!(filter.projection_map.as_columns(), Some([0, 1].as_slice()));
+    // The predicate-only input is still available; only the emitted row is narrower.
+    let NativeChild::MemoGroup { layout, .. } = &filter.child else {
+        unreachable!()
+    };
+    assert_eq!(
+        layout.bindings(),
+        &[
+            ColumnBinding::new(10, 0),
+            ColumnBinding::new(10, 1),
+            ColumnBinding::new(10, 2)
+        ]
+    );
+    assert_eq!(
+        result.root_layout().unwrap().bindings(),
+        &[ColumnBinding::new(10, 0)]
+    );
+}
+
+#[test]
 fn domain_union_routes_each_ordinal_and_preserves_duplicate_null_bags() {
     let state = state();
     let state = state.write().unwrap();

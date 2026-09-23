@@ -937,19 +937,17 @@ mod tests {
                     assert_eq!(get.returned_types.len(), 2);
                 }
                 if wrapper == 20 {
-                    // Memo ingress expands output maps to the canonical
-                    // layout; test that real representation, not an invented
-                    // narrow map that bypasses binding construction.
+                    // Restoring the occurrence map and adding the rowid may
+                    // represent the full carrier as Columns([0, 1]) rather
+                    // than All. Assert its interface, not its encoding.
                     for node in &shell.nodes {
                         match &node.operator {
-                            LogicalOperator::Filter(filter) => assert_eq!(
-                                filter.projection_map,
-                                paro_planner::operator::ProjectionMap::all()
-                            ),
-                            LogicalOperator::Order(order) => assert_eq!(
-                                order.projection_map,
-                                paro_planner::operator::ProjectionMap::all()
-                            ),
+                            LogicalOperator::Filter(filter) => {
+                                assert!(filter.projection_map.is_identity(2));
+                            }
+                            LogicalOperator::Order(order) => {
+                                assert!(order.projection_map.is_identity(2));
+                            }
                             _ => {}
                         }
                     }

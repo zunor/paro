@@ -170,7 +170,6 @@ fn try_native_shell_with_layout(
 
     let mut nodes = shell.nodes.into_vec();
     let right = join.right.clone();
-    let partial_stats = native_child_stats(&nodes, &right);
     let right_key_ordinal = right_layout
         .bindings()
         .iter()
@@ -200,7 +199,10 @@ fn try_native_shell_with_layout(
     let partial_index = nodes.len();
     nodes.push(NativeNode {
         id: state.bind_context.next_plan_id(),
-        stats: partial_stats,
+        // Grouping changes both cardinality and uniqueness. The publication
+        // transaction derives these facts; input-row statistics are not a
+        // valid estimate for the newly introduced relation.
+        stats: super::NodeStats::default(),
         operator: LogicalOperator::Aggregate(Box::new(partial)),
         source_proofs: Box::new([]),
     });
@@ -220,6 +222,7 @@ fn try_native_shell_with_layout(
         return Ok(None);
     }
     nodes[join_index].operator = LogicalOperator::Join(Join::Comparison(rewritten_join));
+    nodes[join_index].stats = super::NodeStats::default();
     nodes[join_index].source_proofs = Box::new([]);
 
     let mut rewritten_aggregate = *aggregate;
@@ -312,16 +315,6 @@ fn child_layout(
         NativeChild::MemoGroup { layout, .. } | NativeChild::Group { layout, .. } => {
             Ok(layout.clone())
         }
-    }
-}
-
-fn native_child_stats(nodes: &[NativeNode], child: &NativeChild) -> super::NodeStats {
-    match child {
-        NativeChild::Node(index) => nodes
-            .get(*index)
-            .map(|node| node.stats.clone())
-            .unwrap_or_default(),
-        NativeChild::MemoGroup { stats, .. } | NativeChild::Group { stats, .. } => stats.clone(),
     }
 }
 
@@ -452,6 +445,70 @@ mod tests {
                 .unwrap()
                 .expect("production binding should take the native path");
         assert_eq!(shell.root_layout().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn production_preaggregation_derives_partial_rows_instead_of_copying_input_rows() {
+        use paro_common::runtime_value::Value;
+        use paro_planner::expression::ConstantExpression;
+        use paro_planner::plan::CardinalityEstimate;
+
+        let mut plan = candidate();
+        let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+            unreachable!()
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+            unreachable!()
+        };
+        let LogicalOperator::ExpressionGet(right) = &mut join.right.operator else {
+            unreachable!()
+        };
+        right.expressions = (0..8)
+            .map(|i| {
+                [i % 2, i]
+                    .map(|value| {
+                        Expression::Constant(
+                            ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt)
+                                .into(),
+                        )
+                    })
+                    .to_vec()
+            })
+            .collect();
+        join.right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(8));
+        let mut input =
+            MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.clone();
+        state.write().unwrap().session =
+            Some(paro_context::TestStatementContextBuilder::minimal().build());
+        let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let binding = matching::scoped_pattern_bindings(
+            PlannerTransformation::AggregateJoinPreaggregation,
+            input.root,
+            expression,
+            &input.memo,
+            &state.read().unwrap(),
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .bindings[0]
+            .clone();
+        let rule = PlannerTransformationRule {
+            transformation: PlannerTransformation::AggregateJoinPreaggregation,
+            planner_state: state,
+        };
+        let mut context = TransformContext::new(&mut input.memo, input.root);
+        let outputs = rule.apply_binding(&binding, &mut context).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let joined = outputs[0].key.children[0];
+        let joined = context.memo().group(joined).unwrap().logical_exprs()[0];
+        let partial = context.memo().logical_expr(joined).unwrap().key.children[1];
+        assert_eq!(
+            context.memo().cardinality_estimate(partial).unwrap().1,
+            3,
+            "without NDV evidence use the grouping estimate (ceil(sqrt(8))), not eight input rows"
+        );
     }
 
     #[test]

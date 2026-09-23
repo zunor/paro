@@ -366,7 +366,7 @@ impl NativeShell {
                         built_children.push(built);
                     }
                     let mut child_iter = built_children.iter().map(|child| child.child.clone());
-                    let operator = payload
+                    let mut operator = payload
                         .semantic_template
                         .operator
                         .clone()
@@ -384,6 +384,23 @@ impl NativeShell {
                         .iter()
                         .map(|child| child.layout.as_ref())
                         .collect::<SmallVec<[_; 2]>>();
+                    // These transparent operators must expose the occurrence
+                    // interface, not every canonical child carrier. Otherwise
+                    // wrapping the same Filter in native TopN/late payload
+                    // alternatives reintroduces predicate-only scan columns.
+                    // Join/TopN producers own their shape-specific expansion
+                    // and restore their root output at the rewrite boundary.
+                    if matches!(
+                        &operator,
+                        LogicalOperator::Filter(_) | LogicalOperator::Order(_)
+                    ) {
+                        super::super::semantic_plan::freeze_operator_output_layout(
+                            &mut operator,
+                            &child_layouts,
+                            &metadata.output_columns,
+                            &state.binding_ids,
+                        )?;
+                    }
                     let layout = Arc::new(operator.output_layout_from_child_refs(&child_layouts));
                     let child_names = built_children
                         .iter()
@@ -2437,6 +2454,55 @@ mod tests {
             input.memo.group(children[0]).unwrap().schema,
             input.memo.group(children[1]).unwrap().schema
         );
+    }
+
+    #[test]
+    fn native_filter_pattern_restores_the_occurrence_output_contract() {
+        use paro_planner::operator::{Filter, ProjectionMap};
+        let mut filter = Filter::new(
+            equality_join(
+                test_base_get(0, 70_011, "left_source", 10),
+                test_base_get(1, 70_012, "right_source", 10),
+                10,
+            ),
+            vec![],
+        );
+        filter.projection_map = ProjectionMap::new(vec![1]);
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(filter));
+        let expected = plan.output_layout();
+        let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.read().unwrap();
+        let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let logical = input.memo.logical_expr(expression).unwrap();
+        let binding = super::super::PatternOperand::Expression {
+            group: input.root,
+            expression,
+            children: logical
+                .key
+                .children
+                .iter()
+                .copied()
+                .map(super::super::PatternOperand::Group)
+                .collect(),
+        };
+        let mut memo = input.memo;
+        let mut context = super::super::TransformContext::new(&mut memo, input.root);
+        let facts = boundary::BoundarySnapshot::read(
+            &mut context,
+            &state,
+            &binding,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .unwrap();
+        let shell = NativeShell::from_pattern(context.memo(), &state, &binding, &facts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shell.root_layout().unwrap(), expected);
+        let LogicalOperator::Filter(filter) = shell.root_operator() else {
+            unreachable!()
+        };
+        assert_eq!(filter.projection_map.as_columns(), Some([1].as_slice()));
     }
 
     #[test]

@@ -265,40 +265,71 @@ pub(super) fn freeze_output_layout(
     output_columns: &[ColumnId],
     state: &PlannerTransformState,
 ) -> Result<OwnedLogicalPlan> {
-    match &mut plan.operator {
+    // Most operators do not carry a restorable projection map. Do not walk
+    // their owned descendants just to call a no-op arm of the local helper.
+    let layouts = if matches!(
+        &plan.operator,
+        LogicalOperator::Filter(_)
+            | LogicalOperator::Order(_)
+            | LogicalOperator::TopN(_)
+            | LogicalOperator::Join(Join::Comparison(_) | Join::Any(_))
+    ) {
+        plan.children()
+            .iter()
+            .map(|child| child.output_layout())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    freeze_operator_output_layout(
+        &mut plan.operator,
+        &layouts.iter().collect::<Vec<_>>(),
+        output_columns,
+        &state.binding_ids,
+    )?;
+    Ok(plan)
+}
+
+/// Restore the selected occurrence interface without materializing an owned
+/// subtree. Canonical payloads deliberately erase projection maps; both native
+/// and owned pattern construction must restore them from the same metadata.
+pub(super) fn freeze_operator_output_layout<Child>(
+    operator: &mut LogicalOperator<Child>,
+    children: &[&paro_planner::operator::LogicalOutputLayout],
+    output_columns: &[ColumnId],
+    bindings: &BindingCatalog,
+) -> Result<()> {
+    let child = |ordinal| {
+        children
+            .get(ordinal)
+            .copied()
+            .ok_or_else(|| paro_error::internal("freezing output is missing a child layout"))
+    };
+    let unary = || {
+        let layout = child(0)?;
+        projection_for_bindings(layout.bindings(), layout.types(), output_columns, bindings)
+    };
+    match operator {
         LogicalOperator::Filter(filter) => {
-            filter.projection_map =
-                projection_for_columns(&filter.child, output_columns, &state.binding_ids)?;
+            filter.projection_map = unary()?;
         }
         LogicalOperator::Order(order) => {
-            order.projection_map =
-                projection_for_columns(&order.child, output_columns, &state.binding_ids)?;
+            order.projection_map = unary()?;
         }
         LogicalOperator::TopN(topn) => {
-            topn.projection_map =
-                projection_for_columns(&topn.child, output_columns, &state.binding_ids)?;
+            topn.projection_map = unary()?;
         }
         LogicalOperator::Join(Join::Comparison(join)) => {
-            let marker = marker_column(join.mark_index, &state.binding_ids)?;
-            let (left, right) = join_projections(
-                &join.left,
-                &join.right,
-                output_columns,
-                marker,
-                &state.binding_ids,
-            )?;
+            let marker = marker_column(join.mark_index, bindings)?;
+            let (left, right) =
+                join_projections(child(0)?, child(1)?, output_columns, marker, bindings)?;
             join.left_projection_map = left;
             join.right_projection_map = right;
         }
         LogicalOperator::Join(Join::Any(join)) => {
-            let marker = marker_column(join.mark_index, &state.binding_ids)?;
-            let (left, right) = join_projections(
-                &join.left,
-                &join.right,
-                output_columns,
-                marker,
-                &state.binding_ids,
-            )?;
+            let marker = marker_column(join.mark_index, bindings)?;
+            let (left, right) =
+                join_projections(child(0)?, child(1)?, output_columns, marker, bindings)?;
             join.left_projection_map = left;
             join.right_projection_map = right;
         }
@@ -310,7 +341,7 @@ pub(super) fn freeze_output_layout(
                 ),
                 &scan.get.returned_types,
                 output_columns,
-                &state.binding_ids,
+                bindings,
             )?;
         }
         LogicalOperator::Join(Join::Cross(_))
@@ -355,7 +386,7 @@ pub(super) fn freeze_output_layout(
         | LogicalOperator::GraphExpand(_)
         | LogicalOperator::DummyScan => {}
     }
-    Ok(plan)
+    Ok(())
 }
 
 fn canonicalize_projection_maps<Child>(operator: &mut LogicalOperator<Child>) {
@@ -424,19 +455,6 @@ fn canonicalize_projection_maps<Child>(operator: &mut LogicalOperator<Child>) {
     }
 }
 
-fn projection_for_columns(
-    child: &OwnedLogicalPlan,
-    output_columns: &[ColumnId],
-    bindings: &BindingCatalog,
-) -> Result<paro_planner::operator::ProjectionMap> {
-    projection_for_bindings(
-        &child.get_column_bindings(),
-        &child.types(),
-        output_columns,
-        bindings,
-    )
-}
-
 pub(super) fn projection_for_bindings(
     input_bindings: &[ColumnBinding],
     input_types: &[paro_common::types::LogicalType],
@@ -484,8 +502,8 @@ pub(super) fn projection_for_bindings(
 }
 
 fn join_projections(
-    left: &OwnedLogicalPlan,
-    right: &OwnedLogicalPlan,
+    left: &paro_planner::operator::LogicalOutputLayout,
+    right: &paro_planner::operator::LogicalOutputLayout,
     output_columns: &[ColumnId],
     marker: Option<ColumnId>,
     bindings: &BindingCatalog,
@@ -533,13 +551,17 @@ fn marker_column(mark_index: Option<usize>, bindings: &BindingCatalog) -> Result
         })
 }
 
-fn resolved_columns(plan: &OwnedLogicalPlan, bindings: &BindingCatalog) -> Result<Vec<ColumnId>> {
-    plan.get_column_bindings()
-        .into_iter()
-        .zip(plan.types())
+fn resolved_columns(
+    layout: &paro_planner::operator::LogicalOutputLayout,
+    bindings: &BindingCatalog,
+) -> Result<Vec<ColumnId>> {
+    layout
+        .bindings()
+        .iter()
+        .zip(layout.types())
         .map(|(binding, logical_type)| {
             bindings
-                .get(binding.table_index, binding.column_index, &logical_type)
+                .get(binding.table_index, binding.column_index, logical_type)
                 .copied()
                 .ok_or_else(|| {
                     paro_error::internal(

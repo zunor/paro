@@ -1534,11 +1534,30 @@ impl TransformationRule for PlannerTransformationRule {
                                 scopes,
                                 resident_nodes,
                             } => {
+                                let shell = if matches!(
+                                    self.transformation,
+                                    PlannerTransformation::TopNIntroduction
+                                        | PlannerTransformation::LatePayloadFetch
+                                ) {
+                                    let Some(shell) =
+                                        native_domain::prune_output_demands(shell, state, memo)?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    shell
+                                } else {
+                                    shell
+                                };
                                 let (shell, scopes, resident_nodes) = if matches!(
                                     self.transformation,
                                     PlannerTransformation::PredicateTransfer
                                         | PlannerTransformation::AggregateDimensionDeferral
+                                        | PlannerTransformation::AggregateJoinPreaggregation
                                 ) {
+                                    // A newly introduced partial aggregate is a new
+                                    // relation, not a row-preserving copy of its input.
+                                    // Derive its grouping domain and join facts through
+                                    // the same transactional native relation contract.
                                     let Some((shell, scopes, resident_nodes)) =
                                         native_domain::refresh_statistics(shell, state, memo)?
                                     else {

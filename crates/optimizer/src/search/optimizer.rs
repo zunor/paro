@@ -85,13 +85,13 @@ impl SearchOptimizer {
                     };
                     match child.operator {
                         LogicalOperator::Filter(filter) => {
-                            if !filter.projection_map.is_all() {
-                                return Ok(None);
-                            }
-                            filters.extend(filter.expressions.iter().cloned());
+                            filters.push(filter);
                             link = &filter.child;
                         }
                         LogicalOperator::Get(get) => {
+                            if !scan_filter_path_preserves_bindings(projection, &filters, get) {
+                                return Ok(None);
+                            }
                             return self.try_rewrite_topn(
                                 root.id,
                                 root.stats,
@@ -99,7 +99,10 @@ impl SearchOptimizer {
                                     topn,
                                     projection,
                                     get_stats: child.stats,
-                                    filters,
+                                    filters: filters
+                                        .into_iter()
+                                        .flat_map(|filter| filter.expressions.iter().cloned())
+                                        .collect(),
                                     get,
                                     order_expr_idx,
                                     order_expr,
@@ -867,15 +870,22 @@ fn extract_topn_pattern<C: paro_planner::plan::LogicalChild>(
     };
     let order_expr_idx = order_expression_index(&topn.orders[0].expression)?;
     let order_expr = projection.expressions.get(order_expr_idx)?;
-    let get_plan = find_get_plan(&*projection.child)?;
+    let mut filters = Vec::new();
+    let get_plan = find_get_plan(&*projection.child, &mut filters)?;
     let LogicalOperator::Get(get) = get_plan.operator() else {
         return None;
     };
+    if !scan_filter_path_preserves_bindings(projection, &filters, get) {
+        return None;
+    }
     Some(TopNPattern {
         topn,
         projection,
         get_stats: get_plan.node_stats(),
-        filters: collect_filters(&*projection.child),
+        filters: filters
+            .into_iter()
+            .flat_map(|filter| filter.expressions.iter().cloned())
+            .collect(),
         get,
         order_expr_idx,
         order_expr,
@@ -890,13 +900,14 @@ fn order_expression_index(expr: &Expression) -> Option<usize> {
     }
 }
 
-fn find_get_plan<P: LogicalPlanRead>(mut plan: &P) -> Option<&P> {
+fn find_get_plan<'a, P: LogicalPlanRead>(
+    mut plan: &'a P,
+    filters: &mut Vec<&'a Filter<P::Child>>,
+) -> Option<&'a P> {
     loop {
         match plan.operator() {
             LogicalOperator::Filter(filter) => {
-                if !filter.projection_map.is_all() {
-                    return None;
-                }
+                filters.push(filter);
                 plan = &*filter.child;
             }
             LogicalOperator::Get(_) => return Some(plan),
@@ -905,14 +916,58 @@ fn find_get_plan<P: LogicalPlanRead>(mut plan: &P) -> Option<&P> {
     }
 }
 
-fn collect_filters<P: LogicalPlanRead>(mut plan: &P) -> Vec<Expression> {
-    let mut filters = Vec::new();
-    while let LogicalOperator::Filter(filter) = plan.operator() {
-        filters.extend(filter.expressions.iter().cloned());
-        plan = &*filter.child;
+/// Collapsing a scan/filter path must preserve the operands, not a particular
+/// ProjectionMap representation. Named bindings survive narrowing/reordering;
+/// positional references are admissible only when their input slot still names
+/// the same scan column. Use the same proof for native and owned occurrences.
+fn scan_filter_path_preserves_bindings<C>(
+    projection: &Projection<C>,
+    filters: &[&Filter<C>],
+    get: &Get,
+) -> bool {
+    let mut columns = (0..get.returned_types.len()).collect::<Vec<_>>();
+    let resolves = |expressions: &[Expression], columns: &[usize]| {
+        expressions.iter().all(|expression| {
+            let mut valid = true;
+            ExpressionIterator::visit(expression, &mut |expression| {
+                valid &= match expression {
+                    Expression::ColumnRef(column) => {
+                        column.depth == 0
+                            && column.binding.table_index == get.table_index
+                            && columns.contains(&column.binding.column_index)
+                            && get.returned_types.get(column.binding.column_index)
+                                == Some(&column.return_type)
+                    }
+                    Expression::Reference(reference) => {
+                        columns.get(reference.index) == Some(&reference.index)
+                            && get.returned_types.get(reference.index)
+                                == Some(&reference.return_type)
+                    }
+                    _ => true,
+                };
+                if valid {
+                    ExpressionVisitDecision::Descend
+                } else {
+                    ExpressionVisitDecision::SkipChildren
+                }
+            });
+            valid
+        })
+    };
+    for filter in filters.iter().rev() {
+        if !resolves(&filter.expressions, &columns)
+            || filter.projection_map.validate(columns.len()).is_err()
+        {
+            return false;
+        }
+        columns = filter
+            .projection_map
+            .to_indices(columns.len())
+            .into_iter()
+            .map(|index| columns[index])
+            .collect();
     }
-    debug_assert!(matches!(plan.operator(), LogicalOperator::Get(_)));
-    filters
+    resolves(&projection.expressions, &columns)
 }
 
 fn extract_vector_intent(
@@ -1412,6 +1467,106 @@ mod tests {
     use paro_planner::expression::{ColumnRefExpression, ConstantExpression, FunctionExpression};
     use paro_planner::operator::ColumnBinding;
     use paro_storage::search::FullTextQueryStats;
+
+    #[test]
+    fn search_window_uses_filter_binding_contract_not_projection_encoding() {
+        use paro_planner::binder::ir::OrderByNode;
+        use paro_planner::operator::ProjectionMap;
+        let column = |index| {
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(7, index), LogicalType::Integer).into(),
+            )
+        };
+        let get =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new_without_table(
+                7,
+                vec!["id".into(), "predicate".into(), "score_input".into()],
+                vec![LogicalType::Integer; 3],
+            ))));
+        let mut lower = Filter::new(get, vec![column(1)]);
+        lower.projection_map = ProjectionMap::new(vec![2, 0]);
+        let mut upper = Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(lower)),
+            vec![column(2)],
+        );
+        upper.projection_map = ProjectionMap::new(vec![1, 0]);
+        let projection = Projection::new(
+            8,
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(upper)),
+            vec![column(0), column(2)],
+        );
+        let mut topn = TopN::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Projection(projection)),
+            vec![OrderByNode {
+                expression: Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(8, 1), LogicalType::Integer).into(),
+                ),
+                ascending: true,
+                nulls_first: false,
+            }],
+            2,
+            0,
+        );
+        let pattern = extract_topn_pattern(&topn).expect("named scan bindings survive both maps");
+        assert_eq!(pattern.filters.len(), 2);
+        assert_eq!(pattern.get.table_index, 7);
+        let LogicalOperator::Projection(projection) = &mut topn.child.operator else {
+            unreachable!()
+        };
+        // The lower predicate can read this column, but the final projection
+        // cannot: it has been removed from that occurrence's output.
+        projection.expressions[0] = column(1);
+        assert!(extract_topn_pattern(&topn).is_none());
+    }
+
+    #[test]
+    fn search_window_declines_shifted_positional_and_foreign_bindings() {
+        use paro_planner::expression::ReferenceExpression;
+        use paro_planner::operator::ProjectionMap;
+        let get = Get::new_without_table(
+            7,
+            vec!["a".into(), "b".into()],
+            vec![LogicalType::Integer; 2],
+        );
+        let mut filter = Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+            vec![],
+        );
+        let mut projection = Projection::new(
+            8,
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )],
+        );
+        filter.projection_map = ProjectionMap::new(vec![0, 1]);
+        assert!(scan_filter_path_preserves_bindings(
+            &projection,
+            &[&filter],
+            &get
+        ));
+        filter.projection_map = ProjectionMap::new(vec![1, 0]);
+        assert!(!scan_filter_path_preserves_bindings(
+            &projection,
+            &[&filter],
+            &get
+        ));
+        for (table, column, depth, ty) in [
+            (9, 0, 0, LogicalType::Integer),
+            (7, 2, 0, LogicalType::Integer),
+            (7, 0, 1, LogicalType::Integer),
+            (7, 0, 0, LogicalType::Varchar),
+        ] {
+            let mut reference = ColumnRefExpression::new(ColumnBinding::new(table, column), ty);
+            reference.depth = depth;
+            projection.expressions[0] = Expression::ColumnRef(reference.into());
+            assert!(!scan_filter_path_preserves_bindings(
+                &projection,
+                &[&filter],
+                &get
+            ));
+        }
+    }
 
     fn noop_scalar(
         _input: &paro_common::chunk::Chunk,
