@@ -23,8 +23,14 @@ impl EmptyResultPullup {
     }
 
     fn optimize_recursive_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
-        plan.try_map_post_order(|plan| Ok(plan.map_operator(|operator| self.pull_up(operator))))
+        plan.try_map_post_order(|plan| Ok(self.normalize_node(plan)))
             .expect("empty-result traversal cannot fail")
+    }
+
+    /// Children have already crossed the construction boundary. This local
+    /// law does not revisit them or choose an equivalent alternative.
+    pub(crate) fn normalize_node(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
+        plan.map_operator(|operator| self.pull_up(operator))
     }
 
     fn pull_up(&self, plan: LogicalOperator) -> LogicalOperator {

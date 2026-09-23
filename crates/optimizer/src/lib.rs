@@ -4,6 +4,7 @@
 //! Query optimizer passes and supporting infrastructure.
 
 pub mod cascades;
+mod construction;
 pub mod context;
 pub mod cost_model;
 pub mod optimizer;

@@ -46,7 +46,6 @@ use crate::context::OptimizationContext;
 use crate::cte::inlining::CTEInlining;
 use crate::cte::iteration::normalize_iteration_ownership;
 use crate::expression::in_clause::InClauseRewriter;
-use crate::expression::normalize_scalar_expressions;
 use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::filter::pullup::FilterPullup;
 use crate::filter::pushdown::FilterPushdown;
@@ -2562,7 +2561,8 @@ impl Optimizer {
         plan = GraphMatchDecompose::new().optimize_plan(plan);
         plan = GraphPredicatePushdown::new().optimize_plan(plan);
 
-        normalize_scalar_expressions(&mut plan);
+        let mut scalar_construction = crate::expression::CanonicalScalars::default();
+        scalar_construction.normalize_plan(&mut plan);
 
         CommonAggregateOptimizer::new().optimize(&mut plan);
         plan = DelimJoinElimination::canonical().optimize_plan(plan);
@@ -2585,10 +2585,9 @@ impl Optimizer {
         // boundaries. Canonicalize predicate placement before Query IR
         // construction just as Memo does for optional multi-consumer choices.
         plan = FilterPushdown::new().rewrite_plan(plan);
-        normalize_scalar_expressions(&mut plan);
+        scalar_construction.normalize_plan(&mut plan);
         plan = FilterPushdown::new().rewrite_plan(plan);
-        plan = EmptyResultPullup::new().optimize_plan(plan);
-        plan = crate::cascades::planner::restriction::normalize_tree(plan)?;
+        plan = crate::construction::finish(plan)?;
         if self.ctx.verify_enabled {
             verify_logical_plan(&self.ctx.bind_context, &plan)?;
         }

@@ -17,11 +17,69 @@ use crate::rules::conjunction::{CommonConjunctionFactorRule, ConjunctionSimplifi
 use crate::rules::constant_folding::ConstantFoldingRule;
 use crate::rules::move_constants::MoveConstantsRule;
 
-/// Restore canonical scalar form after a relational substitution combines
-/// expressions that were previously separated by an operator boundary.
-pub(crate) fn normalize_scalar_expressions(plan: &mut OwnedLogicalPlan) {
-    scalar_normalizer().rewrite_plan(plan);
+/// The scalar construction boundary of one normalization pipeline. Relational
+/// substitutions may replace roots, but cannot mutate a witnessed allocation:
+/// copy-on-write detaches it. Thus unchanged roots need no second rule walk.
+/// Only completed roots are remembered; child/root rule contexts are never
+/// conflated, and this cache neither shares evaluations nor removes fences.
+pub(crate) struct CanonicalScalars {
+    rewriter: rewriter::ExpressionRewriter,
+    completed: std::collections::HashMap<
+        paro_planner::expression::ExpressionIdentity,
+        paro_planner::expression::ExpressionWitness,
+    >,
+    next_sweep: usize,
+    #[cfg(test)]
+    rewrites: usize,
 }
+
+impl Default for CanonicalScalars {
+    fn default() -> Self {
+        Self {
+            rewriter: scalar_normalizer(),
+            completed: Default::default(),
+            next_sweep: 256,
+            #[cfg(test)]
+            rewrites: 0,
+        }
+    }
+}
+
+impl CanonicalScalars {
+    pub(crate) fn normalize_plan(&mut self, plan: &mut OwnedLogicalPlan) {
+        plan.visit_post_order_mut(|node| self.normalize_operator(&mut node.operator));
+    }
+
+    pub(crate) fn normalize_operator<Child>(&mut self, operator: &mut LogicalOperator<Child>) {
+        if self.completed.len() >= self.next_sweep {
+            self.completed.retain(|_, witness| witness.is_alive());
+            self.next_sweep = self.completed.len().saturating_mul(2).max(256);
+        }
+        paro_planner::visitor::enumerate_expressions(operator, |expression| {
+            if self
+                .completed
+                .get(&expression.allocation_identity())
+                .is_some_and(|witness| witness.matches(expression))
+            {
+                return;
+            }
+            self.rewriter
+                .rewrite_expression(expression, &LogicalOperator::DummyScan);
+            #[cfg(test)]
+            {
+                self.rewrites += 1;
+            }
+            self.completed
+                .insert(expression.allocation_identity(), expression.witness());
+        });
+        if let LogicalOperator::Aggregate(aggregate) = operator {
+            aggregate.recompute_returned_types();
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests;
 
 pub(crate) fn scalar_normalizer() -> rewriter::ExpressionRewriter {
     let mut rewriter = rewriter::ExpressionRewriter::new();
