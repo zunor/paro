@@ -220,13 +220,12 @@ impl StatisticsGathering {
                 session: &ctx.session,
                 graph_stats: &mut ctx.graph_stats,
             };
-            plan.stats.estimated_cardinality =
-                self.estimate_plan_cardinality(
-                    &plan.operator,
-                    &plan.stats,
-                    child_layouts,
-                    &mut inputs,
-                );
+            plan.stats.estimated_cardinality = self.estimate_plan_cardinality(
+                &plan.operator,
+                &plan.stats,
+                child_layouts,
+                &mut inputs,
+            );
             plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
         }
         // The recursive baseline can use the current map as its input view.
@@ -307,14 +306,7 @@ impl StatisticsGathering {
             &child_layouts.iter().collect::<Vec<_>>(),
             &child_keys,
         );
-        self.update_output_column_stats(
-            &operator,
-            &stats,
-            &output,
-            child_layouts,
-            maximum,
-            ctx,
-        );
+        self.update_output_column_stats(&operator, &stats, &output, child_layouts, maximum, ctx);
         (stats, operator, output, maximum)
     }
 
@@ -477,11 +469,9 @@ impl StatisticsGathering {
             LogicalOperator::ExternalTable(table) => external_table_cardinality(table),
             LogicalOperator::Order(order) => order.child.estimated_cardinality(),
             LogicalOperator::Window(window) => window.child.estimated_cardinality(),
-            LogicalOperator::Distinct(distinct) => self.estimate_distinct_cardinality(
-                &distinct.child,
-                child_layouts.first()?,
-                ctx,
-            ),
+            LogicalOperator::Distinct(distinct) => {
+                self.estimate_distinct_cardinality(&distinct.child, child_layouts.first()?, ctx)
+            }
             LogicalOperator::Filter(filter) => {
                 self.estimate_filter_cardinality(filter, child_layouts.first()?, ctx)
             }
@@ -768,14 +758,8 @@ impl StatisticsGathering {
                 ) {
                     return Some(estimate);
                 }
-                if let Some(inner) = estimate_unique_dimension_join(
-                    cmp,
-                    left,
-                    right,
-                    left_layout,
-                    right_layout,
-                    ctx,
-                )
+                if let Some(inner) =
+                    estimate_unique_dimension_join(cmp, left, right, left_layout, right_layout, ctx)
                 {
                     return Some(adjust_join_estimate(inner, left, right, cmp.join_type));
                 }
@@ -1928,6 +1912,49 @@ mod tests {
         )
     }
 
+    /// Independent two-gather baseline: compare every relation property and
+    /// serialized column evidence, including producer-before-consumer state.
+    fn assert_query_settlement(plan: &OwnedLogicalPlan, context: &OptimizationContext) {
+        use crate::statistics::propagator::StatisticsPropagator;
+        use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
+        let duplicate =
+            || duplicate_plan_preserving_indices(plan, context.bind_context.shared().as_ref());
+        let mut old_context = context.fork_for_candidate(Arc::new(HashMap::new()));
+        let mut new_context = context.fork_for_candidate(Arc::new(HashMap::new()));
+        let old = StatisticsGathering::new()
+            .gather(duplicate(), &mut old_context)
+            .unwrap();
+        let mut propagation = StatisticsPropagator::new();
+        let old = propagation.propagate(old_context.session.clone(), old);
+        old_context.column_stats = Arc::new(propagation.take_statistics_map());
+        let old = StatisticsGathering::new()
+            .gather(old, &mut old_context)
+            .unwrap();
+        let new =
+            crate::statistics::settle_query_properties(duplicate(), &mut new_context).unwrap();
+        let mut pending = vec![(&old, &new)];
+        while let Some((old, new)) = pending.pop() {
+            assert_eq!(
+                std::mem::discriminant(&old.operator),
+                std::mem::discriminant(&new.operator)
+            );
+            assert_eq!(old.stats, new.stats);
+            assert_eq!(old.output_layout(), new.output_layout());
+            let old_children = old.children();
+            let new_children = new.children();
+            assert_eq!(old_children.len(), new_children.len());
+            pending.extend(old_children.into_iter().zip(new_children));
+        }
+        let columns = |context: &OptimizationContext| {
+            context
+                .column_stats
+                .iter()
+                .map(|(binding, column)| (*binding, column.to_bytes().unwrap()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(columns(&old_context), columns(&new_context));
+    }
+
     fn values_relation(
         bind_context: &BindContext,
         table_index: usize,
@@ -1995,6 +2022,7 @@ mod tests {
             ))),
         );
 
+        assert_query_settlement(&plan, &ctx);
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
             .expect("gather should succeed");
@@ -2265,6 +2293,7 @@ mod tests {
             )),
         );
 
+        assert_query_settlement(&plan, &ctx);
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
             .expect("gather should succeed");
@@ -2299,6 +2328,7 @@ mod tests {
         );
         reference.stats.estimated_cardinality = Some(CardinalityEstimate::exact(37));
 
+        assert_query_settlement(&reference, &ctx);
         let gathered = StatisticsGathering::new()
             .gather(reference, &mut ctx)
             .expect("detached reference should retain its summary");
@@ -2344,6 +2374,7 @@ mod tests {
         let plan =
             OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
 
+        assert_query_settlement(&plan, &ctx);
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
             .expect("gather should succeed");
@@ -2367,6 +2398,7 @@ mod tests {
         let mut ctx = OptimizationContext::new(session, bind_context.clone());
         let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan);
 
+        assert_query_settlement(&plan, &ctx);
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
             .expect("gather should succeed");
@@ -2393,6 +2425,7 @@ mod tests {
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(73));
         plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
 
+        assert_query_settlement(&plan, &ctx);
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
             .expect("gather should succeed");
@@ -2428,6 +2461,7 @@ mod tests {
             LogicalOperator::Aggregate(Box::new(aggregate)),
         );
 
+        assert_query_settlement(&plan, &ctx);
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
             .expect("gather should succeed");
@@ -2733,6 +2767,7 @@ mod tests {
             LogicalOperator::Aggregate(Box::new(aggregate)),
         );
 
+        assert_query_settlement(&plan, &ctx);
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
             .expect("gather should succeed");

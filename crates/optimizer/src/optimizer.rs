@@ -61,8 +61,6 @@ use crate::physical::{
 };
 use crate::profiler::{publish_optimizer_profile_snapshot, OptimizerComponent};
 use crate::statement::{ExplainEnvelope, QueryStatementLayer, StatementBody, StatementPlan};
-use crate::statistics::gathering::StatisticsGathering;
-use crate::statistics::propagator::StatisticsPropagator;
 use crate::subquery::delim_join_elimination::DelimJoinElimination;
 use crate::subquery::empty_result::EmptyResultPullup;
 use crate::subquery::partition_aggregate::CorrelatedPartitionAggregate;
@@ -2597,14 +2595,9 @@ impl Optimizer {
         Ok(plan)
     }
 
-    fn estimate_query_candidate(&self, mut plan: OwnedLogicalPlan) -> Result<CandidatePlan> {
+    fn estimate_query_candidate(&self, plan: OwnedLogicalPlan) -> Result<CandidatePlan> {
         let mut context = self.ctx.fork_for_candidate(Arc::new(HashMap::new()));
-
-        plan = StatisticsGathering::new().gather(plan, &mut context)?;
-        let mut propagator = StatisticsPropagator::new();
-        plan = propagator.propagate(context.session.clone(), plan);
-        context.column_stats = Arc::new(propagator.take_statistics_map());
-        plan = StatisticsGathering::new().gather(plan, &mut context)?;
+        let plan = crate::statistics::settle_query_properties(plan, &mut context)?;
 
         Ok(CandidatePlan {
             plan,
