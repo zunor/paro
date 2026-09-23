@@ -231,6 +231,45 @@ fn completion_only_notification_does_not_reprocess_priced_recipes() {
 }
 
 #[test]
+fn resident_read_snapshot_shares_storage_and_refreshes_exact_child_goal() {
+    let (mut engine, root, child, goal) = resume_engine(false);
+    engine.optimize_group(root, goal).unwrap();
+    let resident = engine.physical_task_cache[&(root, goal)].clone();
+    let (same, changed) = engine
+        .physical_read_set_incremental(root, goal, Some(&resident))
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(same.reads().as_ptr(), resident.reads.reads().as_ptr());
+    let cloned = resident.clone();
+    assert_eq!(
+        cloned.reads.reads().as_ptr(),
+        resident.reads.reads().as_ptr()
+    );
+    assert!(Arc::ptr_eq(
+        cloned.dependencies.as_ref().unwrap(),
+        resident.dependencies.as_ref().unwrap()
+    ));
+
+    // A fact update in an actual consumed child must detach, not mutate the
+    // task's completed witness or silently reuse its cost context.
+    engine.memo.group_mut(child).unwrap().cardinality = GroupCardinality::new(
+        Fingerprint(456),
+        crate::cascades::memo::CardinalityRecipeKind::Statistics,
+        456,
+        456,
+        456,
+    );
+    let (fresh, changed) = engine
+        .physical_read_set_incremental(root, goal, Some(&resident))
+        .unwrap();
+    assert!(changed);
+    assert_ne!(fresh.reads().as_ptr(), resident.reads.reads().as_ptr());
+    assert!(!resident.reads.is_current(&engine.memo).unwrap());
+    assert!(fresh.is_current(&engine.memo).unwrap());
+    assert_eq!(fresh, engine.physical_read_set(root, goal).unwrap());
+}
+
+#[test]
 fn recipe_resume_completed_same_readset_accepts_appended_physical_recipe() {
     let (mut engine, root, child, goal) = resume_engine(false);
     engine.optimize_group(root, goal).unwrap();

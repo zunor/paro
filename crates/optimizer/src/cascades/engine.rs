@@ -41,13 +41,13 @@ use smallvec::SmallVec;
 use super::bounds::{CertifiedLocalWorkFloor, ProvenChildLatencyFloor, ProvenRecipeLatencyFloor};
 use super::budget::{BudgetDecision, BudgetDimension};
 use super::calibration::{
-    LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_ENFORCER_RANDOM_FETCH,
-    OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW,
+    LocalOperatorWork, MachineCalibrationBundle, OP_ENFORCER_RANDOM_FETCH,
+    OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW, ParallelWorkProfile,
 };
 use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
-use super::enforcer::{replay_enforcer_chain, EnforcementPlanner, EnforcerStep};
+use super::enforcer::{EnforcementPlanner, EnforcerStep, replay_enforcer_chain};
 use super::governor::{Governor, PlanMilestone, PlanningPolicy};
-use super::grant::{derive_grant_sensitivity, verify_grant_sharing, GrantSensitivitySummary};
+use super::grant::{GrantSensitivitySummary, derive_grant_sensitivity, verify_grant_sharing};
 use super::ids::{
     AdmissibleGrantSetId, CandidateId, Fingerprint, GroupId, ImplementationId, LogicalExprId,
     PhysicalExprId, QualityPolicyId, ResourceGrantClassId, RuleId, StableFingerprintBuilder,
@@ -1031,7 +1031,7 @@ struct PhysicalTaskState {
     /// implementations, even when the logical/fact ReadSet is unchanged.
     mandatory_only: bool,
     reads: ReadSet,
-    dependencies: Box<[(GroupId, OptimizationGoal)]>,
+    dependencies: Option<Arc<BTreeSet<(GroupId, OptimizationGoal)>>>,
     recipe_cursor: u64,
     /// Readiness passes may cache an incomplete prefix so an unchanged queue
     /// wake-up does not re-enter TaskRegistry.  A normal completion pass may
@@ -1219,7 +1219,7 @@ pub struct CascadesEngine {
     /// at publication avoids rescanning the global recipe table every time a
     /// recursive task captures its exact child ReadSet.
     physical_read_dependencies:
-        BTreeMap<(GroupId, OptimizationGoal), BTreeSet<(GroupId, OptimizationGoal)>>,
+        BTreeMap<(GroupId, OptimizationGoal), Arc<BTreeSet<(GroupId, OptimizationGoal)>>>,
     physical_task_cache: BTreeMap<(GroupId, OptimizationGoal), PhysicalTaskState>,
     /// A proof is retained only for the exact current physical domain. The
     /// TaskRegistry owns its lifecycle; this index avoids scanning all bound
@@ -1953,9 +1953,10 @@ impl CascadesEngine {
                 .physical_read_dependencies
                 .entry((self.memo.canonical_group(group), goal))
                 .or_default();
-            dependencies.extend(
+            Arc::make_mut(dependencies).extend(
                 children
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|(child, child_goal)| (self.memo.canonical_group(child), child_goal)),
             );
         }
@@ -7731,10 +7732,17 @@ impl CascadesEngine {
             }
         }
         let owner = self.memo.canonical_group(group);
-        self.physical_read_dependencies
+        let dependencies = self
+            .physical_read_dependencies
             .entry((owner, goal))
-            .or_default()
-            .extend(child_dependencies.iter().copied());
+            .or_default();
+        // A duplicate recipe must not detach a resident dependency set.
+        if child_dependencies
+            .iter()
+            .any(|child| !dependencies.contains(child))
+        {
+            Arc::make_mut(dependencies).extend(child_dependencies.iter().copied());
+        }
         // Publish the reverse edge together with the recipe.  Registering it
         // only when a parent later recurses into the child leaves a window in
         // which a newly published child frontier has no parent to wake.  The
@@ -7792,11 +7800,11 @@ impl CascadesEngine {
         &self,
         group: GroupId,
         goal: OptimizationGoal,
-    ) -> Box<[(GroupId, OptimizationGoal)]> {
+    ) -> Option<Arc<BTreeSet<(GroupId, OptimizationGoal)>>> {
         self.physical_read_dependencies
             .get(&(self.memo.canonical_group(group), goal))
-            .map(|dependencies| dependencies.iter().copied().collect())
-            .unwrap_or_default()
+            .filter(|dependencies| !dependencies.is_empty())
+            .cloned()
     }
 
     /// Refresh a resident physical task's read cursor by delta.
@@ -7824,68 +7832,20 @@ impl CascadesEngine {
             return Ok((self.physical_read_set(group, goal)?, true));
         };
 
-        let mut reads = Vec::with_capacity(1 + dependencies.len());
-        let mut changed = previous.dependencies.as_ref() != dependencies.as_ref();
-        let previous_reads = previous.reads.reads();
-
-        let current_owner = PatternRead::from_group(&self.memo, group)?;
-        if let Some(read) = previous_reads
-            .iter()
-            .find(|read| {
-                read.physical_goal.is_none() && self.memo.canonical_group(read.group) == group
-            })
-            .copied()
-        {
-            if read.is_current(&self.memo)? {
-                reads.push(read);
-            } else {
-                reads.push(current_owner);
-                changed = true;
-            }
-        } else {
-            reads.push(current_owner);
-            changed = true;
+        let same_dependencies = match (&previous.dependencies, &dependencies) {
+            (None, None) => true,
+            (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+            _ => false,
+        };
+        if same_dependencies {
+            // The dependency owner publishes an immutable set only when its
+            // shape changes. Refresh each observed cursor once, without
+            // rebuilding/sorting the set on the overwhelmingly common hit.
+            return previous.reads.refreshed(&self.memo);
         }
-
-        for (child, child_goal) in dependencies.iter().copied() {
-            let child = self.memo.canonical_group(child);
-            let current = PatternRead::physical_from_group(&self.memo, child, child_goal)?;
-            if let Some(read) = previous_reads.iter().find(|read| {
-                read.physical_goal == Some(child_goal)
-                    && self.memo.canonical_group(read.group) == child
-            }) {
-                if read.is_current(&self.memo)? {
-                    reads.push(*read);
-                } else {
-                    reads.push(current);
-                    changed = true;
-                }
-            } else {
-                reads.push(current);
-                changed = true;
-            }
-        }
-
-        // A merge or recipe withdrawal can remove a dependency.  Do not carry
-        // its old physical cursor into the new task identity.
-        for read in previous_reads
-            .iter()
-            .filter_map(|read| read.physical_goal.map(|goal| (read, goal)))
-        {
-            let (read, read_goal) = read;
-            let key = (self.memo.canonical_group(read.group), read_goal);
-            if !dependencies.contains(&key) {
-                changed = true;
-            }
-        }
-
-        if !changed {
-            // The exact task domain and every cursor are still current.  Keep
-            // the resident normalized set; no sort, deduplication, or new
-            // read-set identity is needed for this wake-up.
-            return Ok((previous.reads.clone(), false));
-        }
-        Ok((ReadSet::new(reads), true))
+        // A new recipe, withdrawal or merge changes the exact read domain.
+        // Reconstruct from its owner; never retain removed child witnesses.
+        Ok((self.physical_read_set(group, goal)?, true))
     }
 
     fn optimize_group(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
@@ -8009,7 +7969,7 @@ impl CascadesEngine {
             TaskRequest::Subscriber { task, .. } => {
                 return Err(paro_error::internal(format!(
                     "recursive optimization request is already in flight for task {task:?}"
-                )))
+                )));
             }
         };
         let current_cursor = self
@@ -11717,9 +11677,11 @@ fn visit_read_group_delta(
     next: &[PatternRead],
     mut visit: impl FnMut(GroupId, bool),
 ) {
-    debug_assert!(previous
-        .windows(2)
-        .all(|pair| pair[0].group <= pair[1].group));
+    debug_assert!(
+        previous
+            .windows(2)
+            .all(|pair| pair[0].group <= pair[1].group)
+    );
     debug_assert!(next.windows(2).all(|pair| pair[0].group <= pair[1].group));
     let (mut left, mut right) = (0, 0);
     while left < previous.len() || right < next.len() {

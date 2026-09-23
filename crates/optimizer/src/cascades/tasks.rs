@@ -11,6 +11,7 @@
 //! so a digest collision can never turn two tasks into one task.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
 
@@ -165,7 +166,7 @@ pub struct EvaluationKey {
 /// does not invent a weaker second versioning scheme.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReadSet {
-    reads: Box<[PatternRead]>,
+    reads: Arc<[PatternRead]>,
 }
 
 impl ReadSet {
@@ -175,7 +176,7 @@ impl ReadSet {
     /// the normalization performed by [`Self::new`].
     pub fn single(read: PatternRead) -> Self {
         Self {
-            reads: Box::new([read]),
+            reads: Arc::from([read]),
         }
     }
 
@@ -211,7 +212,7 @@ impl ReadSet {
             }
         }
         Self {
-            reads: normalized.into_boxed_slice(),
+            reads: normalized.into(),
         }
     }
 
@@ -221,6 +222,23 @@ impl ReadSet {
 
     pub fn reads(&self) -> &[PatternRead] {
         &self.reads
+    }
+
+    /// Validate once per cursor; allocate only when at least one input
+    /// changed. The old snapshot remains immutable for its task/evidence.
+    pub(crate) fn refreshed(&self, memo: &Memo) -> Result<(Self, bool)> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let mut changed = None;
+        for (index, read) in self.reads.iter().enumerate() {
+            let current = read.refreshed(memo)?;
+            if current != *read {
+                changed.get_or_insert_with(|| self.reads.to_vec())[index] = current;
+            }
+        }
+        Ok(match changed {
+            Some(reads) => (Self::new(reads), true),
+            None => (self.clone(), false),
+        })
     }
 
     pub fn is_current(&self, memo: &Memo) -> Result<bool> {
@@ -1392,11 +1410,9 @@ impl TaskRegistry {
             });
             let current =
                 stale.and_then(|read| PatternRead::facts_from_group(memo, read.group).ok());
-            return Err(paro_error::internal(
-                format!(
-                    "task publication rejected an obsolete read or group identity: task={task:?}, intent={intent:?}, written={locally_written_groups:?}, stale_read={stale:?}, current_read={current:?}, canonical={canonical}"
-                ),
-            ));
+            return Err(paro_error::internal(format!(
+                "task publication rejected an obsolete read or group identity: task={task:?}, intent={intent:?}, written={locally_written_groups:?}, stale_read={stale:?}, current_read={current:?}, canonical={canonical}"
+            )));
         }
 
         if self.segments.contains_key(&task) {
@@ -1781,7 +1797,14 @@ fn canonicalize_pattern_operand(memo: &Memo, operand: PatternOperand) -> Pattern
 }
 
 fn canonicalize_read_set(memo: &Memo, reads: ReadSet) -> ReadSet {
-    ReadSet::new(reads.reads.into_vec().into_iter().map(|mut read| {
+    if reads
+        .reads
+        .iter()
+        .all(|read| read.group == memo.canonical_group(read.group))
+    {
+        return reads;
+    }
+    ReadSet::new(reads.reads.iter().copied().map(|mut read| {
         read.group = memo.canonical_group(read.group);
         read
     }))
@@ -1789,8 +1812,28 @@ fn canonicalize_read_set(memo: &Memo, reads: ReadSet) -> ReadSet {
 
 #[cfg(test)]
 mod tests {
-    use crate::cascades::rules::ReadScope;
     use super::*;
+    use crate::cascades::rules::ReadScope;
+
+    #[test]
+    fn canonical_task_reads_are_shared_not_reassembled() {
+        let mut memo = Memo::new(Default::default());
+        let group = memo.create_group(
+            crate::cascades::column::GroupSchema::new([]).unwrap(),
+            crate::cascades::memo::LogicalProperties::default(),
+            crate::cascades::memo::GroupCardinality::default(),
+        );
+        let reads = ReadSet::single(PatternRead::from_group(&memo, group).unwrap());
+        let normalized = canonicalize_read_set(&memo, reads.clone());
+        assert!(Arc::ptr_eq(&reads.reads, &normalized.reads));
+        let mut registry = TaskRegistry::default();
+        let id = registry.intern_read_set(normalized);
+        assert!(Arc::ptr_eq(
+            &reads.reads,
+            &registry.read_set(id).unwrap().reads
+        ));
+        assert_eq!(id, registry.intern_read_set(reads));
+    }
 
     #[test]
     fn failed_task_keeps_its_cause_instead_of_inventing_resource_exhaustion() {
@@ -2774,14 +2817,16 @@ mod tests {
         let obligation = registry
             .add_completion_obligation(task, "unrun child combination")
             .unwrap();
-        assert!(registry
-            .complete(
-                task,
-                TaskOutcome::Progress {
-                    cursor: CursorId::new(0)
-                }
-            )
-            .is_err());
+        assert!(
+            registry
+                .complete(
+                    task,
+                    TaskOutcome::Progress {
+                        cursor: CursorId::new(0)
+                    }
+                )
+                .is_err()
+        );
         registry.discharge_obligation(task, obligation).unwrap();
         registry
             .complete(
@@ -2810,31 +2855,37 @@ mod tests {
                 10,
             )
             .unwrap();
-        assert!(registry
-            .bound_is_current(proof, &Memo::new(Default::default()))
-            .unwrap());
+        assert!(
+            registry
+                .bound_is_current(proof, &Memo::new(Default::default()))
+                .unwrap()
+        );
         assert!(matches!(
             registry.bound(proof).unwrap().kind,
             BoundProofKind::Lower { value: 10 }
         ));
 
-        assert!(registry
-            .record_lower_bound(
-                task,
-                BoundContext {
-                    group: GroupId::new(1),
-                    goal: goal(),
-                    reads,
-                    search_domain: Fingerprint(8),
-                },
-                11,
-            )
-            .is_err());
+        assert!(
+            registry
+                .record_lower_bound(
+                    task,
+                    BoundContext {
+                        group: GroupId::new(1),
+                        goal: goal(),
+                        reads,
+                        search_domain: Fingerprint(8),
+                    },
+                    11,
+                )
+                .is_err()
+        );
 
         registry.invalidate(task).unwrap();
-        assert!(!registry
-            .bound_is_current(proof, &Memo::new(Default::default()))
-            .unwrap());
+        assert!(
+            !registry
+                .bound_is_current(proof, &Memo::new(Default::default()))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2859,9 +2910,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(registry
-            .bound_is_current(proof, &Memo::new(Default::default()))
-            .unwrap());
+        assert!(
+            registry
+                .bound_is_current(proof, &Memo::new(Default::default()))
+                .unwrap()
+        );
 
         let (mut ordinary_registry, ordinary_task) = registry_with_task();
         let ordinary_reads = ordinary_registry.intern_read_set(ReadSet::empty());
@@ -2883,8 +2936,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!ordinary_registry
-            .bound_is_current(ordinary_proof, &Memo::new(Default::default()))
-            .unwrap());
+        assert!(
+            !ordinary_registry
+                .bound_is_current(ordinary_proof, &Memo::new(Default::default()))
+                .unwrap()
+        );
     }
 }

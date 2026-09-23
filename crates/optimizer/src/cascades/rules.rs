@@ -434,7 +434,8 @@ impl PatternRead {
         Ok(Self {
             group,
             scope,
-            logical_frontier_revision: scope.contains(ReadScope::LOGICAL_FRONTIER)
+            logical_frontier_revision: scope
+                .contains(ReadScope::LOGICAL_FRONTIER)
                 .then(|| group_ref.logical_expression_version()),
             physical_goal,
             physical_implementation_revision: scope
@@ -456,12 +457,11 @@ impl PatternRead {
     }
 
     pub fn is_current(self, memo: &Memo) -> Result<bool> {
-        Ok(self.matches(Self::read(
-            memo,
-            self.group,
-            self.scope,
-            self.physical_goal,
-        )?))
+        Ok(self.matches(self.refreshed(memo)?))
+    }
+
+    pub(crate) fn refreshed(self, memo: &Memo) -> Result<Self> {
+        Self::read(memo, self.group, self.scope, self.physical_goal)
     }
 
     /// Publication uses the same exact read contract as task reuse. Physical
@@ -497,9 +497,7 @@ impl PatternRead {
             } else {
                 self.physical_goal
             },
-            physical_implementation_revision: if other
-                .scope
-                .contains(ReadScope::PHYSICAL_FRONTIER)
+            physical_implementation_revision: if other.scope.contains(ReadScope::PHYSICAL_FRONTIER)
             {
                 other.physical_implementation_revision
             } else {
