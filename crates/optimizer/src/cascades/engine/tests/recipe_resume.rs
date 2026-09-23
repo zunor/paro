@@ -8,6 +8,149 @@
 use super::*;
 
 #[test]
+fn unchanged_parent_recipe_consumes_a_new_optional_leaf() {
+    let (mut engine, root, goal) = strong_tree_engine();
+    let child = engine
+        .memo
+        .logical_expr(engine.memo.group(root).unwrap().logical_exprs()[0])
+        .unwrap()
+        .key
+        .children[0];
+    engine.registry = ImplementationRegistry::default();
+    for implementation in [
+        TreeImplementation {
+            id: ImplementationId(40),
+            operator: Fingerprint(100),
+            child: None,
+            child_row_goal: None,
+            local_score: 100.0,
+            mandatory: true,
+        },
+        TreeImplementation {
+            id: ImplementationId(41),
+            operator: Fingerprint(200),
+            child: Some(child),
+            child_row_goal: None,
+            local_score: 0.0,
+            mandatory: true,
+        },
+        TreeImplementation {
+            id: ImplementationId(42),
+            operator: Fingerprint(100),
+            child: None,
+            child_row_goal: None,
+            local_score: 1.0,
+            mandatory: false,
+        },
+    ] {
+        engine
+            .registry
+            .register_implementation(implementation)
+            .unwrap();
+    }
+    engine.mandatory_only = true;
+    engine.optimize_group(root, goal).unwrap();
+    let baseline = engine
+        .memo
+        .group(root)
+        .unwrap()
+        .winner(goal)
+        .unwrap()
+        .clone();
+    let before = engine.child_combination_cost_synthesis_count;
+    assert_eq!(baseline.cost.score.range.expected, 100.0);
+    engine.mandatory_only = false;
+    engine.open_optional_implementation_domain().unwrap();
+    engine.optimize_group(root, goal).unwrap();
+    let selected = engine.memo.group(root).unwrap().winner(goal).unwrap();
+    assert_eq!(selected.cost.score.range.expected, 1.0);
+    assert_eq!(engine.memo.group(root).unwrap().physical_exprs().len(), 1);
+    assert_eq!(
+        engine.child_combination_cost_synthesis_count - before,
+        2,
+        "price only the new leaf and its parent combination, not the baseline again"
+    );
+    assert_eq!(
+        engine
+            .memo
+            .resolve_child_winner(ChildWinnerRef {
+                group: root,
+                goal,
+                candidate: baseline.candidate
+            })
+            .unwrap()
+            .cost,
+        baseline.cost
+    );
+}
+
+#[test]
+fn opening_optional_domain_keeps_exact_prices_but_reopens_coverage() {
+    let (mut engine, root, child, goal) = resume_engine(false);
+    engine.mandatory_only = true;
+    engine.optimize_group(root, goal).unwrap();
+    let epoch = engine.memo.cost_epoch_value();
+    let candidate = engine
+        .memo
+        .group(root)
+        .unwrap()
+        .winner(goal)
+        .unwrap()
+        .candidate;
+    let child_candidates = engine
+        .memo
+        .group(child)
+        .unwrap()
+        .winner_frontier(goal)
+        .unwrap()
+        .candidates()
+        .iter()
+        .map(|c| c.candidate)
+        .collect::<Vec<_>>();
+    let synthesized = engine.child_combination_cost_synthesis_count;
+    let published = engine.memo.published_winner_count();
+    let mandatory_domain = engine.physical_search_domain(root, goal).unwrap();
+    engine.mandatory_only = false;
+    engine.open_optional_implementation_domain().unwrap();
+    assert_eq!(engine.memo.cost_epoch_value(), epoch);
+    assert_ne!(
+        engine.physical_search_domain(root, goal).unwrap(),
+        mandatory_domain
+    );
+    assert!(engine.physical_completion_proofs.is_empty());
+    assert_eq!(
+        engine
+            .memo
+            .group(root)
+            .unwrap()
+            .winner(goal)
+            .unwrap()
+            .candidate,
+        candidate
+    );
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(engine.child_combination_cost_synthesis_count, synthesized);
+    assert_eq!(engine.memo.published_winner_count(), published);
+    assert_eq!(
+        engine
+            .memo
+            .group(child)
+            .unwrap()
+            .winner_frontier(goal)
+            .unwrap()
+            .candidates()
+            .iter()
+            .map(|c| c.candidate)
+            .collect::<Vec<_>>(),
+        child_candidates
+    );
+    assert!(
+        !engine.physical_task_cache[&(child, goal)].mandatory_only,
+        "unchanged parent recipes must still open their children's optional domain"
+    );
+}
+
+#[test]
 fn child_combination_refs_rebuilds_exact_choices_from_stable_ids() {
     let (_, _, child, goal) = resume_engine(false);
     let candidates = [CandidateId::new(41), CandidateId::new(7)];

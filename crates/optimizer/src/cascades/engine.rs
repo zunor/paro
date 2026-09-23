@@ -3944,15 +3944,13 @@ impl CascadesEngine {
                 self.record_search_checkpoints(root);
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
             }
-            self.reset_cost_epoch()?;
+            self.open_optional_implementation_domain()?;
             let _work_phase = crate::work_partition::phase(crate::work_partition::Phase::Optional);
             self.optional_search_started =
                 self.collect_rule_work_profile || self.quality_handoff_enabled;
-            // The archived mandatory incumbent remains the safe plan for this
-            // new cost epoch.  As soon as optional work publishes enough new
-            // logical alternatives, mandatory physical work is re-costed
-            // incrementally below; this keeps the incumbent fallback semantics
-            // intact when cancellation happens before the first publication.
+            // Opening optional implementations changes search coverage, not
+            // the validity of a price. Keep the mandatory candidates in the
+            // frontier; exact fact/recipe/grant contexts still control recost.
             // Re-cost the protected baseline at logical publication batches.
             // This is the quality-first hand-off: a newly published narrow
             // aggregate or pushed domain must become executable before a
@@ -3998,7 +3996,7 @@ impl CascadesEngine {
             .ok_or_else(|| self.infeasible_goal_error(root, goal))
     }
 
-    fn reset_cost_epoch(&mut self) -> Result<()> {
+    fn open_optional_implementation_domain(&mut self) -> Result<()> {
         let _partition =
             crate::work_partition::enter(crate::work_partition::Bucket::PhaseTransition);
         self.quality_production_requests.clear();
@@ -4008,20 +4006,20 @@ impl CascadesEngine {
         self.quality_active_forced_transform_goal = None;
         self.quality_active_domain_continuation = None;
         self.protect_current_winners()?;
-        self.memo.clear_cost_frontiers()?;
-        // Physical recipes are immutable descriptions of already-admitted
-        // implementations. Keep them across a fact/cost epoch so only the
-        // affected winner frontiers are recomposed; rebuilding every recipe
-        // made a grant or logical refresh pay the same construction cost
-        // again. New logical expressions still add recipes incrementally.
+        // Prices, CandidateIds and recipe cursors belong to their exact cost
+        // context, not to an exploration phase. In particular this transition
+        // must not increment CostEpoch or discard the mandatory frontier.
         self.grant_sensitivity.clear();
-        // The cost epoch is part of every child-combination context. A
-        // completion proof from the previous epoch is therefore never a
-        // valid lower-bound source after frontiers are cleared.
+        // Completion has a different lifetime: a closed mandatory domain does
+        // not prove closure after optional implementations become eligible.
         self.physical_completion_proofs.clear();
         self.physical_completion_pending.clear();
         self.physical_response_notifications.clear();
         self.task_registry.invalidate_physical_tasks()?;
+        // Revisit the dependency domain, including children of unchanged
+        // recipes: an optional leaf can improve a parent without publishing a
+        // new logical expression or parent recipe. This is a coverage walk;
+        // ChildCombinationState retains prices for unchanged exact choices.
         self.physical_full_recost = self.next_recipe_sequence.keys().copied().collect();
         self.physical_quality_demanded_groups = self
             .physical_parents
@@ -4412,7 +4410,7 @@ impl CascadesEngine {
                 incumbent
             });
         }
-        self.reset_cost_epoch()?;
+        self.open_optional_implementation_domain()?;
         *optional_started = true;
         self.optional_search_started =
             self.collect_rule_work_profile || self.quality_handoff_enabled;
@@ -4570,7 +4568,7 @@ impl CascadesEngine {
     /// Capture the newest complete root response already published by the
     /// interleaved physical queue.  This function performs no optimization:
     /// it only selects, verifies, and freezes the current frontier entries.
-    /// A class without a qualified post-reset entry inherits its immutable
+    /// A class without a qualified current entry inherits its immutable
     /// mandatory incumbent, if one exists.
     fn snapshot_grant_classes(
         &mut self,
@@ -4605,6 +4603,20 @@ impl CascadesEngine {
                         .cloned()
                 });
             if let Some(winner) = current {
+                if let Some(incumbent) = fallback.and_then(|optimization| {
+                    optimization.winners.iter().find(|incumbent| {
+                        incumbent.class == class.id
+                            && incumbent.goal == goal
+                            && incumbent.frozen.reference.group == root
+                            && incumbent.winner.candidate == winner.candidate
+                    })
+                }) {
+                    // An immutable CandidateId names the same exact child
+                    // choices and costs. Preserve the verified frozen artifact
+                    // when optional exploration has not replaced that winner.
+                    winners.push(incumbent.clone());
+                    continue;
+                }
                 winners.push(self.freeze_grant_winner(root, class.id, goal, winner)?);
                 continue;
             }

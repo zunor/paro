@@ -1462,9 +1462,10 @@ impl Memo {
         Ok(())
     }
 
-    /// Start a new cost epoch after logical facts change. Archived candidate
-    /// DAGs remain immutable and extractable; stale estimates do not compete
-    /// with the new epoch's frontier.
+    /// Exercise wholesale invalidation in the frozen-artifact oracle. The
+    /// production engine refreshes exact cost contexts incrementally; opening
+    /// a search phase must never use this operation.
+    #[cfg(test)]
     pub(crate) fn clear_cost_frontiers(&mut self) -> Result<()> {
         self.cost_epoch = CostEpoch(
             self.cost_epoch
