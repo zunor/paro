@@ -32,6 +32,12 @@ blessing, or history cleanup.
    if the receipt does not expose it, preserve the process/config value in the
    manifest rather than inferring it from a source default. Discover current
    collector flags from `--help`.
+   Normal compile timing currently requires `PARO_COMPILE_WORK_EVIDENCE=1`
+   (`context/session_diagnostics.rs`). Register this bounded observer and check
+   the first completed cell's cold receipts for non-null `compile_work` before
+   continuing a matrix. A missing field is compiler `Uncovered`, not zero;
+   retain valid C1 data and register any replacement cohort separately. Do not
+   enable Detail/statement tracing or substitute diagnostic time to fill it.
 5. Use `benchmark/corpora/tpcds_compare.py` for normal measurements. C1 is
    target occurrence 0 in a fresh process with a verified cache miss; keep
    trace-off C1, warm, and diagnostics in separate cohorts. Validate complete

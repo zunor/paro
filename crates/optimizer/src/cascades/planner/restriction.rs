@@ -224,9 +224,9 @@ mod tests {
             LogicalOperator::Filter(_)
         ));
 
-        // An ordinary bound function is fallible unless its implementation
-        // supplies the stronger totality contract. Such a predicate may not
-        // be evaluated on rows eliminated by the inner restriction.
+        // An explicitly fallible function may not be evaluated on rows
+        // eliminated by the inner restriction, even if it is otherwise
+        // deterministic and has no side effects.
         use paro_function::scalar::ScalarFunction;
         use paro_planner::expression::FunctionExpression;
         let function = ScalarFunction::new(
