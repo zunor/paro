@@ -363,7 +363,8 @@ fn inspect_quality_candidate(
         };
         if physical.id != winner.expression
             || physical.key.children != logical.key.children
-            || winner.children.len() != logical.key.children.len()
+            || (winner.joint_cost_proof.is_none()
+                && winner.children.len() != logical.key.children.len())
             || !selected_physical_contract_is_exact(logical, physical, metadata, &physical_payload)
         {
             return Ok(None);
@@ -440,12 +441,22 @@ fn inspect_quality_candidate(
         ) {
             shape.runtime_filter_joins = shape.runtime_filter_joins.saturating_add(1);
         }
-        for (child, expected_group) in winner
-            .children
-            .iter()
-            .copied()
-            .zip(logical.key.children.iter().copied())
-        {
+        // A region implementation has an explicit physical boundary which
+        // need not be the binary logical root's immediate children. The final
+        // WinnerVerifier independently replays its JointCostProof. Do not
+        // discard that executable DAG as if it were an ordinary local recipe.
+        let expected_groups: Vec<_> = match &winner.joint_cost_proof {
+            Some(proof) => proof
+                .boundary_goals
+                .iter()
+                .map(|(group, _)| *group)
+                .collect(),
+            None => logical.key.children.to_vec(),
+        };
+        if expected_groups.len() != winner.children.len() {
+            return Ok(None);
+        }
+        for (child, expected_group) in winner.children.iter().copied().zip(expected_groups) {
             if memo.canonical_group(child.group) != memo.canonical_group(expected_group)
                 || memo.resolve_child_winner(child).is_none()
             {
