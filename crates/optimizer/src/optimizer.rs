@@ -2584,9 +2584,7 @@ impl Optimizer {
         // Mandatory substitution creates fresh filter/projection/set
         // boundaries. Canonicalize predicate placement before Query IR
         // construction just as Memo does for optional multi-consumer choices.
-        plan = FilterPushdown::new().rewrite_plan(plan);
-        scalar_construction.normalize_plan(&mut plan);
-        plan = FilterPushdown::new().rewrite_plan(plan);
+        plan = crate::construction::predicates(plan, &mut scalar_construction);
         plan = crate::construction::finish(plan)?;
         if self.ctx.verify_enabled {
             verify_logical_plan(&self.ctx.bind_context, &plan)?;

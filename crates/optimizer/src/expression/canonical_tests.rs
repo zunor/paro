@@ -84,3 +84,25 @@ fn scalar_reuse_does_not_merge_volatile_occurrences() {
         .iter()
         .all(|expression| expression.evaluation_properties().is_reorder_fence()));
 }
+
+#[test]
+fn routing_reopens_for_changes_not_for_unseen_or_detached_roots() {
+    let mut construction = CanonicalScalars::default();
+    let mut operator = LogicalOperator::Filter(Filter {
+        child: (),
+        expressions: vec![boolean(true)],
+        projection_map: paro_planner::operator::ProjectionMap::all(),
+    });
+    // An unseen, but already canonical root is not a change.
+    assert!(!construction.normalize_operator(&mut operator));
+    assert!(!construction.normalize_operator(&mut operator));
+    let LogicalOperator::Filter(filter) = &mut operator else {
+        unreachable!()
+    };
+    filter.expressions[0] = Expression::Conjunction(
+        ConjunctionExpression::new(ConjunctionType::And, vec![boolean(true), boolean(false)])
+            .into(),
+    );
+    assert!(construction.normalize_operator(&mut operator));
+    assert!(!construction.normalize_operator(&mut operator));
+}

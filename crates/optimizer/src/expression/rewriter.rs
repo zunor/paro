@@ -52,13 +52,15 @@ impl ExpressionRewriter {
     }
 
     /// Rewrite an expression by applying rules until fixed point.
-    pub(crate) fn rewrite_expression(&self, expr: &mut Expression, op: &LogicalOperator) {
+    pub(crate) fn rewrite_expression(&self, expr: &mut Expression, op: &LogicalOperator) -> bool {
+        let mut changed = false;
         loop {
             let mut changes_made = false;
             *expr = self.apply_rules(expr, op, &mut changes_made);
             if !changes_made {
-                break;
+                return changed;
             }
+            changed = true;
         }
     }
 

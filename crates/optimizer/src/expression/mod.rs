@@ -46,15 +46,23 @@ impl Default for CanonicalScalars {
 }
 
 impl CanonicalScalars {
-    pub(crate) fn normalize_plan(&mut self, plan: &mut OwnedLogicalPlan) {
-        plan.visit_post_order_mut(|node| self.normalize_operator(&mut node.operator));
+    pub(crate) fn normalize_plan(&mut self, plan: &mut OwnedLogicalPlan) -> bool {
+        let mut changed = false;
+        plan.visit_post_order_mut(|node| {
+            changed |= self.normalize_operator(&mut node.operator);
+        });
+        changed
     }
 
-    pub(crate) fn normalize_operator<Child>(&mut self, operator: &mut LogicalOperator<Child>) {
+    pub(crate) fn normalize_operator<Child>(
+        &mut self,
+        operator: &mut LogicalOperator<Child>,
+    ) -> bool {
         if self.completed.len() >= self.next_sweep {
             self.completed.retain(|_, witness| witness.is_alive());
             self.next_sweep = self.completed.len().saturating_mul(2).max(256);
         }
+        let mut changed = false;
         paro_planner::visitor::enumerate_expressions(operator, |expression| {
             if self
                 .completed
@@ -63,7 +71,8 @@ impl CanonicalScalars {
             {
                 return;
             }
-            self.rewriter
+            changed |= self
+                .rewriter
                 .rewrite_expression(expression, &LogicalOperator::DummyScan);
             #[cfg(test)]
             {
@@ -75,6 +84,7 @@ impl CanonicalScalars {
         if let LogicalOperator::Aggregate(aggregate) = operator {
             aggregate.recompute_returned_types();
         }
+        changed
     }
 }
 
