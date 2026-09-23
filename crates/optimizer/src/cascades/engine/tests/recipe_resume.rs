@@ -8,6 +8,84 @@
 use super::*;
 
 #[test]
+fn retained_prices_do_not_publish_mixtures_with_unvisited_optional_children() {
+    let (mut engine, root, goal) = strong_tree_engine();
+    let child = engine
+        .memo
+        .logical_expr(engine.memo.group(root).unwrap().logical_exprs()[0])
+        .unwrap()
+        .key
+        .children[0];
+    engine.registry = ImplementationRegistry::default();
+    for (id, operator, input, score, mandatory) in [
+        (40, 100, None, 100.0, true),
+        (41, 200, Some(child), 10.0, true),
+        (42, 100, None, 1.0, false),
+        (43, 200, Some(child), 0.0, false),
+    ] {
+        engine
+            .registry
+            .register_implementation(TreeImplementation {
+                id: ImplementationId(id),
+                operator: Fingerprint(operator),
+                child: input,
+                child_row_goal: None,
+                local_score: score,
+                mandatory,
+            })
+            .unwrap();
+    }
+    engine.mandatory_only = true;
+    engine.optimize_group(root, goal).unwrap();
+    let candidate = engine
+        .memo
+        .group(root)
+        .unwrap()
+        .winner(goal)
+        .unwrap()
+        .candidate;
+    let before = engine.child_combination_cost_synthesis_count;
+    engine.mandatory_only = false;
+    engine.open_optional_implementation_domain().unwrap();
+    // An earlier recursive child exhausted this readiness step. Existing
+    // mandatory winners still provide an executable fallback, but the next
+    // parent's new recipes must not use an unvisited optional input domain.
+    engine.physical_interleave_step_mode = true;
+    engine.physical_interleave_step_yielded = true;
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(engine.child_combination_cost_synthesis_count, before);
+    assert_eq!(
+        engine
+            .memo
+            .group(root)
+            .unwrap()
+            .winner(goal)
+            .unwrap()
+            .candidate,
+        candidate
+    );
+    assert!(engine.physical_task_cache[&(child, goal)].mandatory_only);
+    assert!(!engine.physical_task_cache[&(root, goal)].complete);
+    engine.physical_interleave_step_mode = false;
+    engine.physical_interleave_step_yielded = false;
+    engine.optimize_group(root, goal).unwrap();
+    assert_eq!(
+        engine
+            .memo
+            .group(root)
+            .unwrap()
+            .winner(goal)
+            .unwrap()
+            .cost
+            .score
+            .range
+            .expected,
+        1.0
+    );
+    assert!(!engine.physical_task_cache[&(child, goal)].mandatory_only);
+}
+
+#[test]
 fn unchanged_parent_recipe_consumes_a_new_optional_leaf() {
     let (mut engine, root, goal) = strong_tree_engine();
     let child = engine

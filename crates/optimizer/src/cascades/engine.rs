@@ -1031,7 +1031,7 @@ struct PhysicalTaskState {
     /// implementations, even when the logical/fact ReadSet is unchanged.
     mandatory_only: bool,
     reads: ReadSet,
-    dependencies: Option<Arc<BTreeSet<(GroupId, OptimizationGoal)>>>,
+    dependencies: Option<PhysicalDependencySnapshot>,
     recipe_cursor: u64,
     /// Readiness passes may cache an incomplete prefix so an unchanged queue
     /// wake-up does not re-enter TaskRegistry.  A normal completion pass may
@@ -1123,6 +1123,8 @@ enum BoundCheckLocation {
     BeforeChildren,
     AfterChildren,
 }
+
+type PhysicalDependencySnapshot = Arc<BTreeSet<(GroupId, OptimizationGoal)>>;
 
 /// The engine is deliberately operator-agnostic. Domain implementations live
 /// in the registry; this type owns stable scheduling, budgets, enforcement,
@@ -1219,7 +1221,7 @@ pub struct CascadesEngine {
     /// at publication avoids rescanning the global recipe table every time a
     /// recursive task captures its exact child ReadSet.
     physical_read_dependencies:
-        BTreeMap<(GroupId, OptimizationGoal), Arc<BTreeSet<(GroupId, OptimizationGoal)>>>,
+        BTreeMap<(GroupId, OptimizationGoal), PhysicalDependencySnapshot>,
     physical_task_cache: BTreeMap<(GroupId, OptimizationGoal), PhysicalTaskState>,
     /// A proof is retained only for the exact current physical domain. The
     /// TaskRegistry owns its lifecycle; this index avoids scanning all bound
@@ -4030,10 +4032,9 @@ impl CascadesEngine {
         Ok(())
     }
 
-    /// Save every currently selected winner before clearing the cost
-    /// frontiers.  The physical archive remains the source of exact child
-    /// payloads; this map only retains the immutable roots that can serve as
-    /// conservative upper bounds during the next epoch.
+    /// Retain selected upper bounds before opening another search domain.
+    /// The archive owns exact child payloads. Their fact reads, not the phase
+    /// transition, decide whether the bounds remain usable.
     fn protect_current_winners(&mut self) -> Result<()> {
         if !self.protected_incumbent_enabled {
             return Ok(());
@@ -7812,7 +7813,7 @@ impl CascadesEngine {
         &self,
         group: GroupId,
         goal: OptimizationGoal,
-    ) -> Option<Arc<BTreeSet<(GroupId, OptimizationGoal)>>> {
+    ) -> Option<PhysicalDependencySnapshot> {
         self.physical_read_dependencies
             .get(&(self.memo.canonical_group(group), goal))
             .filter(|dependencies| !dependencies.is_empty())
@@ -9333,6 +9334,21 @@ impl CascadesEngine {
                 }
                 child_yielded |=
                     self.physical_interleave_step_mode && self.physical_interleave_step_yielded;
+                if child_yielded
+                    && self
+                        .physical_task_cache
+                        .get(&(child, child_goal))
+                        .is_some_and(|entry| entry.mandatory_only != self.mandatory_only)
+                {
+                    // A retained price is usable as an incumbent, but does
+                    // not mean this child's newly opened implementation
+                    // domain has even been visited. Resume the parent after
+                    // that first visit instead of manufacturing every mixture
+                    // of refreshed children and untouched mandatory siblings.
+                    // This is not a completion barrier: once visited, an
+                    // incomplete child's published prefix remains consumable.
+                    return Ok(Some(sequence));
+                }
                 let Some(frontier) = self
                     .memo
                     .group(child)
