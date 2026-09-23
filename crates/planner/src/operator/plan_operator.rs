@@ -614,19 +614,8 @@ fn derive_output_names(root: &LogicalOperator) -> Vec<String> {
                 outputs.push(names);
             }
             FinishDependentJoin(join) => {
-                let mut left = match &join.kind {
-                    DependentJoinKind::Mark { .. } => pop_output_names(&mut outputs),
-                    DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => {
-                        let right = pop_output_names(&mut outputs);
-                        let mut left = pop_output_names(&mut outputs);
-                        left.extend(right);
-                        left
-                    }
-                };
-                if matches!(&join.kind, DependentJoinKind::Mark { .. }) {
-                    left.push("mark".to_string());
-                }
-                outputs.push(left);
+                let names = finish_dependent_join_names(join, &mut outputs);
+                outputs.push(names);
             }
             ExtendWindow(window) => {
                 let mut names = pop_output_names(&mut outputs);
@@ -857,6 +846,16 @@ impl<Child> LogicalOperator<Child> {
                 .copied()
                 .unwrap_or_else(|| panic!("logical output names lost child {index}"))
         };
+        // The iterative join reducer consumes only visible-side results, not
+        // every structural input. Use the same side contract as layout
+        // derivation: MARK/SEMI/ANTI must never consume right-side names as
+        // their left output just because both children have been completed.
+        let join_outputs = || match output_layout_children(self) {
+            OutputLayoutChildren::First => vec![child(0).to_vec()],
+            OutputLayoutChildren::Second => vec![child(1).to_vec()],
+            OutputLayoutChildren::Both => vec![child(0).to_vec(), child(1).to_vec()],
+            OutputLayoutChildren::None => Vec::new(),
+        };
         match self {
             LogicalOperator::Get(get) => get.names.clone(),
             LogicalOperator::BoundReference(reference) => (0..reference.bindings.len())
@@ -921,14 +920,10 @@ impl<Child> LogicalOperator<Child> {
             | LogicalOperator::Delete(_)
             | LogicalOperator::Update(_) => vec!["count".to_string()],
             LogicalOperator::ExpressionGet(values) => values.names.clone(),
-            LogicalOperator::Join(join) => {
-                let mut outputs = child_names.iter().map(|names| (*names).to_vec()).collect();
-                finish_join_names(join, &mut outputs)
-            }
+            LogicalOperator::Join(join) => finish_join_names(join, &mut join_outputs()),
             LogicalOperator::DelimGet(delim) => delim.chunk_names.clone(),
             LogicalOperator::DependentJoin(join) => {
-                let mut outputs = child_names.iter().map(|names| (*names).to_vec()).collect();
-                finish_dependent_join_names(join, &mut outputs)
+                finish_dependent_join_names(join, &mut join_outputs())
             }
             LogicalOperator::SetOperation(_setop) => child(0).to_vec(),
             LogicalOperator::Window(window) => {
@@ -1875,6 +1870,81 @@ mod tests {
                 "local output-name reduction changed {name}"
             );
         }
+    }
+
+    #[test]
+    fn completed_join_names_observe_visible_sides_and_projection_maps() {
+        let leaf = |table, width| {
+            lp(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                table,
+                vec![],
+                (0..width).map(|i| format!("t{table}_c{i}")).collect(),
+                vec![LogicalType::Integer; width],
+            )))
+        };
+        let check = |operator: LogicalOperator| {
+            let inputs = operator
+                .children()
+                .iter()
+                .map(|c| c.output_names())
+                .collect::<Vec<_>>();
+            let names = operator.output_names_from_child_refs(
+                &inputs.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            );
+            assert_eq!(names, operator.output_names());
+            assert_eq!(names.len(), operator.output_layout().len());
+        };
+        for kind in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Outer,
+            JoinType::Single,
+            JoinType::Semi,
+            JoinType::Anti,
+            JoinType::Mark,
+            JoinType::RightSemi,
+            JoinType::RightAnti,
+        ] {
+            for left_width in [0, 2] {
+                for projected in [false, true] {
+                    let mut comparison =
+                        ComparisonJoin::new(kind, leaf(10, left_width), leaf(20, 3), vec![]);
+                    comparison.mark_index = (kind == JoinType::Mark).then_some(30);
+                    if projected {
+                        comparison.left_projection_map = if left_width == 0 {
+                            ProjectionMap::none()
+                        } else {
+                            vec![1].into()
+                        };
+                        comparison.right_projection_map = vec![2, 0].into();
+                    }
+                    let mut any = AnyJoin::new(
+                        kind,
+                        leaf(10, left_width),
+                        leaf(20, 3),
+                        Expression::Constant(
+                            crate::expression::ConstantExpression::new(
+                                paro_common::runtime_value::Value::Boolean(true),
+                                LogicalType::Boolean,
+                            )
+                            .into(),
+                        ),
+                    );
+                    any.mark_index = comparison.mark_index;
+                    any.left_projection_map = comparison.left_projection_map.clone();
+                    any.right_projection_map = comparison.right_projection_map.clone();
+                    check(LogicalOperator::Join(Join::Comparison(comparison)));
+                    check(LogicalOperator::Join(Join::Any(Box::new(any))));
+                }
+            }
+        }
+        check(LogicalOperator::DependentJoin(Box::new(
+            DependentJoin::mark_exists(leaf(10, 0), leaf(20, 3), vec![], 30),
+        )));
+        check(LogicalOperator::DependentJoin(Box::new(
+            DependentJoin::scalar(leaf(10, 2), leaf(20, 3), vec![], None),
+        )));
     }
 
     #[test]

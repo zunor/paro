@@ -53,3 +53,9 @@ and executable archived fallback when optional work is interrupted. Compare
 both the original control and the preceding selected-lowering arm, including
 plan identities and all three queries; do not present it as an independent
 lowering-only comparison.
+
+The SQL gate then found a local output-name reducer consuming both join inputs
+where MARK/SEMI/ANTI expose only one side. Fix it through the existing layout
+side contract, not a result-name repair or expected-output update. Register a
+final `validated` arm with the same matrix and counts after that correctness
+fix; keep the preceding `reopened` evidence and the failing regress log.
