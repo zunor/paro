@@ -14,10 +14,34 @@ use super::*;
 /// not the rule which constructed it. Every selected incoming consumer edge
 /// participates; an unfiltered use requires the full domain. This certificate
 /// covers predicates, not minimal storage width or join-search completion.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CteDemandKey {
+    definition: LogicalExprId,
+    producer_input: u64,
+    consumers: Box<[(u64, Box<[u64]>)]>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct CteDomainProperties {
+    results: BTreeMap<CteDemandKey, bool>,
+    pub(super) builds: u64,
+    pub(super) reuses: u64,
+}
+
+#[cfg(test)]
 pub(super) fn cte_domain_witnesses(
     memo: &Memo,
     nodes: &[QualityCandidateNode],
     state: &PlannerTransformState,
+) -> BTreeSet<usize> {
+    cte_domain_witnesses_with_properties(memo, nodes, state, None)
+}
+
+pub(super) fn cte_domain_witnesses_with_properties(
+    memo: &Memo,
+    nodes: &[QualityCandidateNode],
+    state: &PlannerTransformState,
+    mut properties: Option<&mut quality_properties::SelectedQualityProperties>,
 ) -> BTreeSet<usize> {
     let map = nodes
         .iter()
@@ -42,6 +66,47 @@ pub(super) fn cte_domain_witnesses(
         let Some(producer_child) = producer.children.first().copied() else {
             continue;
         };
+        // A CTE's demand belongs to the selected incoming consumer edges, not
+        // the root candidate or its arrival order. Unrelated new ancestors do
+        // not change this key. Revisions cover exact choices and live facts.
+        let key = properties.as_ref().map(|properties| {
+            let mut consumers: Vec<_> = nodes
+                .iter()
+                .filter(|node| {
+                    matches!(operator(node),
+                Some(LogicalOperator::CTERef(reference)) if reference.cte_index == cte.cte_index)
+                })
+                .map(|consumer| {
+                    let mut incoming = parents
+                        .get(&consumer.reference.candidate)
+                        .into_iter()
+                        .flatten()
+                        .map(|parent| properties.revision(parent.reference.candidate))
+                        .collect::<Vec<_>>();
+                    incoming.sort_unstable();
+                    (
+                        properties.revision(consumer.reference.candidate),
+                        incoming.into_boxed_slice(),
+                    )
+                })
+                .collect();
+            consumers.sort_unstable();
+            CteDemandKey {
+                definition: producer.logical,
+                producer_input: properties.revision(producer_child.candidate),
+                consumers: consumers.into_boxed_slice(),
+            }
+        });
+        if let Some((key, properties)) = key.as_ref().zip(properties.as_mut()) {
+            if let Some(covered) = properties.cte_domains.results.get(key).copied() {
+                properties.cte_domains.reuses += 1;
+                if covered {
+                    witnessed.insert(cte.cte_index);
+                }
+                continue;
+            }
+            properties.cte_domains.builds += 1;
+        }
         let mut references = Vec::new();
         let mut unrestricted = false;
         let mut invalid = false;
@@ -83,26 +148,31 @@ pub(super) fn cte_domain_witnesses(
             }
             unrestricted |= !incoming;
         }
-        if !found || invalid {
-            continue;
-        }
-        if unrestricted {
+        let covered = if !found || invalid {
+            false
+        } else if unrestricted {
             // No finite union of the other consumers' filters can restrict
             // this producer. No pushdown is required by the predicate policy.
-            witnessed.insert(cte.cte_index);
-            continue;
-        }
-        let bindings = cte
-            .output_columns
-            .iter()
-            .map(|column| column.binding)
-            .collect::<Vec<_>>();
-        if let Some(expected) =
-            crate::cte::predicate_domain::derive_producer_predicates(references, &bindings)
-        {
-            if selected_consumes_ref(&map, producer_child, memo, &expected, state) {
-                witnessed.insert(cte.cte_index);
+            true
+        } else {
+            let bindings = cte
+                .output_columns
+                .iter()
+                .map(|column| column.binding)
+                .collect::<Vec<_>>();
+            if let Some(expected) =
+                crate::cte::predicate_domain::derive_producer_predicates(references, &bindings)
+            {
+                selected_consumes_ref(&map, producer_child, memo, &expected, state)
+            } else {
+                false
             }
+        };
+        if let Some((key, properties)) = key.zip(properties.as_mut()) {
+            properties.cte_domains.results.insert(key, covered);
+        }
+        if covered {
+            witnessed.insert(cte.cte_index);
         }
     }
     witnessed
@@ -316,6 +386,7 @@ fn selected_transfer_consumed(
     .is_some_and(|routed| selected_routes_consumed(node, &routed, state))
 }
 
+#[cfg(test)]
 pub(super) fn pending_transfers(
     root: &FrozenCandidate,
     state: &PlannerTransformState,
@@ -420,81 +491,64 @@ pub(super) fn selected_transfer_bindings(
 /// payload clone, or child tree allocation is created here.  The returned
 /// bindings are still only scheduling hints; the ordinary matcher remains the
 /// semantic owner of the complete transformation search.
-pub(super) fn pending_transfers_for_refs(
+pub(super) fn pending_transfer_for_ref(
     memo: &Memo,
-    root: ChildWinnerRef,
-    nodes: &[QualityCandidateNode],
+    reference: ChildWinnerRef,
+    nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
     state: &PlannerTransformState,
-) -> Option<Box<[CandidateId]>> {
-    let nodes = nodes
-        .iter()
-        .map(|node| (node.reference.candidate, node))
-        .collect::<BTreeMap<_, _>>();
-    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityDomain);
-    let mut pending = Vec::new();
-    let mut visited = BTreeSet::new();
-    let mut stack = vec![root];
-    while let Some(reference) = stack.pop() {
-        if !visited.insert(reference.candidate) {
-            continue;
-        }
-        let node = ref_node(&nodes, reference)?;
-        let logical = memo.logical_expr(node.logical)?;
-        let operator = &state
+) -> Option<bool> {
+    let node = ref_node(nodes, reference)?;
+    let logical = memo.logical_expr(node.logical)?;
+    let operator = &state
+        .payloads
+        .logical
+        .get(logical.payload.index())?
+        .semantic_template
+        .operator;
+    if let LogicalOperator::Filter(filter) = operator {
+        let [child] = node.children.as_ref() else {
+            return None;
+        };
+        let child_node = ref_node(nodes, *child)?;
+        let child_logical = memo.logical_expr(child_node.logical)?;
+        let child_operator = &state
             .payloads
             .logical
-            .get(logical.payload.index())?
+            .get(child_logical.payload.index())?
             .semantic_template
             .operator;
-        if let LogicalOperator::Filter(filter) = operator {
-            let [child] = node.children.as_ref() else {
+        let metadata = state.metadata.get(&child_logical.payload)?;
+        if metadata.child_layouts.len() != child_node.children.len() {
+            return None;
+        }
+        let projection_is_graph_chain = if matches!(child_operator, LogicalOperator::Projection(_))
+        {
+            let [input] = child_node.children.as_ref() else {
                 return None;
             };
-            let child_node = ref_node(&nodes, *child)?;
-            let child_logical = memo.logical_expr(child_node.logical)?;
-            let child_operator = &state
-                .payloads
-                .logical
-                .get(child_logical.payload.index())?
-                .semantic_template
-                .operator;
-            let metadata = state.metadata.get(&child_logical.payload)?;
-            if metadata.child_layouts.len() != child_node.children.len() {
-                return None;
-            }
-            let projection_is_graph_chain =
-                if matches!(child_operator, LogicalOperator::Projection(_)) {
-                    let [input] = child_node.children.as_ref() else {
-                        return None;
-                    };
-                    selected_is_graph_chain_ref(&nodes, *input, memo, state)?
-                } else {
-                    false
-                };
-            let owner_fenced = filter
-                .expressions
-                .iter()
-                .any(|expression| expression.evaluation_properties().is_reorder_fence());
-            let mut advances = false;
-            for predicate in &filter.expressions {
-                let transferable = can_advance(
-                    predicate,
-                    child_operator,
-                    &metadata.child_layouts,
-                    projection_is_graph_chain,
-                )?;
-                advances |= !owner_fenced
-                    && transferable
-                    && !selected_transfer_consumed_ref(&nodes, *child, memo, predicate, state);
-            }
-            if advances {
-                pending.push(reference.candidate);
-            }
+            selected_is_graph_chain_ref(nodes, *input, memo, state)?
+        } else {
+            false
+        };
+        let owner_fenced = filter
+            .expressions
+            .iter()
+            .any(|expression| expression.evaluation_properties().is_reorder_fence());
+        let mut advances = false;
+        for predicate in &filter.expressions {
+            let transferable = can_advance(
+                predicate,
+                child_operator,
+                &metadata.child_layouts,
+                projection_is_graph_chain,
+            )?;
+            advances |= !owner_fenced
+                && transferable
+                && !selected_transfer_consumed_ref(nodes, *child, memo, predicate, state);
         }
-        stack.extend(node.children.iter().copied());
+        return Some(advances);
     }
-    pending.sort_unstable();
-    Some(pending.into_boxed_slice())
+    Some(false)
 }
 
 pub(super) fn selected_transfer_bindings_for_refs(

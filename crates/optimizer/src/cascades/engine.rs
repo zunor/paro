@@ -41,13 +41,13 @@ use smallvec::SmallVec;
 use super::bounds::{CertifiedLocalWorkFloor, ProvenChildLatencyFloor, ProvenRecipeLatencyFloor};
 use super::budget::{BudgetDecision, BudgetDimension};
 use super::calibration::{
-    LocalOperatorWork, MachineCalibrationBundle, OP_ENFORCER_RANDOM_FETCH,
-    OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW, ParallelWorkProfile,
+    LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_ENFORCER_RANDOM_FETCH,
+    OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW,
 };
 use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
-use super::enforcer::{EnforcementPlanner, EnforcerStep, replay_enforcer_chain};
+use super::enforcer::{replay_enforcer_chain, EnforcementPlanner, EnforcerStep};
 use super::governor::{Governor, PlanMilestone, PlanningPolicy};
-use super::grant::{GrantSensitivitySummary, derive_grant_sensitivity, verify_grant_sharing};
+use super::grant::{derive_grant_sensitivity, verify_grant_sharing, GrantSensitivitySummary};
 use super::ids::{
     AdmissibleGrantSetId, CandidateId, Fingerprint, GroupId, ImplementationId, LogicalExprId,
     PhysicalExprId, QualityPolicyId, ResourceGrantClassId, RuleId, StableFingerprintBuilder,
@@ -1243,8 +1243,7 @@ pub struct CascadesEngine {
     /// published incrementally, so maintaining this small deduplicated index
     /// at publication avoids rescanning the global recipe table every time a
     /// recursive task captures its exact child ReadSet.
-    physical_read_dependencies:
-        BTreeMap<(GroupId, OptimizationGoal), PhysicalDependencySnapshot>,
+    physical_read_dependencies: BTreeMap<(GroupId, OptimizationGoal), PhysicalDependencySnapshot>,
     physical_task_cache: BTreeMap<(GroupId, OptimizationGoal), PhysicalTaskState>,
     /// A proof is retained only for the exact current physical domain. The
     /// TaskRegistry owns its lifecycle; this index avoids scanning all bound
@@ -3573,16 +3572,11 @@ impl CascadesEngine {
                     self.quality_frontier_candidate_skip_count.saturating_add(1);
                 continue;
             }
-            // A planner provider may inspect the immutable selected path
-            // without freezing it. Providers which do not implement the
-            // accelerator use the complete path below as the compatibility
-            // oracle. The exact fact read set remains part of the candidate
-            // cursor in either case.
             self.quality_preflight_count = self.quality_preflight_count.saturating_add(1);
-            let preflight = provider.preflight(&self.memo, reference, &winner, goal)?;
-            let (reads, preflight) = match preflight {
-                Some(preflight) => (preflight.reads.clone(), Some(preflight)),
-                None => (self.winner_fact_reads(root, &winner)?, None),
+            let evaluation = provider.evaluate(&self.memo, reference, &winner, goal)?;
+            let reads = match &evaluation {
+                Some(evaluation) => evaluation.reads.clone(),
+                None => self.winner_fact_reads(root, &winner)?,
             };
             let diagnostic_facts = self
                 .collect_rule_work_profile
@@ -3594,73 +3588,37 @@ impl CascadesEngine {
                 self.quality_frontier_candidate_count.saturating_add(1);
             self.quality_last_evaluation_candidate = Some(reference.candidate);
             self.quality_last_evaluation_goal = Some(goal);
-            let mut frozen_winner = None;
-            let mut evidence = match preflight.as_ref() {
-                Some(preflight) => Some(preflight.evidence.clone()),
-                None => {
-                    let frozen = self.freeze_grant_winner(root, class, goal, winner.clone())?;
-                    let reference = frozen.frozen.reference;
-                    let evidence =
-                        provider.evidence(&self.memo, reference, &frozen.frozen, goal)?;
-                    frozen_winner = Some(frozen);
-                    evidence
-                }
-            };
-            let Some(mut evidence_value) = evidence.take() else {
+            let Some(evaluation) = evaluation else {
                 self.quality_candidate_missing_evidence_count = self
                     .quality_candidate_missing_evidence_count
                     .saturating_add(1);
                 continue;
             };
+            let evidence_value = &evaluation.evidence;
             self.quality_candidate_evaluation_count =
                 self.quality_candidate_evaluation_count.saturating_add(1);
-            let mut certificate = self.quality_bundles.evaluate_native_candidate(
+            let certificate = self.quality_bundles.evaluate_native_candidate(
                 QualityPolicyId::new(1),
                 reference.candidate,
                 read_id,
-                &evidence_value,
+                evidence_value,
                 1,
             )?;
-            if preflight.is_some() {
-                if certificate.is_some() {
-                    self.quality_preflight_ready_count =
-                        self.quality_preflight_ready_count.saturating_add(1);
-                } else {
-                    self.quality_preflight_policy_rejection_count = self
-                        .quality_preflight_policy_rejection_count
-                        .saturating_add(1);
-                    self.quality_freeze_avoided_count =
-                        self.quality_freeze_avoided_count.saturating_add(1);
-                }
-            }
-            // A cheap policy pass is only a precondition for freezing.  The
-            // exact provider and WinnerVerifier still run once for a
-            // candidate which might be handed off, and the final registry
-            // pass consumes that full evidence. Missing candidates never pay
-            // for this tree materialization.
-            if certificate.is_some() && preflight.is_some() {
-                let frozen = self.freeze_grant_winner(root, class, goal, winner.clone())?;
-                let reference = frozen.frozen.reference;
-                let Some(full_evidence) =
-                    provider.evidence(&self.memo, reference, &frozen.frozen, goal)?
-                else {
-                    self.quality_preflight_missing_count =
-                        self.quality_preflight_missing_count.saturating_add(1);
-                    self.quality_candidate_missing_evidence_count = self
-                        .quality_candidate_missing_evidence_count
-                        .saturating_add(1);
-                    continue;
-                };
-                evidence_value = full_evidence;
-                certificate = self.quality_bundles.evaluate_native_candidate(
-                    QualityPolicyId::new(1),
-                    reference.candidate,
-                    read_id,
-                    &evidence_value,
-                    1,
-                )?;
-                frozen_winner = Some(frozen);
-            }
+            // Certification and executable safety are different contracts.
+            // The exact selected-choice evidence is derived once; freezing
+            // still independently verifies the final winner's executable DAG.
+            let frozen_winner = if certificate.is_some() {
+                self.quality_preflight_ready_count =
+                    self.quality_preflight_ready_count.saturating_add(1);
+                Some(self.freeze_grant_winner(root, class, goal, winner.clone())?)
+            } else {
+                self.quality_preflight_policy_rejection_count = self
+                    .quality_preflight_policy_rejection_count
+                    .saturating_add(1);
+                self.quality_freeze_avoided_count =
+                    self.quality_freeze_avoided_count.saturating_add(1);
+                None
+            };
             let reference = frozen_winner
                 .as_ref()
                 .map_or(reference, |frozen| frozen.frozen.reference);
@@ -3765,24 +3723,14 @@ impl CascadesEngine {
                     .saturating_add(1);
                 self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
                 let missing = self.quality_last_evaluation.missing_fact_kinds.clone();
-                if let Some(preflight) = preflight {
-                    self.record_quality_production_request_preflight(
-                        provider.as_ref(),
-                        (goal, reference, &winner),
-                        &preflight.nodes,
-                        read_id,
-                        &evidence_value,
-                        &missing,
-                    )?;
-                } else if let Some(frozen_winner) = frozen_winner.as_ref() {
-                    self.record_quality_production_request(
-                        goal,
-                        &frozen_winner.frozen,
-                        read_id,
-                        &evidence_value,
-                        &missing,
-                    )?;
-                }
+                self.record_quality_production_request_preflight(
+                    provider.as_ref(),
+                    (goal, reference, &winner),
+                    &evaluation.nodes,
+                    read_id,
+                    evidence_value,
+                    &missing,
+                )?;
                 continue;
             };
             self.quality_last_evaluation = self.quality_bundles.evaluation_summary();
@@ -6976,6 +6924,18 @@ impl CascadesEngine {
         // follow-up pruning change unauditable.
         for (dimension, count) in self.memo.exhaustion_counts() {
             counters.insert(budget_exhaustion_counter_name(dimension), count);
+        }
+        if let Some(work) = self
+            .quality_evidence_provider
+            .as_ref()
+            .and_then(|provider| provider.property_work())
+        {
+            counters.extend([
+                ("quality_property_node_builds", work.node_builds),
+                ("quality_property_node_reuses", work.node_reuses),
+                ("quality_property_cte_builds", work.cte_builds),
+                ("quality_property_cte_reuses", work.cte_reuses),
+            ]);
         }
         counters
     }
@@ -11771,11 +11731,9 @@ fn visit_read_group_delta(
     next: &[PatternRead],
     mut visit: impl FnMut(GroupId, bool),
 ) {
-    debug_assert!(
-        previous
-            .windows(2)
-            .all(|pair| pair[0].group <= pair[1].group)
-    );
+    debug_assert!(previous
+        .windows(2)
+        .all(|pair| pair[0].group <= pair[1].group));
     debug_assert!(next.windows(2).all(|pair| pair[0].group <= pair[1].group));
     let (mut left, mut right) = (0, 0);
     while left < previous.len() || right < next.len() {

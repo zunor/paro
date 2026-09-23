@@ -4,19 +4,17 @@
 //! Cascades engine scheduling, transaction, and costing tests.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use paro_common::types::LogicalType;
 
 use super::*;
-use crate::cascades::rules::ReadScope;
 use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::ids::{
     AdmissibleGrantSetId, CalibrationRevisionId, CandidateId, ColumnId, LogicalPayloadId,
-    OptimizationContextId, PhysicalExprId, PhysicalPayloadId, PropertySetId,
-    ResourceGrantClassId,
+    OptimizationContextId, PhysicalExprId, PhysicalPayloadId, PropertySetId, ResourceGrantClassId,
 };
 use crate::cascades::memo::{
     GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, OptimizationContext,
@@ -32,6 +30,7 @@ use crate::cascades::region::{
     FacetCriticality, RegionArtifactDependencyContract, RegionFacet, RegionFacetKind, RegionForest,
     RegionScopeContract,
 };
+use crate::cascades::rules::ReadScope;
 use crate::cascades::rules::{
     DomainProofId, EquivalentExpression, EvaluationOccurrenceId, GrantDependencyDescriptor,
     PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PhysicalImplementation,
@@ -527,17 +526,16 @@ struct QualityPreflightProbe {
     reads: crate::cascades::tasks::ReadSet,
     preflight_calls: Arc<AtomicUsize>,
     domain_binding_calls: Arc<AtomicUsize>,
-    evidence_calls: Arc<AtomicUsize>,
 }
 
 impl crate::cascades::quality::QualityEvidenceProvider for QualityPreflightProbe {
-    fn preflight(
+    fn evaluate(
         &self,
         memo: &Memo,
         reference: ChildWinnerRef,
         winner: &Winner,
         _: OptimizationGoal,
-    ) -> Result<Option<crate::cascades::quality::QualityCandidatePreflight>> {
+    ) -> Result<Option<crate::cascades::quality::SelectedQualityEvidence>> {
         self.preflight_calls.fetch_add(1, Ordering::Relaxed);
         let physical = memo
             .physical_expr(winner.expression)
@@ -545,33 +543,31 @@ impl crate::cascades::quality::QualityEvidenceProvider for QualityPreflightProbe
         let logical = memo
             .logical_expr(physical.key.logical)
             .expect("probe physical expression has a logical expression");
-        Ok(Some(
-            crate::cascades::quality::QualityCandidatePreflight {
-                nodes: Box::new([crate::cascades::quality::QualityCandidateNode {
-                    reference,
-                    logical: logical.id,
-                    physical: physical.id,
-                    children: winner.children.clone(),
-                }]),
-                reads: self.reads.clone(),
-                evidence: crate::cascades::quality::NativeQualityEvidence {
-                    capabilities: BTreeSet::from([
-                        crate::cascades::quality::BundleCapability::ScanPredicate,
-                    ]),
-                    facts: BTreeSet::from([crate::cascades::quality::BundleFact::OutputDemand]),
-                    region: Fingerprint(1),
-                    applicability_proof: Fingerprint(2),
-                    choices: Box::new([Fingerprint(3)]),
-                    aggregate_regions: Box::new([]),
-                    pending_domain_transfers: Box::new([reference.candidate]),
-                    selected_rules: Box::new([]),
-                    shape: crate::cascades::quality::NativeQualityShape::default(),
-                },
+        Ok(Some(crate::cascades::quality::SelectedQualityEvidence {
+            nodes: Box::new([crate::cascades::quality::QualityCandidateNode {
+                reference,
+                logical: logical.id,
+                physical: physical.id,
+                children: winner.children.clone(),
+            }]),
+            reads: self.reads.clone(),
+            evidence: crate::cascades::quality::NativeQualityEvidence {
+                capabilities: BTreeSet::from([
+                    crate::cascades::quality::BundleCapability::ScanPredicate,
+                ]),
+                facts: BTreeSet::from([crate::cascades::quality::BundleFact::OutputDemand]),
+                region: Fingerprint(1),
+                applicability_proof: Fingerprint(2),
+                choices: Box::new([Fingerprint(3)]),
+                aggregate_regions: Box::new([]),
+                pending_domain_transfers: Box::new([reference.candidate]),
+                selected_rules: Box::new([]),
+                shape: crate::cascades::quality::NativeQualityShape::default(),
             },
-        ))
+        }))
     }
 
-    fn preflight_domain_bindings(
+    fn selected_domain_bindings(
         &self,
         _: &Memo,
         _: ChildWinnerRef,
@@ -581,17 +577,6 @@ impl crate::cascades::quality::QualityEvidenceProvider for QualityPreflightProbe
     ) -> Result<Box<[crate::cascades::rules::PatternBinding]>> {
         self.domain_binding_calls.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new([]))
-    }
-
-    fn evidence(
-        &self,
-        _: &Memo,
-        _: ChildWinnerRef,
-        _: &FrozenCandidate,
-        _: OptimizationGoal,
-    ) -> Result<Option<crate::cascades::quality::NativeQualityEvidence>> {
-        self.evidence_calls.fetch_add(1, Ordering::Relaxed);
-        Ok(None)
     }
 }
 
@@ -604,12 +589,10 @@ fn quality_preflight_avoids_freeze_and_reopens_only_after_fact_change() {
     );
     let preflight_calls = Arc::new(AtomicUsize::new(0));
     let domain_binding_calls = Arc::new(AtomicUsize::new(0));
-    let evidence_calls = Arc::new(AtomicUsize::new(0));
     engine.set_quality_evidence_provider(Arc::new(QualityPreflightProbe {
         reads,
         preflight_calls: Arc::clone(&preflight_calls),
         domain_binding_calls: Arc::clone(&domain_binding_calls),
-        evidence_calls: Arc::clone(&evidence_calls),
     }));
     engine.set_quality_policy_handoff_enabled(true);
     engine.quality_required_goals.insert(goal);
@@ -618,7 +601,6 @@ fn quality_preflight_avoids_freeze_and_reopens_only_after_fact_change() {
         .try_quality_handoff_candidate(group, goal, QualityCheckOrigin::Checkpoint)
         .unwrap();
     assert_eq!(preflight_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(evidence_calls.load(Ordering::Relaxed), 0);
     assert_eq!(engine.quality_freeze_avoided_count, 1);
     assert_eq!(engine.quality_production_requests.len(), 1);
     assert_eq!(domain_binding_calls.load(Ordering::Relaxed), 1);
@@ -657,7 +639,6 @@ fn quality_preflight_avoids_freeze_and_reopens_only_after_fact_change() {
         .try_quality_handoff_candidate(group, goal, QualityCheckOrigin::Checkpoint)
         .unwrap();
     assert_eq!(preflight_calls.load(Ordering::Relaxed), 2);
-    assert_eq!(evidence_calls.load(Ordering::Relaxed), 0);
     assert_eq!(engine.quality_freeze_avoided_count, 2);
     assert_eq!(domain_binding_calls.load(Ordering::Relaxed), 2);
     assert_eq!(
@@ -1598,13 +1579,11 @@ fn physical_interleave_step_resumes_a_partial_child_recipe() {
         .expect("a yielded physical task must resume to a feasible root");
     assert_eq!(winner.cost.score.range.expected, 1.0);
     assert!(engine.task_registry().profile().reopened_evaluations > 0);
-    assert!(
-        engine
-            .memo()
-            .group(child)
-            .and_then(|group| group.winner_frontier(winner.children[0].goal))
-            .is_some_and(|frontier| !frontier.candidates().is_empty())
-    );
+    assert!(engine
+        .memo()
+        .group(child)
+        .and_then(|group| group.winner_frontier(winner.children[0].goal))
+        .is_some_and(|frontier| !frontier.candidates().is_empty()));
 }
 
 #[test]
@@ -1788,9 +1767,7 @@ fn physical_read_of_one_goal_is_not_invalidated_by_another_goal_publication() {
     engine
         .note_physical_frontier_change(child, goal_b, true)
         .unwrap();
-    assert!(!engine
-        .physical_dirty_recipes
-        .contains_key(&(root, goal_a)));
+    assert!(!engine.physical_dirty_recipes.contains_key(&(root, goal_a)));
     let mut unrelated = PhysicalInterleave::new(root, [goal_a]);
     unrelated.pending.remove(&(root, goal_a));
     engine.enqueue_physical_work([(child, goal_b)], &mut unrelated);
@@ -1798,9 +1775,7 @@ fn physical_read_of_one_goal_is_not_invalidated_by_another_goal_publication() {
     engine
         .note_physical_frontier_change(child, goal_a, true)
         .unwrap();
-    assert!(engine
-        .physical_dirty_recipes
-        .contains_key(&(root, goal_a)));
+    assert!(engine.physical_dirty_recipes.contains_key(&(root, goal_a)));
     engine.optimize_group(root, goal_a).unwrap();
 
     let counters = engine.search_work_counters();
@@ -1830,14 +1805,7 @@ fn physical_response_delta_wakes_direct_consumer_before_grandparent() {
         GroupCardinality::default(),
     );
     let fingerprint = Fingerprint(9_900);
-    engine.register_physical_dependency(
-        child,
-        goal,
-        root,
-        goal,
-        PhysicalExprId(0),
-        fingerprint,
-    );
+    engine.register_physical_dependency(child, goal, root, goal, PhysicalExprId(0), fingerprint);
     engine.register_physical_dependency(
         root,
         goal,
@@ -1912,25 +1880,37 @@ fn engine_with_budget(
 fn empty_mandatory_prefix_is_not_infeasible_and_optional_resumes() {
     let (mut engine, root, goal) = engine_with_budget(Default::default());
     let mut registry = ImplementationRegistry::default();
-    registry.register_implementation(FixedLeafImplementation {
-        id: ImplementationId(41), score: 1.0, mandatory: false,
-    }).unwrap();
+    registry
+        .register_implementation(FixedLeafImplementation {
+            id: ImplementationId(41),
+            score: 1.0,
+            mandatory: false,
+        })
+        .unwrap();
     engine.registry = registry;
     engine.mandatory_only = true;
     engine.optimize_group(root, goal).unwrap();
     let state = engine.physical_task_cache[&(root, goal)].clone();
     assert!(engine.memo.group(root).unwrap().winner(goal).is_none());
-    assert!(matches!(engine.task_registry.task(state.task).unwrap().outcome,
-        Some(TaskOutcome::NoCandidate { .. })));
+    assert!(matches!(
+        engine.task_registry.task(state.task).unwrap().outcome,
+        Some(TaskOutcome::NoCandidate { .. })
+    ));
     assert!(engine.physical_completion_proofs.is_empty());
     let mandatory_domain = engine.physical_search_domain(root, goal).unwrap();
     engine.mandatory_only = false;
-    assert_ne!(mandatory_domain, engine.physical_search_domain(root, goal).unwrap());
+    assert_ne!(
+        mandatory_domain,
+        engine.physical_search_domain(root, goal).unwrap()
+    );
     engine.optimize_group(root, goal).unwrap();
     assert!(engine.memo.group(root).unwrap().winner(goal).is_some());
     let evaluations = engine.physical_implementation_expression_evaluations;
     engine.optimize_group(root, goal).unwrap();
-    assert_eq!(evaluations, engine.physical_implementation_expression_evaluations);
+    assert_eq!(
+        evaluations,
+        engine.physical_implementation_expression_evaluations
+    );
 }
 
 #[test]
@@ -1938,9 +1918,13 @@ fn optional_phase_enumerates_implementations_without_a_logical_publication() {
     let (mut engine, root, goal) = engine_with_budget(Default::default());
     let mut registry = ImplementationRegistry::default();
     for (id, score, mandatory) in [(40, 100.0, true), (41, 1.0, false)] {
-        registry.register_implementation(FixedLeafImplementation {
-            id: ImplementationId(id), score, mandatory,
-        }).unwrap();
+        registry
+            .register_implementation(FixedLeafImplementation {
+                id: ImplementationId(id),
+                score,
+                mandatory,
+            })
+            .unwrap();
     }
     // No transformations: the logical ReadSet remains exactly the same when
     // optional physical implementations become eligible.
@@ -1948,14 +1932,24 @@ fn optional_phase_enumerates_implementations_without_a_logical_publication() {
     let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
     assert_eq!(engine.memo.group(root).unwrap().logical_exprs().len(), 1);
     assert_eq!(engine.memo.group(root).unwrap().physical_exprs().len(), 2);
-    assert_eq!(engine.memo.physical_expr(winner.expression).unwrap().key.implementation,
-        ImplementationId(41));
+    assert_eq!(
+        engine
+            .memo
+            .physical_expr(winner.expression)
+            .unwrap()
+            .key
+            .implementation,
+        ImplementationId(41)
+    );
     assert_eq!(winner.cost.score.range.expected, 1.0);
     assert!(engine.memo.search_obligations_empty());
     let evaluations = engine.physical_implementation_expression_evaluations;
     let publications = engine.memo.published_winner_count();
     engine.optimize_group(root, goal).unwrap();
-    assert_eq!(engine.physical_implementation_expression_evaluations, evaluations);
+    assert_eq!(
+        engine.physical_implementation_expression_evaluations,
+        evaluations
+    );
     assert_eq!(engine.memo.published_winner_count(), publications);
 }
 
@@ -2009,12 +2003,10 @@ fn engine_group_merge_redirects_tasks_and_discards_stale_transform_state() {
         Some(TaskState::Invalidated)
     );
     assert!(engine.transformation_observations.is_empty());
-    assert!(
-        !engine
-            .transformation_subscribers
-            .values()
-            .any(|tasks| tasks.contains(&transform_task))
-    );
+    assert!(!engine
+        .transformation_subscribers
+        .values()
+        .any(|tasks| tasks.contains(&transform_task)));
 }
 
 fn transformation_chain_engine(
@@ -2447,24 +2439,20 @@ fn rule_work_profile_is_opt_in_for_diagnostic_cohorts() {
     diagnostic.set_rule_work_profile_enabled(true);
     diagnostic.optimize(group, goal, SearchMode::Memo).unwrap();
     assert!(!diagnostic.rule_work_profile().is_empty());
-    assert!(
-        diagnostic
-            .rule_work_profile()
-            .values()
-            .any(|profile| profile.first_discovered_us.is_some())
-    );
+    assert!(diagnostic
+        .rule_work_profile()
+        .values()
+        .any(|profile| profile.first_discovered_us.is_some()));
     assert!(diagnostic.search_milestones().first_safe_us.is_some());
-    assert!(
-        diagnostic
-            .search_milestones()
-            .first_optional_ready_us
-            .is_some()
-    );
+    assert!(diagnostic
+        .search_milestones()
+        .first_optional_ready_us
+        .is_some());
 }
 
 #[test]
 fn rejection_guards_are_diagnostic_only_and_exclude_successful_proof_branches() {
-    use crate::transformation_rejection::{TransformationRejectionGuard as Guard, reject};
+    use crate::transformation_rejection::{reject, TransformationRejectionGuard as Guard};
     struct WitnessRule {
         emit: bool,
     }
@@ -2697,16 +2685,14 @@ fn statement_cancellation_is_not_an_advisory_rule_failure() {
     let error = engine.optimize(group, goal, SearchMode::Memo).unwrap_err();
     assert!(error.is_query_canceled());
     assert_eq!(engine.memo.group_count(), 1);
-    assert!(
-        !engine
-            .memo
-            .search_obligations()
-            .iter()
-            .any(|obligation| matches!(
-                obligation.reason,
-                crate::cascades::budget::SearchIncompleteReason::RuleFailure { .. }
-            ))
-    );
+    assert!(!engine
+        .memo
+        .search_obligations()
+        .iter()
+        .any(|obligation| matches!(
+            obligation.reason,
+            crate::cascades::budget::SearchIncompleteReason::RuleFailure { .. }
+        )));
 }
 
 #[test]
@@ -2722,12 +2708,10 @@ fn engine_seals_context_catalog_before_optional_search() {
     let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
 
     assert_eq!(winner.physical_fingerprint, Fingerprint(10));
-    assert!(
-        engine
-            .memo()
-            .optimization_context(OptimizationContextId(1))
-            .is_none()
-    );
+    assert!(engine
+        .memo()
+        .optimization_context(OptimizationContextId(1))
+        .is_none());
 }
 
 #[test]
@@ -2832,11 +2816,9 @@ fn shared_child_product_is_lazy_and_uses_immutable_candidate_references() {
             .sum::<usize>(),
         128
     );
-    assert!(
-        batch
-            .combinations
-            .all(|combination| combination.len() == 64)
-    );
+    assert!(batch
+        .combinations
+        .all(|combination| combination.len() == 64));
     assert_eq!(
         engine.memo().group_count(),
         1,
@@ -2917,11 +2899,9 @@ fn incremental_child_combination_oracle_covers_only_the_frontier_delta() {
     state.observe_frontiers(grown.clone());
     let right_delta = drain(&mut state).into_iter().collect::<BTreeSet<_>>();
     assert_eq!(right_delta.len(), 3);
-    assert!(
-        right_delta
-            .iter()
-            .all(|children| children[1] == CandidateId::new(12))
-    );
+    assert!(right_delta
+        .iter()
+        .all(|children| children[1] == CandidateId::new(12)));
     assert!(seen.is_disjoint(&right_delta));
     seen.extend(right_delta);
     assert_eq!(seen.len(), 9, "the full 3-by-3 product is covered once");
@@ -4008,17 +3988,15 @@ fn blocking_enforcers_participate_in_grant_feasibility() {
         spill_policy: SpillPolicy::Forbidden,
         max_parallel_tasks: 1,
     };
-    assert!(
-        enforcer_cost(
-            &[EnforcerStep::MutationInputSpool {
-                barrier: super::super::ids::MutationBarrierId(0),
-            }],
-            too_small,
-            &MachineCalibrationBundle::default(),
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(enforcer_cost(
+        &[EnforcerStep::MutationInputSpool {
+            barrier: super::super::ids::MutationBarrierId(0),
+        }],
+        too_small,
+        &MachineCalibrationBundle::default(),
+    )
+    .unwrap()
+    .is_none());
 
     let spillable = EnforcerCostInput {
         spill_policy: SpillPolicy::Allowed,
@@ -4725,8 +4703,8 @@ fn exact_survivor_bounds_are_absolute_and_proof_idempotent() {
     let correlated = apply(
         &first,
         SidewaysFilterSource {
-            domain: DomainProofId(Fingerprint(first_proof.domain.0.0 + 1)),
-            evaluation: EvaluationOccurrenceId(Fingerprint(first_proof.evaluation.0.0 + 1)),
+            domain: DomainProofId(Fingerprint(first_proof.domain.0 .0 + 1)),
+            evaluation: EvaluationOccurrenceId(Fingerprint(first_proof.evaluation.0 .0 + 1)),
             ..first_proof
         },
     );
@@ -5218,12 +5196,10 @@ fn parent_costs_every_source_sensitive_child_frontier_candidate() {
     engine.diagnostic_cost_phase_times = Some(Arc::clone(&phase_times));
 
     let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
-    assert!(
-        phase_times
-            .0
-            .iter()
-            .all(|n| n.load(std::sync::atomic::Ordering::Relaxed) > 0)
-    );
+    assert!(phase_times
+        .0
+        .iter()
+        .all(|n| n.load(std::sync::atomic::Ordering::Relaxed) > 0));
 
     // Independent exhaustive oracle: remove each candidate's source phase
     // from its complete cost, apply the proven absolute survivor ratio once,

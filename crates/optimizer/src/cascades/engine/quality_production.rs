@@ -141,6 +141,7 @@ impl QualityProductionRequest {
         })
     }
 
+    #[cfg(test)]
     fn from_candidate(
         memo: &Memo,
         frozen: &Arc<FrozenCandidate>,
@@ -367,9 +368,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         continuations: Vec<DomainContinuation>,
     ) -> Result<()> {
-        if continuations.is_empty()
-            || !self.quality_production_requests.contains_key(&goal)
-        {
+        if continuations.is_empty() || !self.quality_production_requests.contains_key(&goal) {
             return Ok(());
         }
         let (enqueued, bindings) = {
@@ -462,11 +461,12 @@ impl CascadesEngine {
                 .quality_preflight_domain_binding_provider_call_count
                 .saturating_add(1);
             request.domain_bindings =
-                provider.preflight_domain_bindings(&self.memo, reference, winner, nodes, goal)?;
+                provider.selected_domain_bindings(&self.memo, reference, winner, nodes, goal)?;
         }
         self.install_quality_production_request(goal, request)
     }
 
+    #[cfg(test)]
     pub(super) fn record_quality_production_request(
         &mut self,
         goal: OptimizationGoal,

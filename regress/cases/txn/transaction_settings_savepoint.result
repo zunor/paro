@@ -106,7 +106,6 @@ paro_diagnostic/PARO_DIAGNOSTIC_STRUCTURAL_QUALITY_EVIDENCE	<unset>	Effective pr
 paro_diagnostic/PARO_DIAGNOSTIC_WORK_PARTITION	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_DISABLE_PROTECTED_INCUMBENT	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_EXPORT_STRONG_INCUMBENT	<unset>	Effective process-start diagnostic environment (read-only)
-paro_diagnostic/PARO_QUALITY_PREFLIGHT	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_STATEMENT_CACHE_EVIDENCE	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_STATEMENT_TRACE	<unset>	Effective process-start diagnostic environment (read-only)
 paro_diagnostic/PARO_STATEMENT_TRACE_SAMPLE	<unset>	Effective process-start diagnostic environment (read-only)

@@ -16,7 +16,7 @@ use paro_common::error::{self as paro_error, Result};
 use super::ids::{
     CandidateId, Fingerprint, LogicalExprId, PhysicalExprId, QualityPolicyId, RuleId,
 };
-use super::memo::{ChildWinnerRef, FrozenCandidate, Memo, OptimizationGoal, Winner};
+use super::memo::{ChildWinnerRef, Memo, OptimizationGoal, Winner};
 use super::rules::PatternBinding;
 use super::tasks::{ReadSet, ReadSetId};
 
@@ -187,43 +187,43 @@ pub struct QualityCandidateNode {
     pub children: Box<[ChildWinnerRef]>,
 }
 
-/// The cheap side of the quality handoff.  A producer may return this after
-/// inspecting only the exact Memo winner references.  Missing evidence is
-/// represented by facts omitted from the compact evidence.  The engine
-/// uses `nodes` and `reads` to request that work
-/// instead of freezing a candidate which cannot be handed off.  An absent
-/// reference graph is represented by the trait method returning `None`, which
-/// selects the complete validation/oracle path.
+/// Exact selected-choice properties and the fact dependencies used to derive
+/// them. Missing facts request production work; absence means the graph could
+/// not be certified. There is no second frozen-tree quality implementation.
 #[derive(Debug, Clone)]
-pub struct QualityCandidatePreflight {
+pub struct SelectedQualityEvidence {
     pub nodes: Box<[QualityCandidateNode]>,
     pub reads: ReadSet,
     pub evidence: NativeQualityEvidence,
 }
 
-/// Production producers must inspect the exact frozen DAG they are asked to
-/// certify. They may not discover a replacement plan or read a stale frontier.
+/// The provider observes immutable selected choices. It never changes a
+/// candidate or substitutes a different frontier winner. The engine performs
+/// executable verification and freezing only after policy certification.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QualityPropertyWork {
+    pub node_builds: u64,
+    pub node_reuses: u64,
+    pub cte_builds: u64,
+    pub cte_reuses: u64,
+}
+
 pub trait QualityEvidenceProvider: std::fmt::Debug {
-    /// Inspect an exact frontier winner without freezing its complete DAG.
-    /// `None` means that the provider does not implement the accelerator and
-    /// the caller must use the complete legacy/oracle path below.
-    fn preflight(
-        &self,
-        _memo: &Memo,
-        _reference: ChildWinnerRef,
-        _winner: &Winner,
-        _goal: OptimizationGoal,
-    ) -> Result<Option<QualityCandidatePreflight>> {
-        Ok(None)
+    fn property_work(&self) -> Option<QualityPropertyWork> {
+        None
     }
 
-    /// Build exact selected-path bindings only after the corresponding
-    /// production request has won the preference check.  A preflight is
-    /// allowed to identify a missing predicate-domain obligation without
-    /// constructing all of its transport payloads.  The default keeps custom
-    /// providers on the ordinary task path; the planner provider overrides it
-    /// with the existing native binding implementation.
-    fn preflight_domain_bindings(
+    fn evaluate(
+        &self,
+        memo: &Memo,
+        reference: ChildWinnerRef,
+        winner: &Winner,
+        goal: OptimizationGoal,
+    ) -> Result<Option<SelectedQualityEvidence>>;
+
+    /// Construct transport only for the missing domain request chosen by the
+    /// existing production scheduler, not for every candidate inspection.
+    fn selected_domain_bindings(
         &self,
         _memo: &Memo,
         _reference: ChildWinnerRef,
@@ -233,14 +233,6 @@ pub trait QualityEvidenceProvider: std::fmt::Debug {
     ) -> Result<Box<[PatternBinding]>> {
         Ok(Box::new([]))
     }
-
-    fn evidence(
-        &self,
-        memo: &Memo,
-        reference: ChildWinnerRef,
-        frozen: &FrozenCandidate,
-        goal: OptimizationGoal,
-    ) -> Result<Option<NativeQualityEvidence>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

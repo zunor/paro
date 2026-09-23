@@ -114,12 +114,104 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
             candidate: winner.candidate,
         };
         let state = state.read().unwrap();
-        let inspected = inspect_quality_candidate(engine.memo(), reference, &state)
-            .unwrap()
-            .unwrap();
+        let mut properties = quality_properties::SelectedQualityProperties::default();
+        let inspected =
+            inspect_quality_candidate(engine.memo(), reference, &state, &mut properties)
+                .unwrap()
+                .unwrap();
         assert_eq!(inspected.cte_producer_witnesses.contains(&9), normalized);
         // Initial/normalization provenance alone never supplies the property.
         assert!(inspected.rules.is_empty());
+        let frozen = engine.memo().freeze_candidate_tree(reference).unwrap();
+        let expected =
+            frozen_quality_evidence(engine.memo(), reference, &frozen, input.root_goal, &state)
+                .unwrap()
+                .unwrap();
+        let actual = planner_quality_evidence(
+            engine.memo(),
+            reference,
+            &winner,
+            input.root_goal,
+            &state,
+            &mut properties,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual.evidence, expected, "normalized={normalized}");
+        let builds = properties.builds;
+        let domain_builds = properties.cte_domains.builds;
+        let again = planner_quality_evidence(
+            engine.memo(),
+            reference,
+            &winner,
+            input.root_goal,
+            &state,
+            &mut properties,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(again.evidence, expected);
+        assert_eq!(properties.builds, builds);
+        assert_eq!(properties.cte_domains.builds, domain_builds);
+        assert!(properties.reuses > 0);
+        assert!(properties.cte_domains.reuses > 0);
+        // The same exact candidate must refresh after a real fact mutation.
+        // Only that node and its ancestors are re-derived, not its siblings.
+        let changed = actual
+            .nodes
+            .iter()
+            .find(|node| node.children.is_empty())
+            .unwrap()
+            .reference;
+        let unchanged: Vec<_> = actual
+            .nodes
+            .iter()
+            .filter(|node| node.children.is_empty() && node.reference.group != changed.group)
+            .map(|node| {
+                (
+                    node.reference.candidate,
+                    properties.revision(node.reference.candidate),
+                )
+            })
+            .collect();
+        engine
+            .memo_mut()
+            .group_mut(changed.group)
+            .unwrap()
+            .logical_properties
+            .maximum_cardinality = Some(17);
+        let refreshed = planner_quality_evidence(
+            engine.memo(),
+            reference,
+            &winner,
+            input.root_goal,
+            &state,
+            &mut properties,
+        )
+        .unwrap()
+        .unwrap();
+        let frozen = engine.memo().freeze_candidate_tree(reference).unwrap();
+        assert_eq!(
+            refreshed.evidence,
+            frozen_quality_evidence(engine.memo(), reference, &frozen, input.root_goal, &state)
+                .unwrap()
+                .unwrap()
+        );
+        assert!(properties.builds > builds);
+        assert!(properties.builds - builds < actual.nodes.len() as u64);
+        for (candidate, revision) in unchanged {
+            assert_eq!(properties.revision(candidate), revision);
+        }
+        // A truncated or cyclic choice graph cannot borrow a cached success.
+        let mut invalid = actual.nodes.to_vec();
+        let root_node = invalid
+            .iter_mut()
+            .find(|node| node.reference == reference)
+            .unwrap();
+        root_node.children = vec![reference].into_boxed_slice();
+        assert!(!properties
+            .refresh(engine.memo(), reference, &invalid, &state)
+            .unwrap());
     }
 }
 
