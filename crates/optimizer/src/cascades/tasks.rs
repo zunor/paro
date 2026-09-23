@@ -169,6 +169,21 @@ pub struct ReadSet {
     reads: Arc<[PatternRead]>,
 }
 
+/// An observation of this exact, immutably borrowed Memo. The private
+/// constructor and borrow prevent a caller from asserting freshness or
+/// mutating the Memo between validation and task lookup. This is ephemeral:
+/// resident tasks still retain ordinary revision-sensitive ReadSets.
+pub(crate) struct CurrentReadSet<'m> {
+    reads: ReadSet,
+    memo: &'m Memo,
+}
+
+impl CurrentReadSet<'_> {
+    pub(crate) fn reads(&self) -> &ReadSet {
+        &self.reads
+    }
+}
+
 impl ReadSet {
     /// Build the overwhelmingly common one-group read without constructing a
     /// temporary ordered map.  A single read already satisfies the canonical
@@ -239,6 +254,11 @@ impl ReadSet {
             Some(reads) => (Self::new(reads), true),
             None => (self.clone(), false),
         })
+    }
+
+    pub(crate) fn observe<'m>(&self, memo: &'m Memo) -> Result<(CurrentReadSet<'m>, bool)> {
+        let (reads, changed) = self.refreshed(memo)?;
+        Ok((CurrentReadSet { reads, memo }, changed))
     }
 
     pub fn is_current(&self, memo: &Memo) -> Result<bool> {
@@ -645,7 +665,7 @@ impl TaskRegistry {
     }
 
     pub fn request(&mut self, intent: TaskIntent, reads: ReadSet) -> Result<TaskRequest> {
-        self.request_with_current_reads(intent, reads, None)
+        self.request_with_current_reads(intent, reads, None, false)
     }
 
     /// Request a task while checking the actual Memo revisions represented by
@@ -662,7 +682,20 @@ impl TaskRegistry {
         let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
         let intent = canonicalize_task_intent(memo, intent);
         let reads = canonicalize_read_set(memo, reads);
-        self.request_with_current_reads(intent, reads, Some(memo))
+        self.request_with_current_reads(intent, reads, Some(memo), false)
+    }
+
+    /// Consume a fresh observation without rescanning its cursors. Unlike a
+    /// boolean "already checked" flag, the token holds the Memo borrow until
+    /// this lookup completes. Refresh has also canonicalized redirected groups.
+    pub(crate) fn request_observed(
+        &mut self,
+        intent: TaskIntent,
+        observed: CurrentReadSet<'_>,
+    ) -> Result<TaskRequest> {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let intent = canonicalize_task_intent(observed.memo, intent);
+        self.request_with_current_reads(intent, observed.reads, Some(observed.memo), true)
     }
 
     fn request_with_current_reads(
@@ -670,6 +703,7 @@ impl TaskRegistry {
         intent: TaskIntent,
         reads: ReadSet,
         memo: Option<&Memo>,
+        observed_current: bool,
     ) -> Result<TaskRequest> {
         self.profile.requests = self.profile.requests.saturating_add(1);
         let kind = intent.kind();
@@ -686,6 +720,7 @@ impl TaskRegistry {
                 .state;
             if !matches!(state, TaskState::Running)
                 && !matches!(state, TaskState::Invalidated)
+                && !observed_current
                 && memo.is_some_and(|memo| {
                     self.read_set(read_set)
                         .is_none_or(|read_set| !read_set.is_current(memo).unwrap_or(false))
@@ -1814,6 +1849,67 @@ fn canonicalize_read_set(memo: &Memo, reads: ReadSet) -> ReadSet {
 mod tests {
     use super::*;
     use crate::cascades::rules::ReadScope;
+
+    #[test]
+    fn observed_request_reuses_only_the_exact_live_input_revision() {
+        let mut memo = Memo::new(Default::default());
+        let group = memo.create_group(
+            GroupSchema::new([]).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let peer = memo.create_group(
+            GroupSchema::new([]).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let reads = ReadSet::single(PatternRead::from_group(&memo, group).unwrap());
+        let intent = TaskIntent::Optimize {
+            group,
+            goal: goal(),
+        };
+        let mut registry = TaskRegistry::default();
+        let (observed, changed) = reads.observe(&memo).unwrap();
+        assert!(!changed);
+        assert!(Arc::ptr_eq(&reads.reads, &observed.reads().reads));
+        let TaskRequest::Leader(first) =
+            registry.request_observed(intent.clone(), observed).unwrap()
+        else {
+            panic!("new observation")
+        };
+        registry.start(first).unwrap();
+        let read_id = registry.intern_read_set(reads.clone());
+        registry
+            .complete(first, TaskOutcome::NoChange { reads: read_id })
+            .unwrap();
+        memo.group_mut(peer)
+            .unwrap()
+            .logical_properties
+            .maximum_cardinality = Some(3);
+        let (observed, changed) = reads.observe(&memo).unwrap();
+        assert!(!changed, "unread facts do not invalidate the observation");
+        assert!(
+            matches!(registry.request_observed(intent.clone(), observed).unwrap(), TaskRequest::Reused { task, .. } if task == first)
+        );
+        memo.group_mut(group)
+            .unwrap()
+            .logical_properties
+            .maximum_cardinality = Some(5);
+        let (observed, changed) = reads.observe(&memo).unwrap();
+        assert!(changed);
+        assert!(
+            matches!(registry.request_observed(intent, observed).unwrap(), TaskRequest::Leader(task) if task != first)
+        );
+        let canonical = memo.merge_groups(group, peer).unwrap();
+        let redirected = ReadSet::single(PatternRead {
+            group: peer,
+            ..reads.reads()[0]
+        });
+        let (observed, changed) = redirected.observe(&memo).unwrap();
+        assert!(changed);
+        assert_eq!(observed.reads().reads()[0].group, canonical);
+        assert!(observed.reads().is_current(&memo).unwrap());
+    }
 
     #[test]
     fn canonical_task_reads_are_shared_not_reassembled() {

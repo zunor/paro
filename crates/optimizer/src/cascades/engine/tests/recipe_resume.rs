@@ -568,9 +568,12 @@ fn resident_read_snapshot_shares_storage_and_refreshes_exact_child_goal() {
         .as_ref()
         .unwrap()
         .clone();
-    let (same, changed) = engine
-        .physical_read_set_incremental(root, goal, Some(&resident))
+    let (domain, changed) = engine
+        .physical_read_domain(root, goal, Some(&resident))
         .unwrap();
+    assert!(!changed);
+    let (observed, changed) = domain.observe(&engine.memo).unwrap();
+    let same = observed.reads();
     assert!(!changed);
     assert_eq!(same.reads().as_ptr(), resident.reads.reads().as_ptr());
     let cloned = resident.clone();
@@ -592,14 +595,17 @@ fn resident_read_snapshot_shares_storage_and_refreshes_exact_child_goal() {
         456,
         456,
     );
-    let (fresh, changed) = engine
-        .physical_read_set_incremental(root, goal, Some(&resident))
+    let (domain, shape_changed) = engine
+        .physical_read_domain(root, goal, Some(&resident))
         .unwrap();
+    assert!(!shape_changed);
+    let (observed, changed) = domain.observe(&engine.memo).unwrap();
+    let fresh = observed.reads();
     assert!(changed);
     assert_ne!(fresh.reads().as_ptr(), resident.reads.reads().as_ptr());
     assert!(!resident.reads.is_current(&engine.memo).unwrap());
     assert!(fresh.is_current(&engine.memo).unwrap());
-    assert_eq!(fresh, engine.physical_read_set(root, goal).unwrap());
+    assert_eq!(*fresh, engine.physical_read_set(root, goal).unwrap());
 }
 
 #[test]

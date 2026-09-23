@@ -7833,16 +7833,11 @@ impl CascadesEngine {
         self.physical_subproblems.entry(key).or_default().resident = Some(state);
     }
 
-    /// Refresh a resident physical task's read cursor by delta.
-    ///
-    /// A task is invalidated for a reason, but that does not mean every input
-    /// it has ever observed changed.  Keep current `PatternRead` values and
-    /// rebuild only the owner or child-goal entries whose version is stale;
-    /// add/remove entries only when the recipe dependency set changed.  The
-    /// resulting ReadSet remains the existing TaskRegistry contract, so this
-    /// is an incremental producer for the same proof rather than a second
-    /// invalidation mechanism.
-    fn physical_read_set_incremental(
+    /// Select the resident input domain without asserting freshness. The
+    /// caller observes it once under an immutable Memo borrow and carries
+    /// that observation through the task lookup. A changed dependency shape
+    /// is rebuilt from its owner, never from notification heuristics.
+    fn physical_read_domain(
         &self,
         group: GroupId,
         goal: OptimizationGoal,
@@ -7864,10 +7859,7 @@ impl CascadesEngine {
             _ => false,
         };
         if same_dependencies {
-            // The dependency owner publishes an immutable set only when its
-            // shape changes. Refresh each observed cursor once, without
-            // rebuilding/sorting the set on the overwhelmingly common hit.
-            return previous.reads.refreshed(&self.memo);
+            return Ok((previous.reads.clone(), false));
         }
         // A new recipe, withdrawal or merge changes the exact read domain.
         // Reconstruct from its owner; never retain removed child witnesses.
@@ -7890,19 +7882,20 @@ impl CascadesEngine {
         let implementation_phase_changed = resident_state
             .as_ref()
             .is_some_and(|entry| entry.mandatory_only != self.mandatory_only);
+        let (read_domain, domain_changed) =
+            self.physical_read_domain(group, goal, resident_state.as_ref())?;
+        let (observed, reads_changed) = read_domain.observe(&self.memo)?;
+        let read_set_changed = domain_changed || reads_changed;
         let fast_reuse = !force_full_recost
             && !implementation_phase_changed
             && dirty_recipes.is_none()
             && !completion_pending
+            && !read_set_changed
             && resident_state.as_ref().is_some_and(|entry| {
                 next_recipe_sequence <= entry.recipe_cursor
                     && (entry.complete
                         || (self.preserve_incomplete_physical
                             && !self.physical_interleave_step_mode))
-                    && entry
-                        .reads
-                        .is_current(&self.memo)
-                        .is_ok_and(|current| current)
             });
         if fast_reuse {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
@@ -7915,13 +7908,11 @@ impl CascadesEngine {
         self.physical_readset_initial_capture_count = self
             .physical_readset_initial_capture_count
             .saturating_add(1);
-        let (requested_read_set, read_set_changed) =
-            self.physical_read_set_incremental(group, goal, resident_state.as_ref())?;
+        let requested_read_set = observed.reads().clone();
         if read_set_changed {
             self.physical_readset_rebuild_count =
                 self.physical_readset_rebuild_count.saturating_add(1);
         }
-        let read_set = requested_read_set.clone();
         let mut new_evaluation = false;
         // An incomplete result from the readiness queue is a reusable prefix,
         // not an instruction to reopen the task on every recursive visit. We
@@ -7929,11 +7920,10 @@ impl CascadesEngine {
         // the exact current frontier below.
         let mut resume_candidate = false;
         let mut resumed_incomplete = false;
-        let task = match self.task_registry.request_current(
-            TaskIntent::Optimize { group, goal },
-            read_set,
-            &self.memo,
-        )? {
+        let task = match self
+            .task_registry
+            .request_observed(TaskIntent::Optimize { group, goal }, observed)?
+        {
             TaskRequest::Leader(task) => {
                 new_evaluation = true;
                 task
@@ -8283,8 +8273,9 @@ impl CascadesEngine {
                 // exact post-child ReadSet before publication; otherwise a
                 // later parent could either miss a child change or retain a
                 // provisional pre-child snapshot.
-                let (post_child_reads, _post_readset_changed) =
-                    self.physical_read_set_incremental(group, goal, resident_state.as_ref())?;
+                let (post_domain, _) =
+                    self.physical_read_domain(group, goal, resident_state.as_ref())?;
+                let (post_child_reads, _) = post_domain.refreshed(&self.memo)?;
                 if post_child_reads != requested_read_set {
                     self.physical_readset_rebuild_count =
                         self.physical_readset_rebuild_count.saturating_add(1);
