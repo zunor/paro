@@ -113,6 +113,7 @@ mod extraction;
 mod identity;
 mod implementation;
 mod predicate_order;
+pub(crate) mod restriction;
 mod scalar_facts;
 mod semantic_plan;
 mod state;

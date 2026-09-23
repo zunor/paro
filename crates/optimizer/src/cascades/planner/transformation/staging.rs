@@ -788,7 +788,7 @@ pub(super) fn stage_transformed_expression(
     fn stage_node(
         session: &mut StagingSession<'_>,
         request: NodeStagingRequest,
-        child_states: Vec<NodeState>,
+        mut child_states: Vec<NodeState>,
     ) -> Result<Option<(NodeState, Option<StagedEquivalent>)>> {
         let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Encoding);
         let NodeStagingRequest {
@@ -799,72 +799,73 @@ pub(super) fn stage_transformed_expression(
             node_context,
             target_child_context,
         } = request;
-        let (id, stats, semantic_operator, settled_layout, source_proofs, resident) = match input {
-            NodeStagingInput::Settled {
-                node,
-                layout,
-                resident,
-            } => {
-                crate::work_partition::settled_node(false);
-                if let LogicalOperator::BoundReference(reference) = &node.operator {
-                    if target.is_some()
-                        || !session
-                            .nested_group_holes
-                            .contains_key(&reference.reference_id)
-                    {
-                        return Err(paro_error::internal(
-                            "staging reached an unregistered or root Memo group hole",
-                        ));
+        let (id, stats, mut semantic_operator, settled_layout, source_proofs, mut resident) =
+            match input {
+                NodeStagingInput::Settled {
+                    node,
+                    layout,
+                    resident,
+                } => {
+                    crate::work_partition::settled_node(false);
+                    if let LogicalOperator::BoundReference(reference) = &node.operator {
+                        if target.is_some()
+                            || !session
+                                .nested_group_holes
+                                .contains_key(&reference.reference_id)
+                        {
+                            return Err(paro_error::internal(
+                                "staging reached an unregistered or root Memo group hole",
+                            ));
+                        }
+                        let names = Arc::from(node.operator.output_names_from_child_refs(&[]));
+                        let LogicalOperator::BoundReference(reference) = node.operator else {
+                            unreachable!()
+                        };
+                        let node = resolve_group_hole_reference(
+                            session,
+                            node.id,
+                            node.stats,
+                            Arc::unwrap_or_clone(layout),
+                            names,
+                            reference,
+                        )?;
+                        return Ok(Some((node, None)));
                     }
-                    let names = Arc::from(node.operator.output_names_from_child_refs(&[]));
-                    let LogicalOperator::BoundReference(reference) = node.operator else {
-                        unreachable!()
-                    };
-                    let node = resolve_group_hole_reference(
-                        session,
+                    let source_proofs = session
+                        .selected_proofs
+                        .get(&node.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    (
                         node.id,
                         node.stats,
-                        Arc::unwrap_or_clone(layout),
-                        names,
-                        reference,
-                    )?;
-                    return Ok(Some((node, None)));
+                        node.operator,
+                        Some(layout),
+                        source_proofs,
+                        resident,
+                    )
                 }
-                let source_proofs = session
-                    .selected_proofs
-                    .get(&node.id)
-                    .cloned()
-                    .unwrap_or_default();
-                (
-                    node.id,
-                    node.stats,
-                    node.operator,
-                    Some(layout),
-                    source_proofs,
-                    resident,
-                )
-            }
-            NodeStagingInput::Native {
-                id,
-                stats,
-                operator,
-                source_proofs,
-                resident,
-            } => {
-                let semantic_operator = operator
-                    .clone()
-                    .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
-                    .expect("mapping native group references to a semantic shell cannot fail");
-                (
+                NodeStagingInput::Native {
                     id,
-                    stats.clone(),
-                    semantic_operator,
-                    None,
+                    stats,
+                    operator,
                     source_proofs,
                     resident,
-                )
-            }
-        };
+                } => {
+                    let semantic_operator = operator
+                        .clone()
+                        .try_map_child_links(&mut |_| Ok::<_, std::convert::Infallible>(()))
+                        .expect("mapping native group references to a semantic shell cannot fail");
+                    (
+                        id,
+                        stats.clone(),
+                        semantic_operator,
+                        None,
+                        source_proofs,
+                        resident,
+                    )
+                }
+            };
         crate::work_partition::staging_payload(false);
         let native_direct = settled_layout.is_none();
         if native_direct {
@@ -895,10 +896,6 @@ pub(super) fn stage_transformed_expression(
             .unwrap_or(options.column_stats);
         let pending_runtime_filter_facets = &mut session.pending_runtime_filter_facets;
 
-        let child_layouts = child_states
-            .iter()
-            .map(|child| child.layout.as_ref())
-            .collect::<Vec<_>>();
         if let Some(contract) = resident.as_ref() {
             if contract.input_fact_count() != child_states.len() {
                 return Err(paro_error::internal(
@@ -948,6 +945,39 @@ pub(super) fn stage_transformed_expression(
                 }
             }
         }
+        if let Some(child) = child_states.first_mut() {
+            if let Some((operator, base)) = restriction::normalize_memo_input(
+                &semantic_operator,
+                child.group,
+                memo,
+                state,
+                &session.facts,
+                target_child_context.unwrap_or(node_context),
+            )? {
+                let facts = session.facts.transport(memo, state, base, &child.layout)?;
+                child.group = base;
+                child.stats.estimated_cardinality = facts.cardinality;
+                child.stats.cardinality_provenance = if facts.cardinality.is_some() {
+                    paro_planner::plan::CardinalityProvenance::Statistics
+                } else {
+                    paro_planner::plan::CardinalityProvenance::Unknown
+                };
+                child.stats.materialization_risk_cardinality =
+                    facts.cardinality.map(|rows| rows.max);
+                child.stats.unique_keys = facts.unique_keys.clone();
+                child.boundary_facts = Some(facts);
+                child.region_scope = PlannerRegionScope::group(base);
+                semantic_operator = operator;
+                // The old contract was validated above, but belongs to a
+                // different input edge. Lower the normalized shell exactly
+                // once; never rebind a frozen contract to unrelated facts.
+                resident = None;
+            }
+        }
+        let child_layouts = child_states
+            .iter()
+            .map(|child| child.layout.as_ref())
+            .collect::<Vec<_>>();
         let output_layout = match (settled_layout, resident.as_ref()) {
             (Some(layout), Some(contract)) => {
                 if layout.as_ref() != &contract.output_layout {
@@ -1222,8 +1252,7 @@ pub(super) fn stage_transformed_expression(
             {
                 return Err(paro_error::internal(format!(
                     "transformation rule {} changed its target group logical contract: target_schema={:?}, output_schema={schema:?}, target_properties={:?}, output_properties={logical_properties:?}",
-                    options.rule.0,
-                    contract.schema, contract.logical_properties,
+                    options.rule.0, contract.schema, contract.logical_properties,
                 )));
             }
             target
@@ -2235,6 +2264,110 @@ mod tests {
     }
 
     #[test]
+    fn restriction_publication_rebinds_to_base_facts_without_a_nested_filter() {
+        use paro_common::runtime_value::Value;
+        use paro_planner::expression::{
+            ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression,
+        };
+        use paro_planner::operator::{Filter, ProjectionMap};
+        let predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(2), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        );
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            test_base_get(0, 30100, "restriction", 100),
+            vec![predicate.clone()],
+        )));
+        let layout = Arc::new(plan.output_layout());
+        let mut input =
+            MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+        let root = input.root;
+        let mut state = input.planner_state.write().unwrap();
+        state.session = Some(TestStatementContextBuilder::minimal().build());
+        let expr = input.memo.group(root).unwrap().logical_exprs()[0];
+        let logical = input.memo.logical_expr(expr).unwrap();
+        let base = logical.key.children[0];
+        let context = state.metadata[&logical.payload].child_context;
+        let facts = {
+            let mut ctx = TransformContext::new(&mut input.memo, root);
+            boundary::BoundarySnapshot::read(
+                &mut ctx,
+                &state,
+                &PatternOperand::Group(root),
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let child = NativeChild::memo_group(
+            &input.memo,
+            &state,
+            &facts,
+            root,
+            &layout,
+            Arc::from(["id".to_owned()]),
+        )
+        .unwrap();
+        let shell = NativeShell {
+            nodes: vec![NativeNode {
+                id: state.bind_context.next_plan_id(),
+                stats: NodeStats::default(),
+                operator: LogicalOperator::Filter(Filter {
+                    expressions: vec![predicate],
+                    child,
+                    projection_map: ProjectionMap::all(),
+                }),
+                source_proofs: Box::new([]),
+            }]
+            .into_boxed_slice(),
+            root: 0,
+        };
+        let staged = stage_transformed_expression(
+            StagingRequest {
+                input: StagingInput::Native {
+                    shell,
+                    resident_nodes: HashMap::new(),
+                },
+                input_facts: facts,
+                column_stats: Arc::new(HashMap::new()),
+                column_stat_scopes: HashMap::new(),
+                resident_nodes: HashMap::new(),
+                target: StagingTarget {
+                    group: root,
+                    rule: RuleId(992),
+                    budget_class: TransformationBudgetClass::Local,
+                    input_context: context,
+                    child_context: context,
+                },
+                regions: StagingRegionRequirements {
+                    preserved_facet: None,
+                    extended_required_facets: Box::new([]),
+                    inherited_runtime_filter_facet: None,
+                },
+                nested_group_holes: BTreeMap::new(),
+                selected_proofs: HashMap::new(),
+            },
+            &mut input.memo,
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(staged.key.children.as_ref(), &[base]);
+        assert_eq!(
+            state.metadata[&staged.payload].child_layouts[0].as_ref(),
+            layout.as_ref()
+        );
+    }
+
+    #[test]
     fn alias_projections_allocate_distinct_schema_contracts() {
         use paro_planner::expression::ColumnRefExpression;
         use paro_planner::operator::{Projection, SetOperation};
@@ -2430,8 +2563,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(staged.as_ref().unwrap().payload, payload_before);
-        assert_eq!(STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get), constructions_before,
-            "exact duplicate must preserve its facts and reuse payload before constructing an extraction clone");
+        assert_eq!(
+            STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get),
+            constructions_before,
+            "exact duplicate must preserve its facts and reuse payload before constructing an extraction clone"
+        );
         assert_eq!(state.staging_arena.len(), arena_len);
     }
 
@@ -2516,8 +2652,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(staged.as_ref().unwrap().payload, payload_before);
-        assert_eq!(STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get), constructions_before,
-            "exact duplicate must preserve its facts and reuse payload before constructing an extraction clone");
+        assert_eq!(
+            STAGING_PAYLOAD_CONSTRUCTIONS.with(std::cell::Cell::get),
+            constructions_before,
+            "exact duplicate must preserve its facts and reuse payload before constructing an extraction clone"
+        );
     }
 
     #[test]

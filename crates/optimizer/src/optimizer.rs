@@ -2596,6 +2596,7 @@ impl Optimizer {
         normalize_scalar_expressions(&mut plan);
         plan = FilterPushdown::new().rewrite_plan(plan);
         plan = EmptyResultPullup::new().optimize_plan(plan);
+        plan = crate::cascades::planner::restriction::normalize_tree(plan)?;
         if self.ctx.verify_enabled {
             verify_logical_plan(&self.ctx.bind_context, &plan)?;
         }

@@ -432,6 +432,10 @@ impl CachedFacts {
 }
 
 impl BoundarySnapshot {
+    pub(super) fn contains_group(&self, memo: &Memo, group: GroupId) -> bool {
+        self.groups.contains_key(&memo.canonical_group(group))
+    }
+
     /// Derive one newly published shell from already observed input facts.
     /// Staging is not allowed to choose or reconstruct input alternatives.
     /// Missing evidence in another recipe remains conservatively unknown.
