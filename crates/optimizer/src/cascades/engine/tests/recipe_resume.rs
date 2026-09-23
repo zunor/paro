@@ -18,8 +18,20 @@ fn exact_recipe_resume_reuses_enforcement_without_certifying_completion() {
     let cost = engine.memo.group(root).unwrap().winner(goal).unwrap().cost;
     engine.mandatory_only = false;
     engine.open_optional_implementation_domain().unwrap();
-    assert!(engine.physical_task_cache[&(root, goal)].mandatory_only);
-    assert!(engine.physical_task_cache[&(child, goal)].mandatory_only);
+    assert!(
+        engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .mandatory_only
+    );
+    assert!(
+        engine.physical_subproblems[&(child, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .mandatory_only
+    );
     assert!(engine.memo.group(root).unwrap().winner(goal).is_none());
     engine.optimize_group(root, goal).unwrap();
     assert_eq!(engine.physical_enforcement_builds, built);
@@ -28,7 +40,13 @@ fn exact_recipe_resume_reuses_enforcement_without_certifying_completion() {
         engine.memo.group(root).unwrap().winner(goal).unwrap().cost,
         cost
     );
-    assert!(!engine.physical_task_cache[&(root, goal)].mandatory_only);
+    assert!(
+        !engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .mandatory_only
+    );
 }
 
 #[test]
@@ -87,8 +105,20 @@ fn retained_prices_do_not_publish_mixtures_with_unvisited_optional_children() {
             candidate
         })
         .is_some());
-    assert!(engine.physical_task_cache[&(child, goal)].mandatory_only);
-    assert!(!engine.physical_task_cache[&(root, goal)].complete);
+    assert!(
+        engine.physical_subproblems[&(child, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .mandatory_only
+    );
+    assert!(
+        !engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .complete
+    );
     engine.physical_interleave_step_mode = false;
     engine.physical_interleave_step_yielded = false;
     engine.optimize_group(root, goal).unwrap();
@@ -105,7 +135,13 @@ fn retained_prices_do_not_publish_mixtures_with_unvisited_optional_children() {
             .expected,
         1.0
     );
-    assert!(!engine.physical_task_cache[&(child, goal)].mandatory_only);
+    assert!(
+        !engine.physical_subproblems[&(child, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .mandatory_only
+    );
 }
 
 #[test]
@@ -267,7 +303,11 @@ fn opening_optional_domain_keeps_exact_prices_but_reopens_coverage() {
         child_candidates
     );
     assert!(
-        !engine.physical_task_cache[&(child, goal)].mandatory_only,
+        !engine.physical_subproblems[&(child, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .mandatory_only,
         "unchanged parent recipes must still open their children's optional domain"
     );
 }
@@ -432,7 +472,11 @@ fn redundant_dirty_notification_does_not_reopen_a_complete_read_context() {
         })
         .map(|(physical, _, fingerprint)| (*physical, *fingerprint))
         .collect();
-    engine.physical_dirty_recipes.insert((root, goal), recipes);
+    engine
+        .physical_subproblems
+        .entry((root, goal))
+        .or_default()
+        .dirty_recipes = Some(recipes);
     engine.optimize_group(root, goal).unwrap();
     assert_eq!(engine.physical_read_set(root, goal).unwrap(), reads);
     assert_eq!(
@@ -458,16 +502,27 @@ fn completion_only_notification_does_not_reprocess_priced_recipes() {
     // First complete the real parent/child task chain.  The later notification
     // is deliberately isolated from the already-consumed frontier response.
     engine.optimize_group(root, goal).unwrap();
-    assert!(engine.physical_task_cache[&(root, goal)].complete);
+    assert!(
+        engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .complete
+    );
 
     let synthesized = engine.child_combination_cost_synthesis_count;
     let reprocessed = engine.physical_recipe_reprocess_count;
     // The child frontier is unchanged. Remove any already-observed work so
     // this assertion isolates the later completion-only notification.
-    engine.physical_dirty_recipes.remove(&(root, goal));
+    engine
+        .physical_subproblems
+        .get_mut(&(root, goal))
+        .unwrap()
+        .dirty_recipes = None;
     let child_cache = engine
-        .physical_task_cache
+        .physical_subproblems
         .get_mut(&(child, goal))
+        .and_then(|state| state.resident.as_mut())
         .expect("the parent task must have observed its child");
     child_cache.complete = false;
 
@@ -475,11 +530,14 @@ fn completion_only_notification_does_not_reprocess_priced_recipes() {
     // response, not a cost/frontier response: the parent must become pending
     // without receiving a dirty recipe set.
     engine.note_physical_completion_change(child, goal, true);
-    assert!(engine.physical_completion_pending.contains(&(root, goal)));
-    assert!(!engine.physical_dirty_recipes.contains_key(&(root, goal)));
+    assert!(engine.physical_subproblems[&(root, goal)].completion_pending);
+    assert!(engine.physical_subproblems[&(root, goal)]
+        .dirty_recipes
+        .is_none());
     engine
-        .physical_task_cache
+        .physical_subproblems
         .get_mut(&(child, goal))
+        .and_then(|state| state.resident.as_mut())
         .unwrap()
         .complete = true;
 
@@ -492,14 +550,24 @@ fn completion_only_notification_does_not_reprocess_priced_recipes() {
         engine.physical_recipe_reprocess_count, reprocessed,
         "completion-only progress must not reprocess old recipes"
     );
-    assert!(engine.physical_task_cache[&(root, goal)].complete);
+    assert!(
+        engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .complete
+    );
 }
 
 #[test]
 fn resident_read_snapshot_shares_storage_and_refreshes_exact_child_goal() {
     let (mut engine, root, child, goal) = resume_engine(false);
     engine.optimize_group(root, goal).unwrap();
-    let resident = engine.physical_task_cache[&(root, goal)].clone();
+    let resident = engine.physical_subproblems[&(root, goal)]
+        .resident
+        .as_ref()
+        .unwrap()
+        .clone();
     let (same, changed) = engine
         .physical_read_set_incremental(root, goal, Some(&resident))
         .unwrap();
@@ -548,7 +616,10 @@ fn recipe_resume_completed_same_readset_accepts_appended_physical_recipe() {
         .clone();
     assert_eq!(baseline.cost.score.range.expected, 110.0);
     assert_eq!(baseline.children[0].candidate, selected);
-    let cached = engine.physical_task_cache.get(&(root, goal)).unwrap();
+    let cached = engine.physical_subproblems[&(root, goal)]
+        .resident
+        .as_ref()
+        .unwrap();
     assert!(
         cached.complete,
         "the prefix must actually be complete, not merely paused"
@@ -587,8 +658,17 @@ fn recipe_resume_completed_same_readset_accepts_appended_physical_recipe() {
         )
         .unwrap();
     assert_eq!(engine.physical_read_set(root, goal).unwrap(), reads);
-    assert_eq!(engine.next_recipe_sequence[&(root, goal)], cursor + 1);
-    assert!(engine.physical_task_cache[&(root, goal)].complete);
+    assert_eq!(
+        engine.physical_subproblems[&(root, goal)].next_recipe_sequence,
+        cursor + 1
+    );
+    assert!(
+        engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .complete
+    );
 
     engine.optimize_group(root, goal).unwrap();
 
@@ -619,10 +699,20 @@ fn recipe_resume_completed_same_readset_accepts_appended_physical_recipe() {
         reopened + 1
     );
     assert_eq!(
-        engine.physical_task_cache[&(root, goal)].recipe_cursor,
+        engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .recipe_cursor,
         cursor + 1
     );
-    assert!(engine.physical_task_cache[&(root, goal)].complete);
+    assert!(
+        engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .complete
+    );
 }
 
 #[test]
@@ -656,7 +746,13 @@ fn recipe_resume_budget_retry_pauses_then_prices_nonselected_child_once() {
         !state.priced.contains_key(&tuple),
         "a denied tuple has no cost yet"
     );
-    assert!(!engine.physical_task_cache[&(root, goal)].complete);
+    assert!(
+        !engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .complete
+    );
     let reads = engine.physical_read_set(root, goal).unwrap();
     let epoch = engine.memo().cost_epoch_value();
     let synthesized = engine.child_combination_cost_synthesis_count;
@@ -667,9 +763,11 @@ fn recipe_resume_budget_retry_pauses_then_prices_nonselected_child_once() {
     // First retry with zero credit: pending_retry must attempt admission again,
     // then pause, not repeatedly skip the same item until the deadline.
     engine
-        .physical_dirty_recipes
+        .physical_subproblems
         .entry((root, goal))
         .or_default()
+        .dirty_recipes
+        .get_or_insert_with(BTreeSet::new)
         .insert((key.0, key.2));
     engine.optimize_group(root, goal).unwrap();
     assert!(
@@ -701,9 +799,11 @@ fn recipe_resume_budget_retry_pauses_then_prices_nonselected_child_once() {
         .unwrap()
         .set_limit(dimension, 1);
     engine
-        .physical_dirty_recipes
+        .physical_subproblems
         .entry((root, goal))
         .or_default()
+        .dirty_recipes
+        .get_or_insert_with(BTreeSet::new)
         .insert((key.0, key.2));
     engine.optimize_group(root, goal).unwrap();
     assert!(!engine.memo.control().deadline_reached());
@@ -728,9 +828,11 @@ fn recipe_resume_budget_retry_pauses_then_prices_nonselected_child_once() {
     // Re-delivery is idempotent: no second synthesis, publication, or credit.
     let publications = engine.memo().published_winner_count();
     engine
-        .physical_dirty_recipes
+        .physical_subproblems
         .entry((root, goal))
         .or_default()
+        .dirty_recipes
+        .get_or_insert_with(BTreeSet::new)
         .insert((key.0, key.2));
     engine.optimize_group(root, goal).unwrap();
     assert_eq!(

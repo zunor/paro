@@ -111,6 +111,10 @@ already satisfies it.
   objective and consumed fact revisions are part of its meaning.
 - Track actual reads, including relevant negative matches. Notify consumers
   of the response or completion change they really depend on.
+- One physical-subproblem owner retains published dependencies, the resident
+  task cursor and pending cost/completion work for an exact `(group, goal)`.
+  TaskRegistry owns lifecycle and proofs; reverse indexes route notifications.
+  A redirect merges pending work but invalidates pre-merge completion.
 - A winner retains exact child choices. Frontier pruning must not invalidate
   archived choices still referenced by a parent or frozen candidate.
 - Parent runtime filters, shared producers and phase composition can change
@@ -132,6 +136,15 @@ already satisfies it.
 - Keep semantic safety, optimization coverage and search completion separate.
   A rule having fired is provenance, not sufficient evidence of a selected
   plan property.
+- Quality properties compose from exact selected children and live fact
+  revisions. A CTE demand proof also owns its selected incoming consumer edges.
+  Unchanged descendants can be reused; a changed dependency reopens its
+  ancestors. Local readiness requests the complete root choice manifest only
+  after applicable facts are present. It is not itself a certificate; policy
+  validation and executable verification remain mandatory for handoff.
+- Query statistics settle through propagation followed by one final fact
+  gathering pass. Do not reintroduce a preliminary gather whose results are
+  immediately replaced, or treat staging as a second construction boundary.
 - A declared resource class is not necessarily feasible. Distinguish a
   verified plan, proven infeasibility, incomplete search, unsupported capability
   and an internal failure.

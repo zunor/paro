@@ -74,8 +74,20 @@ fn yielded_child_is_consumed_before_its_unexplored_tail() {
         33,
         "32 child publications plus one explicitly counted parent composition"
     );
-    assert!(!engine.physical_task_cache[&(root, goal)].complete);
-    assert!(!engine.physical_task_cache[&(child, goal)].complete);
+    assert!(
+        !engine.physical_subproblems[&(root, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .complete
+    );
+    assert!(
+        !engine.physical_subproblems[&(child, goal)]
+            .resident
+            .as_ref()
+            .unwrap()
+            .complete
+    );
     let reference = ChildWinnerRef {
         group: root,
         goal,

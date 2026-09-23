@@ -1759,7 +1759,11 @@ fn physical_read_of_one_goal_is_not_invalidated_by_another_goal_publication() {
     );
     // The earlier goal-A publication may have left the parent dirty. Remove
     // that already-observed work so the next assertions isolate goal B.
-    engine.physical_dirty_recipes.remove(&(root, goal_a));
+    engine
+        .physical_subproblems
+        .get_mut(&(root, goal_a))
+        .unwrap()
+        .dirty_recipes = None;
 
     // Exercise the production publication/invalidation path rather than
     // relying only on a manually assembled ReadSet.  An unrelated frontier
@@ -1768,7 +1772,9 @@ fn physical_read_of_one_goal_is_not_invalidated_by_another_goal_publication() {
     engine
         .note_physical_frontier_change(child, goal_b, true)
         .unwrap();
-    assert!(!engine.physical_dirty_recipes.contains_key(&(root, goal_a)));
+    assert!(engine.physical_subproblems[&(root, goal_a)]
+        .dirty_recipes
+        .is_none());
     let mut unrelated = PhysicalInterleave::new(root, [goal_a]);
     unrelated.pending.remove(&(root, goal_a));
     engine.enqueue_physical_work([(child, goal_b)], &mut unrelated);
@@ -1776,7 +1782,9 @@ fn physical_read_of_one_goal_is_not_invalidated_by_another_goal_publication() {
     engine
         .note_physical_frontier_change(child, goal_a, true)
         .unwrap();
-    assert!(engine.physical_dirty_recipes.contains_key(&(root, goal_a)));
+    assert!(engine.physical_subproblems[&(root, goal_a)]
+        .dirty_recipes
+        .is_some());
     engine.optimize_group(root, goal_a).unwrap();
 
     let counters = engine.search_work_counters();
@@ -1891,7 +1899,10 @@ fn empty_mandatory_prefix_is_not_infeasible_and_optional_resumes() {
     engine.registry = registry;
     engine.mandatory_only = true;
     engine.optimize_group(root, goal).unwrap();
-    let state = engine.physical_task_cache[&(root, goal)].clone();
+    let state = engine.physical_subproblems[&(root, goal)]
+        .resident
+        .clone()
+        .unwrap();
     assert!(engine.memo.group(root).unwrap().winner(goal).is_none());
     assert!(matches!(
         engine.task_registry.task(state.task).unwrap().outcome,
@@ -1994,8 +2005,49 @@ fn engine_group_merge_redirects_tasks_and_discards_stale_transform_state() {
         Box::new([PatternRead::from_group(&engine.memo, secondary).unwrap()]),
     );
 
+    let dependency = engine.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    for (group, sequence) in [(canonical_source, 2), (secondary, 3)] {
+        engine.physical_subproblems.insert(
+            (group, goal),
+            PhysicalSubproblem {
+                resident: Some(PhysicalTaskState {
+                    task,
+                    mandatory_only: true,
+                    reads: ReadSet::empty(),
+                    dependencies: None,
+                    recipe_cursor: sequence,
+                    complete: true,
+                }),
+                dependencies: Arc::new(BTreeSet::from([(dependency, goal)])),
+                dirty_recipes: Some(BTreeSet::from([(
+                    PhysicalExprId::new(sequence as usize),
+                    Fingerprint(sequence as u128),
+                )])),
+                completion_pending: group == secondary,
+                full_recost: group == canonical_source,
+                next_recipe_sequence: sequence,
+            },
+        );
+    }
     let canonical = engine.merge_groups(canonical_source, secondary).unwrap();
 
+    let owner = &engine.physical_subproblems[&(canonical, goal)];
+    assert!(
+        owner.resident.is_none(),
+        "pre-merge completion cannot survive a redirect"
+    );
+    assert_eq!(
+        owner.dependencies.as_ref(),
+        &BTreeSet::from([(dependency, goal)])
+    );
+    assert_eq!(owner.dirty_recipes.as_ref().unwrap().len(), 2);
+    assert!(owner.completion_pending && owner.full_recost);
+    assert_eq!(owner.next_recipe_sequence, 3);
+    assert!(!engine.physical_subproblems.contains_key(&(secondary, goal)));
     assert_eq!(canonical, canonical_source);
     assert_eq!(engine.memo.canonical_group(secondary), canonical);
     assert_eq!(engine.task_registry.canonical_group(secondary), canonical);

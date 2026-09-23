@@ -1063,6 +1063,25 @@ struct PhysicalTaskState {
     complete: bool,
 }
 
+/// One owner for published dependencies, resumable task state and pending work.
+/// The registry still owns task lifecycle/proofs; the reverse index only routes
+/// notifications. Neither of them is another copy of this continuation.
+#[derive(Debug, Default)]
+struct PhysicalSubproblem {
+    resident: Option<PhysicalTaskState>,
+    /// The current published recipe domain; the resident keeps the immutable
+    /// dependency snapshot it actually read, not a second mutable index.
+    dependencies: PhysicalDependencySnapshot,
+    /// None requests the ordinary stream. Some (including empty) is an exact
+    /// delta plus recipes appended since the resident cursor.
+    dirty_recipes: Option<BTreeSet<(PhysicalExprId, Fingerprint)>>,
+    /// A completion wake is not a cost invalidation.
+    completion_pending: bool,
+    /// A new cost/implementation phase requires one coverage walk.
+    full_recost: bool,
+    next_recipe_sequence: u64,
+}
+
 type PhysicalConsumer = (GroupId, OptimizationGoal, PhysicalExprId, Fingerprint);
 type CheckpointCandidateEvidence = (Box<[FrozenChoice]>, Box<[PatternRead]>, bool);
 
@@ -1239,12 +1258,9 @@ pub struct CascadesEngine {
     /// already registered ancestor chain. This index is query-local and is
     /// rebuilt lazily as new native/settled recipes are admitted.
     physical_parents: BTreeMap<(GroupId, OptimizationGoal), BTreeSet<PhysicalConsumer>>,
-    /// Child groups observed by each physical subproblem.  Recipes are
-    /// published incrementally, so maintaining this small deduplicated index
-    /// at publication avoids rescanning the global recipe table every time a
-    /// recursive task captures its exact child ReadSet.
-    physical_read_dependencies: BTreeMap<(GroupId, OptimizationGoal), PhysicalDependencySnapshot>,
-    physical_task_cache: BTreeMap<(GroupId, OptimizationGoal), PhysicalTaskState>,
+    /// One continuation per exact physical goal, including the dependencies
+    /// published with recipes and the notifications not yet consumed by it.
+    physical_subproblems: BTreeMap<(GroupId, OptimizationGoal), PhysicalSubproblem>,
     /// A proof is retained only for the exact current physical domain. The
     /// TaskRegistry owns its lifecycle; this index avoids scanning all bound
     /// records when a parent asks whether a child may provide a lower bound.
@@ -1254,16 +1270,6 @@ pub struct CascadesEngine {
     /// tracing part of normal C1; callers opt in only after model/oracle
     /// admission.
     certified_group_pruning_enabled: bool,
-    /// Recipe identities dirtied by a changed child frontier.  A queued
-    /// parent consumes only these old recipes plus any recipes appended after
-    /// its cursor; a fact/statistics change still deliberately falls back to
-    /// the complete local stream.
-    physical_dirty_recipes:
-        BTreeMap<(GroupId, OptimizationGoal), BTreeSet<(PhysicalExprId, Fingerprint)>>,
-    /// Completion-only notifications are not candidate/cost invalidations.
-    /// A parent may need to close an awaiting task or publish a completion
-    /// certificate, while all already-priced recipes remain reusable.
-    physical_completion_pending: BTreeSet<(GroupId, OptimizationGoal)>,
     /// A recursive physical task can publish a child response before the
     /// enclosing interleave task returns.  Keep the exact changed keys until
     /// the drain boundary so direct consumers are still woken even when the
@@ -1273,11 +1279,6 @@ pub struct CascadesEngine {
     /// claim: the normal dirty/read-set protocol remains authoritative for
     /// what the consumer must process.
     physical_response_notifications: BTreeSet<(GroupId, OptimizationGoal)>,
-    /// Cost frontiers cleared by a new search epoch need one complete rebuild
-    /// per physical subproblem. Once that rebuild has run, an incomplete
-    /// readiness cursor is an append-only prefix and must not force another
-    /// full scan.
-    physical_full_recost: BTreeSet<(GroupId, OptimizationGoal)>,
     /// Exact goals under which a group has been observed as a physical
     /// dependency. A root goal must never be substituted for a child's
     /// required materialization, partitioning, or grant contract.
@@ -1371,7 +1372,6 @@ pub struct CascadesEngine {
     strong_incumbent_first_invalidation_at_us: Option<u64>,
     strong_incumbent_first_invalidation_reason: Option<u64>,
     strong_incumbent_first_invalidated_context_fingerprint: Option<Fingerprint>,
-    next_recipe_sequence: BTreeMap<(GroupId, OptimizationGoal), u64>,
     /// Shared task identity/progress protocol.  Memo remains the owner of
     /// expressions, candidates and facts; this registry only coordinates
     /// resumable work and publication state.
@@ -1532,14 +1532,10 @@ impl CascadesEngine {
             transformation_subscribers: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
             physical_parents: BTreeMap::new(),
-            physical_read_dependencies: BTreeMap::new(),
-            physical_task_cache: BTreeMap::new(),
+            physical_subproblems: BTreeMap::new(),
             physical_completion_proofs: BTreeMap::new(),
             certified_group_pruning_enabled: false,
-            physical_dirty_recipes: BTreeMap::new(),
-            physical_completion_pending: BTreeSet::new(),
             physical_response_notifications: BTreeSet::new(),
-            physical_full_recost: BTreeSet::new(),
             physical_goals: BTreeMap::new(),
             physical_quality_demanded_groups: BTreeSet::new(),
             physical_quality_scheduled_groups: BTreeSet::new(),
@@ -1614,7 +1610,6 @@ impl CascadesEngine {
             strong_incumbent_first_invalidation_at_us: None,
             strong_incumbent_first_invalidation_reason: None,
             strong_incumbent_first_invalidated_context_fingerprint: None,
-            next_recipe_sequence: BTreeMap::new(),
             task_registry: TaskRegistry::default(),
             governor: Governor::new(PlanningPolicy::default())
                 .expect("default planning policy must be valid"),
@@ -1853,7 +1848,6 @@ impl CascadesEngine {
         // failed Memo validation cannot invalidate a live task in advance.
         let _ = self.task_registry.redirect_group(secondary, canonical)?;
         self.recanonicalize_physical_parents();
-        self.physical_task_cache.clear();
         self.revalidate_strong_incumbents_after_merge()?;
         // Logical and physical expression ids from the two pre-merge groups
         // no longer describe an isolated implementation domain.  Revisit the
@@ -1958,39 +1952,35 @@ impl CascadesEngine {
                     .insert((self.memo.canonical_group(parent), goal, physical, recipe));
             }
         }
-        let previous = std::mem::take(&mut self.physical_dirty_recipes);
-        for ((group, goal), recipes) in previous {
-            self.physical_dirty_recipes
+        // Redirect all facets together. A changed implementation domain
+        // invalidates captured task state, but not pending work or edges.
+        let previous = std::mem::take(&mut self.physical_subproblems);
+        for ((group, goal), previous) in previous {
+            let owner = self
+                .physical_subproblems
                 .entry((self.memo.canonical_group(group), goal))
-                .or_default()
-                .extend(recipes);
-        }
-        let previous = std::mem::take(&mut self.physical_completion_pending);
-        for (group, goal) in previous {
-            self.physical_completion_pending
-                .insert((self.memo.canonical_group(group), goal));
+                .or_default();
+            Arc::make_mut(&mut owner.dependencies).extend(
+                previous
+                    .dependencies
+                    .iter()
+                    .map(|(child, goal)| (self.memo.canonical_group(*child), *goal)),
+            );
+            if let Some(dirty) = previous.dirty_recipes {
+                owner
+                    .dirty_recipes
+                    .get_or_insert_with(BTreeSet::new)
+                    .extend(dirty);
+            }
+            owner.completion_pending |= previous.completion_pending;
+            owner.full_recost |= previous.full_recost;
+            owner.next_recipe_sequence = owner
+                .next_recipe_sequence
+                .max(previous.next_recipe_sequence);
         }
         let previous = std::mem::take(&mut self.physical_response_notifications);
         for (group, goal) in previous {
             self.physical_response_notifications
-                .insert((self.memo.canonical_group(group), goal));
-        }
-        let previous = std::mem::take(&mut self.physical_read_dependencies);
-        for ((group, goal), children) in previous {
-            let dependencies = self
-                .physical_read_dependencies
-                .entry((self.memo.canonical_group(group), goal))
-                .or_default();
-            Arc::make_mut(dependencies).extend(
-                children
-                    .iter()
-                    .copied()
-                    .map(|(child, child_goal)| (self.memo.canonical_group(child), child_goal)),
-            );
-        }
-        let previous = std::mem::take(&mut self.physical_full_recost);
-        for (group, goal) in previous {
-            self.physical_full_recost
                 .insert((self.memo.canonical_group(group), goal));
         }
         let previous = std::mem::take(&mut self.physical_goals);
@@ -1999,13 +1989,6 @@ impl CascadesEngine {
                 .entry(self.memo.canonical_group(group))
                 .or_default()
                 .extend(goals);
-        }
-        let previous = std::mem::take(&mut self.next_recipe_sequence);
-        for ((group, goal), sequence) in previous {
-            self.next_recipe_sequence
-                .entry((self.memo.canonical_group(group), goal))
-                .and_modify(|current| *current = (*current).max(sequence))
-                .or_insert(sequence);
         }
     }
 
@@ -3426,9 +3409,11 @@ impl CascadesEngine {
         };
         for (parent, parent_goal, physical, recipe) in parents {
             let dirty = self
-                .physical_dirty_recipes
+                .physical_subproblems
                 .entry((self.memo.canonical_group(parent), parent_goal))
-                .or_default();
+                .or_default()
+                .dirty_recipes
+                .get_or_insert_with(BTreeSet::new);
             if dirty.insert((physical, recipe)) {
                 self.physical_related_goal_notification_count = self
                     .physical_related_goal_notification_count
@@ -3446,7 +3431,12 @@ impl CascadesEngine {
         };
         for (parent, parent_goal, _physical, _recipe) in parents {
             let parent_key = (self.memo.canonical_group(parent), parent_goal);
-            if self.physical_completion_pending.insert(parent_key) {
+            let pending = &mut self
+                .physical_subproblems
+                .entry(parent_key)
+                .or_default()
+                .completion_pending;
+            if !std::mem::replace(pending, true) {
                 self.physical_completion_notification_count = self
                     .physical_completion_notification_count
                     .saturating_add(1);
@@ -3469,8 +3459,9 @@ impl CascadesEngine {
     ) {
         let key = (self.memo.canonical_group(group), goal);
         let previous = self
-            .physical_task_cache
+            .physical_subproblems
             .get(&key)
+            .and_then(|state| state.resident.as_ref())
             .map(|entry| entry.complete);
         if previous == Some(complete) {
             return;
@@ -3502,8 +3493,9 @@ impl CascadesEngine {
                 .map(|group| group.physical_frontier_version(goal))
                 .unwrap_or_default(),
             complete: self
-                .physical_task_cache
+                .physical_subproblems
                 .get(&(group, goal))
+                .and_then(|state| state.resident.as_ref())
                 .is_some_and(|entry| entry.complete),
         }
     }
@@ -3573,13 +3565,8 @@ impl CascadesEngine {
                 continue;
             }
             self.quality_preflight_count = self.quality_preflight_count.saturating_add(1);
-            let evaluation = provider.evaluate(
-                &self.memo,
-                reference,
-                &winner,
-                goal,
-                &self.quality_bundles,
-            )?;
+            let evaluation =
+                provider.evaluate(&self.memo, reference, &winner, goal, &self.quality_bundles)?;
             let reads = match &evaluation {
                 Some(evaluation) => evaluation.reads.clone(),
                 None => self.winner_fact_reads(root, &winner)?,
@@ -4003,14 +3990,18 @@ impl CascadesEngine {
         // Completion has a different lifetime: a closed mandatory domain does
         // not prove closure after optional implementations become eligible.
         self.physical_completion_proofs.clear();
-        self.physical_completion_pending.clear();
+        for state in self.physical_subproblems.values_mut() {
+            state.completion_pending = false;
+        }
         self.physical_response_notifications.clear();
         self.task_registry.invalidate_physical_tasks()?;
         // Revisit the dependency domain, including children of unchanged
         // recipes: an optional leaf can improve a parent without publishing a
         // new logical expression or parent recipe. This is a coverage walk;
         // ChildCombinationState retains prices for unchanged exact choices.
-        self.physical_full_recost = self.next_recipe_sequence.keys().copied().collect();
+        for state in self.physical_subproblems.values_mut() {
+            state.full_recost = state.next_recipe_sequence > 0;
+        }
         self.physical_quality_demanded_groups = self
             .physical_parents
             .keys()
@@ -4846,8 +4837,10 @@ impl CascadesEngine {
         for (parent, parent_goal, _physical, _recipe) in parents {
             let parent_key = (self.memo.canonical_group(parent), parent_goal);
             let has_pending_work = response_changed
-                || self.physical_dirty_recipes.contains_key(&parent_key)
-                || self.physical_completion_pending.contains(&parent_key);
+                || self
+                    .physical_subproblems
+                    .get(&parent_key)
+                    .is_some_and(|state| state.dirty_recipes.is_some() || state.completion_pending);
             if !has_pending_work {
                 continue;
             }
@@ -7688,10 +7681,11 @@ impl CascadesEngine {
         let recipe_published = if let std::collections::btree_map::Entry::Vacant(entry) =
             self.recipes.entry(recipe_key)
         {
-            let sequence = self
-                .next_recipe_sequence
+            let sequence = &mut self
+                .physical_subproblems
                 .entry((self.memo.canonical_group(group), goal))
-                .or_default();
+                .or_default()
+                .next_recipe_sequence;
             let recipe_sequence = *sequence;
             *sequence = sequence
                 .checked_add(1)
@@ -7754,10 +7748,11 @@ impl CascadesEngine {
             }
         }
         let owner = self.memo.canonical_group(group);
-        let dependencies = self
-            .physical_read_dependencies
+        let dependencies = &mut self
+            .physical_subproblems
             .entry((owner, goal))
-            .or_default();
+            .or_default()
+            .dependencies;
         // A duplicate recipe must not detach a resident dependency set.
         if child_dependencies
             .iter()
@@ -7808,7 +7803,11 @@ impl CascadesEngine {
         // it. Child physical frontiers remain exact dependencies and are
         // read with the child goal that the recipe actually consumes.
         let mut reads = vec![PatternRead::from_group(&self.memo, group)?];
-        if let Some(children) = self.physical_read_dependencies.get(&(group, goal)) {
+        if let Some(children) = self
+            .physical_subproblems
+            .get(&(group, goal))
+            .map(|state| &state.dependencies)
+        {
             for (child, child_goal) in children.iter().copied() {
                 reads.push(PatternRead::physical_from_group(
                     &self.memo, child, child_goal,
@@ -7823,10 +7822,15 @@ impl CascadesEngine {
         group: GroupId,
         goal: OptimizationGoal,
     ) -> Option<PhysicalDependencySnapshot> {
-        self.physical_read_dependencies
+        self.physical_subproblems
             .get(&(self.memo.canonical_group(group), goal))
+            .map(|state| &state.dependencies)
             .filter(|dependencies| !dependencies.is_empty())
             .cloned()
+    }
+
+    fn retain_physical_task(&mut self, key: (GroupId, OptimizationGoal), state: PhysicalTaskState) {
+        self.physical_subproblems.entry(key).or_default().resident = Some(state);
     }
 
     /// Refresh a resident physical task's read cursor by delta.
@@ -7877,19 +7881,18 @@ impl CascadesEngine {
         }
         let group = self.memo.canonical_group(group);
         let cache_key = (group, goal);
-        let next_recipe_sequence = self
-            .next_recipe_sequence
-            .get(&cache_key)
-            .copied()
-            .unwrap_or_default();
-        let completion_pending = self.physical_completion_pending.remove(&cache_key);
-        let resident_state = self.physical_task_cache.get(&cache_key).cloned();
+        let state = self.physical_subproblems.entry(cache_key).or_default();
+        let next_recipe_sequence = state.next_recipe_sequence;
+        let completion_pending = std::mem::take(&mut state.completion_pending);
+        let resident_state = state.resident.clone();
+        let mut dirty_recipes = state.dirty_recipes.take();
+        let force_full_recost = std::mem::take(&mut state.full_recost);
         let implementation_phase_changed = resident_state
             .as_ref()
             .is_some_and(|entry| entry.mandatory_only != self.mandatory_only);
-        let fast_reuse = !self.physical_full_recost.contains(&cache_key)
+        let fast_reuse = !force_full_recost
             && !implementation_phase_changed
-            && !self.physical_dirty_recipes.contains_key(&cache_key)
+            && dirty_recipes.is_none()
             && !completion_pending
             && resident_state.as_ref().is_some_and(|entry| {
                 next_recipe_sequence <= entry.recipe_cursor
@@ -7905,8 +7908,6 @@ impl CascadesEngine {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
             return Ok(());
         }
-        let mut dirty_recipes = self.physical_dirty_recipes.remove(&(group, goal));
-        let force_full_recost = self.physical_full_recost.remove(&(group, goal));
         self.physical_subproblem_requests = self.physical_subproblem_requests.saturating_add(1);
         // Child frontiers are part of the exact parent response. Capture them
         // before requesting the task so a changed child selects a new
@@ -7941,9 +7942,8 @@ impl CascadesEngine {
                 // A dirty notification can be redundant. Reused already
                 // certifies the same child/fact ReadSet; only an extended local
                 // recipe stream (or explicit full recost) reopens that proof.
-                let recipe_domain_advanced = self
-                    .physical_task_cache
-                    .get(&cache_key)
+                let recipe_domain_advanced = resident_state
+                    .as_ref()
                     .is_some_and(|cached| next_recipe_sequence > cached.recipe_cursor)
                     || force_full_recost
                     || implementation_phase_changed;
@@ -8151,9 +8151,9 @@ impl CascadesEngine {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
             let canonical_group = self.memo.canonical_group(group);
             let recipe_count = self
-                .next_recipe_sequence
+                .physical_subproblems
                 .get(&(canonical_group, goal))
-                .copied()
+                .map(|state| state.next_recipe_sequence)
                 .unwrap_or_default();
             let cursor = self.task_registry.advance_cursor(
                 task,
@@ -8179,7 +8179,7 @@ impl CascadesEngine {
             let cache_complete =
                 !self.preserve_incomplete_physical && self.memo.search_obligations_empty();
             self.note_physical_completion_change(group, goal, cache_complete);
-            self.physical_task_cache.insert(
+            self.retain_physical_task(
                 cache_key,
                 PhysicalTaskState {
                     task,
@@ -8207,9 +8207,9 @@ impl CascadesEngine {
             self.physical_subproblem_reuses = self.physical_subproblem_reuses.saturating_add(1);
             let canonical_group = self.memo.canonical_group(group);
             let recipe_count = self
-                .next_recipe_sequence
+                .physical_subproblems
                 .get(&(canonical_group, goal))
-                .copied()
+                .map(|state| state.next_recipe_sequence)
                 .unwrap_or_default();
             let cursor = self.task_registry.advance_cursor(
                 task,
@@ -8232,7 +8232,7 @@ impl CascadesEngine {
                 .complete_current(task, &self.memo, outcome)?;
             let cache_complete = !self.preserve_incomplete_physical;
             self.note_physical_completion_change(group, goal, cache_complete);
-            self.physical_task_cache.insert(
+            self.retain_physical_task(
                 cache_key,
                 PhysicalTaskState {
                     task,
@@ -8298,9 +8298,9 @@ impl CascadesEngine {
                     )?;
                 }
                 let recipe_count = self
-                    .next_recipe_sequence
+                    .physical_subproblems
                     .get(&(self.memo.canonical_group(group), goal))
-                    .copied()
+                    .map(|state| state.next_recipe_sequence)
                     .unwrap_or_default();
                 let cursor_position = resume_recipe_cursor.unwrap_or(recipe_count);
                 let cursor = self.task_registry.advance_cursor(
@@ -8365,7 +8365,7 @@ impl CascadesEngine {
                     outcome,
                 )?;
                 self.note_physical_completion_change(group, goal, complete);
-                self.physical_task_cache.insert(
+                self.retain_physical_task(
                     cache_key,
                     PhysicalTaskState {
                         task,
@@ -8395,9 +8395,9 @@ impl CascadesEngine {
     ) -> bool {
         let group = self.memo.canonical_group(group);
         let next_sequence = self
-            .next_recipe_sequence
+            .physical_subproblems
             .get(&(group, goal))
-            .copied()
+            .map(|state| state.next_recipe_sequence)
             .unwrap_or_default();
         match dirty_recipes {
             Some(dirty) => {
