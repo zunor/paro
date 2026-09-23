@@ -194,12 +194,17 @@ mod tests {
 
     #[test]
     fn deep_selected_graph_uses_bounded_native_stack() {
-        std::thread::Builder::new().stack_size(128 * 1024).spawn(|| {
-            let mut nodes: Vec<_> = (0..10_000).map(|id| node(id, &[id + 1])).collect();
-            nodes.push(node(10_000, &[]));
-            let dag = SelectedDag::from_nodes(reference(0), nodes.into()).unwrap();
-            assert_eq!(dag.postorder.len(), 10_001);
-            assert_eq!(dag.postorder.first(), Some(&10_000));
-        }).unwrap().join().unwrap();
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut nodes: Vec<_> = (0..10_000).map(|id| node(id, &[id + 1])).collect();
+                nodes.push(node(10_000, &[]));
+                let dag = SelectedDag::from_nodes(reference(0), nodes.into()).unwrap();
+                assert_eq!(dag.postorder.len(), 10_001);
+                assert_eq!(dag.postorder.first(), Some(&10_000));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

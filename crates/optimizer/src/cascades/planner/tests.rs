@@ -140,6 +140,28 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
         assert_eq!(actual.evidence, expected, "normalized={normalized}");
         let builds = properties.builds;
         let domain_builds = properties.cte_domains.builds;
+        let region_before = properties
+            .region_fact_fingerprint(
+                engine.memo(),
+                reference,
+                input.root_goal,
+                &quality_node_map(&actual.nodes),
+            )
+            .unwrap();
+        let mut other_goal = input.root_goal;
+        other_goal.row_goal = super::super::memo::RowGoal::AtMost(2);
+        assert_ne!(
+            region_before,
+            properties
+                .region_fact_fingerprint(
+                    engine.memo(),
+                    reference,
+                    other_goal,
+                    &quality_node_map(&actual.nodes),
+                )
+                .unwrap(),
+            "a region certificate belongs to its exact goal"
+        );
         let again = planner_quality_evidence(
             engine.memo(),
             reference,
@@ -202,6 +224,18 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
                 .unwrap()
         );
         assert!(properties.builds > builds);
+        let region_after = properties
+            .region_fact_fingerprint(
+                engine.memo(),
+                reference,
+                input.root_goal,
+                &quality_node_map(&refreshed.nodes),
+            )
+            .unwrap();
+        assert_ne!(
+            region_before, region_after,
+            "a changed descendant invalidates its region certificate"
+        );
         assert!(
             Arc::ptr_eq(&actual.nodes, &refreshed.nodes),
             "fact refresh must not reconstruct immutable choices"

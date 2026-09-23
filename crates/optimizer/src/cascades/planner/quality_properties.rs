@@ -22,6 +22,10 @@ struct NodeProperties {
     contains_union: bool,
     is_union: bool,
     pending_domain: Option<bool>,
+    // Only demanded region boundaries receive this scalar certificate, not
+    // an expanded transitive closure per node. Replacing a derived node drops
+    // all of its revision-dependent certificates.
+    region_facts: BTreeMap<OptimizationGoal, Fingerprint>,
 }
 
 /// No frontier membership or cost is stored here. Candidate identities are
@@ -178,6 +182,7 @@ impl SelectedQualityProperties {
                     contains_union,
                     is_union,
                     pending_domain,
+                    region_facts: BTreeMap::new(),
                 },
             );
             self.builds = self.builds.saturating_add(1);
@@ -187,6 +192,26 @@ impl SelectedQualityProperties {
 
     pub(super) fn revision(&self, candidate: CandidateId) -> u64 {
         self.nodes[&candidate].revision
+    }
+
+    pub(super) fn region_fact_fingerprint(
+        &mut self,
+        memo: &Memo,
+        root: ChildWinnerRef,
+        goal: OptimizationGoal,
+        nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
+    ) -> Option<Fingerprint> {
+        if let Some(fingerprint) = self.nodes.get(&root.candidate)?.region_facts.get(&goal) {
+            return Some(*fingerprint);
+        }
+        // An arm enumerated from this root is already in its closure. The
+        // independent oracle still walks root + arm to check this equivalence.
+        let fingerprint = collect_quality_region_fact_fingerprint(memo, root, root, goal, nodes)?;
+        self.nodes
+            .get_mut(&root.candidate)?
+            .region_facts
+            .insert(goal, fingerprint);
+        Some(fingerprint)
     }
 
     pub(super) fn choice(&self, candidate: CandidateId) -> Fingerprint {

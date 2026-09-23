@@ -530,27 +530,28 @@ fn collect_quality_region_fact_fingerprint(
         facts: &mut BTreeMap<GroupId, (Fingerprint, Fingerprint)>,
         visited: &mut BTreeSet<CandidateId>,
     ) -> bool {
-        if !visited.insert(reference.candidate) {
-            return true;
+        let mut pending = vec![reference];
+        while let Some(reference) = pending.pop() {
+            if !visited.insert(reference.candidate) {
+                continue;
+            }
+            let Some(node) = quality_node(nodes, reference) else {
+                return false;
+            };
+            let group = memo.canonical_group(reference.group);
+            let Some(group_ref) = memo.group(group) else {
+                return false;
+            };
+            facts.insert(
+                group,
+                (
+                    group_ref.logical_fact_fingerprint(),
+                    group_ref.statistics_snapshot_fingerprint(),
+                ),
+            );
+            pending.extend(node.children.iter().copied());
         }
-        let Some(node) = quality_node(nodes, reference) else {
-            return false;
-        };
-        let group = memo.canonical_group(reference.group);
-        let Some(group_ref) = memo.group(group) else {
-            return false;
-        };
-        facts.insert(
-            group,
-            (
-                group_ref.logical_fact_fingerprint(),
-                group_ref.statistics_snapshot_fingerprint(),
-            ),
-        );
-        node.children
-            .iter()
-            .copied()
-            .all(|child| visit(memo, child, nodes, facts, visited))
+        true
     }
     if !visit(memo, root, nodes, &mut facts, &mut visited)
         || !visit(memo, arm, nodes, &mut facts, &mut visited)
@@ -578,7 +579,7 @@ fn selected_aggregate_region_witnesses_refs(
     root: ChildWinnerRef,
     nodes: &[QualityCandidateNode],
     goal: OptimizationGoal,
-    properties: &quality_properties::SelectedQualityProperties,
+    properties: &mut quality_properties::SelectedQualityProperties,
 ) -> Option<Vec<AggregateRegionWitness>> {
     let nodes = quality_node_map(nodes);
     let mut witnesses = Vec::new();
@@ -590,9 +591,14 @@ fn selected_aggregate_region_witnesses_refs(
         nodes: &BTreeMap<CandidateId, &QualityCandidateNode>,
         path: &mut Vec<u32>,
         witnesses: &mut Vec<AggregateRegionWitness>,
-        properties: &quality_properties::SelectedQualityProperties,
+        properties: &mut quality_properties::SelectedQualityProperties,
     ) -> Option<()> {
         let (root_candidate, goal) = region_root;
+        // The local property already proves that this whole branch has no
+        // UNION boundary. Do not rescan it while looking for regions.
+        if !properties.contains_union(reference.candidate) {
+            return Some(());
+        }
         let node = quality_node(nodes, reference)?;
         if properties.is_union(reference.candidate) {
             for (index, arm) in node.children.iter().copied().enumerate() {
@@ -614,7 +620,7 @@ fn selected_aggregate_region_witnesses_refs(
                         return None;
                     }
                     let fact_fingerprint =
-                        collect_quality_region_fact_fingerprint(memo, reference, arm, goal, nodes)?;
+                        properties.region_fact_fingerprint(memo, reference, goal, nodes)?;
                     let union_choice = properties.choice(reference.candidate);
                     let mut region = StableFingerprintBuilder::default();
                     region.write_bytes(b"paro.quality.aggregate-region.v2");
@@ -687,8 +693,7 @@ fn selected_aggregate_region_witnesses_refs(
             ) {
                 return None;
             }
-            let fact_fingerprint =
-                collect_quality_region_fact_fingerprint(memo, root, root, goal, &nodes)?;
+            let fact_fingerprint = properties.region_fact_fingerprint(memo, root, goal, &nodes)?;
             let mut region = StableFingerprintBuilder::default();
             region.write_bytes(b"paro.quality.aggregate-region.root.v1");
             region.write_u64(root.candidate.index() as u64);
