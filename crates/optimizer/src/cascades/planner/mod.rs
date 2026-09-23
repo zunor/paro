@@ -972,6 +972,9 @@ impl QualityEvidenceProvider for PlannerQualityEvidenceProvider {
         goal: OptimizationGoal,
         policy: &super::quality::QualityBundleRegistry,
     ) -> Result<Option<SelectedQualityEvidence>> {
+        if reference.goal != goal {
+            return Ok(None);
+        }
         let state = self
             .state
             .read()

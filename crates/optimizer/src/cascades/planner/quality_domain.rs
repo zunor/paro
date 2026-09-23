@@ -506,6 +506,7 @@ pub(super) fn pending_transfer_for_ref(
         .semantic_template
         .operator;
     if let LogicalOperator::Filter(filter) = operator {
+        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityDomain);
         let [child] = node.children.as_ref() else {
             return None;
         };
