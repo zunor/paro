@@ -61,9 +61,11 @@ The first post-stage-2 Q04 cold-planning capture compiled successfully, but its
 cell writer refused a record above its registered 10,578-byte limit. Preserve
 that CapacityExceeded result; it is not a timing gate pass. Before replacement
 collection, select the existing TPC-DS collector for the three exploratory
-cells: one normal fresh block/one warmup/one ABBA round plus one independent
+cells: two normal fresh blocks/one warmup/one ABBA round plus one independent
 Detail block each. The extra normal blocks are exploratory and are not pooled
-into final control/probe samples. Keep the original final sampling contract.
+into final control/probe samples. Two blocks are the collector's minimum;
+the rejected one-block invocation collected no data. Keep the original final
+sampling contract.
 
 Removing the superseded preflight implementation also removes its unused
 process diagnostic setting. The single matching expected setting row is
