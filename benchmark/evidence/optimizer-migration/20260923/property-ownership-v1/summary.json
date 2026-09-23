@@ -1,0 +1,3474 @@
+{
+  "certification": "NotCertified",
+  "common_inputs": {
+    "configuration": {
+      "cohorts": {
+        "diagnostic": {
+          "compile_document": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)",
+          "excluded_from_c1": true,
+          "purpose": "same-operation phase attribution",
+          "statement_cache_evidence": true,
+          "strong_incumbent_experiment": false,
+          "strong_incumbent_inject_logical": false,
+          "strong_incumbent_provide_bound": false,
+          "trace_mode": "off"
+        },
+        "normal": {
+          "allocation_profile": false,
+          "purpose": "primary C1/W",
+          "statement_cache_evidence": true,
+          "strong_incumbent_experiment": false,
+          "strong_incumbent_inject_logical": false,
+          "strong_incumbent_provide_bound": false,
+          "trace_mode": "off"
+        }
+      },
+      "compile_evidence_schema_version": 3,
+      "diagnostic_process_blocks": 1,
+      "execution_dop": 4,
+      "latency_tracks": {
+        "C0": {
+          "auxiliary": "managed_server.startup_to_ready_ms",
+          "name": "first_result_from_process_start",
+          "status": "Uncovered"
+        },
+        "C1": {
+          "cohort": "normal_trace_off",
+          "name": "cold_first_statement",
+          "primary_gate": true,
+          "timer": "client perf_counter_ns around execute/fetch/native result metadata"
+        },
+        "C2": {
+          "diagnostic_only": true,
+          "name": "first_noncompile_path",
+          "status": "diagnostic_only_until_interval_union_is_complete",
+          "timer": "same-operation interval union after compiler return"
+        },
+        "W": {
+          "execution_quality_gate": true,
+          "name": "steady_state",
+          "timer": "execute/fetch/native result metadata after cold sample and cache warmup"
+        }
+      },
+      "measurement_order": "seeded_random_ABBA_per_round_within_fresh_process_block",
+      "measurement_rounds_per_process": 1,
+      "memory_limit": "2GB",
+      "optimizer_search_policy": "quality",
+      "optimizer_verify": false,
+      "paro_input_isolation": "private_copy_per_process",
+      "paro_result_format": "binary",
+      "planning_dop": 1,
+      "process_blocks": 3,
+      "resource_envelope": {
+        "concurrent_target_statements": 1,
+        "memory_limit": "2GB",
+        "page_cache_policy": "private_copy_per_process; OS cache not flushed",
+        "service_cpu_limit": 4
+      },
+      "result_contract_version": "typed-result-v4",
+      "runtime_environment": {
+        "PARO_CERTIFIED_GROUP_PRUNING": null,
+        "PARO_COLD_WORK_EVIDENCE": null,
+        "PARO_COMPILE_WORK_EVIDENCE": "1",
+        "PARO_DIAGNOSTIC_SEARCH_STOP_MS": null,
+        "PARO_DIAGNOSTIC_STREAM_SEQUENTIAL": null,
+        "PARO_DISABLE_PROTECTED_INCUMBENT": null,
+        "PARO_EXPORT_STRONG_INCUMBENT": null,
+        "PARO_STATEMENT_CACHE_EVIDENCE": "1",
+        "PARO_STRONG_INCUMBENT_EXPERIMENT": null,
+        "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": null,
+        "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": null,
+        "RUST_LOG": null
+      },
+      "samples_per_engine": 6,
+      "samples_per_process_per_engine": 2,
+      "statement_timeout_seconds": 300,
+      "status_semantics": {
+        "evidence": "typed compile/admission receipt, schema identity and complete-result validation",
+        "milestone": "pre-registered C1/quality/resource thresholds",
+        "model": "G-Stats/G-Cost admitted only after declared calibration",
+        "regression": "paired normal trace-off C1 comparison against declared baseline"
+      },
+      "threads": 4,
+      "timing_scope": {
+        "canonical_schema_conversion": "outside_each_engine_timer",
+        "cold_statement": "first_statement_parse_compile_admit_execute_fetch_and_native_result_metadata",
+        "compile_document": {
+          "diagnostic_timing": "excluded_from_c1",
+          "normal_timing": "trace_off; no auxiliary compile request",
+          "producer": "server_typed_compile_document",
+          "statement": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)"
+        },
+        "native_result_metadata": "included_in_each_engine_timer",
+        "steady_state": "execute_fetch_and_result_metadata_after_instance_plan_cache_warmup"
+      },
+      "validation_scope": "outside_timed_region_every_sample",
+      "warmups_per_process": 1
+    },
+    "dataset": {
+      "duckdb_path": "/Users/linjunhong/workspace/tpcds-sf1/tpcds-sf1.duckdb",
+      "duckdb_sha256": "568e6c75c0c96a3ba82d6f24e8d515dcf2eb3a85640418c1702c2f9ed6fd8ed7",
+      "load_sql_sha256": "494580a1edbfa41c3876c86ec63e51fd6bd50b46f16a6bd765886f5588f50b82",
+      "paro_data_path": "/private/tmp/paro-migration-relative.u1PLBV",
+      "paro_data_sha256": "256bf479ca982e30c96f9109fb9920d04233c9643b7bcc6a5fd3f5a50554c927",
+      "requested_metadata_track": "generator-declared",
+      "schema_sql_sha256": "40fe37e937c756804b7f6c9905497b2ce34af22062f4a2a6af353a85b30e7240",
+      "source_path": "/Users/linjunhong/workspace/tpcds-sf1/csv",
+      "source_sha256": "4c73cc53e1567cad44341276a09589c209919e1002a7a59fbbedbf9d8e7532f3"
+    },
+    "duckdb": {
+      "execution_isolation": "spawned_fresh_process_per_ABBA_block",
+      "python_extension": {
+        "path": "/Users/linjunhong/workspace/paro/benchmark/.venv/lib/python3.14/site-packages/_duckdb.cpython-314-darwin.so",
+        "sha256": "85fad85339c7e345eabb66a33a25d8503c3ee8881f9d298fa8499a97617dbf68"
+      },
+      "version": "1.5.5"
+    },
+    "harness": {
+      "files": [
+        {
+          "path": "/Users/linjunhong/workspace/paro/benchmark/corpora/tpcds_compare.py",
+          "sha256": "de91c49eaf2c72fc4a6386fb64b8d04db35decd58bc6137725d7414a767b1837"
+        },
+        {
+          "path": "/Users/linjunhong/workspace/paro/benchmark/corpora/benchmark_evidence.py",
+          "sha256": "61857eb7c63be36251853a4c3ab7e01ac85214cfd583055e3dad2f26f72eb997"
+        },
+        {
+          "path": "/Users/linjunhong/workspace/paro/benchmark/corpora/tpcds_result_contract.py",
+          "sha256": "cfbdafb8ae67c4e689a4fd814b3b9aa7c947a48f650aa77a7f8ebf3326cf06f3"
+        },
+        {
+          "path": "/Users/linjunhong/workspace/paro/benchmark/corpora/tpcds_setup.py",
+          "sha256": "9db7956fc506d82008902f962013691b510691ba03ca23c92e89fd24abf2d171"
+        }
+      ]
+    },
+    "query_corpus_sha256": "04f3f951be5526437e3d22b3da0964b687e2bff7e597f07d9d247bc4338740c4"
+  },
+  "evidence_id": "optimizer-property-ownership-20260923-v1",
+  "exploratory": {
+    "demand-proof-q74-run": {
+      "bytes": 243726
+    },
+    "region-boundary-q74-run": {
+      "bytes": 243807
+    },
+    "stage1-isolation-q74-run": {
+      "bytes": 243883
+    },
+    "stage2-q04-run": {
+      "bytes": 201390
+    },
+    "stage2-tpcds-q04-run": {
+      "bytes": 244069
+    },
+    "stage2-tpcds-q11-run": {
+      "bytes": 244178
+    },
+    "stage2-tpcds-q74-run": {
+      "bytes": 243869
+    }
+  },
+  "queries": {
+    "11": {
+      "arms": {
+        "control": {
+          "compiler": {
+            "median_ms": 13.4435,
+            "p90_ms": 13.589,
+            "samples_ms": [
+              12.827,
+              14.148,
+              13.33,
+              13.557,
+              13.118,
+              13.589
+            ]
+          },
+          "diagnostic": [
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 119,
+                "omitted_encoding_detail": 1398,
+                "omitted_source_detail": 664
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 420,
+                  "exclusive_ms": 0.364826
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 0.294659
+                },
+                "Apply": {
+                  "entries": 22,
+                  "exclusive_ms": 0.150126
+                },
+                "Dependencies": {
+                  "entries": 1342,
+                  "exclusive_ms": 0.422226
+                },
+                "Encoding": {
+                  "entries": 57,
+                  "exclusive_ms": 0.718585
+                },
+                "Finish": {
+                  "entries": 799,
+                  "exclusive_ms": 1.587159
+                },
+                "Insert": {
+                  "entries": 23,
+                  "exclusive_ms": 0.036334
+                },
+                "Kernel": {
+                  "entries": 401,
+                  "exclusive_ms": 0.237994
+                },
+                "Match": {
+                  "entries": 748,
+                  "exclusive_ms": 0.234086
+                },
+                "NativeConstruct": {
+                  "entries": 15,
+                  "exclusive_ms": 0.41629
+                },
+                "OwnedRewrite": {
+                  "entries": 16,
+                  "exclusive_ms": 0.228081
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.09396
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.598667
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 2.892417
+                },
+                "Publish": {
+                  "entries": 1653,
+                  "exclusive_ms": 0.251106
+                },
+                "Quality": {
+                  "entries": 1,
+                  "exclusive_ms": 0.0095
+                },
+                "QualityDomain": {
+                  "entries": 2,
+                  "exclusive_ms": 0.060375
+                },
+                "QualityEvidence": {
+                  "entries": 2,
+                  "exclusive_ms": 0.445875
+                },
+                "QualityFreeze": {
+                  "entries": 12,
+                  "exclusive_ms": 0.163
+                },
+                "QualityProduction": {
+                  "entries": 0,
+                  "exclusive_ms": 0
+                },
+                "QualityReads": {
+                  "entries": 109,
+                  "exclusive_ms": 0.096456
+                },
+                "Recipe": {
+                  "entries": 429,
+                  "exclusive_ms": 1.30743
+                },
+                "Rollback": {
+                  "entries": 14,
+                  "exclusive_ms": 0.053462
+                },
+                "Schedule": {
+                  "entries": 498,
+                  "exclusive_ms": 0.310423
+                },
+                "SemanticGuard": {
+                  "entries": 15,
+                  "exclusive_ms": 0.044247
+                },
+                "Settlement": {
+                  "entries": 12,
+                  "exclusive_ms": 0.959539
+                },
+                "Staging": {
+                  "entries": 60,
+                  "exclusive_ms": 0.817795
+                },
+                "Statistics": {
+                  "entries": 35,
+                  "exclusive_ms": 0.458919
+                },
+                "Subproblem": {
+                  "entries": 256,
+                  "exclusive_ms": 1.46859
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 0.659707
+                }
+              },
+              "compiler_ms": 16.664042,
+              "counters": {
+                "child_combination_cost_synthesis_count": 401,
+                "physical_readset_rebuild_count": 301,
+                "physical_subproblem_evaluation_count": 187,
+                "physical_subproblem_request_count": 200,
+                "physical_subproblem_reuse_count": 68,
+                "quality_policy_frontier_candidate_count": 1,
+                "quality_policy_missing_evidence_count": 0,
+                "quality_producer_dispatch_count": 0
+              },
+              "optimizer_ms": 15.381834,
+              "run": "control-1-q11-run"
+            },
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 119,
+                "omitted_encoding_detail": 1398,
+                "omitted_source_detail": 664
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 420,
+                  "exclusive_ms": 0.338794
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 0.279463
+                },
+                "Apply": {
+                  "entries": 22,
+                  "exclusive_ms": 0.149168
+                },
+                "Dependencies": {
+                  "entries": 1342,
+                  "exclusive_ms": 0.418649
+                },
+                "Encoding": {
+                  "entries": 57,
+                  "exclusive_ms": 0.657128
+                },
+                "Finish": {
+                  "entries": 799,
+                  "exclusive_ms": 1.643883
+                },
+                "Insert": {
+                  "entries": 23,
+                  "exclusive_ms": 0.03354
+                },
+                "Kernel": {
+                  "entries": 401,
+                  "exclusive_ms": 0.235584
+                },
+                "Match": {
+                  "entries": 748,
+                  "exclusive_ms": 0.210232
+                },
+                "NativeConstruct": {
+                  "entries": 15,
+                  "exclusive_ms": 0.34129
+                },
+                "OwnedRewrite": {
+                  "entries": 16,
+                  "exclusive_ms": 0.205045
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.072911
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.651708
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 2.693249
+                },
+                "Publish": {
+                  "entries": 1653,
+                  "exclusive_ms": 0.235102
+                },
+                "Quality": {
+                  "entries": 1,
+                  "exclusive_ms": 0.009999
+                },
+                "QualityDomain": {
+                  "entries": 2,
+                  "exclusive_ms": 0.060626
+                },
+                "QualityEvidence": {
+                  "entries": 2,
+                  "exclusive_ms": 0.434583
+                },
+                "QualityFreeze": {
+                  "entries": 12,
+                  "exclusive_ms": 0.170833
+                },
+                "QualityProduction": {
+                  "entries": 0,
+                  "exclusive_ms": 0
+                },
+                "QualityReads": {
+                  "entries": 109,
+                  "exclusive_ms": 0.090173
+                },
+                "Recipe": {
+                  "entries": 429,
+                  "exclusive_ms": 1.271168
+                },
+                "Rollback": {
+                  "entries": 14,
+                  "exclusive_ms": 0.045291
+                },
+                "Schedule": {
+                  "entries": 498,
+                  "exclusive_ms": 0.31123
+                },
+                "SemanticGuard": {
+                  "entries": 15,
+                  "exclusive_ms": 0.037335
+                },
+                "Settlement": {
+                  "entries": 12,
+                  "exclusive_ms": 0.850205
+                },
+                "Staging": {
+                  "entries": 60,
+                  "exclusive_ms": 0.716991
+                },
+                "Statistics": {
+                  "entries": 35,
+                  "exclusive_ms": 0.401668
+                },
+                "Subproblem": {
+                  "entries": 256,
+                  "exclusive_ms": 1.417567
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 0.715918
+                }
+              },
+              "compiler_ms": 16.010167,
+              "counters": {
+                "child_combination_cost_synthesis_count": 401,
+                "physical_readset_rebuild_count": 301,
+                "physical_subproblem_evaluation_count": 187,
+                "physical_subproblem_request_count": 200,
+                "physical_subproblem_reuse_count": 68,
+                "quality_policy_frontier_candidate_count": 1,
+                "quality_policy_missing_evidence_count": 0,
+                "quality_producer_dispatch_count": 0
+              },
+              "optimizer_ms": 14.699333,
+              "run": "control-2-q11-run"
+            }
+          ],
+          "duckdb_c1": {
+            "median_ms": 71.701,
+            "p90_ms": 77.919125,
+            "samples_ms": [
+              68.584166,
+              59.188666,
+              64.869958,
+              77.919125,
+              79.259125,
+              74.817834
+            ]
+          },
+          "duckdb_warm": {
+            "median_ms": 59.7094795,
+            "p90_ms": 73.962375,
+            "samples_ms": [
+              73.962375,
+              55.347333,
+              64.021583,
+              55.015458,
+              67.015541,
+              58.565041,
+              58.736375,
+              133.193208,
+              59.258667,
+              58.517083,
+              68.780375,
+              60.160292
+            ]
+          },
+          "normal_samples": [
+            {
+              "compiler_ms": 12.827,
+              "run": "control-1-q11-run",
+              "sample_id": "11-sample-0000",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 14.148,
+              "run": "control-1-q11-run",
+              "sample_id": "11-sample-0003",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 13.33,
+              "run": "control-1-q11-run",
+              "sample_id": "11-sample-0006",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 13.557,
+              "run": "control-2-q11-run",
+              "sample_id": "11-sample-0000",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 13.118,
+              "run": "control-2-q11-run",
+              "sample_id": "11-sample-0003",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 13.589,
+              "run": "control-2-q11-run",
+              "sample_id": "11-sample-0006",
+              "syntheses": 401
+            }
+          ],
+          "optimizer": {
+            "median_ms": 12.5875,
+            "p90_ms": 12.72,
+            "samples_ms": [
+              11.962,
+              13.253,
+              12.465,
+              12.72,
+              12.26,
+              12.71
+            ]
+          },
+          "paro_c1": {
+            "median_ms": 159.3537705,
+            "p90_ms": 162.685833,
+            "samples_ms": [
+              153.17625,
+              159.352458,
+              159.355083,
+              162.685833,
+              170.153,
+              157.959916
+            ]
+          },
+          "paro_warm": {
+            "median_ms": 96.679542,
+            "p90_ms": 114.357792,
+            "samples_ms": [
+              114.357792,
+              84.701334,
+              88.647875,
+              90.251875,
+              96.936375,
+              83.275,
+              99.90475,
+              116.819667,
+              96.422709,
+              107.110208,
+              112.09125,
+              89.423625
+            ]
+          },
+          "rule": {
+            "median_ms": 2.971,
+            "p90_ms": 3.026,
+            "samples_ms": [
+              2.824,
+              2.986,
+              2.956,
+              3.026,
+              3.12,
+              2.873
+            ]
+          }
+        },
+        "probe": {
+          "compiler": {
+            "median_ms": 13.557,
+            "p90_ms": 23.004,
+            "samples_ms": [
+              12.249,
+              12.904,
+              12.483,
+              23.004,
+              36.987,
+              14.21
+            ]
+          },
+          "diagnostic": [
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 119,
+                "omitted_encoding_detail": 1399,
+                "omitted_source_detail": 664
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 420,
+                  "exclusive_ms": 0.316552
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 0.24641
+                },
+                "Apply": {
+                  "entries": 22,
+                  "exclusive_ms": 0.136505
+                },
+                "Dependencies": {
+                  "entries": 1342,
+                  "exclusive_ms": 0.368467
+                },
+                "Encoding": {
+                  "entries": 57,
+                  "exclusive_ms": 0.556838
+                },
+                "Finish": {
+                  "entries": 799,
+                  "exclusive_ms": 1.465731
+                },
+                "Insert": {
+                  "entries": 23,
+                  "exclusive_ms": 0.029664
+                },
+                "Kernel": {
+                  "entries": 401,
+                  "exclusive_ms": 0.223794
+                },
+                "Match": {
+                  "entries": 748,
+                  "exclusive_ms": 0.203912
+                },
+                "NativeConstruct": {
+                  "entries": 15,
+                  "exclusive_ms": 0.322332
+                },
+                "OwnedRewrite": {
+                  "entries": 16,
+                  "exclusive_ms": 0.167915
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.071912
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.7105
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 2.482584
+                },
+                "Publish": {
+                  "entries": 1653,
+                  "exclusive_ms": 0.216712
+                },
+                "Quality": {
+                  "entries": 1,
+                  "exclusive_ms": 0.008625
+                },
+                "QualityDomain": {
+                  "entries": 9,
+                  "exclusive_ms": 0.038252
+                },
+                "QualityEvidence": {
+                  "entries": 1,
+                  "exclusive_ms": 0.237581
+                },
+                "QualityFreeze": {
+                  "entries": 12,
+                  "exclusive_ms": 0.144125
+                },
+                "QualityProduction": {
+                  "entries": 0,
+                  "exclusive_ms": 0
+                },
+                "QualityReads": {
+                  "entries": 108,
+                  "exclusive_ms": 0.084129
+                },
+                "Recipe": {
+                  "entries": 429,
+                  "exclusive_ms": 1.178488
+                },
+                "Rollback": {
+                  "entries": 14,
+                  "exclusive_ms": 0.04479
+                },
+                "Schedule": {
+                  "entries": 498,
+                  "exclusive_ms": 0.268727
+                },
+                "SemanticGuard": {
+                  "entries": 15,
+                  "exclusive_ms": 0.025333
+                },
+                "Settlement": {
+                  "entries": 12,
+                  "exclusive_ms": 0.750498
+                },
+                "Staging": {
+                  "entries": 60,
+                  "exclusive_ms": 0.621245
+                },
+                "Statistics": {
+                  "entries": 35,
+                  "exclusive_ms": 0.340334
+                },
+                "Subproblem": {
+                  "entries": 256,
+                  "exclusive_ms": 1.316294
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 0.630126
+                }
+              },
+              "compiler_ms": 14.485291,
+              "counters": {
+                "child_combination_cost_synthesis_count": 401,
+                "physical_readset_rebuild_count": 301,
+                "physical_subproblem_evaluation_count": 187,
+                "physical_subproblem_request_count": 200,
+                "physical_subproblem_reuse_count": 68,
+                "quality_policy_frontier_candidate_count": 1,
+                "quality_policy_missing_evidence_count": 0,
+                "quality_producer_dispatch_count": 0,
+                "quality_property_cte_builds": 1,
+                "quality_property_cte_reuses": 0,
+                "quality_property_node_builds": 37,
+                "quality_property_node_reuses": 0
+              },
+              "optimizer_ms": 13.208375,
+              "run": "probe-1-q11-run"
+            },
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 119,
+                "omitted_encoding_detail": 1399,
+                "omitted_source_detail": 664
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 420,
+                  "exclusive_ms": 0.492155
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 0.330088
+                },
+                "Apply": {
+                  "entries": 22,
+                  "exclusive_ms": 0.189417
+                },
+                "Dependencies": {
+                  "entries": 1342,
+                  "exclusive_ms": 0.443593
+                },
+                "Encoding": {
+                  "entries": 57,
+                  "exclusive_ms": 0.660583
+                },
+                "Finish": {
+                  "entries": 800,
+                  "exclusive_ms": 2.124999
+                },
+                "Insert": {
+                  "entries": 23,
+                  "exclusive_ms": 0.036455
+                },
+                "Kernel": {
+                  "entries": 401,
+                  "exclusive_ms": 0.260128
+                },
+                "Match": {
+                  "entries": 748,
+                  "exclusive_ms": 0.253241
+                },
+                "NativeConstruct": {
+                  "entries": 15,
+                  "exclusive_ms": 0.514334
+                },
+                "OwnedRewrite": {
+                  "entries": 16,
+                  "exclusive_ms": 0.270879
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.076921
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.593625
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 2.5815
+                },
+                "Publish": {
+                  "entries": 1653,
+                  "exclusive_ms": 0.27743
+                },
+                "Quality": {
+                  "entries": 1,
+                  "exclusive_ms": 0.011834
+                },
+                "QualityDomain": {
+                  "entries": 9,
+                  "exclusive_ms": 0.046415
+                },
+                "QualityEvidence": {
+                  "entries": 1,
+                  "exclusive_ms": 0.268918
+                },
+                "QualityFreeze": {
+                  "entries": 13,
+                  "exclusive_ms": 0.196458
+                },
+                "QualityProduction": {
+                  "entries": 0,
+                  "exclusive_ms": 0
+                },
+                "QualityReads": {
+                  "entries": 109,
+                  "exclusive_ms": 0.120036
+                },
+                "Recipe": {
+                  "entries": 429,
+                  "exclusive_ms": 1.279579
+                },
+                "Rollback": {
+                  "entries": 14,
+                  "exclusive_ms": 0.089208
+                },
+                "Schedule": {
+                  "entries": 498,
+                  "exclusive_ms": 0.311179
+                },
+                "SemanticGuard": {
+                  "entries": 15,
+                  "exclusive_ms": 0.034583
+                },
+                "Settlement": {
+                  "entries": 12,
+                  "exclusive_ms": 1.072955
+                },
+                "Staging": {
+                  "entries": 60,
+                  "exclusive_ms": 0.911037
+                },
+                "Statistics": {
+                  "entries": 35,
+                  "exclusive_ms": 0.46821
+                },
+                "Subproblem": {
+                  "entries": 256,
+                  "exclusive_ms": 1.606864
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 0.769668
+                }
+              },
+              "compiler_ms": 17.475375,
+              "counters": {
+                "child_combination_cost_synthesis_count": 401,
+                "physical_readset_rebuild_count": 301,
+                "physical_subproblem_evaluation_count": 187,
+                "physical_subproblem_request_count": 200,
+                "physical_subproblem_reuse_count": 68,
+                "quality_policy_frontier_candidate_count": 1,
+                "quality_policy_missing_evidence_count": 0,
+                "quality_producer_dispatch_count": 0,
+                "quality_property_cte_builds": 1,
+                "quality_property_cte_reuses": 0,
+                "quality_property_node_builds": 37,
+                "quality_property_node_reuses": 0
+              },
+              "optimizer_ms": 16.292292,
+              "run": "probe-2-q11-run"
+            }
+          ],
+          "duckdb_c1": {
+            "median_ms": 80.7269375,
+            "p90_ms": 119.923958,
+            "samples_ms": [
+              60.196875,
+              69.809875,
+              66.138708,
+              119.923958,
+              170.941792,
+              91.644
+            ]
+          },
+          "duckdb_warm": {
+            "median_ms": 66.820292,
+            "p90_ms": 117.682959,
+            "samples_ms": [
+              57.089958,
+              83.066625,
+              57.024459,
+              66.613834,
+              53.523791,
+              55.017583,
+              98.894625,
+              67.02675,
+              153.804792,
+              64.538209,
+              117.682959,
+              91.180667
+            ]
+          },
+          "normal_samples": [
+            {
+              "compiler_ms": 12.249,
+              "run": "probe-1-q11-run",
+              "sample_id": "11-sample-0000",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 12.904,
+              "run": "probe-1-q11-run",
+              "sample_id": "11-sample-0003",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 12.483,
+              "run": "probe-1-q11-run",
+              "sample_id": "11-sample-0006",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 23.004,
+              "run": "probe-2-q11-run",
+              "sample_id": "11-sample-0000",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 36.987,
+              "run": "probe-2-q11-run",
+              "sample_id": "11-sample-0003",
+              "syntheses": 401
+            },
+            {
+              "compiler_ms": 14.21,
+              "run": "probe-2-q11-run",
+              "sample_id": "11-sample-0006",
+              "syntheses": 401
+            }
+          ],
+          "optimizer": {
+            "median_ms": 12.6745,
+            "p90_ms": 21.86,
+            "samples_ms": [
+              11.401,
+              12.035,
+              11.636,
+              21.86,
+              34.507,
+              13.314
+            ]
+          },
+          "paro_c1": {
+            "median_ms": 166.555833,
+            "p90_ms": 220.185625,
+            "samples_ms": [
+              148.388792,
+              149.64125,
+              153.620458,
+              220.185625,
+              390.504959,
+              179.491208
+            ]
+          },
+          "paro_warm": {
+            "median_ms": 93.040479,
+            "p90_ms": 156.955167,
+            "samples_ms": [
+              83.705959,
+              84.115334,
+              78.353709,
+              97.219917,
+              78.565917,
+              74.793875,
+              151.372083,
+              95.46275,
+              176.5575,
+              90.618208,
+              156.955167,
+              103.047667
+            ]
+          },
+          "rule": {
+            "median_ms": 3.2845,
+            "p90_ms": 4.885,
+            "samples_ms": [
+              2.954,
+              3.233,
+              3.014,
+              4.885,
+              7.563,
+              3.336
+            ]
+          }
+        }
+      },
+      "compiler_change_pct": 0.8442741845501534,
+      "identical_artifact": {
+        "artifact": [
+          3535358152705178600,
+          17522059646486692000
+        ],
+        "dependencies": [
+          18360253679477146000,
+          10635605012605989000
+        ],
+        "schema_version": 3,
+        "structure": [
+          11516439150351780000,
+          8404971069661154000
+        ]
+      },
+      "identical_search_state": {
+        "budget_limited": {
+          "Observed": false
+        },
+        "groups": {
+          "Observed": 53
+        },
+        "logical_expressions": {
+          "Observed": 61
+        },
+        "obligations": {
+          "Observed": 2
+        },
+        "physical_expressions": {
+          "Observed": 105
+        },
+        "quality_policy_satisfied": {
+          "Observed": true
+        },
+        "search_complete": {
+          "Observed": false
+        },
+        "search_stop": {
+          "Observed": "QualityPolicySatisfied"
+        },
+        "variant_count": {
+          "Observed": 4
+        }
+      },
+      "identical_selection": {
+        "actual_class": 2,
+        "actual_fingerprint": [
+          12351371491982086000,
+          5846829240171668000
+        ],
+        "admission": "Selected",
+        "expected_class": 2,
+        "fallback": null,
+        "image": "Ready",
+        "lowering": "Ready",
+        "lowering_error": null,
+        "reservation": "Committed",
+        "resources": {
+          "class": 2,
+          "external_worker_slots": 0,
+          "max_parallel_tasks": 4,
+          "memory_ceiling_bytes": 2000000000,
+          "memory_completion": "Guaranteed",
+          "minimum_memory_bytes": 28901376,
+          "working_set_memory_bytes": 332928016
+        },
+        "terminal": "Completed",
+        "terminal_error": null
+      },
+      "warm_change_pct": -3.7640465859881678
+    },
+    "74": {
+      "arms": {
+        "control": {
+          "compiler": {
+            "median_ms": 72.5495,
+            "p90_ms": 77.232,
+            "samples_ms": [
+              78.363,
+              71.699,
+              63.99,
+              73.4,
+              77.232,
+              68.156
+            ]
+          },
+          "diagnostic": [
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 1887,
+                "omitted_encoding_detail": 1399,
+                "omitted_source_detail": 2153
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 1065,
+                  "exclusive_ms": 0.691267
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 1.478133
+                },
+                "Apply": {
+                  "entries": 105,
+                  "exclusive_ms": 0.397335
+                },
+                "Dependencies": {
+                  "entries": 5245,
+                  "exclusive_ms": 2.214742
+                },
+                "Encoding": {
+                  "entries": 241,
+                  "exclusive_ms": 1.534329
+                },
+                "Finish": {
+                  "entries": 2106,
+                  "exclusive_ms": 1.845826
+                },
+                "Insert": {
+                  "entries": 98,
+                  "exclusive_ms": 0.125175
+                },
+                "Kernel": {
+                  "entries": 1045,
+                  "exclusive_ms": 0.60759
+                },
+                "Match": {
+                  "entries": 2287,
+                  "exclusive_ms": 1.131443
+                },
+                "NativeConstruct": {
+                  "entries": 73,
+                  "exclusive_ms": 1.083624
+                },
+                "OwnedRewrite": {
+                  "entries": 68,
+                  "exclusive_ms": 0.672164
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.083626
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.501208
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 2.378292
+                },
+                "Publish": {
+                  "entries": 3373,
+                  "exclusive_ms": 0.488717
+                },
+                "Quality": {
+                  "entries": 136,
+                  "exclusive_ms": 0.734347
+                },
+                "QualityDomain": {
+                  "entries": 230,
+                  "exclusive_ms": 3.977903
+                },
+                "QualityEvidence": {
+                  "entries": 230,
+                  "exclusive_ms": 30.250021
+                },
+                "QualityFreeze": {
+                  "entries": 282,
+                  "exclusive_ms": 2.535293
+                },
+                "QualityProduction": {
+                  "entries": 50,
+                  "exclusive_ms": 0.240377
+                },
+                "QualityReads": {
+                  "entries": 201,
+                  "exclusive_ms": 0.402078
+                },
+                "Recipe": {
+                  "entries": 617,
+                  "exclusive_ms": 1.75303
+                },
+                "Rollback": {
+                  "entries": 37,
+                  "exclusive_ms": 0.277875
+                },
+                "Schedule": {
+                  "entries": 1205,
+                  "exclusive_ms": 0.872258
+                },
+                "SemanticGuard": {
+                  "entries": 66,
+                  "exclusive_ms": 0.088296
+                },
+                "Settlement": {
+                  "entries": 59,
+                  "exclusive_ms": 2.541629
+                },
+                "Staging": {
+                  "entries": 262,
+                  "exclusive_ms": 1.939539
+                },
+                "Statistics": {
+                  "entries": 174,
+                  "exclusive_ms": 1.252331
+                },
+                "Subproblem": {
+                  "entries": 606,
+                  "exclusive_ms": 2.815302
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 1.302042
+                }
+              },
+              "compiler_ms": 67.254291,
+              "counters": {
+                "child_combination_cost_synthesis_count": 1045,
+                "physical_readset_rebuild_count": 486,
+                "physical_subproblem_evaluation_count": 307,
+                "physical_subproblem_request_count": 375,
+                "physical_subproblem_reuse_count": 294,
+                "quality_policy_frontier_candidate_count": 140,
+                "quality_policy_missing_evidence_count": 89,
+                "quality_producer_dispatch_count": 40
+              },
+              "optimizer_ms": 66.215792,
+              "run": "control-1-q74-run"
+            },
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 1887,
+                "omitted_encoding_detail": 1399,
+                "omitted_source_detail": 2153
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 1065,
+                  "exclusive_ms": 0.938502
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 1.767192
+                },
+                "Apply": {
+                  "entries": 105,
+                  "exclusive_ms": 0.440882
+                },
+                "Dependencies": {
+                  "entries": 5245,
+                  "exclusive_ms": 2.7565
+                },
+                "Encoding": {
+                  "entries": 241,
+                  "exclusive_ms": 1.966124
+                },
+                "Finish": {
+                  "entries": 2106,
+                  "exclusive_ms": 1.666979
+                },
+                "Insert": {
+                  "entries": 98,
+                  "exclusive_ms": 0.147458
+                },
+                "Kernel": {
+                  "entries": 1045,
+                  "exclusive_ms": 0.857697
+                },
+                "Match": {
+                  "entries": 2287,
+                  "exclusive_ms": 1.306914
+                },
+                "NativeConstruct": {
+                  "entries": 73,
+                  "exclusive_ms": 1.481253
+                },
+                "OwnedRewrite": {
+                  "entries": 68,
+                  "exclusive_ms": 0.936579
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.090123
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.489625
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 2.645166
+                },
+                "Publish": {
+                  "entries": 3373,
+                  "exclusive_ms": 0.598304
+                },
+                "Quality": {
+                  "entries": 136,
+                  "exclusive_ms": 1.058199
+                },
+                "QualityDomain": {
+                  "entries": 230,
+                  "exclusive_ms": 4.440716
+                },
+                "QualityEvidence": {
+                  "entries": 230,
+                  "exclusive_ms": 35.111739
+                },
+                "QualityFreeze": {
+                  "entries": 282,
+                  "exclusive_ms": 3.53646
+                },
+                "QualityProduction": {
+                  "entries": 50,
+                  "exclusive_ms": 0.366498
+                },
+                "QualityReads": {
+                  "entries": 201,
+                  "exclusive_ms": 0.484163
+                },
+                "Recipe": {
+                  "entries": 617,
+                  "exclusive_ms": 2.201378
+                },
+                "Rollback": {
+                  "entries": 37,
+                  "exclusive_ms": 0.329622
+                },
+                "Schedule": {
+                  "entries": 1205,
+                  "exclusive_ms": 1.039213
+                },
+                "SemanticGuard": {
+                  "entries": 66,
+                  "exclusive_ms": 0.150537
+                },
+                "Settlement": {
+                  "entries": 59,
+                  "exclusive_ms": 3.350794
+                },
+                "Staging": {
+                  "entries": 262,
+                  "exclusive_ms": 2.612132
+                },
+                "Statistics": {
+                  "entries": 174,
+                  "exclusive_ms": 1.733665
+                },
+                "Subproblem": {
+                  "entries": 606,
+                  "exclusive_ms": 3.463296
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 1.29829
+                }
+              },
+              "compiler_ms": 80.446833,
+              "counters": {
+                "child_combination_cost_synthesis_count": 1045,
+                "physical_readset_rebuild_count": 486,
+                "physical_subproblem_evaluation_count": 307,
+                "physical_subproblem_request_count": 375,
+                "physical_subproblem_reuse_count": 294,
+                "quality_policy_frontier_candidate_count": 140,
+                "quality_policy_missing_evidence_count": 89,
+                "quality_producer_dispatch_count": 40
+              },
+              "optimizer_ms": 79.266,
+              "run": "control-2-q74-run"
+            }
+          ],
+          "duckdb_c1": {
+            "median_ms": 82.1509585,
+            "p90_ms": 85.887416,
+            "samples_ms": [
+              85.887416,
+              101.601292,
+              83.458042,
+              76.417667,
+              80.554042,
+              80.843875
+            ]
+          },
+          "duckdb_warm": {
+            "median_ms": 66.9112915,
+            "p90_ms": 86.691208,
+            "samples_ms": [
+              65.574375,
+              70.28875,
+              75.486125,
+              86.691208,
+              66.307,
+              65.163375,
+              67.2115,
+              65.113041,
+              99.284417,
+              68.725667,
+              64.398958,
+              66.611083
+            ]
+          },
+          "normal_samples": [
+            {
+              "compiler_ms": 78.363,
+              "run": "control-1-q74-run",
+              "sample_id": "74-sample-0000",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 71.699,
+              "run": "control-1-q74-run",
+              "sample_id": "74-sample-0003",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 63.99,
+              "run": "control-1-q74-run",
+              "sample_id": "74-sample-0006",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 73.4,
+              "run": "control-2-q74-run",
+              "sample_id": "74-sample-0000",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 77.232,
+              "run": "control-2-q74-run",
+              "sample_id": "74-sample-0003",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 68.156,
+              "run": "control-2-q74-run",
+              "sample_id": "74-sample-0006",
+              "syntheses": 1045
+            }
+          ],
+          "optimizer": {
+            "median_ms": 71.31649999999999,
+            "p90_ms": 76.568,
+            "samples_ms": [
+              77.712,
+              70.494,
+              63.317,
+              72.139,
+              76.568,
+              67.473
+            ]
+          },
+          "paro_c1": {
+            "median_ms": 187.2987705,
+            "p90_ms": 197.852917,
+            "samples_ms": [
+              194.592708,
+              180.004833,
+              169.278583,
+              197.852917,
+              198.007167,
+              167.78525
+            ]
+          },
+          "paro_warm": {
+            "median_ms": 64.0919995,
+            "p90_ms": 77.000084,
+            "samples_ms": [
+              68.071958,
+              64.549708,
+              104.454667,
+              70.456667,
+              57.526083,
+              52.795083,
+              56.687709,
+              58.784667,
+              71.124458,
+              77.000084,
+              63.634291,
+              60.905583
+            ]
+          },
+          "rule": {
+            "median_ms": 12.3155,
+            "p90_ms": 13.472,
+            "samples_ms": [
+              12.944,
+              11.35,
+              9.978,
+              13.472,
+              14.256,
+              11.687
+            ]
+          }
+        },
+        "probe": {
+          "compiler": {
+            "median_ms": 40.223,
+            "p90_ms": 44.252,
+            "samples_ms": [
+              52.525,
+              37.955,
+              38.288,
+              38.93,
+              41.516,
+              44.252
+            ]
+          },
+          "diagnostic": [
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 1887,
+                "omitted_encoding_detail": 1400,
+                "omitted_source_detail": 2153
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 1065,
+                  "exclusive_ms": 0.892468
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 1.652628
+                },
+                "Apply": {
+                  "entries": 105,
+                  "exclusive_ms": 0.422893
+                },
+                "Dependencies": {
+                  "entries": 5245,
+                  "exclusive_ms": 2.360453
+                },
+                "Encoding": {
+                  "entries": 241,
+                  "exclusive_ms": 1.678833
+                },
+                "Finish": {
+                  "entries": 2105,
+                  "exclusive_ms": 1.601711
+                },
+                "Insert": {
+                  "entries": 98,
+                  "exclusive_ms": 0.133376
+                },
+                "Kernel": {
+                  "entries": 1045,
+                  "exclusive_ms": 0.638653
+                },
+                "Match": {
+                  "entries": 2287,
+                  "exclusive_ms": 1.245193
+                },
+                "NativeConstruct": {
+                  "entries": 73,
+                  "exclusive_ms": 1.206167
+                },
+                "OwnedRewrite": {
+                  "entries": 68,
+                  "exclusive_ms": 0.79446
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.08692
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.520083
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 2.629625
+                },
+                "Publish": {
+                  "entries": 3373,
+                  "exclusive_ms": 0.509866
+                },
+                "Quality": {
+                  "entries": 136,
+                  "exclusive_ms": 0.313656
+                },
+                "QualityDomain": {
+                  "entries": 67,
+                  "exclusive_ms": 0.472002
+                },
+                "QualityEvidence": {
+                  "entries": 140,
+                  "exclusive_ms": 10.871289
+                },
+                "QualityFreeze": {
+                  "entries": 14,
+                  "exclusive_ms": 0.193208
+                },
+                "QualityProduction": {
+                  "entries": 50,
+                  "exclusive_ms": 0.256126
+                },
+                "QualityReads": {
+                  "entries": 199,
+                  "exclusive_ms": 0.401663
+                },
+                "Recipe": {
+                  "entries": 617,
+                  "exclusive_ms": 1.919613
+                },
+                "Rollback": {
+                  "entries": 37,
+                  "exclusive_ms": 0.280662
+                },
+                "Schedule": {
+                  "entries": 1205,
+                  "exclusive_ms": 0.986302
+                },
+                "SemanticGuard": {
+                  "entries": 66,
+                  "exclusive_ms": 0.094625
+                },
+                "Settlement": {
+                  "entries": 59,
+                  "exclusive_ms": 2.786751
+                },
+                "Staging": {
+                  "entries": 262,
+                  "exclusive_ms": 2.251855
+                },
+                "Statistics": {
+                  "entries": 174,
+                  "exclusive_ms": 1.383254
+                },
+                "Subproblem": {
+                  "entries": 606,
+                  "exclusive_ms": 3.040623
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 1.372625
+                }
+              },
+              "compiler_ms": 44.045042,
+              "counters": {
+                "child_combination_cost_synthesis_count": 1045,
+                "physical_readset_rebuild_count": 486,
+                "physical_subproblem_evaluation_count": 307,
+                "physical_subproblem_request_count": 375,
+                "physical_subproblem_reuse_count": 294,
+                "quality_policy_frontier_candidate_count": 140,
+                "quality_policy_missing_evidence_count": 89,
+                "quality_producer_dispatch_count": 40,
+                "quality_property_cte_builds": 72,
+                "quality_property_cte_reuses": 68,
+                "quality_property_node_builds": 423,
+                "quality_property_node_reuses": 4644
+              },
+              "optimizer_ms": 42.997583,
+              "run": "probe-1-q74-run"
+            },
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 1887,
+                "omitted_encoding_detail": 1400,
+                "omitted_source_detail": 2153
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 1065,
+                  "exclusive_ms": 0.855612
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 1.579639
+                },
+                "Apply": {
+                  "entries": 105,
+                  "exclusive_ms": 0.422881
+                },
+                "Dependencies": {
+                  "entries": 5245,
+                  "exclusive_ms": 2.420673
+                },
+                "Encoding": {
+                  "entries": 241,
+                  "exclusive_ms": 1.612423
+                },
+                "Finish": {
+                  "entries": 2105,
+                  "exclusive_ms": 1.680096
+                },
+                "Insert": {
+                  "entries": 98,
+                  "exclusive_ms": 0.128042
+                },
+                "Kernel": {
+                  "entries": 1045,
+                  "exclusive_ms": 0.70498
+                },
+                "Match": {
+                  "entries": 2287,
+                  "exclusive_ms": 1.244563
+                },
+                "NativeConstruct": {
+                  "entries": 73,
+                  "exclusive_ms": 1.238749
+                },
+                "OwnedRewrite": {
+                  "entries": 68,
+                  "exclusive_ms": 0.815002
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.085628
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.495167
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 2.582083
+                },
+                "Publish": {
+                  "entries": 3373,
+                  "exclusive_ms": 0.61922
+                },
+                "Quality": {
+                  "entries": 136,
+                  "exclusive_ms": 0.318813
+                },
+                "QualityDomain": {
+                  "entries": 67,
+                  "exclusive_ms": 0.516336
+                },
+                "QualityEvidence": {
+                  "entries": 140,
+                  "exclusive_ms": 11.047254
+                },
+                "QualityFreeze": {
+                  "entries": 14,
+                  "exclusive_ms": 0.206875
+                },
+                "QualityProduction": {
+                  "entries": 50,
+                  "exclusive_ms": 0.258203
+                },
+                "QualityReads": {
+                  "entries": 199,
+                  "exclusive_ms": 0.389086
+                },
+                "Recipe": {
+                  "entries": 617,
+                  "exclusive_ms": 2.023884
+                },
+                "Rollback": {
+                  "entries": 37,
+                  "exclusive_ms": 0.288749
+                },
+                "Schedule": {
+                  "entries": 1205,
+                  "exclusive_ms": 0.940474
+                },
+                "SemanticGuard": {
+                  "entries": 66,
+                  "exclusive_ms": 0.09417
+                },
+                "Settlement": {
+                  "entries": 59,
+                  "exclusive_ms": 2.723736
+                },
+                "Staging": {
+                  "entries": 262,
+                  "exclusive_ms": 2.149826
+                },
+                "Statistics": {
+                  "entries": 174,
+                  "exclusive_ms": 1.375925
+                },
+                "Subproblem": {
+                  "entries": 606,
+                  "exclusive_ms": 3.083493
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 1.315918
+                }
+              },
+              "compiler_ms": 44.230667,
+              "counters": {
+                "child_combination_cost_synthesis_count": 1045,
+                "physical_readset_rebuild_count": 486,
+                "physical_subproblem_evaluation_count": 307,
+                "physical_subproblem_request_count": 375,
+                "physical_subproblem_reuse_count": 294,
+                "quality_policy_frontier_candidate_count": 140,
+                "quality_policy_missing_evidence_count": 89,
+                "quality_producer_dispatch_count": 40,
+                "quality_property_cte_builds": 72,
+                "quality_property_cte_reuses": 68,
+                "quality_property_node_builds": 423,
+                "quality_property_node_reuses": 4644
+              },
+              "optimizer_ms": 43.2175,
+              "run": "probe-2-q74-run"
+            }
+          ],
+          "duckdb_c1": {
+            "median_ms": 85.05562499999999,
+            "p90_ms": 91.94225,
+            "samples_ms": [
+              91.94225,
+              82.241083,
+              81.917375,
+              82.257125,
+              98.014583,
+              87.854125
+            ]
+          },
+          "duckdb_warm": {
+            "median_ms": 69.7181035,
+            "p90_ms": 115.573625,
+            "samples_ms": [
+              70.297291,
+              85.75925,
+              64.999125,
+              64.904541,
+              65.309959,
+              67.655667,
+              67.939666,
+              69.138916,
+              120.938209,
+              115.573625,
+              73.044709,
+              76.456459
+            ]
+          },
+          "normal_samples": [
+            {
+              "compiler_ms": 52.525,
+              "run": "probe-1-q74-run",
+              "sample_id": "74-sample-0000",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 37.955,
+              "run": "probe-1-q74-run",
+              "sample_id": "74-sample-0003",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 38.288,
+              "run": "probe-1-q74-run",
+              "sample_id": "74-sample-0006",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 38.93,
+              "run": "probe-2-q74-run",
+              "sample_id": "74-sample-0000",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 41.516,
+              "run": "probe-2-q74-run",
+              "sample_id": "74-sample-0003",
+              "syntheses": 1045
+            },
+            {
+              "compiler_ms": 44.252,
+              "run": "probe-2-q74-run",
+              "sample_id": "74-sample-0006",
+              "syntheses": 1045
+            }
+          ],
+          "optimizer": {
+            "median_ms": 39.504999999999995,
+            "p90_ms": 43.598,
+            "samples_ms": [
+              51.842,
+              37.328,
+              37.651,
+              38.18,
+              40.83,
+              43.598
+            ]
+          },
+          "paro_c1": {
+            "median_ms": 152.47945850000002,
+            "p90_ms": 180.469917,
+            "samples_ms": [
+              188.246041,
+              126.554209,
+              135.7195,
+              141.539625,
+              163.419292,
+              180.469917
+            ]
+          },
+          "paro_warm": {
+            "median_ms": 67.157083,
+            "p90_ms": 93.89975,
+            "samples_ms": [
+              71.5755,
+              68.983416,
+              59.713542,
+              54.05575,
+              54.999166,
+              57.435167,
+              93.89975,
+              55.211583,
+              76.949417,
+              116.374167,
+              65.33075,
+              75.44775
+            ]
+          },
+          "rule": {
+            "median_ms": 11.2165,
+            "p90_ms": 11.982,
+            "samples_ms": [
+              16.053,
+              10.229,
+              10.367,
+              10.584,
+              11.849,
+              11.982
+            ]
+          }
+        }
+      },
+      "compiler_change_pct": -44.55785360340181,
+      "identical_artifact": {
+        "artifact": [
+          3038333177943336400,
+          4850950442375354000
+        ],
+        "dependencies": [
+          18360253679477146000,
+          10635605012605989000
+        ],
+        "schema_version": 3,
+        "structure": [
+          8426077729789499000,
+          14088017237092110000
+        ]
+      },
+      "identical_search_state": {
+        "budget_limited": {
+          "Observed": false
+        },
+        "groups": {
+          "Observed": 95
+        },
+        "logical_expressions": {
+          "Observed": 136
+        },
+        "obligations": {
+          "Observed": 6
+        },
+        "physical_expressions": {
+          "Observed": 217
+        },
+        "quality_policy_satisfied": {
+          "Observed": true
+        },
+        "search_complete": {
+          "Observed": false
+        },
+        "search_stop": {
+          "Observed": "QualityPolicySatisfied"
+        },
+        "variant_count": {
+          "Observed": 4
+        }
+      },
+      "identical_selection": {
+        "actual_class": 2,
+        "actual_fingerprint": [
+          8861301760553881000,
+          17303754817057340000
+        ],
+        "admission": "Selected",
+        "expected_class": 2,
+        "fallback": null,
+        "image": "Ready",
+        "lowering": "Ready",
+        "lowering_error": null,
+        "reservation": "Committed",
+        "resources": {
+          "class": 2,
+          "external_worker_slots": 0,
+          "max_parallel_tasks": 4,
+          "memory_ceiling_bytes": 2000000000,
+          "memory_completion": "Guaranteed",
+          "minimum_memory_bytes": 28901376,
+          "working_set_memory_bytes": 30506016
+        },
+        "terminal": "Completed",
+        "terminal_error": null
+      },
+      "warm_change_pct": 4.782318423378262
+    },
+    "04": {
+      "arms": {
+        "control": {
+          "compiler": {
+            "median_ms": 20.287,
+            "p90_ms": 20.822,
+            "samples_ms": [
+              20.535,
+              22.386,
+              19.316,
+              20.039,
+              20.822,
+              19.985
+            ]
+          },
+          "diagnostic": [
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 756,
+                "omitted_encoding_detail": 1400,
+                "omitted_source_detail": 1511
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 810,
+                  "exclusive_ms": 0.645498
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 0.316031
+                },
+                "Apply": {
+                  "entries": 30,
+                  "exclusive_ms": 0.222163
+                },
+                "Dependencies": {
+                  "entries": 1866,
+                  "exclusive_ms": 0.564239
+                },
+                "Encoding": {
+                  "entries": 62,
+                  "exclusive_ms": 0.577998
+                },
+                "Finish": {
+                  "entries": 1249,
+                  "exclusive_ms": 2.401413
+                },
+                "Insert": {
+                  "entries": 27,
+                  "exclusive_ms": 0.034041
+                },
+                "Kernel": {
+                  "entries": 782,
+                  "exclusive_ms": 0.359553
+                },
+                "Match": {
+                  "entries": 914,
+                  "exclusive_ms": 0.271749
+                },
+                "NativeConstruct": {
+                  "entries": 19,
+                  "exclusive_ms": 0.343503
+                },
+                "OwnedRewrite": {
+                  "entries": 24,
+                  "exclusive_ms": 0.25692
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.127132
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.969458
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 4.167917
+                },
+                "Publish": {
+                  "entries": 2378,
+                  "exclusive_ms": 0.332216
+                },
+                "Quality": {
+                  "entries": 1,
+                  "exclusive_ms": 0.009917
+                },
+                "QualityDomain": {
+                  "entries": 2,
+                  "exclusive_ms": 0.084834
+                },
+                "QualityEvidence": {
+                  "entries": 2,
+                  "exclusive_ms": 0.675082
+                },
+                "QualityFreeze": {
+                  "entries": 12,
+                  "exclusive_ms": 0.230376
+                },
+                "QualityProduction": {
+                  "entries": 0,
+                  "exclusive_ms": 0
+                },
+                "QualityReads": {
+                  "entries": 160,
+                  "exclusive_ms": 0.157576
+                },
+                "Recipe": {
+                  "entries": 566,
+                  "exclusive_ms": 1.655918
+                },
+                "Rollback": {
+                  "entries": 22,
+                  "exclusive_ms": 0.072622
+                },
+                "Schedule": {
+                  "entries": 665,
+                  "exclusive_ms": 0.325058
+                },
+                "SemanticGuard": {
+                  "entries": 19,
+                  "exclusive_ms": 0.04779
+                },
+                "Settlement": {
+                  "entries": 18,
+                  "exclusive_ms": 1.25175
+                },
+                "Staging": {
+                  "entries": 76,
+                  "exclusive_ms": 0.907339
+                },
+                "Statistics": {
+                  "entries": 52,
+                  "exclusive_ms": 0.647956
+                },
+                "Subproblem": {
+                  "entries": 340,
+                  "exclusive_ms": 2.002579
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 1.021122
+                }
+              },
+              "compiler_ms": 22.832583,
+              "counters": {
+                "child_combination_cost_synthesis_count": 782,
+                "physical_readset_rebuild_count": 418,
+                "physical_subproblem_evaluation_count": 264,
+                "physical_subproblem_request_count": 284,
+                "physical_subproblem_reuse_count": 75,
+                "quality_policy_frontier_candidate_count": 1,
+                "quality_policy_missing_evidence_count": 0,
+                "quality_producer_dispatch_count": 0
+              },
+              "optimizer_ms": 20.67975,
+              "run": "control-1-q04-run"
+            },
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 756,
+                "omitted_encoding_detail": 1400,
+                "omitted_source_detail": 1511
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 810,
+                  "exclusive_ms": 0.570653
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 0.275996
+                },
+                "Apply": {
+                  "entries": 30,
+                  "exclusive_ms": 0.213825
+                },
+                "Dependencies": {
+                  "entries": 1866,
+                  "exclusive_ms": 0.532958
+                },
+                "Encoding": {
+                  "entries": 62,
+                  "exclusive_ms": 0.516668
+                },
+                "Finish": {
+                  "entries": 1249,
+                  "exclusive_ms": 2.19301
+                },
+                "Insert": {
+                  "entries": 27,
+                  "exclusive_ms": 0.033001
+                },
+                "Kernel": {
+                  "entries": 782,
+                  "exclusive_ms": 0.355039
+                },
+                "Match": {
+                  "entries": 914,
+                  "exclusive_ms": 0.249897
+                },
+                "NativeConstruct": {
+                  "entries": 19,
+                  "exclusive_ms": 0.333333
+                },
+                "OwnedRewrite": {
+                  "entries": 24,
+                  "exclusive_ms": 0.195417
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.099996
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 1.037125
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 3.925291
+                },
+                "Publish": {
+                  "entries": 2378,
+                  "exclusive_ms": 0.328972
+                },
+                "Quality": {
+                  "entries": 1,
+                  "exclusive_ms": 0.010708
+                },
+                "QualityDomain": {
+                  "entries": 2,
+                  "exclusive_ms": 0.088458
+                },
+                "QualityEvidence": {
+                  "entries": 2,
+                  "exclusive_ms": 0.723084
+                },
+                "QualityFreeze": {
+                  "entries": 12,
+                  "exclusive_ms": 0.228166
+                },
+                "QualityProduction": {
+                  "entries": 0,
+                  "exclusive_ms": 0
+                },
+                "QualityReads": {
+                  "entries": 160,
+                  "exclusive_ms": 0.136712
+                },
+                "Recipe": {
+                  "entries": 566,
+                  "exclusive_ms": 1.558418
+                },
+                "Rollback": {
+                  "entries": 22,
+                  "exclusive_ms": 0.045669
+                },
+                "Schedule": {
+                  "entries": 665,
+                  "exclusive_ms": 0.318938
+                },
+                "SemanticGuard": {
+                  "entries": 19,
+                  "exclusive_ms": 0.040712
+                },
+                "Settlement": {
+                  "entries": 18,
+                  "exclusive_ms": 1.158793
+                },
+                "Staging": {
+                  "entries": 76,
+                  "exclusive_ms": 0.807419
+                },
+                "Statistics": {
+                  "entries": 52,
+                  "exclusive_ms": 0.57725
+                },
+                "Subproblem": {
+                  "entries": 340,
+                  "exclusive_ms": 1.822031
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 1.209003
+                }
+              },
+              "compiler_ms": 21.730416,
+              "counters": {
+                "child_combination_cost_synthesis_count": 782,
+                "physical_readset_rebuild_count": 418,
+                "physical_subproblem_evaluation_count": 264,
+                "physical_subproblem_request_count": 284,
+                "physical_subproblem_reuse_count": 75,
+                "quality_policy_frontier_candidate_count": 1,
+                "quality_policy_missing_evidence_count": 0,
+                "quality_producer_dispatch_count": 0
+              },
+              "optimizer_ms": 19.586542,
+              "run": "control-2-q04-run"
+            }
+          ],
+          "duckdb_c1": {
+            "median_ms": 131.4530835,
+            "p90_ms": 146.357209,
+            "samples_ms": [
+              127.677917,
+              135.22825,
+              146.357209,
+              124.125916,
+              127.494292,
+              155.494458
+            ]
+          },
+          "duckdb_warm": {
+            "median_ms": 120.7513335,
+            "p90_ms": 127.015167,
+            "samples_ms": [
+              124.368875,
+              108.674584,
+              127.015167,
+              122.6025,
+              127.758084,
+              106.96225,
+              124.760292,
+              113.87275,
+              119.163584,
+              122.339083,
+              116.199291,
+              105.0465
+            ]
+          },
+          "normal_samples": [
+            {
+              "compiler_ms": 20.535,
+              "run": "control-1-q04-run",
+              "sample_id": "04-sample-0000",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 22.386,
+              "run": "control-1-q04-run",
+              "sample_id": "04-sample-0003",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 19.316,
+              "run": "control-1-q04-run",
+              "sample_id": "04-sample-0006",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 20.039,
+              "run": "control-2-q04-run",
+              "sample_id": "04-sample-0000",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 20.822,
+              "run": "control-2-q04-run",
+              "sample_id": "04-sample-0003",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 19.985,
+              "run": "control-2-q04-run",
+              "sample_id": "04-sample-0006",
+              "syntheses": 782
+            }
+          ],
+          "optimizer": {
+            "median_ms": 18.4735,
+            "p90_ms": 18.989,
+            "samples_ms": [
+              18.745,
+              20.539,
+              17.51,
+              18.063,
+              18.989,
+              18.202
+            ]
+          },
+          "paro_c1": {
+            "median_ms": 258.920104,
+            "p90_ms": 277.543084,
+            "samples_ms": [
+              257.9575,
+              289.106333,
+              248.917292,
+              243.070875,
+              259.882708,
+              277.543084
+            ]
+          },
+          "paro_warm": {
+            "median_ms": 153.58350000000002,
+            "p90_ms": 193.93175,
+            "samples_ms": [
+              167.947125,
+              147.029166,
+              191.7145,
+              140.52275,
+              140.21975,
+              143.526583,
+              147.320875,
+              161.267875,
+              136.133625,
+              196.437333,
+              193.93175,
+              159.846125
+            ]
+          },
+          "rule": {
+            "median_ms": 3.912,
+            "p90_ms": 4.271,
+            "samples_ms": [
+              4.309,
+              3.762,
+              3.828,
+              3.879,
+              3.945,
+              4.271
+            ]
+          }
+        },
+        "probe": {
+          "compiler": {
+            "median_ms": 19.3455,
+            "p90_ms": 19.66,
+            "samples_ms": [
+              19.66,
+              19.143,
+              20.344,
+              19.548,
+              18.874,
+              18.205
+            ]
+          },
+          "diagnostic": [
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 756,
+                "omitted_encoding_detail": 1401,
+                "omitted_source_detail": 1511
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 810,
+                  "exclusive_ms": 0.656317
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 0.300425
+                },
+                "Apply": {
+                  "entries": 30,
+                  "exclusive_ms": 0.214008
+                },
+                "Dependencies": {
+                  "entries": 1866,
+                  "exclusive_ms": 0.582789
+                },
+                "Encoding": {
+                  "entries": 62,
+                  "exclusive_ms": 0.512293
+                },
+                "Finish": {
+                  "entries": 1249,
+                  "exclusive_ms": 2.224289
+                },
+                "Insert": {
+                  "entries": 27,
+                  "exclusive_ms": 0.032291
+                },
+                "Kernel": {
+                  "entries": 782,
+                  "exclusive_ms": 0.403423
+                },
+                "Match": {
+                  "entries": 914,
+                  "exclusive_ms": 0.263465
+                },
+                "NativeConstruct": {
+                  "entries": 19,
+                  "exclusive_ms": 0.321666
+                },
+                "OwnedRewrite": {
+                  "entries": 24,
+                  "exclusive_ms": 0.229705
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.111206
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 0.96175
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 3.814375
+                },
+                "Publish": {
+                  "entries": 2378,
+                  "exclusive_ms": 0.338169
+                },
+                "Quality": {
+                  "entries": 1,
+                  "exclusive_ms": 0.01171
+                },
+                "QualityDomain": {
+                  "entries": 14,
+                  "exclusive_ms": 0.055668
+                },
+                "QualityEvidence": {
+                  "entries": 1,
+                  "exclusive_ms": 0.388748
+                },
+                "QualityFreeze": {
+                  "entries": 12,
+                  "exclusive_ms": 0.220332
+                },
+                "QualityProduction": {
+                  "entries": 0,
+                  "exclusive_ms": 0
+                },
+                "QualityReads": {
+                  "entries": 159,
+                  "exclusive_ms": 0.136336
+                },
+                "Recipe": {
+                  "entries": 566,
+                  "exclusive_ms": 1.593499
+                },
+                "Rollback": {
+                  "entries": 22,
+                  "exclusive_ms": 0.069083
+                },
+                "Schedule": {
+                  "entries": 665,
+                  "exclusive_ms": 0.317239
+                },
+                "SemanticGuard": {
+                  "entries": 19,
+                  "exclusive_ms": 0.037375
+                },
+                "Settlement": {
+                  "entries": 18,
+                  "exclusive_ms": 1.198123
+                },
+                "Staging": {
+                  "entries": 76,
+                  "exclusive_ms": 0.818997
+                },
+                "Statistics": {
+                  "entries": 52,
+                  "exclusive_ms": 0.579128
+                },
+                "Subproblem": {
+                  "entries": 340,
+                  "exclusive_ms": 2.020551
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 0.950831
+                }
+              },
+              "compiler_ms": 21.531167,
+              "counters": {
+                "child_combination_cost_synthesis_count": 782,
+                "physical_readset_rebuild_count": 418,
+                "physical_subproblem_evaluation_count": 264,
+                "physical_subproblem_request_count": 284,
+                "physical_subproblem_reuse_count": 75,
+                "quality_policy_frontier_candidate_count": 1,
+                "quality_policy_missing_evidence_count": 0,
+                "quality_producer_dispatch_count": 0,
+                "quality_property_cte_builds": 1,
+                "quality_property_cte_reuses": 0,
+                "quality_property_node_builds": 55,
+                "quality_property_node_reuses": 0
+              },
+              "optimizer_ms": 19.363791,
+              "run": "probe-1-q04-run"
+            },
+            {
+              "bounded_detail": {
+                "detail_limit": 2048,
+                "omitted_capture_detail": 756,
+                "omitted_encoding_detail": 1401,
+                "omitted_source_detail": 1511
+              },
+              "buckets": {
+                "Admission": {
+                  "entries": 810,
+                  "exclusive_ms": 0.668537
+                },
+                "Agenda": {
+                  "entries": 1,
+                  "exclusive_ms": 0.304257
+                },
+                "Apply": {
+                  "entries": 30,
+                  "exclusive_ms": 0.221748
+                },
+                "Dependencies": {
+                  "entries": 1866,
+                  "exclusive_ms": 0.553333
+                },
+                "Encoding": {
+                  "entries": 62,
+                  "exclusive_ms": 0.540253
+                },
+                "Finish": {
+                  "entries": 1249,
+                  "exclusive_ms": 2.184369
+                },
+                "Insert": {
+                  "entries": 27,
+                  "exclusive_ms": 0.034875
+                },
+                "Kernel": {
+                  "entries": 782,
+                  "exclusive_ms": 0.363927
+                },
+                "Match": {
+                  "entries": 914,
+                  "exclusive_ms": 0.26922
+                },
+                "NativeConstruct": {
+                  "entries": 19,
+                  "exclusive_ms": 0.343043
+                },
+                "OwnedRewrite": {
+                  "entries": 24,
+                  "exclusive_ms": 0.255126
+                },
+                "PhaseTransition": {
+                  "entries": 1,
+                  "exclusive_ms": 0.130674
+                },
+                "PhysicalLowering": {
+                  "entries": 1,
+                  "exclusive_ms": 1.024917
+                },
+                "Pre": {
+                  "entries": 2,
+                  "exclusive_ms": 4.105416
+                },
+                "Publish": {
+                  "entries": 2378,
+                  "exclusive_ms": 0.328204
+                },
+                "Quality": {
+                  "entries": 1,
+                  "exclusive_ms": 0.011417
+                },
+                "QualityDomain": {
+                  "entries": 14,
+                  "exclusive_ms": 0.055042
+                },
+                "QualityEvidence": {
+                  "entries": 1,
+                  "exclusive_ms": 0.415833
+                },
+                "QualityFreeze": {
+                  "entries": 12,
+                  "exclusive_ms": 0.232083
+                },
+                "QualityProduction": {
+                  "entries": 0,
+                  "exclusive_ms": 0
+                },
+                "QualityReads": {
+                  "entries": 159,
+                  "exclusive_ms": 0.147618
+                },
+                "Recipe": {
+                  "entries": 566,
+                  "exclusive_ms": 1.602929
+                },
+                "Rollback": {
+                  "entries": 22,
+                  "exclusive_ms": 0.073583
+                },
+                "Schedule": {
+                  "entries": 665,
+                  "exclusive_ms": 0.316472
+                },
+                "SemanticGuard": {
+                  "entries": 19,
+                  "exclusive_ms": 0.040164
+                },
+                "Settlement": {
+                  "entries": 18,
+                  "exclusive_ms": 1.20104
+                },
+                "Staging": {
+                  "entries": 76,
+                  "exclusive_ms": 0.845294
+                },
+                "Statistics": {
+                  "entries": 52,
+                  "exclusive_ms": 0.612334
+                },
+                "Subproblem": {
+                  "entries": 340,
+                  "exclusive_ms": 2.030582
+                },
+                "Unclassified": {
+                  "entries": 0,
+                  "exclusive_ms": 1.044293
+                }
+              },
+              "compiler_ms": 22.2505,
+              "counters": {
+                "child_combination_cost_synthesis_count": 782,
+                "physical_readset_rebuild_count": 418,
+                "physical_subproblem_evaluation_count": 264,
+                "physical_subproblem_request_count": 284,
+                "physical_subproblem_reuse_count": 75,
+                "quality_policy_frontier_candidate_count": 1,
+                "quality_policy_missing_evidence_count": 0,
+                "quality_producer_dispatch_count": 0,
+                "quality_property_cte_builds": 1,
+                "quality_property_cte_reuses": 0,
+                "quality_property_node_builds": 55,
+                "quality_property_node_reuses": 0
+              },
+              "optimizer_ms": 19.956583,
+              "run": "probe-2-q04-run"
+            }
+          ],
+          "duckdb_c1": {
+            "median_ms": 140.723167,
+            "p90_ms": 147.497333,
+            "samples_ms": [
+              151.1565,
+              147.497333,
+              139.840625,
+              137.863917,
+              137.870625,
+              141.605709
+            ]
+          },
+          "duckdb_warm": {
+            "median_ms": 129.6563955,
+            "p90_ms": 152.878709,
+            "samples_ms": [
+              109.974958,
+              110.623959,
+              116.367333,
+              125.45525,
+              136.772292,
+              133.857541,
+              152.229458,
+              152.878709,
+              161.979375,
+              106.436666,
+              112.192459,
+              140.701167
+            ]
+          },
+          "normal_samples": [
+            {
+              "compiler_ms": 19.66,
+              "run": "probe-1-q04-run",
+              "sample_id": "04-sample-0000",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 19.143,
+              "run": "probe-1-q04-run",
+              "sample_id": "04-sample-0003",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 20.344,
+              "run": "probe-1-q04-run",
+              "sample_id": "04-sample-0006",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 19.548,
+              "run": "probe-2-q04-run",
+              "sample_id": "04-sample-0000",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 18.874,
+              "run": "probe-2-q04-run",
+              "sample_id": "04-sample-0003",
+              "syntheses": 782
+            },
+            {
+              "compiler_ms": 18.205,
+              "run": "probe-2-q04-run",
+              "sample_id": "04-sample-0006",
+              "syntheses": 782
+            }
+          ],
+          "optimizer": {
+            "median_ms": 17.1885,
+            "p90_ms": 17.338,
+            "samples_ms": [
+              17.138,
+              17.338,
+              18.52,
+              17.239,
+              17.063,
+              16.411
+            ]
+          },
+          "paro_c1": {
+            "median_ms": 268.2684585,
+            "p90_ms": 287.585666,
+            "samples_ms": [
+              268.365833,
+              268.171084,
+              307.218542,
+              287.585666,
+              248.590833,
+              260.347083
+            ]
+          },
+          "paro_warm": {
+            "median_ms": 164.0985,
+            "p90_ms": 189.81775,
+            "samples_ms": [
+              185.159958,
+              177.620917,
+              182.608333,
+              136.404083,
+              169.319875,
+              152.819041,
+              141.798667,
+              189.81775,
+              136.069,
+              158.877125,
+              242.161875,
+              153.782041
+            ]
+          },
+          "rule": {
+            "median_ms": 3.8325,
+            "p90_ms": 4.078,
+            "samples_ms": [
+              4.09,
+              3.862,
+              4.078,
+              3.803,
+              3.767,
+              3.756
+            ]
+          }
+        }
+      },
+      "compiler_change_pct": -4.640903041356525,
+      "identical_artifact": {
+        "artifact": [
+          823032698491271300,
+          10824070841557360000
+        ],
+        "dependencies": [
+          9249514814487343000,
+          7551949414919324000
+        ],
+        "schema_version": 3,
+        "structure": [
+          1422724112900433700,
+          16326026178588715000
+        ]
+      },
+      "identical_search_state": {
+        "budget_limited": {
+          "Observed": false
+        },
+        "groups": {
+          "Observed": 69
+        },
+        "logical_expressions": {
+          "Observed": 77
+        },
+        "obligations": {
+          "Observed": 2
+        },
+        "physical_expressions": {
+          "Observed": 121
+        },
+        "quality_policy_satisfied": {
+          "Observed": true
+        },
+        "search_complete": {
+          "Observed": false
+        },
+        "search_stop": {
+          "Observed": "QualityPolicySatisfied"
+        },
+        "variant_count": {
+          "Observed": 4
+        }
+      },
+      "identical_selection": {
+        "actual_class": 2,
+        "actual_fingerprint": [
+          5388449204632279000,
+          1773016664838677000
+        ],
+        "admission": "Selected",
+        "expected_class": 2,
+        "fallback": null,
+        "image": "Ready",
+        "lowering": "Ready",
+        "lowering_error": null,
+        "reservation": "Committed",
+        "resources": {
+          "class": 2,
+          "external_worker_slots": 0,
+          "max_parallel_tasks": 4,
+          "memory_ceiling_bytes": 2000000000,
+          "memory_completion": "Guaranteed",
+          "minimum_memory_bytes": 28901376,
+          "working_set_memory_bytes": 343335216
+        },
+        "terminal": "Completed",
+        "terminal_error": null
+      },
+      "warm_change_pct": 6.846438582269565
+    }
+  },
+  "runs": {
+    "control-1-q04-run": {
+      "binary_sha256": "7c8446babe66c85287a243396bd907af434a529be5e9db113f27ce6ff1788a15",
+      "compiler_ms": [
+        20.535,
+        22.386,
+        19.316
+      ],
+      "duckdb_c1_ms": [
+        127.677917,
+        135.22825,
+        146.357209
+      ],
+      "duckdb_warm_ms": [
+        124.368875,
+        108.674584,
+        127.015167,
+        122.6025,
+        127.758084,
+        106.96225
+      ],
+      "paro_c1_ms": [
+        257.9575,
+        289.106333,
+        248.917292
+      ],
+      "paro_warm_ms": [
+        167.947125,
+        147.029166,
+        191.7145,
+        140.52275,
+        140.21975,
+        143.526583
+      ],
+      "random_seed": 2026092303,
+      "source": {
+        "commit": "437c6539415596460d925cdc5a14960b6bc6c3bc",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "control-1-q11-run": {
+      "binary_sha256": "7c8446babe66c85287a243396bd907af434a529be5e9db113f27ce6ff1788a15",
+      "compiler_ms": [
+        12.827,
+        14.148,
+        13.33
+      ],
+      "duckdb_c1_ms": [
+        68.584166,
+        59.188666,
+        64.869958
+      ],
+      "duckdb_warm_ms": [
+        73.962375,
+        55.347333,
+        64.021583,
+        55.015458,
+        67.015541,
+        58.565041
+      ],
+      "paro_c1_ms": [
+        153.17625,
+        159.352458,
+        159.355083
+      ],
+      "paro_warm_ms": [
+        114.357792,
+        84.701334,
+        88.647875,
+        90.251875,
+        96.936375,
+        83.275
+      ],
+      "random_seed": 2026092303,
+      "source": {
+        "commit": "437c6539415596460d925cdc5a14960b6bc6c3bc",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "control-1-q74-run": {
+      "binary_sha256": "7c8446babe66c85287a243396bd907af434a529be5e9db113f27ce6ff1788a15",
+      "compiler_ms": [
+        78.363,
+        71.699,
+        63.99
+      ],
+      "duckdb_c1_ms": [
+        85.887416,
+        101.601292,
+        83.458042
+      ],
+      "duckdb_warm_ms": [
+        65.574375,
+        70.28875,
+        75.486125,
+        86.691208,
+        66.307,
+        65.163375
+      ],
+      "paro_c1_ms": [
+        194.592708,
+        180.004833,
+        169.278583
+      ],
+      "paro_warm_ms": [
+        68.071958,
+        64.549708,
+        104.454667,
+        70.456667,
+        57.526083,
+        52.795083
+      ],
+      "random_seed": 2026092303,
+      "source": {
+        "commit": "437c6539415596460d925cdc5a14960b6bc6c3bc",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "control-2-q04-run": {
+      "binary_sha256": "7c8446babe66c85287a243396bd907af434a529be5e9db113f27ce6ff1788a15",
+      "compiler_ms": [
+        20.039,
+        20.822,
+        19.985
+      ],
+      "duckdb_c1_ms": [
+        124.125916,
+        127.494292,
+        155.494458
+      ],
+      "duckdb_warm_ms": [
+        124.760292,
+        113.87275,
+        119.163584,
+        122.339083,
+        116.199291,
+        105.0465
+      ],
+      "paro_c1_ms": [
+        243.070875,
+        259.882708,
+        277.543084
+      ],
+      "paro_warm_ms": [
+        147.320875,
+        161.267875,
+        136.133625,
+        196.437333,
+        193.93175,
+        159.846125
+      ],
+      "random_seed": 2026092304,
+      "source": {
+        "commit": "437c6539415596460d925cdc5a14960b6bc6c3bc",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "control-2-q11-run": {
+      "binary_sha256": "7c8446babe66c85287a243396bd907af434a529be5e9db113f27ce6ff1788a15",
+      "compiler_ms": [
+        13.557,
+        13.118,
+        13.589
+      ],
+      "duckdb_c1_ms": [
+        77.919125,
+        79.259125,
+        74.817834
+      ],
+      "duckdb_warm_ms": [
+        58.736375,
+        133.193208,
+        59.258667,
+        58.517083,
+        68.780375,
+        60.160292
+      ],
+      "paro_c1_ms": [
+        162.685833,
+        170.153,
+        157.959916
+      ],
+      "paro_warm_ms": [
+        99.90475,
+        116.819667,
+        96.422709,
+        107.110208,
+        112.09125,
+        89.423625
+      ],
+      "random_seed": 2026092304,
+      "source": {
+        "commit": "437c6539415596460d925cdc5a14960b6bc6c3bc",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "control-2-q74-run": {
+      "binary_sha256": "7c8446babe66c85287a243396bd907af434a529be5e9db113f27ce6ff1788a15",
+      "compiler_ms": [
+        73.4,
+        77.232,
+        68.156
+      ],
+      "duckdb_c1_ms": [
+        76.417667,
+        80.554042,
+        80.843875
+      ],
+      "duckdb_warm_ms": [
+        67.2115,
+        65.113041,
+        99.284417,
+        68.725667,
+        64.398958,
+        66.611083
+      ],
+      "paro_c1_ms": [
+        197.852917,
+        198.007167,
+        167.78525
+      ],
+      "paro_warm_ms": [
+        56.687709,
+        58.784667,
+        71.124458,
+        77.000084,
+        63.634291,
+        60.905583
+      ],
+      "random_seed": 2026092304,
+      "source": {
+        "commit": "437c6539415596460d925cdc5a14960b6bc6c3bc",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "probe-1-q04-run": {
+      "binary_sha256": "d81bdfe0b37a1aefed8933a8b4d6f3c52f54fbf42010f498fb09975fefe225c5",
+      "compiler_ms": [
+        19.66,
+        19.143,
+        20.344
+      ],
+      "duckdb_c1_ms": [
+        151.1565,
+        147.497333,
+        139.840625
+      ],
+      "duckdb_warm_ms": [
+        109.974958,
+        110.623959,
+        116.367333,
+        125.45525,
+        136.772292,
+        133.857541
+      ],
+      "paro_c1_ms": [
+        268.365833,
+        268.171084,
+        307.218542
+      ],
+      "paro_warm_ms": [
+        185.159958,
+        177.620917,
+        182.608333,
+        136.404083,
+        169.319875,
+        152.819041
+      ],
+      "random_seed": 2026092303,
+      "source": {
+        "commit": "11462c1dc1bb208d308366aba8358b4906805008",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "probe-1-q11-run": {
+      "binary_sha256": "d81bdfe0b37a1aefed8933a8b4d6f3c52f54fbf42010f498fb09975fefe225c5",
+      "compiler_ms": [
+        12.249,
+        12.904,
+        12.483
+      ],
+      "duckdb_c1_ms": [
+        60.196875,
+        69.809875,
+        66.138708
+      ],
+      "duckdb_warm_ms": [
+        57.089958,
+        83.066625,
+        57.024459,
+        66.613834,
+        53.523791,
+        55.017583
+      ],
+      "paro_c1_ms": [
+        148.388792,
+        149.64125,
+        153.620458
+      ],
+      "paro_warm_ms": [
+        83.705959,
+        84.115334,
+        78.353709,
+        97.219917,
+        78.565917,
+        74.793875
+      ],
+      "random_seed": 2026092303,
+      "source": {
+        "commit": "11462c1dc1bb208d308366aba8358b4906805008",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "probe-1-q74-run": {
+      "binary_sha256": "d81bdfe0b37a1aefed8933a8b4d6f3c52f54fbf42010f498fb09975fefe225c5",
+      "compiler_ms": [
+        52.525,
+        37.955,
+        38.288
+      ],
+      "duckdb_c1_ms": [
+        91.94225,
+        82.241083,
+        81.917375
+      ],
+      "duckdb_warm_ms": [
+        70.297291,
+        85.75925,
+        64.999125,
+        64.904541,
+        65.309959,
+        67.655667
+      ],
+      "paro_c1_ms": [
+        188.246041,
+        126.554209,
+        135.7195
+      ],
+      "paro_warm_ms": [
+        71.5755,
+        68.983416,
+        59.713542,
+        54.05575,
+        54.999166,
+        57.435167
+      ],
+      "random_seed": 2026092303,
+      "source": {
+        "commit": "11462c1dc1bb208d308366aba8358b4906805008",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "probe-2-q04-run": {
+      "binary_sha256": "d81bdfe0b37a1aefed8933a8b4d6f3c52f54fbf42010f498fb09975fefe225c5",
+      "compiler_ms": [
+        19.548,
+        18.874,
+        18.205
+      ],
+      "duckdb_c1_ms": [
+        137.863917,
+        137.870625,
+        141.605709
+      ],
+      "duckdb_warm_ms": [
+        152.229458,
+        152.878709,
+        161.979375,
+        106.436666,
+        112.192459,
+        140.701167
+      ],
+      "paro_c1_ms": [
+        287.585666,
+        248.590833,
+        260.347083
+      ],
+      "paro_warm_ms": [
+        141.798667,
+        189.81775,
+        136.069,
+        158.877125,
+        242.161875,
+        153.782041
+      ],
+      "random_seed": 2026092304,
+      "source": {
+        "commit": "11462c1dc1bb208d308366aba8358b4906805008",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "probe-2-q11-run": {
+      "binary_sha256": "d81bdfe0b37a1aefed8933a8b4d6f3c52f54fbf42010f498fb09975fefe225c5",
+      "compiler_ms": [
+        23.004,
+        36.987,
+        14.21
+      ],
+      "duckdb_c1_ms": [
+        119.923958,
+        170.941792,
+        91.644
+      ],
+      "duckdb_warm_ms": [
+        98.894625,
+        67.02675,
+        153.804792,
+        64.538209,
+        117.682959,
+        91.180667
+      ],
+      "paro_c1_ms": [
+        220.185625,
+        390.504959,
+        179.491208
+      ],
+      "paro_warm_ms": [
+        151.372083,
+        95.46275,
+        176.5575,
+        90.618208,
+        156.955167,
+        103.047667
+      ],
+      "random_seed": 2026092304,
+      "source": {
+        "commit": "11462c1dc1bb208d308366aba8358b4906805008",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "probe-2-q74-run": {
+      "binary_sha256": "d81bdfe0b37a1aefed8933a8b4d6f3c52f54fbf42010f498fb09975fefe225c5",
+      "compiler_ms": [
+        38.93,
+        41.516,
+        44.252
+      ],
+      "duckdb_c1_ms": [
+        82.257125,
+        98.014583,
+        87.854125
+      ],
+      "duckdb_warm_ms": [
+        67.939666,
+        69.138916,
+        120.938209,
+        115.573625,
+        73.044709,
+        76.456459
+      ],
+      "paro_c1_ms": [
+        141.539625,
+        163.419292,
+        180.469917
+      ],
+      "paro_warm_ms": [
+        93.89975,
+        55.211583,
+        76.949417,
+        116.374167,
+        65.33075,
+        75.44775
+      ],
+      "random_seed": 2026092304,
+      "source": {
+        "commit": "11462c1dc1bb208d308366aba8358b4906805008",
+        "dirty": false,
+        "status": [],
+        "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  },
+  "derivation": {
+    "normal": "Accepted normal attempt, Verified receipt with compilation=Executed and cache_hit=false; compiler_elapsed_us / 1000. Cached warm receipts are not new compilations.",
+    "diagnostic": "Separate accepted Detail capture; optimizer_work bucket exclusive_ns / 1e6. Not subtracted from normal client timings.",
+    "percentile": "Maintained tpcds_compare.percentile, fraction=0.9; descriptive only at six fresh samples per arm.",
+    "validators": [
+      "validate_campaign_summary",
+      "validate_benchmark_payload",
+      "validate_compile_document"
+    ],
+    "identities": "All source/build/input/harness identities matched within arm and across shared input fields; exact artifact and selection/resource identities equal across all normal receipts and shared artifact identity equal to corresponding diagnostic capture.",
+    "warm": "Q04 batch 1 crossed the pre-registered 10% investigation threshold. All samples retained; combined six-block changes are below that threshold but do not certify non-inferiority."
+  }
+}
