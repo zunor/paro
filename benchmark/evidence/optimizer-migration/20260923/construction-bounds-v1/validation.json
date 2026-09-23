@@ -1,0 +1,68 @@
+{
+  "evidence_id": "construction-bounds-v1",
+  "registration": "../construction-bounds-registration.md",
+  "source": {
+    "control": "45819b96b4b30f0c941dda96ff55b9eac3f4667c",
+    "probe": "81c4ab2196dea966faea723d94167668a888cb33",
+    "both_measured_clean": true
+  },
+  "collection": {
+    "completed_run_outputs": 12,
+    "accepted_normal_cells": 12,
+    "accepted_diagnostic_cells": 12,
+    "normal_receipts": 108,
+    "cold_receipts": 36,
+    "warm_receipts": 72,
+    "validated_capture_hashes": 12,
+    "registered_archive_limit_bytes": 20971520,
+    "run_output_capacity_omissions": 0,
+    "omitted_search_counters": 0,
+    "omitted_variants": 0,
+    "detail_event_omissions_control_and_probe": {
+      "Q04": {"source": 1511, "capture": 756, "encoding": 1401},
+      "Q11": {"source": 664, "capture": 119, "encoding": 1399},
+      "Q74": {"source": 2153, "capture": 1887, "encoding": 1400}
+    },
+    "readers": [
+      "harness.receipt_contract.validate_campaign_summary",
+      "harness.receipt_contract.validate_benchmark_payload",
+      "harness.receipt_contract.validate_compile_document",
+      "corpora.cold_planning._typed_compile_measurements"
+    ],
+    "association": "artifact identity, expected grant, actual normal admission and portfolio variant membership",
+    "compile_only_selected_fingerprint": "Uncovered/NotInstrumented",
+    "full_typed_result_and_order_validation": "Passed"
+  },
+  "checks": [
+    {"command": "cargo test --workspace --locked", "status": "Passed"},
+    {"command": "cargo check --workspace --locked", "status": "Passed"},
+    {"command": "cargo clippy --workspace --all-targets --locked -- -D warnings", "status": "Passed"},
+    {"scope": "paro-optimizer full tests", "passed": 1407, "failed": 0},
+    {"command": "make -C benchmark test PYTHON=.venv/bin/python", "passed": 207, "failed": 0},
+    {"cwd": "regress", "command": "../benchmark/.venv/bin/python -m pytest unit -q", "passed": 103, "skipped": 1, "failed": 0},
+    {"scope": "full compare-only SQL regress, final probe release binary", "passed": 185, "failed": 0, "skipped": 0, "optimizer_verify": true, "fd_limit": 65536, "expected_updates": 0, "report": "sql-regress.txt", "sha256": "3c108a8106cf6195d188a247c42c67adde14f60cb6e7398fdf42115d9bc43b9a"},
+    {"command": "benchmark/.venv/bin/python tools/ci/check_memory_runtime_api.py", "status": "Passed"},
+    {"command": "benchmark/.venv/bin/python tools/ci/check_vector_copy_fallible_api.py", "status": "Passed"},
+    {"command": "git diff --check b367b3ea..HEAD", "status": "Passed"}
+  ],
+  "search": {
+    "policy": "quality",
+    "stop": "QualityPolicySatisfied",
+    "search_complete": false,
+    "certified_recipe_prunes": 0,
+    "cost_synthesis_counts_control_and_probe": {"Q04": 782, "Q11": 401, "Q74": 1045},
+    "same_per_query_admitted_artifact_selection_and_resources": true
+  },
+  "performance": {
+    "classification": "EngineeringPilotNotCertified",
+    "compiler_lt_10ms": "NotMet",
+    "engine_parity": "NotCertified",
+    "warm_noninferiority": "NotCertified",
+    "warm_investigation_open": ["Q04", "Q74"],
+    "remaining_scope": [
+      "per-property incremental selected evidence beyond compact region anchors",
+      "general continuation-safe certified pruning",
+      "cause of Q04/Q74 warm median investigation-line exceedance"
+    ]
+  }
+}
