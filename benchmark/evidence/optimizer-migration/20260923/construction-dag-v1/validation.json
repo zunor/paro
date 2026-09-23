@@ -1,0 +1,60 @@
+{
+  "source": "295d487b43bb01af8cf258bf67c4b344001d3cf5",
+  "binary_sha256": "84afb4fbbc4c84c53331b84fe9cc1696214468e0c226ef467a443483bf09667b",
+  "checks": [
+    {
+      "command": "RUST_MIN_STACK=33554432 cargo test --workspace --locked",
+      "status": "Passed",
+      "passed": 6940,
+      "failed": 0,
+      "ignored": 85,
+      "optimizer_passed": 1401
+    },
+    {
+      "command": "cargo check --workspace --locked",
+      "status": "Passed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+      "status": "Passed"
+    },
+    {
+      "command": "make -C benchmark test",
+      "status": "Passed",
+      "tests": 207
+    },
+    {
+      "command": "benchmark/.venv/bin/python -m pytest regress/unit -q",
+      "status": "Passed",
+      "passed": 103,
+      "skipped": 1
+    },
+    {
+      "command": "benchmark/.venv/bin/python tools/ci/check_memory_runtime_api.py",
+      "status": "Passed"
+    },
+    {
+      "command": "benchmark/.venv/bin/python tools/ci/check_vector_copy_fallible_api.py",
+      "status": "Passed"
+    },
+    {
+      "command": "ulimit -n 65536; PARO_UPDATE=0 PARO_WRITE_ACTUAL=1 benchmark/.venv/bin/python regress/runner.py --host 127.0.0.1 --port 16443 --user paro --database postgres --optimizer-verify on",
+      "status": "Passed",
+      "passed": 185,
+      "failed": 0,
+      "skipped": 0,
+      "new": 0,
+      "expected_updates": 0
+    },
+    {
+      "command": "Maintained RunOutput campaign/cell/compile-document validators; capture SHA validation",
+      "status": "Passed",
+      "campaigns": 12,
+      "normal_receipts": 108,
+      "diagnostic_captures": 12
+    }
+  ],
+  "performance": "Directional pilot only. NotCertified; Q74 warm investigation remains unresolved. No <10ms or ProofComplete claim.",
+  "static_scope": "Strict Clippy, targeted formatting and memory guards passed. Whole-repository header/format cleanup was not in scope; no claim of make static.",
+  "lifecycle": "Reused the selected checkout and one Cargo target sequentially. No new worktree. Original ignored regress/report restored. Task test server stopped; historical data and recovery refs untouched."
+}
