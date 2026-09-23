@@ -297,7 +297,7 @@ impl Fixture {
                         candidate: self.frozen.reference.candidate,
                         anchor: node.reference.candidate,
                         fact_fingerprint: Fingerprint(920 + i as u128),
-                        choices: Box::new([]),
+                        anchor_choice: Fingerprint(0),
                         covered,
                     }
                 })

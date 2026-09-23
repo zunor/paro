@@ -138,7 +138,11 @@ pub struct AggregateRegionWitness {
     pub candidate: CandidateId,
     pub anchor: CandidateId,
     pub fact_fingerprint: Fingerprint,
-    pub choices: Box<[Fingerprint]>,
+    /// The exact selected anchor already names immutable child CandidateIds.
+    /// Membership in the root choice manifest therefore binds its entire
+    /// selected subtree; expanding that subtree again for every region adds
+    /// no identity evidence. Fact revisions remain a separate witness.
+    pub anchor_choice: Fingerprint,
     pub covered: bool,
 }
 
@@ -714,11 +718,7 @@ fn aggregate_coverage_is_complete(input: &BundleInput) -> bool {
             witness.covered
                 && witness.candidate == candidate
                 && witness.anchor.is_valid()
-                && !witness.choices.is_empty()
-                && witness
-                    .choices
-                    .iter()
-                    .all(|choice| input.choices.contains(choice))
+                && input.choices.contains(&witness.anchor_choice)
         })
 }
 
@@ -732,7 +732,7 @@ mod tests {
             candidate,
             anchor: CandidateId(8),
             fact_fingerprint: Fingerprint(11),
-            choices: choices.to_vec().into_boxed_slice(),
+            anchor_choice: choices[0],
             covered: true,
         }
     }
@@ -1129,7 +1129,7 @@ mod tests {
         ));
 
         value.aggregate_regions[0].candidate = CandidateId(4);
-        value.aggregate_regions[0].choices = Box::new([Fingerprint(99)]);
+        value.aggregate_regions[0].anchor_choice = Fingerprint(99);
         assert!(matches!(
             registry.evaluate(BundleId(3), &value, 1).unwrap(),
             BundleResult::MissingEvidence { missing, .. }

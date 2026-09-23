@@ -4,6 +4,79 @@
 use super::*;
 
 #[test]
+fn local_bound_preparation_requires_a_live_pruning_request() {
+    let (mut engine, root, goal) = engine(0);
+    let mut recipe = recipe(Box::new([]));
+    recipe.task_supply = TaskSupplyContract::Serial;
+    recipe.cost_composition = CostComposition::Sequential;
+    assert!(!engine
+        .recipe_is_provably_worse(root, goal, &recipe)
+        .unwrap());
+    assert!(recipe.certified_local_work.get().is_none());
+    engine.set_certified_group_pruning_enabled(true);
+    // Enabling proofs alone is insufficient: this group has no upper bound.
+    assert!(!engine
+        .recipe_is_provably_worse(root, goal, &recipe)
+        .unwrap());
+    assert!(recipe.certified_local_work.get().is_none());
+    engine.optimize_group(root, goal).unwrap();
+    let _ = engine
+        .recipe_is_provably_worse(root, goal, &recipe)
+        .unwrap();
+    assert!(recipe.certified_local_work.get().is_some());
+}
+
+#[test]
+fn unsupported_parent_requirement_does_not_prepare_children() {
+    let (mut engine, root, mut goal) = strong_tree_engine();
+    let class = crate::physical::ResourceGrantClass {
+        id: ResourceGrantClassId(7),
+        hard_memory_bytes: 1024,
+        spill_policy: SpillPolicy::Forbidden,
+        max_parallel_tasks: 1,
+    };
+    engine.prime_grant_context([class]).unwrap();
+    goal.grant = GrantGoalKey::Class(class.id);
+    let child = engine
+        .memo
+        .logical_expr(engine.memo.group(root).unwrap().logical_exprs()[0])
+        .unwrap()
+        .key
+        .children[0];
+    let mut unsupported = required();
+    unsupported.replayability = ReplayabilityRequirement::Rewindable;
+    let unsupported_goal = OptimizationGoal {
+        required: engine.memo.intern_required(unsupported).unwrap(),
+        ..goal
+    };
+    engine.optimize_group(root, unsupported_goal).unwrap();
+    assert!(engine
+        .memo
+        .group(root)
+        .unwrap()
+        .winner(unsupported_goal)
+        .is_none());
+    assert!(engine
+        .memo
+        .group(child)
+        .unwrap()
+        .physical_exprs()
+        .is_empty());
+    assert_eq!(engine.child_combination_cost_synthesis_count, 0);
+
+    // Failure of this requirement is not a group-wide infeasibility fact.
+    // The ordinary goal must still build and consume the child normally.
+    engine.optimize_group(root, goal).unwrap();
+    assert!(engine.memo.group(root).unwrap().winner(goal).is_some());
+    assert!(!engine
+        .memo
+        .group(child)
+        .unwrap()
+        .physical_exprs()
+        .is_empty());
+}
+
+#[test]
 fn enforcement_preparation_is_goal_local_and_does_not_cache_feasibility() {
     use super::super::super::properties::{
         NullOrder, OrderingKey, OrderingScope, RequiredOrdering, SortDirection,
@@ -96,7 +169,7 @@ fn recipe(children: Box<[(GroupId, OptimizationGoal)]>) -> CostRecipe {
         enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(20.0).unwrap(), 8),
         physical_fingerprint: Fingerprint(10),
         region: None,
-        certified_local_work: None,
+        certified_local_work: OnceLock::new(),
         immutable_cost_identity: OnceLock::new(),
         enforcement: OnceLock::new(),
     }

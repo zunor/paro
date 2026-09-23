@@ -281,17 +281,13 @@ struct TaskKey {
 /// expression.  This is deliberately derived from the selected expression's
 /// proof set, not from `LogicalExpr::applied_rules`, which is an audit trail of
 /// attempted work and may include rejected or unused applications.
-pub(crate) fn selected_proof_rule_ids(logical: &LogicalExpr) -> Box<[RuleId]> {
-    logical
-        .proofs
-        .iter()
-        .filter_map(|proof| match proof {
-            EquivalenceProof::Transformation { rule, .. }
-            | EquivalenceProof::TransformationDescendant { rule }
-            | EquivalenceProof::SpecializedEnumerator { rule, .. } => Some(*rule),
-            EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => None,
-        })
-        .collect()
+pub(crate) fn selected_proof_rule_ids(logical: &LogicalExpr) -> impl Iterator<Item = RuleId> + '_ {
+    logical.proofs.iter().filter_map(|proof| match proof {
+        EquivalenceProof::Transformation { rule, .. }
+        | EquivalenceProof::TransformationDescendant { rule }
+        | EquivalenceProof::SpecializedEnumerator { rule, .. } => Some(*rule),
+        EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => None,
+    })
 }
 
 struct TransformationInsertion {
@@ -529,7 +525,7 @@ struct CostRecipe {
     /// A proof-backed floor for the recipe's own work. Unknown/statistical
     /// ranges remain `None`; the floor never stands in for child or logical
     /// search completeness.
-    certified_local_work: Option<CertifiedLocalWorkFloor>,
+    certified_local_work: OnceLock<Option<CertifiedLocalWorkFloor>>,
     /// These fields are immutable after recipe publication. Facts, statistics,
     /// grant and calibration remain separate live inputs to combination identity;
     /// resuming a recipe does not hash its unchanged source-work payload again.
@@ -539,6 +535,28 @@ struct CostRecipe {
     /// calibration, row/grant inputs and active frontier membership remain
     /// subject to their existing cost-context checks.
     enforcement: OnceLock<Option<super::enforcer::EnforcedPlan>>,
+}
+
+impl CostRecipe {
+    /// This is immutable recipe evidence, not a child-frontier or incumbent
+    /// certificate. Construct it only after the caller has an applicable
+    /// pruning request and a live upper bound. Disabled pruning and mandatory
+    /// baseline construction must not pay for an unused proof.
+    fn certified_local_work(&self) -> Option<CertifiedLocalWorkFloor> {
+        *self.certified_local_work.get_or_init(|| {
+            if self.source_filter_apply_cost.is_some()
+                || self.cost_composition.sideways_filter().is_some()
+                || self.cost_composition.overlapping_children() != 0
+                || !matches!(
+                    self.task_supply,
+                    TaskSupplyContract::Serial | TaskSupplyContract::Source { .. }
+                )
+            {
+                return None;
+            }
+            CertifiedLocalWorkFloor::from_exact_cost(self.local_cost, self.physical_fingerprint)
+        })
+    }
 }
 
 /// Exact query-local identity for one child-frontier combination. The budget
@@ -2986,7 +3004,7 @@ impl CascadesEngine {
                 physical_fingerprint: frozen.winner.physical_fingerprint,
                 children: frozen.winner.children.clone(),
                 rules: frozen.logical.applied_rules.iter().copied().collect(),
-                selected_rules: selected_proof_rule_ids(&frozen.logical),
+                selected_rules: selected_proof_rule_ids(&frozen.logical).collect(),
             });
             for child in frozen.children.iter() {
                 visit(child, choices, visited);
@@ -7629,23 +7647,6 @@ impl CascadesEngine {
                 return Ok(());
             }
         }
-        let certified_local_work = if candidate.source_filter_apply_cost.is_none()
-            && !matches!(
-                candidate.cost_composition,
-                CostComposition::SidewaysFilter { .. }
-            )
-            && candidate.cost_composition.overlapping_children() == 0
-            && matches!(
-                candidate.task_supply,
-                TaskSupplyContract::Serial | TaskSupplyContract::Source { .. }
-            ) {
-            CertifiedLocalWorkFloor::from_exact_cost(
-                candidate.local_cost,
-                candidate.stable_event(goal),
-            )
-        } else {
-            None
-        };
         let implementation_revision_before = self
             .memo
             .group(group)
@@ -7707,7 +7708,7 @@ impl CascadesEngine {
                 enforcer_cost_input: candidate.enforcer_cost_input,
                 physical_fingerprint: candidate.physical_fingerprint,
                 region: candidate.region,
-                certified_local_work,
+                certified_local_work: OnceLock::new(),
                 immutable_cost_identity: OnceLock::new(),
                 enforcement: OnceLock::new(),
             }));
@@ -8245,7 +8246,6 @@ impl CascadesEngine {
         }
         let result = self.optimize_group_inner(
             (group, goal),
-            task,
             recipe_start,
             recipe_cursor,
             enumerate_local_implementations,
@@ -8983,7 +8983,6 @@ impl CascadesEngine {
         &mut self,
         group: GroupId,
         goal: OptimizationGoal,
-        _task: TaskId,
         recipe: &CostRecipe,
     ) -> Result<bool> {
         if self.mandatory_only || !self.certified_group_pruning_enabled {
@@ -9012,7 +9011,18 @@ impl CascadesEngine {
                 .phase_overlap_unsupported
                 .saturating_add(1);
         }
-        let Some(floor) = recipe.certified_local_work else {
+        let Some(incumbent_cost) = self.incumbent_cost_for_goal(group, goal) else {
+            self.certified_bound_diagnostics.no_incumbent = self
+                .certified_bound_diagnostics
+                .no_incumbent
+                .saturating_add(1);
+            CertifiedBoundDiagnostics::add_elapsed(
+                &mut self.certified_bound_diagnostics.compute_us,
+                started,
+            );
+            return Ok(false);
+        };
+        let Some(floor) = recipe.certified_local_work() else {
             if recipe.source_filter_apply_cost.is_none()
                 && recipe.cost_composition.sideways_filter().is_none()
                 && recipe.cost_composition.overlapping_children() == 0
@@ -9022,17 +9032,6 @@ impl CascadesEngine {
                     .local_interval_uncertain
                     .saturating_add(1);
             }
-            CertifiedBoundDiagnostics::add_elapsed(
-                &mut self.certified_bound_diagnostics.compute_us,
-                started,
-            );
-            return Ok(false);
-        };
-        let Some(incumbent_cost) = self.incumbent_cost_for_goal(group, goal) else {
-            self.certified_bound_diagnostics.no_incumbent = self
-                .certified_bound_diagnostics
-                .no_incumbent
-                .saturating_add(1);
             CertifiedBoundDiagnostics::add_elapsed(
                 &mut self.certified_bound_diagnostics.compute_us,
                 started,
@@ -9266,7 +9265,6 @@ impl CascadesEngine {
     fn optimize_group_inner(
         &mut self,
         subproblem: (GroupId, OptimizationGoal),
-        task: TaskId,
         recipe_start: u64,
         recipe_cursor: u64,
         enumerate_local_implementations: bool,
@@ -9328,7 +9326,7 @@ impl CascadesEngine {
             if !self.memo.control().checkpoint()? {
                 break;
             }
-            if self.recipe_is_provably_worse(group, goal, task, &recipe)? {
+            if self.recipe_is_provably_worse(group, goal, &recipe)? {
                 continue;
             }
             // Once every child has a current completion certificate, the
@@ -9345,6 +9343,34 @@ impl CascadesEngine {
             if child_bound == Some(true) {
                 continue;
             }
+            // Requirement geometry and its resource input are recipe-local.
+            // Reject an impossible parent before recursively preparing child
+            // frontiers. This is feasibility, not scalar winner pruning: no
+            // child operating point can repair an unavailable enforcer.
+            let Some(enforced) = self.prepare_enforcement(physical, goal, &recipe)? else {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    physical_expression = physical.index(),
+                    "physical recipe rejected because its required enforcer is absent from the execution ABI"
+                );
+                continue;
+            };
+            let Some(enforcer_phase) = enforcer_cost(
+                &enforced.steps,
+                recipe.enforcer_cost_input,
+                self.memo.calibration(),
+            )?
+            else {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    physical_expression = physical.index(),
+                    ?enforced.steps,
+                    "physical recipe rejected because its enforcer chain is infeasible"
+                );
+                continue;
+            };
             child_frontiers.resize_with(recipe.child_goals.len(), Vec::new);
             for frontier in child_frontiers.iter_mut() {
                 frontier.clear();
@@ -9463,38 +9489,6 @@ impl CascadesEngine {
                 }
                 continue;
             }
-            // Geometry is immutable for this recipe/goal; its price below
-            // still uses the current calibration and exact resource input.
-            let Some(enforced) = self.prepare_enforcement(physical, goal, &recipe)? else {
-                tracing::debug!(
-                    target: "paro::optimizer",
-                    memo_group = group.index(),
-                    physical_expression = physical.index(),
-                    "physical recipe rejected because its required enforcer is absent from the execution ABI"
-                );
-                if child_yielded {
-                    return Ok(Some(sequence));
-                }
-                continue;
-            };
-            let Some(enforcer_phase) = enforcer_cost(
-                &enforced.steps,
-                recipe.enforcer_cost_input,
-                self.memo.calibration(),
-            )?
-            else {
-                tracing::debug!(
-                    target: "paro::optimizer",
-                    memo_group = group.index(),
-                    physical_expression = physical.index(),
-                    ?enforced.steps,
-                    "physical recipe rejected because its enforcer chain is infeasible"
-                );
-                if child_yielded {
-                    return Ok(Some(sequence));
-                }
-                continue;
-            };
             let current_frontier_ids = child_frontiers
                 .iter()
                 .map(|frontier| {

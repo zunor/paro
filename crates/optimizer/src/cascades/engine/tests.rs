@@ -366,7 +366,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),
             physical_fingerprint: Fingerprint(91),
-            certified_local_work: None,
+            certified_local_work: OnceLock::new(),
             immutable_cost_identity: OnceLock::new(),
             enforcement: OnceLock::new(),
             region: Some(RegionCandidateContract {

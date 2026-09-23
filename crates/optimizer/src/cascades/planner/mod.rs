@@ -159,13 +159,12 @@ struct PlannerQualityEvidenceProvider {
 /// frozen candidate.  `LogicalExpr::applied_rules` is intentionally absent:
 /// it records that a rule reached the apply gate at some point in the Memo,
 /// not that its output is present in this candidate.
+#[cfg(test)]
 fn selected_rule_proofs(
     logical: &crate::cascades::memo::LogicalExpr,
     origin_rule: Option<RuleId>,
 ) -> BTreeSet<RuleId> {
     selected_proof_rule_ids(logical)
-        .iter()
-        .copied()
         .filter(|rule| {
             // A staged payload carries one origin rule.  Requiring its proof
             // prevents an apply attempt, empty result, or budget-rejected
@@ -181,23 +180,18 @@ fn selected_rule_proofs(
 /// payload-local lineage retained while a native shell copied an inner Memo
 /// node. Neither source consults `applied_rules`; the latter is only an audit
 /// of work that reached an apply gate.
-fn selected_payload_rule_proofs(
-    logical: &crate::cascades::memo::LogicalExpr,
-    metadata: &PlannerOperatorMetadata,
-) -> BTreeSet<RuleId> {
-    let mut rules = selected_rule_proofs(logical, None);
-    rules.extend(
-        metadata
-            .selected_proofs
-            .iter()
-            .filter_map(|proof| match proof {
-                EquivalenceProof::Transformation { rule, .. }
-                | EquivalenceProof::TransformationDescendant { rule }
-                | EquivalenceProof::SpecializedEnumerator { rule, .. } => Some(*rule),
-                EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => None,
-            }),
-    );
-    rules
+fn selected_payload_rule_proofs<'a>(
+    logical: &'a crate::cascades::memo::LogicalExpr,
+    metadata: &'a PlannerOperatorMetadata,
+) -> impl Iterator<Item = RuleId> + 'a {
+    selected_proof_rule_ids(logical).chain(metadata.selected_proofs.iter().filter_map(|proof| {
+        match proof {
+            EquivalenceProof::Transformation { rule, .. }
+            | EquivalenceProof::TransformationDescendant { rule }
+            | EquivalenceProof::SpecializedEnumerator { rule, .. } => Some(*rule),
+            EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => None,
+        }
+    }))
 }
 
 fn selected_physical_contract_is_exact(
@@ -370,11 +364,11 @@ fn inspect_quality_candidate(
         }
         groups.insert(memo.canonical_group(reference.group));
         shape.nodes = shape.nodes.saturating_add(1);
-        let selected_rules = selected_payload_rule_proofs(logical, metadata);
-        if metadata.origin_rule.is_some() && selected_rules.is_empty() {
+        let mut selected_rules = selected_payload_rule_proofs(logical, metadata).peekable();
+        if metadata.origin_rule.is_some() && selected_rules.peek().is_none() {
             return Ok(None);
         }
-        rules.extend(selected_rules.iter().copied());
+        rules.extend(selected_rules);
         if winner.provided.result_guarantee != ResultGuarantee::Exact
             || metadata.provided.result_guarantee != ResultGuarantee::Exact
         {
@@ -608,22 +602,12 @@ fn selected_aggregate_region_witnesses_refs(
                     && shape.joins > 0
                     && !properties.contains_union(arm.candidate)
                 {
-                    let mut choices = Vec::new();
-                    let mut choice_visited = BTreeSet::new();
-                    if !collect_quality_node_choices(
-                        arm,
-                        nodes,
-                        &mut choices,
-                        &mut choice_visited,
-                        properties,
-                    ) {
-                        return None;
-                    }
+                    let anchor_choice = properties.choice(arm.candidate);
                     let fact_fingerprint =
                         properties.region_fact_fingerprint(memo, reference, goal, nodes)?;
                     let union_choice = properties.choice(reference.candidate);
                     let mut region = StableFingerprintBuilder::default();
-                    region.write_bytes(b"paro.quality.aggregate-region.v2");
+                    region.write_bytes(b"paro.quality.aggregate-region.v3");
                     region.write_u64(root_candidate.index() as u64);
                     region.write_u64(arm.candidate.index() as u64);
                     region.write_fingerprint(union_choice);
@@ -632,15 +616,13 @@ fn selected_aggregate_region_witnesses_refs(
                         region.write_u64(component as u64);
                     }
                     region.write_fingerprint(fact_fingerprint);
-                    for choice in choices.iter().copied() {
-                        region.write_fingerprint(choice);
-                    }
+                    region.write_fingerprint(anchor_choice);
                     witnesses.push(AggregateRegionWitness {
                         region: region.finish(),
                         candidate: root_candidate,
                         anchor: arm.candidate,
                         fact_fingerprint,
-                        choices: choices.into_boxed_slice(),
+                        anchor_choice,
                         covered: shape.decomposed,
                     });
                 }
@@ -682,31 +664,19 @@ fn selected_aggregate_region_witnesses_refs(
     if witnesses.is_empty() {
         let shape = properties.aggregate_shape(root.candidate);
         if shape.aggregates > 0 {
-            let mut choices = Vec::new();
-            let mut choice_visited = BTreeSet::new();
-            if !collect_quality_node_choices(
-                root,
-                &nodes,
-                &mut choices,
-                &mut choice_visited,
-                properties,
-            ) {
-                return None;
-            }
+            let anchor_choice = properties.choice(root.candidate);
             let fact_fingerprint = properties.region_fact_fingerprint(memo, root, goal, &nodes)?;
             let mut region = StableFingerprintBuilder::default();
-            region.write_bytes(b"paro.quality.aggregate-region.root.v1");
+            region.write_bytes(b"paro.quality.aggregate-region.root.v2");
             region.write_u64(root.candidate.index() as u64);
             region.write_fingerprint(fact_fingerprint);
-            for choice in choices.iter().copied() {
-                region.write_fingerprint(choice);
-            }
+            region.write_fingerprint(anchor_choice);
             witnesses.push(AggregateRegionWitness {
                 region: region.finish(),
                 candidate: root.candidate,
                 anchor: root.candidate,
                 fact_fingerprint,
-                choices: choices.into_boxed_slice(),
+                anchor_choice,
                 covered: shape.decomposed,
             });
         }
@@ -1083,7 +1053,7 @@ fn record_frozen_candidate_trace(
             frozen.physical.key.implementation.0,
             frozen.winner.children.clone(),
             frozen.logical.applied_rules.iter().copied().collect(),
-            selected_proof_rule_ids(&frozen.logical),
+            selected_proof_rule_ids(&frozen.logical).collect(),
             frozen.logical.proofs.iter().cloned().collect(),
             origin_rule,
             payload_selected_proofs,

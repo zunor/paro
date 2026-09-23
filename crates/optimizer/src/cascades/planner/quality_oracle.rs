@@ -203,7 +203,7 @@ pub(super) fn selected_aggregate_region_witnesses(
                         let fact_fingerprint =
                             collect_region_fact_fingerprint(memo, union, arm, goal)?;
                         let mut region = StableFingerprintBuilder::default();
-                        region.write_bytes(b"paro.quality.aggregate-region.v2");
+                        region.write_bytes(b"paro.quality.aggregate-region.v3");
                         region.write_u64(root_candidate.index() as u64);
                         region.write_u64(arm.reference.candidate.index() as u64);
                         region.write_fingerprint(frozen_choice_fingerprint(union));
@@ -212,15 +212,18 @@ pub(super) fn selected_aggregate_region_witnesses(
                             region.write_u64(component as u64);
                         }
                         region.write_fingerprint(fact_fingerprint);
-                        for choice in choices.iter().copied() {
-                            region.write_fingerprint(choice);
-                        }
+                        // The oracle still expands the complete subtree. Its
+                        // first element must be the exact anchor consumed by
+                        // the production compositional witness.
+                        let anchor_choice = *choices.first()?;
+                        assert_eq!(anchor_choice, frozen_choice_fingerprint(arm));
+                        region.write_fingerprint(anchor_choice);
                         witnesses.push(AggregateRegionWitness {
                             region: region.finish(),
                             candidate: root_candidate,
                             anchor: arm.reference.candidate,
                             fact_fingerprint,
-                            choices: choices.into_boxed_slice(),
+                            anchor_choice,
                             covered: shape.decomposed,
                         });
                     }
@@ -253,18 +256,18 @@ pub(super) fn selected_aggregate_region_witnesses(
             collect_frozen_choices(root, &mut choices, &mut choice_visited);
             let fact_fingerprint = collect_region_fact_fingerprint(memo, root, root, goal)?;
             let mut region = StableFingerprintBuilder::default();
-            region.write_bytes(b"paro.quality.aggregate-region.root.v1");
+            region.write_bytes(b"paro.quality.aggregate-region.root.v2");
             region.write_u64(root.reference.candidate.index() as u64);
             region.write_fingerprint(fact_fingerprint);
-            for choice in choices.iter().copied() {
-                region.write_fingerprint(choice);
-            }
+            let anchor_choice = *choices.first()?;
+            assert_eq!(anchor_choice, frozen_choice_fingerprint(root));
+            region.write_fingerprint(anchor_choice);
             witnesses.push(AggregateRegionWitness {
                 region: region.finish(),
                 candidate: root.reference.candidate,
                 anchor: root.reference.candidate,
                 fact_fingerprint,
-                choices: choices.into_boxed_slice(),
+                anchor_choice,
                 covered: shape.decomposed,
             });
         }
@@ -382,7 +385,8 @@ pub(super) fn frozen_quality_evidence(
             physical: frozen.physical.id,
             children: Arc::from(frozen.winner.children.as_ref()),
         });
-        let selected_rules = selected_payload_rule_proofs(&frozen.logical, metadata);
+        let selected_rules: BTreeSet<_> =
+            selected_payload_rule_proofs(&frozen.logical, metadata).collect();
         if metadata.origin_rule.is_some() && selected_rules.is_empty() {
             // The sidecar says this payload came from a rule, but the
             // selected Memo expression has no corresponding equivalence
