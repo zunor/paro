@@ -24,6 +24,8 @@ contracts. Existing lazy execution-image lowering is not a substitute claim.
 - Clean source before collection; the maintained collector records its exact
   commit, binary hash, build flags, SQL, harness and data identities. One shared
   Cargo target, sequential builds; no task-owned build/test during sampling.
+  Expected release `parod` SHA-256 after the two code commits:
+  `1babf012f98913d01d4617e39f0d9803e3a976998c96e9ccfd4c5df1060e5285`.
 - Immutable relocatable SF1 seed: `/private/tmp/paro-migration-relative.u1PLBV`,
   SHA-256 `256bf479ca982e30c96f9109fb9920d04233c9643b7bcc6a5fd3f5a50554c927`.
 - DuckDB declaration: `benchmark/requirements.txt`, **1.5.5**. Expected native
