@@ -63,3 +63,21 @@ regress. Compare regress with the existing 18-failure control without updating
 expected files. Archive compact RunOutput cells/receipts, one capture per cell,
 inputs/manifest and a conclusion. Raw logs and historical event floods remain
 outside Git; no worktree, recovery ref or user dataset is deleted.
+
+## Host-interference amendment (before the additional cell)
+
+The original collection is retained unchanged. A separate MatrixOne Go build
+started at 03:29:36 UTC, overlapping the final six seconds of the Q11
+verifier-off run (03:29:22–03:29:42). Subsequent Go compilation/static analysis
+also used substantial CPU. Its processes are outside this task and are not
+stopped by this task. This invalidates an isolation claim for that cohort;
+it does not invalidate SQL results or authorize removing individual samples.
+
+After owned regress/tests finish and the known external Go build/lint has
+ended, collect **one** additional five-block Q11 verifier-off cell, with one
+separate diagnostic capture. Keep the same code, binary, seed, settings and
+timer boundaries. Check for active build/lint processes before and after
+collection; if they recur, label the additional cell NotCertified as well,
+not another retry-until-green. No other target or criterion changes, and no
+pooling with the original cells. This amendment cannot make the original
+campaign an isolated or powered parity comparison.
