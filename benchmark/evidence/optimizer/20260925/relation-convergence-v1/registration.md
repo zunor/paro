@@ -69,3 +69,27 @@ Retain bounded collector packages under `breadth/`, at most 64MiB total.
 Do not compare these verifier-on, low-sample timings with the latency pilot.
 TPC-H remains a separate gate: its SF1 `.tbl` input is not installed in the
 selected environment; no smaller-scale data may use the SF1 expected results.
+
+## Connected-region correction and second breadth attempt
+
+The first breadth attempt was deliberately interrupted after Q18's timeout
+was reproduced as an avoidable Cartesian input hidden inside a connected join
+region. Its original partial campaign and completed/failed cells stay intact;
+there is no fabricated campaign completion or quality-arm result. The next
+source opens unconstrained Cartesian nodes during region extraction, preserving
+control/evaluation fences and the explicit disconnected-region fallback.
+
+Rerun the seven-cell latency pilot and the registered 99-query breadth screen
+under `connected-regions/`, with unchanged settings and a separate 64MiB breadth
+allowance. The older cohorts are not replaced or pooled. Run Q18 first as a
+correctness diagnostic before spending the full breadth screen.
+
+The local TPC-H 3.0.0 dbgen has now generated SF1 data in the owned directory
+`/private/tmp/paro-tpch-sf1.LKW8GF`, using its adjacent dists.dss. Record generator,
+distribution and input file hashes. Use the checked-in 22-query workload and
+its existing full-result/digest oracles under both read policies, verifier on,
+4 threads/2GB, one untimed warmup and one collected execution, 60s timeout.
+Setup writes stay on quality; only read queries select the registered policy.
+This engineering correctness screen supplies no cold/parity claim. Preserve
+timeouts, unknown capabilities and exact numeric differences without blessing.
+Its normal bounded RunOutput packages have a separate 8MiB allowance.
