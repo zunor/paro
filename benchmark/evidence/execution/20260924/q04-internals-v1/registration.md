@@ -23,10 +23,11 @@ bundle is not itself a stopping-policy difference. This is an ablation, not a
 proposal to disable rules in production. Inspect actual selected plans: rule
 settings alone do not prove that a single/two-stage contrast was obtained.
 
-Collect four independent process blocks in T/S/S/T order (one collector report
-per block), with three measured warm repetitions after one warmup. Each block
-has a fresh Paro and DuckDB process. Diagnostics are separate; collect one
-bounded COMPILE capture for the first block of each arm. A supplementary
+Collect four cohorts in T/S/S/T order, each with the collector's minimum of two
+independent process blocks (eight blocks total, four per arm), with three
+measured warm repetitions after one warmup. Each block has a fresh Paro and
+DuckDB process. Diagnostics are separate: one bounded COMPILE capture per
+cohort, never a normal timing sample. A supplementary
 instrumented ANALYZE may explain row reduction and operator work but cannot
 certify speed or be subtracted from normal timing. A quality-policy reference,
 if collected, is a separate arm, not pooled with the ablation.
@@ -62,7 +63,7 @@ are otherwise comparable. A different plan outside the intended placement
 makes attribution to aggregate stages Incomparable, not a failed SQL result.
 
 Report per-block cold/compile/warm and actual aggregate input/output cardinality.
-With two blocks per arm and ambient load, all speed conclusions are
+With four blocks per arm and ambient load, all speed conclusions are
 NotCertified regardless of the observed median. A structural decomposition
 witness proves a legal merge, **not** execution benefit. Do not delete a final
 merge based on observed near-unique groups, and do not substitute runtime row
