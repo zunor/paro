@@ -60,3 +60,14 @@ No query-name, column-name, cardinality or SQL-text specialization is permitted.
 The failed exploratory `EXPLAIN (ANALYZE, FORMAT JSON)` request is retained as
 unsupported syntax; it yielded no execution measurements. Existing plain
 EXPLAIN ANALYZE is a human-readable exploratory view, not a new timing source.
+
+## Collection interruption
+
+The first control batch completed, but observation of concurrent Go compilation
+and a busy VM established uncontrolled host interference. Retain the complete
+`control-1` campaign; it is not a causal speed or parity baseline. The first
+probe collector was interrupted after its release build and before SQL
+collection. No probe timing was accepted. At the user's request, all further
+performance collection is deferred while implementation and correctness testing
+continue. Resume with a newly registered complete interleaved comparison once
+the host is available; do not splice these control samples into that comparison.

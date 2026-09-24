@@ -193,6 +193,9 @@ fn execute(chunk: &Chunk, state: &dyn ExpressionState, result: &mut Vector) -> R
     result.set_count(chunk.size());
     // All inputs have the exact physical i64 domain certified at construction.
     // Decoded views retain dictionary/constant selection and its NULL mapping.
+    // Resolve copy-on-write through the fallible boundary before obtaining the
+    // pointer; validity-only writes below cannot move this exclusive buffer.
+    result.try_make_exclusive()?;
     let output = unsafe { result.flat_data_mut::<i64>() };
     let limit = 10_i64.pow(u32::from(plan.precision));
     for row in 0..chunk.size() {
@@ -376,5 +379,23 @@ mod tests {
             .binary(&bind("+", &money(16, 2), &narrow), first, left)
             .unwrap();
         assert!(builder.finish(root).is_none());
+    }
+
+    #[test]
+    fn totality_is_proved_independently_and_expression_size_is_bounded() {
+        let ty = money(15, 2);
+        let mut builder = DecimalLinearBuilder::default();
+        let left = builder.input(ty.clone()).unwrap();
+        let right = builder.input(ty.clone()).unwrap();
+        let mut invalid = bind("+", &ty, &ty);
+        invalid.return_type = ty.clone();
+        // A claimed infallible function cannot justify erasing a narrow
+        // intermediate that lacks room for the sum of its two input domains.
+        invalid.error_mode = FunctionErrorMode::Infallible;
+        assert!(builder.binary(&invalid, left, right).is_none());
+        for _ in 2..MAX_TERMS {
+            assert!(builder.input(ty.clone()).is_some());
+        }
+        assert!(builder.input(ty).is_none());
     }
 }
