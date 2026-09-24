@@ -109,6 +109,8 @@ old engine.
 Performance registration and results are owned by
 `benchmark/evidence/optimizer/20260924/direct-pipeline-v1/`.
 Shared regional work and finite-domain estimation follow-up evidence is in
-`benchmark/evidence/optimizer/20260924/regional-cost-v1/`. Broad correctness,
+`benchmark/evidence/optimizer/20260924/regional-cost-v1/`; joint aggregate-grain
+planning and its final-source policy matrix are in
+`benchmark/evidence/optimizer/20260925/joint-grain-v1/`. Broad correctness,
 resource and execution-quality gates, not a three-query compile pilot, own
 default promotion.

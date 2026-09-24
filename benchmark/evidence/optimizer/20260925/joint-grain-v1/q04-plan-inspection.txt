@@ -1,0 +1,305 @@
+POLICY pipeline
+MATERIALIZED_CTE  (rows=100)
+  CTE Name: year_total
+  Materialization: MATERIALIZED
+  Reference Count: 6
+  ->  SET_OPERATION  (rows=252279)
+        ->  SET_OPERATION  (rows=202769)
+              ->  PROJECTION  (rows=105450)
+                    Output: customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear, year_total, sale_type
+                    ->  FILTER  (rows=105450)
+                          Filter: public.date_dim.d_year = 2002 OR public.date_dim.d_year = 2001 AND sum_partial_merge(aggregate_state_1) > 0
+                          ->  AGGREGATE  (rows=183392)
+                                Group Key: public.customer.c_customer_id, public.customer.c_first_name, public.customer.c_last_name, public.customer.c_preferred_cust_flag, public.customer.c_birth_country, public.customer.c_login, public.customer.c_email_address, public.date_dim.d_year
+                                Initial Lookup Hash Key: public.customer.c_customer_id
+                                Aggregates: sum_partial_merge(sum(/(CAST(+(-(-(public.store_sales.ss_ext_list_price, public.store_sales.ss_ext_wholesale_cost), public.store_sales.ss_ext_discount_amt), public.store_sales.ss_ext_sales_price) AS DOUBLE), 2)))
+                                ->  HASH_JOIN  (rows=183392)
+                                      Join Type: INNER
+                                      Build Index: integer_build_time
+                                      Join Condition: public.store_sales.ss_customer_sk = public.customer.c_customer_sk
+                                      ->  AGGREGATE  (rows=183392)
+                                            Group Key: public.store_sales.ss_customer_sk, public.date_dim.d_year
+                                            Aggregates: sum(/(CAST(+(-(-(public.store_sales.ss_ext_list_price, public.store_sales.ss_ext_wholesale_cost), public.store_sales.ss_ext_discount_amt), public.store_sales.ss_ext_sales_price) AS DOUBLE), 2))
+                                            ->  HASH_JOIN  (rows=1120846)
+                                                  Join Type: INNER
+                                                  Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=4 artifact=861bc4da51252d41e79c01153e6f3d41
+                                                  Build Index: integer_build_time
+                                                  Join Condition: public.store_sales.ss_sold_date_sk = public.date_dim.d_date_sk
+                                                  ->  ROWSET_SCAN on public.store_sales  (rows=2880404)
+                                                        Column IDs: 0, 3, 14, 15, 16, 17
+                                                        Columns: ss_sold_date_sk, ss_customer_sk, ss_ext_discount_amt, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_list_price
+                                                  ->  ROWSET_SCAN on public.date_dim  (rows=723)
+                                                        Column IDs: 0, 6
+                                                        Columns: d_date_sk, d_year
+                                                        Pushed Predicate: d_year = 2002 OR d_year = 2001
+                                                        Late Materialize: auto
+                                      ->  ROWSET_SCAN on public.customer  (rows=100000)
+                                            Column IDs: 0, 1, 8, 9, 10, 14, 15, 16
+                                            Columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+              ->  PROJECTION  (rows=97319)
+                    Output: customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear, year_total, sale_type
+                    ->  FILTER  (rows=97319)
+                          Filter: public.date_dim.d_year = 2002 OR public.date_dim.d_year = 2001 AND sum_partial_merge(aggregate_state_1) > 0
+                          ->  AGGREGATE  (rows=169250)
+                                Group Key: public.customer.c_customer_id, public.customer.c_first_name, public.customer.c_last_name, public.customer.c_preferred_cust_flag, public.customer.c_birth_country, public.customer.c_login, public.customer.c_email_address, public.date_dim.d_year
+                                Initial Lookup Hash Key: public.customer.c_customer_id
+                                Aggregates: sum_partial_merge(sum(/(CAST(+(-(-(public.catalog_sales.cs_ext_list_price, public.catalog_sales.cs_ext_wholesale_cost), public.catalog_sales.cs_ext_discount_amt), public.catalog_sales.cs_ext_sales_price) AS DOUBLE), 2)))
+                                ->  HASH_JOIN  (rows=169250)
+                                      Join Type: INNER
+                                      Join Condition: public.customer.c_customer_sk = public.catalog_sales.cs_bill_customer_sk
+                                      ->  ROWSET_SCAN on public.customer  (rows=100000)
+                                            Column IDs: 0, 1, 8, 9, 10, 14, 15, 16
+                                            Columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+                                      ->  AGGREGATE  (rows=169250)
+                                            Group Key: public.catalog_sales.cs_bill_customer_sk, public.date_dim.d_year
+                                            Aggregates: sum(/(CAST(+(-(-(public.catalog_sales.cs_ext_list_price, public.catalog_sales.cs_ext_wholesale_cost), public.catalog_sales.cs_ext_discount_amt), public.catalog_sales.cs_ext_sales_price) AS DOUBLE), 2))
+                                            ->  HASH_JOIN  (rows=557645)
+                                                  Join Type: INNER
+                                                  Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=4 artifact=e9c216225475f25c8b8ca73ada9aebd0
+                                                  Build Index: integer_build_time
+                                                  Join Condition: public.catalog_sales.cs_sold_date_sk = public.date_dim.d_date_sk
+                                                  ->  ROWSET_SCAN on public.catalog_sales  (rows=1441548)
+                                                        Column IDs: 0, 3, 22, 23, 24, 25
+                                                        Columns: cs_sold_date_sk, cs_bill_customer_sk, cs_ext_discount_amt, cs_ext_sales_price, cs_ext_wholesale_cost, cs_ext_list_price
+                                                  ->  ROWSET_SCAN on public.date_dim  (rows=723)
+                                                        Column IDs: 0, 6
+                                                        Columns: d_date_sk, d_year
+                                                        Pushed Predicate: d_year = 2002 OR d_year = 2001
+                                                        Late Materialize: auto
+        ->  PROJECTION  (rows=49510)
+              Output: customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear, year_total, sale_type
+              ->  FILTER  (rows=49510)
+                    Filter: public.date_dim.d_year = 2002 OR public.date_dim.d_year = 2001 AND sum_partial_merge(aggregate_state_1) > 0
+                    ->  AGGREGATE  (rows=86104)
+                          Group Key: public.customer.c_customer_id, public.customer.c_first_name, public.customer.c_last_name, public.customer.c_preferred_cust_flag, public.customer.c_birth_country, public.customer.c_login, public.customer.c_email_address, public.date_dim.d_year
+                          Initial Lookup Hash Key: public.customer.c_customer_id
+                          Aggregates: sum_partial_merge(sum(/(CAST(+(-(-(public.web_sales.ws_ext_list_price, public.web_sales.ws_ext_wholesale_cost), public.web_sales.ws_ext_discount_amt), public.web_sales.ws_ext_sales_price) AS DOUBLE), 2)))
+                          ->  HASH_JOIN  (rows=86104)
+                                Join Type: INNER
+                                Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=4 artifact=bc675a4af0e12844f54ceff2cc1daf7e
+                                Join Condition: public.customer.c_customer_sk = public.web_sales.ws_bill_customer_sk
+                                ->  ROWSET_SCAN on public.customer  (rows=100000)
+                                      Column IDs: 0, 1, 8, 9, 10, 14, 15, 16
+                                      Columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+                                ->  AGGREGATE  (rows=86104)
+                                      Group Key: public.web_sales.ws_bill_customer_sk, public.date_dim.d_year
+                                      Aggregates: sum(/(CAST(+(-(-(public.web_sales.ws_ext_list_price, public.web_sales.ws_ext_wholesale_cost), public.web_sales.ws_ext_discount_amt), public.web_sales.ws_ext_sales_price) AS DOUBLE), 2))
+                                      ->  HASH_JOIN  (rows=279932)
+                                            Join Type: INNER
+                                            Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=4 artifact=3be56e703e89c0158c71807b40d99b15
+                                            Build Index: integer_build_time
+                                            Join Condition: public.web_sales.ws_sold_date_sk = public.date_dim.d_date_sk
+                                            ->  ROWSET_SCAN on public.web_sales  (rows=719384)
+                                                  Column IDs: 0, 4, 22, 23, 24, 25
+                                                  Columns: ws_sold_date_sk, ws_bill_customer_sk, ws_ext_discount_amt, ws_ext_sales_price, ws_ext_wholesale_cost, ws_ext_list_price
+                                            ->  ROWSET_SCAN on public.date_dim  (rows=723)
+                                                  Column IDs: 0, 6
+                                                  Columns: d_date_sk, d_year
+                                                  Pushed Predicate: d_year = 2002 OR d_year = 2001
+                                                  Late Materialize: auto
+  ->  TOP_N  (rows=100)
+        Sort Key: t_s_secyear.customer_id ASC NULLS FIRST, t_s_secyear.customer_first_name ASC NULLS FIRST, t_s_secyear.customer_last_name ASC NULLS FIRST, t_s_secyear.customer_preferred_cust_flag ASC NULLS FIRST
+        Limit: 100
+        ->  PROJECTION  (rows=109640)
+              Output: t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_preferred_cust_flag
+              ->  FILTER  (rows=109640)
+                    Filter: CASE WHEN t_c_firstyear.year_total > 0 THEN /(t_c_secyear.year_total, t_c_firstyear.year_total) ELSE NULL END > CASE WHEN t_s_firstyear.year_total > 0 THEN /(t_s_secyear.year_total, t_s_firstyear.year_total) ELSE NULL END
+                    ->  HASH_JOIN  (rows=14920)
+                          Join Type: INNER
+                          Join Condition: t_s_secyear.customer_id = t_c_secyear.customer_id
+                          ->  FILTER  (rows=10299)
+                                Filter: t_s_secyear.dyear = 2002 AND t_s_secyear.sale_type = 's'
+                                ->  CTE_SCAN  (rows=252279)
+                                      CTE Index: 0
+                                      Table Index: 37
+                          ->  FILTER  (rows=144746)
+                                Filter: CASE WHEN t_c_firstyear.year_total > 0 THEN /(t_c_secyear.year_total, t_c_firstyear.year_total) ELSE NULL END > CASE WHEN t_w_firstyear.year_total > 0 THEN /(t_w_secyear.year_total, t_w_firstyear.year_total) ELSE NULL END
+                                ->  HASH_JOIN  (rows=19697)
+                                      Join Type: INNER
+                                      Join Condition: t_c_secyear.customer_id = t_w_secyear.customer_id
+                                      ->  HASH_JOIN  (rows=191093)
+                                            Join Type: INNER
+                                            Join Condition: t_c_secyear.customer_id = t_s_firstyear.customer_id
+                                            ->  FILTER  (rows=10299)
+                                                  Filter: t_c_secyear.dyear = 2002 AND t_c_secyear.sale_type = 'c'
+                                                  ->  CTE_SCAN  (rows=252279)
+                                                        CTE Index: 0
+                                                        Table Index: 39
+                                            ->  HASH_JOIN  (rows=75684)
+                                                  Join Type: INNER
+                                                  Join Condition: t_s_firstyear.customer_id = t_w_firstyear.customer_id
+                                                  ->  HASH_JOIN  (rows=75684)
+                                                        Join Type: INNER
+                                                        Join Condition: t_s_firstyear.customer_id = t_c_firstyear.customer_id
+                                                        ->  FILTER  (rows=7622)
+                                                              Filter: t_s_firstyear.dyear = 2001 AND t_s_firstyear.year_total > 0 AND t_s_firstyear.sale_type = 's'
+                                                              ->  CTE_SCAN  (rows=252279)
+                                                                    CTE Index: 0
+                                                                    Table Index: 36
+                                                        ->  FILTER  (rows=7622)
+                                                              Filter: t_c_firstyear.dyear = 2001 AND t_c_firstyear.year_total > 0 AND t_c_firstyear.sale_type = 'c'
+                                                              ->  CTE_SCAN  (rows=252279)
+                                                                    CTE Index: 0
+                                                                    Table Index: 38
+                                                  ->  FILTER  (rows=7622)
+                                                        Filter: t_w_firstyear.dyear = 2001 AND t_w_firstyear.year_total > 0 AND t_w_firstyear.sale_type = 'w'
+                                                        ->  CTE_SCAN  (rows=252279)
+                                                              CTE Index: 0
+                                                              Table Index: 40
+                                      ->  FILTER  (rows=10299)
+                                            Filter: t_w_secyear.dyear = 2002 AND t_w_secyear.sale_type = 'w'
+                                            ->  CTE_SCAN  (rows=252279)
+                                                  CTE Index: 0
+                                                  Table Index: 41
+POLICY quality
+MATERIALIZED_CTE  (rows=100)
+  CTE Name: year_total
+  Materialization: MATERIALIZED
+  Reference Count: 6
+  ->  SET_OPERATION  (rows=1126093)
+        ->  SET_OPERATION  (rows=965132)
+              ->  PROJECTION  (rows=644486)
+                    Output: customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear, year_total, sale_type
+                    ->  FILTER  (rows=644486)
+                          Filter: public.date_dim.d_year = 2001 AND sum_partial_merge(aggregate_state_1) > 0 OR public.date_dim.d_year = 2002
+                          ->  AGGREGATE  (rows=1120846)
+                                Group Key: public.customer.c_customer_id, public.customer.c_first_name, public.customer.c_last_name, public.customer.c_preferred_cust_flag, public.customer.c_birth_country, public.customer.c_login, public.customer.c_email_address, public.date_dim.d_year
+                                Initial Lookup Hash Key: public.customer.c_customer_id
+                                Aggregates: sum_partial_merge(sum(/(CAST(+(-(-(public.store_sales.ss_ext_list_price, public.store_sales.ss_ext_wholesale_cost), public.store_sales.ss_ext_discount_amt), public.store_sales.ss_ext_sales_price) AS DOUBLE), 2)))
+                                ->  HASH_JOIN  (rows=183392)
+                                      Join Type: INNER
+                                      Join Condition: public.customer.c_customer_sk = public.store_sales.ss_customer_sk
+                                      ->  ROWSET_SCAN on public.customer  (rows=100000)
+                                            Column IDs: 0, 1, 8, 9, 10, 14, 15, 16
+                                            Columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+                                      ->  AGGREGATE  (rows=183392)
+                                            Group Key: public.store_sales.ss_customer_sk, public.date_dim.d_year
+                                            Aggregates: sum(/(CAST(+(-(-(public.store_sales.ss_ext_list_price, public.store_sales.ss_ext_wholesale_cost), public.store_sales.ss_ext_discount_amt), public.store_sales.ss_ext_sales_price) AS DOUBLE), 2))
+                                            ->  HASH_JOIN  (rows=2880404)
+                                                  Join Type: INNER
+                                                  Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=4 artifact=e6d394bbb863c998247bca89405ba3e3
+                                                  Build Index: integer_build_time
+                                                  Join Condition: public.store_sales.ss_sold_date_sk = public.date_dim.d_date_sk
+                                                  ->  ROWSET_SCAN on public.store_sales  (rows=2880404)
+                                                        Column IDs: 0, 3, 14, 15, 16, 17
+                                                        Columns: ss_sold_date_sk, ss_customer_sk, ss_ext_discount_amt, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_list_price
+                                                  ->  ROWSET_SCAN on public.date_dim  (rows=723)
+                                                        Column IDs: 0, 6
+                                                        Columns: d_date_sk, d_year
+                                                        Pushed Predicate: d_year = 2002 OR d_year = 2001
+                                                        Late Materialize: auto
+              ->  PROJECTION  (rows=320646)
+                    Output: customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear, year_total, sale_type
+                    ->  FILTER  (rows=320646)
+                          Filter: public.date_dim.d_year = 2002 OR sum_partial_merge(aggregate_state_1) > 0 AND public.date_dim.d_year = 2001
+                          ->  AGGREGATE  (rows=557645)
+                                Group Key: public.customer.c_customer_id, public.customer.c_first_name, public.customer.c_last_name, public.customer.c_preferred_cust_flag, public.customer.c_birth_country, public.customer.c_login, public.customer.c_email_address, public.date_dim.d_year
+                                Initial Lookup Hash Key: public.customer.c_customer_id
+                                Aggregates: sum_partial_merge(sum(/(CAST(+(-(-(public.catalog_sales.cs_ext_list_price, public.catalog_sales.cs_ext_wholesale_cost), public.catalog_sales.cs_ext_discount_amt), public.catalog_sales.cs_ext_sales_price) AS DOUBLE), 2)))
+                                ->  HASH_JOIN  (rows=169250)
+                                      Join Type: INNER
+                                      Join Condition: public.customer.c_customer_sk = public.catalog_sales.cs_bill_customer_sk
+                                      ->  ROWSET_SCAN on public.customer  (rows=100000)
+                                            Column IDs: 0, 1, 8, 9, 10, 14, 15, 16
+                                            Columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+                                      ->  AGGREGATE  (rows=169250)
+                                            Group Key: public.catalog_sales.cs_bill_customer_sk, public.date_dim.d_year
+                                            Aggregates: sum(/(CAST(+(-(-(public.catalog_sales.cs_ext_list_price, public.catalog_sales.cs_ext_wholesale_cost), public.catalog_sales.cs_ext_discount_amt), public.catalog_sales.cs_ext_sales_price) AS DOUBLE), 2))
+                                            ->  HASH_JOIN  (rows=1441548)
+                                                  Join Type: INNER
+                                                  Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=4 artifact=ed822de9aecf218574aa88ab8b2cbc6a
+                                                  Build Index: integer_build_time
+                                                  Join Condition: public.catalog_sales.cs_sold_date_sk = public.date_dim.d_date_sk
+                                                  ->  ROWSET_SCAN on public.catalog_sales  (rows=1441548)
+                                                        Column IDs: 0, 3, 22, 23, 24, 25
+                                                        Columns: cs_sold_date_sk, cs_bill_customer_sk, cs_ext_discount_amt, cs_ext_sales_price, cs_ext_wholesale_cost, cs_ext_list_price
+                                                  ->  ROWSET_SCAN on public.date_dim  (rows=723)
+                                                        Column IDs: 0, 6
+                                                        Columns: d_date_sk, d_year
+                                                        Pushed Predicate: d_year = 2002 OR d_year = 2001
+                                                        Late Materialize: auto
+        ->  PROJECTION  (rows=160961)
+              Output: customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear, year_total, sale_type
+              ->  FILTER  (rows=160961)
+                    Filter: public.date_dim.d_year = 2002 OR public.date_dim.d_year = 2001 AND sum_partial_merge(aggregate_state_1) > 0
+                    ->  AGGREGATE  (rows=279932)
+                          Group Key: public.customer.c_customer_id, public.customer.c_first_name, public.customer.c_last_name, public.customer.c_preferred_cust_flag, public.customer.c_birth_country, public.customer.c_login, public.customer.c_email_address, public.date_dim.d_year
+                          Initial Lookup Hash Key: public.customer.c_customer_id
+                          Aggregates: sum_partial_merge(sum(/(CAST(+(-(-(public.web_sales.ws_ext_list_price, public.web_sales.ws_ext_wholesale_cost), public.web_sales.ws_ext_discount_amt), public.web_sales.ws_ext_sales_price) AS DOUBLE), 2)))
+                          ->  HASH_JOIN  (rows=86104)
+                                Join Type: INNER
+                                Join Condition: public.customer.c_customer_sk = public.web_sales.ws_bill_customer_sk
+                                ->  ROWSET_SCAN on public.customer  (rows=100000)
+                                      Column IDs: 0, 1, 8, 9, 10, 14, 15, 16
+                                      Columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+                                ->  AGGREGATE  (rows=86104)
+                                      Group Key: public.web_sales.ws_bill_customer_sk, public.date_dim.d_year
+                                      Aggregates: sum(/(CAST(+(-(-(public.web_sales.ws_ext_list_price, public.web_sales.ws_ext_wholesale_cost), public.web_sales.ws_ext_discount_amt), public.web_sales.ws_ext_sales_price) AS DOUBLE), 2))
+                                      ->  HASH_JOIN  (rows=719384)
+                                            Join Type: INNER
+                                            Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=4 artifact=b2bc4298ef6b802371c6fcb9041ed025
+                                            Build Index: integer_build_time
+                                            Join Condition: public.web_sales.ws_sold_date_sk = public.date_dim.d_date_sk
+                                            ->  ROWSET_SCAN on public.web_sales  (rows=719384)
+                                                  Column IDs: 0, 4, 22, 23, 24, 25
+                                                  Columns: ws_sold_date_sk, ws_bill_customer_sk, ws_ext_discount_amt, ws_ext_sales_price, ws_ext_wholesale_cost, ws_ext_list_price
+                                            ->  ROWSET_SCAN on public.date_dim  (rows=723)
+                                                  Column IDs: 0, 6
+                                                  Columns: d_date_sk, d_year
+                                                  Pushed Predicate: d_year = 2001 OR d_year = 2002
+                                                  Late Materialize: auto
+  ->  LIMIT  (rows=100)
+        Limit: 100
+        ->  ORDER_BY  (rows=3062)
+              Sort Key: t_s_secyear.customer_id ASC NULLS FIRST, t_s_secyear.customer_first_name ASC NULLS FIRST, t_s_secyear.customer_last_name ASC NULLS FIRST, t_s_secyear.customer_preferred_cust_flag ASC NULLS FIRST
+              ->  PROJECTION  (rows=3062)
+                    Output: t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_preferred_cust_flag
+                    ->  FILTER  (rows=3062)
+                          Filter: CASE WHEN t_c_firstyear.year_total > 0 THEN /(t_c_secyear.year_total, t_c_firstyear.year_total) ELSE NULL END > CASE WHEN t_w_firstyear.year_total > 0 THEN /(t_w_secyear.year_total, t_w_firstyear.year_total) ELSE NULL END
+                          ->  HASH_JOIN  (rows=10207)
+                                Join Type: INNER
+                                Join Condition: t_w_secyear.customer_id = t_s_firstyear.customer_id
+                                ->  FILTER  (rows=45973)
+                                      Filter: t_w_secyear.sale_type = 'w' AND t_w_secyear.dyear = 2002
+                                      ->  CTE_SCAN  (rows=1126093)
+                                            CTE Index: 0
+                                            Table Index: 41
+                                ->  HASH_JOIN  (rows=10207)
+                                      Join Type: INNER
+                                      Join Condition: t_w_firstyear.customer_id = t_s_firstyear.customer_id
+                                      ->  FILTER  (rows=34023)
+                                            Filter: t_w_firstyear.sale_type = 'w' AND t_w_firstyear.dyear = 2001 AND t_w_firstyear.year_total > 0
+                                            ->  CTE_SCAN  (rows=1126093)
+                                                  CTE Index: 0
+                                                  Table Index: 40
+                                      ->  FILTER  (rows=10207)
+                                            Filter: CASE WHEN t_c_firstyear.year_total > 0 THEN /(t_c_secyear.year_total, t_c_firstyear.year_total) ELSE NULL END > CASE WHEN t_s_firstyear.year_total > 0 THEN /(t_s_secyear.year_total, t_s_firstyear.year_total) ELSE NULL END
+                                            ->  HASH_JOIN  (rows=34023)
+                                                  Join Type: INNER
+                                                  Join Condition: t_s_firstyear.customer_id = t_c_secyear.customer_id
+                                                  ->  HASH_JOIN  (rows=34023)
+                                                        Join Type: INNER
+                                                        Join Condition: t_s_firstyear.customer_id = t_c_firstyear.customer_id
+                                                        ->  HASH_JOIN  (rows=34023)
+                                                              Join Type: INNER
+                                                              Join Condition: t_s_secyear.customer_id = t_s_firstyear.customer_id
+                                                              ->  FILTER  (rows=45973)
+                                                                    Filter: t_s_secyear.sale_type = 's' AND t_s_secyear.dyear = 2002
+                                                                    ->  CTE_SCAN  (rows=1126093)
+                                                                          CTE Index: 0
+                                                                          Table Index: 37
+                                                              ->  FILTER  (rows=34023)
+                                                                    Filter: t_s_firstyear.sale_type = 's' AND t_s_firstyear.dyear = 2001 AND t_s_firstyear.year_total > 0
+                                                                    ->  CTE_SCAN  (rows=1126093)
+                                                                          CTE Index: 0
+                                                                          Table Index: 36
+                                                        ->  FILTER  (rows=34023)
+                                                              Filter: t_c_firstyear.sale_type = 'c' AND t_c_firstyear.dyear = 2001 AND t_c_firstyear.year_total > 0
+                                                              ->  CTE_SCAN  (rows=1126093)
+                                                                    CTE Index: 0
+                                                                    Table Index: 38
+                                                  ->  FILTER  (rows=45973)
+                                                        Filter: t_c_secyear.sale_type = 'c' AND t_c_secyear.dyear = 2002
+                                                        ->  CTE_SCAN  (rows=1126093)
+                                                              CTE Index: 0
+                                                              Table Index: 39
