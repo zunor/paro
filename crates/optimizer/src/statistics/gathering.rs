@@ -138,6 +138,7 @@ struct CardinalityInputs<'a> {
 /// OwnedLogicalPlan solely to expose a child's row estimate.
 trait LocalChildFacts {
     fn estimated_cardinality(&self) -> Option<CardinalityEstimate>;
+    fn finite_domains(&self) -> &paro_planner::plan::finite_domain::FiniteDomains;
 
     fn unique_keys(&self) -> Vec<Vec<ColumnBinding>> {
         Vec::new()
@@ -149,6 +150,9 @@ trait LocalChildFacts {
 }
 
 impl LocalChildFacts for Box<OwnedLogicalPlan> {
+    fn finite_domains(&self) -> &paro_planner::plan::finite_domain::FiniteDomains {
+        &self.stats.finite_domains
+    }
     fn estimated_cardinality(&self) -> Option<CardinalityEstimate> {
         self.stats.estimated_cardinality
     }
@@ -163,6 +167,9 @@ impl LocalChildFacts for Box<OwnedLogicalPlan> {
 }
 
 impl LocalChildFacts for BoundReference {
+    fn finite_domains(&self) -> &paro_planner::plan::finite_domain::FiniteDomains {
+        &self.facts.finite_domains
+    }
     fn estimated_cardinality(&self) -> Option<CardinalityEstimate> {
         self.facts.cardinality
     }
@@ -729,6 +736,34 @@ impl StatisticsGathering {
         ctx: &CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
         let child = filter.child.estimated_cardinality()?;
+        if let Some(FiniteFilterSelectivity {
+            fraction,
+            impossible,
+            residuals,
+        }) = finite_filter_fraction(&filter.expressions, filter.child.finite_domains())
+        {
+            if impossible {
+                return Some(CardinalityEstimate::exact(0));
+            }
+            if fraction == 1.0 && residuals.is_empty() {
+                return Some(child);
+            }
+            let residual = ctx.cost_model.estimate_filter_cardinality_with_positions(
+                child.expected,
+                &residuals,
+                ctx.column_stats,
+                child_layout.bindings(),
+            );
+            // A permitted value set is not a frequency histogram. Uniform
+            // weighting is only the point prior; never scale the upper
+            // envelope by that fraction or advertise an exact row count.
+            return Some(CardinalityEstimate {
+                min: 0,
+                expected: ((residual.expected as f64 * fraction).round() as u64)
+                    .min(child.expected),
+                max: child.max,
+            });
+        }
         Some(ctx.cost_model.estimate_filter_cardinality_with_positions(
             child.expected,
             &filter.expressions,
@@ -1141,6 +1176,68 @@ impl StatisticsGathering {
             .map(|rows| rows.max(1))
             .unwrap_or_else(|| default_table_cardinality(Some(ctx.session)))
     }
+}
+
+struct FiniteFilterSelectivity {
+    fraction: f64,
+    impossible: bool,
+    residuals: Vec<Expression>,
+}
+
+fn finite_filter_fraction(
+    expressions: &[Expression],
+    domains: &paro_planner::plan::finite_domain::FiniteDomains,
+) -> Option<FiniteFilterSelectivity> {
+    use paro_planner::plan::finite_domain::DomainValue;
+    if domains.is_empty() {
+        return None;
+    }
+    let mut selected = BTreeMap::<ColumnBinding, BTreeSet<DomainValue>>::new();
+    let mut residuals = Vec::new();
+    let mut pending = expressions.iter().collect::<Vec<_>>();
+    while let Some(expression) = pending.pop() {
+        if let Expression::Conjunction(c) = expression {
+            if c.conjunction_type == ConjunctionType::And {
+                pending.extend(&c.children);
+                continue;
+            }
+        }
+        let constraint = finite_equality_domain(expression).and_then(|(binding, values)| {
+            domains.get(&binding)?;
+            let values = values
+                .iter()
+                .map(DomainValue::from_value)
+                .collect::<Option<BTreeSet<_>>>()?;
+            Some((binding, values))
+        });
+        if let Some((binding, values)) = constraint {
+            selected
+                .entry(binding)
+                .and_modify(|old| *old = old.intersection(&values).cloned().collect())
+                .or_insert(values);
+        } else {
+            residuals.push(expression.clone());
+        }
+    }
+    if selected.is_empty() {
+        return None;
+    }
+    let mut impossible = false;
+    let fraction = selected.iter().fold(1.0, |fraction, (binding, values)| {
+        let known = &domains[binding];
+        impossible |= known.is_disjoint(values);
+        fraction
+            * if known.is_empty() {
+                0.0
+            } else {
+                known.intersection(values).count() as f64 / known.len() as f64
+            }
+    });
+    Some(FiniteFilterSelectivity {
+        fraction,
+        impossible,
+        residuals,
+    })
 }
 
 /// Estimate a semi join between two filtered views of the same statistical
@@ -2029,6 +2126,54 @@ mod tests {
             column_ref(right_table, right_column),
             JoinComparisonType::Equal,
         )
+    }
+
+    #[test]
+    fn finite_filter_domain_is_counted_once_and_is_not_a_frequency_proof() {
+        use paro_planner::plan::finite_domain::{DomainValue, FiniteDomains};
+        let predicate = |table, value| {
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    column_ref(table, 0),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into(),
+                    ),
+                )
+                .into(),
+            )
+        };
+        let domains = FiniteDomains::from([(
+            ColumnBinding::new(1, 0),
+            BTreeSet::from([DomainValue::Integer(1), DomainValue::Integer(2)]),
+        )]);
+        let selected =
+            finite_filter_fraction(&[predicate(1, 1), predicate(1, 1)], &domains).unwrap();
+        assert_eq!(selected.fraction, 0.5);
+        assert!(!selected.impossible);
+        assert!(selected.residuals.is_empty());
+        assert!(
+            finite_filter_fraction(&[predicate(1, 3)], &domains)
+                .unwrap()
+                .impossible
+        );
+
+        // Numerical underflow of an independence prior is not a proof that
+        // a conjunction has no matching row.
+        let domains = (0..1200)
+            .map(|table| {
+                (
+                    ColumnBinding::new(table, 0),
+                    BTreeSet::from([DomainValue::Integer(1), DomainValue::Integer(2)]),
+                )
+            })
+            .collect();
+        let predicates = (0..1200)
+            .map(|table| predicate(table, 1))
+            .collect::<Vec<_>>();
+        let selected = finite_filter_fraction(&predicates, &domains).unwrap();
+        assert_eq!(selected.fraction, 0.0);
+        assert!(!selected.impossible);
     }
 
     /// Independent two-gather baseline: compare every relation property and

@@ -34,3 +34,20 @@ Breadth is a separate correctness screen, not this timing gate. TPC-DS99 and
 TPC-H22 require every query's declared numeric/order contract; known errors and
 unsupported capabilities block default promotion. Do not extend this pilot's
 statistics or relax its contracts to claim breadth, C1 parity or ProofComplete.
+
+## Amendment: finite-domain selectivity cohort
+
+The first seven cells at 1932674ba remain retained, including negative Q04
+results. New independent fixtures exposed a shared model gap: a disjoint-tag
+CTE join estimated zero for four rows, and overlapping branches estimated one
+for sixteen. The second source additionally consumes semantic finite domains
+for Filter estimation: tautologies/contradictions are proven separately from
+a uniform point prior; an allowed domain is not a frequency histogram or a
+tighter row-count upper bound. This is a new intervention, not replacement
+samples for the initial cohort.
+
+Repeat the same seven cells, ordering, sampling and resource contract under
+the `post-domain-selectivity` directory after clean build and correctness
+checks. Total retained capacity becomes 32MiB for both cohorts plus 2MiB for
+known-cardinality fixtures. Cross-cohort deltas are exploratory, not matched
+causal speedups. The independent 4/16-row expectations remain unchanged.
