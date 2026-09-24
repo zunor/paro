@@ -575,14 +575,10 @@ impl PhysicalPlanExtractor {
                 .into_boxed_slice()
         };
 
-        let group_key_encodings = if dependent_layout.is_some() {
-            (0..groups.len())
-                .map(|_| GroupKeyEncoding::Identity)
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
-        } else {
-            plan_group_key_encodings(aggregate, &group_indices)
-        };
+        // The lookup domain and SQL output domain are independent: dependent
+        // columns are aggregate states, while retained keys can still use a
+        // lossless compact representation. Emit decodes through the output map.
+        let group_key_encodings = plan_group_key_encodings(aggregate, &group_indices);
         let mut spec = AggregateSpec {
             grouping_key_count: groups.len(),
             initial_lookup_hash_key_count: plan_initial_lookup_hash_key_count(

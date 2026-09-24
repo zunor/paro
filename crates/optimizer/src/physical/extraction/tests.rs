@@ -603,7 +603,7 @@ fn aggregate_materializes_proven_dependent_groups_as_states() {
             vec![],
             vec!["key".to_string(), "name".to_string(), "comment".to_string()],
             vec![
-                LogicalType::BigInt,
+                LogicalType::Varchar,
                 LogicalType::Varchar,
                 LogicalType::Varchar,
             ],
@@ -618,7 +618,7 @@ fn aggregate_materializes_proven_dependent_groups_as_states() {
         3,
         values,
         vec![
-            ref_expr(0, LogicalType::BigInt),
+            ref_expr(0, LogicalType::Varchar),
             ref_expr(1, LogicalType::Varchar),
             ref_expr(2, LogicalType::Varchar),
         ],
@@ -630,6 +630,11 @@ fn aggregate_materializes_proven_dependent_groups_as_states() {
         determinants: Box::new([0]),
         dependents: Box::new([1, 2]),
     });
+    // Retained keys and dependent-state output are independent domains. A
+    // proven compact key must survive removal of other grouping columns.
+    let mut key_stats = StringStats::create_empty(LogicalType::Varchar);
+    StringStats::update(&mut key_stats, "key");
+    aggregate.group_stats[0] = Some(key_stats);
     let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
@@ -644,9 +649,16 @@ fn aggregate_materializes_proven_dependent_groups_as_states() {
     assert_eq!(spec.aggregates.len(), 3);
     assert_eq!(spec.state_output_projection.as_ref(), [0, 2, 3, 1]);
     assert_eq!(
+        spec.group_key_encodings.as_ref(),
+        [GroupKeyEncoding::PackedString {
+            physical_type: LogicalType::UInteger,
+            max_length: 3,
+        }]
+    );
+    assert_eq!(
         spec.output_types.as_ref(),
         [
-            LogicalType::BigInt,
+            LogicalType::Varchar,
             LogicalType::Varchar,
             LogicalType::Varchar,
             LogicalType::BigInt,
