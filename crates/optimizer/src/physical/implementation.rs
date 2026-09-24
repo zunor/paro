@@ -908,6 +908,48 @@ struct RuntimeFilterProbeSource<'a> {
     boundary: Option<&'a paro_planner::operator::bound_reference::BoundSourceColumn>,
 }
 
+/// Freeze the existing source-lineage contract at a local relation boundary.
+/// Regional costing must expose precisely the RF capability that committed
+/// tree selection sees; an opaque child must not silently disable that choice.
+pub(crate) fn planner_source_lineage(
+    plan: &OwnedLogicalPlan,
+    statistics: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+) -> Vec<Option<Vec<paro_planner::operator::bound_reference::BoundSourceColumn>>> {
+    use paro_planner::operator::bound_reference::BoundSourceColumn;
+    (0..plan.types().len())
+        .map(|ordinal| {
+            runtime_filter_probe_lineages(plan, ordinal)?
+                .sources
+                .into_iter()
+                .map(|source| {
+                    if let Some(boundary) = source.boundary {
+                        return Some(boundary.clone());
+                    }
+                    let plan = source.plan?;
+                    let binding = *plan.get_column_bindings().get(source.output_index)?;
+                    let ty = plan.types().get(source.output_index)?.clone();
+                    let expression = Expression::ColumnRef(
+                        paro_planner::expression::ColumnRefExpression::new(binding, ty).into(),
+                    );
+                    Some(BoundSourceColumn {
+                        source: runtime_filter_source_id(source)?.0,
+                        occurrence: plan.id.0 as usize,
+                        column: source.output_index,
+                        rows: plan.stats.estimated_cardinality,
+                        distinct: statistics
+                            .get(&binding)
+                            .map(|s| s.distinct_evidence().point),
+                        unique: matches!(
+                            infer_runtime_filter_probe_multiplicity(plan, [&expression]),
+                            RuntimeFilterProbeMultiplicity::DeclaredUnique
+                        ),
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn runtime_filter_source_id(source: RuntimeFilterProbeSource<'_>) -> Option<WorkSourceId> {
     if let Some(boundary) = source.boundary {
         return Some(WorkSourceId(boundary.source));

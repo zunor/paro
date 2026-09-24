@@ -9,6 +9,7 @@ use crate::physical::direct;
 use paro_context::compile_diagnostics::Observation::Observed;
 use paro_planner::operator::ExplainMode;
 
+mod aggregate_region;
 #[cfg(test)]
 mod tests;
 
@@ -62,53 +63,22 @@ impl Optimizer {
         // grain, or a proven partial-state/merge decomposition. Join DP runs
         // inside each legal state before comparing it; neither state's cost
         // may be based on the incoming, unoptimized join order.
-        let mut region_choices = 0_u64;
+        let mut region_work = aggregate_region::Work::default();
         plan = plan.try_map_post_order(|input| {
             self.ctx.session.cancellation.check()?;
-            if !matches!(&input.operator, LogicalOperator::Aggregate(a)
-                if crate::aggregate::dimension_deferral::root_eligible(a))
-            {
-                return Ok(input);
-            }
-            let copy =
-                duplicate_plan_preserving_indices(&input, self.ctx.bind_context.shared().as_ref());
-            let (alternative, changed) =
-                crate::aggregate::dimension_deferral::optimize_plan(copy, &self.ctx.bind_context)?;
-            if !changed {
-                return Ok(input);
-            }
-            let input = self.optimize_pipeline_join_regions(input)?;
-            let alternative = self.optimize_pipeline_join_regions(alternative)?;
-            let mut baseline_candidate = self.settle_query_candidate(input)?;
-            baseline_candidate.plan = self.pipeline_occurrences(baseline_candidate.plan)?;
-            let mut alternative = self.settle_query_candidate(alternative)?;
-            alternative.plan = self.pipeline_occurrences(alternative.plan)?;
-            let baseline = direct::estimate(
-                &baseline_candidate.plan,
-                &baseline_candidate.column_stats,
+            let Some(selected) = aggregate_region::optimize(
+                &input,
+                &self.ctx,
                 grant,
                 &self.calibration,
-                &self.ctx.session,
-            )?;
-            let proposed = direct::estimate(
-                &alternative.plan,
-                &alternative.column_stats,
-                grant,
-                &self.calibration,
-                &self.ctx.session,
-            )?;
-            region_choices += 1;
-            if proposed.as_ref().is_some_and(|proposed| {
-                baseline.as_ref().is_none_or(|baseline| {
-                    crate::physical::ObjectiveProfile::Latency
-                        .compare(proposed, baseline)
-                        .is_lt()
-                })
-            }) {
-                Ok(alternative.plan)
-            } else {
-                Ok(baseline_candidate.plan)
-            }
+                self.budget.max_join_connected_pairs as usize,
+                &mut region_work,
+            )?
+            else {
+                return Ok(input);
+            };
+            self.ctx.column_stats_mut().extend(selected.columns);
+            Ok(selected.plan)
         })?;
         // Every committed rewrite reopens predicate routing before join DP.
         // Required domains must reach the source, not remain as join residuals.
@@ -251,7 +221,14 @@ impl Optimizer {
                 ("pipeline_extraction_us", extraction_us),
                 ("pipeline_selected_nodes", selection.nodes),
                 ("pipeline_local_alternatives", selection.alternatives),
-                ("pipeline_aggregate_decisions", region_choices),
+                ("pipeline_aggregate_decisions", region_work.regions),
+                ("pipeline_joint_transitions", region_work.transitions),
+                ("pipeline_partial_states", region_work.partial_states),
+                ("pipeline_selected_partial", region_work.selected_partial),
+                (
+                    "pipeline_joint_budget_fallbacks",
+                    region_work.budget_fallbacks,
+                ),
                 ("memo_group_count", 0),
                 ("memo_logical_expression_count", 0),
                 ("memo_physical_expression_count", 0),
@@ -283,22 +260,5 @@ impl Optimizer {
             node.id = self.ctx.bind_context.next_plan_id();
             Ok(node)
         })
-    }
-
-    fn optimize_pipeline_join_regions(
-        &mut self,
-        plan: OwnedLogicalPlan,
-    ) -> Result<OwnedLogicalPlan> {
-        let plan = crate::construction::predicates(plan, &mut Default::default());
-        let candidate = self.settle_query_candidate(plan)?;
-        JoinOrderOptimizer::new(self.ctx.cost_model.defaults.clone())
-            .with_search_budget(&self.budget)
-            .with_physical_pricing(&self.calibration)?
-            .optimize_regions(
-                self.ctx.session.as_ref(),
-                candidate.plan,
-                &candidate.column_stats,
-                &self.ctx.bind_context,
-            )
     }
 }

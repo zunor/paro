@@ -25,12 +25,22 @@ pub(crate) struct DirectSelection {
     pub cost: SearchCost,
     pub nodes: u64,
     pub alternatives: u64,
+    pub response: Completed,
 }
 
-struct Completed {
-    cost: SearchCost,
-    hard_rows: Option<u64>,
-    result: requirements::ResultGuarantee,
+/// The physical response of a completed relation, shared by regional search
+/// and committed-tree selection. Estimates are not semantic row bounds.
+#[derive(Clone)]
+pub(crate) struct Completed {
+    pub cost: SearchCost,
+    pub hard_rows: Option<u64>,
+    pub result: requirements::ResultGuarantee,
+}
+
+pub(crate) struct LocalSelection {
+    pub implementation: PhysicalImplementationFlavor,
+    pub response: Completed,
+    pub alternatives: u64,
 }
 
 /// Memory floors are conservatively simultaneous. Elastic state shares one
@@ -94,17 +104,17 @@ pub(crate) fn select(
 /// Cost a short-lived region without publishing physical contracts, RF
 /// ownership, fingerprints or executable alternatives. Only the committed
 /// tree is materialized by `select`.
-pub(crate) fn estimate(
+pub(crate) fn estimate_response(
     root: &OwnedLogicalPlan,
     statistics: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     grant: ResourceGrantClass,
     calibration: &MachineCalibrationBundle,
     session: &paro_context::StatementContext,
-) -> Result<Option<SearchCost>> {
+) -> Result<Option<Completed>> {
     let _scope = crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
     Ok(
         select_impl(root, statistics, grant, calibration, session, false)?
-            .map(|result| result.cost),
+            .map(|selection| selection.response),
     )
 }
 
@@ -121,7 +131,6 @@ fn select_impl(
     let mut completed = HashMap::<PlanNodeId, Completed>::new();
     let mut contracts = HashMap::new();
     let mut alternatives = 0;
-    let bindings = BindingCatalog::default();
     while let Some((plan, visited)) = pending.pop() {
         session.cancellation.check()?;
         if !visited {
@@ -143,91 +152,16 @@ fn select_impl(
                     .ok_or_else(|| paro_error::internal("pipeline child was not selected"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let bounds = children
-            .iter()
-            .map(|c| c.hard_rows)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let template = planner_cost_facts(plan, statistics, &bindings, Default::default())?;
-        let facts = selected_cost_facts(plan, &template, bounds)?;
-        let implementations = planner_implementation_set(plan, session.limits.rowset_scan_pushdown);
-        let model = LocalCostModel {
-            operator_type: plan.operator.op_type(),
-            local_cost: planner_operator_cost(
-                plan,
-                children.len(),
-                facts.output_rows_hard_upper,
-                &facts.child_rows_hard_upper,
-                Default::default(),
-            )?,
-            baseline: implementations.baseline,
-            resource_sensitive: planner_grant_dependency(&plan.operator)
-                == GrantDependencyDescriptor::Sensitive,
-            spillable: planner_operator_spillable(&plan.operator),
-            perfect_hash: facts.perfect_hash,
-            runtime_filter_key_types: &facts.runtime_filter_key_types,
-        };
-        let mut best: Option<(F, SearchCost)> = None;
-        for flavor in std::iter::once(implementations.baseline).chain(
-            [
-                F::PerfectHashAggregate,
-                F::SingletonAggregateProjection,
-                F::HashJoinRuntimeFilter,
-                F::HashJoinBuildLeft,
-                F::HashJoinBuildLeftRuntimeFilter,
-                F::SortRangeJoin,
-                F::ClassicIeJoin,
-                F::PartitionAggregateWindow,
-                F::CrossProductExternal,
-            ]
-            .into_iter()
-            .filter(|f| implementations.supports(*f)),
-        ) {
-            alternatives += 1;
-            let local = implementation_cost(
-                &model,
-                &facts,
-                flavor,
-                calibration,
-                grant.max_parallel_tasks,
-            )?;
-            let Some(mut local) = fit_local_cost(
-                local,
-                flavor_spillable(&model, flavor),
-                grant,
-                session.limits.force_external,
-            )?
-            else {
-                continue;
-            };
-            local.max_parallel_tasks = grant.max_parallel_tasks;
-            local.output_pipeline_tasks = useful_output_tasks(&facts, grant.max_parallel_tasks);
-            let Some(cost) = compose(local, &children, grant)? else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(_, previous)| {
-                ObjectiveProfile::Latency.compare(&cost, previous).is_lt()
-            }) {
-                best = Some((flavor, cost));
-            }
-        }
-        let Some((implementation, cost)) = best else {
+        let Some(selected) =
+            select_local(plan, statistics, &children, grant, calibration, session)?
+        else {
             return Ok(None);
         };
-        let result = children
-            .iter()
-            .map(|child| child.result)
-            .chain(std::iter::once(operator_result_guarantee(&plan.operator)))
-            .find(|result| matches!(result, requirements::ResultGuarantee::ApproximateAllowed(_)))
-            .unwrap_or(requirements::ResultGuarantee::Exact);
-        completed.insert(
-            plan.id,
-            Completed {
-                cost,
-                hard_rows: facts.output_rows_hard_upper,
-                result,
-            },
-        );
+        alternatives += selected.alternatives;
+        let implementation = selected.implementation;
+        let cost = selected.response.cost;
+        let result = selected.response.result;
+        completed.insert(plan.id, selected.response);
         if !publish {
             continue;
         }
@@ -291,6 +225,110 @@ fn select_impl(
         contracts: Arc::new(contracts),
         cost,
         alternatives,
+        response: completed.get(&root.id).expect("selected root").clone(),
+    }))
+}
+
+/// Price precisely one operator against already completed child responses.
+/// Region candidates may use fact-backed child boundaries; this function
+/// never selects or prices their descendants again.
+pub(crate) fn select_local(
+    plan: &OwnedLogicalPlan,
+    statistics: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    children: &[&Completed],
+    grant: ResourceGrantClass,
+    calibration: &MachineCalibrationBundle,
+    session: &paro_context::StatementContext,
+) -> Result<Option<LocalSelection>> {
+    use PhysicalImplementationFlavor as F;
+    let bindings = BindingCatalog::default();
+    let mut alternatives = 0;
+    let bounds = children
+        .iter()
+        .map(|c| c.hard_rows)
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let template = planner_cost_facts(plan, statistics, &bindings, Default::default())?;
+    let facts = selected_cost_facts(plan, &template, bounds)?;
+    let implementations = planner_implementation_set(plan, session.limits.rowset_scan_pushdown);
+    let model = LocalCostModel {
+        operator_type: plan.operator.op_type(),
+        local_cost: planner_operator_cost(
+            plan,
+            children.len(),
+            facts.output_rows_hard_upper,
+            &facts.child_rows_hard_upper,
+            Default::default(),
+        )?,
+        baseline: implementations.baseline,
+        resource_sensitive: planner_grant_dependency(&plan.operator)
+            == GrantDependencyDescriptor::Sensitive,
+        spillable: planner_operator_spillable(&plan.operator),
+        perfect_hash: facts.perfect_hash,
+        runtime_filter_key_types: &facts.runtime_filter_key_types,
+    };
+    let mut best: Option<(F, SearchCost)> = None;
+    for flavor in std::iter::once(implementations.baseline).chain(
+        [
+            F::PerfectHashAggregate,
+            F::SingletonAggregateProjection,
+            F::HashJoinRuntimeFilter,
+            F::HashJoinBuildLeft,
+            F::HashJoinBuildLeftRuntimeFilter,
+            F::SortRangeJoin,
+            F::ClassicIeJoin,
+            F::PartitionAggregateWindow,
+            F::CrossProductExternal,
+        ]
+        .into_iter()
+        .filter(|f| implementations.supports(*f)),
+    ) {
+        alternatives += 1;
+        let local = implementation_cost(
+            &model,
+            &facts,
+            flavor,
+            calibration,
+            grant.max_parallel_tasks,
+        )?;
+        let Some(mut local) = fit_local_cost(
+            local,
+            flavor_spillable(&model, flavor),
+            grant,
+            session.limits.force_external,
+        )?
+        else {
+            continue;
+        };
+        local.max_parallel_tasks = grant.max_parallel_tasks;
+        local.output_pipeline_tasks = useful_output_tasks(&facts, grant.max_parallel_tasks);
+        let Some(cost) = compose(local, children, grant)? else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(_, previous)| ObjectiveProfile::Latency.compare(&cost, previous).is_lt())
+        {
+            best = Some((flavor, cost));
+        }
+    }
+    let Some((implementation, cost)) = best else {
+        return Ok(None);
+    };
+    let result = children
+        .iter()
+        .map(|child| child.result)
+        .chain(std::iter::once(operator_result_guarantee(&plan.operator)))
+        .find(|result| matches!(result, requirements::ResultGuarantee::ApproximateAllowed(_)))
+        .unwrap_or(requirements::ResultGuarantee::Exact);
+    Ok(Some(LocalSelection {
+        implementation,
+        alternatives,
+        response: Completed {
+            cost,
+            hard_rows: facts.output_rows_hard_upper,
+            result,
+        },
     }))
 }
 

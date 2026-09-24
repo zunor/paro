@@ -36,6 +36,32 @@ pub(crate) fn root_eligible<Child>(aggregate: &Aggregate<Child>) -> bool {
         && aggregate.has_plain_grouping_domain()
 }
 
+/// A partial-state law, not merely an aggregate with the same name. Reuse
+/// this check for every planner that moves aggregation across an inner join.
+pub(crate) fn partial_merge(
+    expression: &Expression,
+) -> Option<paro_function::aggregate::AggregateFunction> {
+    let Expression::Aggregate(partial) = expression else {
+        return None;
+    };
+    if partial.aggr_type != AggregateType::NonDistinct
+        || !partial.order_bys.is_empty()
+        || partial
+            .children
+            .iter()
+            .any(|child| !expression_is_movable(child))
+        || partial
+            .filter
+            .as_deref()
+            .is_some_and(|filter| !expression_is_movable(filter))
+    {
+        return None;
+    }
+    let merge = partial.function.partial_merge_function()?;
+    (merge.arguments == [partial.return_type.clone()] && merge.return_type == partial.return_type)
+        .then_some(merge)
+}
+
 /// Produce one root-local aggregate alternative. The caller owns traversal;
 /// recursively rewriting descendants here would duplicate region decisions.
 pub fn optimize_plan(
@@ -232,33 +258,11 @@ fn recognize(plan: &OwnedLogicalPlan) -> Option<DimensionDeferral> {
     let mut merge_functions = Vec::with_capacity(aggregate.aggregates.len());
     for expression in &aggregate.aggregates {
         let expanded = inline_projections(expression, &projections)?;
-        let Expression::Aggregate(partial) = &expanded else {
-            return None;
-        };
-        if partial.aggr_type != AggregateType::NonDistinct || !partial.order_bys.is_empty() {
-            return None;
-        }
-        if partial
-            .children
-            .iter()
-            .any(|child| !expression_is_movable(child))
-            || partial
-                .filter
-                .as_deref()
-                .is_some_and(|filter| !expression_is_movable(filter))
-        {
-            return None;
-        }
+        let merge = partial_merge(&expanded)?;
         if !matches!(
             expression_domain(&expanded, &fact_bindings, &dimension_bindings),
             ExpressionDomain::Fact | ExpressionDomain::Constant
         ) {
-            return None;
-        }
-        let merge = partial.function.partial_merge_function()?;
-        if merge.arguments != [partial.return_type.clone()]
-            || merge.return_type != partial.return_type
-        {
             return None;
         }
         partial_aggregates.push(expanded);

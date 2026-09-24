@@ -8,10 +8,12 @@ permanent optimizer or an exhaustive-optimality claim.
 
 1. Canonicalize the bound query and perform required DISTINCT decomposition.
 2. Commit relational normalization and derive relation statistics.
-3. Compare safe root-local aggregate deferral alternatives after join ordering
-   inside each legal aggregate shape. Cost-only selection does not publish
-   winner contracts. Discard the losing tree and route necessary predicates
-   again after a committed rewrite.
+3. Optimize bounded aggregate/join regions jointly. States are keyed by the
+   relation subset and the subset at which partial states were formed (the
+   latter fixes their grouping grain). Raw and partial rows are not competing
+   implementations of the same relation. Join, partial and final transitions
+   share local statistics propagation/gathering and `direct::select_local`.
+   Reconstruct only the selected DAG, then route necessary predicates again.
 4. Enumerate maximal legal join regions using the existing bounded join
    enumerator, including regions exposed by committed rewrites. Boundaries
    remain semantic boundaries, including outer
@@ -29,10 +31,11 @@ implementation eligibility and pure cost calculations. Cascades and the direct
 path consume these contracts. `physical/join_work.rs` also owns hash work units
 and their frozen calibration for regional DP: both build orientations include
 retained payload width, and expected rows rank work independently of risk and
-hard resource bounds. This does not yet unify the whole-plan objective: DP
-adds local work while physical composition also models phases and runtime
-filter responses. Region estimates and settled physical facts still have
-different derivation paths. Some shared
+hard resource bounds. Joint aggregate regions use the full direct physical
+response, including memory feasibility, task supply and RF source lineage;
+ordinary join-only regions still use the older additive work enumerator.
+That remaining domain must not be described as unified physical-response DP.
+Some shared
 identity/calibration types still live under the historical cascades namespace;
 moving their module location is not required to avoid the Memo runtime.
 
@@ -54,9 +57,11 @@ exhaustion. Memo counters are zero; selected nodes, local alternatives and
 aggregate decisions have separate pipeline counters.
 
 Stage-end statistics are deliberately recomputed at rewrite boundaries in this
-slice. Aggregate alternatives may still duplicate a subtree and compare full
-local subtree costs. These are visible remaining costs, not a claim of one
-linear traversal or a final 2ms implementation.
+slice. Joint states share immutable child choices, output statistics and
+fact-backed boundaries. Atomic inputs are priced once per region; transitions
+never recurse through them. Selected output statistics are published together
+with the selected tree. The final stage still derives executable contracts;
+this is not a claim of one linear traversal or a final 2ms implementation.
 
 Multi-relation residuals retain their complete relation support. They become
 applicable only on a cut containing all referenced relations; their estimated
@@ -67,13 +72,21 @@ by the shared estimator instead of multiplied as independent events. Neither
 mechanism turns statistical estimates into semantic proofs or removes runtime
 predicates.
 
-The aggregate search currently has two legal tree shapes, original and proven
-partial/final deferral. It is **not** joint `(relation subset, aggregate state)`
-DP and does not enumerate every legal placement. A future joint enumerator
-must carry grain, state schema and final-merge requirements as typed boundary
-properties, preserve DISTINCT/NULL/outer-join semantics, and compare against an
-independent small-region exhaustive oracle. It must not grow another global
-Memo or treat the presence of preaggregation as proof of execution quality.
+The joint domain is explicit: at most eight atomic inputs connected by movable
+inner equi-column predicates, one grouped aggregate with a registered partial
+merge law, and at most one partial transition per plan. Every boundary key and
+original grouping input needed above a partial transition is retained. Final
+merge is mandatory, including when different dimension keys share a label or
+a dimension duplicates rows. DISTINCT, ordered/non-mergeable aggregates,
+non-equi cuts, outer joins and opaque projections are not given invented laws.
+Unsupported regions retain their original aggregation and ordinary join DP.
+
+One current-grant response per subset/grain is a bounded planning heuristic,
+not a dominance proof under every parent or an exhaustive SQL search. The
+existing connected-pair budget also bounds joint transitions; exhaustion
+retains the original region and reports a fallback rather than infeasibility.
+Counters separate regions, transitions, partial states, selected partials and
+budget fallbacks. SQL result and execution-quality gates remain independent.
 
 ## Plan-quality preservation
 

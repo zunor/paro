@@ -39,8 +39,10 @@ async fn direct_pipeline_executes_relational_boundaries_without_memo() {
         "SET threads=2",
         "CREATE TABLE pipe_dim(k INT PRIMARY KEY, label VARCHAR)",
         "CREATE TABLE pipe_fact(k INT, v INT)",
+        "CREATE TABLE pipe_labels(label VARCHAR, bucket INT)",
         "INSERT INTO pipe_dim VALUES (1,'shared'),(2,'shared'),(3,'other'),(4,'empty')",
         "INSERT INTO pipe_fact VALUES (1,10),(1,20),(2,3),(3,NULL),(NULL,4)",
+        "INSERT INTO pipe_labels VALUES ('shared',1),('shared',1),('other',2),(NULL,3)",
     ] {
         exec_ok(&mut session, &mut sink, sql).await;
     }
@@ -58,6 +60,10 @@ async fn direct_pipeline_executes_relational_boundaries_without_memo() {
         "SELECT a.k,b.k,c.k FROM pipe_dim a, pipe_dim b, pipe_dim c WHERE a.k=b.k AND b.k=c.k AND CASE WHEN a.k>0 THEN (a.k+b.k)::DOUBLE/c.k ELSE 0 END > 1.5 ORDER BY a.k,b.k,c.k",
         "SELECT d.label, AVG(f.v), MIN(f.v), MAX(f.v), COUNT(f.v) FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k GROUP BY d.label ORDER BY d.label",
         "SELECT d.label,COUNT(DISTINCT f.v) FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k GROUP BY d.label ORDER BY d.label",
+        "SELECT l.bucket,SUM(f.v)::BIGINT,COUNT(f.v),COUNT(*),MIN(f.v),MAX(f.v) FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k JOIN pipe_labels l ON d.label=l.label GROUP BY l.bucket ORDER BY l.bucket",
+        "SELECT l.bucket,SUM(f.v) FILTER (WHERE f.v>5)::BIGINT,COUNT(f.v) FILTER (WHERE f.v>5) FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k JOIN pipe_labels l ON d.label=l.label GROUP BY l.bucket ORDER BY l.bucket",
+        "SELECT l.bucket,AVG(f.v),COUNT(DISTINCT f.v) FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k JOIN pipe_labels l ON d.label=l.label GROUP BY l.bucket ORDER BY l.bucket",
+        "SELECT l.bucket,SUM(f.v)::BIGINT FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k JOIN pipe_labels l ON d.label=l.label WHERE f.v<0 GROUP BY l.bucket ORDER BY l.bucket",
         "SELECT COUNT(DISTINCT k) AS n, SUM(DISTINCT v)::BIGINT AS s FROM pipe_fact",
         "WITH p AS MATERIALIZED (SELECT k,v FROM pipe_fact UNION ALL SELECT k,v FROM pipe_fact) SELECT a.k,SUM(a.v+b.v)::BIGINT AS s FROM p a JOIN p b ON a.k=b.k WHERE a.v>5 AND b.v<30 GROUP BY a.k ORDER BY a.k",
     ] {
@@ -76,6 +82,12 @@ async fn direct_pipeline_executes_relational_boundaries_without_memo() {
     // merge into one SQL group, not escape as separate partial groups.
     exec_ok(&mut session, &mut sink, "SELECT SUM(f.v)::BIGINT FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k WHERE d.label='shared' GROUP BY d.label").await;
     assert_eq!(query_i64_col(&sink, 0), vec![33]);
+    exec_ok(&mut session, &mut sink, "SELECT SUM(f.v)::BIGINT FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k JOIN pipe_labels l ON d.label=l.label WHERE l.bucket=1 GROUP BY l.bucket").await;
+    assert_eq!(
+        query_i64_col(&sink, 0),
+        vec![66],
+        "duplicate dimensions must multiply partial states before the final merge"
+    );
 }
 
 #[tokio::test]
