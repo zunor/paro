@@ -20,6 +20,7 @@ impl Optimizer {
         explain: Option<ExplainEnvelope>,
     ) -> Result<OptimizedStatement> {
         let started = Instant::now();
+        let normalization_scope = crate::work_partition::enter(crate::work_partition::Bucket::Pre);
         self.ctx.session.cancellation.check()?;
         if !self.budget.disabled_transformation_rules.is_empty() {
             return Err(paro_error::invalid_input(
@@ -52,10 +53,15 @@ impl Optimizer {
         self.ctx
             .profiler
             .record(OptimizerComponent::SemanticNormalization, started.elapsed());
+        let normalization_us = started.elapsed().as_micros() as u64;
+        drop(normalization_scope);
 
         let region_started = Instant::now();
-        // Compare only root-local aggregate alternatives. Descendants already
-        // have one committed shape; the losing alternative dies at this call.
+        let region_scope = crate::work_partition::enter(crate::work_partition::Bucket::Subproblem);
+        // Each aggregate region has a bounded grain domain: original SQL
+        // grain, or a proven partial-state/merge decomposition. Join DP runs
+        // inside each legal state before comparing it; neither state's cost
+        // may be based on the incoming, unoptimized join order.
         let mut region_choices = 0_u64;
         plan = plan.try_map_post_order(|input| {
             self.ctx.session.cancellation.check()?;
@@ -71,16 +77,20 @@ impl Optimizer {
             if !changed {
                 return Ok(input);
             }
+            let input = self.optimize_pipeline_join_regions(input)?;
+            let alternative = self.optimize_pipeline_join_regions(alternative)?;
+            let mut baseline_candidate = self.settle_query_candidate(input)?;
+            baseline_candidate.plan = self.pipeline_occurrences(baseline_candidate.plan)?;
             let mut alternative = self.settle_query_candidate(alternative)?;
             alternative.plan = self.pipeline_occurrences(alternative.plan)?;
-            let baseline = direct::select(
-                &input,
-                &self.ctx.column_stats,
+            let baseline = direct::estimate(
+                &baseline_candidate.plan,
+                &baseline_candidate.column_stats,
                 grant,
                 &self.calibration,
                 &self.ctx.session,
             )?;
-            let proposed = direct::select(
+            let proposed = direct::estimate(
                 &alternative.plan,
                 &alternative.column_stats,
                 grant,
@@ -91,13 +101,13 @@ impl Optimizer {
             if proposed.as_ref().is_some_and(|proposed| {
                 baseline.as_ref().is_none_or(|baseline| {
                     crate::physical::ObjectiveProfile::Latency
-                        .compare(&proposed.cost, &baseline.cost)
+                        .compare(proposed, baseline)
                         .is_lt()
                 })
             }) {
                 Ok(alternative.plan)
             } else {
-                Ok(input)
+                Ok(baseline_candidate.plan)
             }
         })?;
         // Every committed rewrite reopens predicate routing before join DP.
@@ -107,6 +117,7 @@ impl Optimizer {
         self.ctx.column_stats = candidate.column_stats;
         plan = JoinOrderOptimizer::new(self.ctx.cost_model.defaults.clone())
             .with_search_budget(&self.budget)
+            .with_physical_pricing(&self.calibration)?
             .optimize_regions(
                 self.ctx.session.as_ref(),
                 candidate.plan,
@@ -122,8 +133,11 @@ impl Optimizer {
             OptimizerComponent::RegionOptimization,
             region_started.elapsed(),
         );
+        let regions_us = region_started.elapsed().as_micros() as u64;
+        drop(region_scope);
 
         let physical_started = Instant::now();
+        let physical_scope = crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
         let selection = direct::select(
             &candidate.plan,
             &self.ctx.column_stats,
@@ -138,7 +152,11 @@ impl Optimizer {
             OptimizerComponent::PhysicalSelection,
             physical_started.elapsed(),
         );
+        let selection_us = physical_started.elapsed().as_micros() as u64;
+        drop(physical_scope);
         let physical_started = Instant::now();
+        let extraction_scope =
+            crate::work_partition::enter(crate::work_partition::Bucket::PhysicalLowering);
         let mut plan = candidate.plan;
         let analyze_spec = explain
             .as_ref()
@@ -190,6 +208,8 @@ impl Optimizer {
             OptimizerComponent::PhysicalExtraction,
             physical_started.elapsed(),
         );
+        let extraction_us = physical_started.elapsed().as_micros() as u64;
+        drop(extraction_scope);
         self.compile_work = paro_context::CompileWork {
             optimizer_elapsed_us: started.elapsed().as_micros() as u64,
             child_combination_cost_synthesis_count: selection.alternatives,
@@ -225,6 +245,10 @@ impl Optimizer {
                 record.safety_verified = Observed(true);
             });
             capture.search_counters(std::collections::BTreeMap::from([
+                ("pipeline_normalization_us", normalization_us),
+                ("pipeline_regions_us", regions_us),
+                ("pipeline_selection_us", selection_us),
+                ("pipeline_extraction_us", extraction_us),
                 ("pipeline_selected_nodes", selection.nodes),
                 ("pipeline_local_alternatives", selection.alternatives),
                 ("pipeline_aggregate_decisions", region_choices),
@@ -259,5 +283,22 @@ impl Optimizer {
             node.id = self.ctx.bind_context.next_plan_id();
             Ok(node)
         })
+    }
+
+    fn optimize_pipeline_join_regions(
+        &mut self,
+        plan: OwnedLogicalPlan,
+    ) -> Result<OwnedLogicalPlan> {
+        let plan = crate::construction::predicates(plan, &mut Default::default());
+        let candidate = self.settle_query_candidate(plan)?;
+        JoinOrderOptimizer::new(self.ctx.cost_model.defaults.clone())
+            .with_search_budget(&self.budget)
+            .with_physical_pricing(&self.calibration)?
+            .optimize_regions(
+                self.ctx.session.as_ref(),
+                candidate.plan,
+                &candidate.column_stats,
+                &self.ctx.bind_context,
+            )
     }
 }

@@ -161,7 +161,9 @@ impl DPJoinNode {
 ///
 #[derive(Debug)]
 pub(crate) struct CostModel {
-    selectivity_defaults: SelectivityDefaults,
+    pub(crate) regional_pricing: Option<crate::physical::join_work::JoinWorkPricing>,
+    pub(crate) residual_selectivities: Vec<(Arc<JoinRelationSet>, f64)>,
+    pub(crate) selectivity_defaults: SelectivityDefaults,
     /// Cardinality estimator used to calculate cost.
     pub cardinality_estimator: CardinalityEstimator,
     risk_cardinality_estimator: CardinalityEstimator,
@@ -206,6 +208,7 @@ struct JoinCostInputs<'a> {
 struct JoinConditionProfile {
     left_payload_width: usize,
     right_payload_width: usize,
+    hash_key_width: usize,
     has_join_conditions: bool,
     has_hash_key: bool,
 }
@@ -292,6 +295,8 @@ impl CostModel {
     /// Create a join cost model from the statement's shared priors.
     pub fn new(selectivity_defaults: SelectivityDefaults) -> Self {
         Self {
+            regional_pricing: None,
+            residual_selectivities: Vec::new(),
             cardinality_estimator: CardinalityEstimator::new(selectivity_defaults.clone()),
             risk_cardinality_estimator: CardinalityEstimator::new(selectivity_defaults.clone()),
             materialization_cardinality_estimator: CardinalityEstimator::new(
@@ -307,6 +312,7 @@ impl CostModel {
 
     /// Clear query-local estimates.
     pub fn reset(&mut self) {
+        self.residual_selectivities.clear();
         self.cardinality_estimator = CardinalityEstimator::new(self.selectivity_defaults.clone());
         self.risk_cardinality_estimator =
             CardinalityEstimator::new(self.selectivity_defaults.clone());
@@ -442,9 +448,7 @@ impl CostModel {
             Some(JoinEdgeOrientation::Inverted) => Some(right.risk_cardinality),
             None => None,
         };
-        let estimated_join_rows = self
-            .cardinality_estimator
-            .estimate_cardinality(&combination);
+        let estimated_join_rows = self.get_cardinality(&combination);
         let join_rows = preserved_expected_rows.map_or(estimated_join_rows, |preserved| {
             estimated_join_rows.min(preserved)
         });
@@ -477,11 +481,19 @@ impl CostModel {
             None => self.materialization_cardinality(&combination),
         }
         .max(risk_join_rows);
+        let priced_join_rows = if self.regional_pricing.is_some() {
+            // Charge output before newly activated residuals, without
+            // multiplying predicates inherited from child relations twice.
+            self.cardinality_before_activation(&combination, &left.set, &right.set)
+                .min(preserved_expected_rows.unwrap_or(f64::INFINITY))
+        } else {
+            risk_join_rows
+        };
         let (breakdown, build_side) = self.cost_breakdown_for_cardinality(JoinCostInputs {
             left,
             right,
             predicates,
-            join_rows: risk_join_rows,
+            join_rows: priced_join_rows,
             output_payload_width,
             left_materialization_rows,
             right_materialization_rows,
@@ -550,6 +562,69 @@ impl CostModel {
         let right_rows = right.risk_cardinality;
         let conditions = Self::condition_profile(predicates);
         let filtering_side = Self::reduction_filtering_side(predicates);
+        if let Some(pricing) = self.regional_pricing {
+            use crate::physical::join_work::HashJoinWork;
+            let hash_cost = |build: &DPJoinNode, probe: &DPJoinNode| {
+                pricing.price(HashJoinWork {
+                    build_rows: build.cardinality,
+                    probe_rows: probe.cardinality,
+                    output_rows: join_rows,
+                    build_width: build.output_payload_width as f64,
+                    probe_width: probe.output_payload_width as f64,
+                    output_width: output_payload_width as f64,
+                    key_width: conditions.hash_key_width as f64,
+                })
+            };
+            let left_cost = if conditions.has_hash_key {
+                hash_cost(left, right)
+            } else {
+                left.cardinality * left.output_payload_width as f64
+            };
+            let right_cost = if conditions.has_hash_key {
+                hash_cost(right, left)
+            } else {
+                right.cardinality * right.output_payload_width as f64
+            };
+            let build_side = choose_join_build_side(
+                filtering_side,
+                JoinBuildCandidate {
+                    serialized_work: left_cost,
+                    contains_control_region: self.contains_control_region(&left.set),
+                },
+                JoinBuildCandidate {
+                    serialized_work: right_cost,
+                    contains_control_region: self.contains_control_region(&right.set),
+                },
+            );
+            let work = if conditions.has_hash_key {
+                match build_side {
+                    JoinBuildSide::Left => left_cost,
+                    JoinBuildSide::Right => right_cost,
+                }
+            } else {
+                pricing.non_hash(
+                    HashJoinWork {
+                        build_rows: right.cardinality,
+                        probe_rows: left.cardinality,
+                        output_rows: join_rows,
+                        build_width: right.output_payload_width as f64,
+                        probe_width: left.output_payload_width as f64,
+                        output_width: output_payload_width as f64,
+                        key_width: 0.0,
+                    },
+                    conditions.has_join_conditions,
+                )
+            };
+            return (
+                JoinCostBreakdown {
+                    build: work,
+                    probe: 0.0,
+                    match_output: 0.0,
+                    children: left.cost + right.cost,
+                },
+                build_side,
+            );
+        }
         if !conditions.has_hash_key {
             let left_row_width = estimate_row_width_from_payload(left.output_payload_width) as f64;
             let right_row_width =
@@ -692,6 +767,7 @@ impl CostModel {
         let mut left_width = 0usize;
         let mut right_width = 0usize;
         let mut has_hash_key = false;
+        let mut hash_key_width = 0usize;
         for predicate in predicates.predicates() {
             let Some(orientation) = predicate.orientation() else {
                 continue;
@@ -699,11 +775,18 @@ impl CostModel {
             let filter = predicate.filter();
             let mut add_comparison =
                 |comparison: &paro_planner::expression::ComparisonExpression| {
-                    has_hash_key |= matches!(
+                    let is_hash_key = matches!(
                         comparison.comparison_type,
                         paro_planner::expression::ComparisonType::Equal
                             | paro_planner::expression::ComparisonType::NotDistinctFrom
                     );
+                    has_hash_key |= is_hash_key;
+                    if is_hash_key {
+                        hash_key_width = hash_key_width.saturating_add(
+                            paro_storage::rowset::scan_cost::ScanAccessCostModel::default()
+                                .estimated_width(&comparison.right.return_type()),
+                        );
+                    }
                     let expression_width = |expression: &Expression| {
                         estimate_row_payload_width(&[expression.return_type()])
                     };
@@ -733,6 +816,7 @@ impl CostModel {
         JoinConditionProfile {
             left_payload_width: left_width,
             right_payload_width: right_width,
+            hash_key_width,
             has_join_conditions: predicates.has_join_conditions(),
             has_hash_key,
         }
@@ -776,7 +860,31 @@ impl CostModel {
 
     /// Get the estimated cardinality for a relation set.
     pub fn get_cardinality(&mut self, set: &JoinRelationSet) -> f64 {
-        self.cardinality_estimator.estimate_cardinality(set)
+        // Estimate from the complete set, never by repeatedly multiplying a
+        // child's already-filtered count. Each eligible predicate contributes
+        // once regardless of the chosen tree or the graph's duplicate edges.
+        let fraction: f64 = self
+            .residual_selectivities
+            .iter()
+            .filter(|(required, _)| set.contains_all(required))
+            .map(|(_, fraction)| fraction)
+            .product();
+        self.cardinality_estimator.estimate_cardinality(set) * fraction
+    }
+
+    pub(crate) fn cardinality_before_activation(
+        &mut self,
+        set: &JoinRelationSet,
+        left: &JoinRelationSet,
+        right: &JoinRelationSet,
+    ) -> f64 {
+        let inherited: f64 = self
+            .residual_selectivities
+            .iter()
+            .filter(|(required, _)| left.contains_all(required) || right.contains_all(required))
+            .map(|(_, fraction)| fraction)
+            .product();
+        self.cardinality_estimator.estimate_cardinality(set) * inherited
     }
 
     pub fn get_risk_cardinality(&mut self, set: &JoinRelationSet) -> f64 {
@@ -1076,6 +1184,69 @@ mod tests {
         let breakdown =
             model.compute_cost_breakdown(&left, &right, &mut sets, node.predicates.as_ref());
         assert_eq!(breakdown.build, expected_right_build);
+    }
+
+    #[test]
+    fn committed_region_uses_expected_work_without_erasing_resource_risk() {
+        let mut sets = JoinRelationSetManager::new();
+        let filter = create_equality_filter(&mut sets, 0, 0, 1, 0, 0);
+        let mut left_stats = RelationStats::with_cardinality(10);
+        left_stats.materialization_cardinality = 1_000_000;
+        left_stats.estimated_payload_width = 8;
+        let mut right_stats = RelationStats::with_cardinality(100_000);
+        right_stats.estimated_payload_width = 128;
+        let mut model = CostModel::new(SelectivityDefaults::default());
+        model.regional_pricing = Some(
+            crate::physical::join_work::JoinWorkPricing::new(
+                &crate::cascades::calibration::MachineCalibrationBundle::builtin_production(),
+            )
+            .unwrap(),
+        );
+        model.init_equivalent_relations(std::slice::from_ref(&filter));
+        model.init_cost_model(&mut sets, &[left_stats, right_stats]);
+        let left = leaf(&mut model, sets.get_relation(0));
+        let right = leaf(&mut model, sets.get_relation(1));
+        let node = model.compute_cost_and_create_node(
+            &left,
+            &right,
+            &mut sets,
+            Some(predicate_set(std::slice::from_ref(&filter))),
+        );
+        assert_eq!(node.build_side, JoinBuildSide::Left);
+        assert!(node.materialization_cardinality >= 1_000_000.0);
+    }
+
+    #[test]
+    fn residual_activation_requires_full_support_and_is_not_multiplied_on_revisit() {
+        let mut sets = JoinRelationSetManager::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
+        model.init_cost_model(
+            &mut sets,
+            &[
+                RelationStats::with_cardinality(10),
+                RelationStats::with_cardinality(10),
+                RelationStats::with_cardinality(10),
+            ],
+        );
+        let pair = sets.get_relation_from_vec(vec![0, 1]);
+        let all = sets.get_relation_from_vec(vec![0, 1, 2]);
+        let pair_before = model.get_cardinality(&pair);
+        let all_before = model.get_cardinality(&all);
+        model.residual_selectivities.push((all.clone(), 0.25));
+        assert_eq!(model.get_cardinality(&pair), pair_before);
+        assert_eq!(model.get_cardinality(&all), all_before * 0.25);
+        assert_eq!(model.get_cardinality(&all), all_before * 0.25);
+        let last = sets.get_relation(2);
+        assert_eq!(
+            model.cardinality_before_activation(&all, &pair, &last),
+            all_before
+        );
+        model.residual_selectivities.push((pair.clone(), 0.5));
+        assert_eq!(
+            model.cardinality_before_activation(&all, &pair, &last),
+            all_before * 0.5
+        );
+        assert_eq!(model.get_cardinality(&all), all_before * 0.125);
     }
 
     #[test]

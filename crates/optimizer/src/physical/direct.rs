@@ -88,6 +88,34 @@ pub(crate) fn select(
     calibration: &MachineCalibrationBundle,
     session: &paro_context::StatementContext,
 ) -> Result<Option<DirectSelection>> {
+    select_impl(root, statistics, grant, calibration, session, true)
+}
+
+/// Cost a short-lived region without publishing physical contracts, RF
+/// ownership, fingerprints or executable alternatives. Only the committed
+/// tree is materialized by `select`.
+pub(crate) fn estimate(
+    root: &OwnedLogicalPlan,
+    statistics: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    grant: ResourceGrantClass,
+    calibration: &MachineCalibrationBundle,
+    session: &paro_context::StatementContext,
+) -> Result<Option<SearchCost>> {
+    let _scope = crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
+    Ok(
+        select_impl(root, statistics, grant, calibration, session, false)?
+            .map(|result| result.cost),
+    )
+}
+
+fn select_impl(
+    root: &OwnedLogicalPlan,
+    statistics: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    grant: ResourceGrantClass,
+    calibration: &MachineCalibrationBundle,
+    session: &paro_context::StatementContext,
+    publish: bool,
+) -> Result<Option<DirectSelection>> {
     use PhysicalImplementationFlavor as F;
     let mut pending = vec![(root, false)];
     let mut completed = HashMap::<PlanNodeId, Completed>::new();
@@ -186,6 +214,23 @@ pub(crate) fn select(
         let Some((implementation, cost)) = best else {
             return Ok(None);
         };
+        let result = children
+            .iter()
+            .map(|child| child.result)
+            .chain(std::iter::once(operator_result_guarantee(&plan.operator)))
+            .find(|result| matches!(result, requirements::ResultGuarantee::ApproximateAllowed(_)))
+            .unwrap_or(requirements::ResultGuarantee::Exact);
+        completed.insert(
+            plan.id,
+            Completed {
+                cost,
+                hard_rows: facts.output_rows_hard_upper,
+                result,
+            },
+        );
+        if !publish {
+            continue;
+        }
         // This identity is local to the selected tree, not a cross-run plan
         // digest. The physical canonical encoder owns the latter boundary.
         let mut identity = StableFingerprintBuilder::default();
@@ -196,12 +241,6 @@ pub(crate) fn select(
             implementation,
             F::HashJoinRuntimeFilter | F::HashJoinBuildLeftRuntimeFilter
         );
-        let result = children
-            .iter()
-            .map(|child| child.result)
-            .chain(std::iter::once(operator_result_guarantee(&plan.operator)))
-            .find(|result| matches!(result, requirements::ResultGuarantee::ApproximateAllowed(_)))
-            .unwrap_or(requirements::ResultGuarantee::Exact);
         let provided = ProvidedProperties {
             ordering: requirements::ProvidedOrdering::Unordered,
             partitioning: requirements::ProvidedPartitioning::Singleton,
@@ -242,21 +281,13 @@ pub(crate) fn select(
                 "pipeline relation tree contains duplicate node ids",
             ));
         }
-        completed.insert(
-            plan.id,
-            Completed {
-                cost,
-                hard_rows: facts.output_rows_hard_upper,
-                result,
-            },
-        );
     }
     let cost = completed
         .get(&root.id)
         .ok_or_else(|| paro_error::internal("pipeline root is absent"))?
         .cost;
     Ok(Some(DirectSelection {
-        nodes: contracts.len() as u64,
+        nodes: completed.len() as u64,
         contracts: Arc::new(contracts),
         cost,
         alternatives,

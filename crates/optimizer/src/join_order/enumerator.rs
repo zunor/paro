@@ -951,6 +951,88 @@ mod tests {
     }
 
     #[test]
+    fn calibrated_region_matches_independent_exhaustive_bipartitions() {
+        // Enumerate every labelled binary tree independently of DPccp's
+        // neighbor traversal and frontier admission. The cost kernel is the
+        // common contract, not a second implementation of physical costing.
+        fn exhaustive(
+            mask: u8,
+            leaves: &[DPJoinNode],
+            filters: &[Arc<FilterInfo>],
+            sets: &mut JoinRelationSetManager,
+            costs: &mut CostModel,
+        ) -> Vec<DPJoinNode> {
+            if mask.count_ones() == 1 {
+                return vec![leaves[mask.trailing_zeros() as usize].clone()];
+            }
+            let mut result = Vec::new();
+            let mut left_mask = (mask - 1) & mask;
+            while left_mask != 0 {
+                let right_mask = mask ^ left_mask;
+                if left_mask < right_mask {
+                    let left = exhaustive(left_mask, leaves, filters, sets, costs);
+                    let right = exhaustive(right_mask, leaves, filters, sets, costs);
+                    for a in &left {
+                        for b in &right {
+                            if let CutPredicateResolution::Resolved(Some(predicates)) =
+                                JoinPredicateSet::from_filters(filters, &a.set, &b.set)
+                            {
+                                result.push(costs.compute_cost_and_create_node(
+                                    a,
+                                    b,
+                                    sets,
+                                    Some(predicates),
+                                ));
+                            }
+                        }
+                    }
+                }
+                left_mask = (left_mask - 1) & mask;
+            }
+            result
+        }
+        for rows in [[10, 200, 3, 800], [1000, 2, 400, 30]] {
+            let mut sets = JoinRelationSetManager::new();
+            let mut costs = CostModel::new(Default::default());
+            costs.regional_pricing = Some(
+                crate::physical::join_work::JoinWorkPricing::new(
+                    &crate::cascades::calibration::MachineCalibrationBundle::builtin_production(),
+                )
+                .unwrap(),
+            );
+            let mut graph = QueryGraphEdges::new();
+            let mut filters = Vec::new();
+            for a in 0..4 {
+                for b in a + 1..4 {
+                    let filter = create_equality_filter(&mut sets, a, 0, b, 0, filters.len());
+                    let left = sets.get_relation(a);
+                    let right = sets.get_relation(b);
+                    graph.create_edge(&left, right.clone(), Some(filter.clone()));
+                    graph.create_edge(&right, left, Some(filter.clone()));
+                    filters.push(filter);
+                }
+            }
+            costs.init_equivalent_relations(&filters);
+            costs.init_cost_model(&mut sets, &rows.map(RelationStats::with_cardinality));
+            let mut dp =
+                PlanEnumerator::with_budget(&graph, &mut sets, &mut costs, 4, 12, 10_000, 1024);
+            dp.init_leaf_plans();
+            let leaves = (0..4)
+                .map(|i| dp.plans[&dp.set_manager.get_relation(i)][0].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(dp.solve_join_order(), EnumerationOutcome::Complete);
+            let selected = dp.get_final_plan().unwrap().cost;
+            drop(dp);
+            let oracle = exhaustive(15, &leaves, &filters, &mut sets, &mut costs)
+                .into_iter()
+                .map(|node| node.cost)
+                .min_by(f64::total_cmp)
+                .unwrap();
+            assert!((selected - oracle).abs() <= oracle.abs() * 1e-12);
+        }
+    }
+
+    #[test]
     fn test_plan_enumerator_two_relations() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model = CostModel::new(crate::cost_model::SelectivityDefaults::default());

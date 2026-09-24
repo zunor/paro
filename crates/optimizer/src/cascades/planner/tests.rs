@@ -1444,7 +1444,7 @@ fn memo_hash_join_can_select_logical_left_as_physical_build() {
 }
 
 #[test]
-fn memo_hash_join_does_not_materialize_a_selectivity_reduced_fact_subtree() {
+fn memo_hash_join_ranks_expected_work_without_discarding_materialization_risk() {
     let bind_context = BindContext::new();
     let mut reduced_fact = OwnedLogicalPlan::new(
         &bind_context,
@@ -1492,10 +1492,14 @@ fn memo_hash_join_does_not_materialize_a_selectivity_reduced_fact_subtree() {
         .contracts
         .get(&optimized.plan.id)
         .expect("root winner contract");
+    // The left relation really contains eight rows. A million-row risk
+    // envelope is not an instruction to build the 4096-row right relation.
+    // Keep uncertainty in the cost/resource contract, not the mean estimate.
     assert_eq!(
         contract.implementation,
-        PhysicalImplementationFlavor::HashJoin
+        PhysicalImplementationFlavor::HashJoinBuildLeft
     );
+    assert!(contract.cost.work_latency.upper > contract.cost.work_latency.expected);
 }
 
 #[test]

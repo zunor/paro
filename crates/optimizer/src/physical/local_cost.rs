@@ -306,8 +306,8 @@ pub(crate) fn flavor_spillable(
     }
 }
 
-const OP_HASH_BUILD_ROW: OpClassId = OpClassId(1);
-const OP_HASH_PROBE_ROW: OpClassId = OpClassId(2);
+const OP_HASH_BUILD_ROW: OpClassId = super::join_work::HASH_BUILD;
+const OP_HASH_PROBE_ROW: OpClassId = super::join_work::HASH_PROBE;
 const OP_NESTED_LOOP_PAIR: OpClassId = OpClassId(3);
 const OP_SORT_COMPARE: OpClassId = OpClassId(4);
 pub(crate) const OP_RANGE_JOIN_ROW: OpClassId = OpClassId(5);
@@ -527,7 +527,6 @@ pub(crate) fn implementation_cost(
                 .get(build_index)
                 .copied()
                 .flatten();
-            work.add(OP_HASH_BUILD_ROW, build_work)?;
             let probe = if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
                 let build_domain = runtime_filter_build_domain(
                     facts.runtime_filter_build_distinct_expected,
@@ -585,21 +584,38 @@ pub(crate) fn implementation_cost(
             // composition prices the full lookup stream separately; local
             // tuple movement and probing must use only the surviving logical
             // child rows or wide probes are charged twice.
-            let effective_children = if build_left {
-                [left, probe]
-            } else {
-                [probe, right]
+            if facts.child_row_widths.len() != 2 {
+                return Err(paro_error::internal(
+                    "hash-join work requires two typed input widths",
+                ));
+            }
+            let point = |build_rows, probe_rows, output_rows| super::join_work::HashJoinWork {
+                build_rows,
+                probe_rows,
+                output_rows,
+                build_width: facts.child_row_widths[build_index] as f64,
+                probe_width: facts.child_row_widths[1 - build_index] as f64,
+                output_width: facts.output_row_width as f64,
+                key_width: facts.hash_key_width.unwrap_or(8) as f64,
             };
-            add_tuple_byte_work_for_children(&mut work, facts, &effective_children)?;
-            add_hash_key_byte_work(
+            super::join_work::add_hash_join_work(
                 &mut work,
-                build_work.checked_add(probe)?,
-                facts.hash_key_width,
+                [
+                    point(build_work.lower, probe.lower, facts.output_rows.lower),
+                    point(
+                        build_work.expected,
+                        probe.expected,
+                        facts.output_rows.expected,
+                    ),
+                    point(build_work.upper, probe.upper, facts.output_rows.upper),
+                ],
             )?;
-            work.add(OP_HASH_PROBE_ROW, probe.checked_add(facts.output_rows)?)?;
-            peak_memory_upper = build_hard_upper
-                .unwrap_or(u64::MAX)
-                .saturating_mul(facts.output_row_width.saturating_div(2).max(32));
+            peak_memory_upper = build_hard_upper.unwrap_or(u64::MAX).saturating_mul(
+                super::join_work::hash_build_width(
+                    facts.child_row_widths[build_index] as f64,
+                    facts.hash_key_width.unwrap_or(8) as f64,
+                ) as u64,
+            );
         }
         PhysicalImplementationFlavor::NestedLoopJoin => {
             let left = facts
@@ -875,6 +891,18 @@ pub(crate) fn hash_join_build_work_ppm(
             .copied()
             .unwrap_or(facts.output_row_width),
     )?;
+    add_stream_byte_work(
+        &mut build_work,
+        build,
+        super::join_work::hash_build_width(
+            facts
+                .child_row_widths
+                .get(build_index)
+                .copied()
+                .unwrap_or(facts.output_row_width) as f64,
+            facts.hash_key_width.unwrap_or(8) as f64,
+        ) as u64,
+    )?;
 
     let mut probe_work = LocalOperatorWork::default();
     add_hash_key_byte_work(&mut probe_work, probe, facts.hash_key_width)?;
@@ -1105,7 +1133,10 @@ fn expected_retained_memory_target(
             ));
             estimated_bytes(
                 child(build_index),
-                facts.output_row_width.saturating_div(2).max(32),
+                super::join_work::hash_build_width(
+                    child_width(build_index) as f64,
+                    facts.hash_key_width.unwrap_or(8) as f64,
+                ) as u64,
             )
         }
         PhysicalImplementationFlavor::NestedLoopJoin

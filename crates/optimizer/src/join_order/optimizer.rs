@@ -179,6 +179,19 @@ impl JoinOrderOptimizer {
         self
     }
 
+    /// A committed region selects its physical hash orientation with the
+    /// statement's calibration. Later lowering consumes that decision rather
+    /// than silently reranking it under a different cardinality envelope.
+    pub(crate) fn with_physical_pricing(
+        mut self,
+        calibration: &crate::cascades::calibration::MachineCalibrationBundle,
+    ) -> Result<Self> {
+        self.cost_model.regional_pricing = Some(crate::physical::join_work::JoinWorkPricing::new(
+            calibration,
+        )?);
+        Ok(self)
+    }
+
     /// Optimize the join order of a logical plan.
     ///
     /// This is the main entry point for join order optimization.
@@ -413,7 +426,37 @@ impl JoinOrderOptimizer {
             .chain(inferred_filters)
             .collect();
 
-        self.cost_model.init_equivalent_relations(&filter_infos);
+        // A computed multi-relation expression is not a direct-key NDV
+        // equality. Keep its whole support and price it when that support is
+        // available; never discard it merely because it has no key binding.
+        let estimator_filters = if self.cost_model.regional_pricing.is_some() {
+            let estimator = LogicalCostModel {
+                defaults: self.cost_model.selectivity_defaults.clone(),
+                ..Default::default()
+            };
+            filter_infos
+                .iter()
+                .filter(|filter| {
+                    let residual = filter.join_type() == JoinType::Inner
+                        && filter.set.count() > 1
+                        && (filter.left_binding.is_none() || filter.right_binding.is_none());
+                    if residual {
+                        self.cost_model.residual_selectivities.push((
+                            Arc::clone(&filter.set),
+                            estimator
+                                .estimate_selectivity(&filter.filter, &self.column_stats)
+                                .clamp(0.0, 1.0),
+                        ));
+                    }
+                    !residual
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            filter_infos.clone()
+        };
+        self.cost_model
+            .init_equivalent_relations(&estimator_filters);
         for filter_info in &filter_infos {
             if let (Some(left_set), Some(right_set)) =
                 (filter_info.left_set(), filter_info.right_set())
@@ -869,7 +912,7 @@ impl JoinOrderOptimizer {
 
     /// Reconstruct a logical plan from a DP join node.
     fn reconstruct_plan(
-        &self,
+        &mut self,
         bind_context: &BindContext,
         node: &DPJoinNode,
         used_filters: &mut HashSet<usize>,
@@ -935,6 +978,10 @@ impl JoinOrderOptimizer {
                 }
 
                 let mut join = ComparisonJoin::new(chosen_join_type, left_plan, right_plan, vec![]);
+                if self.cost_model.regional_pricing.is_some() && reduction_orientation.is_none() {
+                    join.build_side_constraint =
+                        paro_planner::operator::JoinBuildSideConstraint::Right;
+                }
                 join.anti_join_mode = predicates.anti_join_mode();
                 for predicate in predicates.predicates() {
                     let appended = self.append_join_conditions(&mut join, predicate);
@@ -993,7 +1040,21 @@ impl JoinOrderOptimizer {
             // largest allocation. Re-label the already-owned nodes in one
             // post-order pass instead; relation plans were copied at their
             // ownership boundary above, so no sibling candidate is aliased.
-            let result = self.attach_remaining_filters(result, &node.set, used_filters);
+            let mut result = result;
+            if self.cost_model.regional_pricing.is_some() && reduction_orientation.is_none() {
+                let before = self.cost_model.cardinality_before_activation(
+                    &node.set,
+                    &node.left_set,
+                    &node.right_set,
+                );
+                result.stats.estimated_cardinality = Some(Self::join_cardinality_estimate(before));
+            }
+            let mut result = self.attach_remaining_filters(result, &node.set, used_filters);
+            if self.cost_model.regional_pricing.is_some() {
+                // DP already accounts for every whole-support residual once.
+                // Reconstructing its Filter must not discount that count again.
+                Self::set_reconstructed_cardinality(&mut result, node);
+            }
             let (result, ()) = result.try_fold_post_order(|mut plan, _| {
                 plan.id = bind_context.next_plan_id();
                 Ok((plan, ()))

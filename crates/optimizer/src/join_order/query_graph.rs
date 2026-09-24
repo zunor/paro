@@ -136,6 +136,17 @@ impl JoinPredicateSet {
         let mut boundary_join_type = None;
         let mut selected = Vec::<Arc<FilterInfo>>::new();
         for filter in filters {
+            // A connectivity edge is not permission to evaluate a hyperedge
+            // before all of its operands exist. Reconstruction and costing
+            // must agree on the same complete predicate support.
+            if !filter
+                .set
+                .relations()
+                .iter()
+                .all(|r| left.contains(*r) || right.contains(*r))
+            {
+                continue;
+            }
             if boundary_join_type.is_none()
                 && matches!(filter.join_type, JoinType::Semi | JoinType::Anti)
             {

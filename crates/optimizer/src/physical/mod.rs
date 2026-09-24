@@ -51,6 +51,7 @@ pub(crate) mod aggregate_planning;
 pub(crate) mod direct;
 pub mod extraction;
 pub(crate) mod implementation;
+pub(crate) mod join_work;
 pub(crate) mod local_cost;
 mod rewrite;
 pub(crate) mod selected;
