@@ -115,3 +115,27 @@ each query. Use no memory/profile sidecars, bounded normal receipts and the
 existing typed result oracles. Server maximum is explicitly 2GiB (matching the
 workload's minimum buffer pool), query memory_limit remains 2GB. No performance
 claim is made while other correctness workloads or background loads run.
+
+## TPC-H fixture/publication correction
+
+The raw dbgen files have a terminal separator that the strict CSV COPY schema
+does not accept. Preserve those failed setup attempts and raw input. Convert
+only the last `|` before each newline into the checked-in workload's CSV shape,
+in a separate owned directory; hash both forms. Do not change values, queries,
+expected results or comparison tolerances. The converted-input attempts are
+distinct runs under the same resource envelope.
+
+An independent DuckDB 1.5.5 audit consumes exactly those converted files and
+the unchanged query SQL, using the existing `normalize_row_v1`/validator/digest
+contract. Only Paro-specific SET statements and metadata-only UNIQUE NOT
+ENFORCED declarations are removed from fixture DDL. This is oracle diagnosis,
+not replacement expected results or a latency comparison. Preserve the first
+audit's raw-Decimal scalar-normalization mistake and corrected v2 separately.
+
+The direct runner's missing-sample publisher exposed another defect on the
+quality arm's Q09 resource failure: it replaced the original failure with a
+sample-count error. After fixing planned sample coordinates, retain every
+uncollected slot as Uncovered with no invented timing; preserve setup/build/
+teardown errors. Run new pipeline/quality `*-retained` attempts to validate
+publication of real successes and failures. Never replace the earlier files
+or accept a Failed attempt. This is not retry-until-green or new optimizer code.

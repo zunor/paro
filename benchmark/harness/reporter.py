@@ -111,6 +111,12 @@ class BenchmarkReporter:
                 "name": workload.name,
                 "params": workload.params,
                 "build_time_ms": workload.build_time_ms,
+                "setup_status": workload.setup_status,
+                "setup_error": workload.setup_error,
+                "build_status": workload.build_status,
+                "build_error": workload.build_error,
+                "teardown_status": workload.teardown_status,
+                "teardown_error": workload.teardown_error,
                 "queries": [],
             }
             for query in workload.queries:
@@ -158,6 +164,16 @@ class BenchmarkReporter:
                                 sample_count - len(receipt_associations)
                             )
                         )
+                    planned_count = max(iterations, 1)
+                    if sample_count > planned_count:
+                        raise ValueError("query produced more samples than registered")
+                    if sample_count < planned_count:
+                        if not query.error and query.validation_result != "FAIL":
+                            raise ValueError("successful query did not collect every registered sample")
+                        receipt_associations.extend(
+                            uncovered_receipt("registered sample was not collected after query/setup failure")
+                            for _ in range(planned_count - sample_count)
+                        )
                     end = sample_cursor + len(receipt_associations)
                     if end > len(registered_sample_ids):
                         raise ValueError(
@@ -191,6 +207,7 @@ class BenchmarkReporter:
                     "id": query.id,
                     "validate_mode": query.validate_mode,
                     "samples_ms": query.samples_ms,
+                    "uncollected_samples": max(0, max(iterations, 1) - len(query.samples_ms)),
                     "stats": stats,
                     "memory": memory,
                     "rss": rss,

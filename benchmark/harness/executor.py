@@ -161,18 +161,25 @@ class BenchmarkExecutor:
                     conn = None
                     break
             self._apply_relative_latency_guards(workload, result)
-        else:
-            for query in workload.queries:
-                result.queries.append(
-                    QueryExecutionResult(
-                        id=query.id,
-                        validate_mode=query.validate,
-                        expected=query.expected,
-                        validation_result="FAIL",
-                        validation_detail="setup/build failed",
-                        error="SKIPPED: setup/build stage failed",
-                    )
+        # Every planned query retains its coordinate, even when setup failed
+        # or a timed-out query closed the connection. Missing queries must not
+        # silently shift the following registered samples onto another query.
+        skipped_reason = (
+            "setup/build stage failed"
+            if result.setup_status == "FAIL" or result.build_status == "FAIL"
+            else "an earlier query closed the connection"
+        )
+        for query in workload.queries[len(result.queries):]:
+            result.queries.append(
+                QueryExecutionResult(
+                    id=query.id,
+                    validate_mode=query.validate,
+                    expected=query.expected,
+                    validation_result="FAIL",
+                    validation_detail=skipped_reason,
+                    error=f"SKIPPED: {skipped_reason}",
                 )
+            )
 
         teardown_conn = None
         try:
