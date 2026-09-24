@@ -26,11 +26,17 @@ seed = ImmutableDataSeed.capture(SEED_PATH)
 args = Namespace(optimizer_verify='off', optimizer_search_policy=sys.argv[1], threads=4,
                  memory_limit='2GB', statement_timeout_seconds=60,
                  disabled_optimizer_rules=sys.argv[2] if len(sys.argv) > 2 else '')
+emitted_bytes = 0
 
 def emit(value):
+    global emitted_bytes
     encoded = json.dumps(value, ensure_ascii=False)
-    if len(encoded.encode()) > 32 * 1024 * 1024:
+    record_bytes = len(encoded.encode('utf-8')) + 1
+    if record_bytes > 32 * 1024 * 1024:
         raise RuntimeError('diagnostic record exceeds temporary 32 MiB limit')
+    if emitted_bytes + record_bytes > 64 * 1024 * 1024:
+        raise RuntimeError('diagnostic stream exceeds temporary 64 MiB limit')
+    emitted_bytes += record_bytes
     print(encoded, flush=True)
 
 emit({'kind': 'identity', 'source': repository_identity(ROOT), 'binary_sha256': content_digest(binary),
