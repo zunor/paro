@@ -262,7 +262,7 @@ def main() -> int:
     parser.add_argument("--user", default="paro")
     parser.add_argument("--process-blocks", type=int, default=5)
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--optimizer-search-policy", choices=("quality", "budgeted"), default="quality")
+    parser.add_argument("--optimizer-search-policy", choices=("regional", "quality", "budgeted"), default="quality")
     parser.add_argument("--optimizer-verify", choices=("on", "off"), default="on")
     parser.add_argument("--memory-limit", default="2GB")
     parser.add_argument("--watchdog-seconds", type=int, default=30)

@@ -94,6 +94,7 @@ class RunnerConfig:
     runtime_profiles: Mapping[str, RuntimeProfile]
     managed_runtime_env: tuple[str, ...]
     optimizer_verify: bool | None = None
+    optimizer_search_policy: str | None = None
 
     @property
     def cases_dir(self) -> Path:
@@ -228,8 +229,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database", help="Database name")
     parser.add_argument("--user", help="Database user")
     parser.add_argument("--password", help="Database password")
+    parser.add_argument("--report-dir", type=Path, help="Owned output directory for this run")
     parser.add_argument("--optimizer-verify", choices=("on", "off"),
                         help="Set optimizer verification on every connection, including restarts")
+    parser.add_argument("--optimizer-search-policy", choices=("quality", "budgeted", "regional"),
+                        help="Set the optimizer policy on every connection, including restarts")
     parser.add_argument(
         "--update",
         action="store_true",
@@ -331,7 +335,9 @@ def resolve_config(
     if jobs <= 0:
         raise RunnerError(f"invalid jobs: {jobs}")
 
-    report_dir = root / "report"
+    report_dir = getattr(args, "report_dir", None) or root / "report"
+    if getattr(args, "report_dir", None) is not None and report_dir.exists():
+        raise RunnerError("explicit report directory must not already exist")
 
     return RunnerConfig(
         host=host,
@@ -352,6 +358,7 @@ def resolve_config(
         managed_runtime_env=managed_runtime_env,
         optimizer_verify=(None if getattr(args, "optimizer_verify", None) is None
                           else args.optimizer_verify == "on"),
+        optimizer_search_policy=getattr(args, "optimizer_search_policy", None),
     )
 
 
@@ -761,11 +768,17 @@ def _open_connection(
         ) from exc
 
     conn.autocommit = True
-    if config.optimizer_verify is not None:
+    if config.optimizer_verify is not None or config.optimizer_search_policy is not None:
         try:
             with conn.cursor() as cursor:
-                cursor.execute("SET optimizer_verify = " +
-                               ("true" if config.optimizer_verify else "false"))
+                if config.optimizer_verify is not None:
+                    cursor.execute("SET optimizer_verify = " +
+                                   ("true" if config.optimizer_verify else "false"))
+                if config.optimizer_search_policy is not None:
+                    if config.optimizer_search_policy not in ("quality", "budgeted", "regional"):
+                        raise RunnerError("invalid optimizer search policy")
+                    cursor.execute("SET optimizer_search_policy = '" +
+                                   config.optimizer_search_policy + "'")
         except Exception:
             conn.close()
             raise

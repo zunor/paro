@@ -370,7 +370,7 @@ pub(super) fn extract_frozen_planner_tree(
                 } else {
                     match mode {
                         SearchMode::Direct => crate::physical::properties::PlanOrigin::Direct,
-                        SearchMode::Memo => crate::physical::properties::PlanOrigin::Memo,
+                        SearchMode::Memo | SearchMode::Regional => crate::physical::properties::PlanOrigin::Memo,
                     }
                 };
                 let (region_owner, mut owned_artifacts) = extracted_region_ownership(memo, winner)?;

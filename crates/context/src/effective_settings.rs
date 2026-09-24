@@ -8,10 +8,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
-/// Search stopping policy, independent of semantic safety and search budgets.
-/// Neither variant promises exhaustive search when an isolation limit is hit.
+/// Planning strategy, independent of semantic safety and search budgets.
+/// No strategy promises exhaustive search when an isolation limit is hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OptimizerSearchPolicy {
+    /// Ordered relational stages followed by costing a closed candidate catalog.
+    Regional,
     QualityCoverage,
     #[default]
     BudgetedSearch,
@@ -20,16 +22,18 @@ pub enum OptimizerSearchPolicy {
 impl OptimizerSearchPolicy {
     pub fn parse(value: &str) -> paro_common::error::Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "regional" => Ok(Self::Regional),
             "quality" => Ok(Self::QualityCoverage),
             "budgeted" => Ok(Self::BudgetedSearch),
             _ => Err(paro_common::error::invalid_input(
-                "optimizer_search_policy expects quality or budgeted",
+                "optimizer_search_policy expects regional, quality or budgeted",
             )),
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Regional => "regional",
             Self::QualityCoverage => "quality",
             Self::BudgetedSearch => "budgeted",
         }
@@ -186,6 +190,18 @@ mod tests {
         assert_eq!(
             settings("budgeted").optimizer_search_policy().unwrap(),
             OptimizerSearchPolicy::BudgetedSearch
+        );
+        assert_eq!(
+            settings("regional").optimizer_search_policy().unwrap(),
+            OptimizerSearchPolicy::Regional
+        );
+        assert_ne!(
+            settings("regional").planning_fingerprint(),
+            settings("budgeted").planning_fingerprint()
+        );
+        assert_ne!(
+            settings("regional").planning_fingerprint(),
+            settings("quality").planning_fingerprint()
         );
         assert!(settings("chain").optimizer_search_policy().is_err());
         assert_ne!(

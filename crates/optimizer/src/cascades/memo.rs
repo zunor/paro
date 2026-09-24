@@ -2622,6 +2622,87 @@ impl Memo {
             });
     }
 
+    pub(crate) fn record_regional_scope(&mut self) {
+        self.failed_search_obligations
+            .insert(super::budget::SearchObligation {
+                group: None,
+                reason: super::budget::SearchIncompleteReason::RegionalProgram,
+                witness: Fingerprint(0),
+            });
+    }
+
+    /// Commit a regional normalization boundary before physical implementation.
+    /// The old expression remains in the immutable arena for proof/source IDs,
+    /// but leaves every active discovery index. This is not cost dominance and
+    /// cannot be used to prune a live physical response frontier.
+    pub(crate) fn retire_pre_normal_form(
+        &mut self,
+        group: GroupId,
+        source: LogicalExprId,
+        replacement: LogicalExprId,
+    ) -> Result<()> {
+        let group = self.canonical_group(group);
+        let entry = self
+            .group(group)
+            .ok_or_else(|| paro_error::internal("normalization lost its group"))?;
+        if self.transformation_group_snapshots.is_some()
+            || !self.physical_exprs.is_empty()
+            || source == replacement
+            || !entry.logical_exprs.contains(&source)
+            || !entry.logical_exprs.contains(&replacement)
+            || !self.logical_exprs[replacement.index()]
+                .proofs
+                .iter()
+                .any(|proof| {
+                    matches!(proof, EquivalenceProof::Transformation { source: prior, .. } if *prior == source)
+                })
+        {
+            return Err(paro_error::internal(
+                "invalid regional normalization boundary",
+            ));
+        }
+        // A rewrite may legally wrap its own equivalence group as long as
+        // the input remains available. Such a cyclic alternative is not a
+        // replacement representation. Conservatively retain the input if
+        // any path can lead back to this group.
+        let mut pending = self.logical_exprs[replacement.index()].key.children.to_vec();
+        let mut seen = BTreeSet::new();
+        while let Some(child) = pending.pop() {
+            let child = self.canonical_group(child);
+            if child == group {
+                return Ok(());
+            }
+            if seen.insert(child) {
+                for expression in self.groups[child.index()].logical_exprs() {
+                    pending.extend(
+                        self.logical_exprs[expression.index()]
+                            .key
+                            .children
+                            .iter()
+                            .copied(),
+                    );
+                }
+            }
+        }
+        let revision = self
+            .logical_frontier_revision
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("Memo frontier revision overflow"))?;
+        let entry = &mut self.groups[group.index()];
+        entry.logical_exprs.retain(|&id| id != source);
+        entry.logical_index.retain(|_, ids| {
+            ids.retain(|&id| id != source);
+            !ids.is_empty()
+        });
+        entry.logical_operator_index.retain(|_, ids| {
+            ids.retain(|&id| id != source);
+            !ids.is_empty()
+        });
+        self.logical_frontier_revision = revision;
+        entry.logical_expression_version = revision;
+        Ok(())
+    }
+
     pub fn groups(&self) -> impl Iterator<Item = &Group> {
         self.groups
             .iter()

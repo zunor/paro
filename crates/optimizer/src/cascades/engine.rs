@@ -84,6 +84,8 @@ use super::tasks::{
 use crate::physical::{ObjectiveProfile, ResourceGrantClass, SpillPolicy};
 
 mod quality_production;
+mod regional;
+pub(crate) use regional::RegionalPass;
 use quality_production::QualityProductionRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,8 @@ pub enum SearchMode {
     /// Narrow shapes: shared implementations/properties/costing, no equivalent
     /// relational exploration.
     Direct,
+    /// Cost a catalog sealed by a finite relational program; no logical agenda.
+    Regional,
     /// Contextual Memo exploration with bounded transformations.
     Memo,
 }
@@ -4372,7 +4376,10 @@ impl CascadesEngine {
         if result.winners.is_empty() {
             return Err(self.infeasible_goal_error(root, base_goal));
         }
-        if let Some(expected_class) = expected {
+        // The closed regional catalog is priced eagerly for every declared
+        // grant. Do not attach the single-expected-class lazy-search contract
+        // to it, or call the other evaluated classes "mandatory only".
+        if let Some(expected_class) = expected.filter(|_| mode != SearchMode::Regional) {
             result.safe_winners = result.winners.clone();
             result.grant_search = Some(
                 crate::physical::GrantSearchCoverage::new(

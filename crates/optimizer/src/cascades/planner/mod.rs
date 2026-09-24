@@ -120,6 +120,7 @@ mod extraction;
 mod identity;
 mod implementation;
 mod predicate_order;
+mod regional;
 pub(crate) mod restriction;
 mod scalar_facts;
 mod semantic_plan;
@@ -1715,13 +1716,26 @@ impl OptimizationInput {
                 .map(|class| ResourceGrantClassId::new(class.index))
         });
         drop(preparation_partition);
+        let physical_mode = if engine.memo().budget().search_policy
+            == Some(paro_context::OptimizerSearchPolicy::Regional)
+        {
+            engine.prepare_regional_candidates(self.root, regional::RELATIONAL_PROGRAM)?;
+            SearchMode::Regional
+        } else {
+            self.mode
+        };
+        // Candidate production is finished. Even when its optional envelope
+        // expired, materialize a feasible execution choice from the closed
+        // catalog; cancellation is still checked by the shared control.
+        let regional_pricing = (physical_mode == SearchMode::Regional)
+            .then(|| engine.memo().control().incumbent_phase());
         let grant_optimization = if statement_context.is_some() {
             engine.optimize_for_expected_grant(
                 self.root,
                 self.root_goal,
                 AdmissibleGrantSetId(0),
                 grant_classes.values().copied(),
-                self.mode,
+                physical_mode,
                 expected_class,
             )?
         } else {
@@ -1732,9 +1746,10 @@ impl OptimizationInput {
                 self.root_goal,
                 AdmissibleGrantSetId(0),
                 grant_classes.values().copied(),
-                self.mode,
+                physical_mode,
             )?
         };
+        drop(regional_pricing);
         let _finish_partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
         engine.note_search_return();
         let export_strong_incumbents = self.export_strong_incumbent

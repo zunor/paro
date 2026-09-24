@@ -1183,7 +1183,12 @@ fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
     // Production Memo -> mandatory/optional -> frozen winner -> extraction.
     // The semantic ORDER template erases its projection map, but the target
     // group has only `id`. A direct native rewrite must restore that contract.
-    for offset in [0, 3] {
+    for (offset, policy) in [
+        (0, paro_context::OptimizerSearchPolicy::BudgetedSearch),
+        (3, paro_context::OptimizerSearchPolicy::BudgetedSearch),
+        (0, paro_context::OptimizerSearchPolicy::Regional),
+        (3, paro_context::OptimizerSearchPolicy::Regional),
+    ] {
         let session = crate::subquery::partition_aggregate_tests::setup_session();
         let binder = Binder::new(session.clone());
         let bind_context = binder.bind_context.clone();
@@ -1231,7 +1236,10 @@ fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
                 column_stats: Arc::new(HashMap::new()),
             }],
             &binder,
-            SearchBudget::default(),
+            SearchBudget {
+                search_policy: Some(policy),
+                ..SearchBudget::default()
+            },
             &context,
         )
         .unwrap();
@@ -1242,6 +1250,20 @@ fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
             max_parallel_tasks: 1,
         });
         let optimized = input.optimize(&grants).unwrap();
+        if policy == paro_context::OptimizerSearchPolicy::Regional {
+            assert!(
+                optimized.grant_search.is_none(),
+                "regional costing is eager across declared classes"
+            );
+            assert!(optimized
+                .variants
+                .iter()
+                .any(|v| v.class == ResourceGrantClassId(0)));
+            assert!(optimized
+                .variants
+                .iter()
+                .any(|v| v.class == ResourceGrantClassId(2)));
+        }
         assert!(
             optimized
                 .rule_insertions

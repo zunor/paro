@@ -171,7 +171,7 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
     SettingDescriptor {
         name: "optimizer_search_policy",
         category: "Query Tuning",
-        description: "Stop at verified quality coverage or continue budgeted search",
+        description: "Use a finite regional program, quality coverage, or budgeted search",
         vartype: "string",
         context: "user",
         unit: None,
@@ -1062,7 +1062,12 @@ mod tests {
         let instance = paro_instance::Instance::new_in_memory();
         let mut session = crate::Session::new(1, instance);
         let mut sink = CollectingSink::new();
-        for (value, accepted) in [("budgeted", true), ("QUALITY", true), ("chain", false)] {
+        for (value, accepted) in [
+            ("regional", true),
+            ("budgeted", true),
+            ("QUALITY", true),
+            ("chain", false),
+        ] {
             let before = session
                 .effective_setting("optimizer_search_policy")
                 .cloned();

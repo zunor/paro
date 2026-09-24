@@ -24,6 +24,13 @@ Bound statement / owned binder IR
 Read-only diagnostics observe this flow; they must not select a plan.
 ~~~
 
+The opt-in `regional` policy runs a finite ordered native producer program,
+then costs the closed catalog without a logical exploration agenda. It shares
+the IR, semantic proofs, physical contracts and extraction with the current
+planner; it is not yet a lightweight region-local physical solver. See the
+[regional pipeline contract](../../docs/optimizer/regional-pipeline.md).
+The default must not change solely because a new scheduler terminates sooner.
+
 The convergence target is one normalization/construction contract for both
 initial expressions and newly produced alternatives. Binder-owned mutable IR
 is legitimate; repeated whole-tree transport inside search is not the target
@@ -56,6 +63,7 @@ Paths below are relative to this crate.
 | Query context | [context.rs](src/context.rs) | Planning configuration and statement-scoped context |
 | Memo | [cascades/memo.rs](src/cascades/memo.rs) | Groups, alternatives, facts, frontiers, exact candidate identities and frozen candidates |
 | Search | [cascades/engine.rs](src/cascades/engine.rs) | Implementation, composition, publication and candidate handoff |
+| Finite relational program | [program](src/cascades/planner/regional.rs), [driver](src/cascades/engine/regional.rs) | Ordered normalization and bounded regional alternatives before physical costing |
 | Tasks | [cascades/tasks.rs](src/cascades/tasks.rs) | Goal-scoped work, read sets, continuations, invalidation and lifecycle |
 | Search bounds | [cascades/budget.rs](src/cascades/budget.rs), [cascades/control.rs](src/cascades/control.rs) | Work budgets, cancellation and incomplete-search reporting |
 | Scalar IR | [cascades/scalar.rs](src/cascades/scalar.rs), [cascades/scalar_lowering.rs](src/cascades/scalar_lowering.rs) | Interned expressions and binding-aware import/export |

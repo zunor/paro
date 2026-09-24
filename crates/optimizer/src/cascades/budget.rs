@@ -21,6 +21,9 @@ pub struct SearchObligation {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SearchIncompleteReason {
+    /// A finite regional program was evaluated, not the transitive closure of
+    /// all registered transformations. This is a scope boundary, not exhaustion.
+    RegionalProgram,
     /// A declared grant has only its mandatory executable baseline; optional
     /// closure was deferred by resource selection, not rejected by a budget.
     OptionalGrantDeferred(super::ids::ResourceGrantClassId),

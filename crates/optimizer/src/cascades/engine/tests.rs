@@ -64,6 +64,9 @@ mod grant_capacity;
 #[path = "tests/grant_lazy.rs"]
 mod grant_lazy;
 
+#[path = "tests/regional.rs"]
+mod regional;
+
 #[test]
 fn quality_fact_observation_requires_same_candidate_combination() {
     use crate::cascades::quality::BundleFact;

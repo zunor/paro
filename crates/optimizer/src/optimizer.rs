@@ -2121,14 +2121,18 @@ impl Optimizer {
         self.ctx.profiler.record(
             match mode {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
-                crate::cascades::SearchMode::Memo => OptimizerComponent::MemoExploration,
+                crate::cascades::SearchMode::Memo | crate::cascades::SearchMode::Regional => {
+                    OptimizerComponent::MemoExploration
+                }
             },
             search_phase_started.elapsed(),
         );
         self.ctx.profiler.record_component_allocation(
             match mode {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
-                crate::cascades::SearchMode::Memo => OptimizerComponent::MemoExploration,
+                crate::cascades::SearchMode::Memo | crate::cascades::SearchMode::Regional => {
+                    OptimizerComponent::MemoExploration
+                }
             },
             paro_common::allocator::allocated_bytes_since(search_phase_allocated),
         );
@@ -2435,9 +2439,11 @@ impl Optimizer {
 
         let budget = &self.budget;
         let config_values = [
-            u64::from(
-                budget.search_policy == Some(paro_context::OptimizerSearchPolicy::QualityCoverage),
-            ),
+            match budget.search_policy {
+                Some(paro_context::OptimizerSearchPolicy::Regional) => 2,
+                Some(paro_context::OptimizerSearchPolicy::QualityCoverage) => 1,
+                _ => 0,
+            },
             u64::from(budget.max_optional_groups_per_initial_group),
             u64::from(budget.max_optional_composition_groups_per_initial_group),
             u64::from(budget.max_optional_logical_exprs_per_group),
