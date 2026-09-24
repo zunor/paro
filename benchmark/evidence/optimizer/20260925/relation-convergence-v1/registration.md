@@ -93,3 +93,25 @@ Setup writes stay on quality; only read queries select the registered policy.
 This engineering correctness screen supplies no cold/parity claim. Preserve
 timeouts, unknown capabilities and exact numeric differences without blessing.
 Its normal bounded RunOutput packages have a separate 8MiB allowance.
+
+## Breadth capacity interruption and continuation
+
+Both connected-region arms reached Q66, where the existing 36,096-byte normal
+cell lease rejected the serialized result. Preserve the original capacity
+terminals, Q39 exact numeric failures, Q58 binding failures and all earlier
+samples. Q66 is Uncovered; the original campaigns are not complete. Do not
+raise their capacity or remove receipt fields to turn them green.
+
+Continue only previously unexecuted Q67–99 in separately owned range campaigns
+under the unchanged registered breadth settings, pipeline then quality. Record
+the new harness source and unchanged optimizer binary identity; these fragments
+are coverage evidence, not a repaired full-campaign or performance claim. They
+share the existing 64MiB connected-breadth allowance.
+
+Before TPC-H collection, fix direct-run acceptance of its own successfully
+sealed attempt; failed attempts must remain unaccepted. Let TPC-H query profile
+collection follow the invocation's existing opt-in, rather than force it on in
+each query. Use no memory/profile sidecars, bounded normal receipts and the
+existing typed result oracles. Server maximum is explicitly 2GiB (matching the
+workload's minimum buffer pool), query memory_limit remains 2GB. No performance
+claim is made while other correctness workloads or background loads run.

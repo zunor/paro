@@ -623,6 +623,8 @@ def execute_workloads(
                 result_path=result.result_path,
                 summary_path=result.summary_path,
             )
+            if not result.failed:
+                owned_attempt.accept()
     except BaseException:
         if owned_attempt is not None:
             try:
