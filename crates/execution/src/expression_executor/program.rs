@@ -732,6 +732,9 @@ impl<'a> ProgramCompiler<'a> {
     fn compile_expression_inner(&mut self, expr: &'a Expression) -> CompiledExpr {
         match expr {
             Expression::Function(expr) => {
+                if let Some(fused) = self.try_compile_decimal_linear_fusion(expr) {
+                    return fused;
+                }
                 if let Some(fused) = self.try_compile_decimal_factor_product_fusion(expr) {
                     return fused;
                 }
@@ -874,6 +877,65 @@ impl<'a> ProgramCompiler<'a> {
                 );
             }
         }
+    }
+
+    fn try_compile_decimal_linear_fusion(
+        &mut self,
+        expr: &'a paro_planner::expression::FunctionExpression,
+    ) -> Option<CompiledExpr> {
+        use paro_function::scalar::operators::arithmetic::DecimalLinearBuilder;
+        if !DecimalLinearBuilder::accepts(&expr.function) || expr.children.len() != 2 {
+            return None;
+        }
+        // Iterative postorder: retain CSE boundaries and evaluate leaves in their
+        // original order. No recursive walk or logical plan mutation is needed.
+        let mut builder = DecimalLinearBuilder::default();
+        let mut inputs = Vec::new();
+        let mut results = Vec::new();
+        enum Work<'a> {
+            Visit(&'a Expression),
+            Combine(&'a BoundScalarFunction),
+        }
+        let mut stack = vec![Work::Combine(&expr.function)];
+        stack.extend(expr.children.iter().rev().map(Work::Visit));
+        while let Some(work) = stack.pop() {
+            match work {
+                Work::Combine(function) => {
+                    let right = results.pop()?;
+                    let left = results.pop()?;
+                    results.push(builder.binary(function, left, right)?);
+                }
+                Work::Visit(child) => {
+                    if let Expression::Function(nested) = child {
+                        if nested.children.len() == 2
+                            && DecimalLinearBuilder::accepts(&nested.function)
+                            && !self
+                                .shared_slots_by_identity
+                                .contains(self.fingerprints.identity(child))
+                        {
+                            stack.push(Work::Combine(&nested.function));
+                            stack.extend(nested.children.iter().rev().map(Work::Visit));
+                            continue;
+                        }
+                    }
+                    results.push(builder.input(child.return_type())?);
+                    inputs.push(child);
+                }
+            }
+        }
+        let function = builder.finish(results.pop()?)?;
+        let children = inputs
+            .into_iter()
+            .map(|input| self.compile_expression(input))
+            .collect::<Vec<_>>();
+        Some(CompiledExpr {
+            cse_safe: children.iter().all(|child| child.cse_safe),
+            expr: PhysicalExpression::Function(PhysicalFunctionExpression {
+                function,
+                children: children.into_iter().map(|child| child.expr).collect(),
+                return_type: expr.return_type.clone(),
+            }),
+        })
     }
 
     fn try_compile_decimal_factor_fusion(
@@ -1230,6 +1292,50 @@ mod tests {
             )
             .into(),
         )
+    }
+
+    #[test]
+    fn decimal_linear_tree_compiles_once_and_keeps_shared_boundary() {
+        fn binary(name: &str, left: Expression, right: Expression) -> Expression {
+            let function = bind_decimal(name, &[left.return_type(), right.return_type()]);
+            Expression::Function(
+                FunctionExpression::new(
+                    function.clone(),
+                    vec![left, right],
+                    function.return_type.clone(),
+                )
+                .into(),
+            )
+        }
+        let ty = LogicalType::Decimal {
+            precision: 7,
+            scale: 2,
+        };
+        let inner = binary("-", reference(0, ty.clone()), reference(1, ty.clone()));
+        let tree = binary(
+            "+",
+            binary("-", inner.clone(), reference(2, ty.clone())),
+            reference(3, ty),
+        );
+        let program = PhysicalExpressionProgram::compile(
+            std::slice::from_ref(&tree),
+            ExpressionProgramVersion::anonymous(),
+        );
+        let PhysicalExpression::Function(root) = program.root(0) else {
+            panic!("linear root");
+        };
+        assert_eq!(root.function.name, "decimal_linear_fusion");
+        assert_eq!(root.children.len(), 4);
+        let program = PhysicalExpressionProgram::compile(
+            &[inner, tree],
+            ExpressionProgramVersion::anonymous(),
+        );
+        let PhysicalExpression::Function(root) = program.root(1) else {
+            panic!("linear root");
+        };
+        assert_eq!(root.function.name, "decimal_linear_fusion");
+        assert_eq!(root.children.len(), 3);
+        assert!(matches!(root.children[0], PhysicalExpression::Shared(_)));
     }
 
     #[test]

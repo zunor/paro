@@ -10,6 +10,8 @@
 //! - Chunk: ✅
 
 mod direct_decimal;
+mod linear_decimal;
+pub use linear_decimal::DecimalLinearBuilder;
 
 use crate::decimal::{
     pow10_checked, rescale_checked, round_divide_checked, to_i128, DecimalInteger,
@@ -1490,8 +1492,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    struct BindState {
-        bind_data: Arc<dyn FunctionData>,
+    pub(super) struct BindState {
+        pub(super) bind_data: Arc<dyn FunctionData>,
     }
 
     impl ExpressionState for BindState {

@@ -41,3 +41,22 @@ Bound retained campaign evidence to 20MiB. No raw event floods, binaries or
 server logs in the archive. Preserve necessary counterexamples and negative
 results. Validate affected Rust tests, workspace check/tests, strict Clippy,
 benchmark and compare-only SQL regress; never bless failures.
+
+## Registered intervention: exact linear DECIMAL lowering
+
+The exploratory plan has three narrow-key partial/final aggregates feeding a
+six-reader CTE; this is not a missing-date-filter/aggregation-placement case.
+A 10-second warm CPU sample puts DECIMAL arithmetic, its per-value reader and
+native-plan dispatch among the leading leaves (1,134 / 1,106 / 643 samples).
+These are CPU samples, not exclusive C1 milliseconds. The existing direct
+kernels decline nullable input batches, and the three total equal-scale
+add/subtract nodes materialize separate vectors. Hypothesis: one certified
+NULL-strict integer kernel removes the intermediate traversals/allocations
+without changing optimizer decisions, floating SUM order, budgets or policy.
+Fusion requires an independent precision/scale envelope for every removed node,
+retains CSE/leaf evaluation order and declines unsupported/error-capable types.
+No query-name, column-name, cardinality or SQL-text specialization is permitted.
+
+The failed exploratory `EXPLAIN (ANALYZE, FORMAT JSON)` request is retained as
+unsupported syntax; it yielded no execution measurements. Existing plain
+EXPLAIN ANALYZE is a human-readable exploratory view, not a new timing source.

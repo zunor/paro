@@ -3305,6 +3305,75 @@ mod tests {
         Expression::Reference(ReferenceExpression::new(index, LogicalType::Boolean).into())
     }
 
+    #[test]
+    fn decimal_linear_execution_reuses_nullable_selected_batches() {
+        use paro_function::scalar::operators::arithmetic::register_arithmetic_functions;
+        use paro_function::scalar::{ScalarBindInput, ScalarFunctionSet};
+        fn binary(name: &str, left: Expression, right: Expression) -> Expression {
+            let mut set = ScalarFunctionSet::new(name.into());
+            register_arithmetic_functions(&mut set);
+            let (function, types) = set
+                .bind(&[left.return_type(), right.return_type()])
+                .unwrap();
+            let function = function
+                .bind(&ScalarBindInput::new(types, vec![None, None]))
+                .unwrap();
+            Expression::Function(
+                FunctionExpression::new(
+                    function.clone(),
+                    vec![left, right],
+                    function.return_type.clone(),
+                )
+                .into(),
+            )
+        }
+        let ty = LogicalType::Decimal {
+            precision: 7,
+            scale: 2,
+        };
+        let reference =
+            |index| Expression::Reference(ReferenceExpression::new(index, ty.clone()).into());
+        let expr = binary(
+            "+",
+            binary("-", binary("-", reference(0), reference(1)), reference(2)),
+            reference(3),
+        );
+        let mut executor = ExpressionExecutor::new(&expr);
+        let runtime = test_runtime(test_session());
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator()).unwrap();
+        for nullable in [true, false, true] {
+            let mut columns = Vec::new();
+            for col in 0..4 {
+                let mut vector = paro_common::test_utils::test_vector(ty.clone());
+                vector.set_count(32);
+                for row in 0..32 {
+                    vector.set_i64(row, row as i64 * 10 + col);
+                    if nullable && row == col as usize {
+                        vector.try_set_null(row, true).unwrap();
+                    }
+                }
+                let sel = SelectionVector::try_from_indices(
+                    (0..32).rev().collect(),
+                    vector.allocator().clone(),
+                )
+                .unwrap();
+                columns.push(Vector::try_dictionary(Arc::new(vector), sel).unwrap());
+            }
+            let input = paro_common::test_utils::test_chunk_from_vectors(columns);
+            executor
+                .execute_all_into(&input, &runtime, &mut output)
+                .unwrap();
+            for row in 0..32 {
+                let value = output.get_value(0, row).unwrap();
+                if nullable && row >= 28 {
+                    assert!(value.is_null());
+                } else {
+                    assert_eq!(value, Value::Decimal(0, 10, 2));
+                }
+            }
+        }
+    }
+
     fn add_one_function(
         input: &Chunk,
         _runtime: &dyn FunctionExecContext,
