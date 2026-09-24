@@ -53,6 +53,8 @@ async fn direct_pipeline_executes_relational_boundaries_without_memo() {
         "SELECT k FROM pipe_dim WHERE k NOT IN (SELECT k FROM pipe_fact) ORDER BY k",
         "SELECT k, (SELECT COUNT(*) FROM pipe_fact f WHERE f.k=d.k) AS n FROM pipe_dim d ORDER BY k",
         "SELECT DISTINCT k FROM pipe_fact ORDER BY k NULLS FIRST",
+        "SELECT a.k,b.k FROM pipe_dim a CROSS JOIN pipe_dim b ORDER BY a.k,b.k",
+        "SELECT k,label,SUM(k) OVER(PARTITION BY label),COUNT(*) OVER() FROM pipe_dim ORDER BY k",
         "SELECT a.k,b.k,c.k FROM pipe_dim a, pipe_dim b, pipe_dim c WHERE a.k=b.k AND b.k=c.k AND CASE WHEN a.k>0 THEN (a.k+b.k)::DOUBLE/c.k ELSE 0 END > 1.5 ORDER BY a.k,b.k,c.k",
         "SELECT d.label, AVG(f.v), MIN(f.v), MAX(f.v), COUNT(f.v) FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k GROUP BY d.label ORDER BY d.label",
         "SELECT d.label,COUNT(DISTINCT f.v) FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k GROUP BY d.label ORDER BY d.label",

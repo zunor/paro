@@ -297,7 +297,7 @@ impl PhysicalPlan {
     /// explicit so a consumer never treats a later encoding as compatible.
     pub fn structural_identity_fingerprint(&self) -> Result<Fingerprint, PhysicalIdentityError> {
         let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.physical-plan-structure.v4.typed-canonical");
+        builder.write_bytes(b"paro.physical-plan-structure.v5.typed-canonical");
 
         // The traversal is iterative on purpose.  Physical plans can contain
         // long unary spines and a fingerprint must not depend on recursion
@@ -1118,6 +1118,68 @@ fn write_semantic_kind_fields(
         }
     }
 
+    fn write_spill_policy(
+        builder: &mut StableFingerprintBuilder,
+        policy: super::specs::SpillExecutionPolicy,
+    ) {
+        use super::specs::SpillExecutionPolicy;
+        builder.write_u64(match policy {
+            SpillExecutionPolicy::InMemory => 0,
+            SpillExecutionPolicy::Adaptive => 1,
+            SpillExecutionPolicy::ForcedExternal => 2,
+        });
+    }
+
+    // Ordinary and partition-window aggregates own the same execution
+    // payload. Encode it once, without reconstructing an operator or relying
+    // on its abbreviated EXPLAIN presentation. Estimated capacity and the
+    // resource operating point are not part of structural identity.
+    fn write_aggregate(builder: &mut StableFingerprintBuilder, spec: &super::specs::AggregateSpec) {
+        builder.write_u64(spec.grouping_key_count as u64);
+        write_hashed_slice(
+            builder,
+            b"state-output-projection",
+            &spec.state_output_projection,
+        );
+        write_expressions(builder, spec.projection_exprs.iter());
+        write_hashed_slice(builder, b"aggregate-payload-types", &spec.payload_types);
+        write_expressions(builder, spec.groups.iter());
+        write_expressions(builder, spec.aggregates.iter());
+        write_hashed_slice(builder, b"group-key-encodings", &spec.group_key_encodings);
+        write_index_matrix(builder, b"grouping-sets", &spec.grouping_sets);
+        write_index_matrix(builder, b"grouping-functions", &spec.grouping_functions);
+        write_index_matrix(builder, b"aggregate-inputs", &spec.aggregate_inputs);
+        write_hashed_slice(builder, b"aggregate-filters", &spec.aggregate_filters);
+        write_index_matrix(builder, b"aggregate-orders", &spec.aggregate_orders);
+        write_expressions(builder, spec.having_filter.iter());
+        write_spill_policy(builder, spec.spill_policy);
+        builder.write_u64(spec.post_reduction.is_some() as u64);
+        if let Some(post) = &spec.post_reduction {
+            write_hashed_slice(builder, b"post-aggregate-types", &post.aggregate_types);
+            write_expressions(builder, post.reducers.iter());
+            write_hashed_slice(builder, b"post-reducer-types", &post.reducer_types);
+            write_expressions(builder, post.scalar_expressions.iter());
+            write_hashed_slice(builder, b"post-scalar-types", &post.scalar_types);
+            write_expressions(builder, std::iter::once(&post.predicate));
+            write_hashed(
+                builder,
+                b"post-input-rollup-sources",
+                &post.input_rollup_sources,
+            );
+        }
+        builder.write_u64(spec.perfect_hash.is_some() as u64);
+        if let Some(perfect) = &spec.perfect_hash {
+            write_hashed_slice(builder, b"perfect-group-minima", &perfect.group_minima);
+            write_hashed_slice(
+                builder,
+                b"perfect-group-cardinalities",
+                &perfect.group_cardinalities,
+            );
+        }
+        write_strings(builder, spec.output_names.iter());
+        write_hashed_slice(builder, b"aggregate-output-types", &spec.output_types);
+    }
+
     match kind {
         PhysicalNodeKind::Filter(spec) => {
             builder.write_u64(1);
@@ -1274,18 +1336,27 @@ fn write_semantic_kind_fields(
         }
         PhysicalNodeKind::Aggregate(spec) => {
             builder.write_u64(9);
-            builder.write_u64(spec.grouping_key_count as u64);
-            builder.write_u64(spec.initial_lookup_hash_key_count as u64);
-            write_expressions(builder, spec.projection_exprs.iter());
-            write_expressions(builder, spec.groups.iter());
-            write_expressions(builder, spec.aggregates.iter());
-            write_hashed_slice(builder, b"group-key-encodings", &spec.group_key_encodings);
-            write_index_matrix(builder, b"grouping-sets", &spec.grouping_sets);
-            write_index_matrix(builder, b"grouping-functions", &spec.grouping_functions);
-            write_index_matrix(builder, b"aggregate-inputs", &spec.aggregate_inputs);
-            write_hashed_slice(builder, b"aggregate-filters", &spec.aggregate_filters);
-            write_index_matrix(builder, b"aggregate-orders", &spec.aggregate_orders);
-            write_expressions(builder, spec.having_filter.iter());
+            write_aggregate(builder, spec);
+        }
+        PhysicalNodeKind::CrossProduct(spec) => {
+            builder.write_u64(18);
+            write_hashed_slice(builder, b"cross-left-types", &spec.left_output_types);
+            write_hashed_slice(builder, b"cross-right-types", &spec.right_output_types);
+            write_strings(builder, spec.output_names.iter());
+            write_hashed_slice(builder, b"cross-output-types", &spec.output_types);
+            write_spill_policy(builder, spec.spill_policy);
+        }
+        PhysicalNodeKind::PartitionAggregateWindow(spec) => {
+            builder.write_u64(19);
+            builder.write_u64(match spec.domain {
+                super::specs::PartitionAggregateDomain::Global => 0,
+                super::specs::PartitionAggregateDomain::Keyed => 1,
+            });
+            write_hashed_slice(builder, b"partition-input-types", &spec.input_types);
+            write_hashed_slice(builder, b"partition-detail-columns", &spec.detail_columns);
+            write_aggregate(builder, &spec.aggregate);
+            write_strings(builder, spec.output_names.iter());
+            write_hashed_slice(builder, b"partition-output-types", &spec.output_types);
         }
         PhysicalNodeKind::Window(spec) => {
             builder.write_u64(10);
@@ -3391,6 +3462,91 @@ mod identity_tests {
         assert_eq!(
             left.structural_identity_fingerprint().unwrap(),
             right.structural_identity_fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn structural_identity_covers_cross_product_and_nested_aggregate_payload() {
+        use crate::physical::specs::{
+            AggregateSpec, CrossProductSpec, PartitionAggregateDomain,
+            PartitionAggregateWindowSpec, SpillExecutionPolicy,
+        };
+
+        fn fingerprint(kind: PhysicalNodeKind) -> Fingerprint {
+            let mut builder = StableFingerprintBuilder::default();
+            write_semantic_kind_fields(&mut builder, &kind).unwrap();
+            builder.finish()
+        }
+
+        let mut cross = CrossProductSpec {
+            left_output_types: Box::new([LogicalType::Integer]),
+            right_output_types: Box::new([LogicalType::BigInt]),
+            output_names: Box::new(["a".into(), "b".into()]),
+            output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
+            spill_policy: SpillExecutionPolicy::Adaptive,
+        };
+        let original = fingerprint(PhysicalNodeKind::CrossProduct(cross.clone()));
+        cross.spill_policy = SpillExecutionPolicy::ForcedExternal;
+        assert_ne!(
+            original,
+            fingerprint(PhysicalNodeKind::CrossProduct(cross.clone()))
+        );
+        cross.spill_policy = SpillExecutionPolicy::Adaptive;
+        cross.left_output_types = Box::new([LogicalType::BigInt]);
+        assert_ne!(original, fingerprint(PhysicalNodeKind::CrossProduct(cross)));
+
+        let aggregate = AggregateSpec {
+            grouping_key_count: 0,
+            initial_lookup_hash_key_count: 0,
+            state_output_projection: Box::new([]),
+            estimated_input_rows: Some(10),
+            projection_exprs: Box::new([]),
+            payload_types: Box::new([]),
+            groups: Box::new([]),
+            group_key_encodings: Box::new([]),
+            grouping_sets: Box::new([]),
+            aggregates: Box::new([]),
+            grouping_functions: Box::new([]),
+            aggregate_inputs: Box::new([]),
+            aggregate_filters: Box::new([]),
+            aggregate_orders: Box::new([]),
+            post_reduction: None,
+            having_filter: Box::new([]),
+            spill_policy: SpillExecutionPolicy::Adaptive,
+            perfect_hash: None,
+            output_names: Box::new([]),
+            output_types: Box::new([]),
+        };
+        let mut window = PartitionAggregateWindowSpec {
+            domain: PartitionAggregateDomain::Global,
+            input_types: Box::new([LogicalType::Integer]),
+            detail_columns: Box::new([0]),
+            aggregate,
+            output_names: Box::new(["a".into()]),
+            output_types: Box::new([LogicalType::Integer]),
+        };
+        let original = fingerprint(PhysicalNodeKind::PartitionAggregateWindow(Box::new(
+            window.clone(),
+        )));
+        window.aggregate.estimated_input_rows = Some(100);
+        assert_eq!(
+            original,
+            fingerprint(PhysicalNodeKind::PartitionAggregateWindow(Box::new(
+                window.clone()
+            )))
+        );
+        window.aggregate.spill_policy = SpillExecutionPolicy::ForcedExternal;
+        assert_ne!(
+            original,
+            fingerprint(PhysicalNodeKind::PartitionAggregateWindow(Box::new(
+                window.clone()
+            )))
+        );
+        window.aggregate.spill_policy = SpillExecutionPolicy::Adaptive;
+        window.detail_columns = Box::new([]);
+        assert_ne!(
+            original,
+            fingerprint(PhysicalNodeKind::PartitionAggregateWindow(Box::new(window)))
         );
     }
 
