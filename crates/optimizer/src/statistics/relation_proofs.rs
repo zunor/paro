@@ -103,6 +103,9 @@ impl RelationProofs {
                 {
                     let mut separators = Vec::new();
                     for (ordinal, binding) in output.bindings().iter().enumerate() {
+                        if output.types()[ordinal].collation().is_some() {
+                            continue;
+                        }
                         if let Some((l, r)) = ll
                             .bindings()
                             .get(ordinal)
@@ -205,7 +208,13 @@ impl RelationProofs {
             }
             _ => {}
         }
-        result.retain(|b, _| output.bindings().contains(b));
+        result.retain(|b, _| {
+            output
+                .bindings()
+                .iter()
+                .position(|c| c == b)
+                .is_some_and(|i| output.types()[i].collation().is_none())
+        });
         // Removing a non-NULL constant key component is valid under either
         // NULL equality contract. Never infer dependencies between other
         // grouping columns, and never use estimated NDV=1 as a constant.
@@ -319,9 +328,24 @@ mod tests {
         )
     }
     fn union(tag: &str) -> NodeStats {
+        union_with_collation(tag, false)
+    }
+
+    fn union_with_collation(tag: &str, collated: bool) -> NodeStats {
         let l = layout(1);
         let r = layout(2);
-        let output = layout(3);
+        let output = if collated {
+            LogicalOutputLayout::new(
+                vec![
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                    LogicalType::varchar_collation("NOCASE"),
+                ],
+                layout(3).bindings().to_vec(),
+            )
+        } else {
+            layout(3)
+        };
         let ld = FiniteDomains::from([(
             l.bindings()[2],
             BTreeSet::from([DomainValue::String("s".into())]),
@@ -372,6 +396,10 @@ mod tests {
         assert!(
             union("s").unique_keys.is_empty(),
             "overlapping branch tags cannot prove uniqueness"
+        );
+        assert!(
+            union_with_collation("S", true).unique_keys.is_empty(),
+            "byte-distinct tags do not prove disjointness under a collation"
         );
     }
 
