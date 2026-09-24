@@ -60,3 +60,16 @@ JOB/CEB/TPC-DS/TPC-H/LDBC promotion gate. Failures remain blockers; no baseline
 or output-contract relaxation is authorized.
 The breadth screen is a separate standard campaign with a 64MiB package
 ceiling; the 12MiB limit above applies to the six-cell latency matrix.
+
+## Amendment C: typed identity coverage validation
+
+The breadth screen stopped at Q66's registered cell capacity after Q01–Q65;
+its partial output and all query failures are retained. Typed CrossProduct
+and PartitionAggregateWindow encoders are now independently tested, including
+the shared aggregate payload. After final static/workspace checks, rerun
+Q09/Q12 with verification enabled as representative real-data coverage checks.
+Do not inherit the other failed queries' passes from those representatives.
+Repeat the six-cell Q04/Q11/Q74 matrix with the original sampling protocol on
+the final clean source so v5 identities are not mixed with matrix B receipts.
+The repeated matrix has its own 12MiB ceiling and remains exploratory; capacity
+limits are not increased to rescue the failed breadth campaign.
