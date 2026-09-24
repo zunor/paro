@@ -947,7 +947,7 @@ impl AggregateHashTable {
                     };
                     flat_sources.push(source);
                 }
-                target.combine_many(&mut flat_sources)
+                target.combine_owned(flat_sources)
             }
             Self::Radix(target) => {
                 let mut radix_sources = Vec::with_capacity(sources.len());
@@ -1721,12 +1721,8 @@ bits {}/{} routing {:?}/{:?} partitions {}/{} group_types {:?}/{:?}",
                 sources_by_partition[partition_idx].push(partition);
             }
         }
-        for (target, sources) in self
-            .partitions
-            .iter_mut()
-            .zip(sources_by_partition.iter_mut())
-        {
-            target.combine_many(sources)?;
+        for (target, sources) in self.partitions.iter_mut().zip(sources_by_partition) {
+            target.combine_owned(sources)?;
         }
         self.hash_runtime_stats.merge(source_runtime_stats);
         Ok(())

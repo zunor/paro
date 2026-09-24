@@ -437,13 +437,31 @@ fn build_map_from_scan(rows: Vec<Vec<Value>>) -> HashMap<i32, i64> {
 }
 
 fn sum_table(groups: &[i32], values: &[i64]) -> GroupedAggregateHashTable {
-    assert_eq!(groups.len(), values.len());
     let allocator = paro_common::test_utils::test_allocator();
-    let mut table = GroupedAggregateHashTable::new(
+    sum_table_with_allocator(groups, values, allocator)
+}
+
+fn sum_table_with_allocator(
+    groups: &[i32],
+    values: &[i64],
+    allocator: Arc<dyn Allocator>,
+) -> GroupedAggregateHashTable {
+    sum_table_with_memory(groups, values, allocator, detached_table_memory())
+}
+
+fn sum_table_with_memory(
+    groups: &[i32],
+    values: &[i64],
+    allocator: Arc<dyn Allocator>,
+    memory: MemoryAccountingContext,
+) -> GroupedAggregateHashTable {
+    assert_eq!(groups.len(), values.len());
+    let mut table = GroupedAggregateHashTable::new_with_memory(
         vec![LogicalType::Integer],
         vec![make_sum_object()],
         vec![vec![0]],
         allocator.clone(),
+        memory,
     )
     .expect("sum table");
     let groups = Chunk::from_vectors(
@@ -1331,6 +1349,158 @@ fn grouped_hash_table_reclaims_finalized_lookup_storage_without_breaking_scan() 
         .collect::<Vec<_>>();
     scanned.sort_unstable();
     assert_eq!(scanned, values);
+}
+
+#[test]
+fn owned_merge_moves_first_fragment_without_rebuilding_states() {
+    reset_destructor_calls();
+    let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let memory = MemoryAccountingContext::from_owner(
+        pool.clone(),
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    );
+    let mut target = sum_table_with_memory(
+        &[],
+        &[],
+        paro_common::test_utils::test_allocator(),
+        memory.clone(),
+    );
+    let source = sum_table_with_memory(
+        &[1, 2],
+        &[10, 20],
+        paro_common::test_utils::test_allocator(),
+        memory,
+    );
+    let storage = source.data.as_ptr();
+    let source_bytes = source.memory_usage();
+    target.combine_owned(vec![source]).unwrap();
+    assert_eq!(
+        target.data.as_ptr(),
+        storage,
+        "tuple storage must move, not be reconstructed"
+    );
+    assert_eq!(target.memory_usage(), source_bytes);
+    assert_eq!(destructor_calls(), 0, "moved source states must stay alive");
+    assert_eq!(
+        build_map_from_scan(collect_scan_rows(&mut target)),
+        HashMap::from([(1, 10), (2, 20)])
+    );
+    drop(target);
+    assert_eq!(pool.issued_bytes(), 0);
+    assert_eq!(
+        destructor_calls(),
+        2,
+        "each transferred state is destroyed exactly once"
+    );
+}
+
+#[test]
+fn owned_merge_preserves_floating_point_fragment_order() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let build = |keys: &[i32], values: &[f64]| {
+        let (function, _) = paro_function::aggregate::distributive::sum::get_sum_function()
+            .bind(&[LogicalType::Double])
+            .unwrap();
+        let object = AggregateObject::from_bound(&AggregateExpression::new(
+            function,
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Double).into(),
+            )],
+            LogicalType::Double,
+        ))
+        .unwrap();
+        let mut table = GroupedAggregateHashTable::new(
+            vec![LogicalType::Integer],
+            vec![object],
+            vec![vec![0]],
+            allocator.clone(),
+        )
+        .unwrap();
+        if !keys.is_empty() {
+            let groups = Chunk::from_vectors(
+                vec![paro_common::test_utils::test_i32_vector(keys)],
+                allocator.clone(),
+            );
+            let hashes = table.hash_groups(&groups).unwrap();
+            let mut addresses =
+                paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, keys.len());
+            let mut selection = paro_common::test_utils::test_selection_with_capacity(keys.len());
+            table
+                .find_or_create_groups(&groups, &hashes, &mut addresses, &mut selection)
+                .unwrap();
+            let payload = Chunk::from_vectors(
+                vec![paro_common::test_utils::test_f64_vector(values)],
+                allocator.clone(),
+            );
+            table.update_aggregates(&payload, &addresses, None).unwrap();
+        }
+        table
+    };
+    let mut target = build(&[], &[]);
+    // The larger second fragment must not replace the first as merge base.
+    target
+        .combine_owned(vec![
+            build(&[1], &[1e16]),
+            build(&[1, 2], &[-1e16, 2.0]),
+            build(&[1], &[1.0]),
+        ])
+        .unwrap();
+    let rows = collect_scan_rows(&mut target);
+    let row = rows.iter().find(|row| row[0] == Value::Integer(1)).unwrap();
+    let Value::Double(value) = row[1] else {
+        panic!("double sum");
+    };
+    assert_eq!(value.to_bits(), 1.0_f64.to_bits());
+}
+
+#[test]
+fn owned_merge_does_not_move_between_accounting_owners() {
+    let memory = |pool: Arc<QueryMemoryPool>| {
+        MemoryAccountingContext::from_owner(
+            pool,
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        )
+    };
+    let target_pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let source_pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let mut target = sum_table_with_memory(
+        &[],
+        &[],
+        paro_common::test_utils::test_allocator(),
+        memory(target_pool.clone()),
+    );
+    let source = sum_table_with_memory(
+        &[1, 2],
+        &[10, 20],
+        paro_common::test_utils::test_allocator(),
+        memory(source_pool.clone()),
+    );
+    let allocator = target.allocator();
+    assert!(!Arc::ptr_eq(&allocator, &source.allocator()));
+    target.combine_owned(vec![source]).unwrap();
+    assert!(Arc::ptr_eq(&allocator, &target.allocator()));
+    assert_eq!(source_pool.issued_bytes(), 0);
+    assert!(target_pool.issued_bytes() > 0);
+    assert_eq!(
+        build_map_from_scan(collect_scan_rows(&mut target)),
+        HashMap::from([(1, 10), (2, 20)])
+    );
+    drop(target);
+    assert_eq!(target_pool.issued_bytes(), 0);
+}
+
+#[test]
+fn owned_merge_validates_all_sources_before_adopting_first() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut target = sum_table_with_allocator(&[], &[], allocator.clone());
+    let first = sum_table_with_allocator(&[1], &[10], allocator);
+    let incompatible = count_table(&[2]);
+    assert!(target.combine_owned(vec![first, incompatible]).is_err());
+    assert_eq!(target.count(), 0);
 }
 
 #[test]

@@ -1736,6 +1736,12 @@ impl GroupedAggregateHashTable {
             if left.payload_size != right.payload_size
                 || left.child_count != right.child_count
                 || left.return_type != right.return_type
+                || !left.function.execution_semantics_equal(&right.function)
+                || !paro_function::scalar::function_data_equals(
+                    left.bind_info.as_ref(),
+                    right.bind_info.as_ref(),
+                )
+                || left.aggr_type != right.aggr_type
             {
                 return Err(paro_error::internal(format!(
                     "Aggregate object mismatch at index {idx}: \

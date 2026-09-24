@@ -6,6 +6,38 @@
 use super::*;
 
 impl GroupedAggregateHashTable {
+    /// Merge owned fragments. Unlike borrowed `combine_many`, this boundary
+    /// may move the first non-empty table into an empty destination, including
+    /// its arena, key heap, index and allocation leases. Never pick a larger
+    /// later fragment: that would reorder floating-point/ordered combine.
+    pub(crate) fn combine_owned(&mut self, mut sources: Vec<Self>) -> Result<()> {
+        // Validate the whole frontier before moving any ownership. A failed
+        // admission must not publish a partially substituted table.
+        for source in &sources {
+            self.ensure_compatible(source)?;
+        }
+        if self.count == 0 {
+            if let Some(first) = sources.iter_mut().find(|source| source.count != 0) {
+                if self.memory.has_same_target(&first.memory)
+                    && self.aggregate_inputs == first.aggregate_inputs
+                    && self
+                        .aggregate_objects
+                        .iter()
+                        .zip(&first.aggregate_objects)
+                        .all(|(left, right)| {
+                            left.filter == right.filter && left.order_bys == right.order_bys
+                        })
+                {
+                    // Allocator adapter identity need not match: each owned
+                    // buffer and arena retains the allocator which created it.
+                    // The accounting destination, however, must be identical.
+                    std::mem::swap(self, first);
+                }
+            }
+        }
+        self.combine_many(&mut sources)
+    }
+
     /// Combine another table without round-tripping serialized group keys
     /// through column vectors. Stored hashes are reused, fixed-width keys stay
     /// in row form, and only out-of-line varlen bytes move between heaps.
