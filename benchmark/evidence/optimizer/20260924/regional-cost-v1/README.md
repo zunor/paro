@@ -24,6 +24,80 @@
 Default policy remains `quality`. No Cascades deletion, global optimality,
 runtime adaptive build-side switching or default-promotion claim is made.
 
+## Final source matrix C
+
+Clean source `6084d3fcd`; executable SHA256
+`5fd10a53ba052a279adbcb3d431133841a678004a5b7f2f94771607cceb52fd5`.
+This includes the v5 physical identity coverage fix. The original exploratory
+protocol and limitations apply; no thresholds were changed. All six cells
+passed complete typed results and the maintained campaign/receipt validators.
+These are normal SELECT medians, not diagnostic times.
+
+| Query | Policy | Compiler ms | C1 ms | DuckDB C1 ms | Warm ms | DuckDB warm ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Q04 | pipeline | 8.180 | 248.072 | 137.098 | 154.051 | 111.288 |
+| Q04 | quality | 19.280 | 231.370 | 154.728 | 132.795 | 113.564 |
+| Q11 | pipeline | 4.463 | 131.951 | 70.459 | 80.062 | 56.081 |
+| Q11 | quality | 12.399 | 143.666 | 66.606 | 81.104 | 55.269 |
+| Q74 | pipeline | 3.860 | 95.491 | 82.786 | 56.829 | 69.974 |
+| Q74 | quality | 10.876 | 105.276 | 81.927 | 53.787 | 64.385 |
+
+Compiler samples (microseconds, sorted for presentation; collection order and
+every slow sample remain in the cells):
+
+| Query | pipeline | quality |
+| --- | --- | --- |
+| Q04 | 7885, 8180, 10903 | 17933, 19280, 25060 |
+| Q11 | 4420, 4463, 4544 | 12326, 12399, 13273 |
+| Q74 | 3782, 3860, 3963 | 10865, 10876, 11103 |
+
+The result is mixed, not completion of the four-task architecture program.
+Q04 pipeline warm remains worse than quality and triggers the registered
+investigation threshold. Q11 and Q74 compile/C1 favor pipeline in this cohort,
+but no query has certified parity. These are policy comparisons within one
+binary, not an isolated before/after causal claim for the shared kernel.
+
+After timing ended, separate read-only plan inspection (`selected-plans.txt`,
+one bounded four-plan text supplement) confirmed:
+
+- Both Q74 branches again select partial aggregate, dimension join and final
+  merge, with date scans estimated at 723 rows. Both policies still carry the
+  redundant OR/IN predicate, but no longer multiply its estimated selectivity.
+- Q04's consumer now applies a ratio predicate before the last relation is
+  joined. Its remaining store/catalog producer joins still build the customer
+  input in pipeline, versus the partial aggregate in quality. The store
+  partial estimate is 183,392 rows versus 100,000 customer rows. A shared kernel
+  alone has not fixed estimation/phase response or chosen the best build side.
+- Q04/Q74 CTE/final-aggregate estimates still differ markedly between policies.
+  This is direct evidence that a single canonical relation-estimate owner is
+  not finished. Do not relabel local work-unit sharing as complete model unity.
+
+This separate inspection suggests next boundaries; it does not causally assign
+all warm latency to one operator or substitute for sample-linked diagnostics.
+
+## Final validation
+
+- `RUST_MIN_STACK=33554432 cargo test --workspace --locked -q -- --test-threads=2`:
+  passed; optimizer 1,430 passed. Existing ignored tests remain ignored.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- Release server build: passed. Memory-runtime and fallible-vector guards:
+  passed. Task-file formatting and `git diff --check`: passed; not a claim
+  that all pre-existing repository formatting/header debt is resolved.
+- Benchmark tests: 229 passed, one pre-existing pytest return-value warning.
+- Real pipeline session tests, including forced-external CTE, cross product,
+  partition/global window, NULL, DISTINCT, and shared dimension groups: passed.
+- Final-source verifier-on SF1 Q09 and Q12: exact results and receipt/campaign
+  validators passed. Their concurrently collected timing is not a latency
+  claim. Other failed breadth cases are not silently upgraded to passes.
+- Full default SQL regress, FD limit 65,536: 184 passed, one existing settings
+  description text failure, zero new cases. The exact expected/actual difference
+  is retained in `regress/error.txt`. No expected or `.actual` files updated.
+
+Remaining work is joint aggregate-state DP, one region estimate/physical
+response contract (including RF/phase effects), unknown/low-resource policy
+coverage, and the broader failed/incomplete corpus gates below. The old
+quality search is a bounded comparison reference, not an exhaustive oracle.
+
 ## Registered exploratory matrix B
 
 Source `40b912359`, before the subsequent identity-only coverage fix. Each run's
