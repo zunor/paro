@@ -107,8 +107,10 @@ switching, exhaustive SQL search, or ProofComplete result in this delivery.
 ## Validation
 
 - Final-source workspace tests, including optimizer 1,433 tests: passed.
-- Strict workspace/all-target Clippy, release build, task-file formatting and
-  `git diff --check`: passed.
+- Strict workspace/all-target Clippy, release build and task-source formatting/
+  whitespace checks: passed. The byte-preserved generated `regress/error.txt`
+  has a terminal blank line reported by the archive commit's whitespace check;
+  it was not edited to make raw evidence look clean.
 - Benchmark Make test target: 207 tests passed. Temporary missing-baseline
   messages belong to harness unit tests, not a real failed performance gate.
 - Real session tests cover duplicate dimension rows/labels, NULL, filtered
