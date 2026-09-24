@@ -137,6 +137,12 @@ fn flatten<'a>(
             flatten(&join.right, leaves, conditions);
             conditions.extend(join.conditions.iter().cloned());
         }
+        LogicalOperator::Join(Join::Cross(join))
+            if join.build_side_constraint == JoinBuildSideConstraint::Either =>
+        {
+            flatten(&join.left, leaves, conditions);
+            flatten(&join.right, leaves, conditions);
+        }
         _ => leaves.push(plan),
     }
 }
@@ -258,10 +264,16 @@ impl<'a> Region<'a> {
                     collect(&j.right, leaves, conditions, residuals);
                     conditions.extend(j.conditions.iter().cloned());
                 }
+                LogicalOperator::Join(Join::Cross(j))
+                    if j.build_side_constraint == JoinBuildSideConstraint::Either =>
+                {
+                    collect(&j.left, leaves, conditions, residuals);
+                    collect(&j.right, leaves, conditions, residuals);
+                }
                 _ => leaves.push(plan),
             }
         }
-        if !join_root(plan) {
+        if !join_root(plan) || crate::expression::join_region_has_evaluation_fence(&plan.operator) {
             return None;
         }
         let mut leaves = vec![];
@@ -634,6 +646,9 @@ pub(super) fn optimize(
 pub(super) fn join_root(plan: &OwnedLogicalPlan) -> bool {
     match &plan.operator {
         LogicalOperator::Join(Join::Comparison(j)) => is_plain_inner_equi_join(j),
+        LogicalOperator::Join(Join::Cross(j)) => {
+            j.build_side_constraint == JoinBuildSideConstraint::Either
+        }
         LogicalOperator::Filter(f) => f.expressions.iter().all(movable) && join_root(&f.child),
         _ => false,
     }
@@ -915,6 +930,10 @@ mod tests {
                             !matches!(node.operator, LogicalOperator::BoundReference(_)),
                             "no pricing boundary may escape reconstruction"
                         );
+                        assert!(
+                            !matches!(node.operator, LogicalOperator::Join(Join::Cross(_))),
+                            "connected test regions must not retain an avoidable Cartesian product"
+                        );
                         if let LogicalOperator::Join(Join::Comparison(join)) = &node.operator {
                             joins += 1;
                             let left = join.left.get_column_bindings();
@@ -949,6 +968,26 @@ mod tests {
         assert!(work.transitions > 0);
         assert_eq!(work.partial_states, 0);
         assert_eq!(work.budget_fallbacks, 0);
+    }
+
+    #[test]
+    fn connected_region_opens_cartesian_input_before_committing_physical_choices() {
+        // The third relation connects the first two. Treating their syntactic
+        // CROSS PRODUCT as an atomic leaf locks in an arbitrarily large
+        // intermediate, even though the complete region is connected.
+        let work = exercise_domain("SELECT s_acctbal,r_name,n_name FROM supplier CROSS JOIN region JOIN nation ON s_nationkey=n_nationkey AND r_regionkey=n_regionkey", 10000, true);
+        assert!(work.regions > 0);
+        assert_eq!(work.budget_fallbacks, 0);
+    }
+
+    #[test]
+    fn genuinely_disconnected_region_keeps_the_explicit_fallback_domain() {
+        let work = exercise_domain(
+            "SELECT s_acctbal,r_name FROM supplier CROSS JOIN region",
+            10000,
+            true,
+        );
+        assert_eq!(work.regions, 0);
     }
 
     #[test]

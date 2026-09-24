@@ -144,7 +144,7 @@ pub(crate) fn comparison_join_has_evaluation_fence<Child>(join: &ComparisonJoin<
     })
 }
 
-fn join_region_has_evaluation_fence(operator: &LogicalOperator) -> bool {
+pub(crate) fn join_region_has_evaluation_fence(operator: &LogicalOperator) -> bool {
     match operator {
         LogicalOperator::Join(join) => join_tree_has_evaluation_fence(join),
         LogicalOperator::Filter(filter) => {
