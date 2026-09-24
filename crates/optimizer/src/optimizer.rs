@@ -79,6 +79,8 @@ struct CandidatePlan {
     column_stats: Arc<HashMap<paro_planner::operator::ColumnBinding, Arc<ColumnStatistics>>>,
 }
 
+mod pipeline;
+
 impl CandidatePlan {
     fn into_alternative(self, source: AlternativeOrigin) -> LogicalAlternative {
         LogicalAlternative {
@@ -509,6 +511,10 @@ impl Optimizer {
         };
         let observes_optimizer_diagnostics = observes_optimizer_diagnostics(&query);
         let explain = statement.explain;
+        if self.budget.search_policy == Some(paro_context::OptimizerSearchPolicy::Pipeline) {
+            drop(pre_partition);
+            return self.optimize_pipeline(query, statement_layer, explain);
+        }
         let phase_started = Instant::now();
         let phase_allocated = paro_common::allocator::thread_allocated_bytes();
         let graph_plans = enumerate_graph_region_plans(
@@ -2440,6 +2446,7 @@ impl Optimizer {
         let budget = &self.budget;
         let config_values = [
             match budget.search_policy {
+                Some(paro_context::OptimizerSearchPolicy::Pipeline) => 3,
                 Some(paro_context::OptimizerSearchPolicy::Regional) => 2,
                 Some(paro_context::OptimizerSearchPolicy::QualityCoverage) => 1,
                 _ => 0,

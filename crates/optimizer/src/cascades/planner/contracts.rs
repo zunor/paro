@@ -159,87 +159,11 @@ pub(super) fn stable_cardinality_recipe(
     fingerprint.finish()
 }
 
-pub(super) fn planner_grant_dependency<Child>(
-    operator: &LogicalOperator<Child>,
-) -> GrantDependencyDescriptor {
-    if matches!(
-        operator,
-        LogicalOperator::Aggregate(_)
-            | LogicalOperator::Distinct(_)
-            | LogicalOperator::Order(_)
-            | LogicalOperator::TopN(_)
-            | LogicalOperator::Window(_)
-            | LogicalOperator::MaterializedCTE(_)
-            | LogicalOperator::RecursiveCTE(_)
-            | LogicalOperator::Join(_)
-    ) {
-        GrantDependencyDescriptor::Sensitive
-    } else if matches!(
-        operator,
-        LogicalOperator::Get(_)
-            | LogicalOperator::SearchScan(_)
-            | LogicalOperator::FullTextFilterScan(_)
-            | LogicalOperator::GraphScan(_)
-            | LogicalOperator::CTERef(_)
-            | LogicalOperator::ExternalTable(_)
-    ) {
-        GrantDependencyDescriptor::Parallelism
-    } else {
-        GrantDependencyDescriptor::Invariant
-    }
-}
-
-pub(super) fn planner_operator_spillable<Child>(operator: &LogicalOperator<Child>) -> bool {
-    match operator {
-        LogicalOperator::Aggregate(aggregate) => {
-            !aggregate.groups.is_empty()
-                && aggregate.aggregates.iter().all(|expression| {
-                    matches!(
-                        expression,
-                        Expression::Aggregate(aggregate)
-                            if !aggregate.is_distinct() && aggregate.order_bys.is_empty()
-                    )
-                })
-        }
-        LogicalOperator::Distinct(_) | LogicalOperator::Order(_) | LogicalOperator::Window(_) => {
-            true
-        }
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            crate::physical::extraction::helpers::supports_external_hash_join_type(join.join_type)
-        }
-        // Cross product has two explicit physical implementations. This flag
-        // advertises the external one; the in-memory implementation remains a
-        // separate non-spillable candidate.
-        LogicalOperator::Join(Join::Cross(_)) => true,
-        LogicalOperator::MaterializedCTE(_) => true,
-        _ => false,
-    }
-}
-
 pub(super) fn implementation_spillable(
     metadata: &PlannerOperatorMetadata,
     flavor: PhysicalImplementationFlavor,
 ) -> bool {
-    match flavor {
-        PhysicalImplementationFlavor::HashJoin
-        | PhysicalImplementationFlavor::HashJoinBuildLeft
-        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
-        | PhysicalImplementationFlavor::HashJoinRuntimeFilter
-        | PhysicalImplementationFlavor::HashAggregate
-        | PhysicalImplementationFlavor::PartitionAggregateWindow
-        | PhysicalImplementationFlavor::Window => metadata.spillable,
-        PhysicalImplementationFlavor::AdaptiveSort => metadata.spillable,
-        PhysicalImplementationFlavor::CrossProductExternal => metadata.spillable,
-        PhysicalImplementationFlavor::Structural => metadata.spillable,
-        PhysicalImplementationFlavor::NestedLoopJoin
-        | PhysicalImplementationFlavor::CrossProductInMemory
-        | PhysicalImplementationFlavor::HeapTopN
-        | PhysicalImplementationFlavor::PerfectHashAggregate
-        | PhysicalImplementationFlavor::SingletonAggregateProjection
-        | PhysicalImplementationFlavor::SortRangeJoin
-        | PhysicalImplementationFlavor::ClassicIeJoin
-        | PhysicalImplementationFlavor::SearchProvider => false,
-    }
+    crate::physical::local_cost::flavor_spillable(&metadata.local_cost_model(), flavor)
 }
 
 pub(super) fn planner_structural_retained_children<Child>(
@@ -604,10 +528,11 @@ mod tests {
     use crate::cascades::ids::{AdmissibleGrantSetId, ResourceGrantClassId};
     use crate::cascades::memo::GrantGoalKey;
     use crate::cascades::planner::costing::RuntimeFilterExactness;
-    use crate::cascades::planner::state::ResolvedRuntimeFilterSource;
-    use crate::cascades::planner::state::RuntimeFilterProbeMultiplicity;
     use crate::cascades::rules::GrantDependencyDescriptor;
     use crate::cascades::rules::WorkSourceId;
+    use crate::physical::local_cost::{
+        ResolvedRuntimeFilterSource, RuntimeFilterProbeMultiplicity,
+    };
     use crate::physical::PhysicalGrantContract;
 
     #[test]
@@ -625,14 +550,12 @@ mod tests {
             selected_node_grant_contract(GrantDependencyDescriptor::Sensitive, goal, 4).unwrap(),
             PhysicalGrantContract::Class(ResourceGrantClassId(7)),
         );
-        assert!(
-            selected_node_grant_contract(
-                GrantDependencyDescriptor::Sensitive,
-                GrantGoalKey::Invariant(AdmissibleGrantSetId(1)),
-                4,
-            )
-            .is_err()
-        );
+        assert!(selected_node_grant_contract(
+            GrantDependencyDescriptor::Sensitive,
+            GrantGoalKey::Invariant(AdmissibleGrantSetId(1)),
+            4,
+        )
+        .is_err());
     }
 
     #[test]
@@ -740,7 +663,7 @@ pub(super) fn selected_node_grant_contract(
 }
 
 pub(super) fn cost_for_grant(
-    mut cost: SearchCost,
+    cost: SearchCost,
     dependency: GrantDependencyDescriptor,
     spillable: bool,
     grant: GrantGoalKey,
@@ -764,84 +687,7 @@ pub(super) fn cost_for_grant(
     let class = classes.get(&class_id).ok_or_else(|| {
         paro_error::internal("physical implementation references an unknown grant class")
     })?;
-    if cost.minimum_memory_bytes > class.hard_memory_bytes {
-        return Ok(None);
-    }
-    if spillable && class.spill_policy == SpillPolicy::Forbidden {
-        // In a no-spill class the entire retained state is required for
-        // forward progress. It is neither revocable nor a soft target, even
-        // when the same implementation can be adaptive in another class.
-        if force_spill
-            || cost.peak_memory_upper == u64::MAX
-            || cost.peak_memory_upper > class.hard_memory_bytes
-        {
-            return Ok(None);
-        }
-        cost.minimum_memory_bytes = cost.minimum_memory_bytes.max(cost.peak_memory_upper);
-        cost.non_revocable_memory_upper =
-            cost.non_revocable_memory_upper.max(cost.peak_memory_upper);
-        cost.revocable_memory_target = 0;
-        cost.validate()?;
-        return Ok(Some(cost));
-    }
-    if cost.peak_memory_upper == u64::MAX {
-        if spillable && class.spill_policy == SpillPolicy::Allowed {
-            // These implementations allocate all retained state through the
-            // query pool. The allocator bounds resident memory and the spill
-            // protocol proves forward progress. Spill volume stays UNKNOWN.
-            cost.peak_memory_upper = class.hard_memory_bytes;
-            cost.revocable_memory_target = cost
-                .revocable_memory_target
-                .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
-            cost.validate()?;
-            return Ok(Some(cost));
-        }
-        if cost.memory_completion.is_runtime_capped() {
-            // The query allocator is the resident-memory proof for this
-            // explicitly best-effort implementation.  This does not promote
-            // it to a forward-progress guarantee: portfolio selection keeps
-            // preferring any fully bounded or spillable alternative.
-            cost.apply_runtime_cap(class.hard_memory_bytes, cost.minimum_memory_bytes)?;
-            return Ok(Some(cost));
-        }
-        return Ok(None);
-    }
-    if force_spill && spillable {
-        if class.spill_policy == SpillPolicy::Forbidden {
-            return Ok(None);
-        } else {
-            let spilled = cost.revocable_memory_target.max(1);
-            cost.peak_memory_upper = cost.peak_memory_upper.min(class.hard_memory_bytes);
-            cost.revocable_memory_target = cost
-                .revocable_memory_target
-                .min(cost.peak_memory_upper - cost.minimum_memory_bytes);
-            add_spill_cost(&mut cost, spilled)?;
-            cost.validate()?;
-            return Ok(Some(cost));
-        }
-    }
-    if cost.peak_memory_upper <= class.hard_memory_bytes {
-        return Ok(Some(cost));
-    }
-    if spillable && class.spill_policy == SpillPolicy::Allowed {
-        let spilled = cost
-            .preferred_memory_bytes()
-            .saturating_sub(class.hard_memory_bytes);
-        cost.peak_memory_upper = class.hard_memory_bytes;
-        cost.revocable_memory_target = cost
-            .revocable_memory_target
-            .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
-        if spilled > 0 {
-            add_spill_cost(&mut cost, spilled)?;
-        }
-        cost.validate()?;
-        return Ok(Some(cost));
-    }
-    if cost.memory_completion.is_runtime_capped() {
-        cost.apply_runtime_cap(class.hard_memory_bytes, cost.minimum_memory_bytes)?;
-        return Ok(Some(cost));
-    }
-    Ok(None)
+    crate::physical::local_cost::fit_local_cost(cost, spillable, *class, force_spill)
 }
 
 pub(super) fn planner_enforcer_cost_input(
@@ -866,37 +712,10 @@ pub(super) fn planner_enforcer_cost_input(
     Ok(input)
 }
 
-pub(super) fn add_spill_cost(cost: &mut SearchCost, spilled: u64) -> Result<()> {
-    cost.spill_bytes_expected = cost.spill_bytes_expected.saturating_add(spilled);
-    let io_work = (spilled as f64 / 4096.0).max(1.0);
-    let spill_range = CompactRange::new(io_work, io_work * 2.0, io_work * 6.0)?;
-    cost.score.range = cost.score.range.checked_add(spill_range)?;
-    cost.score.risk_adjusted += io_work * 3.0;
-    cost.critical_path = cost.critical_path.checked_add(spill_range)?;
-    cost.resources_expected[ResourceDimension::SequentialIo as usize] += io_work * 2.0;
-    cost.resources_risk_upper[ResourceDimension::SequentialIo as usize] += io_work * 6.0;
-    cost.validate()?;
-    Ok(())
-}
-
 pub(super) fn provided_result_guarantee<Child>(
     operator: &LogicalOperator<Child>,
 ) -> ResultGuarantee {
-    match operator {
-        LogicalOperator::SearchScan(scan)
-            if scan.request.intents.iter().any(|intent| {
-                matches!(
-                    intent,
-                    paro_storage::search::SearchIntent::Hnsw(hnsw)
-                        if hnsw.options.objective
-                            == paro_storage::index::hnsw::HnswSearchObjective::CostOptimized
-                )
-            }) =>
-        {
-            ResultGuarantee::ApproximateAllowed(COST_OPTIMIZED_SEARCH_POLICY)
-        }
-        _ => ResultGuarantee::Exact,
-    }
+    crate::physical::implementation::operator_result_guarantee(operator)
 }
 
 pub(super) fn search_payload_fingerprint(
@@ -1012,18 +831,16 @@ mod resource_contract_tests {
         let spill = class(SpillPolicy::Allowed);
         let grant = GrantGoalKey::Class(no_spill.id);
 
-        assert!(
-            cost_for_grant(
-                cost(u64::MAX, 800 * 1024),
-                GrantDependencyDescriptor::Sensitive,
-                true,
-                grant,
-                &BTreeMap::from([(no_spill.id, no_spill)]),
-                false,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(cost_for_grant(
+            cost(u64::MAX, 800 * 1024),
+            GrantDependencyDescriptor::Sensitive,
+            true,
+            grant,
+            &BTreeMap::from([(no_spill.id, no_spill)]),
+            false,
+        )
+        .unwrap()
+        .is_none());
         assert_eq!(
             cost_for_grant(
                 cost(u64::MAX, 800 * 1024),
@@ -1089,28 +906,24 @@ mod resource_contract_tests {
         )
         .expect_err("runtime-capped cost must participate in grant optimization");
 
-        assert!(
-            error
-                .to_string()
-                .contains("runtime-capped memory makes an implementation grant-sensitive")
-        );
+        assert!(error
+            .to_string()
+            .contains("runtime-capped memory makes an implementation grant-sensitive"));
     }
 
     #[test]
     fn forced_external_representation_is_not_faked_in_a_no_spill_class() {
         let no_spill = class(SpillPolicy::Forbidden);
-        assert!(
-            cost_for_grant(
-                cost(900 * 1024, 800 * 1024),
-                GrantDependencyDescriptor::Sensitive,
-                true,
-                GrantGoalKey::Class(no_spill.id),
-                &BTreeMap::from([(no_spill.id, no_spill)]),
-                true,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(cost_for_grant(
+            cost(900 * 1024, 800 * 1024),
+            GrantDependencyDescriptor::Sensitive,
+            true,
+            GrantGoalKey::Class(no_spill.id),
+            &BTreeMap::from([(no_spill.id, no_spill)]),
+            true,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

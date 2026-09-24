@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Immutable physical-plan IR and extraction from verified Memo winners.
+//! Immutable physical-plan IR and lowering from selected physical contracts.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -48,7 +48,10 @@ pub use verifier::PhysicalPlanVerifier;
 
 pub(crate) mod aggregate_planning;
 
+pub(crate) mod direct;
 pub mod extraction;
+pub(crate) mod implementation;
+pub(crate) mod local_cost;
 mod rewrite;
 pub(crate) mod selected;
 

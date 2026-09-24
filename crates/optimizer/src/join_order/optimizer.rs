@@ -216,6 +216,37 @@ impl JoinOrderOptimizer {
         plan.try_map_post_order(|plan| self.optimize_current_plan(ctx, bind_context, plan))
     }
 
+    /// Optimize maximal legal regions once. Nested joins of the same region
+    /// belong to its DP table, not to another invocation of the enumerator.
+    pub(crate) fn optimize_regions(
+        &mut self,
+        ctx: &StatementContext,
+        plan: OwnedLogicalPlan,
+        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        bind_context: &BindContext,
+    ) -> Result<OwnedLogicalPlan> {
+        self.column_stats = column_stats.clone();
+        let plan = ColumnLifetimeAnalyzer::for_join_enumeration().optimize(plan)?;
+        let mut roots = HashSet::new();
+        let mut pending = vec![(&plan, false)];
+        while let Some((node, inside)) = pending.pop() {
+            ctx.cancellation.check()?;
+            let region = self.can_optimize_join(&node.operator);
+            if region && !inside {
+                roots.insert(node.id);
+            }
+            pending.extend(node.children().into_iter().map(|child| (child, region)));
+        }
+        plan.try_map_post_order(|plan| {
+            ctx.cancellation.check()?;
+            if roots.contains(&plan.id) {
+                self.optimize_current_plan(ctx, bind_context, plan)
+            } else {
+                Ok(plan)
+            }
+        })
+    }
+
     /// Enumerate only the join region rooted at `plan`.
     ///
     /// Cascades schedules one firing per Memo expression, so traversal belongs

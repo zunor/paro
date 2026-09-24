@@ -217,7 +217,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
         );
         let max_concurrent_tasks = parallel_tasks_for_goal(goal, &self.grant_classes)?;
         let local_cost = implementation_cost(
-            metadata,
+            &metadata.local_cost_model(),
             &cost_facts,
             metadata.implementations.baseline,
             self.calibration.as_ref(),
@@ -410,7 +410,7 @@ impl PhysicalImplementation for AlternativeImplementation {
         );
         let max_concurrent_tasks = parallel_tasks_for_goal(goal, &self.grant_classes)?;
         let implementation_cost = implementation_cost(
-            metadata,
+            &metadata.local_cost_model(),
             &cost_facts,
             self.flavor,
             self.calibration.as_ref(),

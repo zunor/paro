@@ -14,6 +14,8 @@ use paro_context::{OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics}
 pub enum OptimizerComponent {
     SemanticNormalization,
     QueryIrConstruction,
+    RegionOptimization,
+    PhysicalSelection,
     DirectPhysicalSearch,
     MemoExploration,
     PhysicalExtraction,
@@ -21,9 +23,11 @@ pub enum OptimizerComponent {
 }
 
 impl OptimizerComponent {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::SemanticNormalization,
         Self::QueryIrConstruction,
+        Self::RegionOptimization,
+        Self::PhysicalSelection,
         Self::DirectPhysicalSearch,
         Self::MemoExploration,
         Self::PhysicalExtraction,
@@ -34,6 +38,8 @@ impl OptimizerComponent {
         match self {
             Self::SemanticNormalization => "semantic_normalization",
             Self::QueryIrConstruction => "query_ir_construction",
+            Self::RegionOptimization => "region_optimization",
+            Self::PhysicalSelection => "physical_selection",
             Self::DirectPhysicalSearch => "direct_physical_search",
             Self::MemoExploration => "memo_exploration",
             Self::PhysicalExtraction => "physical_extraction",
@@ -44,7 +50,10 @@ impl OptimizerComponent {
     pub const fn kind(self) -> &'static str {
         match self {
             Self::SemanticNormalization | Self::QueryIrConstruction => "frontend",
-            Self::DirectPhysicalSearch | Self::MemoExploration => "search",
+            Self::DirectPhysicalSearch
+            | Self::MemoExploration
+            | Self::RegionOptimization
+            | Self::PhysicalSelection => "search",
             Self::PhysicalExtraction => "extraction",
             Self::WinnerVerification => "verification",
         }

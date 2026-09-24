@@ -22,7 +22,7 @@ pub(super) struct LocalContract {
     proofs: BTreeSet<EquivalenceProof>,
     selected_proofs: Box<[EquivalenceProof]>,
     origin: Option<RuleId>,
-    implementations: state::PlannerImplementationSet,
+    implementations: crate::physical::implementation::PlannerImplementationSet,
     search: Option<(PhysicalPayloadId, Fingerprint)>,
     pub operator: LogicalOperatorType,
     pub rules: BTreeSet<RuleId>,

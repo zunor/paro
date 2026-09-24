@@ -4,7 +4,6 @@
 //! Planner payloads, implementation metadata, and transformation savepoints.
 
 use super::*;
-use paro_common::types::LogicalType;
 
 /// Persistent ownership scope for one logical subtree.
 ///
@@ -609,6 +608,20 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) baseline_payload: PhysicalPayloadId,
 }
 
+impl PlannerOperatorMetadata {
+    pub(super) fn local_cost_model(&self) -> crate::physical::local_cost::LocalCostModel<'_> {
+        crate::physical::local_cost::LocalCostModel {
+            operator_type: self.operator_type,
+            local_cost: self.local_cost,
+            baseline: self.implementations.baseline,
+            resource_sensitive: self.grant_dependency == GrantDependencyDescriptor::Sensitive,
+            spillable: self.spillable,
+            perfect_hash: self.cost_facts.perfect_hash,
+            runtime_filter_key_types: &self.cost_facts.runtime_filter_key_types,
+        }
+    }
+}
+
 /// One immutable, aligned schema shared by metadata, requirement witnesses and
 /// boundary readers. Cloning a requirement must not copy every column/type.
 pub(super) type PlannerBindingLayout = Arc<paro_planner::operator::LogicalOutputLayout>;
@@ -626,161 +639,4 @@ pub(super) struct PlannerSearchImplementationMetadata {
     pub(super) provided: ProvidedProperties,
     pub(super) local_cost: SearchCost,
     pub(super) cost_facts: PlannerCostFacts,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct PlannerCostFacts {
-    pub(super) child_row_widths: Box<[u64]>,
-    /// Expression-local cardinality risk for materializing each child. Unlike
-    /// `child_rows_hard_upper`, this is statistical evidence used for ranking
-    /// only; it never proves capacity or query correctness.
-    pub(super) child_materialization_risk_rows: Box<[u64]>,
-    pub(super) output_row_width: u64,
-    /// Bytes participating in one hash key. Row-oriented hash work is
-    /// calibrated for one integral key; wider/composite keys pay separately.
-    pub(super) hash_key_width: Option<u64>,
-    /// Bytes physically read from base-table column sources for each scan
-    /// row. `None` identifies a non-scan structural operator.
-    pub(super) scan_access_width: Option<u64>,
-    /// Snapshot physical rows presented by a base-table source before
-    /// predicates. This is task-supply evidence only: it affects duration
-    /// ranking, never cardinality or a semantic upper bound.
-    pub(super) scan_physical_rows: Option<u64>,
-    pub(super) scan_work_source: Option<WorkSourceId>,
-    pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
-    pub(super) topn_capacity: Option<u64>,
-    pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
-    pub(super) runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity,
-    pub(super) runtime_filter_probe_source_rows: Option<paro_planner::plan::CardinalityEstimate>,
-    pub(super) runtime_filter_build_left_probe_source_rows:
-        Option<paro_planner::plan::CardinalityEstimate>,
-    pub(super) runtime_filter_probe_sources: Box<[PlannerRuntimeFilterSource]>,
-    pub(super) runtime_filter_build_left_probe_sources: Box<[PlannerRuntimeFilterSource]>,
-    /// Snapshot estimate of the distinct build-key domain. This ranks
-    /// runtime-filter benefit; it never proves capacity or correctness.
-    pub(super) runtime_filter_build_distinct_expected: Option<u64>,
-    /// Stable output identity used to resolve the current build domain from
-    /// the right child group at cost-composition time.
-    pub(super) runtime_filter_build_domain_column: Option<ColumnId>,
-    /// Identity of all equality-key expressions and their input layout.
-    /// Unlike a single-column NDV lookup this exists for composite keys.
-    pub(super) runtime_filter_build_key: Option<Fingerprint>,
-    /// Snapshot estimate for the logical-left key domain when a physical
-    /// implementation inverts build and probe.
-    pub(super) runtime_filter_build_left_distinct_expected: Option<u64>,
-    pub(super) runtime_filter_build_left_domain_column: Option<ColumnId>,
-    pub(super) runtime_filter_build_left_key: Option<Fingerprint>,
-    pub(super) runtime_filter_key_types: Box<[LogicalType]>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct ResolvedPlannerCostFacts {
-    pub(super) output_rows: CompactRange,
-    pub(super) child_rows: Box<[CompactRange]>,
-    pub(super) output_rows_hard_upper: Option<u64>,
-    pub(super) child_rows_hard_upper: Box<[Option<u64>]>,
-    pub(super) child_row_widths: Box<[u64]>,
-    pub(super) child_materialization_risk_rows: Box<[u64]>,
-    pub(super) output_row_width: u64,
-    pub(super) hash_key_width: Option<u64>,
-    pub(super) scan_access_width: Option<u64>,
-    pub(super) scan_physical_rows: Option<u64>,
-    pub(super) scan_work_source: Option<WorkSourceId>,
-    pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
-    pub(super) topn_capacity: Option<u64>,
-    pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
-    pub(super) runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity,
-    pub(super) runtime_filter_probe_source_rows: Option<CompactRange>,
-    pub(super) runtime_filter_build_left_probe_source_rows: Option<CompactRange>,
-    pub(super) runtime_filter_probe_sources: Box<[ResolvedRuntimeFilterSource]>,
-    pub(super) runtime_filter_build_left_probe_sources: Box<[ResolvedRuntimeFilterSource]>,
-    pub(super) runtime_filter_build_distinct_expected: Option<u64>,
-    /// Identity of the logical relation/key domain that produces a runtime
-    /// filter.  This is deliberately separate from the physical operator
-    /// fingerprint and from the evaluation occurrence: two physical
-    /// implementations of one Memo group share it, while nested joins with
-    /// the same operator shape do not alias one another.
-    pub(super) runtime_filter_build_domain_identity: Option<Fingerprint>,
-    pub(super) runtime_filter_build_left_domain_identity: Option<Fingerprint>,
-    pub(super) runtime_filter_build_left_distinct_expected: Option<u64>,
-    pub(super) runtime_filter_key_types: Box<[LogicalType]>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum RuntimeFilterProbeMultiplicity {
-    #[default]
-    Unknown,
-    /// Snapshot HLL evidence for the probe-key domain. This is an expected
-    /// distribution input only; it is neither a schema invariant nor a
-    /// correctness or memory proof.
-    EstimatedDistinct { keys: u64 },
-    /// Catalog uniqueness survives plan reuse and may tighten the risk range.
-    DeclaredUnique,
-}
-
-/// One physical rowset lane reached by a runtime-filter key lineage. Source
-/// cardinality and key multiplicity stay attached to the lane: summing them
-/// first loses a declared-unique proof when another lineage is non-unique.
-#[derive(Debug, Clone)]
-pub(super) struct PlannerRuntimeFilterSource {
-    pub(super) source: WorkSourceId,
-    pub(super) rows: paro_planner::plan::CardinalityEstimate,
-    pub(super) multiplicity: RuntimeFilterProbeMultiplicity,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ResolvedRuntimeFilterSource {
-    pub(super) source: WorkSourceId,
-    pub(super) rows: CompactRange,
-    pub(super) multiplicity: RuntimeFilterProbeMultiplicity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PlannerImplementationSet {
-    pub(super) baseline: PhysicalImplementationFlavor,
-    pub(super) perfect_hash_aggregate: bool,
-    pub(super) sort_range_join: bool,
-    pub(super) classic_ie_join: bool,
-    pub(super) hash_join_build_left: bool,
-    pub(super) hash_join_build_left_runtime_filter: bool,
-    pub(super) hash_join_runtime_filter: bool,
-    pub(super) partition_aggregate_window: bool,
-    pub(super) singleton_aggregate_projection: bool,
-    pub(super) external_cross_product: bool,
-}
-
-impl PlannerImplementationSet {
-    pub(super) const STRUCTURAL: Self = Self {
-        baseline: PhysicalImplementationFlavor::Structural,
-        perfect_hash_aggregate: false,
-        sort_range_join: false,
-        classic_ie_join: false,
-        hash_join_build_left: false,
-        hash_join_build_left_runtime_filter: false,
-        hash_join_runtime_filter: false,
-        partition_aggregate_window: false,
-        singleton_aggregate_projection: false,
-        external_cross_product: false,
-    };
-
-    pub(super) fn supports(self, flavor: PhysicalImplementationFlavor) -> bool {
-        match flavor {
-            PhysicalImplementationFlavor::PerfectHashAggregate => self.perfect_hash_aggregate,
-            PhysicalImplementationFlavor::SortRangeJoin => self.sort_range_join,
-            PhysicalImplementationFlavor::ClassicIeJoin => self.classic_ie_join,
-            PhysicalImplementationFlavor::HashJoinBuildLeft => self.hash_join_build_left,
-            PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter => {
-                self.hash_join_build_left_runtime_filter
-            }
-            PhysicalImplementationFlavor::HashJoinRuntimeFilter => self.hash_join_runtime_filter,
-            PhysicalImplementationFlavor::PartitionAggregateWindow => {
-                self.partition_aggregate_window
-            }
-            PhysicalImplementationFlavor::SingletonAggregateProjection => {
-                self.singleton_aggregate_projection
-            }
-            PhysicalImplementationFlavor::CrossProductExternal => self.external_cross_product,
-            _ => false,
-        }
-    }
 }

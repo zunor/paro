@@ -17,7 +17,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use crate::physical::{ObjectiveProfile, ResourceGrantClass, SpillPolicy};
+#[cfg(test)]
+use crate::cascades::{rules::WorkSourceId, LocalOperatorWork};
+#[cfg(test)]
+use crate::physical::SpillPolicy;
+use crate::physical::{ObjectiveProfile, ResourceGrantClass};
 use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
@@ -27,7 +31,7 @@ use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::binder::Binder;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{AntiJoinMode, Join, JoinComparisonType, JoinType};
+use paro_planner::operator::join::{Join, JoinComparisonType, JoinType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator, LogicalOperatorType};
 use paro_planner::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan};
 use paro_storage::statistics::ColumnStatistics;
@@ -45,22 +49,20 @@ use crate::statistics::propagator::StatisticsPropagator;
 use crate::subquery::scalar_aggregate_window;
 
 use super::budget::{BudgetDimension, SearchBudget};
-use super::calibration::{
-    LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_HASH_KEY_BYTE_BLOCK,
-    OP_RUNTIME_FILTER_APPLY_ROW, OP_RUNTIME_FILTER_BUILD_ROW, OP_TUPLE_BYTE_BLOCK,
-};
+use super::calibration::{MachineCalibrationBundle, ParallelWorkProfile};
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility, GroupSchema};
+#[cfg(test)]
 use super::cost::ResourceDimension;
-use super::cost::{CompactRange, ScoreSummary, SearchCost};
+use super::cost::{CompactRange, SearchCost};
 use super::engine::{
     selected_proof_rule_ids, CascadesEngine, PricedIncumbent, SearchMode, SearchStopReason,
     SeedPlan,
 };
 use super::ids::{
     AdmissibleGrantSetId, BaseRelationId, CandidateId, ColumnId, Fingerprint, GroupId,
-    ImplementationId, LogicalExprId, LogicalPayloadId, OpClassId, OptimizationContextId,
-    PhysicalExprId, PhysicalPayloadId, PropertySetId, QualityPolicyId, ResourceGrantClassId,
-    RuleId, ScalarExprId, SnapshotId, StableFingerprintBuilder,
+    ImplementationId, LogicalExprId, LogicalPayloadId, OptimizationContextId, PhysicalExprId,
+    PhysicalPayloadId, PropertySetId, QualityPolicyId, ResourceGrantClassId, RuleId, ScalarExprId,
+    SnapshotId, StableFingerprintBuilder,
 };
 use super::memo::{
     CardinalityEnvelope, CardinalityRecipeKind, ChildWinnerRef, CteReferenceDomain,
@@ -91,7 +93,7 @@ use super::rules::{
     PatternEnumerationCompletion, PatternOperand, PatternRead, PhysicalCandidate,
     PhysicalImplementation, QualityDependency, RootDispatch, RuleContext, RulePromise,
     SidewaysFilterSource, TaskSupplyContract, TransformContext, TransformationBudgetClass,
-    TransformationPreflight, TransformationRule, WorkSourceId, AGGREGATE_DIMENSION_DEFERRAL_RULE,
+    TransformationPreflight, TransformationRule, AGGREGATE_DIMENSION_DEFERRAL_RULE,
     AGGREGATE_DIMENSION_SHARING_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
     AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
     AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_DEMAND_PUSHDOWN_RULE,

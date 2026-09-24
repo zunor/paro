@@ -75,7 +75,7 @@ ORDER BY table_name, constraint_name, ordinal_position
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-data-dir", type=Path, required=True)
-    parser.add_argument("--optimizer-search-policy", choices=("regional", "quality", "budgeted"), default="quality")
+    parser.add_argument("--optimizer-search-policy", choices=("pipeline", "regional", "quality", "budgeted"), default="quality")
     parser.add_argument("--optimizer-verify", choices=("on", "off"), default="on")
     parser.add_argument("--disabled-optimizer-rules", default="", help=(
         "Comma-separated public rule names for a registered ablation; recorded as "

@@ -14,17 +14,12 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 
-#[cfg(test)]
 use paro_common::error::Result;
-#[cfg(test)]
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::Expression;
-#[cfg(test)]
 use paro_planner::expression::{AggregateExpression, AggregateType, ColumnRefExpression};
 use paro_planner::operator::{Aggregate, ColumnBinding};
-#[cfg(test)]
 use paro_planner::operator::{ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator};
-#[cfg(test)]
 use paro_planner::plan::{NodeStats, OwnedLogicalPlan, PlanNodeId};
 
 use crate::expression::traversal::visit_expression;
@@ -41,10 +36,8 @@ pub(crate) fn root_eligible<Child>(aggregate: &Aggregate<Child>) -> bool {
         && aggregate.has_plain_grouping_domain()
 }
 
-/// Produce one root-local aggregate alternative. Memo owns traversal and rule
-/// scheduling; recursively rewriting descendants here would duplicate work
-/// and make one firing consume unrelated equivalence groups.
-#[cfg(test)]
+/// Produce one root-local aggregate alternative. The caller owns traversal;
+/// recursively rewriting descendants here would duplicate region decisions.
 pub fn optimize_plan(
     plan: OwnedLogicalPlan,
     bind_context: &BindContext,
@@ -61,7 +54,6 @@ enum ExpressionDomain {
     Invalid,
 }
 
-#[cfg(test)]
 struct DimensionDeferral {
     projection_depth: usize,
     partial_groups: Vec<Expression>,
@@ -71,19 +63,16 @@ struct DimensionDeferral {
     fact_conditions: Vec<FactConditionRewrite>,
 }
 
-#[cfg(test)]
 enum DeferredOuterGroup {
     Partial { ordinal: usize },
     Dimension(Box<Expression>),
 }
 
-#[cfg(test)]
 struct FactConditionRewrite {
     key_ordinal: usize,
     fact_on_left: bool,
 }
 
-#[cfg(test)]
 struct DimensionRewriteInput {
     root_id: PlanNodeId,
     root_stats: NodeStats,
@@ -91,7 +80,6 @@ struct DimensionRewriteInput {
     join: ComparisonJoin,
 }
 
-#[cfg(test)]
 fn rewrite_node(
     plan: OwnedLogicalPlan,
     bind_context: &BindContext,
@@ -111,7 +99,6 @@ fn rewrite_node(
 /// post-join merge. The dimension is moved, not copied: unmatched fact states
 /// disappear at the final inner join, so an earlier existence join would be
 /// both redundant and more expensive.
-#[cfg(test)]
 fn recognize(plan: &OwnedLogicalPlan) -> Option<DimensionDeferral> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
@@ -288,7 +275,6 @@ fn recognize(plan: &OwnedLogicalPlan) -> Option<DimensionDeferral> {
     })
 }
 
-#[cfg(test)]
 impl DimensionRewriteInput {
     /// Consume the exact operator spine recognized above without cloning it.
     /// A future recognizer drift reconstructs and returns the original plan;
@@ -328,7 +314,6 @@ impl DimensionRewriteInput {
     }
 }
 
-#[cfg(test)]
 fn take_join_below_projections(
     plan: OwnedLogicalPlan,
     projection_depth: usize,
@@ -364,7 +349,6 @@ fn take_join_below_projections(
     }
 }
 
-#[cfg(test)]
 fn apply(
     input: DimensionRewriteInput,
     witness: DimensionDeferral,
@@ -501,7 +485,6 @@ fn inline_projection<Child>(
     (!invalid.get()).then_some(result)
 }
 
-#[cfg(test)]
 fn expression_is_movable(expression: &Expression) -> bool {
     let properties = expression.evaluation_properties();
     properties.can_share_evaluation() && !properties.is_reorder_fence()

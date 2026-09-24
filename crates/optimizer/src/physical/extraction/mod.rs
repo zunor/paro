@@ -190,9 +190,9 @@ impl PhysicalPlanExtractor {
         self
     }
 
-    /// Query extraction is only valid when every relational node is backed by
-    /// a verified Memo winner. Utility lowering deliberately does not enable
-    /// this mode because it never enters the relational Memo.
+    /// Query extraction requires an explicit implementation/resource contract
+    /// for every selected occurrence, from either Memo or direct selection.
+    /// Utility lowering does not enable this relational contract requirement.
     pub(crate) fn requiring_winner_contracts(mut self) -> Self {
         self.require_winner_contracts = true;
         self

@@ -34,7 +34,7 @@ pub mod properties {
 pub mod region;
 pub mod rules;
 pub mod scalar;
-mod scalar_lowering;
+pub(crate) mod scalar_lowering;
 pub mod tasks;
 pub(crate) use scalar_lowering::BindingCatalog;
 pub(crate) use scalar_lowering::{encode_value, physical_expression_fingerprint};
