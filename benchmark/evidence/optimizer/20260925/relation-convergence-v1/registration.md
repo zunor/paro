@@ -51,3 +51,21 @@ the `post-domain-selectivity` directory after clean build and correctness
 checks. Total retained capacity becomes 32MiB for both cohorts plus 2MiB for
 known-cardinality fixtures. Cross-cohort deltas are exploratory, not matched
 causal speedups. The independent 4/16-row expectations remain unchanged.
+
+## Breadth screen registration
+
+After both timing cohorts finish, run the maintained collector over TPC-DS
+01–99 for pipeline/joint, then quality/joint, using the same binary, SF1 seed,
+DuckDB and resource envelope. This is an exploratory correctness/coverage
+screen, **not** the ordered full CORPORA gate or a performance certification.
+Enable optimizer_verify; use two fresh blocks, one warmup, one ABBA round,
+one separate Detail block, 100 bootstrap draws and a 20s statement timeout.
+Keep independent query failures and continue to other registered queries;
+do not retry failed queries until green. Timeout, unsupported SQL and result
+differences are separate failures, not exclusions. A numeric difference does
+not inherit a historical Q39 certificate for a different build or plan.
+
+Retain bounded collector packages under `breadth/`, at most 64MiB total.
+Do not compare these verifier-on, low-sample timings with the latency pilot.
+TPC-H remains a separate gate: its SF1 `.tbl` input is not installed in the
+selected environment; no smaller-scale data may use the SF1 expected results.
