@@ -204,6 +204,17 @@ struct InlineKey {
     null_mask: u64,
 }
 
+impl InlineKey {
+    fn from_prepared(source: &TupleScatterSource<'_>, row: usize) -> Result<Self> {
+        let mut bytes = [0; INLINE_KEY_MAX_BYTES];
+        let null_mask = source.copy_fixed_key(row, &mut bytes)?;
+        Ok(Self {
+            bits: u64::from_le_bytes(bytes),
+            null_mask,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InlineKeyLayout {
     group_types: Vec<LogicalType>,
@@ -234,6 +245,7 @@ impl InlineKeyLayout {
         })
     }
 
+    #[cfg(test)]
     fn encode_row(&self, groups: &Chunk, row_idx: usize) -> Result<InlineKey> {
         if row_idx >= groups.size() {
             return Err(paro_error::internal(format!(
@@ -760,8 +772,7 @@ impl GroupedAggregateHashTable {
         let mut new_group_count = 0usize;
         let observe_prefix_probes = self.hash_contract.lookup_is_prefix();
         let mut max_prefix_probe_distance = 0usize;
-        let inline_key_layout = self.inline_key_layout.clone();
-        if let Some(inline_layout) = inline_key_layout {
+        if self.inline_key_layout.is_some() {
             let inline_key_data = self.inline_key_storage_mut_ptr()?;
             for input_idx in 0..input_row_count {
                 let row_idx = source_row_at(input_idx);
@@ -770,7 +781,7 @@ impl GroupedAggregateHashTable {
                 } else {
                     hash_at(input_idx, row_idx)?
                 };
-                let inline_key = inline_layout.encode_row(groups, row_idx)?;
+                let inline_key = InlineKey::from_prepared(&scatter_source, row_idx)?;
                 let mut slot = self.slot_for_hash(hash);
                 let mut probe_distance = 0usize;
                 loop {
@@ -2150,6 +2161,7 @@ fn inline_key_component_width(logical_type: &LogicalType) -> Option<usize> {
     }
 }
 
+#[cfg(test)]
 fn write_inline_component_bytes(
     key_bytes: &mut [u8; INLINE_KEY_MAX_BYTES],
     offset: usize,

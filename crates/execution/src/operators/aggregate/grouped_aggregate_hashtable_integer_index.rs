@@ -344,9 +344,11 @@ impl GroupedAggregateHashTable {
         new_groups.set_len(groups.size());
         let new_group_data = new_groups.as_mut_slice().as_mut_ptr();
         let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
-        let inline_key_layout = self.inline_key_layout.clone().ok_or_else(|| {
-            paro_error::internal("Adaptive integer aggregate requires inline key storage")
-        })?;
+        if self.inline_key_layout.is_none() {
+            return Err(paro_error::internal(
+                "Adaptive integer aggregate requires inline key storage",
+            ));
+        }
         let inline_key_data = self.inline_key_storage_mut_ptr()?;
         let mut new_state_ptrs = Vec::with_capacity(possible_new_groups);
         let mut new_group_count = 0usize;
@@ -361,7 +363,7 @@ impl GroupedAggregateHashTable {
             }
 
             let hash = index.kind.hash(view, row_idx);
-            let inline_key = inline_key_layout.encode_row(groups, row_idx)?;
+            let inline_key = InlineKey::from_prepared(&scatter_source, row_idx)?;
             let mut hash_slot = self.slot_for_hash(hash);
             while self.entries[hash_slot].is_occupied() {
                 hash_slot = (hash_slot + 1) & self.bitmask;

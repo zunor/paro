@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-data-dir", type=Path, required=True)
     parser.add_argument("--optimizer-search-policy", choices=("quality", "budgeted"), default="quality")
     parser.add_argument("--optimizer-verify", choices=("on", "off"), default="on")
+    parser.add_argument("--disabled-optimizer-rules", default="", help=(
+        "Comma-separated public rule names for a registered ablation; recorded as "
+        "a search-domain change, not a production performance improvement."
+    ))
     parser.add_argument("--listen", default="127.0.0.1:6432")
     parser.add_argument("--database", default="postgres")
     parser.add_argument("--user", default="paro")
@@ -477,6 +481,7 @@ def configure_paro(connection: psycopg.Connection[Any], args: argparse.Namespace
     with connection.cursor() as cursor:
         cursor.execute(sql.SQL("SET optimizer_verify = {}").format(sql.Literal(args.optimizer_verify == "on")))
         cursor.execute(sql.SQL("SET optimizer_search_policy = {}").format(sql.Literal(args.optimizer_search_policy)))
+        cursor.execute(sql.SQL("SET disabled_optimizer_rules = {}").format(sql.Literal(args.disabled_optimizer_rules)))
         cursor.execute(sql.SQL("SET threads = {}").format(sql.Literal(args.threads)))
         cursor.execute(
             sql.SQL("SET memory_limit = {}").format(sql.Literal(args.memory_limit))
@@ -830,6 +835,7 @@ def main() -> int:
             ),
             "optimizer_verify": args.optimizer_verify == "on",
             "optimizer_search_policy": args.optimizer_search_policy,
+            "disabled_optimizer_rules": args.disabled_optimizer_rules,
             "planning_dop": 1,
             "execution_dop": args.threads,
             "cohorts": {

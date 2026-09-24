@@ -72,6 +72,93 @@ fn lookup_entries_only_pay_for_inline_keys_when_supported() {
 }
 
 #[test]
+fn compact_prepared_keys_match_independent_scalar_encoding() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let rows = 16;
+    let values = [
+        (LogicalType::TinyInt, Value::TinyInt(-17)),
+        (LogicalType::UTinyInt, Value::UTinyInt(241)),
+        (LogicalType::SmallInt, Value::SmallInt(-12345)),
+        (LogicalType::USmallInt, Value::USmallInt(54321)),
+        (LogicalType::Integer, Value::Integer(i32::MIN)),
+        (LogicalType::UInteger, Value::UInteger(u32::MAX)),
+        (LogicalType::BigInt, Value::BigInt(i64::MIN)),
+        (LogicalType::UBigInt, Value::UBigInt(u64::MAX)),
+    ];
+    let mut vectors = values
+        .iter()
+        .map(|(ty, value)| {
+            let mut vector =
+                Vector::try_constant_from_value(ty.clone(), value.clone(), rows, allocator.clone())
+                    .unwrap();
+            vector.try_flatten().unwrap();
+            vector.try_set_null(3, true).unwrap();
+            vector.try_set_null(9, true).unwrap();
+            Arc::new(vector)
+        })
+        .collect::<Vec<_>>();
+    vectors.push(Arc::new(
+        Vector::try_sequence(-9, 3, rows, allocator.clone()).unwrap(),
+    ));
+    vectors.push(Arc::new(
+        Vector::try_constant(LogicalType::BigInt, -99_i64, rows, allocator.clone()).unwrap(),
+    ));
+    // Widths exercise both single and composite packed keys, with constants,
+    // flat vectors, sequences, repeated and nested dictionary selections.
+    for indices in [
+        vec![0, 1, 2, 3],
+        vec![4, 5],
+        vec![6],
+        vec![7],
+        vec![8],
+        vec![9],
+    ] {
+        for nesting in 0..3 {
+            let columns = indices
+                .iter()
+                .map(|&index| {
+                    let mut column = vectors[index].clone();
+                    for _ in 0..nesting {
+                        let selection = SelectionVector::try_from_indices(
+                            (0..rows).map(|i| ((i * 3) % rows) as u32).collect(),
+                            allocator.clone(),
+                        )
+                        .unwrap();
+                        column = Arc::new(Vector::try_dictionary(column, selection).unwrap());
+                    }
+                    column
+                })
+                .collect::<Vec<_>>();
+            let types = columns
+                .iter()
+                .map(|col| col.logical_type().clone())
+                .collect::<Vec<_>>();
+            let groups = Chunk::from_arc_vectors(columns, allocator.clone());
+            let table =
+                GroupedAggregateHashTable::new(types.clone(), vec![], vec![], allocator.clone())
+                    .unwrap();
+            let prepared = table.layout.prepare_scatter(&groups).unwrap();
+            let scalar = InlineKeyLayout::try_new(&types).unwrap();
+            for row in 0..rows {
+                let mut bytes = [0xcc; INLINE_KEY_MAX_BYTES];
+                let null_mask = prepared.copy_fixed_key(row, &mut bytes).unwrap();
+                assert_eq!(
+                    InlineKey {
+                        bits: u64::from_le_bytes(bytes),
+                        null_mask
+                    },
+                    scalar.encode_row(&groups, row).unwrap()
+                );
+            }
+            assert_eq!(prepared.out_of_line_bytes_upper_bound(None).unwrap(), 0);
+            assert!(prepared
+                .out_of_line_bytes_upper_bound(Some(&[rows as u32]))
+                .is_err());
+        }
+    }
+}
+
+#[test]
 fn growth_is_fully_precharged_before_the_table_owner_is_entered() {
     let pool = Arc::new(QueryMemoryPool::new(1 << 20));
     let owner: Arc<dyn MemoryOwner> = pool.clone();
