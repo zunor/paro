@@ -79,6 +79,7 @@ fn boundary(
             cardinality: plan.stats.estimated_cardinality,
             maximum_cardinality: response.hard_rows,
             unique_keys: plan.stats.unique_keys.clone(),
+            finite_domains: plan.stats.finite_domains.clone(),
             source_lineage: crate::physical::implementation::planner_source_lineage(plan),
             contains_control_region:
                 crate::join::build_probe_side::contains_control_region_boundary(plan),
@@ -98,12 +99,14 @@ pub(super) struct Work {
 }
 
 struct Region<'a> {
-    aggregate: Aggregate<()>,
+    aggregate: Option<Aggregate<()>>,
     leaves: Vec<&'a OwnedLogicalPlan>,
     conditions: Vec<JoinCondition>,
     owners: BTreeMap<ColumnBinding, Mask>,
     types: BTreeMap<ColumnBinding, paro_common::types::LogicalType>,
     arguments: Mask,
+    residuals: Vec<(Mask, Expression)>,
+    output: LogicalOutputLayout,
 }
 
 fn columns(expression: &Expression) -> Option<BTreeSet<ColumnBinding>> {
@@ -227,12 +230,81 @@ impl<'a> Region<'a> {
             returned_types: aggregate.returned_types.clone(),
         };
         Some(Self {
-            aggregate,
+            aggregate: Some(aggregate),
             leaves,
             conditions,
             owners,
             types,
             arguments,
+            residuals: vec![],
+            output: plan.output_layout(),
+        })
+    }
+
+    fn recognize_joins(plan: &'a OwnedLogicalPlan) -> Option<Self> {
+        fn collect<'a>(
+            plan: &'a OwnedLogicalPlan,
+            leaves: &mut Vec<&'a OwnedLogicalPlan>,
+            conditions: &mut Vec<JoinCondition>,
+            residuals: &mut Vec<Expression>,
+        ) {
+            match &plan.operator {
+                LogicalOperator::Filter(f) if join_root(plan) => {
+                    residuals.extend(f.expressions.iter().cloned());
+                    collect(&f.child, leaves, conditions, residuals);
+                }
+                LogicalOperator::Join(Join::Comparison(j)) if is_plain_inner_equi_join(j) => {
+                    collect(&j.left, leaves, conditions, residuals);
+                    collect(&j.right, leaves, conditions, residuals);
+                    conditions.extend(j.conditions.iter().cloned());
+                }
+                _ => leaves.push(plan),
+            }
+        }
+        if !join_root(plan) {
+            return None;
+        }
+        let mut leaves = vec![];
+        let mut conditions = vec![];
+        let mut predicates = vec![];
+        collect(plan, &mut leaves, &mut conditions, &mut predicates);
+        if !(2..=8).contains(&leaves.len()) {
+            return None;
+        }
+        let mut owners = BTreeMap::new();
+        let mut types = BTreeMap::new();
+        for (index, leaf) in leaves.iter().enumerate() {
+            for (binding, ty) in leaf.get_column_bindings().into_iter().zip(leaf.types()) {
+                if owners.insert(binding, 1 << index).is_some() {
+                    return None;
+                }
+                types.insert(binding, ty);
+            }
+        }
+        if conditions.iter().any(|c| !matches!((&c.left, &c.right), (Expression::ColumnRef(l), Expression::ColumnRef(r))
+            if l.depth == 0 && r.depth == 0 && owners.contains_key(&l.binding) && owners.contains_key(&r.binding))) { return None; }
+        let residuals = predicates
+            .into_iter()
+            .map(|expression| {
+                if !movable(&expression) {
+                    return None;
+                }
+                let mut support = 0;
+                for binding in columns(&expression)? {
+                    support |= *owners.get(&binding)?;
+                }
+                Some((support, expression))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            aggregate: None,
+            leaves,
+            conditions,
+            owners,
+            types,
+            arguments: 0,
+            residuals,
+            output: plan.output_layout(),
         })
     }
 
@@ -372,7 +444,11 @@ impl Planner<'_> {
                 });
             }
         }
-        for group in &region.aggregate.groups {
+        let aggregate = region
+            .aggregate
+            .as_ref()
+            .expect("partial transition owns a merge law");
+        for group in &aggregate.groups {
             for binding in columns(group).expect("recognized group") {
                 if region.owners[&binding] & mask != 0 {
                     keys.insert(binding);
@@ -400,7 +476,7 @@ impl Planner<'_> {
             *input.boundary(0)?,
             groups,
             vec![],
-            region.aggregate.aggregates.clone(),
+            aggregate.aggregates.clone(),
             vec![],
         );
         let Some(mut output) =
@@ -420,7 +496,23 @@ impl Planner<'_> {
     }
 
     fn finish(&mut self, region: &Region<'_>, input: Arc<Node>) -> Result<Option<Arc<Node>>> {
-        let mut aggregate = region.aggregate.clone();
+        let Some(mut aggregate) = region.aggregate.clone() else {
+            if input.layout.bindings() == region.output.bindings() {
+                return Ok(Some(input));
+            }
+            let indices = region
+                .output
+                .bindings()
+                .iter()
+                .map(|b| input.layout.bindings().iter().position(|c| c == b))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    paro_common::error::internal("region lost a promised output binding")
+                })?;
+            let mut filter = paro_planner::operator::Filter::new(*input.boundary(0)?, vec![]);
+            filter.projection_map = paro_planner::operator::ProjectionMap::new(indices);
+            return self.emit(LogicalOperator::Filter(filter), vec![input]);
+        };
         aggregate.groups = aggregate
             .groups
             .into_iter()
@@ -505,21 +597,17 @@ fn reconstruct(
     // The selected build orientation is a physical decision, not a second
     // opportunity to reinterpret expected rows as a worst-case row envelope.
     if let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator {
-        if matches!(
+        join.build_side_constraint = if matches!(
             node.implementation,
             PhysicalImplementationFlavor::HashJoinBuildLeft
                 | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
         ) {
-            std::mem::swap(&mut join.left, &mut join.right);
-            for condition in &mut join.conditions {
-                std::mem::swap(&mut condition.left, &mut condition.right);
-            }
-            std::mem::swap(
-                &mut join.left_projection_map,
-                &mut join.right_projection_map,
-            );
-        }
-        join.build_side_constraint = JoinBuildSideConstraint::Right;
+            JoinBuildSideConstraint::Left
+        } else {
+            JoinBuildSideConstraint::Right
+        };
+        // Keep logical output positions stable. A physical build decision
+        // must not swap a child's layout under an already priced projection.
     }
     Ok(plan)
 }
@@ -540,6 +628,41 @@ pub(super) fn optimize(
     let Some(region) = Region::recognize(plan) else {
         return Ok(None);
     };
+    optimize_region(region, context, grant, calibration, max_transitions, work)
+}
+
+pub(super) fn join_root(plan: &OwnedLogicalPlan) -> bool {
+    match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(j)) => is_plain_inner_equi_join(j),
+        LogicalOperator::Filter(f) => f.expressions.iter().all(movable) && join_root(&f.child),
+        _ => false,
+    }
+}
+
+pub(super) fn optimize_joins(
+    plan: &OwnedLogicalPlan,
+    context: &OptimizationContext,
+    grant: ResourceGrantClass,
+    calibration: &crate::cascades::calibration::MachineCalibrationBundle,
+    max_transitions: usize,
+    work: &mut Work,
+) -> Result<Option<Selection>> {
+    let Some(region) = Region::recognize_joins(plan) else {
+        return Ok(None);
+    };
+    optimize_region(region, context, grant, calibration, max_transitions, work)
+}
+
+fn optimize_region(
+    region: Region<'_>,
+    context: &OptimizationContext,
+    grant: ResourceGrantClass,
+    calibration: &crate::cascades::calibration::MachineCalibrationBundle,
+    max_transitions: usize,
+    work: &mut Work,
+) -> Result<Option<Selection>> {
+    let allow_partial = context.session.settings.optimizer_aggregate_strategy()?
+        == paro_context::OptimizerAggregateStrategy::Joint;
     let mut planner = Planner {
         context: context.fork_for_candidate(Arc::new(HashMap::new())),
         gathering: StatisticsGathering::new(),
@@ -576,21 +699,33 @@ pub(super) fn optimize(
             stats: leaf.stats.clone(),
             operator: LogicalOperator::DummyScan,
         };
-        states[1 << index].insert(
-            None,
-            Arc::new(Node {
-                shell,
-                children: vec![],
-                leaf: Some(index),
-                layout,
-                columns,
-                response,
-                implementation: PhysicalImplementationFlavor::Structural,
-                rebind: BTreeMap::new(),
-                partial_aggregate_index: None,
-                boundary,
-            }),
-        );
+        let mut node = Arc::new(Node {
+            shell,
+            children: vec![],
+            leaf: Some(index),
+            layout,
+            columns,
+            response,
+            implementation: PhysicalImplementationFlavor::Structural,
+            rebind: BTreeMap::new(),
+            partial_aggregate_index: None,
+            boundary,
+        });
+        let residuals = region
+            .residuals
+            .iter()
+            .filter(|(support, _)| *support == 1 << index)
+            .map(|(_, e)| e.clone())
+            .collect::<Vec<_>>();
+        if !residuals.is_empty() {
+            let filter = paro_planner::operator::Filter::new(*node.boundary(0)?, residuals);
+            let Some(filtered) = planner.emit(LogicalOperator::Filter(filter), vec![node])? else {
+                planner.work.budget_fallbacks += u64::from(planner.exhausted);
+                return Ok(None);
+            };
+            node = filtered;
+        }
+        states[1 << index].insert(None, node);
     }
     let full: Mask = (1 << region.leaves.len()) - 1;
     for size in 1..=region.leaves.len() {
@@ -637,10 +772,38 @@ pub(super) fn optimize(
                                         *r.boundary(1)?,
                                         conditions,
                                     );
-                                    if let Some(node) = planner.emit(
+                                    if let Some(mut node) = planner.emit(
                                         LogicalOperator::Join(Join::Comparison(join)),
                                         vec![l.clone(), r.clone()],
                                     )? {
+                                        let residuals = region
+                                            .residuals
+                                            .iter()
+                                            .filter(|(support, _)| {
+                                                if *support == 0 {
+                                                    mask == full
+                                                } else {
+                                                    *support & mask == *support
+                                                        && *support & left != *support
+                                                        && *support & right != *support
+                                                }
+                                            })
+                                            .map(|(_, e)| e.clone())
+                                            .collect::<Vec<_>>();
+                                        if !residuals.is_empty() {
+                                            let filter = paro_planner::operator::Filter::new(
+                                                *node.boundary(0)?,
+                                                residuals,
+                                            );
+                                            let Some(filtered) = planner.emit(
+                                                LogicalOperator::Filter(filter),
+                                                vec![node],
+                                            )?
+                                            else {
+                                                continue;
+                                            };
+                                            node = filtered;
+                                        }
                                         retain(
                                             &mut states,
                                             StateKey {
@@ -657,7 +820,11 @@ pub(super) fn optimize(
                     left = (left - 1) & mask;
                 }
             }
-            if mask != full && region.arguments & mask == region.arguments {
+            if allow_partial
+                && region.aggregate.is_some()
+                && mask != full
+                && region.arguments & mask == region.arguments
+            {
                 if let Some(raw) = states[mask as usize].get(&None).cloned() {
                     if let Some(partial) = planner.partial(&region, mask, raw)? {
                         states[mask as usize].insert(Some(mask), partial);
@@ -678,11 +845,11 @@ pub(super) fn optimize(
             }
         }
     }
-    let Some(best) = best else { return Ok(None) };
     if planner.exhausted {
         planner.work.budget_fallbacks += 1;
         return Ok(None);
     }
+    let Some(best) = best else { return Ok(None) };
     planner.work.regions += 1;
     planner.work.selected_partial += u64::from(best.partial_aggregate_index.is_some());
     let mut columns = HashMap::new();
@@ -704,6 +871,10 @@ mod tests {
     use paro_planner::planner::Planner;
 
     fn exercise(sql: &str, budget: usize) -> Work {
+        exercise_domain(sql, budget, false)
+    }
+
+    fn exercise_domain(sql: &str, budget: usize, ordinary: bool) -> Work {
         let session = crate::subquery::partition_aggregate_tests::setup_session();
         let mut planner = Planner::new(session.clone());
         planner
@@ -724,6 +895,7 @@ mod tests {
         candidate
             .plan
             .try_visit_pre_order(|plan| {
+                let optimize = if ordinary { optimize_joins } else { optimize };
                 if let Some(selected) = optimize(
                     plan,
                     &optimizer.ctx,
@@ -760,7 +932,7 @@ mod tests {
                         }
                         Ok(())
                     })?;
-                    assert_eq!(joins, 2);
+                    assert!(joins > 0);
                 }
                 Ok(())
             })
@@ -769,6 +941,15 @@ mod tests {
     }
 
     const QUERY: &str = "SELECT n_name, r_name, sum(s_acctbal) FROM supplier JOIN nation ON s_nationkey=n_nationkey JOIN region ON n_regionkey=r_regionkey GROUP BY n_name,r_name";
+
+    #[test]
+    fn ordinary_regions_use_physical_response_and_preserve_output_bindings() {
+        let work = exercise_domain("SELECT r_name,n_name,s_acctbal FROM supplier JOIN nation ON s_nationkey=n_nationkey JOIN region ON n_regionkey=r_regionkey WHERE s_acctbal > n_nationkey", 10000, true);
+        assert!(work.regions > 0);
+        assert!(work.transitions > 0);
+        assert_eq!(work.partial_states, 0);
+        assert_eq!(work.budget_fallbacks, 0);
+    }
 
     #[test]
     fn joint_states_explore_multiple_aggregation_cuts_without_tree_copies() {

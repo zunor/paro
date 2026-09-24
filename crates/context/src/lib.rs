@@ -47,7 +47,9 @@ pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
 pub use diagnostic_environment::{
     initialize_diagnostic_environment, snapshot as diagnostic_environment,
 };
-pub use effective_settings::{EffectiveSettings, OptimizerSearchPolicy};
+pub use effective_settings::{
+    EffectiveSettings, OptimizerAggregateStrategy, OptimizerSearchPolicy,
+};
 pub use execution_resources::ExecutionResources;
 pub use memory_governance::{
     QueryMemoryBudgetSpec, QueryMemoryCoordinator, QueryMemoryRegistration, QueryMemoryTarget,

@@ -85,12 +85,38 @@ impl Optimizer {
         plan = crate::construction::predicates(plan, &mut Default::default());
         let candidate = self.settle_query_candidate(plan)?;
         self.ctx.column_stats = candidate.column_stats;
+        let mut roots = std::collections::HashSet::new();
+        let mut pending = vec![(&candidate.plan, false)];
+        while let Some((node, inside)) = pending.pop() {
+            let is_region = aggregate_region::join_root(node);
+            if is_region && !inside {
+                roots.insert(node.id);
+            }
+            pending.extend(node.children().into_iter().map(|child| (child, is_region)));
+        }
+        let mut join_work = aggregate_region::Work::default();
+        let joined = candidate.plan.try_map_post_order(|input| {
+            if roots.contains(&input.id) {
+                if let Some(selected) = aggregate_region::optimize_joins(
+                    &input,
+                    &self.ctx,
+                    grant,
+                    &self.calibration,
+                    self.budget.max_join_connected_pairs as usize,
+                    &mut join_work,
+                )? {
+                    self.ctx.column_stats_mut().extend(selected.columns);
+                    return Ok(selected.plan);
+                }
+            }
+            Ok(input)
+        })?;
         plan = JoinOrderOptimizer::new(self.ctx.cost_model.defaults.clone())
             .with_search_budget(&self.budget)
             .with_physical_pricing(&self.calibration)?
             .optimize_regions(
                 self.ctx.session.as_ref(),
-                candidate.plan,
+                joined,
                 &self.ctx.column_stats,
                 &self.ctx.bind_context,
             )?;
@@ -225,6 +251,12 @@ impl Optimizer {
                 ("pipeline_joint_transitions", region_work.transitions),
                 ("pipeline_partial_states", region_work.partial_states),
                 ("pipeline_selected_partial", region_work.selected_partial),
+                ("pipeline_response_join_regions", join_work.regions),
+                ("pipeline_response_join_transitions", join_work.transitions),
+                (
+                    "pipeline_response_join_fallbacks",
+                    join_work.budget_fallbacks,
+                ),
                 (
                     "pipeline_joint_budget_fallbacks",
                     region_work.budget_fallbacks,

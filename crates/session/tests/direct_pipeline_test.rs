@@ -77,6 +77,11 @@ async fn direct_pipeline_executes_relational_boundaries_without_memo() {
         assert_eq!(rows(&sink), expected, "{sql}");
         assert_eq!(sink.assert_single_result().types, types, "{sql}");
         assert_eq!(sink.assert_single_result().names, names, "{sql}");
+        exec_ok(&mut session, &mut sink, "SET optimizer_aggregate_strategy='single_stage'").await;
+        exec_ok(&mut session, &mut sink, sql).await;
+        assert_eq!(rows(&sink), expected, "single_stage: {sql}");
+        assert_eq!(sink.assert_single_result().types, types, "{sql}");
+        exec_ok(&mut session, &mut sink, "SET optimizer_aggregate_strategy='joint'").await;
     }
     // Independent expected value: two dimension keys sharing one label must
     // merge into one SQL group, not escape as separate partial groups.

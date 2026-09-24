@@ -84,7 +84,8 @@ disabled_optimizer_rules	(empty)	Comma-separated optimizer transformation names 
 force_external	false	Force spill-capable operators onto external paths
 max_temp_directory_size	unlimited	Maximum size of the temporary spill directory
 memory_limit	1GB	Maximum memory available to the current session
-optimizer_search_policy	quality	Stop at verified quality coverage or continue budgeted search
+optimizer_aggregate_strategy	joint	Pipeline aggregate search domain: joint or single_stage
+optimizer_search_policy	quality	Use a finite regional program, quality coverage, or budgeted search
 optimizer_verify	true	Enable optimizer verification outside debug builds
 parallel_scheduler	true	Enable the worker-pool pipeline scheduler for morsel-capable pipelines
 paro_diagnostic/PARO_CERTIFIED_GROUP_PRUNING	<unset>	Effective process-start diagnostic environment (read-only)

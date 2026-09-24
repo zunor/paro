@@ -180,6 +180,17 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
         apply_effective: apply_noop,
     },
     SettingDescriptor {
+        name: "optimizer_aggregate_strategy",
+        category: "Query Tuning",
+        description: "Pipeline aggregate search domain: joint or single_stage",
+        vartype: "string",
+        context: "user",
+        unit: None,
+        default_value: |_| Value::Varchar("joint".into()),
+        parse_value: parse_optimizer_aggregate_strategy,
+        apply_effective: apply_noop,
+    },
+    SettingDescriptor {
         name: "rowset_scan_pushdown",
         category: "Query Tuning",
         description: "Enable rowset predicate pushdown and late materialization",
@@ -611,6 +622,17 @@ fn parse_vector_search_objective(_session: &Session, values: &[String]) -> Resul
             "invalid vector_search_objective '{value}'; expected exact or cost_optimized"
         ))),
     }
+}
+
+fn parse_optimizer_aggregate_strategy(session: &Session, values: &[String]) -> Result<Value> {
+    let Value::Varchar(value) = parse_string_value(session, values)? else {
+        unreachable!("string setting")
+    };
+    Ok(Value::Varchar(
+        paro_context::OptimizerAggregateStrategy::parse(&value)?
+            .as_str()
+            .into(),
+    ))
 }
 
 fn parse_positive_integer_value(_session: &Session, values: &[String]) -> Result<Value> {

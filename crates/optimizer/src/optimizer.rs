@@ -515,6 +515,13 @@ impl Optimizer {
             drop(pre_partition);
             return self.optimize_pipeline(query, statement_layer, explain);
         }
+        if self.ctx.session.settings.optimizer_aggregate_strategy()?
+            != paro_context::OptimizerAggregateStrategy::Joint
+        {
+            return Err(paro_common::error::invalid_input(
+                "optimizer_aggregate_strategy=single_stage requires optimizer_search_policy=pipeline",
+            ));
+        }
         let phase_started = Instant::now();
         let phase_allocated = paro_common::allocator::thread_allocated_bytes();
         let graph_plans = enumerate_graph_region_plans(

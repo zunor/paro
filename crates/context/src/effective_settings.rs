@@ -44,6 +44,32 @@ impl OptimizerSearchPolicy {
     }
 }
 
+/// Aggregate search domain of the staged planner, not a query-specific hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OptimizerAggregateStrategy {
+    #[default]
+    Joint,
+    SingleStage,
+}
+
+impl OptimizerAggregateStrategy {
+    pub fn parse(value: &str) -> paro_common::error::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "joint" => Ok(Self::Joint),
+            "single_stage" => Ok(Self::SingleStage),
+            _ => Err(paro_common::error::invalid_input(
+                "optimizer_aggregate_strategy expects joint or single_stage",
+            )),
+        }
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Joint => "joint",
+            Self::SingleStage => "single_stage",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EffectiveSettings {
     raw: HashMap<String, Value>,
@@ -90,6 +116,18 @@ impl EffectiveSettings {
 
     pub fn force_external(&self) -> bool {
         matches!(self.get("force_external"), Some(Value::Boolean(true)))
+    }
+
+    pub fn optimizer_aggregate_strategy(
+        &self,
+    ) -> paro_common::error::Result<OptimizerAggregateStrategy> {
+        match self.get("optimizer_aggregate_strategy") {
+            Some(Value::Varchar(value)) => OptimizerAggregateStrategy::parse(value),
+            None => Ok(OptimizerAggregateStrategy::default()),
+            _ => Err(paro_common::error::invalid_input(
+                "invalid optimizer_aggregate_strategy type",
+            )),
+        }
     }
 
     pub fn rowset_scan_pushdown(&self) -> bool {
@@ -148,6 +186,7 @@ impl EffectiveSettings {
             "default_table_cardinality",
             "disabled_optimizer_rules",
             "optimizer_search_policy",
+            "optimizer_aggregate_strategy",
             "force_external",
             "max_temp_directory_size",
             "memory_limit",
@@ -178,6 +217,29 @@ fn value_to_usize(value: Option<&Value>) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_search_domain_is_validated_and_part_of_cache_identity() {
+        let settings = |value: &str| {
+            EffectiveSettings::new(HashMap::from([(
+                "optimizer_aggregate_strategy".into(),
+                Value::Varchar(value.into()),
+            )]))
+        };
+        assert_eq!(
+            settings("single_stage")
+                .optimizer_aggregate_strategy()
+                .unwrap(),
+            OptimizerAggregateStrategy::SingleStage
+        );
+        assert!(settings("force_partial")
+            .optimizer_aggregate_strategy()
+            .is_err());
+        assert_ne!(
+            settings("joint").planning_fingerprint(),
+            settings("single_stage").planning_fingerprint()
+        );
+    }
 
     #[test]
     fn search_policy_is_validated_and_separates_plan_cache_identity() {
