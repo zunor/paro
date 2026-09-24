@@ -1,0 +1,16 @@
+41360  68.3  7.8 01-00:40:26 /System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine
+  384  17.0  0.4 02-02:15:00 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  839  15.7  3.2 02-02:14:49 /opt/homebrew/opt/mongodb-community/bin/mongod
+  342  11.5  0.1 02-02:15:00 /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds
+ 1212   6.9  0.4 02-02:14:26 /Applications/Ghostty.app/Contents/MacOS/ghostty
+57295   4.8  0.0       00:14 rg
+ 2594   2.7  0.8 02-02:11:46 /Applications/企业微信.app/Contents/MacOS/企业微信
+  583   2.5  0.1 02-02:14:57 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  747   1.3  0.1 02-02:14:53 /System/Library/CoreServices/Spotlight.app/Contents/MacOS/Spotlight
+ 2570   1.1  0.2 02-02:12:01 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/153.0.8010.53/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)
+ 1168   1.1  0.3 02-02:14:36 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/153.0.8010.53/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)
+  560   1.1  0.2 02-02:14:57 /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+  526   0.8  0.2 02-02:14:58 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+39339   0.7  0.2    01:21:11 /Applications/ChatGPT.app/Contents/Resources/codex
+56352   0.6  0.2 01-21:14:27 /Applications/企业微信.app/Contents/Frameworks/企业微信 Helper (Renderer).app/Contents/MacOS/企业微信 Helper (Renderer)
+  318   0.6  0.0 02-02:15:00 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd

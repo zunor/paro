@@ -1,0 +1,16 @@
+41360  61.9  9.6 01-00:53:01 /System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine
+  839  12.4  5.2 02-02:27:24 /opt/homebrew/opt/mongodb-community/bin/mongod
+  384  12.2  0.3 02-02:27:35 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 1212   5.1  0.4 02-02:27:01 /Applications/Ghostty.app/Contents/MacOS/ghostty
+  583   2.2  0.1 02-02:27:32 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+58389   1.2  0.3       06:37 /Users/linjunhong/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.darwin-arm64/pkg/tool/darwin_arm64/compile
+ 2594   1.1  0.6 02-02:24:21 /Applications/企业微信.app/Contents/MacOS/企业微信
+ 2566   1.0  0.1 02-02:24:47 /Applications/Cisco/Cisco Secure Client.app/Contents/MacOS/Cisco Secure Client
+ 1168   1.0  0.3 02-02:27:11 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/153.0.8010.53/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)
+21998   0.7  0.3    03:31:43 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT
+  560   0.7  0.4 02-02:27:32 /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+  318   0.7  0.0 02-02:27:35 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+56352   0.6  0.2 01-21:27:02 /Applications/企业微信.app/Contents/Frameworks/企业微信 Helper (Renderer).app/Contents/MacOS/企业微信 Helper (Renderer)
+  353   0.6  0.0 02-02:27:35 /usr/libexec/opendirectoryd
+  314   0.5  0.0 02-02:27:35 /usr/libexec/logd
+58355   0.3  0.1       06:48 /System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared

@@ -1,0 +1,16 @@
+41360  74.6  7.6 01-00:51:27 /System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine
+  839  23.4  2.7 02-02:25:50 /opt/homebrew/opt/mongodb-community/bin/mongod
+  384  12.1  0.3 02-02:26:01 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+65081   7.6  0.1       00:00 /System/Library/ExtensionKit/Extensions/IFTelemetrySELFIngestor.appex/Contents/MacOS/IFTelemetrySELFIngestor
+ 1212   6.3  0.4 02-02:25:27 /Applications/Ghostty.app/Contents/MacOS/ghostty
+65079   4.1  0.1       00:01 /System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/extensionkitservice.xpc/Contents/MacOS/extensionkitservice
+64911   2.4  0.1       00:07 /System/Library/PrivateFrameworks/SiriAnalytics.framework/Versions/A/XPCServices/SAExtensionOrchestrator.xpc/Contents/MacOS/SAExtensionOrchestrator
+  600   2.3  0.1 02-02:25:57 /usr/libexec/rapportd
+  583   2.2  0.1 02-02:25:58 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  376   1.8  0.1 02-02:26:01 /usr/sbin/bluetoothd
+    1   1.5  0.1 02-02:26:39 /sbin/launchd
+65075   1.4  0.0       00:02 /usr/libexec/sysmond
+  630   1.4  0.1 02-02:25:57 /usr/libexec/sharingd
+  389   1.2  0.1 02-02:26:01 /usr/libexec/runningboardd
+ 2566   1.1  0.1 02-02:23:13 /Applications/Cisco/Cisco Secure Client.app/Contents/MacOS/Cisco Secure Client
+ 1168   1.1  0.3 02-02:25:37 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/153.0.8010.53/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)

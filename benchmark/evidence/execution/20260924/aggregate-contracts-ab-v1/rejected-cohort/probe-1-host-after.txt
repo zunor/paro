@@ -1,0 +1,16 @@
+41360  65.4  6.8 01-00:32:21 /System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine
+  384  33.1  0.4 02-02:06:55 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  490  15.9  0.1 02-02:06:54 /opt/cisco/secureclient/bin/vpnagentd
+22148  15.0  0.8    03:10:51 /Applications/WeChat.app/Contents/MacOS/WeChat
+84072   9.6  0.0    21:25:04 /System/Library/CoreServices/screencaptureui.app/Contents/MacOS/screencaptureui
+  839   9.6  2.2 02-02:06:44 /opt/homebrew/opt/mongodb-community/bin/mongod
+48667   8.8  0.1       06:16 /System/Library/CoreServices/talagentd
+ 2594   8.3  0.9 02-02:03:41 /Applications/企业微信.app/Contents/MacOS/企业微信
+ 1212   7.7  0.4 02-02:06:21 /Applications/Ghostty.app/Contents/MacOS/ghostty
+  866   7.6  0.1 02-02:06:44 /Applications/CheatSheet.app/Contents/MacOS/CheatSheet
+33159   7.5  0.6 01-18:42:42 codex
+  535   6.6  0.0 02-02:06:53 /System/Library/DriverExtensions/com.apple.AppleUserHIDDrivers.dext/com.apple.AppleUserHIDDrivers
+48686   5.4  0.1       06:08 /System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl
+  583   2.9  0.1 02-02:06:52 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+33805   1.7  0.1 01-18:40:50 /Users/linjunhong/.codex/packages/standalone/releases/0.155.1-aarch64-apple-darwin/bin/codex-code-mode-host
+  526   1.4  0.2 02-02:06:53 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN

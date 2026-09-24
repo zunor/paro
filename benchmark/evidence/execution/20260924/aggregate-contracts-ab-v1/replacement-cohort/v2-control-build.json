@@ -1,0 +1,21 @@
+{
+  "command": [
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "--bin",
+    "parod"
+  ],
+  "cargo": "cargo 1.92.0 (344c4567c 2025-10-21)",
+  "jobs": 4,
+  "elapsed_ms": 105928.887,
+  "source": {
+    "commit": "e37ae93f78917ac927bd05d9e6a769b7f7b729ea",
+    "dirty": false,
+    "status": [],
+    "working_tree_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "binary_path": "/Users/linjunhong/workspace/paro/target/release/parod",
+  "binary_sha256": "4bb7edfca32192625ab61e5dd967a1be2b239d57e46e33c63020672c22d5079b"
+}
