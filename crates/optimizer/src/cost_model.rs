@@ -428,15 +428,23 @@ impl CostModel {
                     let estimate = |child| estimates[&resolver.key(child)];
                     let value = match combine {
                         Combine::And(terms) => combine_conjunction_terms(terms, estimate),
-                        Combine::Or(children) => disjunction_estimate(children.into_iter().map(
-                            |(child, occurrences)| {
-                                repeat_selectivity(
-                                    estimate(child),
-                                    occurrences,
-                                    ConjunctionType::Or,
-                                )
-                            },
-                        )),
+                        Combine::Or(children) => {
+                            if let Some(value) =
+                                disjoint_equality_estimate(&children, resolver, work)?
+                            {
+                                value
+                            } else {
+                                disjunction_estimate(children.into_iter().map(
+                                    |(child, occurrences)| {
+                                        repeat_selectivity(
+                                            estimate(child),
+                                            occurrences,
+                                            ConjunctionType::Or,
+                                        )
+                                    },
+                                ))
+                            }
+                        }
                         Combine::Not(child) => estimate(child).complement(),
                     };
                     estimates.insert(resolver.key(node), value);
@@ -742,6 +750,64 @@ impl CostModel {
 enum ConjunctionTerm<Node> {
     Input(Node, Option<ColumnBinding>, u64),
     Estimate(SelectivityEstimate, Option<ColumnBinding>),
+}
+
+/// Distinct equality values on one integral column are disjoint events, not
+/// independent Bernoulli trials. In particular, reapplying `year = a OR year
+/// = b` to its two-value output domain must not repeatedly multiply rows by
+/// 0.75. This is a costing estimate, never a proof that a predicate can be
+/// removed: the NDV point can be estimated and NULL coverage can be unknown.
+fn disjoint_equality_estimate<'a, View: PredicateView<'a>>(
+    terms: &[(View::Node, u64)],
+    resolver: &View,
+    work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
+) -> SelectivityResult<Option<SelectivityEstimate>> {
+    let mut domain = None;
+    let mut values = HashSet::new();
+    let mut point = None;
+    for &(node, _) in terms {
+        work.admit()?;
+        if !resolver.can_share(node) {
+            return Ok(None);
+        }
+        let PredicateKind::Comparison(comparison, left, right) = resolver.kind(node) else {
+            return Ok(None);
+        };
+        if !matches!(
+            comparison,
+            ComparisonType::Equal | ComparisonType::NotDistinctFrom
+        ) {
+            return Ok(None);
+        }
+        let Some((column, constant, _)) =
+            column_constant_comparison(comparison, left, right, resolver)
+        else {
+            return Ok(None);
+        };
+        let Some(binding) = resolver.binding(column) else {
+            return Ok(None);
+        };
+        let Some(value) = ordered_integral_value(constant) else {
+            return Ok(None);
+        };
+        let Some(distinct) = resolver
+            .statistics(column)
+            .and_then(|stats| stats.point)
+            .filter(|n| *n > 0)
+        else {
+            return Ok(None);
+        };
+        let current = (binding, value.domain);
+        if domain.is_some_and(|previous| previous != current)
+            || point.is_some_and(|previous| previous != distinct)
+        {
+            return Ok(None);
+        }
+        domain = Some(current);
+        point = Some(distinct);
+        values.insert(value.coordinate);
+    }
+    Ok(point.map(|point| SelectivityEstimate::estimated(values.len() as f64 / point as f64)))
 }
 
 fn repeat_selectivity(
@@ -1631,6 +1697,76 @@ mod tests {
         assert_eq!(
             model.estimate_selectivity(&expr, &HashMap::new()),
             model.defaults.equality
+        );
+    }
+
+    #[test]
+    fn equality_union_uses_one_domain_and_does_not_discount_it_repeatedly() {
+        let model = CostModel::default();
+        let binding = ColumnBinding::new(1, 0);
+        let equality = |binding, value| {
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(binding, LogicalType::Integer).into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+                    ),
+                )
+                .into(),
+            )
+        };
+        let either = |children| {
+            Expression::Conjunction(
+                paro_planner::expression::ConjunctionExpression::new(ConjunctionType::Or, children)
+                    .into(),
+            )
+        };
+        let predicate = either(vec![
+            equality(binding, 2001),
+            equality(binding, 2002),
+            equality(binding, 2001),
+        ]);
+        let statistics = |point| {
+            HashMap::from([(
+                binding,
+                Arc::new(ColumnStatistics::with_estimated_distinct(
+                    paro_storage::statistics::BaseStatistics::create_unknown(LogicalType::Integer),
+                    Some(point),
+                )),
+            )])
+        };
+        assert_eq!(
+            model.estimate_selectivity(&predicate, &statistics(200)),
+            0.01
+        );
+        let filtered = statistics(2);
+        let mut rows = 721;
+        for _ in 0..8 {
+            rows = model
+                .estimate_filter_cardinality(rows, std::slice::from_ref(&predicate), &filtered)
+                .expected;
+            assert_eq!(rows, 721);
+        }
+        let resolver = StatisticsResolver::logical(&filtered);
+        assert!(
+            !model
+                .estimate_selectivity_with_provenance(&predicate, &resolver)
+                .proven
+        );
+        // Equalities on different columns may overlap; never add them as a
+        // disjoint union, even when their type and NDV happen to match.
+        let other = ColumnBinding::new(1, 1);
+        let mut separate = filtered;
+        separate.insert(other, separate[&binding].clone());
+        assert_eq!(
+            model.estimate_selectivity(
+                &either(vec![equality(binding, 2001), equality(other, 2002)]),
+                &separate
+            ),
+            0.75
         );
     }
 
