@@ -893,6 +893,7 @@ impl BoundarySnapshot {
                     .map(|column| facts.column_values.get(column).cloned())
                     .collect(),
                 unique_keys,
+                finite_domains: Default::default(),
                 grouping_unique_keys,
                 source_lineage: columns
                     .iter()

@@ -63,8 +63,9 @@ fn external_table_cardinality<Child: LocalChildFacts>(
 
 #[derive(Default)]
 pub struct StatisticsGathering {
+    proofs: super::relation_proofs::RelationProofs,
     cte_cardinality: HashMap<usize, CardinalityEstimate>,
-    cte_output_stats: HashMap<usize, Vec<Arc<ColumnStatistics>>>,
+    cte_output_stats: HashMap<usize, BTreeMap<usize, Arc<ColumnStatistics>>>,
     delim_cardinality: HashMap<usize, CardinalityEstimate>,
     delim_output_stats: HashMap<usize, Vec<Arc<ColumnStatistics>>>,
 }
@@ -91,6 +92,27 @@ pub(crate) fn merge_set_operation_column_statistics(
 struct StatisticsGatherFolder<'a> {
     gathering: &'a mut StatisticsGathering,
     context: &'a mut OptimizationContext,
+}
+
+fn cte_columns(
+    layout: &LogicalOutputLayout,
+    correspondence: Option<&[paro_planner::operator::cte::CteOutputColumn]>,
+    context: &impl ColumnStatsView,
+) -> BTreeMap<usize, Arc<ColumnStatistics>> {
+    let values = collect_output_stats_for_layout(layout, context);
+    match correspondence {
+        None => values.into_iter().enumerate().collect(),
+        Some(columns) => columns
+            .iter()
+            .filter_map(|column| {
+                let ordinal = layout
+                    .bindings()
+                    .iter()
+                    .position(|b| *b == column.binding)?;
+                Some((column.definition.0, values.get(ordinal)?.clone()))
+            })
+            .collect(),
+    }
 }
 
 struct GatheredNodeProperties {
@@ -213,7 +235,9 @@ impl StatisticsGathering {
         input_column_stats: SharedColumnStatistics,
         ctx: &mut OptimizationContext,
     ) -> (OwnedLogicalPlan, LogicalOutputLayout, Option<u64>) {
-        if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
+        if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph
+            || matches!(plan.operator, LogicalOperator::Filter(_))
+        {
             let mut inputs = CardinalityInputs {
                 column_stats: &input_column_stats,
                 cost_model: &ctx.cost_model,
@@ -237,10 +261,21 @@ impl StatisticsGathering {
             &plan.operator,
             child_maximum_cardinalities,
         );
-        plan.stats.unique_keys = crate::statistics::unique_keys::derive_local_unique_keys(
+        let inputs = plan
+            .operator
+            .children()
+            .into_iter()
+            .map(|c| super::relation_proofs::Input {
+                keys: &c.stats.unique_keys,
+                domains: &c.stats.finite_domains,
+            })
+            .collect::<Vec<_>>();
+        self.proofs.derive(
             &plan.operator,
             &output,
             child_layouts,
+            &inputs,
+            &mut plan.stats,
         );
         self.update_output_column_stats(
             &plan.operator,
@@ -276,7 +311,9 @@ impl StatisticsGathering {
         LogicalOutputLayout,
         Option<u64>,
     ) {
-        if stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
+        if stats.cardinality_provenance != CardinalityProvenance::JoinGraph
+            || matches!(operator, LogicalOperator::Filter(_))
+        {
             let mut inputs = CardinalityInputs {
                 column_stats: &input_column_stats,
                 cost_model: &ctx.cost_model,
@@ -296,16 +333,15 @@ impl StatisticsGathering {
             &operator,
             child_maximum_cardinalities,
         );
-        let mut child_keys = Vec::new();
+        let mut inputs = Vec::new();
         operator.visit_child_links(&mut |child| {
-            child_keys.push(child.facts.unique_keys.as_slice());
+            inputs.push(super::relation_proofs::Input {
+                keys: &child.facts.unique_keys,
+                domains: &child.facts.finite_domains,
+            });
         });
-        stats.unique_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
-            &operator,
-            &output,
-            &child_layouts.iter().collect::<Vec<_>>(),
-            &child_keys,
-        );
+        self.proofs
+            .derive(&operator, &output, child_layouts, &inputs, &mut stats);
         self.update_output_column_stats(&operator, &stats, &output, child_layouts, maximum, ctx);
         (stats, operator, output, maximum)
     }
@@ -319,7 +355,8 @@ impl StatisticsGathering {
         if let Some(cardinality) = cardinality {
             self.cte_cardinality.insert(index, cardinality);
         }
-        self.cte_output_stats.insert(index, columns);
+        self.cte_output_stats
+            .insert(index, columns.into_iter().enumerate().collect());
     }
 
     pub fn gather(
@@ -358,10 +395,18 @@ impl StatisticsGathering {
         };
         match &parent_skeleton.operator {
             LogicalOperator::MaterializedCTE(cte) => {
-                self.publish_cte_statistics(cte.cte_index, first, first_layout, ctx);
+                self.proofs
+                    .publish(cte.cte_index, &cte.output_columns, &first.stats);
+                self.publish_cte_statistics(
+                    cte.cte_index,
+                    first,
+                    first_layout,
+                    Some(&cte.output_columns),
+                    ctx,
+                );
             }
             LogicalOperator::RecursiveCTE(cte) => {
-                self.publish_cte_statistics(cte.cte_index, first, first_layout, ctx);
+                self.publish_cte_statistics(cte.cte_index, first, first_layout, None, ctx);
             }
             LogicalOperator::Join(Join::Comparison(join))
                 if !join.duplicate_eliminated_columns.is_empty() =>
@@ -384,15 +429,14 @@ impl StatisticsGathering {
         cte_index: usize,
         producer: &OwnedLogicalPlan,
         producer_layout: &LogicalOutputLayout,
+        correspondence: Option<&[paro_planner::operator::cte::CteOutputColumn]>,
         ctx: &OptimizationContext,
     ) {
         if let Some(cardinality) = producer.stats.estimated_cardinality {
             self.cte_cardinality.insert(cte_index, cardinality);
         }
-        self.cte_output_stats.insert(
-            cte_index,
-            collect_output_stats_for_layout(producer_layout, ctx),
-        );
+        self.cte_output_stats
+            .insert(cte_index, cte_columns(producer_layout, correspondence, ctx));
     }
 
     fn publish_delim_statistics(
@@ -615,7 +659,7 @@ impl StatisticsGathering {
                 }
                 self.cte_output_stats.insert(
                     cte.cte_index,
-                    collect_output_stats_for_layout(child_layouts.first()?, ctx),
+                    cte_columns(child_layouts.first()?, Some(&cte.output_columns), ctx),
                 );
                 cte.child.estimated_cardinality()
             }
@@ -630,7 +674,7 @@ impl StatisticsGathering {
                 self.cte_cardinality.insert(cte.cte_index, estimate);
                 self.cte_output_stats.insert(
                     cte.cte_index,
-                    collect_output_stats_for_layout(child_layouts.first()?, ctx),
+                    cte_columns(child_layouts.first()?, None, ctx),
                 );
                 Some(estimate)
             }
@@ -761,7 +805,12 @@ impl StatisticsGathering {
                 if let Some(inner) =
                     estimate_unique_dimension_join(cmp, left, right, left_layout, right_layout, ctx)
                 {
-                    return Some(adjust_join_estimate(inner, left, right, cmp.join_type));
+                    return Some(adjust_join_estimate(
+                        cap_unique_join(inner, cmp, left, right, left_layout, right_layout),
+                        left,
+                        right,
+                        cmp.join_type,
+                    ));
                 }
                 let selectivity = estimate_comparison_join_selectivity(
                     &cmp.conditions,
@@ -772,7 +821,14 @@ impl StatisticsGathering {
                     ctx,
                 );
                 Some(adjust_join_estimate(
-                    apply_selectivity(product_estimate(left, right), selectivity),
+                    cap_unique_join(
+                        apply_selectivity(product_estimate(left, right), selectivity),
+                        cmp,
+                        left,
+                        right,
+                        left_layout,
+                        right_layout,
+                    ),
                     left,
                     right,
                     cmp.join_type,
@@ -977,12 +1033,35 @@ impl StatisticsGathering {
             LogicalOperator::RecursiveCTE(cte) => self
                 .cte_output_stats
                 .get(&cte.cte_index)
-                .cloned()
+                .map(|columns| {
+                    cte.column_types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ty)| {
+                            columns
+                                .get(&i)
+                                .cloned()
+                                .unwrap_or_else(|| ColumnStatistics::create_unknown(ty.clone()))
+                        })
+                        .collect()
+                })
                 .unwrap_or_else(|| unknown_stats_for_types(&cte.column_types)),
             LogicalOperator::CTERef(cte_ref) => self
                 .cte_output_stats
                 .get(&cte_ref.cte_index)
-                .cloned()
+                .map(|columns| {
+                    cte_ref
+                        .definition_columns
+                        .iter()
+                        .zip(&cte_ref.column_types)
+                        .map(|(definition, ty)| {
+                            columns
+                                .get(&definition.0)
+                                .cloned()
+                                .unwrap_or_else(|| ColumnStatistics::create_unknown(ty.clone()))
+                        })
+                        .collect()
+                })
                 .unwrap_or_else(|| unknown_stats_for_types(&cte_ref.column_types)),
             LogicalOperator::DelimGet(delim) => self
                 .delim_output_stats
@@ -1162,6 +1241,44 @@ fn plan_has_single_column_unique_key<Child: LocalChildFacts>(
         .unique_keys()
         .iter()
         .any(|key| key.len() == 1 && key[0] == binding)
+}
+
+fn cap_unique_join<Child: LocalChildFacts>(
+    mut estimate: CardinalityEstimate,
+    join: &paro_planner::operator::ComparisonJoin<Child>,
+    left: CardinalityEstimate,
+    right: CardinalityEstimate,
+    left_layout: &LogicalOutputLayout,
+    right_layout: &LogicalOutputLayout,
+) -> CardinalityEstimate {
+    let mut left_keys = BTreeSet::new();
+    let mut right_keys = BTreeSet::new();
+    for condition in &join.conditions {
+        if condition.comparison == JoinComparisonType::Equal {
+            if let Some(binding) = expression_binding(&condition.left, left_layout.bindings()) {
+                left_keys.insert(binding);
+            }
+            if let Some(binding) = expression_binding(&condition.right, right_layout.bindings()) {
+                right_keys.insert(binding);
+            }
+        }
+    }
+    let covered = |keys: Vec<Vec<ColumnBinding>>, matched: &BTreeSet<ColumnBinding>| {
+        keys.iter()
+            .any(|key| !key.is_empty() && key.iter().all(|k| matched.contains(k)))
+    };
+    for bound in [
+        covered(join.right.unique_keys(), &right_keys).then_some(left),
+        covered(join.left.unique_keys(), &left_keys).then_some(right),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        estimate.expected = estimate.expected.min(bound.expected);
+        estimate.max = estimate.max.min(bound.max).max(estimate.expected);
+        estimate.min = estimate.min.min(estimate.expected);
+    }
+    estimate
 }
 
 fn unique_lookup_estimate(
@@ -1370,7 +1487,9 @@ fn filter_output_stats<Child>(
 /// OR is accepted only when every branch constrains the same column. The
 /// resulting bound follows from the predicate itself and remains valid after
 /// DML, unlike a min/max range observed in one table snapshot.
-fn finite_equality_domain(expression: &Expression) -> Option<(ColumnBinding, Vec<Value>)> {
+pub(super) fn finite_equality_domain(
+    expression: &Expression,
+) -> Option<(ColumnBinding, Vec<Value>)> {
     match expression {
         Expression::Comparison(comparison)
             if matches!(
@@ -2406,6 +2525,24 @@ mod tests {
         assert_eq!(
             gathered.stats.estimated_cardinality,
             Some(CardinalityEstimate::exact(1))
+        );
+    }
+
+    #[test]
+    fn residual_filter_reestimates_from_current_input_not_stale_join_graph() {
+        let bind_context = BindContext::new();
+        let mut ctx = OptimizationContext::new(make_test_session(), bind_context.clone());
+        let mut plan = OwnedLogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Filter(Filter::new(values_relation(&bind_context, 1, 10), vec![])),
+        );
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1000));
+        plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+        let gathered = StatisticsGathering::new().gather(plan, &mut ctx).unwrap();
+        assert_eq!(gathered.stats.estimated_cardinality.unwrap().expected, 10);
+        assert_eq!(
+            gathered.stats.cardinality_provenance,
+            CardinalityProvenance::Statistics
         );
     }
 

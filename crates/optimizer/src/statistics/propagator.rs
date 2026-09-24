@@ -19,8 +19,8 @@ use paro_planner::expression::{
     WindowInvocation,
 };
 use paro_planner::operator::{
-    aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Join,
-    BoundReference, JoinComparisonType, LogicalOperator, LogicalOutputLayout,
+    aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, BoundReference,
+    ColumnBinding, Join, JoinComparisonType, LogicalOperator, LogicalOutputLayout,
 };
 use paro_planner::plan::{LogicalPlanPostOrderFolder, OwnedLogicalPlan};
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StatsInfo};
@@ -174,7 +174,7 @@ fn collect_group_dependencies(
 /// Propagates column statistics through the logical plan.
 pub struct StatisticsPropagator {
     statistics_map: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-    cte_statistics: HashMap<usize, Vec<Arc<ColumnStatistics>>>,
+    cte_statistics: HashMap<usize, HashMap<usize, Arc<ColumnStatistics>>>,
 }
 
 struct StatisticsPropagationFolder<'a> {
@@ -198,16 +198,29 @@ impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsPropagationFo
         // first child is only the anchor: publishing that domain to the
         // recursive reference mistakes iteration zero for a fixed point and
         // can erase termination predicates as "always true".
-        let cte_index = match &parent_skeleton.operator {
-            LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
+        let cte = match &parent_skeleton.operator {
+            LogicalOperator::MaterializedCTE(cte) => Some(cte),
             _ => None,
         };
-        if let Some(cte_index) = cte_index {
+        if let Some(cte) = cte {
             let Some(layout) = completed_layouts.first() else {
                 return Ok(());
             };
             if let Some(statistics) = self.propagator.capture_output_statistics(layout) {
-                self.propagator.cte_statistics.insert(cte_index, statistics);
+                let statistics = cte
+                    .output_columns
+                    .iter()
+                    .filter_map(|column| {
+                        let ordinal = layout
+                            .bindings()
+                            .iter()
+                            .position(|b| *b == column.binding)?;
+                        Some((column.definition.0, statistics.get(ordinal)?.clone()))
+                    })
+                    .collect();
+                self.propagator
+                    .cte_statistics
+                    .insert(cte.cte_index, statistics);
             }
         }
         Ok(())
@@ -612,7 +625,11 @@ impl StatisticsPropagator {
             LogicalOperator::RecursiveCTE(cte) => LogicalOperator::RecursiveCTE(cte),
             LogicalOperator::CTERef(cte_ref) => {
                 if let Some(stats) = self.cte_statistics.get(&cte_ref.cte_index).cloned() {
-                    for (column_index, stats) in stats.into_iter().enumerate() {
+                    for (column_index, definition) in cte_ref.definition_columns.iter().enumerate()
+                    {
+                        let Some(stats) = stats.get(&definition.0).cloned() else {
+                            continue;
+                        };
                         self.statistics_map.insert(
                             ColumnBinding {
                                 table_index: cte_ref.table_index,
@@ -752,7 +769,9 @@ impl StatisticsPropagator {
                         // a false/unknown filter.  Replacing it with an
                         // EmptyResult would require an owned child wrapper.
                         FilterPropagateResult::FilterAlwaysFalse
-                        | FilterPropagateResult::FilterFalseOrNull => return LogicalOperator::Filter(filter),
+                        | FilterPropagateResult::FilterFalseOrNull => {
+                            return LogicalOperator::Filter(filter)
+                        }
                         _ => i += 1,
                     }
                 }
@@ -810,7 +829,11 @@ impl StatisticsPropagator {
             }
             LogicalOperator::CTERef(cte_ref) => {
                 if let Some(stats) = self.cte_statistics.get(&cte_ref.cte_index).cloned() {
-                    for (column_index, stats) in stats.into_iter().enumerate() {
+                    for (column_index, definition) in cte_ref.definition_columns.iter().enumerate()
+                    {
+                        let Some(stats) = stats.get(&definition.0).cloned() else {
+                            continue;
+                        };
                         self.statistics_map.insert(
                             ColumnBinding {
                                 table_index: cte_ref.table_index,

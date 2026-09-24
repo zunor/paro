@@ -78,8 +78,7 @@ struct LocalShape {
 /// occurrence-local integer or pointer address.
 #[derive(Debug, Clone)]
 pub(super) struct NativeRelationInput {
-    pub(super) facts:
-        Arc<paro_planner::operator::bound_reference::BoundRelationFacts>,
+    pub(super) facts: Arc<paro_planner::operator::bound_reference::BoundRelationFacts>,
     pub(super) layout: LogicalOutputLayout,
     pub(super) stats: NodeStats,
     pub(super) maximum: Option<u64>,
@@ -118,8 +117,8 @@ fn native_relation_inputs_match(
     entry.layout == *layout
         && entry.inputs.len() == inputs.len()
         && entry.inputs.iter().zip(inputs).all(|(cached, current)| {
-            let facts_same = Arc::ptr_eq(&cached.facts, &current.facts)
-                || cached.facts == current.facts;
+            let facts_same =
+                Arc::ptr_eq(&cached.facts, &current.facts) || cached.facts == current.facts;
             cached.layout == current.layout
                 && cached.stats == current.stats
                 && cached.maximum == current.maximum
@@ -296,7 +295,8 @@ impl SettlementCache {
                     self.native_relations.remove(&operator);
                 }
             }
-            self.native_relation_invalidations = self.native_relation_invalidations.saturating_add(1);
+            self.native_relation_invalidations =
+                self.native_relation_invalidations.saturating_add(1);
         }
     }
 
@@ -350,7 +350,10 @@ impl SettlementCache {
     }
 
     pub(in crate::cascades::planner) fn native_relation_entry_count(&self) -> u64 {
-        self.native_relations.values().map(|entries| entries.len() as u64).sum()
+        self.native_relations
+            .values()
+            .map(|entries| entries.len() as u64)
+            .sum()
     }
 
     pub(in crate::cascades::planner) fn discard_stale_recipes(&mut self, arena: &LogicalPlanArena) {
@@ -487,6 +490,7 @@ impl SettlementCache {
         domain.cardinality = fact.stats.estimated_cardinality;
         domain.maximum_cardinality = fact.maximum;
         domain.unique_keys = fact.stats.unique_keys.clone();
+        domain.finite_domains = fact.stats.finite_domains.clone();
         domain.column_domains = fact
             .columns
             .iter()
@@ -681,7 +685,8 @@ impl SettlementCache {
                 .map(|(ordinal, fact)| self.boundary(ordinal, *fact).map(Box::new))
                 .collect::<Result<Vec<_>>>()?,
         )?;
-        let statistics_partition = crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
+        let statistics_partition =
+            crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
         crate::expression::scalar_normalizer().visit_operator_expressions(&mut plan.operator);
         let mut context = crate::context::OptimizationContext::new(
             environment.session.clone(),
@@ -2035,11 +2040,24 @@ mod tests {
                     )
                 })
                 .unwrap();
-            assert_eq!(cache.facts[result.facts].stats.estimated_cardinality.unwrap().expected, rows);
+            assert_eq!(
+                cache.facts[result.facts]
+                    .stats
+                    .estimated_cardinality
+                    .unwrap()
+                    .expected,
+                rows
+            );
             results.push(result.facts);
-            let key = cache.locals.keys().find(|key| key.input_stats == shell.stats).unwrap();
-            assert!(matches!(cache.classify_local_miss(key, &shell.operator, &arena),
-                crate::work_partition::MissKind::NewContent));
+            let key = cache
+                .locals
+                .keys()
+                .find(|key| key.input_stats == shell.stats)
+                .unwrap();
+            assert!(matches!(
+                cache.classify_local_miss(key, &shell.operator, &arena),
+                crate::work_partition::MissKind::NewContent
+            ));
         }
         assert_ne!(results[0], results[1]);
     }

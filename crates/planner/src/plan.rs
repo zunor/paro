@@ -4,6 +4,7 @@
 //! Logical plan wrapper and plan-node metadata.
 
 pub mod arena;
+pub mod finite_domain;
 pub use arena::LogicalPlan;
 
 use std::mem::ManuallyDrop;
@@ -224,6 +225,8 @@ pub struct NodeStats {
     pub materialization_risk_cardinality: Option<u64>,
     /// Node-local unique keys derived once in the statistics post-order pass.
     pub unique_keys: Vec<UniqueKey>,
+    /// Semantic finite domains, never sampled min/max or estimated NDV.
+    pub finite_domains: finite_domain::FiniteDomains,
 }
 
 impl NodeStats {
@@ -236,6 +239,7 @@ impl NodeStats {
     /// never carry them across the structural mutation implicitly.
     pub fn invalidate_structural_facts(&mut self) {
         self.unique_keys.clear();
+        self.finite_domains.clear();
     }
 
     /// Replace the complete row-count contract as one coherent update.

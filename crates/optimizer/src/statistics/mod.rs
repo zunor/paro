@@ -8,6 +8,7 @@ pub(crate) mod cardinality_bound;
 pub mod cost;
 pub mod gathering;
 pub mod propagator;
+pub(crate) mod relation_proofs;
 pub(crate) mod unique_keys;
 
 /// The query construction boundary owns column-domain propagation followed by

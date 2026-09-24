@@ -190,6 +190,7 @@ pub struct BoundRelationFactValues {
     pub column_domains: Vec<BoundColumnDomain>,
     pub column_values: Vec<Option<BoundColumnValues>>,
     pub unique_keys: Vec<UniqueKey>,
+    pub finite_domains: crate::plan::finite_domain::FiniteDomains,
     /// Keys that remain unique when SQL grouping treats NULL values as equal.
     /// This is deliberately separate from ordinary/catalog uniqueness: a
     /// nullable UNIQUE constraint can admit several NULL tuples.
@@ -207,6 +208,7 @@ impl Default for BoundRelationFactValues {
             column_domains: Vec::new(),
             column_values: Vec::new(),
             unique_keys: Vec::new(),
+            finite_domains: Default::default(),
             grouping_unique_keys: Vec::new(),
             source_lineage: Vec::new(),
             contains_control_region: true,

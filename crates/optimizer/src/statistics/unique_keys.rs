@@ -353,13 +353,7 @@ pub(crate) fn derive_unique_keys_from_facts<Child>(
 /// call this once at their public boundary so downstream consumers never see
 /// bindings paired with stale output ordinals.
 pub(crate) fn refresh_unique_keys(plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
-    plan.try_fold_post_order(|mut plan, child_layouts: Vec<_>| {
-        let output_layout = plan.operator.output_layout_from_children(&child_layouts);
-        plan.stats.unique_keys =
-            derive_local_unique_keys(&plan.operator, &output_layout, &child_layouts);
-        Ok((plan, output_layout))
-    })
-    .map(|(plan, _)| plan)
+    super::relation_proofs::refresh(plan)
 }
 
 fn comparison_join_unique_keys<Child>(
@@ -612,7 +606,7 @@ fn relation_key_is_covered(keys: &[UniqueKey], covered: &HashSet<usize>) -> bool
     })
 }
 
-fn normalize_unique_keys(keys: &mut Vec<UniqueKey>) {
+pub(super) fn normalize_unique_keys(keys: &mut Vec<UniqueKey>) {
     for key in keys.iter_mut() {
         let mut columns = key.columns.to_vec();
         columns.sort_unstable();
