@@ -1,0 +1,43 @@
+{
+  "kind": "FixtureIdentity",
+  "scale_factor": 1,
+  "generator": {
+    "path": "/Users/linjunhong/workspace/mo-tpch/dbgen/dbgen",
+    "version": "3.0.0",
+    "sha256": "86bd0761d98a18624e1324cef59be96da25c96d8cf34bb87bd058ed7bca950c3",
+    "distribution_sha256": "4dc56300de1e5ac5e1900519794538e2b5d1b6caf5cd55703bf53000dd748876",
+    "arguments": ["-s", "1", "-b", "/Users/linjunhong/workspace/mo-tpch/dbgen/dists.dss"]
+  },
+  "raw_root": "/private/tmp/paro-tpch-sf1.LKW8GF",
+  "normalized_root": "/private/tmp/paro-tpch-sf1-csv.eIRkDY",
+  "conversion": "sed 's/|$//' on each .tbl into a separate directory; raw files retained",
+  "columns": ["file", "raw_sha256", "normalized_sha256"],
+  "files": [
+    ["customer.tbl", "4483680548a965833877c911ed43e795f4d3543c7a3f7d1dba9ccb24ea5989d6", "a035a33a703d3a043ecf97746b4e3a7988316c1c04923fda63231a59d5e46092"],
+    ["lineitem.tbl", "96d555e07a1ae8cf5196387d9edd9427f9af70c56fa5f4b18affee5555ddb184", "4feb529dfa255799bbf0243d2f2c5028375dfb684e592eb94775345602aa2728"],
+    ["nation.tbl", "66f96949939fa8fdf1c4ffed1e5f6c2842fe11a14b51fdc6ed1e17460031e8c5", "7d47bc9397da331054fa92b8fb92e4c074004bad72dcbb893012093218dccf6c"],
+    ["orders.tbl", "8709061d7bbc81932356fdfc664f8d582252747c2d7e204ae6d3cde624586357", "3f111871419ea6f319fcc51c235d199b3edf16754c5e100be92927527e5f6c97"],
+    ["part.tbl", "f0e4ccdfb5f6d19428ce54f9c84b17037d20f00ac8d2b2272c8d43b18a0b4880", "cecd01146ae002aebe47e6b58bd81644df1d51d9c14da3425aea2b4976e02d60"],
+    ["partsupp.tbl", "43c37f99918f06d4de6b99b05c0a28d5c46f71d66424cffcc595cb059a499254", "3a68b7b7757cd3aacccb39c4bc092dc3edf3b7e0e7609a259c39238cae0be41e"],
+    ["region.tbl", "6022658d673924389b54dcb70fa8c3d6da1b0d7afa3c1c017bab62a019df404f", "5a7c2fe9718db00ff5e5bc82a9ebfa8abc492cc75260d3c0ffb411974f235ab0"],
+    ["supplier.tbl", "9b99cf155974e6db8773970b40746bfccfa64fa078169574165f3e19e2158391", "f5699b5df22724f41bee9b8521798d8fc0cecd5beb0bd3bca96547ac58095547"]
+  ],
+  "workload_manifest_sha256": "13b45c772d4f3328c66e9dd87e2652198a17af102d52637a88841b6861534156",
+  "setup_sql_sha256": "a6757f598adb33bec794f2cc513495faed4f0292a8798b4500c0c2d4ffdcd65b",
+  "binary_sha256": "218e1ee87229c7f5e62db8faab4b70988f75e2c4b7bda2d8972fee2f9b327e1d",
+  "optimizer_source": "83b2c7ed348688decf47f4dd5c6d0f3491733c68",
+  "initial_harness_source": "f96d5f76a",
+  "retained_harness_source": "ea595ead9",
+  "duckdb_version": "1.5.5",
+  "duckdb_native_sha256": "85fad85339c7e345eabb66a33a25d8503c3ee8881f9d298fa8499a97617dbf68",
+  "threads": 4,
+  "server_memory": "2GiB",
+  "query_memory": "2GB",
+  "optimizer_verify": true,
+  "iterations": 1,
+  "warmups": 1,
+  "timeout_seconds": 60,
+  "profile": false,
+  "normal_compile_observer": "PARO_COMPILE_WORK_EVIDENCE=1",
+  "latency_certification": "NotCertified"
+}

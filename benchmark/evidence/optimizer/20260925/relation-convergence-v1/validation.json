@@ -1,0 +1,55 @@
+{
+  "kind": "TaskValidationLedger",
+  "task_base": "edc572964",
+  "optimizer_build_source": "83b2c7ed348688decf47f4dd5c6d0f3491733c68",
+  "benchmark_final_source": "ea595ead9",
+  "scope": "semantic relation facts, bounded ordinary physical-response DP and migration screens",
+  "checks": {
+    "workspace_rust_tests": {"passed": 7000, "failed": 0, "ignored": 85},
+    "strict_clippy_workspace_all_targets": "Passed",
+    "release_build_locked": "Passed",
+    "benchmark_tests": {"passed": 215, "failed": 0},
+    "sql_regress": {"passed": 185, "failed": 0, "skipped": 0, "new": 0, "fd_limit": 65536},
+    "task_rustfmt": "Passed",
+    "memory_runtime_api_guard": "Passed",
+    "vector_copy_fallible_guard": "Passed",
+    "workspace_rustfmt": {"status": "Failed", "unchanged_files": 57},
+    "repository_header_check": {"status": "Failed", "issues": 169, "files_byte_identical_to_task_base": 57}
+  },
+  "evidence_validation": {
+    "latency_pilot_campaigns": 21,
+    "pilot_campaign_cell_capture_schema": "Passed",
+    "q18_diagnostic_schema": "Passed",
+    "tpcds_published_cell_and_capture_schema": "Passed",
+    "tpcds_original_capacity_campaign_summary": "Rejected: campaign summary status differs from manifest",
+    "tpcds_67_99_continuation_campaign_schema": "Passed",
+    "tpch_retained_payload_schema": "Passed; failed workloads remain Failed and unaccepted"
+  },
+  "coverage": {
+    "tpcds_pipeline": {"result_passes": 96, "failures": [39, 58], "capacity_uncovered": [66]},
+    "tpcds_quality": {"result_passes": 95, "failures": [39, 58, 64], "capacity_uncovered": [66]},
+    "tpch_pipeline": {"oracle_passes": 16, "oracle_failures": [1, 2, 10, 13, 15, 20]},
+    "tpch_quality": {"oracle_passes": 15, "oracle_failures": [1, 2, 10, 13, 15, 20], "resource_failure": [9]},
+    "same_fixture_duckdb_oracle_failures": [1, 2, 10, 13, 15, 20]
+  },
+  "verdicts": {
+    "core_slice": "ImplementedAndTested",
+    "default_promotion": "Blocked",
+    "full_corpora_gate": "NotPassed",
+    "statistics_model_admission": "NotCertified",
+    "performance_noninferiority": "NotCertified",
+    "duckdb_parity": "NotCertified",
+    "exhaustive_optimality": "NotProven"
+  },
+  "replay_entry_points": [
+    "make test",
+    "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "cargo build --release --locked --bin parod",
+    "make -C benchmark test",
+    "make -C regress ci (owned release server, fd limit 65536)",
+    "benchmark/corpora/tpcds_compare.py (settings and identities in each inputs.json)",
+    "benchmark/runner.py run --workload tpch (settings in tpch/fixture-inputs.json)"
+  ],
+  "original_test_logs_root": "/private/tmp/paro-relation-convergence.BeCX81",
+  "cleanup": "Only owned test servers stopped; datasets, other worktrees and recovery state preserved"
+}

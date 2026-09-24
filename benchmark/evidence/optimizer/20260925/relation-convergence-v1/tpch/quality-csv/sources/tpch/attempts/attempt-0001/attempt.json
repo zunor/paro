@@ -1,0 +1,1 @@
+{"arm_id":"quality","attempt_id":"attempt-0001","attempt_index":0,"campaign_id":"campaign-20260924T193858760419Z-71339-6a49d3c4bf","failure":"sources/tpch/attempts/attempt-0001/failure.json","query_case":"tpch","result":null,"run_id":"quality-csv","schema_version":3,"sealed_at":"2026-09-24T19:39:32.806470+00:00","source_id":"tpch","status":"Incomplete","summary":null}

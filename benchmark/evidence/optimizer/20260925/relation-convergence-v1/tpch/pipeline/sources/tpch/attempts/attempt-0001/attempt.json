@@ -1,0 +1,1 @@
+{"arm_id":"pipeline","attempt_id":"attempt-0001","attempt_index":0,"campaign_id":"campaign-20260924T193515451979Z-63409-d8384de237","failure":"sources/tpch/attempts/attempt-0001/failure.json","query_case":"tpch","result":null,"run_id":"pipeline","schema_version":3,"sealed_at":"2026-09-24T19:35:16.595520+00:00","source_id":"tpch","status":"Incomplete","summary":null}

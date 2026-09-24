@@ -65,3 +65,25 @@ for inventing a unique-key proof or declaring this optimizer migration done.
 Prioritize from measured same-statement attribution rather than residual
 differences between medians. Performance interference invalidates certification,
 not the correctness reproducer.
+
+## Implemented slice and promotion blockers (2026-09-25)
+
+Semantic CTE/disjoint-UNION key and finite-domain transfer, child-owned Filter
+estimates, ordinary-region physical-response DP, and typed aggregate ablation
+are implemented. Connected syntactic CROSS inputs are opened without crossing
+evaluation fences; a breadth-discovered Q18 Cartesian regression is fixed.
+Full SQL regress passes 185 cases. The implementation does not establish
+complete search or make unsupported/fallback regions disappear.
+
+See the [versioned evidence ledger](../../benchmark/evidence/optimizer/20260925/relation-convergence-v1/README.md).
+The broader screen invalidates a three-query-only promotion: Q39/Q58 remain,
+Q66 has an unclosed evidence-capacity boundary, and Q72 exposes fallback-plan
+quality outside the shared-response region. TPC-H oracle applicability is not
+established merely by matching SF1: generated text/distribution identity and
+numeric semantics matter. Resource failure must remain distinct from wrong
+results, missing observation and compiler failure. The corrected reporter keeps
+uncollected sample coordinates without inventing elapsed time.
+
+Items 1–3 above are delivered; items 4–6 have not passed. Keep quality as default
+until the declared gates close. Do not trade unsupported-case coverage for a
+smaller compile median or turn the bounded DP into another global Memo engine.
