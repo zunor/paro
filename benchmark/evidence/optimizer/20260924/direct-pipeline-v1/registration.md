@@ -36,3 +36,14 @@ Archive each cell's compact RunOutput once, at most 2MiB/cell (12MiB total),
 plus this registration and findings; no duplicate raw logs or event dumps.
 The SQL default is not changed by this pilot. Promotion requires broad
 correctness/resource coverage and a separate registered performance gate.
+
+## Amendment A: metadata table-function identity
+
+The first pipeline Q04 cell stopped during metadata inventory, before any
+normal target sample: the direct path requested a canonical physical identity
+for an ordinary table function, which had no encoder. Preserve the failed cell
+and its completed quality control as an interrupted cohort, not a comparison.
+Add typed encoding for argument-bound table functions; opaque statement bind
+data remains explicitly unsupported. After tests, restart all six cells on
+that same new binary with the original resources, counts and run order.
+Replacement output names use `a-`; no original output is overwritten.

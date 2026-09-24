@@ -1324,6 +1324,30 @@ fn write_semantic_kind_fields(
         PhysicalNodeKind::DummyScan(_) | PhysicalNodeKind::EmptyResult(_) => {
             builder.write_u64(15);
         }
+        PhysicalNodeKind::TableFunctionScan(spec) if spec.bind_data.is_none() => {
+            // Ordinary table functions bind from these arguments at execution.
+            // Statement-specific opaque bind data has no canonical contract and
+            // must continue to fail closed rather than use Debug or an address.
+            builder.write_u64(16);
+            builder.write_bytes(spec.function.name.as_bytes());
+            write_hashed_slice(builder, b"signature", &spec.function.arguments);
+            write_hashed(builder, b"varargs", &spec.function.varargs);
+            write_hashed_slice(
+                builder,
+                b"named-parameters",
+                &spec.function.named_parameters,
+            );
+            builder.write_u64(spec.function.projection_pushdown as u64);
+            builder.write_u64(spec.function.filter_pushdown as u64);
+            builder.write_u64(spec.table_index as u64);
+            write_expressions(builder, spec.arguments.iter());
+            write_hashed(builder, b"projection", &spec.projection_ids);
+            write_hashed_slice(builder, b"input-types", &spec.input_table_types);
+            write_strings(builder, spec.input_table_names.iter());
+            write_hashed_slice(builder, b"output-types", &spec.output_types);
+            write_strings(builder, spec.output_names.iter());
+            builder.write_u64(spec.with_ordinality as u64);
+        }
         _ => {
             return Err(PhysicalIdentityError::UnsupportedKind { kind: kind.name() });
         }
@@ -3389,6 +3413,54 @@ mod identity_tests {
         assert_eq!(
             invalid_edge.structural_identity_fingerprint(),
             Err(PhysicalIdentityError::InvalidEdge)
+        );
+    }
+
+    #[test]
+    fn table_function_identity_tracks_payload_and_rejects_opaque_binding() {
+        use crate::physical::specs::TableFunctionScanSpec;
+        use paro_function::table::{BoundTableFunctionData, TableFunction, TableFunctionBindData};
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Opaque;
+        impl TableFunctionBindData for Opaque {
+            fn clone_box(&self) -> Box<dyn TableFunctionBindData> {
+                Box::new(self.clone())
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let mut plan = dummy_plan(false, "function", "value");
+        let spec = TableFunctionScanSpec {
+            function: Arc::new(TableFunction::new("catalog_rows", vec![])),
+            bind_data: None,
+            table_index: 0,
+            arguments: Box::new([]),
+            projection_ids: None,
+            input_table_types: Box::new([]),
+            input_table_names: Box::new([]),
+            output_names: Box::new(["value".to_string()]),
+            output_types: Box::new([LogicalType::BigInt]),
+            with_ordinality: false,
+        };
+        plan.nodes.get_mut(plan.root).unwrap().kind =
+            PhysicalNodeKind::TableFunctionScan(spec.clone());
+        let original = plan.structural_identity_fingerprint().unwrap();
+        let mut changed = spec;
+        changed.with_ordinality = true;
+        plan.nodes.get_mut(plan.root).unwrap().kind =
+            PhysicalNodeKind::TableFunctionScan(changed.clone());
+        assert_ne!(original, plan.structural_identity_fingerprint().unwrap());
+        changed.bind_data = Some(BoundTableFunctionData::new(Box::new(Opaque)));
+        plan.nodes.get_mut(plan.root).unwrap().kind = PhysicalNodeKind::TableFunctionScan(changed);
+        assert_eq!(
+            plan.structural_identity_fingerprint(),
+            Err(PhysicalIdentityError::UnsupportedKind {
+                kind: "TABLE_FUNCTION_SCAN"
+            })
         );
     }
 

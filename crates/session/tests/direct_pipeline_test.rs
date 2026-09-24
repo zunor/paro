@@ -45,6 +45,8 @@ async fn direct_pipeline_executes_relational_boundaries_without_memo() {
         exec_ok(&mut session, &mut sink, sql).await;
     }
     for sql in [
+        "SELECT * FROM generate_series(1,3) AS t(i) ORDER BY i",
+        "SELECT constraint_name,table_name FROM information_schema.table_constraints WHERE table_name='pipe_dim' ORDER BY constraint_name",
         "SELECT d.label, SUM(f.v)::BIGINT AS s, COUNT(*) AS n FROM pipe_fact f JOIN pipe_dim d ON f.k=d.k GROUP BY d.label ORDER BY d.label",
         "SELECT d.k, COUNT(f.v) AS n FROM pipe_dim d LEFT JOIN pipe_fact f ON f.k=d.k GROUP BY d.k ORDER BY d.k",
         "SELECT k FROM pipe_dim d WHERE EXISTS (SELECT 1 FROM pipe_fact f WHERE f.k=d.k AND f.v>2) ORDER BY k",
