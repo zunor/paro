@@ -36,3 +36,27 @@ default SQL regress, and a verifier-on TPC-DS breadth screen with the maintained
 typed result contract. Unsupported resources/statements and absent corpus data
 remain explicit blockers to default promotion and removal of Cascades. No
 expected-result updates or silently accepted numeric tolerances.
+
+## Amendment B: shared finite-domain selectivity
+
+The first six-cell matrix is retained as a negative result: Q04 and Q74
+pipeline execution did not reach the quality reference. Subsequent plan
+inspection found that Q74's equivalent OR/IN restrictions on one year column
+were multiplied, estimating two years as roughly seven date rows. A second
+same-binary matrix will test a generic integral finite-domain intersection in
+the shared selectivity owner. It does not remove predicates or convert NDV
+estimates into hard bounds. All original sampling and correctness rules apply;
+this is a new exploratory cohort, not a retrospective causal claim.
+
+Collection writes outside the source tree, under the owned
+`/private/tmp/paro-regional-cost.Wwk0Ju` root, before final bounded archival.
+The initial in-repository output attempt was rejected by the source identity
+gate and is retained as invalid rather than used as a timing sample.
+
+The separate verifier-on breadth screen uses the maintained collector's
+minimum supported two fresh blocks, one warmup, one warm round, and one
+diagnostic block per query. This is a TPC-DS-only coverage screen, not the full
+JOB/CEB/TPC-DS/TPC-H/LDBC promotion gate. Failures remain blockers; no baseline
+or output-contract relaxation is authorized.
+The breadth screen is a separate standard campaign with a 64MiB package
+ceiling; the 12MiB limit above applies to the six-cell latency matrix.

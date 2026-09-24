@@ -752,6 +752,98 @@ enum ConjunctionTerm<Node> {
     Estimate(SelectivityEstimate, Option<ColumnBinding>),
 }
 
+/// A finite, non-NULL integral filter domain. This is an estimation input,
+/// not permission to erase a predicate or assert a hard row-count bound.
+struct FiniteFilterEstimate {
+    binding: ColumnBinding,
+    domain: IntegralDomain,
+    point: u64,
+    values: HashSet<u128>,
+    first_expression: usize,
+}
+
+fn finite_filter_estimate<'a, View: PredicateView<'a>>(
+    expression: View::Node,
+    resolver: &View,
+    work: &mut SelectivityWork<impl FnMut() -> paro_common::error::Result<bool>>,
+) -> SelectivityResult<Option<FiniteFilterEstimate>> {
+    if !matches!(
+        resolver.kind(expression),
+        PredicateKind::Or
+            | PredicateKind::Comparison(ComparisonType::Equal, _, _)
+            | PredicateKind::Operator(OperatorType::In)
+    ) {
+        return Ok(None);
+    }
+    let terms = flatten_associative([expression], resolver, ConjunctionType::Or, work)?;
+    let mut result: Option<FiniteFilterEstimate> = None;
+    for (node, _) in terms {
+        work.admit()?;
+        if !resolver.can_share(node) {
+            return Ok(None);
+        }
+        let (column, constants) = match resolver.kind(node) {
+            PredicateKind::Comparison(ComparisonType::Equal, left, right) => {
+                let Some((column, constant, _)) =
+                    column_constant_comparison(ComparisonType::Equal, left, right, resolver)
+                else {
+                    return Ok(None);
+                };
+                (column, smallvec::smallvec![constant])
+            }
+            PredicateKind::Operator(OperatorType::In) => {
+                let Some(column) = resolver.operator_child(node, 0) else {
+                    return Ok(None);
+                };
+                let mut constants = smallvec::SmallVec::<[&Value; 4]>::new();
+                for index in 1..resolver.operator_child_count(node) {
+                    work.admit()?;
+                    let Some(constant) = resolver
+                        .operator_child(node, index)
+                        .and_then(|child| resolver.constant(child))
+                    else {
+                        return Ok(None);
+                    };
+                    constants.push(constant);
+                }
+                (column, constants)
+            }
+            _ => return Ok(None),
+        };
+        let Some(binding) = resolver.binding(column) else {
+            return Ok(None);
+        };
+        let Some(point) = resolver
+            .statistics(column)
+            .and_then(|s| s.point)
+            .filter(|p| *p > 0)
+        else {
+            return Ok(None);
+        };
+        for constant in constants {
+            work.admit()?;
+            let Some(value) = ordered_integral_value(constant) else {
+                return Ok(None);
+            };
+            let current = result.get_or_insert_with(|| FiniteFilterEstimate {
+                binding,
+                domain: value.domain,
+                point,
+                values: HashSet::new(),
+                first_expression: 0,
+            });
+            if current.binding != binding
+                || current.domain != value.domain
+                || current.point != point
+            {
+                return Ok(None);
+            }
+            current.values.insert(value.coordinate);
+        }
+    }
+    Ok(result)
+}
+
 /// Distinct equality values on one integral column are disjoint events, not
 /// independent Bernoulli trials. In particular, reapplying `year = a OR year
 /// = b` to its two-value output domain must not repeatedly multiply rows by
@@ -852,8 +944,29 @@ fn conjunction_terms<'a, View: PredicateView<'a>>(
     let mut intervals = Vec::<IntegralIntervalEstimate>::new();
     let mut interval_by_binding = HashMap::<ColumnBinding, usize>::new();
     let mut interval_for_expression = vec![None; flattened.len()];
+    let mut finite = Vec::<FiniteFilterEstimate>::new();
+    let mut finite_by_domain = HashMap::<(ColumnBinding, IntegralDomain, u64), usize>::new();
+    let mut finite_for_expression = vec![None; flattened.len()];
     for (expression_idx, (expression, _)) in flattened.iter().copied().enumerate() {
         work.admit()?;
+        if let Some(mut constraint) = finite_filter_estimate(expression, resolver, work)? {
+            let key = (constraint.binding, constraint.domain, constraint.point);
+            let index = finite_by_domain.get(&key).copied();
+            let index = if let Some(index) = index {
+                finite[index]
+                    .values
+                    .retain(|value| constraint.values.contains(value));
+                index
+            } else {
+                constraint.first_expression = expression_idx;
+                finite.push(constraint);
+                let index = finite.len() - 1;
+                finite_by_domain.insert(key, index);
+                index
+            };
+            finite_for_expression[expression_idx] = Some(index);
+            continue;
+        }
         let Some(constraint) = integral_range_constraint(expression, resolver) else {
             continue;
         };
@@ -880,6 +993,18 @@ fn conjunction_terms<'a, View: PredicateView<'a>>(
     let mut terms = Vec::new();
     for (expression_idx, (expression, occurrences)) in flattened.into_iter().enumerate() {
         work.admit()?;
+        if let Some(index) = finite_for_expression[expression_idx] {
+            let estimate = &finite[index];
+            if estimate.first_expression == expression_idx {
+                terms.push(ConjunctionTerm::Estimate(
+                    SelectivityEstimate::estimated(
+                        estimate.values.len() as f64 / estimate.point as f64,
+                    ),
+                    Some(estimate.binding),
+                ));
+            }
+            continue;
+        }
         match interval_for_expression[expression_idx] {
             Some(interval_idx) if intervals[interval_idx].first_expression == expression_idx => {
                 terms.push(ConjunctionTerm::Estimate(
@@ -1310,7 +1435,7 @@ fn estimate_range_selectivity<'a>(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IntegralDomain {
     Boolean,
     TinyInt,
@@ -1741,6 +1866,38 @@ mod tests {
         assert_eq!(
             model.estimate_selectivity(&predicate, &statistics(200)),
             0.01
+        );
+        let in_values = |values: &[i32]| {
+            let mut children = vec![Expression::ColumnRef(
+                ColumnRefExpression::new(binding, LogicalType::Integer).into(),
+            )];
+            children.extend(values.iter().map(|value| {
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(*value), LogicalType::Integer).into(),
+                )
+            }));
+            Expression::Operator(
+                OperatorExpression::new(OperatorType::In, children, LogicalType::Boolean).into(),
+            )
+        };
+        for expressions in [
+            vec![predicate.clone(), in_values(&[2001, 2002, 2002])],
+            vec![in_values(&[2002, 2001]), predicate.clone()],
+        ] {
+            let estimate =
+                model.estimate_filter_cardinality(10_000, &expressions, &statistics(200));
+            assert_eq!(estimate.expected, 100);
+            assert!(estimate.max > estimate.expected, "NDV is not a hard bound");
+        }
+        assert_eq!(
+            model
+                .estimate_filter_cardinality(
+                    10_000,
+                    &[predicate.clone(), in_values(&[2002, 2003])],
+                    &statistics(200),
+                )
+                .expected,
+            50
         );
         let filtered = statistics(2);
         let mut rows = 721;
