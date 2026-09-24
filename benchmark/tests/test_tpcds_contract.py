@@ -35,6 +35,7 @@ class TpcdsResultContractTests(unittest.TestCase):
         for verify, literal in (("on", "true"), ("off", "false")):
             connection = MagicMock()
             args = SimpleNamespace(optimizer_verify=verify, optimizer_search_policy="quality",
+                                   optimizer_aggregate_strategy="joint",
                                    disabled_optimizer_rules="aggregate_dimension_deferral,aggregate_dimension_sharing",
                                    threads=4, memory_limit="2GB", statement_timeout_seconds=30)
             configure_paro(connection, args)
@@ -42,7 +43,8 @@ class TpcdsResultContractTests(unittest.TestCase):
                           connection.cursor.return_value.__enter__.return_value.execute.call_args_list]
             self.assertEqual(statements[0], f"SET optimizer_verify = {literal}")
             self.assertEqual(statements[1], "SET optimizer_search_policy = 'quality'")
-            self.assertEqual(statements[2], "SET disabled_optimizer_rules = 'aggregate_dimension_deferral,aggregate_dimension_sharing'")
+            self.assertEqual(statements[2], "SET optimizer_aggregate_strategy = 'joint'")
+            self.assertEqual(statements[3], "SET disabled_optimizer_rules = 'aggregate_dimension_deferral,aggregate_dimension_sharing'")
 
     def test_engine_identity_is_not_a_diagnostic_label(self) -> None:
         schema = duckdb_schema([("x", "VARCHAR")])[0]
