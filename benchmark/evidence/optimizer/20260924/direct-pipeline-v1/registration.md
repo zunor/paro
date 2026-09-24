@@ -47,3 +47,16 @@ Add typed encoding for argument-bound table functions; opaque statement bind
 data remains explicitly unsupported. After tests, restart all six cells on
 that same new binary with the original resources, counts and run order.
 Replacement output names use `a-`; no original output is overwritten.
+
+## Amendment B: declared admission class
+
+Replacement Q04 and Q11 cells passed SQL results, but pipeline receipt
+association was Uncovered: compile expected class 0 while the single-class
+portfolio lacked its expected-class declaration. Q11 had already started
+before Q04's receipt was inspected. Do not certify these compiler samples or
+pair diagnostics to them. Preserve all four cells, including Q04's slower
+warm timings. Attach explicit single-class coverage (no optional classes) to
+the portfolio and test receipt/portfolio agreement. Restart the original six
+cells on the fixed binary, with output prefix `b-`; validate each completed
+cell before starting the next. Counts, thresholds and other settings remain
+unchanged.

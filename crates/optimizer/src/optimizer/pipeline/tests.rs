@@ -29,7 +29,12 @@ fn pipeline_real_entry_has_one_resource_contract_and_no_memo() {
         portfolio.verify().unwrap();
         assert_eq!(portfolio.variants.len(), 1, "{sql}");
         assert_eq!(portfolio.grant_classes.len(), 1, "{sql}");
+        let coverage = portfolio.grant_search.as_ref().unwrap();
+        assert_eq!(coverage.expected_class, Some(portfolio.grant_classes[0].id));
+        assert!(coverage.optional_classes.is_empty());
+        assert!(coverage.unresolved_classes.is_empty());
         let receipt = optimizer.compile_receipt().unwrap();
+        assert_eq!(receipt.expected_class, Observed(portfolio.grant_classes[0].id.0));
         assert_eq!(receipt.groups, Observed(0));
         assert_eq!(receipt.logical_expressions, Observed(0));
         assert_eq!(receipt.physical_expressions, Observed(0));

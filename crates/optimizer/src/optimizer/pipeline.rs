@@ -179,7 +179,12 @@ impl Optimizer {
             crate::physical::ObjectiveProfile::Latency,
             [grant],
             [(grant.id, physical, fingerprint, selection.cost)],
-        )?;
+        )?
+        .with_grant_search(Some(crate::physical::GrantSearchCoverage::new(
+            Some(grant.id),
+            [grant.id],
+            false,
+        )))?;
         portfolio.verify()?;
         self.ctx.profiler.record(
             OptimizerComponent::PhysicalExtraction,
