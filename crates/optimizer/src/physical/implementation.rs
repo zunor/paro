@@ -913,7 +913,6 @@ struct RuntimeFilterProbeSource<'a> {
 /// tree selection sees; an opaque child must not silently disable that choice.
 pub(crate) fn planner_source_lineage(
     plan: &OwnedLogicalPlan,
-    statistics: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
 ) -> Vec<Option<Vec<paro_planner::operator::bound_reference::BoundSourceColumn>>> {
     use paro_planner::operator::bound_reference::BoundSourceColumn;
     (0..plan.types().len())
@@ -931,16 +930,20 @@ pub(crate) fn planner_source_lineage(
                     let expression = Expression::ColumnRef(
                         paro_planner::expression::ColumnRefExpression::new(binding, ty).into(),
                     );
+                    let multiplicity = infer_runtime_filter_probe_multiplicity(plan, [&expression]);
                     Some(BoundSourceColumn {
                         source: runtime_filter_source_id(source)?.0,
                         occurrence: plan.id.0 as usize,
                         column: source.output_index,
                         rows: plan.stats.estimated_cardinality,
-                        distinct: statistics
-                            .get(&binding)
-                            .map(|s| s.distinct_evidence().point),
+                        distinct: match multiplicity {
+                            RuntimeFilterProbeMultiplicity::EstimatedDistinct { keys } => {
+                                Some(keys)
+                            }
+                            _ => None,
+                        },
                         unique: matches!(
-                            infer_runtime_filter_probe_multiplicity(plan, [&expression]),
+                            multiplicity,
                             RuntimeFilterProbeMultiplicity::DeclaredUnique
                         ),
                     })

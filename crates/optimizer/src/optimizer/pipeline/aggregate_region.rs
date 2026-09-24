@@ -67,7 +67,6 @@ impl Node {
 fn boundary(
     plan: &OwnedLogicalPlan,
     layout: &LogicalOutputLayout,
-    columns: &SharedColumnStatistics,
     response: &direct::Completed,
 ) -> Result<BoundReference> {
     BoundReference::new(
@@ -80,7 +79,7 @@ fn boundary(
             cardinality: plan.stats.estimated_cardinality,
             maximum_cardinality: response.hard_rows,
             unique_keys: plan.stats.unique_keys.clone(),
-            source_lineage: crate::physical::implementation::planner_source_lineage(plan, columns),
+            source_lineage: crate::physical::implementation::planner_source_lineage(plan),
             contains_control_region:
                 crate::join::build_probe_side::contains_control_region_boundary(plan),
             ..Default::default()
@@ -332,12 +331,7 @@ impl Planner<'_> {
                 })
                 .collect(),
         );
-        let boundary = boundary(
-            &plan,
-            &layout,
-            &self.context.column_stats,
-            &selected.response,
-        )?;
+        let boundary = boundary(&plan, &layout, &selected.response)?;
         let (shell, _) = LogicalPlanNode::detach(plan);
         let mut rebind = BTreeMap::new();
         let mut partial_aggregate_index = None;
@@ -569,7 +563,7 @@ pub(super) fn optimize(
             return Ok(None);
         };
         let layout = leaf.output_layout();
-        let boundary = boundary(leaf, &layout, &context.column_stats, &response)?;
+        let boundary = boundary(leaf, &layout, &response)?;
         let columns = Arc::new(
             layout
                 .bindings()
