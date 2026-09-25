@@ -1,0 +1,164 @@
+{
+  "validator": "benchmark/harness/receipt_contract.py",
+  "runs": [
+    {
+      "run": "corpus-pipeline-run",
+      "manifest_status": "Incomplete",
+      "validated_cells": 130,
+      "validated_captures": 64,
+      "errors": [
+        {
+          "path": "campaign.json",
+          "error": "campaign summary status differs from manifest"
+        }
+      ]
+    },
+    {
+      "run": "corpus-quality-run",
+      "manifest_status": "Running",
+      "validated_cells": 10,
+      "validated_captures": 5,
+      "errors": []
+    },
+    {
+      "run": "corpus-v2-pipeline-run",
+      "manifest_status": "Completed",
+      "validated_cells": 68,
+      "validated_captures": 34,
+      "errors": []
+    },
+    {
+      "run": "corpus-v2-quality-run",
+      "manifest_status": "Incomplete",
+      "validated_cells": 198,
+      "validated_captures": 97,
+      "errors": []
+    },
+    {
+      "run": "outlier-23-run",
+      "manifest_status": "Completed",
+      "validated_cells": 1,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "outlier-47-run",
+      "manifest_status": "Completed",
+      "validated_cells": 1,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "outlier-51-run",
+      "manifest_status": "Completed",
+      "validated_cells": 1,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "outlier-67-run",
+      "manifest_status": "Completed",
+      "validated_cells": 1,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "outlier-72-run",
+      "manifest_status": "Completed",
+      "validated_cells": 1,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "outlier-78-run",
+      "manifest_status": "Completed",
+      "validated_cells": 1,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "probe-04-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "probe-05-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "probe-11-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "probe-40-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "probe-49-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "probe-72-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "probe-74-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "probe-80-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "quality-72-run",
+      "manifest_status": "Incomplete",
+      "validated_cells": 2,
+      "validated_captures": 0,
+      "errors": []
+    },
+    {
+      "run": "quality-v2-72-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "window-51-run",
+      "manifest_status": "Completed",
+      "validated_cells": 2,
+      "validated_captures": 1,
+      "errors": []
+    },
+    {
+      "run": "window-corpus-pipeline-run",
+      "manifest_status": "Incomplete",
+      "validated_cells": 198,
+      "validated_captures": 97,
+      "errors": []
+    }
+  ]
+}

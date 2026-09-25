@@ -149,3 +149,25 @@ bytes) did not meet that workload's declared 2GiB minimum. Keep that environment
 failure. Use a separate `tpch-v2` coverage run with exactly 2,147,483,648 bytes;
 this does not change the TPC-DS envelope or establish cross-workload timing
 comparability.
+
+## Delivery and remaining gates
+
+The implementation/measurement slice is delivered in
+[join-predicate-contract-v1](../../benchmark/evidence/optimizer/20260925/join-predicate-contract-v1/README.md).
+The final binary closes the inner predicate and delimiter substitution contracts;
+append-only windows consume each input delta once. Normal Q51 measurements show
+a large directional improvement, with unchanged selected structural identity,
+but neither parity nor default promotion is certified.
+
+Final pipeline TPC-DS coverage is 97/99, with Q39/Q58 still blocking. TPC-H's
+six static/numeric fixture failures and SQL regress's three text failures remain
+explicit; no expected output was changed. These gates precede default switching.
+Runtime adaptive build-side choice, per-key composite RF response costing,
+pipeline write coverage and compacting the remaining DP statistics transitions
+are not completed by this delivery.
+
+The bounded corpus report now supplies the next prioritization input. Complete
+typed operator attribution in the existing execution record before making
+operator-level causal claims: the current D6 producer reports that profile as
+Uncovered even when its capture and execution receipt complete successfully.
+Do not replace this missing contract with another raw-text profile parser.

@@ -1,0 +1,59 @@
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=2.626..5.696 rows=366 loops=2 scheduler_worker_count=1 scheduler_ready_time_us=25) logical_node_id=81
+  SINK #1 HASH_JOIN_BUILD (actual time=5.331..5.600 rows=366 loops=1 runtime_filter_installed_count=1)
+PIPELINE 1
+  SOURCE #2 ROWSET_SCAN (actual time=7.690..21.155 rows=142180 loops=48 scheduler_worker_count=4 scheduler_ready_time_us=27)
+  TRANSFORM #3 HASH_JOIN_PROBE (actual time=8.490..21.147 rows=142180 loops=44)
+  SINK #4 HASH_AGGREGATE_BUILD (actual time=8.591..21.155 rows=142180 loops=44 aggregate_hash_max_radix_partition_skew_percent=134)
+PIPELINE 2
+  SOURCE #5 HASH_JOIN_SPILL_REPLAY (actual time=0.000..0.000 rows=0 loops=0)
+  SINK #6 HASH_AGGREGATE_BUILD (actual time=0.000..0.000 rows=0 loops=0)
+PIPELINE 3
+  SOURCE #7 HASH_AGGREGATE_EMIT (actual time=919.097..919.933 rows=138310 loops=40 scheduler_worker_count=4 scheduler_ready_time_us=49)
+  SINK #8 WINDOW_BUILD (actual time=919.182..919.761 rows=138310 loops=36)
+PIPELINE 4
+  SOURCE #9 WINDOW_EMIT (actual time=1130.508..1132.275 rows=138310 loops=35)
+  TRANSFORM #10 PROJECTION (actual time=1130.510..1132.219 rows=138310 loops=34)
+  SINK #11 HASH_JOIN_BUILD (actual time=1130.513..1132.267 rows=138310 loops=34)
+PIPELINE 5
+  SOURCE #12 ROWSET_SCAN (actual time=2.626..5.691 rows=366 loops=2 scheduler_worker_count=1 scheduler_ready_time_us=211) logical_node_id=90
+  SINK #13 HASH_JOIN_BUILD (actual time=5.331..5.599 rows=366 loops=1 runtime_filter_installed_count=1)
+PIPELINE 6
+  SOURCE #14 ROWSET_SCAN (actual time=23.935..80.795 rows=553970 loops=170 scheduler_worker_count=4 scheduler_ready_time_us=35)
+  TRANSFORM #15 HASH_JOIN_PROBE (actual time=24.626..80.736 rows=553970 loops=166)
+  SINK #16 HASH_AGGREGATE_BUILD (actual time=24.678..80.793 rows=553970 loops=166 aggregate_hash_max_radix_partition_skew_percent=175)
+PIPELINE 7
+  SOURCE #17 HASH_JOIN_SPILL_REPLAY (actual time=0.000..0.000 rows=0 loops=0)
+  SINK #18 HASH_AGGREGATE_BUILD (actual time=0.000..0.000 rows=0 loops=0)
+PIPELINE 8
+  SOURCE #19 HASH_AGGREGATE_EMIT (actual time=98.131..101.817 rows=499205 loops=128 scheduler_worker_count=4 scheduler_ready_time_us=48)
+  SINK #20 WINDOW_BUILD (actual time=99.079..101.602 rows=499205 loops=124)
+PIPELINE 9
+  SOURCE #21 WINDOW_EMIT (actual time=1133.331..1133.396 rows=499205 loops=123)
+  SINK #22 MATERIALIZE (actual time=1133.332..1133.383 rows=499205 loops=122)
+PIPELINE 10
+  SOURCE #23 MATERIALIZED (actual time=1133.485..1140.148 rows=499205 loops=126 scheduler_worker_count=4 scheduler_ready_time_us=46)
+  TRANSFORM #24 PROJECTION (actual time=1133.489..1139.955 rows=499205 loops=122)
+  TRANSFORM #25 HASH_JOIN_PROBE (actual time=1133.492..1140.020 rows=499205 loops=244)
+  TRANSFORM #26 PROJECTION (actual time=1133.570..1140.148 rows=499205 loops=244)
+  SINK #27 WINDOW_BUILD (actual time=1133.586..1140.148 rows=499205 loops=244)
+PIPELINE 11
+  SOURCE #28 HASH_JOIN_SPILL_REPLAY (actual time=1140.201..1140.202 rows=0 loops=1)
+  TRANSFORM #29 PROJECTION (actual time=0.000..0.000 rows=0 loops=0)
+  SINK #30 WINDOW_BUILD (actual time=0.000..0.000 rows=0 loops=0)
+PIPELINE 12
+  SOURCE #31 HASH_JOIN_UNMATCHED (actual time=1140.231..1146.278 rows=111479 loops=35 scheduler_worker_count=4 scheduler_ready_time_us=51)
+  TRANSFORM #32 PROJECTION (actual time=1140.426..1146.273 rows=111479 loops=31)
+  SINK #33 WINDOW_BUILD (actual time=1140.609..1146.273 rows=111479 loops=31)
+PIPELINE 13
+  SOURCE #34 WINDOW_EMIT (actual time=2588.199..2592.083 rows=610684 loops=151)
+  TRANSFORM #35 FILTER (actual time=2588.200..2592.075 rows=25543 loops=150)
+  TRANSFORM #36 PROJECTION (actual time=2588.610..2592.075 rows=25543 loops=150)
+  SINK #37 TOP_N_BUILD (actual time=2588.613..2592.077 rows=25543 loops=150)
+PIPELINE 14
+  SOURCE #38 TOP_N_EMIT (actual time=2592.325..2592.330 rows=100 loops=2)
+  SINK #39 CLIENT_RESULT (actual time=2592.326..2592.327 rows=100 loops=1)
+PROFILE schema_version=1 query_id=1 events=3064 parallelism=4 workers=4 worker_utilization=0.0340 ready_time_us=492 wait_time_us=0 wake_coalesce=0 backpressure=0 runtime_filter_installed=2 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=0 revoked_bytes=0 revocable_bytes=0 spill_bytes=0 spill_latency_us=0 yield_latency_us=0 repartition_depth=0
+Execution Time: 2593.966 ms
+Rows Returned: 100

@@ -1,0 +1,156 @@
+[ERROR]
+[SCRIPT   FILE]: cases/python_udf/scalar/fixed_width_fast_path.sql
+[ROW    NUMBER]: 0
+[SQL STATEMENT]: CREATE FUNCTION py_numpy_fast(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+IMMUTABLE
+IMPORTS ('<repo>/regress/report/fixtures/python_udf/scalar/fixed_width_fast_path/python_udf/modules/fake_numpy/numpy.py')
+AS $$
+import numpy
+return a.to_numpy() + 7
+$$;
+[EXPECT RESULT]:
+CREATE FUNCTION py_numpy_fast(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+IMMUTABLE
+IMPORTS ('<repo>/regress/report/fixtures/python_udf/scalar/fixed_width_fast_path/python_udf/modules/fake_numpy/numpy.py')
+AS $$
+import numpy
+return a.to_numpy() + 7
+$$;
+[ACTUAL RESULT]:
+CREATE FUNCTION py_numpy_fast(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+IMMUTABLE
+IMPORTS ('/private/tmp/paro-join-contract.Cayz7A/regress-v2/fixtures/python_udf/scalar/fixed_width_fast_path/python_udf/modules/fake_numpy/numpy.py')
+AS $$
+import numpy
+return a.to_numpy() + 7
+$$;
+
+[ERROR]
+[SCRIPT   FILE]: cases/python_udf/scalar/imported_helper.sql
+[ROW    NUMBER]: 0
+[SQL STATEMENT]: CREATE FUNCTION py_imported(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+IMMUTABLE
+IMPORTS ('<repo>/regress/report/fixtures/python_udf/scalar/imported_helper/python_udf/modules/basic_math/basic_math.py')
+AS $$
+from basic_math import shift_all
+return shift_all(a.materialize_py())
+$$;
+[EXPECT RESULT]:
+CREATE FUNCTION py_imported(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+IMMUTABLE
+IMPORTS ('<repo>/regress/report/fixtures/python_udf/scalar/imported_helper/python_udf/modules/basic_math/basic_math.py')
+AS $$
+from basic_math import shift_all
+return shift_all(a.materialize_py())
+$$;
+[ACTUAL RESULT]:
+CREATE FUNCTION py_imported(a INTEGER) RETURNS INTEGER
+LANGUAGE python
+IMMUTABLE
+IMPORTS ('/private/tmp/paro-join-contract.Cayz7A/regress-v2/fixtures/python_udf/scalar/imported_helper/python_udf/modules/basic_math/basic_math.py')
+AS $$
+from basic_math import shift_all
+return shift_all(a.materialize_py())
+$$;
+
+[ERROR]
+[SCRIPT   FILE]: cases/query/cte/cte_explain.sql
+[ROW    NUMBER]: 1
+[SQL STATEMENT]: EXPLAIN
+WITH base(id, grp, amount) AS MATERIALIZED (
+    VALUES
+        (1, 'east', 10),
+        (2, 'east', 20),
+        (3, 'west', 15),
+        (4, 'west', 30),
+        (5, 'north', 5)
+),
+agg AS (
+    SELECT grp, SUM(amount) AS total
+    FROM base
+    GROUP BY grp
+),
+peers AS (
+    SELECT l.id, r.id AS peer_id, l.grp
+    FROM base AS l
+    JOIN base AS r ON l.grp = r.grp AND l.id < r.id
+)
+SELECT p.id, p.peer_id, a.total
+FROM peers AS p
+JOIN agg AS a ON a.grp = p.grp
+ORDER BY p.id, p.peer_id;
+[EXPECT RESULT]:
+QUERY PLAN
+MATERIALIZED_CTE  (rows=0)
+  CTE Name: base
+  Materialization: MATERIALIZED
+  Reference Count: 3
+  ->  VALUES  (rows=5)
+  ->  ORDER_BY  (rows=0)
+        Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
+        ->  PROJECTION  (rows=0)
+              Output: p.id, p.peer_id, a.total
+              ->  HASH_JOIN  (rows=0)
+                    Join Type: INNER
+                    Join Condition: a.grp = p.grp
+                    ->  PROJECTION  (rows=3)
+                          Output: grp, total
+                          ->  AGGREGATE  (rows=3)
+                                Group Key: base.grp
+                                Aggregates: sum(base.amount)
+                                ->  CTE_SCAN  (rows=5)
+                                      CTE Index: 0
+                                      Table Index: 25
+                    ->  PROJECTION  (rows=1)
+                          Output: id, peer_id, grp
+                          ->  FILTER  (rows=1)
+                                Filter: r.id > l.id
+                                ->  HASH_JOIN  (rows=3)
+                                      Join Type: INNER
+                                      Join Condition: l.grp = r.grp
+                                      ->  CTE_SCAN  (rows=5)
+                                            CTE Index: 0
+                                            Table Index: 16
+                                      ->  CTE_SCAN  (rows=5)
+                                            CTE Index: 0
+                                            Table Index: 17
+[ACTUAL RESULT]:
+QUERY PLAN
+MATERIALIZED_CTE  (rows=0)
+  CTE Name: base
+  Materialization: MATERIALIZED
+  Reference Count: 3
+  ->  VALUES  (rows=5)
+  ->  ORDER_BY  (rows=0)
+        Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
+        ->  PROJECTION  (rows=0)
+              Output: p.id, p.peer_id, a.total
+              ->  HASH_JOIN  (rows=0)
+                    Join Type: INNER
+                    Join Condition: a.grp = p.grp
+                    ->  PROJECTION  (rows=3)
+                          Output: grp, total
+                          ->  AGGREGATE  (rows=3)
+                                Group Key: base.grp
+                                Aggregates: sum(base.amount)
+                                ->  CTE_SCAN  (rows=5)
+                                      CTE Index: 0
+                                      Table Index: 25
+                    ->  PROJECTION  (rows=1)
+                          Output: id, peer_id, grp
+                          ->  HASH_JOIN  (rows=1)
+                                Join Type: INNER
+                                Join Condition: l.grp = r.grp
+                                Join Condition: l.id < r.id
+                                ->  CTE_SCAN  (rows=5)
+                                      CTE Index: 0
+                                      Table Index: 16
+                                ->  CTE_SCAN  (rows=5)
+                                      CTE Index: 0
+                                      Table Index: 17
+

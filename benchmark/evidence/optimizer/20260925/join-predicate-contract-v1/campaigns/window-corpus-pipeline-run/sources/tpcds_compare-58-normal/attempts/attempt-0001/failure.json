@@ -1,0 +1,1 @@
+{"arm_id":"normal","attempt_id":"attempt-0001","campaign_id":"campaign-20260925T065217400167Z-43204-8b8a3fdaa6","error":"SyntaxError: Ambiguous column name: item_id","query_case":"58","run_id":"window-corpus-pipeline-run","schema_version":3,"source_id":"tpcds_compare-58-normal","status":"Incomplete"}
