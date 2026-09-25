@@ -495,7 +495,14 @@ fn collect_native_join_input(
             {
                 return Ok(false);
             }
-            if !at_root && !filter.projection_map.is_identity(layouts[index].len()) {
+            // Positional projection indices belong to the input namespace,
+            // not the already projected output of this Filter. A narrowing
+            // filter is a region boundary, even if its output is contiguous.
+            if !at_root
+                && !filter
+                    .projection_map
+                    .is_identity(native_child_layout(&filter.child, layouts)?.len())
+            {
                 return Ok(false);
             }
             if at_root {
