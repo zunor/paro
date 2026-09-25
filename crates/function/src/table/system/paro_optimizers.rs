@@ -190,7 +190,10 @@ fn paro_optimizers_function(
         *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(7) {
-        let ids: Vec<i64> = record_ids.iter().map(|id| (*id).min(i64::MAX as u64) as i64).collect();
+        let ids: Vec<i64> = record_ids
+            .iter()
+            .map(|id| (*id).min(i64::MAX as u64) as i64)
+            .collect();
         *col = Vector::try_from_i64(&ids, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(8) {
@@ -367,7 +370,10 @@ mod tests {
             Value::Varchar("metric".to_string())
         );
         assert_eq!(chunk.column(7).unwrap().get_value(0), Value::BigInt(0));
-        assert_eq!(chunk.column(8).unwrap().get_value(0), Value::Varchar("".to_string()));
+        assert_eq!(
+            chunk.column(8).unwrap().get_value(0),
+            Value::Varchar("".to_string())
+        );
         assert_eq!(
             chunk.column(0).unwrap().get_value(1),
             Value::Varchar("memo_exploration".to_string())

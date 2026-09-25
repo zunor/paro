@@ -469,7 +469,10 @@ impl<R: Read + Seek> ColumnReader<R> {
 
         let (body, _footer, _) = self.page_reader.read_page(&mut self.reader, &opts)?;
 
-        let _cold_work = paro_common::cold_work::WorkScope::new(paro_common::cold_work::Kind::ZoneMap, body.len());
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::ZoneMap,
+            body.len(),
+        );
         self.zonemap_index = Some(Arc::new(ZoneMapIndexReader::from_bytes(&body)?));
 
         Ok(())
@@ -487,7 +490,10 @@ impl<R: Read + Seek> ColumnReader<R> {
                 .with_codec(self.opts.compression);
 
             let (body, _footer, _) = self.page_reader.read_page(&mut self.reader, &opts)?;
-            let _cold_work = paro_common::cold_work::WorkScope::new(paro_common::cold_work::Kind::Dictionary, body.len());
+            let _cold_work = paro_common::cold_work::WorkScope::new(
+                paro_common::cold_work::Kind::Dictionary,
+                body.len(),
+            );
             let mut dictionary = BinaryPlainPageDecoder::new(body);
             dictionary.init()?;
             self.dictionary = Some(Arc::new(dictionary));

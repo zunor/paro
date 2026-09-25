@@ -174,18 +174,15 @@ impl Task for PrefetchTask {
         for item in &self.items {
             let item_start = Instant::now();
             let key = item.key;
-            let result = self
-                .cache
-                .get_or_load_into(
-                    key,
-                    PageContentKind::Compressed,
-                    item.size as usize,
-                    |destination| {
-                        let options =
-                            PageReadOptions::new(PagePointer::new(item.offset, item.size));
-                        PageIO::read_page_bytes_into(&mut file, &options, destination)
-                    },
-                );
+            let result = self.cache.get_or_load_into(
+                key,
+                PageContentKind::Compressed,
+                item.size as usize,
+                |destination| {
+                    let options = PageReadOptions::new(PagePointer::new(item.offset, item.size));
+                    PageIO::read_page_bytes_into(&mut file, &options, destination)
+                },
+            );
             match result {
                 Ok(_) => {
                     self.registry.mark_ready(key);

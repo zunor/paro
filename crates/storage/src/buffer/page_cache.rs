@@ -848,7 +848,10 @@ impl PageCache {
                 return Ok(None);
             };
 
-            let _cold_work = paro_common::cold_work::WorkScope::new(paro_common::cold_work::Kind::BufferFill, size);
+            let _cold_work = paro_common::cold_work::WorkScope::new(
+                paro_common::cold_work::Kind::BufferFill,
+                size,
+            );
 
             // SAFETY: this newly allocated buffer is pinned by `buffer` and
             // is not reachable from the cache until initialization succeeds.
@@ -1154,7 +1157,10 @@ impl PageCache {
         kind: PageContentKind,
         data: &[u8],
     ) -> Result<(BufferHandle, SharedBlockHandle)> {
-        let _cold_work = paro_common::cold_work::WorkScope::new(paro_common::cold_work::Kind::BufferFill, data.len());
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::BufferFill,
+            data.len(),
+        );
         if data.is_empty() {
             return Err(paro_error::invalid_input("page data is empty"));
         }
@@ -1223,23 +1229,36 @@ mod tests {
         let source = [1_u8, 2, 3, 4];
 
         let first = cache
-            .get_or_load_into(key, PageContentKind::Compressed, source.len(), |destination| {
-                destination.copy_from_slice(&source);
-                Ok(())
-            })
+            .get_or_load_into(
+                key,
+                PageContentKind::Compressed,
+                source.len(),
+                |destination| {
+                    destination.copy_from_slice(&source);
+                    Ok(())
+                },
+            )
             .unwrap();
         let first_ptr = first.data().unwrap().as_ptr();
         assert_eq!(first.data().unwrap(), source);
-        assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), source.len() as i64);
+        assert_eq!(
+            pool.get_tag_usage(MemoryTag::PageCache),
+            source.len() as i64
+        );
         drop(first);
 
         let mut initialized = false;
         let second = cache
-            .get_or_load_into(key, PageContentKind::Compressed, source.len(), |destination| {
-                initialized = true;
-                destination.fill(9);
-                Ok(())
-            })
+            .get_or_load_into(
+                key,
+                PageContentKind::Compressed,
+                source.len(),
+                |destination| {
+                    initialized = true;
+                    destination.fill(9);
+                    Ok(())
+                },
+            )
             .unwrap();
         assert!(!initialized);
         assert_eq!(second.data().unwrap().as_ptr(), first_ptr);
@@ -1252,24 +1271,17 @@ mod tests {
         let cache = PageCache::new(pool.clone());
         let key = PageKey::new(1, 2, 0, 3, 1024, 4);
 
-        let first = cache.get_or_load_into(
-            key,
-            PageContentKind::Compressed,
-            4,
-            |_destination| Err(paro_common::error::data_corrupted("synthetic read failure")),
-        );
+        let first = cache.get_or_load_into(key, PageContentKind::Compressed, 4, |_destination| {
+            Err(paro_common::error::data_corrupted("synthetic read failure"))
+        });
         assert!(first.is_err());
         assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), 0);
 
-        let failed_retry = cache.get_or_load_into(
-            key,
-            PageContentKind::Compressed,
-            4,
-            |destination| {
+        let failed_retry =
+            cache.get_or_load_into(key, PageContentKind::Compressed, 4, |destination| {
                 destination.fill(2);
                 Ok(())
-            },
-        );
+            });
         assert!(failed_retry.is_err());
 
         let recovered = cache

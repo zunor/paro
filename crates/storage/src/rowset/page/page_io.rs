@@ -683,8 +683,7 @@ mod tests {
         .unwrap();
         let opts = PageReadOptions::new(ptr).with_codec(CompressionType::Lz4);
         let raw = PageIO::read_page_bytes(&mut buffer, &opts).unwrap();
-        let (_, uncompressed_size, body_size) =
-            PageIO::parse_page_footer(&raw, true).unwrap();
+        let (_, uncompressed_size, body_size) = PageIO::parse_page_footer(&raw, true).unwrap();
         assert!(body_size < uncompressed_size as usize);
 
         let mut destination = vec![0_u8; uncompressed_size as usize];

@@ -9,8 +9,8 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::OnceLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 pub const MAX_OPERATORS: usize = 1024;
@@ -35,13 +35,24 @@ struct Occupancy {
     last: Instant,
 }
 impl Occupancy {
-    fn new() -> Self { Self { active:[0; KINDS], nanos:[0; 1 << KINDS], last:Instant::now() } }
+    fn new() -> Self {
+        Self {
+            active: [0; KINDS],
+            nanos: [0; 1 << KINDS],
+            last: Instant::now(),
+        }
+    }
     fn settle(&mut self) {
         self.settle_at(Instant::now());
     }
     fn settle_at(&mut self, now: Instant) {
-        let mask = self.active.iter().enumerate().fold(0, |mask,(i,n)| mask | (usize::from(*n > 0) << i));
-        self.nanos[mask] = self.nanos[mask].saturating_add(now.duration_since(self.last).as_nanos() as u64);
+        let mask = self
+            .active
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (i, n)| mask | (usize::from(*n > 0) << i));
+        self.nanos[mask] =
+            self.nanos[mask].saturating_add(now.duration_since(self.last).as_nanos() as u64);
         self.last = now;
     }
     fn transition(&mut self, from: Option<usize>, to: Option<usize>) {
@@ -49,8 +60,12 @@ impl Occupancy {
     }
     fn transition_at(&mut self, from: Option<usize>, to: Option<usize>, now: Instant) {
         self.settle_at(now);
-        if let Some(i) = from { self.active[i] = self.active[i].saturating_sub(1); }
-        if let Some(i) = to { self.active[i] += 1; }
+        if let Some(i) = from {
+            self.active[i] = self.active[i].saturating_sub(1);
+        }
+        if let Some(i) = to {
+            self.active[i] += 1;
+        }
     }
 }
 fn occupancy() -> &'static Mutex<Occupancy> {
@@ -101,12 +116,25 @@ pub struct WorkScope {
 }
 impl WorkScope {
     pub fn new(kind: Kind, bytes: usize) -> Option<Self> {
-        if !enabled() || !ACTIVE.load(Relaxed) { return None; }
+        if !enabled() || !ACTIVE.load(Relaxed) {
+            return None;
+        }
         let parent = CURRENT_KIND.with(|current| current.replace(Some(kind as usize)));
-        occupancy().lock().unwrap().transition(parent, Some(kind as usize));
-        Some(Self { started: Instant::now(), accounted: ACCOUNTED_NS.with(Cell::get),
-            kind: kind as usize, bytes: bytes as u64, operator: None, epoch: EPOCH.load(Relaxed),
-            parent, occupancy_entered:true, _not_send: PhantomData })
+        occupancy()
+            .lock()
+            .unwrap()
+            .transition(parent, Some(kind as usize));
+        Some(Self {
+            started: Instant::now(),
+            accounted: ACCOUNTED_NS.with(Cell::get),
+            kind: kind as usize,
+            bytes: bytes as u64,
+            operator: None,
+            epoch: EPOCH.load(Relaxed),
+            parent,
+            occupancy_entered: true,
+            _not_send: PhantomData,
+        })
     }
     pub fn operator(kind: Kind, id: usize) -> Option<Self> {
         let mut scope = Self::new(kind, 0)?;
@@ -116,9 +144,18 @@ impl WorkScope {
 }
 impl Drop for WorkScope {
     fn drop(&mut self) {
-        if self.occupancy_entered { CURRENT_KIND.with(|current| current.set(self.parent)); }
-        if !ACTIVE.load(Relaxed) || self.epoch != EPOCH.load(Relaxed) { return; }
-        if self.occupancy_entered { occupancy().lock().unwrap().transition(Some(self.kind), self.parent); }
+        if self.occupancy_entered {
+            CURRENT_KIND.with(|current| current.set(self.parent));
+        }
+        if !ACTIVE.load(Relaxed) || self.epoch != EPOCH.load(Relaxed) {
+            return;
+        }
+        if self.occupancy_entered {
+            occupancy()
+                .lock()
+                .unwrap()
+                .transition(Some(self.kind), self.parent);
+        }
         let total = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let own = ACCOUNTED_NS.with(|clock| {
             let nested = clock.get().saturating_sub(self.accounted);
@@ -133,29 +170,51 @@ impl Drop for WorkScope {
             if id < MAX_OPERATORS {
                 OP_NANOS[id].fetch_add(own, Relaxed);
                 OP_COUNTS[id].fetch_add(1, Relaxed);
-            } else { OVERFLOW.fetch_add(1, Relaxed); }
+            } else {
+                OVERFLOW.fetch_add(1, Relaxed);
+            }
         }
     }
 }
 
 #[derive(Default, Clone, Copy)]
-struct Usage { minor: u64, major: u64, max_rss: u64, valid: bool }
+struct Usage {
+    minor: u64,
+    major: u64,
+    max_rss: u64,
+    valid: bool,
+}
 fn usage() -> Usage {
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         let mut value = std::mem::MaybeUninit::<libc::rusage>::uninit();
         // SAFETY: getrusage initializes the structure on success; no pointer escapes.
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, value.as_mut_ptr()) } != 0 { return Usage::default(); }
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, value.as_mut_ptr()) } != 0 {
+            return Usage::default();
+        }
         let value = unsafe { value.assume_init() };
         let scale = if cfg!(target_os = "macos") { 1 } else { 1024 };
-        Usage { minor: value.ru_minflt.max(0) as u64, major: value.ru_majflt.max(0) as u64,
-            max_rss: (value.ru_maxrss.max(0) as u64).saturating_mul(scale), valid: true }
+        Usage {
+            minor: value.ru_minflt.max(0) as u64,
+            major: value.ru_majflt.max(0) as u64,
+            max_rss: (value.ru_maxrss.max(0) as u64).saturating_mul(scale),
+            valid: true,
+        }
     }
-    #[cfg(not(unix))] { Usage::default() }
+    #[cfg(not(unix))]
+    {
+        Usage::default()
+    }
 }
 
 /// One actual execution occurrence, excluding parse/compiler. maxRSS is the
 /// process lifetime high-water at these endpoints, not a resettable statement peak.
-pub struct Window { before: Usage, overlaps: u64, started: Instant, owner: bool }
+pub struct Window {
+    before: Usage,
+    overlaps: u64,
+    started: Instant,
+    owner: bool,
+}
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub valid: bool,
@@ -175,7 +234,8 @@ impl Snapshot {
         let mut rows = vec![
             ("valid_isolated_window".into(), u64::from(self.valid)),
             ("execution_elapsed_us".into(), self.elapsed_us),
-            ("minor_faults".into(), self.minor), ("major_faults".into(), self.major),
+            ("minor_faults".into(), self.minor),
+            ("major_faults".into(), self.major),
             ("process_max_rss_before_bytes".into(), self.rss_before),
             ("process_max_rss_after_bytes".into(), self.rss_after),
             ("operator_overflow_count".into(), self.overflow),
@@ -197,29 +257,60 @@ impl Snapshot {
 }
 impl Window {
     pub fn begin() -> Option<Self> {
-        if !enabled() { return None; }
+        if !enabled() {
+            return None;
+        }
         Some(Self::begin_enabled())
     }
     fn begin_enabled() -> Self {
         let owner = IN_FLIGHT.fetch_add(1, Relaxed) == 0;
-        if !owner { OVERLAPS.fetch_add(1, Relaxed); }
+        if !owner {
+            OVERLAPS.fetch_add(1, Relaxed);
+        }
         if owner {
             EPOCH.fetch_add(1, Relaxed);
             ACTIVE.store(true, Relaxed);
-            for values in [&COUNTS[..], &BYTES[..], &NANOS[..], &OP_NANOS[..], &OP_COUNTS[..]] {
-                for value in values { value.store(0, Relaxed); }
+            for values in [
+                &COUNTS[..],
+                &BYTES[..],
+                &NANOS[..],
+                &OP_NANOS[..],
+                &OP_COUNTS[..],
+            ] {
+                for value in values {
+                    value.store(0, Relaxed);
+                }
             }
             OVERFLOW.store(0, Relaxed);
         }
         let before = usage();
         let started = Instant::now();
-        if owner { *occupancy().lock().unwrap() = Occupancy { active:[0; KINDS], nanos:[0; 1 << KINDS], last:started }; }
-        Self { before, overlaps: OVERLAPS.load(Relaxed), started, owner }
+        if owner {
+            *occupancy().lock().unwrap() = Occupancy {
+                active: [0; KINDS],
+                nanos: [0; 1 << KINDS],
+                last: started,
+            };
+        }
+        Self {
+            before,
+            overlaps: OVERLAPS.load(Relaxed),
+            started,
+            owner,
+        }
     }
     pub fn finish(self) -> Snapshot {
         let after = usage();
-        let occupancy_nanos = { let mut clock = occupancy().lock().unwrap(); clock.settle(); clock.nanos };
-        let valid = self.owner && self.overlaps == OVERLAPS.load(Relaxed) && self.before.valid && after.valid && OVERFLOW.load(Relaxed) == 0;
+        let occupancy_nanos = {
+            let mut clock = occupancy().lock().unwrap();
+            clock.settle();
+            clock.nanos
+        };
+        let valid = self.owner
+            && self.overlaps == OVERLAPS.load(Relaxed)
+            && self.before.valid
+            && after.valid
+            && OVERFLOW.load(Relaxed) == 0;
         let mut operators = Vec::new();
         for id in 0..MAX_OPERATORS {
             let count = OP_COUNTS[id].load(Relaxed);
@@ -227,16 +318,34 @@ impl Window {
                 operators.push((id, count, OP_NANOS[id].load(Relaxed)));
             }
         }
-        Snapshot { valid, elapsed_us:self.started.elapsed().as_micros() as u64,
-            minor:after.minor.saturating_sub(self.before.minor), major:after.major.saturating_sub(self.before.major),
-            rss_before:self.before.max_rss, rss_after:after.max_rss, overflow:OVERFLOW.load(Relaxed),
-            metrics:std::array::from_fn(|i| [COUNTS[i].load(Relaxed), BYTES[i].load(Relaxed), NANOS[i].load(Relaxed)]), operators, occupancy_nanos }
+        Snapshot {
+            valid,
+            elapsed_us: self.started.elapsed().as_micros() as u64,
+            minor: after.minor.saturating_sub(self.before.minor),
+            major: after.major.saturating_sub(self.before.major),
+            rss_before: self.before.max_rss,
+            rss_after: after.max_rss,
+            overflow: OVERFLOW.load(Relaxed),
+            metrics: std::array::from_fn(|i| {
+                [
+                    COUNTS[i].load(Relaxed),
+                    BYTES[i].load(Relaxed),
+                    NANOS[i].load(Relaxed),
+                ]
+            }),
+            operators,
+            occupancy_nanos,
+        }
     }
 }
-impl Drop for Window { fn drop(&mut self) {
-    if self.owner { ACTIVE.store(false, Relaxed); }
-    IN_FLIGHT.fetch_sub(1, Relaxed);
-} }
+impl Drop for Window {
+    fn drop(&mut self) {
+        if self.owner {
+            ACTIVE.store(false, Relaxed);
+        }
+        IN_FLIGHT.fetch_sub(1, Relaxed);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -264,10 +373,28 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         let window = Window::begin_enabled();
         ACCOUNTED_NS.with(|v| v.set(0));
-        let outer = WorkScope { started: Instant::now(), accounted: 0, kind: 4, bytes:0,
-            operator: None, epoch:EPOCH.load(Relaxed), parent:None, occupancy_entered:false, _not_send: PhantomData };
-        let inner = WorkScope { started: Instant::now(), accounted: 0, kind: 1, bytes:17,
-            operator: None, epoch:EPOCH.load(Relaxed), parent:None, occupancy_entered:false, _not_send: PhantomData };
+        let outer = WorkScope {
+            started: Instant::now(),
+            accounted: 0,
+            kind: 4,
+            bytes: 0,
+            operator: None,
+            epoch: EPOCH.load(Relaxed),
+            parent: None,
+            occupancy_entered: false,
+            _not_send: PhantomData,
+        };
+        let inner = WorkScope {
+            started: Instant::now(),
+            accounted: 0,
+            kind: 1,
+            bytes: 17,
+            operator: None,
+            epoch: EPOCH.load(Relaxed),
+            parent: None,
+            occupancy_entered: false,
+            _not_send: PhantomData,
+        };
         drop(inner);
         drop(outer);
         assert_eq!(BYTES[1].load(Relaxed), 17);
@@ -284,8 +411,17 @@ mod tests {
         assert!(!third.finish().valid);
         assert!(!second.finish().valid);
         let aborted = Window::begin_enabled();
-        let old = WorkScope { started: Instant::now(), accounted: ACCOUNTED_NS.with(Cell::get),
-            kind:0, bytes:99, operator:None, epoch:EPOCH.load(Relaxed), parent:None, occupancy_entered:false, _not_send:PhantomData };
+        let old = WorkScope {
+            started: Instant::now(),
+            accounted: ACCOUNTED_NS.with(Cell::get),
+            kind: 0,
+            bytes: 99,
+            operator: None,
+            epoch: EPOCH.load(Relaxed),
+            parent: None,
+            occupancy_entered: false,
+            _not_send: PhantomData,
+        };
         drop(aborted);
         let fresh = Window::begin_enabled();
         drop(old);
