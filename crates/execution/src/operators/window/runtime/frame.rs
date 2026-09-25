@@ -317,6 +317,18 @@ pub(super) fn visit_append_only_aggregate_frames(
             1,
             allocator.clone(),
         )?;
+        // A delta is frequently one row (ROWS CURRENT ROW). Own the bounded
+        // writable payload once, not a new set of vectors for every prefix.
+        // Reset releases variable-width scratch and restores validity before
+        // the next delta; aggregate update may consume but cannot retain it.
+        let input_types = aggregate
+            .children
+            .iter()
+            .map(Expression::return_type)
+            .collect::<Vec<_>>();
+        let mut payload_chunk =
+            Chunk::try_initialize(&input_types, VECTOR_SIZE, allocator.clone())?;
+        let mut selected_keys = Vec::with_capacity(VECTOR_SIZE);
         let mut previous: Option<Range<usize>> = None;
         for (index, frame) in frames.into_iter().enumerate() {
             if frame.start > frame.end
@@ -331,17 +343,12 @@ pub(super) fn visit_append_only_aggregate_frames(
             for batch in (start..frame.end).step_by(VECTOR_SIZE) {
                 let count = (frame.end - batch).min(VECTOR_SIZE);
                 let batch_keys = &sorted_keys[batch..batch + count];
-                let selected_keys = if let Some(filter) = aggregate.filter.as_deref() {
-                    batch_keys
-                        .iter()
-                        .copied()
-                        .filter(|key| {
-                            matches!(value_from_expr(chunks, key, filter), Value::Boolean(true))
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
+                selected_keys.clear();
+                if let Some(filter) = aggregate.filter.as_deref() {
+                    selected_keys.extend(batch_keys.iter().copied().filter(|key| {
+                        matches!(value_from_expr(chunks, key, filter), Value::Boolean(true))
+                    }));
+                }
                 let input_keys = if aggregate.filter.is_some() {
                     selected_keys.as_slice()
                 } else {
@@ -351,13 +358,8 @@ pub(super) fn visit_append_only_aggregate_frames(
                     continue;
                 }
                 address_batch.try_set_count(input_keys.len())?;
-                let inputs =
-                    materialize_aggregate_inputs(chunks, input_keys, aggregate, allocator.clone())?;
-                let payload_chunk = Chunk::try_from_arc_vectors_with_cardinality(
-                    inputs.into_iter().map(Arc::new).collect(),
-                    input_keys.len(),
-                    allocator.clone(),
-                )?;
+                payload_chunk.try_reset(allocator.clone())?;
+                materialize_aggregate_inputs(chunks, input_keys, aggregate, &mut payload_chunk)?;
                 let payload = AggregatePayload {
                     chunk: &payload_chunk,
                     aggregate_inputs: &aggregate_inputs,
@@ -417,13 +419,13 @@ fn materialize_aggregate_inputs(
     chunks: &[Chunk],
     keys: &[WindowRowKey],
     aggregate: &paro_planner::expression::AggregateExpression,
-    allocator: Arc<dyn Allocator>,
-) -> Result<Vec<Vector>> {
-    let mut inputs = Vec::with_capacity(aggregate.children.len());
-    for child in &aggregate.children {
-        let mut vector =
-            Vector::try_new(child.return_type(), keys.len().max(1), allocator.clone())?;
-        vector.try_set_count(keys.len())?;
+    payload: &mut Chunk,
+) -> Result<()> {
+    payload.try_set_cardinality(keys.len())?;
+    for (column, child) in aggregate.children.iter().enumerate() {
+        let vector = payload.column_mut(column).ok_or_else(|| {
+            paro_error::internal("aggregate window payload is missing an argument")
+        })?;
         for (row, key) in keys.iter().enumerate() {
             match child {
                 Expression::Constant(constant) => vector.set_value(row, &constant.value),
@@ -458,9 +460,8 @@ fn materialize_aggregate_inputs(
                 }
             }
         }
-        inputs.push(vector);
     }
-    Ok(inputs)
+    Ok(())
 }
 
 fn frame_range(

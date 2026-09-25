@@ -359,6 +359,7 @@ fn append_only_frames_match_independent_recomputation_and_update_each_row_once()
     use paro_common::vector::Vector;
     use paro_function::aggregate::{AggregateInputData, AggregateStateInput};
     thread_local! { static UPDATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { static INPUT_BUFFERS: std::cell::RefCell<std::collections::BTreeSet<usize>> = const { std::cell::RefCell::new(std::collections::BTreeSet::new()) }; }
     unsafe fn count_updates(
         inputs: &[&Vector],
         data: &AggregateInputData,
@@ -366,6 +367,11 @@ fn append_only_frames_match_independent_recomputation_and_update_each_row_once()
         count: usize,
     ) {
         UPDATED.with(|value| value.set(value.get() + count));
+        INPUT_BUFFERS.with(|buffers| {
+            buffers
+                .borrow_mut()
+                .insert(inputs[0].flat_data::<i32>() as usize);
+        });
         let (sum, _) = get_sum_function().bind(&[LogicalType::Integer]).unwrap();
         (sum.update)(inputs, data, states, count);
     }
@@ -416,6 +422,7 @@ fn append_only_frames_match_independent_recomputation_and_update_each_row_once()
         })
         .collect();
     UPDATED.with(|value| value.set(0));
+    INPUT_BUFFERS.with(|buffers| buffers.borrow_mut().clear());
     let mut actual = Vec::new();
     frame::visit_append_only_aggregate_frames(
         &chunks,
@@ -431,6 +438,9 @@ fn append_only_frames_match_independent_recomputation_and_update_each_row_once()
     .unwrap();
     assert_eq!(actual, expected);
     assert_eq!(UPDATED.with(|value| value.get()), keys.len());
+    // Chunk's reset contract swaps its active and spare vectors. The number
+    // of backing buffers is fixed at two, independent of the frame count.
+    assert_eq!(INPUT_BUFFERS.with(|buffers| buffers.borrow().len()), 2);
     assert!(frame::visit_append_only_aggregate_frames(
         &chunks,
         &keys,
@@ -487,6 +497,58 @@ fn append_only_frames_destroy_state_on_output_error() {
     .unwrap_err();
     assert!(error.to_string().contains("output failed"));
     assert_eq!(DESTROYED.with(|value| value.get()), 1);
+}
+
+#[test]
+fn append_only_workspace_owns_varlen_values_across_resets() {
+    use super::{frame, WindowRowKey};
+    let ty = LogicalType::Varchar;
+    let (function, _) = get_min_function().bind(std::slice::from_ref(&ty)).unwrap();
+    let expression = WindowExpression::aggregate(
+        AggregateExpression::new(function, vec![reference(0, ty.clone())], ty.clone()),
+        vec![],
+        vec![],
+        WindowFrame::default(),
+    );
+    let values = [
+        Value::Null(ty.clone()),
+        Value::Varchar("z".repeat(128)),
+        Value::Varchar("a".repeat(256)),
+        Value::Null(ty.clone()),
+    ];
+    let mut chunk = Chunk::try_initialize(&[ty], values.len(), test_allocator()).unwrap();
+    chunk.try_set_cardinality(values.len()).unwrap();
+    for (row, value) in values.iter().enumerate() {
+        chunk.set_value(0, row, value).unwrap();
+    }
+    let keys = (0..values.len())
+        .map(|row_idx| WindowRowKey {
+            chunk_idx: 0,
+            row_idx,
+        })
+        .collect::<Vec<_>>();
+    let mut actual = Vec::new();
+    frame::visit_append_only_aggregate_frames(
+        &[chunk],
+        &keys,
+        (1..=values.len()).map(|end| 0..end),
+        &expression,
+        test_allocator(),
+        |_, value| {
+            actual.push(value);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        actual,
+        vec![
+            values[0].clone(),
+            values[1].clone(),
+            values[2].clone(),
+            values[2].clone()
+        ]
+    );
 }
 
 #[test]
