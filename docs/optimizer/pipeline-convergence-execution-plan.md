@@ -1,7 +1,8 @@
 # Pipeline 收尾与执行性能收敛计划
 
 状态：设计完成，实施未完成。核查基点：`d4a50344e`。
-本计划不切换默认、不认证性能、不修改结果基线，也不授权清理历史材料。
+实施范围已获授权：第 6 步切换 pipeline 默认，但保留生产 Cascades 的显式入口。
+不认证未经验证的性能、不修改结果基线，也不清理历史材料。
 仅考虑长期架构：一个生产规划入口、一个执行诊断来源、一套性能证据协议。
 
 ## 1. 结论与证据边界
@@ -54,7 +55,7 @@ PipelineReady 不要求先追平 DuckDB；DuckDB parity 也不能替代写语句
 | P3 首次执行关键路径 | 复用 P1 身份，不依赖 P2 | 同一请求直接阶段账本，随后只优化测得的主因 |
 | P4 复合 RF 与剩余计划退化 | P1、最小配对工具 | Q72 实际跳页；Q05 定位；Q04/Q11 build ablation 裁决 |
 | P5 规划功能与准入 | P0，可与执行优化独立推进 | 写入、检索、图、资源和错误路径全覆盖 |
-| P6 默认切换与删除旧路径 | P5 + 同二进制全语料门 | 默认 pipeline，删除生产 Cascades 调用及无用配置 |
+| P6 默认切换、保留显式 Cascades | P5 + 同二进制全语料门 | 默认 pipeline，quality/budgeted 仍显式可选；无静默策略回退 |
 
 单个开发流推荐顺序：P0 的最小反例 → P1 → P2 → P3 → P4 → P5 → P6。
 P0 中需要较长数值证明的工作可以单独推进，不把所有正确性工作挂在 P1 后。
@@ -160,7 +161,9 @@ segment/page 排除 → 实际读/解码行数 → join 输出。
 ### P5/P6：功能准入和唯一生产入口
 
 - 将 StatementPlan 的写层接入 pipeline 现有物理合同：INSERT/SELECT、UPDATE、
-  DELETE、RETURNING、约束、Halloween 屏障及支持的 COPY/utility 路径。utility
+  DELETE、约束、Halloween 屏障及支持的 COPY/utility 路径。RETURNING 必须先
+  核对 parser 的支持域；物理 WriteContract 有 returning 字段不代表 SQL 已支持。
+  不以切换规划默认之名悄悄扩展 SQL 语法。utility
   共用 lowering 不等于 DML 已支持。必须从建表/写入起全程 pipeline 跑 regress，
   不静默调用 quality。测试 auto/explicit transaction、回滚、取消、失败后重用。
 - 检索/图验证合法 access path 与 fallback、评分/统计快照、残余、overlay 和输出
@@ -169,9 +172,10 @@ segment/page 排除 → 实际读/解码行数 → join 输出。
   资源变化和取消都必须可解释。禁止靠猜测另一个 grant winner 回退。
 - 两套 DP 的遗留覆盖按区域语义收口：共用图、谓词归属、估计与物理响应；每个
   区域有唯一 planner owner。必要特殊区域显式标记，不能隐藏第二轮全树重排。
-- 默认切换前列举生产依赖；将被 direct 路径共用的 identity/事实/验证等移到公共
-  owner，而不是随 cascades 目录一起删除。切换通过后删除旧生产入口和废弃配置，
-  不永久维护 shadow Memo。测试保留小域独立穷举 oracle，quality 从未被认证为
+- 默认切换前列举生产依赖，direct 与 Cascades 继续共用 identity/事实/验证合同。
+  本轮不删除 Cascades；quality/budgeted 是显式策略，而不是 pipeline 遇错后的
+  隐藏 fallback。session 默认和无 setting 的底层默认必须来自同一个 typed 值，
+  SET/RESET、缓存键及 receipt 均保留实际策略。测试保留小域独立穷举 oracle，quality 从未被认证为
   全局最优，不能把 quality regret 叫 optimality gap。
 
 ## 4. 测量与发布门
@@ -222,5 +226,5 @@ P1 能产生可信摘要就推进执行优化，不等待所有事件可视化�
 写路径。P3 不先选“预热”方案。P4 不以未证实的 Q04 build 假设阻塞 Q72。
 不引入查询 ID 特判、不放大搜索预算、不恢复质量形状计数门、不改性能口径。
 
-本计划完成不代表上述实现完成。默认仍保持原策略，C2/F2、PipelineReady、
+本计划完成不代表上述实现完成。默认切换单独验证，C2/F2、PipelineReady、
 FirstStatementParity 均需相应新证据；旧测试通过记录不能替代当前源码验证。
