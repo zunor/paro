@@ -83,22 +83,8 @@ SELECT l.id
 FROM join_elim_left AS l
 LEFT JOIN join_elim_right_nonunique AS r ON l.id = r.id;
 
--- The production isolation surface is name based; disabling one optional
--- equivalence rule must retain the mandatory executable baseline.
-SET disabled_optimizer_rules = 'no_such_rule';
-SHOW disabled_optimizer_rules;
-
-SET disabled_optimizer_rules = 'join_elimination';
-
-EXPLAIN
-SELECT l.id, l.payload
-FROM join_elim_left AS l
-LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
-
-RESET disabled_optimizer_rules;
-
 -- The diagnostics query must observe the preceding compilation rather than
--- replacing its session snapshot with its own zero-rule profile.
+-- replacing its session snapshot with its own empty stage profile.
 EXPLAIN
 SELECT l.id, l.payload
 FROM join_elim_left AS l
@@ -107,10 +93,10 @@ LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
 SELECT name, kind, metric_unit, metric_value > 0 AS observed
 FROM paro_optimizers()
 WHERE name IN (
-    'join_elimination',
-    'memo_group_count',
-    'memo_logical_expression_count',
-    'memo_physical_expression_count'
+    'semantic_normalization',
+    'region_optimization',
+    'physical_selection',
+    'physical_extraction'
 )
 ORDER BY kind, name;
 

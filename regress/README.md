@@ -251,6 +251,9 @@ The fixture contract is intentionally narrow:
 1. Declare staged roots with `-- @fixture python_udf/modules/basic_math`
 2. Reference the staged location with `{{fixture:python_udf/modules/basic_math}}`
 3. Keep artifact resolution and worker bootstrap on the real product path; fixture staging only copies files into the run-local report area
+4. Execute the expanded absolute path, but retain the original fixture token in
+   the transcript's SQL identity. Fixture substitution does not scrub result
+   values or errors; explicitly requested normalizers retain their own scope.
 
 Example:
 

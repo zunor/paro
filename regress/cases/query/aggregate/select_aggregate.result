@@ -626,10 +626,12 @@ PROJECTION  (rows=3)
   Output: g_tiny, cd_x
   ->  AGGREGATE  (rows=3)
         Group Key: agg_phase3_values.g_tiny
-        Aggregates: count(DISTINCT agg_phase3_values.x)
-        ->  PROJECTION  (rows=8)
-              Output: g_tiny, x
-              ->  VALUES  (rows=8)
+        Aggregates: count(agg_phase3_values.x)
+        ->  AGGREGATE  (rows=8)
+              Group Key: agg_phase3_values.g_tiny, agg_phase3_values.x
+              ->  PROJECTION  (rows=8)
+                    Output: g_tiny, x
+                    ->  VALUES  (rows=8)
 
 EXPLAIN SELECT
     g_tiny,

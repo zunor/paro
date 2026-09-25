@@ -40,9 +40,9 @@ ORDER BY ts_rank(
 ) DESC
 LIMIT 5;
 QUERY PLAN
-PROJECTION  (rows=1)
+PROJECTION  (rows=2)
   Output: id
-  ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=1)
+  ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>
         Search Root: <search-root-id>

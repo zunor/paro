@@ -621,7 +621,7 @@ def _execute_statement(conn: Any, block: Block, index: int) -> QueryOutput:
             return QueryOutput(
                 block_index=index,
                 line_no=block.line_no,
-                sql=block.sql,
+                sql=block.transcript_sql,
                 mode="nosort",
                 epsilon=None,
                 columns=[],
@@ -668,7 +668,7 @@ def _execute_copy_out(conn: Any, block: Block, *, block_index: int) -> QueryOutp
             return QueryOutput(
                 block_index=block_index,
                 line_no=block.line_no,
-                sql=block.sql,
+                sql=block.transcript_sql,
                 mode="nosort",
                 epsilon=None,
                 columns=[],
@@ -701,7 +701,7 @@ def _execute_copy_in(conn: Any, block: Block, *, block_index: int) -> QueryOutpu
                 return QueryOutput(
                     block_index=block_index,
                     line_no=block.line_no,
-                    sql=block.sql,
+                    sql=block.transcript_sql,
                     mode="nosort",
                     epsilon=None,
                     columns=[],
@@ -720,7 +720,7 @@ def _execute_copy_in(conn: Any, block: Block, *, block_index: int) -> QueryOutpu
             return QueryOutput(
                 block_index=block_index,
                 line_no=block.line_no,
-                sql=block.sql,
+                sql=block.transcript_sql,
                 mode="nosort",
                 epsilon=None,
                 columns=[],
@@ -743,7 +743,7 @@ def _capture_error_as_output(block: Block, index: int, exc: Exception) -> QueryO
     return QueryOutput(
         block_index=index,
         line_no=block.line_no,
-        sql=block.sql,
+        sql=block.transcript_sql,
         mode="nosort",
         epsilon=None,
         columns=[],
@@ -761,7 +761,7 @@ def _capture_copy_error_as_output(block: Block, index: int, exc: Exception) -> Q
     return QueryOutput(
         block_index=index,
         line_no=block.line_no,
-        sql=block.sql,
+        sql=block.transcript_sql,
         mode="nosort",
         epsilon=None,
         columns=[],
@@ -804,7 +804,7 @@ def _execute_statement_expect_error(conn: Any, block: Block, index: int) -> Quer
         return QueryOutput(
             block_index=index,
             line_no=block.line_no,
-            sql=block.sql,
+            sql=block.transcript_sql,
             mode="nosort",
             epsilon=None,
             columns=[],
@@ -860,7 +860,7 @@ def _execute_query(
         return QueryOutput(
             block_index=block_index,
             line_no=block.line_no,
-            sql=block.sql,
+            sql=block.transcript_sql,
             mode=mode,
             epsilon=block.epsilon,
             columns=columns,
@@ -906,7 +906,7 @@ def _execute_file_query(
         return QueryOutput(
             block_index=block_index,
             line_no=block.line_no,
-            sql=block.sql,
+            sql=block.transcript_sql,
             mode="file",
             epsilon=None,
             columns=["line"],

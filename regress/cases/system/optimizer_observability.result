@@ -39,11 +39,11 @@ title	3	1	2	true
 
 SELECT name, kind, invocation_count >= 0 AS has_invocations
 FROM paro_optimizers()
-WHERE name IN ('query_ir_construction', 'memo_exploration')
+WHERE name IN ('semantic_normalization', 'region_optimization')
 ORDER BY name;
 name	kind	has_invocations
-memo_exploration	search	true
-query_ir_construction	frontend	true
+region_optimization	planning	true
+semantic_normalization	frontend	true
 
 -- @normalize explain_search_ids
 EXPLAIN (VERBOSE)

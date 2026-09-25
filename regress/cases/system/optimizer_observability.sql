@@ -32,7 +32,7 @@ ORDER BY column_name, segment_id;
 
 SELECT name, kind, invocation_count >= 0 AS has_invocations
 FROM paro_optimizers()
-WHERE name IN ('query_ir_construction', 'memo_exploration')
+WHERE name IN ('semantic_normalization', 'region_optimization')
 ORDER BY name;
 
 -- @normalize explain_search_ids

@@ -292,6 +292,8 @@ def test_prepare_case_blocks_stages_fixture_and_rewrites_sql(tmp_path: Path) -> 
     ]
 
     prepared = runner._prepare_case_blocks(case_path, blocks, config)
+    assert prepared[0].transcript_sql == blocks[0].sql
+    assert prepared[0].source_sql == blocks[0].sql
 
     staged_root = config.staged_fixtures_dir / "python_udf" / "fixture_case" / "python_udf" / "modules" / "basic_math"
     assert staged_root.exists()

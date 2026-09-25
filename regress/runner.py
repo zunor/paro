@@ -596,7 +596,7 @@ def _prepare_case_blocks(case_path: Path, blocks: List[Any], config: RunnerConfi
         if sql == block.sql:
             prepared_blocks.append(block)
         else:
-            prepared_blocks.append(replace(block, sql=sql))
+            prepared_blocks.append(replace(block, sql=sql, source_sql=block.transcript_sql))
     return prepared_blocks
 
 

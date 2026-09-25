@@ -7,7 +7,7 @@ SELECT count(*) > 0 AS has_rows FROM paro_optimizers();
 
 SELECT name, kind
 FROM paro_optimizers()
-WHERE name IN ('semantic_normalization', 'memo_exploration', 'winner_verification')
+WHERE name IN ('semantic_normalization', 'region_optimization', 'physical_selection', 'physical_extraction')
 ORDER BY name;
 
 SELECT count(*) > 0 AS has_invocations

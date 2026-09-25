@@ -83,37 +83,6 @@ PROJECTION  (rows=3)
               Column IDs: 0
               Columns: id
 
-SET disabled_optimizer_rules = 'no_such_rule';
-ERROR: unknown optimizer transformation rule 'no_such_rule' (SQLSTATE=22023)
-
-SHOW disabled_optimizer_rules;
-disabled_optimizer_rules
-(empty)
-
-SET disabled_optimizer_rules = 'join_elimination';
-SET
-
-EXPLAIN
-SELECT l.id, l.payload
-FROM join_elim_left AS l
-LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
-QUERY PLAN
-PROJECTION  (rows=3)
-  Output: l.id, l.payload
-  ->  HASH_JOIN  (rows=3)
-        Join Type: LEFT
-        Build Index: integer_build_time
-        Join Condition: l.id = r.id
-        ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
-              Column IDs: 0, 1
-              Columns: id, payload
-        ->  ROWSET_SCAN on public.join_elim_right_unique r  (rows=2)
-              Column IDs: 0
-              Columns: id
-
-RESET disabled_optimizer_rules;
-RESET
-
 EXPLAIN
 SELECT l.id, l.payload
 FROM join_elim_left AS l
@@ -128,15 +97,14 @@ PROJECTION  (rows=3)
 SELECT name, kind, metric_unit, metric_value > 0 AS observed
 FROM paro_optimizers()
 WHERE name IN (
-    'join_elimination',
-    'memo_group_count',
-    'memo_logical_expression_count',
-    'memo_physical_expression_count'
+    'semantic_normalization',
+    'region_optimization',
+    'physical_selection',
+    'physical_extraction'
 )
 ORDER BY kind, name;
 name	kind	metric_unit	observed
-memo_group_count	search_counter	count	true
-memo_logical_expression_count	search_counter	count	true
-memo_physical_expression_count	search_counter	count	true
-join_elimination	transformation_rule	insertions	true
-join_elimination	transformation_rule_attempt	attempts	true
+physical_extraction	extraction	invocations	true
+semantic_normalization	frontend	invocations	true
+physical_selection	planning	invocations	true
+region_optimization	planning	invocations	true

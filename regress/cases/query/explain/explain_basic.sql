@@ -25,6 +25,10 @@ FROM explain_topn_rt
 ORDER BY score DESC
 LIMIT 5 OFFSET 6000;
 
+-- Verify that the physical TopN offset is executed, not just rendered.
+SELECT id FROM explain_topn_rt ORDER BY score DESC LIMIT 5 OFFSET 6000;
+SELECT id FROM explain_topn_rt ORDER BY score DESC LIMIT 2 OFFSET 1;
+
 DROP TABLE explain_topn_rt;
 
 DROP TABLE IF EXISTS explain_piecewise_left;

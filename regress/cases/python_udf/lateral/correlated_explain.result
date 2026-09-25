@@ -29,8 +29,8 @@ ORDER_BY  (rows=60)
                           ->  PROJECTION  (rows=2)
                                 Output: __external_arg_1, x
                                 ->  CROSS_PRODUCT  (rows=2)
-                                      ->  DUMMY_SCAN  (rows=1)
                                       ->  DELIM_SCAN  (rows=2)
+                                      ->  DUMMY_SCAN  (rows=1)
 
 DROP FUNCTION py_scale(INTEGER);
 DROP FUNCTION

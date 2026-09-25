@@ -1812,6 +1812,9 @@ fn collect_explain_properties(
                 );
             }
             push_string_property(&mut properties, "Limit", spec.limit.to_string());
+            if spec.offset != 0 {
+                push_string_property(&mut properties, "Offset", spec.offset.to_string());
+            }
         }
         PhysicalNodeKind::VectorSearch(spec) => {
             push_search_token_properties(&mut properties, &spec.capability_token);

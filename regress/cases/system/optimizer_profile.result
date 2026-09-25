@@ -8,12 +8,13 @@ true
 
 SELECT name, kind
 FROM paro_optimizers()
-WHERE name IN ('semantic_normalization', 'memo_exploration', 'winner_verification')
+WHERE name IN ('semantic_normalization', 'region_optimization', 'physical_selection', 'physical_extraction')
 ORDER BY name;
 name	kind
-memo_exploration	search
+physical_extraction	extraction
+physical_selection	planning
+region_optimization	planning
 semantic_normalization	frontend
-winner_verification	verification
 
 SELECT count(*) > 0 AS has_invocations
 FROM paro_optimizers()

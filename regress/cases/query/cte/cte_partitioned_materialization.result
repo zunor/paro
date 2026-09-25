@@ -16,7 +16,7 @@ MATERIALIZED_CTE  (rows=1)
   CTE Name: segmented
   Materialization: MATERIALIZED
   Reference Count: 3
-  ->  VALUES  (rows=1)
+  ->  VALUES  (rows=3)
   ->  PROJECTION  (rows=1)
         Output: selected_sum
         ->  AGGREGATE  (rows=1)
@@ -27,21 +27,21 @@ MATERIALIZED_CTE  (rows=1)
                                 Output: v
                                 ->  FILTER  (rows=1)
                                       Filter: segmented.st = 1
-                                      ->  CTE_SCAN  (rows=1)
+                                      ->  CTE_SCAN  (rows=3)
                                             CTE Index: <cte-1>
                                             Table Index: 33
                           ->  PROJECTION  (rows=1)
                                 Output: v
                                 ->  FILTER  (rows=1)
                                       Filter: segmented.st = 2
-                                      ->  CTE_SCAN  (rows=1)
+                                      ->  CTE_SCAN  (rows=3)
                                             CTE Index: <cte-1>
                                             Table Index: 41
                     ->  PROJECTION  (rows=1)
                           Output: v
                           ->  FILTER  (rows=1)
                                 Filter: segmented.st = 3
-                                ->  CTE_SCAN  (rows=1)
+                                ->  CTE_SCAN  (rows=3)
                                       CTE Index: <cte-1>
                                       Table Index: 49
 

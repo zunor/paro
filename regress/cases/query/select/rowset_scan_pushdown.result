@@ -92,7 +92,7 @@ PROJECTION  (rows=1)
         Cardinality: [1, 1, 1]
         Output Schema: aggregate_state_1 BIGINT
         ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
-              Pushed Predicate: k < 5 AND k >= 2
+              Pushed Predicate: k >= 2 AND k < 5
               Cardinality: [9, 19, 29]
               Output Schema: (none)
 
@@ -143,7 +143,7 @@ PROJECTION  (rows=1)
         Output Schema: aggregate_state_1 BIGINT
         ->  HASH_JOIN  (rows=19)
               Join Type: INNER
-              Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=6a676810f14b006143d6301ea62ff8d5
+              Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=b90fdac674cf7ca987aa48915e7147a9
               Build Index: integer_build_time
               Join Condition: c.k = d.k
               Cardinality: [10, 19, 29]
@@ -269,26 +269,21 @@ PROJECTION  (rows=3)
   Output: phone, wide
   Cardinality: [3, 3, 3]
   Output Schema: phone VARCHAR, wide VARCHAR
-  ->  ROW_FETCH  (rows=3)
-        Output: phone, wide
-        Sources: 1
+  ->  TOP_N  (rows=3)
+        Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
+        Limit: 3
         Cardinality: [3, 3, 3]
         Output Schema: phone VARCHAR, wide VARCHAR
-        ->  TOP_N  (rows=3)
-              Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
-              Limit: 3
-              Cardinality: [3, 3, 3]
-              Output Schema: __late_rowid_6 BIGINT
-              ->  PROJECTION  (rows=3333)
-                    Output: id, rowid
+        ->  PROJECTION  (rows=3333)
+              Output: phone, wide, id
+              Cardinality: [1666, 3333, 5000]
+              Output Schema: phone VARCHAR, wide VARCHAR, public.matched_prefix_late_payload_case.id INTEGER
+              ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
+                    Column IDs: 0, 1, 2
+                    Columns: id, phone, wide
+                    Pushed Predicate: phone IN ('13x', '31y')
                     Cardinality: [1666, 3333, 5000]
-                    Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
-                    ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
-                          Column IDs: 0
-                          Columns: id, rowid
-                          Pushed Predicate: phone IN ('13x', '31y')
-                          Cardinality: [1666, 3333, 5000]
-                          Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
+                    Output Schema: public.matched_prefix_late_payload_case.id INTEGER, public.matched_prefix_late_payload_case.phone VARCHAR, public.matched_prefix_late_payload_case.wide VARCHAR
 
 SELECT phone, wide
 FROM matched_prefix_late_payload_case
@@ -307,27 +302,22 @@ WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
 ORDER BY id
 LIMIT 3;
 QUERY PLAN
-ROW_FETCH  (rows=3)
-  Output: id, prefix, wide
-  Sources: 1
+TOP_N  (rows=3)
+  Sort Key: id ASC NULLS LAST
+  Limit: 3
   Cardinality: [3, 3, 3]
   Output Schema: id INTEGER, prefix VARCHAR, wide VARCHAR
-  ->  TOP_N  (rows=3)
-        Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
-        Limit: 3
-        Cardinality: [3, 3, 3]
-        Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
-        ->  PROJECTION  (rows=1000)
-              Output: id, __matched_prefix_1_2, rowid
+  ->  PROJECTION  (rows=1000)
+        Output: id, prefix, wide
+        Cardinality: [500, 1000, 1501]
+        Output Schema: id INTEGER, prefix VARCHAR, wide VARCHAR
+        ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=1000)
+              Column IDs: 0, 1, 2
+              Columns: id, phone, wide
+              Pushed Predicate: phone HAS PREFIX IN ("13", "31")
+              Late Materialize: auto
               Cardinality: [500, 1000, 1501]
-              Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
-              ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=1000)
-                    Column IDs: 0, 1
-                    Columns: id, __matched_prefix_1_2, rowid
-                    Pushed Predicate: phone HAS PREFIX IN ("13", "31")
-                    Late Materialize: auto
-                    Cardinality: [500, 1000, 1501]
-                    Output Schema: public.matched_prefix_late_payload_case.id INTEGER, __matched_prefix_1_2 VARCHAR, rowid BIGINT
+              Output Schema: public.matched_prefix_late_payload_case.id INTEGER, public.matched_prefix_late_payload_case.phone VARCHAR, public.matched_prefix_late_payload_case.wide VARCHAR
 
 SELECT id, substring(phone FROM 1 FOR 2) AS prefix, wide
 FROM matched_prefix_late_payload_case
