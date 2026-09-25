@@ -12,7 +12,7 @@ pub use shared::BindShared;
 pub use snapshot::BindSnapshot;
 
 use crate::binder::ir::CTEBindState;
-use crate::plan::PlanNodeId;
+use crate::logical::plan::PlanNodeId;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnID, ColumnRef, Expr, Identifier};

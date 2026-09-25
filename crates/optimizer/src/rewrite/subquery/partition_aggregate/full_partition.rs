@@ -80,7 +80,7 @@ pub(super) fn recognize_full_partition_join(
 fn validate_full_partition_binding_contract(
     join: &ComparisonJoin,
     scalar: &ScalarBranch<'_>,
-    delim: &paro_planner::operator::DelimGet,
+    delim: &paro_planner::logical::operator::DelimGet,
     inner_keys: &[Expression],
 ) -> bool {
     let key_count = join.duplicate_eliminated_columns.len();
@@ -259,7 +259,7 @@ pub(super) fn apply_full_partition_join(
             "full-partition witness no longer points to a Filter",
         ));
     };
-    let paro_planner::operator::Filter {
+    let paro_planner::logical::operator::Filter {
         expressions: filter_expressions,
         child,
         projection_map: filter_projection_map,
@@ -324,7 +324,7 @@ pub(super) fn apply_full_partition_join(
             bind_context,
         );
     }
-    let filter = paro_planner::operator::Filter {
+    let filter = paro_planner::logical::operator::Filter {
         expressions: filter_expressions,
         child: Box::new(OwnedLogicalPlan::new(
             bind_context,
@@ -345,7 +345,7 @@ pub(super) fn apply_full_partition_join(
 /// late scalar join.
 fn localize_inner_full_partition_filter(
     filter_expressions: Vec<Expression>,
-    filter_projection_map: paro_planner::operator::ProjectionMap,
+    filter_projection_map: paro_planner::logical::operator::ProjectionMap,
     scalar_join: ComparisonJoin,
     bind_context: &BindContext,
 ) -> Result<OwnedLogicalPlan> {
@@ -372,7 +372,7 @@ fn localize_inner_full_partition_filter(
         });
     }
     if required.is_empty() {
-        let filter = paro_planner::operator::Filter {
+        let filter = paro_planner::logical::operator::Filter {
             expressions: filter_expressions,
             child: Box::new(OwnedLogicalPlan::new(
                 bind_context,
@@ -387,8 +387,8 @@ fn localize_inner_full_partition_filter(
     }
 
     let target_id = smallest_extensible_inner_owner(&scalar_join.left, &required);
-    if target_id == paro_planner::plan::PlanNodeId::SYNTHETIC {
-        let filter = paro_planner::operator::Filter {
+    if target_id == paro_planner::logical::plan::PlanNodeId::SYNTHETIC {
+        let filter = paro_planner::logical::operator::Filter {
             expressions: filter_expressions,
             child: Box::new(OwnedLogicalPlan::new(
                 bind_context,
@@ -432,7 +432,7 @@ fn localize_inner_full_partition_filter(
             left_projection_map,
             right_projection_map,
         };
-        let local_filter = paro_planner::operator::Filter {
+        let local_filter = paro_planner::logical::operator::Filter {
             expressions: filter_expressions,
             child: Box::new(OwnedLogicalPlan::new(
                 bind_context,
@@ -440,7 +440,7 @@ fn localize_inner_full_partition_filter(
             )),
             // The localized relation widens the selected owner by the scalar
             // output; its enclosing join path is required to use `All` maps.
-            projection_map: paro_planner::operator::ProjectionMap::all(),
+            projection_map: paro_planner::logical::operator::ProjectionMap::all(),
         };
         Ok(OwnedLogicalPlan::new(
             bind_context,
@@ -459,7 +459,7 @@ fn localize_inner_full_partition_filter(
 mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
-    use paro_planner::operator::{ExpressionGet, ProjectionMap};
+    use paro_planner::logical::operator::{ExpressionGet, ProjectionMap};
 
     use super::*;
 

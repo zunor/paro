@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import types
 import unittest
@@ -48,36 +51,36 @@ class CompileWorkEvidenceTest(unittest.TestCase):
     def test_only_exact_cache_occurrence_is_attached(self):
         query = "SELECT 1"
         fp = statement_fingerprint(query)
-        identity = {"schema_version": 3, "artifact": [1, 2],
+        identity = {"schema_version": 4, "artifact": [1, 2],
                     "structure": [3, 4], "dependencies": [5, 6]}
         rows = [
             typed_row("statement_cache", 11, {
-                "schema_version": 3, "decision_id": 11, "query_fingerprint": fp,
+                "schema_version": 4, "decision_id": 11, "query_fingerprint": fp,
                 "occurrence": 9, "cache_hit": False, "artifact_identity": identity,
                 "compile_work": {"optimizer_elapsed_us": 17},
                 "compile_receipt": {
-                    "schema_version": 3, "artifact_identity": identity,
-                    "search_stop": {"Observed": "QualityPolicySatisfied"},
-                    "search_complete": {"Observed": False},
-                    "quality_policy_satisfied": {"Observed": True},
+                    "schema_version": 4, "artifact_identity": identity,
+                    "planning_status": {"Observed": "Planned"},
+
+
                     "budget_limited": {"Observed": False},
-                    "obligations": {"Observed": 0},
-                    "groups": {"Observed": 1},
-                    "logical_expressions": {"Observed": 1},
-                    "physical_expressions": {"Observed": 1},
+
+
+
+
                     "expected_class": {"Observed": 2},
                     "variant_count": {"Observed": 1},
                     "omitted_variants": 0,
                     "compile_work": {
                         "compiler_elapsed_us": 20,
                         "optimizer_elapsed_us": 17,
-                        "rule_elapsed_us": 3,
-                        "child_combination_cost_synthesis_count": 1,
+                        "normalization_elapsed_us": 3,
+                        "physical_alternatives": 1,
                     },
                 },
             }),
             typed_row("execution_receipt", 12, {
-                "schema_version": 3, "execution_id": 12, "statement_decision_id": 11,
+                "schema_version": 4, "execution_id": 12, "statement_decision_id": 11,
                 "artifact_identity": identity, "expected_class": 2,
                 "actual_class": 2, "actual_fingerprint": [7, 8],
                 "resources": {
@@ -92,12 +95,12 @@ class CompileWorkEvidenceTest(unittest.TestCase):
                 "terminal_error": None,
             }),
             typed_row("statement_cache", 13, {
-                "schema_version": 3, "decision_id": 13, "query_fingerprint": fp,
+                "schema_version": 4, "decision_id": 13, "query_fingerprint": fp,
                 "occurrence": 10, "cache_hit": True, "artifact_identity": identity,
                 "compile_work": None,
             }),
             typed_row("execution_receipt", 14, {
-                "schema_version": 3, "execution_id": 14, "statement_decision_id": 13,
+                "schema_version": 4, "execution_id": 14, "statement_decision_id": 13,
                 "artifact_identity": identity,
             }),
         ]
@@ -108,24 +111,22 @@ class CompileWorkEvidenceTest(unittest.TestCase):
         self.assertEqual(evidence["statement_decision_id"], 11)
         self.assertEqual(evidence["execution_id"], 12)
 
-        # A quality handoff may follow a locally exhausted optional budget.
-        # This is valid incomplete search, not a missing/corrupt receipt.
+        # Bounded regional fallback is a valid plan, not a corrupt receipt.
         payload = json.loads(rows[0][-1])
         payload["compile_receipt"]["budget_limited"] = {"Observed": True}
-        payload["compile_receipt"]["obligations"] = {"Observed": 1}
+        payload["compile_receipt"]["planning_status"] = {"Observed": "PlannedWithFallback"}
         rows[0] = typed_row("statement_cache", 11, payload)
         evidence = collect_statement_cache_evidence(connection, query, before_execution_ids={14})
         self.assertEqual(evidence["status"], "Verified")
         self.assertEqual(evidence["compile"]["raw"], {"optimizer_elapsed_us": 17})
-        self.assertFalse(evidence["compile"]["receipt"]["search_complete"]["Observed"])
+        self.assertEqual(evidence["compile"]["receipt"]["planning_status"]["Observed"], "PlannedWithFallback")
 
-        payload["compile_receipt"]["obligations"] = {"Observed": 0}
+        payload["compile_receipt"]["planning_status"] = {"Observed": "Planned"}
         rows[0] = typed_row("statement_cache", 11, payload)
         evidence = collect_statement_cache_evidence(connection, query, before_execution_ids={14})
         self.assertEqual(evidence["status"], "Uncovered")
 
-        payload["compile_receipt"]["obligations"] = {"Observed": 1}
-        payload["compile_receipt"]["search_stop"] = {"Observed": "Complete"}
+        payload["compile_receipt"]["planning_status"] = {"Observed": "QualityPolicySatisfied"}
         rows[0] = typed_row("statement_cache", 11, payload)
         evidence = collect_statement_cache_evidence(connection, query, before_execution_ids={14})
         self.assertEqual(evidence["status"], "Uncovered")
@@ -134,7 +135,7 @@ class CompileWorkEvidenceTest(unittest.TestCase):
         query = "SELECT 1"
         fp = statement_fingerprint(query)
         rows = [typed_row("statement_cache", 11, {
-            "schema_version": 3, "decision_id": 11, "query_fingerprint": fp,
+            "schema_version": 4, "decision_id": 11, "query_fingerprint": fp,
             "occurrence": 0, "cache_hit": False, "artifact_identity": None,
             "compile_work": None,
         })]

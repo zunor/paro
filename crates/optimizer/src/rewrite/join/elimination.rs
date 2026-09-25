@@ -15,10 +15,10 @@ use std::collections::HashSet;
 
 use paro_catalog::entry::ConstraintType;
 use paro_planner::expression::{Expression, ExpressionIterator, WindowExpression};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator, Projection,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 pub struct JoinElimination {
     changed: bool,
@@ -32,20 +32,6 @@ impl JoinElimination {
     pub fn optimize(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let required_bindings = output_bindings(&plan.operator);
         self.optimize_required_plan(plan, &required_bindings)
-    }
-
-    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
-        let required_bindings = output_bindings(&plan.operator);
-        self.optimize_required_plan(plan, &required_bindings)
-    }
-
-    pub fn optimize_plan_with_change(
-        &mut self,
-        plan: OwnedLogicalPlan,
-    ) -> (OwnedLogicalPlan, bool) {
-        self.changed = false;
-        let plan = self.optimize_plan(plan);
-        (plan, self.changed)
     }
 
     fn optimize_required_plan(
@@ -565,10 +551,10 @@ mod tests {
     use paro_catalog::entry::{ColumnDefinition, Constraint, TableCatalogEntry};
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, Expression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ColumnBinding, Get, Join, JoinCondition, JoinType, LogicalOperator, Projection,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
 
@@ -631,7 +617,7 @@ mod tests {
         let mut get = Get::new(table_index, names, types.clone(), table);
         get.column_sources = column_ids
             .into_iter()
-            .map(|column_id| paro_planner::operator::GetColumnSource::Stored { column_id })
+            .map(|column_id| paro_planner::logical::operator::GetColumnSource::Stored { column_id })
             .collect();
         get.column_types = types.clone();
         get.returned_types = types;

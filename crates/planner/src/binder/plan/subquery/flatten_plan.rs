@@ -5,8 +5,8 @@
 
 use crate::binder::plan::subquery::flatten_dependent_join;
 use crate::binder::Binder;
-use crate::operator::{Join, LogicalOperator};
-use crate::plan::OwnedLogicalPlan;
+use crate::logical::operator::{Join, LogicalOperator};
+use crate::logical::plan::OwnedLogicalPlan;
 use paro_common::error::Result;
 
 pub(crate) fn flatten_dependent_joins_in_plan(

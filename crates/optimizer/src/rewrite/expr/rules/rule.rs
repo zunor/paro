@@ -4,7 +4,7 @@
 //! Traits and result types for expression rewrite rules.
 
 use paro_planner::expression::Expression;
-use paro_planner::operator::LogicalOperator;
+use paro_planner::logical::operator::LogicalOperator;
 
 use super::expression_matcher::ExpressionMatcher;
 
@@ -61,6 +61,7 @@ pub trait Rule {
     fn apply(&self, op: &LogicalOperator, bindings: Vec<&Expression>, is_root: bool) -> RuleResult;
 
     /// Get the rule name for diagnostics.
+    #[cfg(any(test, feature = "test-support"))]
     fn name(&self) -> &'static str {
         std::any::type_name::<Self>()
     }

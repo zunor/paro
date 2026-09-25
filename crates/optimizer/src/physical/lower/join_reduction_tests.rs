@@ -13,10 +13,12 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, ConstantExpression, Expression, ReferenceExpression,
 };
-use paro_planner::operator::graph_expand::{ExpandDirection, GraphExpand};
-use paro_planner::operator::join::{ComparisonJoin, JoinComparisonType, JoinCondition, JoinType};
-use paro_planner::operator::{Filter, Get, Join, LogicalOperator, Projection, Window};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::graph_expand::{ExpandDirection, GraphExpand};
+use paro_planner::logical::operator::join::{
+    ComparisonJoin, JoinComparisonType, JoinCondition, JoinType,
+};
+use paro_planner::logical::operator::{Filter, Get, Join, LogicalOperator, Projection, Window};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use super::{
     hash_join_build_keys_are_declared_unique, plan_reduction_runtime_filter_fusion,
@@ -62,8 +64,8 @@ fn declared_unique_get(ctx: &BindContext) -> OwnedLogicalPlan {
             relation_name: Some("unique_build".to_string()),
             relation_alias: None,
             column_sources: vec![
-                paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
-                paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
+                paro_planner::logical::operator::GetColumnSource::Stored { column_id: 0 },
+                paro_planner::logical::operator::GetColumnSource::Stored { column_id: 1 },
             ],
             column_types: vec![LogicalType::Varchar, LogicalType::BigInt],
             table: Some(table),
@@ -215,14 +217,14 @@ fn unique_build_proof_requires_a_key_preserving_join() {
     let join_conditions = vec![JoinCondition::new(
         Expression::ColumnRef(
             paro_planner::expression::ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(6, 1),
+                paro_planner::logical::operator::ColumnBinding::new(6, 1),
                 LogicalType::BigInt,
             )
             .into(),
         ),
         Expression::ColumnRef(
             paro_planner::expression::ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(7, 1),
+                paro_planner::logical::operator::ColumnBinding::new(7, 1),
                 LogicalType::BigInt,
             )
             .into(),
@@ -374,7 +376,7 @@ fn branch_runtime_filters_require_one_shared_pruning_contract() {
 fn reduction_remap_rejects_correlated_source_bindings() {
     let expression = Expression::ColumnRef(
         paro_planner::expression::ColumnRefExpression::with_depth(
-            paro_planner::operator::ColumnBinding::new(7, 0),
+            paro_planner::logical::operator::ColumnBinding::new(7, 0),
             LogicalType::BigInt,
             1,
         )

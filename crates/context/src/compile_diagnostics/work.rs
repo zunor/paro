@@ -9,79 +9,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(usize)]
 pub enum WorkKind {
-    Pre,
-    Agenda,
-    Match,
-    Apply,
-    Insert,
-    Schedule,
-    Recipe,
-    Subproblem,
-    Kernel,
-    Admission,
-    Publish,
-    Quality,
-    Finish,
-    QualityEvidence,
-    QualityDomain,
-    QualityProduction,
-    QualityFreeze,
-    QualityReads,
-    NativeConstruct,
-    Statistics,
-    OwnedRewrite,
-    Settlement,
-    Staging,
-    SemanticGuard,
-    Rollback,
-    Encoding,
-    Dependencies,
-    PhaseTransition,
+    Normalization,
+    RegionPlanning,
+    PhysicalSelection,
     PhysicalLowering,
     Unclassified,
 }
 
 impl WorkKind {
-    pub const ALL: [Self; 30] = [
-        Self::Pre,
-        Self::Agenda,
-        Self::Match,
-        Self::Apply,
-        Self::Insert,
-        Self::Schedule,
-        Self::Recipe,
-        Self::Subproblem,
-        Self::Kernel,
-        Self::Admission,
-        Self::Publish,
-        Self::Quality,
-        Self::Finish,
-        Self::QualityEvidence,
-        Self::QualityDomain,
-        Self::QualityProduction,
-        Self::QualityFreeze,
-        Self::QualityReads,
-        Self::NativeConstruct,
-        Self::Statistics,
-        Self::OwnedRewrite,
-        Self::Settlement,
-        Self::Staging,
-        Self::SemanticGuard,
-        Self::Rollback,
-        Self::Encoding,
-        Self::Dependencies,
-        Self::PhaseTransition,
+    pub const ALL: [Self; 5] = [
+        Self::Normalization,
+        Self::RegionPlanning,
+        Self::PhysicalSelection,
         Self::PhysicalLowering,
         Self::Unclassified,
     ];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(usize)]
-pub enum WorkPhase {
-    OutsideSearch,
-    Mandatory,
-    Optional,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -97,9 +39,6 @@ pub struct WorkEntry {
 pub struct OptimizerWork {
     pub total_ns: u64,
     pub buckets: [WorkEntry; WorkKind::ALL.len()],
-    pub outside_search_ns: u64,
-    pub mandatory_ns: u64,
-    pub optional_ns: u64,
 }
 
 impl OptimizerWork {
@@ -112,10 +51,6 @@ impl OptimizerWork {
                 .buckets
                 .iter()
                 .try_fold(0u64, |sum, row| sum.checked_add(row.exclusive_ns))
-                == Some(self.total_ns)
-            && [self.outside_search_ns, self.mandatory_ns, self.optional_ns]
-                .into_iter()
-                .try_fold(0u64, |sum, ns| sum.checked_add(ns))
                 == Some(self.total_ns)
     }
 }

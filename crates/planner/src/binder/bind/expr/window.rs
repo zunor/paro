@@ -375,8 +375,8 @@ fn bind_frame_offset(
 mod tests {
     use super::*;
     use crate::binder::test_utils::test_binder_with_search_path;
-    use crate::operator::LogicalOperator;
-    use crate::plan::OwnedLogicalPlan;
+    use crate::logical::operator::LogicalOperator;
+    use crate::logical::plan::OwnedLogicalPlan;
     use paro_catalog::collection::InstallMode;
     use paro_catalog::entry::{AggregateFunctionCatalogEntry, CatalogEntryEnum, CatalogType};
     use paro_catalog::search_path::CatalogSearchEntry;

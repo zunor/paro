@@ -83,7 +83,7 @@ pub fn render(capture: &SealedCompileCapture, json: bool) -> String {
 
 /// Render a sealed compile record and, when ANALYZE actually ran the same
 /// compiled statement, append the immutable execution receipt.  Admission is
-/// never inferred from the portfolio fields in the compile record.
+/// never inferred from the artifact fields in the compile record.
 pub fn render_with_execution(
     capture: &SealedCompileCapture,
     json: bool,
@@ -119,14 +119,12 @@ pub fn render_with_execution_level(
             writeln!(writer, "phase             nanoseconds (Observed / Uncovered)")?;
             writeln!(writer, "bind              {:?}\noptimizer         {:?}\nverify            {:?}\nfinish            {:?}\ncompiler wall     {:?}", record.bind_ns, record.optimizer_ns, record.verify_ns, record.finish_ns, record.compiler_ns)?;
             writeln!(writer, "compiler other    {:?}\nparse             {:?}", record.compiler_other_ns, record.parse)?;
-            writeln!(writer, "artifact={:?} safety={:?} stop={:?} complete={:?} obligations={:?}", record.artifact, record.safety_verified, record.search_stop, record.search_complete, record.obligations)?;
-            writeln!(writer, "quality_satisfied={:?} budget_limited={:?} groups={:?} logical={:?} physical={:?}", record.quality_policy_satisfied, record.budget_limited, record.groups, record.logical_expressions, record.physical_expressions)?;
+            writeln!(writer, "artifact={:?} safety={:?} planning={:?} bounded={:?}", record.artifact, record.safety_verified, record.planning_status, record.budget_limited)?;
             writeln!(writer, "input={:?} output={:?} artifact_identity={:?} settings={:?} memory_bytes={:?} parallel_tasks={:?}", record.input_fingerprint, record.output_identity, record.artifact_identity, record.planning_settings, record.available_memory_bytes, record.available_parallel_tasks)?;
             writeln!(writer, "expected_class={:?} variants={:?} selected_fingerprint={:?}", record.expected_class, record.variant_count, record.selected_fingerprint)?;
             for v in &record.variants { writeln!(writer, "variant {} fingerprint={:?} admissible_classes={}", v.ordinal,v.physical_fingerprint,v.admissible_classes)?; }
             writeln!(writer, "admission={:?} execution={:?}", record.admission, record.execution)?;
-            for r in &record.rules { writeln!(writer, "rule {} binding_calls={} binding_ns={} apply_attempts={} apply_ns={} inserted={} elapsed_ns={}",r.id,r.binding_calls,r.binding_ns,r.attempts,r.elapsed_ns.saturating_sub(r.binding_ns),r.inserted,r.elapsed_ns)?; }
-            writeln!(writer, "omitted_rules={} omitted_variants={} omitted_source_detail={} omitted_capture_detail={} omitted_encoding_detail={} retained_limit={} encoded_limit={} response_terminal={:?} execution_receipt={:?}",record.omitted_rules,record.omitted_variants,record.omitted_source_detail,record.omitted_capture_detail,record.omitted_encoding_detail,record.retained_limit,record.encoded_limit,record.response_terminal,record.execution_receipt)?;
+            writeln!(writer, "omitted_variants={} omitted_source_detail={} omitted_capture_detail={} omitted_encoding_detail={} retained_limit={} encoded_limit={} response_terminal={:?} execution_receipt={:?}",record.omitted_variants,record.omitted_source_detail,record.omitted_capture_detail,record.omitted_encoding_detail,record.retained_limit,record.encoded_limit,record.response_terminal,record.execution_receipt)?;
             if include_detail {
                 for event in &record.detail {
                     writeln!(writer, "detail {}", serde_json::to_string(event).map_err(io::Error::other)?)?;
@@ -177,7 +175,6 @@ pub fn validate_json(
         || r.retained_limit != RETAINED_LIMIT
         || r.process_limit != PROCESS_LIMIT
         || r.process_reservation != 2 << 20
-        || r.rules.len() > MAX_RULES
         || r.search_counters.len() > MAX_SEARCH_COUNTERS
         || r.variants.len() > MAX_VARIANTS
         || r.detail_limit != MAX_DETAIL_EVENTS
@@ -197,51 +194,13 @@ pub fn validate_json(
         }
     }
     let mut source_sequences = BTreeMap::<&'static str, u64>::new();
-    let candidate_event_ids: BTreeSet<u64> = r
-        .detail
-        .iter()
-        .filter_map(|event| match event {
-            DetailEvent::Candidate {
-                source_sequence, ..
-            } => Some(*source_sequence),
-            _ => None,
-        })
-        .collect();
-    let mut child_ordinals = BTreeSet::new();
-    let mut fact_ordinals = BTreeSet::new();
     for event in &r.detail {
-        let stream = event.stream_name();
-        if let Some(previous) = source_sequences.insert(stream, event.source_sequence()) {
+        if let Some(previous) =
+            source_sequences.insert(event.stream_name(), event.source_sequence())
+        {
             if event.source_sequence() <= previous {
                 return Err("detail source sequence is unordered".into());
             }
-        }
-        match event {
-            DetailEvent::CandidateChild {
-                parent_event_id,
-                ordinal,
-                ..
-            } => {
-                if !candidate_event_ids.contains(parent_event_id) {
-                    return Err("candidate child references an unknown parent event".into());
-                }
-                if !child_ordinals.insert((*parent_event_id, *ordinal)) {
-                    return Err("candidate child ordinal is not unique for its parent".into());
-                }
-            }
-            DetailEvent::Fact {
-                parent_event_id,
-                ordinal,
-                ..
-            } => {
-                if !candidate_event_ids.contains(parent_event_id) {
-                    return Err("fact references an unknown parent event".into());
-                }
-                if !fact_ordinals.insert((*parent_event_id, *ordinal)) {
-                    return Err("fact ordinal is not unique for its parent".into());
-                }
-            }
-            _ => {}
         }
     }
     if let Observation::Observed(identity) = r.artifact_identity {
@@ -371,10 +330,9 @@ pub fn validate_json(
             return Err("completed execution has incomplete lifecycle phases".into());
         }
     }
-    if r.rules.windows(2).any(|pair| pair[0].id >= pair[1].id)
-        || r.variants
-            .windows(2)
-            .any(|pair| pair[0].ordinal >= pair[1].ordinal)
+    if r.variants
+        .windows(2)
+        .any(|pair| pair[0].ordinal >= pair[1].ordinal)
     {
         return Err("duplicate or unordered bounded identity".into());
     }
@@ -382,7 +340,7 @@ pub fn validate_json(
         if (r.variants.len() as u64).checked_add(r.omitted_variants) != Some(count as u64)
             || r.variants.iter().any(|v| usize::from(v.ordinal) >= count)
         {
-            return Err("portfolio coverage does not close".into());
+            return Err("artifact coverage does not close".into());
         }
     }
     if let Observation::Observed(fingerprint) = r.selected_fingerprint {
@@ -397,37 +355,24 @@ pub fn validate_json(
             .iter()
             .any(|v| v.physical_fingerprint == fingerprint && v.admissible_classes & bit != 0)
         {
-            return Err("selected artifact is not represented in its portfolio".into());
+            return Err("selected artifact is not represented in its artifact".into());
         }
     }
     if r.admission != Observation::NotExecuted || r.execution != Observation::NotExecuted {
         return Err("Summary cannot claim target execution".into());
     }
-    if r.search_complete == Observation::Observed(true) && r.obligations != Observation::Observed(0)
-    {
-        return Err("complete search has unresolved or uncovered obligations".into());
-    }
-    if r.search_stop == Observation::Observed(SearchStop::Complete)
-        && (r.search_complete != Observation::Observed(true)
-            || r.budget_limited != Observation::Observed(false))
-    {
-        return Err("Complete requires complete non-budget-limited search".into());
-    }
-    if r.search_complete == Observation::Observed(true)
-        && (r.search_stop != Observation::Observed(SearchStop::Complete)
-            || r.budget_limited != Observation::Observed(false))
-    {
-        return Err("complete search contradicts stop or resource status".into());
-    }
-    if r.search_stop == Observation::Observed(SearchStop::QualityPolicySatisfied)
-        && r.quality_policy_satisfied != Observation::Observed(true)
-    {
-        return Err("quality stop requires satisfied policy".into());
-    }
-    if r.search_stop == Observation::Observed(SearchStop::BudgetLimited)
-        && r.budget_limited != Observation::Observed(true)
-    {
-        return Err("budget stop requires budget-limited status".into());
+    match r.planning_status {
+        Observation::Observed(PlanningStatus::Planned)
+            if r.budget_limited != Observation::Observed(false) =>
+        {
+            return Err("planned status contradicts regional fallback".into())
+        }
+        Observation::Observed(PlanningStatus::PlannedWithFallback)
+            if r.budget_limited != Observation::Observed(true) =>
+        {
+            return Err("bounded status lacks a regional fallback".into())
+        }
+        _ => {}
     }
     if r.outcome == CompileOutcome::Success
         && (r.artifact != ArtifactStatus::CompiledArtifactReady
@@ -480,19 +425,12 @@ mod tests {
         use paro_context::compile_diagnostics::*;
         let capture = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
         for source_sequence in 0..MAX_DETAIL_EVENTS as u64 {
-            capture.detail(DetailEvent::Quality {
+            capture.detail(DetailEvent::Stage {
                 source_sequence,
-                event_time_us: source_sequence,
-                candidate: None,
-                goal: None,
-                completed: 0,
-                not_applicable: 0,
-                missing_evidence: 0,
-                suspended: 0,
-                missing_facts: 1,
-                missing_bundles: Box::new([1]),
-                missing_fact_kinds: Box::new([1]),
-                policy_satisfied: false,
+                stage: work::WorkKind::RegionPlanning,
+                elapsed_ns: source_sequence,
+                items: 1,
+                fallbacks: 0,
             });
         }
         let sealed = capture.seal();
@@ -520,7 +458,7 @@ mod tests {
         validate_json(json.as_bytes()).unwrap();
         assert!(validate_json(json.replace("NotExecuted", "NotApplicable").as_bytes()).is_err());
         assert!(validate_json(
-            json.replace("\"schema_version\":3", "\"schema_version\":2")
+            json.replace("\"schema_version\":4", "\"schema_version\":2")
                 .as_bytes()
         )
         .is_err());
@@ -538,69 +476,21 @@ mod tests {
     }
 
     #[test]
-    fn detail_streams_use_owned_sequences_and_typed_parent_ordinals() {
+    fn detail_rejects_duplicate_producer_sequences() {
         use paro_context::compile_diagnostics::*;
-
         let capture = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
-        capture.detail(DetailEvent::Candidate {
-            source_sequence: 10,
-            event_time_us: 11,
-            stage: 2,
-            group: MemoGroupRef(1),
-            goal: None,
-            candidate: Some(CandidateRef(7)),
-            source: None,
-            source_child: None,
-            logical: None,
-            physical: None,
-            recipe: None,
-            rule: None,
-            expected_cost_bits: None,
-            upper_cost_bits: None,
-        });
-        capture.detail(DetailEvent::CandidateChild {
-            source_sequence: 0,
-            parent_event_id: 10,
-            ordinal: 0,
-            event_time_us: 12,
-            stage: 2,
-            candidate: Some(CandidateRef(7)),
-            child_group: MemoGroupRef(2),
-            child_candidate: CandidateRef(8),
-            goal: GoalRef {
-                required: 3,
-                grant: 4,
-                context: 5,
-            },
-        });
-        capture.detail(DetailEvent::Fact {
-            source_sequence: 0,
-            parent_event_id: 10,
-            ordinal: 0,
-            event_time_us: 13,
-            candidate: Some(CandidateRef(7)),
-            group: MemoGroupRef(1),
-            logical_fact: FingerprintRef([6, 7]),
-            statistics_snapshot: FingerprintRef([8, 9]),
+        capture.detail(DetailEvent::Stage {
+            source_sequence: 1,
+            stage: work::WorkKind::Normalization,
+            elapsed_ns: 10,
+            items: 1,
+            fallbacks: 0,
         });
         let json = render(&capture.seal(), true);
         validate_json(json.as_bytes()).unwrap();
-
         let mut invalid: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let detail = invalid
-            .get_mut("detail")
-            .and_then(serde_json::Value::as_array_mut)
-            .unwrap();
-        detail[1]["data"]["parent_event_id"] = serde_json::json!(999);
-        assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
-
-        let mut invalid: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let detail = invalid
-            .get_mut("detail")
-            .and_then(serde_json::Value::as_array_mut)
-            .unwrap();
-        detail[1]["data"]["ordinal"] = serde_json::json!(0);
-        detail.push(detail[1].clone());
+        let detail = invalid["detail"].as_array_mut().unwrap();
+        detail.push(detail[0].clone());
         assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
     }
 
@@ -639,9 +529,8 @@ mod tests {
         ));
         let capture = CompileCapture::try_start().unwrap();
         capture.update(|r| {
-            r.search_stop = Observation::Observed(SearchStop::Complete);
-            r.search_complete = Observation::Observed(false);
-            r.obligations = Observation::Observed(5);
+            r.planning_status = Observation::Observed(PlanningStatus::Planned);
+
             r.budget_limited = Observation::Observed(true);
         });
         assert!(validate_json(render(&capture.seal(), true).as_bytes()).is_err());
@@ -814,21 +703,12 @@ mod tests {
             record.compiler_other_ns = Observation::Observed(0);
         });
         for sequence in 0..MAX_DETAIL_EVENTS {
-            capture.detail(DetailEvent::Task {
+            capture.detail(DetailEvent::Stage {
                 source_sequence: sequence as u64,
-                event_time_us: sequence as u64,
-                group: MemoGroupRef(sequence as u64),
-                expression: LogicalExprRef(sequence as u64),
-                rule: RuleRef(1),
-                first_binding: None,
-                first_run_us: None,
-                first_published_us: None,
-                match_count: 1,
-                applicable_count: 1,
-                published_count: 1,
-                no_match_count: 0,
-                no_output_count: 0,
-                budget_rejected_count: 0,
+                stage: work::WorkKind::RegionPlanning,
+                elapsed_ns: 0,
+                items: 1,
+                fallbacks: 0,
             });
         }
         let json = render_with_execution(&capture.seal(), true, Some(receipt));

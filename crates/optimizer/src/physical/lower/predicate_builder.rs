@@ -14,7 +14,7 @@ use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::expression::{
     evaluate_constant_expression, ComparisonType, ConjunctionType, Expression, OperatorType,
 };
-use paro_planner::operator::get::Get;
+use paro_planner::logical::operator::get::Get;
 use paro_storage::index::{Predicate, PredicateComparison, PredicateTree};
 
 use crate::physical::specs::SearchPredicateTemplate;
@@ -710,7 +710,7 @@ mod tests {
         CastExpression, ConstantExpression, FunctionExpression, OperatorExpression,
         ParameterExpression, ReferenceExpression,
     };
-    use paro_planner::operator::Get;
+    use paro_planner::logical::operator::Get;
 
     #[test]
     fn search_predicate_template_retains_typed_runtime_parameter() {

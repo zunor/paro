@@ -65,21 +65,18 @@ class TpcdsResultContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "distinct"):
             corpus_impact_summary([measured("01", 1, 1), measured("01", 2, 1)])
 
-    def test_verifier_and_search_policy_are_explicit_runtime_settings(self) -> None:
+    def test_verifier_is_explicit_without_retired_search_settings(self) -> None:
         from unittest.mock import MagicMock
         for verify, literal in (("on", "true"), ("off", "false")):
             connection = MagicMock()
-            args = SimpleNamespace(optimizer_verify=verify, optimizer_search_policy="quality",
-                                   optimizer_aggregate_strategy="joint",
-                                   disabled_optimizer_rules="aggregate_dimension_deferral,aggregate_dimension_sharing",
+            args = SimpleNamespace(optimizer_verify=verify,
                                    threads=4, memory_limit="2GB", statement_timeout_seconds=30)
             configure_paro(connection, args)
             statements = [call.args[0].as_string() for call in
                           connection.cursor.return_value.__enter__.return_value.execute.call_args_list]
             self.assertEqual(statements[0], f"SET optimizer_verify = {literal}")
-            self.assertEqual(statements[1], "SET optimizer_search_policy = 'quality'")
-            self.assertEqual(statements[2], "SET optimizer_aggregate_strategy = 'joint'")
-            self.assertEqual(statements[3], "SET disabled_optimizer_rules = 'aggregate_dimension_deferral,aggregate_dimension_sharing'")
+            self.assertFalse(any("optimizer_search_policy" in statement or
+                                 "disabled_optimizer_rules" in statement for statement in statements))
 
     def test_engine_identity_is_not_a_diagnostic_label(self) -> None:
         schema = duckdb_schema([("x", "VARCHAR")])[0]

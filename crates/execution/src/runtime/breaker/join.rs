@@ -13,7 +13,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::MemoryAccountingClass;
 use paro_common::memory::{MemoryAccountingContext, MemoryError, MemoryResult};
 use paro_common::types::LogicalType;
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinCondition, JoinType};
 use paro_storage::buffer::{BufferPool, MemoryTag};
 use paro_storage::index::{ColumnId, PredicateTree};
 use paro_storage::row::{

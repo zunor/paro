@@ -8,10 +8,10 @@ use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{
     ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     CTERef, CrossProduct, ExpressionGet, Filter, LogicalOperator, MaterializedCTE,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 fn integer_equality(table_index: usize, column_index: usize, value: i32) -> Expression {
     Expression::Comparison(
@@ -19,7 +19,7 @@ fn integer_equality(table_index: usize, column_index: usize, value: i32) -> Expr
             ComparisonType::Equal,
             Expression::ColumnRef(
                 ColumnRefExpression::new(
-                    paro_planner::operator::ColumnBinding::new(table_index, column_index),
+                    paro_planner::logical::operator::ColumnBinding::new(table_index, column_index),
                     LogicalType::Integer,
                 )
                 .into(),
@@ -72,7 +72,10 @@ fn materialized_cte_plan(unfiltered: bool) -> OwnedLogicalPlan {
         filtered_consumer(11, 2)
     };
     let consumers = OwnedLogicalPlan::synthetic(LogicalOperator::Join(
-        paro_planner::operator::Join::Cross(CrossProduct::new(filtered_consumer(10, 1), second)),
+        paro_planner::logical::operator::Join::Cross(CrossProduct::new(
+            filtered_consumer(10, 1),
+            second,
+        )),
     ));
     OwnedLogicalPlan::new(
         &bind_context,
@@ -99,7 +102,8 @@ fn all_consumers_required_and_residuals_preserved() {
             matches!(cte.cte_query.operator, LogicalOperator::Filter(_)),
             !unfiltered
         );
-        let LogicalOperator::Join(paro_planner::operator::Join::Cross(join)) = &cte.child.operator
+        let LogicalOperator::Join(paro_planner::logical::operator::Join::Cross(join)) =
+            &cte.child.operator
         else {
             panic!("expected cross")
         };
@@ -155,7 +159,7 @@ fn unfiltered_reference_in_nested_producer_blocks_restriction() {
 
 #[test]
 fn consumer_mapping_uses_definition_identity_not_column_position() {
-    use paro_planner::operator::cte::{CteColumnId, CteOutputColumn};
+    use paro_planner::logical::operator::cte::{CteColumnId, CteOutputColumn};
     let mut reference = CTERef::new(
         9,
         10,
@@ -177,7 +181,7 @@ fn consumer_mapping_uses_definition_identity_not_column_position() {
     let filter = Filter {
         child: (),
         expressions: vec![integer_equality(10, 0, 2)],
-        projection_map: paro_planner::operator::ProjectionMap::all(),
+        projection_map: paro_planner::logical::operator::ProjectionMap::all(),
     };
     let mapped = filtered_cte_ref(&reference, &filter, &output).unwrap();
     assert_eq!(
@@ -194,7 +198,8 @@ fn a_foreign_consumer_column_cannot_restrict_the_producer() {
     let LogicalOperator::MaterializedCTE(cte) = &mut plan.operator else {
         unreachable!()
     };
-    let LogicalOperator::Join(paro_planner::operator::Join::Cross(join)) = &mut cte.child.operator
+    let LogicalOperator::Join(paro_planner::logical::operator::Join::Cross(join)) =
+        &mut cte.child.operator
     else {
         unreachable!()
     };

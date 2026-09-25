@@ -450,7 +450,7 @@ mod tests {
     use super::*;
     use crate::binder::test_utils::test_binder;
     use crate::expression::ColumnRefExpression;
-    use crate::operator::ColumnBinding;
+    use crate::logical::operator::ColumnBinding;
 
     fn column(index: usize, logical_type: LogicalType) -> Expression {
         Expression::ColumnRef(

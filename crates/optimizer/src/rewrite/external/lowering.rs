@@ -8,16 +8,19 @@ use paro_planner::binder::bind::from::join_utils::{collect_table_bindings, get_e
 use paro_planner::binder::context::BindContext;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
-use paro_planner::operator::external_project::{ExternalCostEstimate, ExternalProjectExpression};
-use paro_planner::operator::{
+use paro_planner::logical::operator::external_project::{
+    ExternalCostEstimate, ExternalProjectExpression,
+};
+use paro_planner::logical::operator::{
     Aggregate, AnyJoin, ComparisonJoin, Distinct, Filter, Join, JoinSide, LogicalExternalProject,
     LogicalOperator, Order, Projection, TopN, Update, Window,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 #[derive(Debug)]
 pub struct ExternalRoutineLoweringResult {
     pub plan: OwnedLogicalPlan,
+    #[cfg(test)]
     pub changed: bool,
 }
 
@@ -25,10 +28,6 @@ pub struct ExternalRoutineLoweringResult {
 pub struct ExternalRoutineLoweringPass;
 
 impl ExternalRoutineLoweringPass {
-    pub fn name(self) -> &'static str {
-        "ExternalRoutineLoweringPass"
-    }
-
     pub fn lower(
         plan: OwnedLogicalPlan,
         bind_context: &BindContext,
@@ -38,6 +37,7 @@ impl ExternalRoutineLoweringPass {
         lowerer.ensure_no_unlowered_external_routines(&plan)?;
         Ok(ExternalRoutineLoweringResult {
             plan,
+            #[cfg(test)]
             changed: lowerer.changed,
         })
     }
@@ -397,7 +397,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
         Ok(join)
     }
 
-    fn ensure_limit_is_native(&self, limit: &paro_planner::operator::Limit) -> Result<()> {
+    fn ensure_limit_is_native(&self, limit: &paro_planner::logical::operator::Limit) -> Result<()> {
         if limit
             .limit
             .as_ref()
@@ -633,7 +633,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
             .enumerate()
             .map(|(idx, expression)| LayerMapping {
                 binding: ColumnRefExpression::new(
-                    paro_planner::operator::ColumnBinding::new(
+                    paro_planner::logical::operator::ColumnBinding::new(
                         project_index,
                         child_column_count + idx,
                     ),
@@ -858,11 +858,11 @@ mod tests {
     use paro_planner::expression::{
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
     };
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ComparisonJoin, ExpressionGet, Filter, Join, JoinCondition, JoinType, LogicalOperator,
         Order, Projection,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     use super::{ExternalRoutineLoweringPass, ExternalRoutineLoweringResult};
 
@@ -877,7 +877,7 @@ mod tests {
     fn int_column(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
             ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(table_index, column_index),
+                paro_planner::logical::operator::ColumnBinding::new(table_index, column_index),
                 LogicalType::Integer,
             )
             .into(),

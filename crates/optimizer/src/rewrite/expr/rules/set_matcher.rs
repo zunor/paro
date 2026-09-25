@@ -35,6 +35,7 @@ impl SetMatcher {
     ///
     /// # Returns
     /// `true` if matching succeeded according to the policy
+    #[cfg(test)]
     pub fn matches<'a>(
         matchers: &[Box<dyn ExpressionMatcher>],
         entries: &[&'a Expression],
@@ -85,6 +86,7 @@ impl SetMatcher {
     }
 
     /// Recursive helper for unordered matching.
+    #[cfg(test)]
     fn match_recursive<'a>(
         matchers: &[Box<dyn ExpressionMatcher>],
         entries: &[&'a Expression],

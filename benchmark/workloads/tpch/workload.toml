@@ -17,7 +17,6 @@ data_dir = "/tmp/paro-tpch-data"
 thread_count = 4
 memory_limit = "2GB"
 rowset_scan_pushdown = true
-optimizer_search_policy = "quality"
 optimizer_verify = false
 
 [setup]

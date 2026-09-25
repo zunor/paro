@@ -226,10 +226,10 @@ pub(super) fn fuse_adjacent_projects(transforms: Vec<TransformSpec>) -> Vec<Tran
 
 fn fuse_adjacent_projects_with_lineage(
     transforms: Vec<TransformSpec>,
-    operator_lineage: Box<[Option<paro_planner::plan::PlanNodeId>]>,
+    operator_lineage: Box<[Option<paro_planner::logical::plan::PlanNodeId>]>,
 ) -> (
     Vec<TransformSpec>,
-    Vec<Option<paro_planner::plan::PlanNodeId>>,
+    Vec<Option<paro_planner::logical::plan::PlanNodeId>>,
 ) {
     debug_assert_eq!(transforms.len(), operator_lineage.len());
     let mut fused = Vec::with_capacity(transforms.len());

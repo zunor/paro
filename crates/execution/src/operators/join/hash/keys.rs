@@ -9,7 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::JoinCondition;
+use paro_planner::logical::operator::join::JoinCondition;
 use std::sync::Arc;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
@@ -147,7 +147,7 @@ mod tests {
     use super::*;
     use paro_common::runtime_value::Value;
     use paro_planner::expression::{ConstantExpression, ReferenceExpression};
-    use paro_planner::operator::join::JoinComparisonType;
+    use paro_planner::logical::operator::join::JoinComparisonType;
 
     fn equality(left: Expression, right: Expression) -> JoinCondition {
         JoinCondition::new(left, right, JoinComparisonType::Equal)

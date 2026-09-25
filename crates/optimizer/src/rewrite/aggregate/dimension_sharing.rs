@@ -25,11 +25,11 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, ConstantExpression, Expression};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Filter, Join, JoinComparisonType, JoinType,
     LogicalOperator, Projection, SetOperation,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputSlot {
@@ -43,7 +43,7 @@ struct BranchView<'a> {
     filter: Option<&'a Filter>,
     outer: &'a Aggregate,
     join: &'a ComparisonJoin,
-    dimension: &'a paro_planner::operator::Get,
+    dimension: &'a paro_planner::logical::operator::Get,
     partial: &'a Aggregate,
     output_slots: Vec<OutputSlot>,
 }
@@ -334,7 +334,7 @@ fn output_slot(expression: &Expression, aggregate: &Aggregate) -> Option<OutputS
 
 fn join_conditions_match_partial(
     join: &ComparisonJoin,
-    dimension: &paro_planner::operator::Get,
+    dimension: &paro_planner::logical::operator::Get,
     partial: &Aggregate,
 ) -> bool {
     let dimension_bindings = join
@@ -427,8 +427,8 @@ fn equivalent_branch_bindings(
 /// rewrite. Keeping it centralized prevents pattern ordering from spending a
 /// bounded candidate frontier on dimension pairs the rule must later reject.
 pub(crate) fn equivalent_dimension_gets(
-    left: &paro_planner::operator::Get,
-    right: &paro_planner::operator::Get,
+    left: &paro_planner::logical::operator::Get,
+    right: &paro_planner::logical::operator::Get,
 ) -> bool {
     left.table
         .as_ref()
@@ -981,15 +981,11 @@ fn build_nary_union_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cascades::planner::{AlternativeOrigin, LogicalAlternative, MemoBuilder};
-    use crate::cascades::SearchBudget;
-    use crate::physical::{ResourceGrantClass, SpillPolicy};
+
     use crate::rewrite::aggregate::dimension_deferral;
     use crate::rewrite::subquery::partition_aggregate_tests::setup_session;
     use crate::verify::verify_logical_plan;
-    use paro_planner::planner::Planner;
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use paro_planner::binder::Planner;
 
     fn planned_union(sql: &str) -> (OwnedLogicalPlan, Planner) {
         let session = setup_session();
@@ -1141,100 +1137,6 @@ mod tests {
         .expect("inspect n-ary shared plan");
         assert_eq!(nation_scans, 1, "{plan:#?}");
         assert_eq!(aggregates, 4, "three partials plus one merge: {plan:#?}");
-    }
-
-    #[test]
-    fn nary_sharing_plan_is_stable_across_default_budget_envelope() {
-        fn optimize(group_factor: u32) -> (crate::cascades::Fingerprint, f64, usize, u64) {
-            let session = setup_session();
-            let statement = paro_parser::parse_one(
-                "SELECT n_name, sum(s_acctbal), 'a' FROM supplier JOIN nation \
-                 ON s_nationkey = n_nationkey GROUP BY n_name \
-                 UNION ALL \
-                 SELECT n_name, sum(s_acctbal), 'b' FROM supplier JOIN nation \
-                 ON s_nationkey = n_nationkey GROUP BY n_name \
-                 UNION ALL \
-                 SELECT n_name, sum(s_acctbal), 'c' FROM supplier JOIN nation \
-                 ON s_nationkey = n_nationkey GROUP BY n_name",
-            )
-            .unwrap()
-            .stmt;
-            let mut planner = Planner::new(session.clone());
-            planner.create_plan(statement).unwrap();
-            let plan =
-                defer_branch_aggregates(planner.take_plan().unwrap(), &planner.binder.bind_context);
-            let mut budget = SearchBudget::default();
-            budget.max_optional_groups_per_initial_group = group_factor;
-            budget.max_optional_composition_groups_per_initial_group = group_factor;
-            // This fixture explicitly supplies one class below. Freeze the
-            // same class domain for expected-grant selection in its session.
-            budget.max_grant_classes = 1;
-            let context = crate::context::OptimizationContext::new(
-                session,
-                planner.binder.bind_context.clone(),
-            );
-            let output = MemoBuilder::build_with_search(
-                vec![LogicalAlternative {
-                    plan,
-                    source: AlternativeOrigin::Baseline,
-                    column_stats: Arc::new(HashMap::new()),
-                }],
-                &planner.binder,
-                budget,
-                &context,
-            )
-            .unwrap()
-            .optimize(&[ResourceGrantClass {
-                id: crate::cascades::ResourceGrantClassId(0),
-                hard_memory_bytes: u64::MAX,
-                spill_policy: SpillPolicy::Allowed,
-                max_parallel_tasks: 1,
-            }])
-            .unwrap();
-            assert!(output
-                .rule_insertions
-                .get(&crate::cascades::rules::AGGREGATE_DIMENSION_SHARING_RULE)
-                .is_some_and(|count| *count > 0));
-            let winner = &output.variants[0];
-            let mut dimension_scans = 0;
-            winner
-                .plan
-                .try_visit_pre_order(|node| {
-                    if matches!(&node.operator, LogicalOperator::Get(get)
-                        if get.table.as_ref().is_some_and(|table| table.base.base.name == "nation"))
-                    {
-                        dimension_scans += 1;
-                    }
-                    Ok(())
-                })
-                .unwrap();
-            (
-                winner.physical_fingerprint,
-                winner.cost.score.range.expected,
-                dimension_scans,
-                output
-                    .rule_insertions
-                    .get(&crate::cascades::rules::AGGREGATE_DIMENSION_SHARING_RULE)
-                    .copied()
-                    .unwrap_or(0),
-            )
-        }
-
-        let variants = [8, 16, 32, 64, 128]
-            .into_iter()
-            .map(optimize)
-            .collect::<Vec<_>>();
-        assert!(variants
-            .iter()
-            .all(|(_, _, _, insertions)| *insertions >= 2));
-        assert!(variants.windows(2).all(|pair| pair[0].2 == pair[1].2));
-        assert!(
-            variants.windows(2).all(|pair| pair[0].0 == pair[1].0),
-            "{variants:?}"
-        );
-        assert!(variants
-            .windows(2)
-            .all(|pair| (pair[0].1 - pair[1].1).abs() < 1e-9));
     }
 
     #[test]

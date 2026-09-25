@@ -45,13 +45,7 @@ async fn order_by_result_namespace_is_not_the_input_namespace() {
     ] {
         exec_ok(&mut session, &mut sink, sql).await;
     }
-    for policy in ["pipeline", "quality"] {
-        exec_ok(
-            &mut session,
-            &mut sink,
-            &format!("SET optimizer_search_policy='{policy}'"),
-        )
-        .await;
+    for repetition in 0..2 {
         for sql in [
             "SELECT a.item_id FROM order_a a JOIN order_b b ON a.v=b.v ORDER BY item_id",
             "WITH a AS (SELECT item_id,v FROM order_a), b AS (SELECT item_id,v FROM order_b) SELECT a.item_id FROM a,b WHERE a.v=b.v ORDER BY item_id",
@@ -60,7 +54,7 @@ async fn order_by_result_namespace_is_not_the_input_namespace() {
             "SELECT a.item_id,a.item_id FROM order_a a ORDER BY item_id",
         ] {
             exec_ok(&mut session, &mut sink, sql).await;
-            assert_eq!(query_i64_col(&sink, 0), vec![1,2], "{policy}: {sql}");
+            assert_eq!(query_i64_col(&sink, 0), vec![1,2], "{repetition}: {sql}");
         }
         // A compound ORDER expression binds its inputs, not output aliases.
         exec_ok(
@@ -77,7 +71,7 @@ async fn order_by_result_namespace_is_not_the_input_namespace() {
             sink.clear();
             assert!(
                 session.execute_simple_query(sql, &mut sink).await.is_err(),
-                "{policy}: {sql}"
+                "{repetition}: {sql}"
             );
         }
     }
@@ -94,7 +88,6 @@ async fn pipeline_writes_preserve_input_and_transaction_contracts() {
     );
     let mut sink = CollectingSink::new();
     for sql in [
-        "SET optimizer_search_policy='pipeline'",
         "SET optimizer_verify=true",
         "CREATE TABLE pipe_write(k INT PRIMARY KEY, v INT)",
         "INSERT INTO pipe_write VALUES (1,10),(2,20),(3,30)",
@@ -203,21 +196,17 @@ async fn direct_pipeline_executes_relational_boundaries_without_memo() {
         "SELECT COUNT(DISTINCT k) AS n, SUM(DISTINCT v)::BIGINT AS s FROM pipe_fact",
         "WITH p AS MATERIALIZED (SELECT k,v FROM pipe_fact UNION ALL SELECT k,v FROM pipe_fact) SELECT a.k,SUM(a.v+b.v)::BIGINT AS s FROM p a JOIN p b ON a.k=b.k WHERE a.v>5 AND b.v<30 GROUP BY a.k ORDER BY a.k",
     ] {
-        exec_ok(&mut session, &mut sink, "SET optimizer_search_policy='quality'").await;
         exec_ok(&mut session, &mut sink, sql).await;
         let expected = rows(&sink);
         let types = sink.assert_single_result().types.clone();
         let names = sink.assert_single_result().names.clone();
-        exec_ok(&mut session, &mut sink, "SET optimizer_search_policy='pipeline'").await;
         exec_ok(&mut session, &mut sink, sql).await;
         assert_eq!(rows(&sink), expected, "{sql}");
         assert_eq!(sink.assert_single_result().types, types, "{sql}");
         assert_eq!(sink.assert_single_result().names, names, "{sql}");
-        exec_ok(&mut session, &mut sink, "SET optimizer_aggregate_strategy='single_stage'").await;
         exec_ok(&mut session, &mut sink, sql).await;
-        assert_eq!(rows(&sink), expected, "single_stage: {sql}");
+        assert_eq!(rows(&sink), expected, "repeat: {sql}");
         assert_eq!(sink.assert_single_result().types, types, "{sql}");
-        exec_ok(&mut session, &mut sink, "SET optimizer_aggregate_strategy='joint'").await;
     }
     // Independent expected value: two dimension keys sharing one label must
     // merge into one SQL group, not escape as separate partial groups.
@@ -247,13 +236,7 @@ async fn correlated_ranges_survive_predicate_canonicalization() {
         "INSERT INTO corr_o VALUES (1,10,6),(2,20,5),(3,20,8),(4,30,2),(5,NULL,4),(6,40,1)",
         "INSERT INTO corr_d VALUES (10,1,4),(10,2,9),(10,3,7),(20,1,5),(20,2,8),(20,3,6),(20,4,8),(30,1,3),(30,2,1),(NULL,1,50)",
     ] { exec_ok(&mut session, &mut sink, sql).await; }
-    for policy in ["quality", "pipeline"] {
-        exec_ok(
-            &mut session,
-            &mut sink,
-            &format!("SET optimizer_search_policy='{policy}'"),
-        )
-        .await;
+    for repetition in 0..2 {
         exec_ok(&mut session, &mut sink,
             "SELECT o.id, EXISTS(SELECT 1 FROM corr_d d WHERE d.grp=o.grp AND d.score>=o.threshold) FROM corr_o o ORDER BY o.id").await;
         assert_eq!(
@@ -261,11 +244,11 @@ async fn correlated_ranges_survive_predicate_canonicalization() {
             (1..=6)
                 .map(|id| vec![Value::Integer(id), Value::Boolean(id <= 4)])
                 .collect::<Vec<_>>(),
-            "{policy}"
+            "{repetition}"
         );
         exec_ok(&mut session, &mut sink,
             "SELECT o.id FROM corr_o o WHERE EXISTS(SELECT 1 FROM corr_d d WHERE d.grp=o.grp AND d.score>=o.threshold) ORDER BY o.id").await;
-        assert_eq!(query_i64_col(&sink, 0), vec![1, 2, 3, 4], "{policy}");
+        assert_eq!(query_i64_col(&sink, 0), vec![1, 2, 3, 4], "{repetition}");
         exec_ok(&mut session, &mut sink,
             "SELECT o.id,p.score FROM corr_o o CROSS JOIN LATERAL (SELECT d.score FROM corr_d d WHERE d.grp=o.grp AND d.score>=o.threshold ORDER BY d.score DESC,d.seq LIMIT 1) p ORDER BY o.id").await;
         assert_eq!(
@@ -274,7 +257,7 @@ async fn correlated_ranges_survive_predicate_canonicalization() {
                 .into_iter()
                 .map(|(id, score)| vec![Value::Integer(id), Value::Integer(score)])
                 .collect::<Vec<_>>(),
-            "{policy}"
+            "{repetition}"
         );
     }
 }
@@ -291,7 +274,6 @@ async fn direct_pipeline_keeps_real_external_cte_execution() {
         "SET threads=1",
         "CREATE TABLE pipe_spill(k INT)",
         "INSERT INTO pipe_spill SELECT (i % 10)::INT FROM generate_series(1,10000) AS t(i)",
-        "SET optimizer_search_policy='pipeline'",
         "SET force_external=true",
     ] {
         exec_ok(&mut session, &mut sink, sql).await;

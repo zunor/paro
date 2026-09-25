@@ -4,9 +4,11 @@
 //! Apply expression-level rewrite rules to a logical plan.
 
 use paro_planner::expression::{Expression, ExpressionIterator};
-use paro_planner::operator::LogicalOperator;
-use paro_planner::plan::OwnedLogicalPlan;
-use paro_planner::visitor::enumerate_expressions;
+use paro_planner::logical::operator::LogicalOperator;
+#[cfg(any(test, feature = "test-support"))]
+use paro_planner::logical::plan::OwnedLogicalPlan;
+#[cfg(any(test, feature = "test-support"))]
+use paro_planner::logical::visitor::enumerate_expressions;
 
 use crate::rewrite::expr::rules::rule::{Rule, RuleResult};
 
@@ -31,11 +33,13 @@ impl ExpressionRewriter {
     }
 
     /// Rewrite every operator/expression in a logical plan.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn rewrite_plan(&mut self, plan: &mut OwnedLogicalPlan) {
         plan.visit_post_order_mut(|node| self.visit_operator_expressions(&mut node.operator));
     }
 
     /// Visit and rewrite expressions in a logical operator.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn visit_operator_expressions<Child>(&mut self, op: &mut LogicalOperator<Child>) {
         // Expression rules do not inspect the surrounding operator today; use a stable leaf
         // for the `Rule::apply` context slot so we never clone a full [`LogicalOperator`].
@@ -169,7 +173,7 @@ mod tests {
         ComparisonExpression, ComparisonType, ConstantExpression, WindowExpression, WindowFrame,
         WindowFrameBound, WindowFrameType,
     };
-    use paro_planner::operator::{Distinct, ExpressionGet, Filter, Limit, Projection};
+    use paro_planner::logical::operator::{Distinct, ExpressionGet, Filter, Limit, Projection};
 
     /// A test rule that adds 1 to integer constants less than 100.
     /// This prevents infinite loops by only applying to small values.
@@ -318,7 +322,7 @@ mod tests {
     #[test]
     fn no_op_preserves_shared_root_and_changed_child_detaches_only_its_path() {
         use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
-        use paro_planner::operator::ColumnBinding;
+        use paro_planner::logical::operator::ColumnBinding;
         let column = Expression::ColumnRef(
             ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
         );

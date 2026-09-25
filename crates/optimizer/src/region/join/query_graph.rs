@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use paro_planner::expression::Expression;
-use paro_planner::operator::{AntiJoinMode, ColumnBinding, JoinType};
+use paro_planner::logical::operator::{AntiJoinMode, ColumnBinding, JoinType};
 
 use crate::region::join::relation::JoinRelationSet;
 
@@ -446,6 +446,7 @@ impl NeighborInfo {
     }
 
     /// Check if this is a cross product edge (no filters).
+    #[cfg(test)]
     pub fn is_cross_product(&self) -> bool {
         self.filters.is_empty()
     }

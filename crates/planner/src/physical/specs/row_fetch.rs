@@ -28,7 +28,7 @@ pub struct RelationalRowFetchMapping {
 }
 
 /// Optional physical fusion of the projection immediately above a logical
-/// [`crate::operator::RowFetch`]. The RowFetch operator remains a
+/// [`crate::logical::operator::RowFetch`]. The RowFetch operator remains a
 /// complete standalone transform; fusion only removes an avoidable transform
 /// dispatch and intermediate chunk on the common TopN path.
 #[derive(Debug, Clone)]

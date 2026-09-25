@@ -7,11 +7,14 @@
 //! Each matcher can match specific expression patterns and collect bindings.
 //! Many matcher types are part of the rule-extension API (used by tests and future rules).
 
-use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, OperatorType};
+use paro_planner::expression::Expression;
+#[cfg(test)]
+use paro_planner::expression::{ComparisonType, ConjunctionType};
 
+#[cfg(test)]
 use super::function_matcher::FunctionMatcher;
+#[cfg(test)]
 use super::set_matcher::{SetMatcher, SetMatcherPolicy};
-use super::type_matcher::TypeMatcher;
 
 /// Trait for matching expressions.
 ///
@@ -30,8 +33,10 @@ pub trait ExpressionMatcher {
 }
 
 /// Matches any expression.
+#[cfg(any(test, feature = "test-support"))]
 pub struct AnyExpressionMatcher;
 
+#[cfg(any(test, feature = "test-support"))]
 impl ExpressionMatcher for AnyExpressionMatcher {
     fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
         bindings.push(expr);
@@ -40,8 +45,10 @@ impl ExpressionMatcher for AnyExpressionMatcher {
 }
 
 /// Matches constant expressions.
+#[cfg(test)]
 pub struct ConstantExpressionMatcher;
 
+#[cfg(test)]
 impl ExpressionMatcher for ConstantExpressionMatcher {
     fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
         if matches!(expr, Expression::Constant(_)) {
@@ -54,8 +61,10 @@ impl ExpressionMatcher for ConstantExpressionMatcher {
 }
 
 /// Matches column reference expressions.
+#[cfg(test)]
 pub struct ColumnRefExpressionMatcher;
 
+#[cfg(test)]
 impl ExpressionMatcher for ColumnRefExpressionMatcher {
     fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
         if matches!(expr, Expression::ColumnRef(_)) {
@@ -68,6 +77,7 @@ impl ExpressionMatcher for ColumnRefExpressionMatcher {
 }
 
 /// Matches comparison expressions with optional child matchers.
+#[cfg(test)]
 pub struct ComparisonExpressionMatcher {
     /// Optional matcher for comparison type.
     pub comparison_type: Option<ComparisonType>,
@@ -77,8 +87,10 @@ pub struct ComparisonExpressionMatcher {
     pub policy: SetMatcherPolicy,
 }
 
+#[cfg(test)]
 impl ComparisonExpressionMatcher {
     /// Create a matcher for any comparison expression.
+    #[cfg(test)]
     pub fn any() -> Self {
         Self {
             comparison_type: None,
@@ -88,6 +100,7 @@ impl ComparisonExpressionMatcher {
     }
 
     /// Create a matcher for a specific comparison type.
+    #[cfg(test)]
     pub fn with_type(comparison_type: ComparisonType) -> Self {
         Self {
             comparison_type: Some(comparison_type),
@@ -97,6 +110,7 @@ impl ComparisonExpressionMatcher {
     }
 
     /// Add child matchers for left and right operands.
+    #[cfg(test)]
     pub fn with_children(
         mut self,
         left: Box<dyn ExpressionMatcher>,
@@ -105,14 +119,9 @@ impl ComparisonExpressionMatcher {
         self.child_matchers = vec![left, right];
         self
     }
-
-    /// Set the matching policy.
-    pub fn with_policy(mut self, policy: SetMatcherPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
 }
 
+#[cfg(test)]
 impl ExpressionMatcher for ComparisonExpressionMatcher {
     fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
         let Expression::Comparison(comp) = expr else {
@@ -139,6 +148,7 @@ impl ExpressionMatcher for ComparisonExpressionMatcher {
 }
 
 /// Matches conjunction expressions (AND/OR).
+#[cfg(test)]
 pub struct ConjunctionExpressionMatcher {
     /// Optional matcher for conjunction type.
     pub conjunction_type: Option<ConjunctionType>,
@@ -148,17 +158,10 @@ pub struct ConjunctionExpressionMatcher {
     pub policy: SetMatcherPolicy,
 }
 
+#[cfg(test)]
 impl ConjunctionExpressionMatcher {
-    /// Create a matcher for any conjunction expression.
-    pub fn any() -> Self {
-        Self {
-            conjunction_type: None,
-            child_matchers: Vec::new(),
-            policy: SetMatcherPolicy::Unordered,
-        }
-    }
-
     /// Create a matcher for AND expressions.
+    #[cfg(test)]
     pub fn and() -> Self {
         Self {
             conjunction_type: Some(ConjunctionType::And),
@@ -166,29 +169,9 @@ impl ConjunctionExpressionMatcher {
             policy: SetMatcherPolicy::Unordered,
         }
     }
-
-    /// Create a matcher for OR expressions.
-    pub fn or() -> Self {
-        Self {
-            conjunction_type: Some(ConjunctionType::Or),
-            child_matchers: Vec::new(),
-            policy: SetMatcherPolicy::Unordered,
-        }
-    }
-
-    /// Add child matchers.
-    pub fn with_children(mut self, matchers: Vec<Box<dyn ExpressionMatcher>>) -> Self {
-        self.child_matchers = matchers;
-        self
-    }
-
-    /// Set the matching policy.
-    pub fn with_policy(mut self, policy: SetMatcherPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
 }
 
+#[cfg(test)]
 impl ExpressionMatcher for ConjunctionExpressionMatcher {
     fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
         let Expression::Conjunction(conj) = expr else {
@@ -215,6 +198,7 @@ impl ExpressionMatcher for ConjunctionExpressionMatcher {
 }
 
 /// Matches function expressions.
+#[cfg(test)]
 pub struct FunctionExpressionMatcher {
     /// Optional function name matcher.
     pub function_matcher: Option<Box<dyn FunctionMatcher>>,
@@ -224,17 +208,10 @@ pub struct FunctionExpressionMatcher {
     pub policy: SetMatcherPolicy,
 }
 
+#[cfg(test)]
 impl FunctionExpressionMatcher {
-    /// Create a matcher for any function expression.
-    pub fn any() -> Self {
-        Self {
-            function_matcher: None,
-            child_matchers: Vec::new(),
-            policy: SetMatcherPolicy::Ordered,
-        }
-    }
-
     /// Create a matcher for a specific function.
+    #[cfg(test)]
     pub fn with_function(function_matcher: Box<dyn FunctionMatcher>) -> Self {
         Self {
             function_matcher: Some(function_matcher),
@@ -242,20 +219,9 @@ impl FunctionExpressionMatcher {
             policy: SetMatcherPolicy::Ordered,
         }
     }
-
-    /// Add child matchers for arguments.
-    pub fn with_children(mut self, matchers: Vec<Box<dyn ExpressionMatcher>>) -> Self {
-        self.child_matchers = matchers;
-        self
-    }
-
-    /// Set the matching policy.
-    pub fn with_policy(mut self, policy: SetMatcherPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
 }
 
+#[cfg(test)]
 impl ExpressionMatcher for FunctionExpressionMatcher {
     fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
         let Expression::Function(func) = expr else {
@@ -282,181 +248,6 @@ impl ExpressionMatcher for FunctionExpressionMatcher {
 }
 
 /// Matches cast expressions.
-pub struct CastExpressionMatcher {
-    /// Optional type matcher for target type.
-    pub type_matcher: Option<Box<dyn TypeMatcher>>,
-    /// Optional matcher for the child expression.
-    pub child_matcher: Option<Box<dyn ExpressionMatcher>>,
-}
-
-impl CastExpressionMatcher {
-    /// Create a matcher for any cast expression.
-    pub fn any() -> Self {
-        Self {
-            type_matcher: None,
-            child_matcher: None,
-        }
-    }
-
-    /// Create a matcher for cast to a specific type.
-    pub fn with_type(type_matcher: Box<dyn TypeMatcher>) -> Self {
-        Self {
-            type_matcher: Some(type_matcher),
-            child_matcher: None,
-        }
-    }
-
-    /// Add a child matcher.
-    pub fn with_child(mut self, matcher: Box<dyn ExpressionMatcher>) -> Self {
-        self.child_matcher = Some(matcher);
-        self
-    }
-}
-
-impl ExpressionMatcher for CastExpressionMatcher {
-    fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
-        let Expression::Cast(cast) = expr else {
-            return false;
-        };
-
-        // Check target type if matcher is provided
-        if let Some(ref matcher) = self.type_matcher {
-            if !matcher.matches(&cast.target_type) {
-                return false;
-            }
-        }
-
-        bindings.push(expr);
-
-        // Match child if matcher is provided
-        if let Some(ref matcher) = self.child_matcher {
-            return matcher.matches(&cast.child, bindings);
-        }
-
-        true
-    }
-}
-
-/// Matches operator expressions (IN, NOT, IS NULL, etc.).
-pub struct OperatorExpressionMatcher {
-    /// Optional operator type.
-    pub operator_type: Option<OperatorType>,
-    /// Matchers for children.
-    pub child_matchers: Vec<Box<dyn ExpressionMatcher>>,
-    /// Policy for matching children.
-    pub policy: SetMatcherPolicy,
-}
-
-impl OperatorExpressionMatcher {
-    /// Create a matcher for any operator expression.
-    pub fn any() -> Self {
-        Self {
-            operator_type: None,
-            child_matchers: Vec::new(),
-            policy: SetMatcherPolicy::Ordered,
-        }
-    }
-
-    /// Create a matcher for a specific operator type.
-    pub fn with_type(operator_type: OperatorType) -> Self {
-        Self {
-            operator_type: Some(operator_type),
-            child_matchers: Vec::new(),
-            policy: SetMatcherPolicy::Ordered,
-        }
-    }
-
-    /// Add child matchers.
-    pub fn with_children(mut self, matchers: Vec<Box<dyn ExpressionMatcher>>) -> Self {
-        self.child_matchers = matchers;
-        self
-    }
-}
-
-impl ExpressionMatcher for OperatorExpressionMatcher {
-    fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
-        let Expression::Operator(op) = expr else {
-            return false;
-        };
-
-        // Check operator type if specified
-        if let Some(expected_type) = &self.operator_type {
-            if op.operator_type != *expected_type {
-                return false;
-            }
-        }
-
-        bindings.push(expr);
-
-        // Match children if matchers are provided
-        if !self.child_matchers.is_empty() {
-            let children: Vec<&Expression> = op.children.iter().collect();
-            return SetMatcher::matches(&self.child_matchers, &children, bindings, self.policy);
-        }
-
-        true
-    }
-}
-
-/// Matches aggregate expressions.
-pub struct AggregateExpressionMatcher {
-    /// Optional function name matcher.
-    pub function_matcher: Option<Box<dyn FunctionMatcher>>,
-    /// Matchers for arguments.
-    pub child_matchers: Vec<Box<dyn ExpressionMatcher>>,
-    /// Policy for matching children.
-    pub policy: SetMatcherPolicy,
-}
-
-impl AggregateExpressionMatcher {
-    /// Create a matcher for any aggregate expression.
-    pub fn any() -> Self {
-        Self {
-            function_matcher: None,
-            child_matchers: Vec::new(),
-            policy: SetMatcherPolicy::Ordered,
-        }
-    }
-
-    /// Create a matcher for a specific aggregate function.
-    pub fn with_function(function_matcher: Box<dyn FunctionMatcher>) -> Self {
-        Self {
-            function_matcher: Some(function_matcher),
-            child_matchers: Vec::new(),
-            policy: SetMatcherPolicy::Ordered,
-        }
-    }
-}
-
-impl ExpressionMatcher for AggregateExpressionMatcher {
-    fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
-        let Expression::Aggregate(agg) = expr else {
-            return false;
-        };
-
-        // Check function name if matcher is provided
-        if let Some(ref matcher) = self.function_matcher {
-            if !matcher.matches(&agg.function.name) {
-                return false;
-            }
-        }
-
-        bindings.push(expr);
-
-        // Match children if matchers are provided
-        if !self.child_matchers.is_empty() {
-            let children: Vec<&Expression> = agg.children.iter().collect();
-            return SetMatcher::matches(&self.child_matchers, &children, bindings, self.policy);
-        }
-
-        true
-    }
-}
-
-/// Matches any foldable constant expression.
-///
-/// A foldable expression is one that can be evaluated at compile time
-/// (contains only constants and deterministic functions).
 pub struct FoldableConstantMatcher;
 
 impl FoldableConstantMatcher {
@@ -505,28 +296,6 @@ impl ExpressionMatcher for FoldableConstantMatcher {
     }
 }
 
-/// Matches expressions with a specific return type.
-pub struct TypedExpressionMatcher {
-    type_matcher: Box<dyn TypeMatcher>,
-}
-
-impl TypedExpressionMatcher {
-    pub fn new(type_matcher: Box<dyn TypeMatcher>) -> Self {
-        Self { type_matcher }
-    }
-}
-
-impl ExpressionMatcher for TypedExpressionMatcher {
-    fn matches<'a>(&self, expr: &'a Expression, bindings: &mut Vec<&'a Expression>) -> bool {
-        if self.type_matcher.matches(&expr.return_type()) {
-            bindings.push(expr);
-            true
-        } else {
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,7 +319,7 @@ mod tests {
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
             ColumnRefExpression {
-                binding: paro_planner::operator::ColumnBinding {
+                binding: paro_planner::logical::operator::ColumnBinding {
                     table_index,
                     column_index,
                 },

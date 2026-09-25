@@ -1,8 +1,8 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::operator::{ExplainMode, ExplainSpec};
-use crate::plan::CardinalityEstimate;
+use crate::logical::operator::{ExplainMode, ExplainSpec};
+use crate::logical::plan::CardinalityEstimate;
 use serde_json::{Map, Value as JsonValue};
 
 pub type ExplainNodeId = u64;

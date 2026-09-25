@@ -56,7 +56,7 @@ impl MemoryCompletion {
         }
     }
 
-    /// Deterministic portfolio preference. A completion proof always wins;
+    /// Deterministic artifact preference. A completion proof always wins;
     /// among best-effort alternatives, a smaller known demand wins and an
     /// unbounded demand ranks last.
     pub fn preference_cmp(self, other: Self) -> Ordering {
@@ -243,7 +243,7 @@ pub struct ScoreSummary {
 
 /// No heap-backed collection belongs in this structure.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SearchCost {
+pub struct PhysicalCost {
     pub score: ScoreSummary,
     pub resources_expected: [f64; RESOURCE_DIMS],
     pub resources_risk_upper: [f64; RESOURCE_DIMS],
@@ -279,7 +279,7 @@ pub struct SearchCost {
     pub external_worker_slots_upper: u16,
 }
 
-impl SearchCost {
+impl PhysicalCost {
     pub const ZERO: Self = Self {
         score: ScoreSummary {
             range: CompactRange::ZERO,
@@ -667,122 +667,10 @@ impl SearchCost {
         result.validate()?;
         Ok(result)
     }
-
-    pub fn dominates(&self, other: &Self) -> bool {
-        self.continuation_cmp(other) == Some(Ordering::Less)
-    }
-
-    /// Partial order of the cost coordinates a physical continuation can
-    /// observe. Equality belongs to this same relation: using full struct
-    /// equality for ties retained unlimited candidates differing only in a
-    /// lower-bound estimate, even though neither dominated the other.
-    ///
-    /// Lower bounds remain attached to the selected candidate as evidence;
-    /// they are not ranking objectives or resource requirements. No epsilon,
-    /// rounding, or projection of a ranking/feasibility axis is used here.
-    /// Source response is a separate, goal-dependent contract checked by Memo.
-    pub fn continuation_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.compare_continuation(other, None)
-    }
-
-    /// A goal propagates one objective to every child. Reporting-only resource
-    /// vectors do not become independent ranking objectives. Retain work/span
-    /// separately for latency (a parent can reverse their local max), and keep
-    /// every memory/admission coordinate regardless of objective.
-    pub fn continuation_cmp_for(
-        &self,
-        other: &Self,
-        objective: super::objective::ObjectiveProfile,
-    ) -> Option<Ordering> {
-        self.compare_continuation(other, Some(objective))
-    }
-
-    fn compare_continuation(
-        &self,
-        other: &Self,
-        objective: Option<super::objective::ObjectiveProfile>,
-    ) -> Option<Ordering> {
-        use super::objective::ObjectiveProfile;
-        if self.max_parallel_tasks != other.max_parallel_tasks
-            || self.output_pipeline_tasks != other.output_pipeline_tasks
-            || self.external_workers != other.external_workers
-        {
-            return None;
-        }
-        let mut result = Ordering::Equal;
-        macro_rules! observe {
-            ($comparison:expr) => {
-                match $comparison? {
-                    Ordering::Equal => {}
-                    order if result == Ordering::Equal || result == order => result = order,
-                    _ => return None,
-                }
-            };
-        }
-        macro_rules! axis {
-            ($field:ident $(.$member:ident)*) => {
-                observe!(self.$field$(.$member)*.partial_cmp(&other.$field$(.$member)*));
-            };
-        }
-        if matches!(
-            objective,
-            None | Some(ObjectiveProfile::Latency | ObjectiveProfile::Throughput)
-        ) {
-            axis!(score.range.expected);
-        }
-        axis!(score.risk_adjusted);
-        if matches!(objective, None | Some(ObjectiveProfile::Robustness)) {
-            axis!(score.range.upper);
-        }
-        if matches!(objective, None | Some(ObjectiveProfile::Latency)) {
-            axis!(work_latency.expected);
-            axis!(critical_path.expected);
-        }
-        if objective.is_none() {
-            axis!(work_latency.upper);
-            axis!(critical_path.upper);
-        }
-        axis!(non_revocable_memory_upper);
-        axis!(minimum_memory_bytes);
-        // The elastic delta is relative to a candidate-specific floor. Two
-        // candidates with the same absolute operating point do not trade off
-        // memory merely because one proves a smaller non-revocable floor.
-        observe!(Some(
-            self.preferred_memory_bytes()
-                .cmp(&other.preferred_memory_bytes())
-        ));
-        axis!(peak_memory_upper);
-        observe!(Some(
-            self.memory_completion
-                .preference_cmp(other.memory_completion)
-        ));
-        axis!(spill_bytes_expected);
-        axis!(external_worker_slots_upper);
-        if objective.is_none() {
-            for (left, right) in self
-                .resources_expected
-                .iter()
-                .zip(&other.resources_expected)
-            {
-                observe!(left.partial_cmp(right));
-            }
-            for (left, right) in self
-                .resources_risk_upper
-                .iter()
-                .zip(&other.resources_risk_upper)
-            {
-                observe!(left.partial_cmp(right));
-            }
-        } else if objective == Some(ObjectiveProfile::Throughput) {
-            observe!(self.resources_expected[ResourceDimension::Cpu as usize]
-                .partial_cmp(&other.resources_expected[ResourceDimension::Cpu as usize]));
-        }
-        Some(result)
-    }
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<SearchCost>() <= 256);
+    assert!(std::mem::size_of::<PhysicalCost>() <= 256);
 };
 
 #[cfg(test)]
@@ -790,182 +678,17 @@ mod memory_tests {
     use super::*;
 
     #[test]
-    fn goal_pruning_is_monotone_under_independently_enumerated_continuations() {
-        use super::super::objective::ObjectiveProfile;
-        let mut candidates = Vec::new();
-        for work in [10.0, 12.0] {
-            for span in [4.0, 10.0] {
-                for floor in [1, 3] {
-                    for risk in [20.0, 24.0] {
-                        candidates.push(SearchCost {
-                            score: ScoreSummary {
-                                range: CompactRange::new(0.0, work, risk).unwrap(),
-                                risk_adjusted: risk,
-                            },
-                            work_latency: CompactRange::new(0.0, work, risk).unwrap(),
-                            critical_path: CompactRange::new(0.0, span, risk).unwrap(),
-                            max_parallel_tasks: 4,
-                            output_pipeline_tasks: 4,
-                            minimum_memory_bytes: floor,
-                            non_revocable_memory_upper: floor,
-                            revocable_memory_target: 8 - floor,
-                            peak_memory_upper: 8,
-                            resources_expected: [work, 100.0 - work, 0.0, 0.0, 0.0, 0.0],
-                            resources_risk_upper: [risk, 100.0 - risk, 0.0, 0.0, 0.0, 0.0],
-                            ..SearchCost::ZERO
-                        });
-                    }
-                }
-            }
-        }
-        for objective in [
-            ObjectiveProfile::Latency,
-            ObjectiveProfile::Throughput,
-            ObjectiveProfile::Memory,
-            ObjectiveProfile::Robustness,
-        ] {
-            for left in &candidates {
-                for right in &candidates {
-                    if !matches!(
-                        left.continuation_cmp_for(right, objective),
-                        Some(Ordering::Less | Ordering::Equal)
-                    ) {
-                        continue;
-                    }
-                    for work in [0.0, 100.0] {
-                        for span in [0.0, 40.0] {
-                            for parent_floor in [0, 4] {
-                                // Independent task/footprint oracle. Do not call
-                                // SearchCost composition or ObjectiveProfile::compare.
-                                let key = |child: &SearchCost| {
-                                    let w = child.work_latency.expected + work;
-                                    let s = child.critical_path.expected + span;
-                                    let expected = child.score.range.expected + work;
-                                    let risk = child.score.risk_adjusted + work;
-                                    let peak = (child.peak_memory_upper)
-                                        .max(parent_floor + child.preferred_memory_bytes())
-                                        as f64;
-                                    match objective {
-                                        ObjectiveProfile::Latency => {
-                                            vec![(w / 4.0).max(s), w, expected, risk, peak]
-                                        }
-                                        ObjectiveProfile::Throughput => vec![
-                                            child.resources_expected[0] + work,
-                                            expected,
-                                            risk,
-                                            peak,
-                                        ],
-                                        ObjectiveProfile::Memory => vec![peak, risk, 0.0],
-                                        ObjectiveProfile::Robustness => {
-                                            vec![child.score.range.upper + work, risk, peak]
-                                        }
-                                    }
-                                };
-                                assert!(
-                                    key(left) <= key(right),
-                                    "{objective:?} left={left:?} right={right:?}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let low_floor = candidates[0];
-        let higher_floor = SearchCost {
-            minimum_memory_bytes: 3,
-            non_revocable_memory_upper: 3,
-            revocable_memory_target: 5,
-            ..low_floor
-        };
-        assert_eq!(
-            low_floor.continuation_cmp_for(&higher_floor, ObjectiveProfile::Latency),
-            Some(Ordering::Less)
-        );
-        let different_resources = SearchCost {
-            resources_expected: [100.0; RESOURCE_DIMS],
-            resources_risk_upper: [200.0; RESOURCE_DIMS],
-            ..low_floor
-        };
-        assert_eq!(
-            low_floor.continuation_cmp_for(&different_resources, ObjectiveProfile::Latency),
-            Some(Ordering::Equal)
-        );
-        assert_ne!(
-            low_floor.continuation_cmp_for(&different_resources, ObjectiveProfile::Throughput),
-            Some(Ordering::Equal)
-        );
-    }
-
-    #[test]
-    fn continuation_equivalence_ignores_only_non_ranking_lower_evidence() {
-        let cost = SearchCost {
-            score: ScoreSummary {
-                range: CompactRange::new(0.0, 10.0, 100.0).unwrap(),
-                risk_adjusted: 55.0,
-            },
-            work_latency: CompactRange::new(0.0, 20.0, 200.0).unwrap(),
-            critical_path: CompactRange::new(0.0, 20.0, 200.0).unwrap(),
-            ..SearchCost::ZERO
-        };
-        let mut other = cost;
-        other.score.range.lower = 5.0;
-        other.work_latency.lower = 10.0;
-        other.critical_path.lower = 10.0;
-        assert_ne!(cost, other);
-        assert_eq!(cost.continuation_cmp(&other), Some(Ordering::Equal));
-        assert!(!cost.dominates(&other));
-        assert!(!other.dominates(&cost));
-        for objective in [
-            super::super::objective::ObjectiveProfile::Latency,
-            super::super::objective::ObjectiveProfile::Throughput,
-            super::super::objective::ObjectiveProfile::Memory,
-            super::super::objective::ObjectiveProfile::Robustness,
-        ] {
-            assert_eq!(objective.compare(&cost, &other), Ordering::Equal);
-            for parent in [SearchCost::ZERO, cost, other] {
-                assert_eq!(
-                    objective.compare(
-                        &cost.sequential(parent).unwrap(),
-                        &other.sequential(parent).unwrap()
-                    ),
-                    Ordering::Equal
-                );
-            }
-        }
-        // Capacity and external identity are observable by continuations,
-        // even when all scalar objective coordinates happen to be equal.
-        for distinct in [
-            SearchCost {
-                max_parallel_tasks: 4,
-                ..cost
-            },
-            SearchCost {
-                output_pipeline_tasks: 4,
-                ..cost
-            },
-            SearchCost {
-                external_workers: ExternalWorkerRequirementSetId(1),
-                ..cost
-            },
-        ] {
-            assert_eq!(cost.continuation_cmp(&distinct), None);
-            assert_eq!(distinct.continuation_cmp(&cost), None);
-        }
-    }
-
-    #[test]
     fn sequential_composition_preserves_preferred_memory_below_the_hard_peak() {
-        let first = SearchCost {
+        let first = PhysicalCost {
             minimum_memory_bytes: 10,
             revocable_memory_target: 40,
             peak_memory_upper: 100,
-            ..SearchCost::ZERO
+            ..PhysicalCost::ZERO
         };
-        let second = SearchCost {
+        let second = PhysicalCost {
             minimum_memory_bytes: 20,
             peak_memory_upper: 30,
-            ..SearchCost::ZERO
+            ..PhysicalCost::ZERO
         };
 
         let combined = first.sequential(second).unwrap();
@@ -977,12 +700,12 @@ mod memory_tests {
 
     #[test]
     fn runtime_cap_preserves_the_uncapped_demand() {
-        let mut cost = SearchCost {
+        let mut cost = PhysicalCost {
             non_revocable_memory_upper: u64::MAX,
             minimum_memory_bytes: 10,
             peak_memory_upper: u64::MAX,
             memory_completion: MemoryCompletion::runtime_capped_unbounded(),
-            ..SearchCost::ZERO
+            ..PhysicalCost::ZERO
         };
 
         cost.apply_runtime_cap(100, 10).unwrap();
@@ -1027,18 +750,18 @@ mod memory_tests {
 
     #[test]
     fn runtime_capped_peer_cannot_mask_an_invalid_guaranteed_component() {
-        let invalid_guaranteed = SearchCost {
+        let invalid_guaranteed = PhysicalCost {
             non_revocable_memory_upper: 20,
             minimum_memory_bytes: 10,
             peak_memory_upper: 20,
-            ..SearchCost::ZERO
+            ..PhysicalCost::ZERO
         };
-        let runtime_capped = SearchCost {
+        let runtime_capped = PhysicalCost {
             non_revocable_memory_upper: 10,
             minimum_memory_bytes: 10,
             peak_memory_upper: 10,
             memory_completion: MemoryCompletion::runtime_capped_known(10),
-            ..SearchCost::ZERO
+            ..PhysicalCost::ZERO
         };
 
         assert!(invalid_guaranteed.sequential(runtime_capped).is_err());
@@ -1049,14 +772,14 @@ mod memory_tests {
 mod tests {
     use super::*;
 
-    fn cost(score: f64, memory: u64) -> SearchCost {
-        SearchCost {
+    fn cost(score: f64, memory: u64) -> PhysicalCost {
+        PhysicalCost {
             score: ScoreSummary {
                 range: CompactRange::point(score).unwrap(),
                 risk_adjusted: score,
             },
             peak_memory_upper: memory,
-            ..SearchCost::ZERO
+            ..PhysicalCost::ZERO
         }
     }
 
@@ -1068,15 +791,9 @@ mod tests {
     }
 
     #[test]
-    fn pareto_dominance_requires_no_regression() {
-        assert!(cost(1.0, 10).dominates(&cost(2.0, 20)));
-        assert!(!cost(1.0, 30).dominates(&cost(2.0, 20)));
-    }
-
-    #[test]
     fn hot_cost_remains_small_copyable_pod() {
-        assert!(std::mem::size_of::<SearchCost>() <= 256);
-        let value = SearchCost::ZERO;
+        assert!(std::mem::size_of::<PhysicalCost>() <= 256);
+        let value = PhysicalCost::ZERO;
         let copied = value;
         assert_eq!(value, copied);
     }

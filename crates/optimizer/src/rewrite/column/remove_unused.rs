@@ -11,9 +11,9 @@ use paro_planner::binder::Binder;
 use paro_planner::expression::{
     AggregateExpression, ColumnRefExpression, ConstantExpression, Expression, ExpressionIterator,
 };
-use paro_planner::operator::{ColumnBinding, LogicalOperator, Projection};
-use paro_planner::plan::OwnedLogicalPlan;
-use paro_planner::visitor::LogicalOperatorVisitor;
+use paro_planner::logical::operator::{ColumnBinding, LogicalOperator, Projection};
+use paro_planner::logical::plan::OwnedLogicalPlan;
+use paro_planner::logical::visitor::LogicalOperatorVisitor;
 
 use crate::rewrite::expr::binding_replacer::ReplacementBinding;
 
@@ -146,7 +146,7 @@ impl<'a> RemoveUnusedColumns<'a> {
     }
 
     /// Clear unused columns from a Get.
-    fn remove_columns_from_get(&mut self, get: &mut paro_planner::operator::Get) {
+    fn remove_columns_from_get(&mut self, get: &mut paro_planner::logical::operator::Get) {
         let mut new_column_sources = Vec::new();
         let mut new_column_types = Vec::new();
         let mut new_returned_types = Vec::new();
@@ -181,7 +181,7 @@ impl<'a> RemoveUnusedColumns<'a> {
 
     fn projected_bindings(
         plan: &OwnedLogicalPlan,
-        projection: &paro_planner::operator::ProjectionMap,
+        projection: &paro_planner::logical::operator::ProjectionMap,
     ) -> Vec<ColumnBinding> {
         let bindings = plan.get_column_bindings();
         match projection.as_columns() {
@@ -453,7 +453,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 // No need to propagate replacements up - already updated via raw pointers
             }
             LogicalOperator::Join(join) => {
-                use paro_planner::operator::{JoinComparisonType, JoinType};
+                use paro_planner::logical::operator::{JoinComparisonType, JoinType};
 
                 // Joins don't produce new columns, pass through to both children
                 let mut child_optimizer =
@@ -466,20 +466,20 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 // may compact either input. Preserve their binding identity so
                 // the maps can be rebuilt against the final child layouts.
                 let (mut projected_left_bindings, mut projected_right_bindings) = match join {
-                    paro_planner::operator::Join::Comparison(join) => (
+                    paro_planner::logical::operator::Join::Comparison(join) => (
                         Self::projected_bindings(join.left.as_ref(), &join.left_projection_map),
                         Self::projected_bindings(join.right.as_ref(), &join.right_projection_map),
                     ),
-                    paro_planner::operator::Join::Any(join) => (
+                    paro_planner::logical::operator::Join::Any(join) => (
                         Self::projected_bindings(join.left.as_ref(), &join.left_projection_map),
                         Self::projected_bindings(join.right.as_ref(), &join.right_projection_map),
                     ),
-                    paro_planner::operator::Join::Cross(_) => (Vec::new(), Vec::new()),
+                    paro_planner::logical::operator::Join::Cross(_) => (Vec::new(), Vec::new()),
                 };
 
                 // For INNER JOIN with equality predicates, we can optimize:
                 // Replace references to RHS with references to LHS to reduce columns extracted from hash table
-                if let paro_planner::operator::Join::Comparison(cj) = join {
+                if let paro_planner::logical::operator::Join::Comparison(cj) = join {
                     if !child_optimizer.everything_referenced && cj.join_type == JoinType::Inner {
                         for cond in &mut cj.conditions {
                             // Only for equality comparisons
@@ -523,7 +523,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
 
                 // Collect references from join conditions
                 match join {
-                    paro_planner::operator::Join::Comparison(cj) => {
+                    paro_planner::logical::operator::Join::Comparison(cj) => {
                         // Delim capture keys are evaluated against the captured
                         // child just like join conditions. Track them here so a
                         // pruned scan both retains the key and rewrites its
@@ -536,10 +536,10 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                             child_optimizer.visit_expression(&mut cond.right);
                         }
                     }
-                    paro_planner::operator::Join::Any(aj) => {
+                    paro_planner::logical::operator::Join::Any(aj) => {
                         child_optimizer.visit_expression(&mut aj.condition);
                     }
-                    paro_planner::operator::Join::Cross(_) => {}
+                    paro_planner::logical::operator::Join::Cross(_) => {}
                 }
 
                 let child_refs = child_optimizer.column_references.clone();
@@ -567,7 +567,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 Self::remap_bindings(&mut projected_left_bindings, &left_optimizer.replacements);
                 Self::remap_bindings(&mut projected_right_bindings, &right_optimizer.replacements);
                 match join {
-                    paro_planner::operator::Join::Comparison(join) => {
+                    paro_planner::logical::operator::Join::Comparison(join) => {
                         join.left_projection_map = Self::rebuild_projection_map(
                             join.left.as_ref(),
                             &projected_left_bindings,
@@ -579,7 +579,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                         )
                         .into();
                     }
-                    paro_planner::operator::Join::Any(join) => {
+                    paro_planner::logical::operator::Join::Any(join) => {
                         join.left_projection_map = Self::rebuild_projection_map(
                             join.left.as_ref(),
                             &projected_left_bindings,
@@ -591,14 +591,14 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                         )
                         .into();
                     }
-                    paro_planner::operator::Join::Cross(_) => {}
+                    paro_planner::logical::operator::Join::Cross(_) => {}
                 }
                 // After replacing bindings, we may have duplicate conditions
-                if let paro_planner::operator::Join::Comparison(cj) = join {
+                if let paro_planner::logical::operator::Join::Comparison(cj) = join {
                     let mut unique_conditions = Vec::new();
                     for cond in cj.conditions.drain(..) {
                         let is_duplicate = unique_conditions.iter().any(
-                            |existing: &paro_planner::operator::JoinCondition| {
+                            |existing: &paro_planner::logical::operator::JoinCondition| {
                                 cond.left.evaluation_properties().can_share_evaluation()
                                     && cond.right.evaluation_properties().can_share_evaluation()
                                     && existing.comparison == cond.comparison
@@ -694,7 +694,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 }
             }
             LogicalOperator::SetOperation(setop) => {
-                use paro_planner::operator::SetOpType;
+                use paro_planner::logical::operator::SetOpType;
                 let layout_sensitive = [&setop.left, &setop.right].into_iter().any(|child| {
                     child
                         .output_names()
@@ -832,7 +832,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 // - For DISTINCT ON, no need to implicitly reference everything
                 // - For regular DISTINCT, all columns are used for comparison
 
-                use paro_planner::operator::DistinctType;
+                use paro_planner::logical::operator::DistinctType;
 
                 let new_everything_referenced = match distinct.distinct_type {
                     DistinctType::DistinctOn => {
@@ -1010,12 +1010,12 @@ mod tests {
         AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, Expression,
         ReferenceExpression,
     };
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         Aggregate, ColumnBinding, ComparisonJoin, ExpressionGet, Filter, Get, Join,
         JoinComparisonType, JoinCondition, JoinType, LogicalOperator, PostAggregateReduction,
         Projection,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     fn int_column(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(

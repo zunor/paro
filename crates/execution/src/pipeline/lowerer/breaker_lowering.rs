@@ -445,7 +445,7 @@ impl<'a> PipelineLowerer<'a> {
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
         if let BreakerDispatch::SetOperation(spec) = &breaker {
-            if spec.op == paro_planner::operator::SetOpType::Union
+            if spec.op == paro_planner::logical::operator::SetOpType::Union
                 && spec.all
                 && transforms.iter().all(|transform| {
                     matches!(

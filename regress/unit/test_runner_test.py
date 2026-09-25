@@ -33,8 +33,7 @@ def test_restart_rejects_missing_cwd_before_stopping_server(monkeypatch):
 def test_optimizer_verifier_is_reapplied_to_each_connection(tmp_path, monkeypatch):
     from types import SimpleNamespace
     (tmp_path / "config.toml").write_text("[connection]\n[test]\n")
-    config = runner.resolve_config(runner.parse_args(["--optimizer-verify", "on",
-                                   "--optimizer-search-policy", "pipeline"]),
+    config = runner.resolve_config(runner.parse_args(["--optimizer-verify", "on"]),
                                    env={}, root_dir=tmp_path)
     statements = []
 
@@ -53,8 +52,7 @@ def test_optimizer_verifier_is_reapplied_to_each_connection(tmp_path, monkeypatc
                         lambda: SimpleNamespace(connect=lambda **kwargs: Connection()))
     for _ in range(3):
         assert runner._open_connection(config).autocommit
-    assert statements == ["SET optimizer_verify = true",
-                          "SET optimizer_search_policy = 'pipeline'"] * 3
+    assert statements == ["SET optimizer_verify = true"] * 3
 
 
 def test_discover_case_files_and_filter(tmp_path: Path) -> None:

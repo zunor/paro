@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use paro_common::logging::targets;
 use paro_planner::expression::{ComparisonType, Expression, ExpressionIterator};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     AntiJoinMode, ColumnBinding, Join, JoinBuildSideConstraint, JoinType, LogicalOperator,
     LogicalOperatorType,
 };
@@ -18,7 +18,9 @@ use crate::region::join::relation::JoinRelationSetManager;
 use crate::rewrite::expr::{
     comparison_join_tree_has_evaluation_fence, join_tree_has_evaluation_fence,
 };
-use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
+use paro_storage::statistics::DistinctEvidence;
+#[cfg(test)]
+use paro_storage::statistics::DistinctProvenance;
 use tracing::debug;
 
 /// A filter extracted from the logical plan together with the join semantics it came from.
@@ -70,7 +72,7 @@ pub struct RelationStats {
     /// Estimated cardinality (row count).
     pub cardinality: usize,
     /// Ranking priors must remain distinguishable from relation evidence.
-    pub cardinality_provenance: paro_planner::plan::CardinalityProvenance,
+    pub cardinality_provenance: paro_planner::logical::plan::CardinalityProvenance,
     /// Risk-adjusted cardinality used only to rank join orders.
     ///
     /// This remains separate from `cardinality`: uncertain predicates must
@@ -91,7 +93,6 @@ pub struct RelationStats {
     /// Declared unique keys that remain visible in this relation.
     pub unique_keys: Vec<Vec<ColumnBinding>>,
     /// Filter strength (selectivity factor).
-    pub filter_strength: f64,
     /// Whether statistics have been initialized.
     pub stats_initialized: bool,
 }
@@ -103,13 +104,12 @@ impl RelationStats {
             column_distinct_count: HashMap::new(),
             materialization_distinct_count: HashMap::new(),
             cardinality: 1,
-            cardinality_provenance: paro_planner::plan::CardinalityProvenance::Unknown,
+            cardinality_provenance: paro_planner::logical::plan::CardinalityProvenance::Unknown,
             risk_cardinality: 1,
             materialization_cardinality: 1,
             estimated_payload_width: 1,
             contains_control_region: false,
             unique_keys: Vec::new(),
-            filter_strength: 1.0,
             stats_initialized: false,
         }
     }
@@ -118,7 +118,7 @@ impl RelationStats {
     pub fn with_cardinality(cardinality: usize) -> Self {
         Self {
             cardinality,
-            cardinality_provenance: paro_planner::plan::CardinalityProvenance::Statistics,
+            cardinality_provenance: paro_planner::logical::plan::CardinalityProvenance::Statistics,
             risk_cardinality: cardinality,
             materialization_cardinality: cardinality,
             stats_initialized: true,
@@ -135,6 +135,7 @@ pub struct DistinctCount {
     /// Whether this is an expected domain at this relational boundary,
     /// rather than a fallback derived only from a row/range upper estimate.
     /// A Memo estimate need not own a storage HyperLogLog allocation.
+    #[cfg(test)]
     pub has_expected_distinct: bool,
     /// Evidence retained alongside the legacy costing point.  The point is
     /// suitable for ranking only; callers that need a complete domain proof
@@ -144,6 +145,7 @@ pub struct DistinctCount {
 
 impl DistinctCount {
     /// Create a new distinct count.
+    #[cfg(test)]
     pub fn new(distinct_count: usize, has_expected_distinct: bool) -> Self {
         let provenance = if has_expected_distinct {
             DistinctProvenance::ObservedFull
@@ -154,6 +156,7 @@ impl DistinctCount {
         };
         Self {
             distinct_count,
+            #[cfg(test)]
             has_expected_distinct,
             evidence: DistinctEvidence {
                 lower: if matches!(provenance, DistinctProvenance::ObservedFull) {
@@ -168,17 +171,14 @@ impl DistinctCount {
         }
     }
 
-    pub fn from_evidence(evidence: DistinctEvidence, has_expected_distinct: bool) -> Self {
+    pub fn from_evidence(evidence: DistinctEvidence, _has_expected_distinct: bool) -> Self {
         let evidence = evidence.normalized();
         Self {
             distinct_count: evidence.point as usize,
-            has_expected_distinct,
+            #[cfg(test)]
+            has_expected_distinct: _has_expected_distinct,
             evidence,
         }
-    }
-
-    pub fn is_complete_observation(&self) -> bool {
-        self.evidence.is_complete_observation()
     }
 }
 
@@ -186,22 +186,14 @@ impl DistinctCount {
 ///
 #[derive(Debug)]
 pub struct SingleJoinRelation {
-    /// The logical operator for this relation.
-    pub op: LogicalOperator,
-    /// The parent operator (if any).
-    pub parent: Option<Box<LogicalOperator>>,
     /// Statistics for this relation.
     pub stats: RelationStats,
 }
 
 impl SingleJoinRelation {
     /// Create a new single join relation.
-    fn new(op: LogicalOperator, parent: Option<LogicalOperator>, stats: RelationStats) -> Self {
-        Self {
-            op,
-            parent: parent.map(Box::new),
-            stats,
-        }
+    fn new(stats: RelationStats) -> Self {
+        Self { stats }
     }
 }
 
@@ -233,7 +225,7 @@ impl RelationManager {
     pub fn add_relation(
         &mut self,
         op: LogicalOperator,
-        parent: Option<LogicalOperator>,
+        _parent: Option<LogicalOperator>,
         stats: RelationStats,
     ) {
         let relation_id = self.relations.len();
@@ -265,44 +257,7 @@ impl RelationManager {
             }
         }
 
-        self.relations
-            .push(SingleJoinRelation::new(op, parent, stats));
-    }
-
-    /// Add an atomic relation when the caller already owns a native operator
-    /// shell.
-    ///
-    /// Join enumeration only needs the relation-to-column namespace and its
-    /// statistics. Requiring callers to manufacture an `OwnedLogicalPlan`
-    /// (or a dummy `Get`) just to populate those two pieces reintroduces the
-    /// tree bridge that native rule producers are meant to avoid. The
-    /// relation manager keeps a transport-only `DummyScan` marker for this
-    /// path; native reconstruction owns the real child reference.
-    pub(crate) fn add_relation_shape(
-        &mut self,
-        table_indices: impl IntoIterator<Item = usize>,
-        stats: RelationStats,
-    ) {
-        let relation_id = self.relations.len();
-        for table_index in table_indices {
-            match self.relation_mapping.entry(table_index) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(relation_id);
-                }
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    debug_assert_eq!(
-                        *entry.get(),
-                        relation_id,
-                        "table index {table_index} belongs to multiple join relations"
-                    );
-                }
-            }
-        }
-        self.relations.push(SingleJoinRelation::new(
-            LogicalOperator::DummyScan,
-            None,
-            stats,
-        ));
+        self.relations.push(SingleJoinRelation::new(stats));
     }
 
     /// Get the relation ID for a table index.
@@ -313,16 +268,6 @@ impl RelationManager {
     /// Get all relation statistics.
     pub fn get_relation_stats(&self) -> Vec<RelationStats> {
         self.relations.iter().map(|r| r.stats.clone()).collect()
-    }
-
-    /// Take ownership of all relations.
-    pub fn take_relations(&mut self) -> Vec<SingleJoinRelation> {
-        std::mem::take(&mut self.relations)
-    }
-
-    /// Get a reference to a relation by ID.
-    pub fn get_relation(&self, relation_id: usize) -> Option<&SingleJoinRelation> {
-        self.relations.get(relation_id)
     }
 
     /// Get a mutable reference to a relation by ID.
@@ -456,39 +401,9 @@ impl RelationManager {
         }
     }
 
-    /// Local eligibility for a Memo operator payload. Descendant boundaries
-    /// are inspected by the native pattern on their own group edges.
-    pub(crate) fn join_shell_is_reorderable<Child>(join: &Join<Child>) -> bool {
-        if join.build_side_constraint() != JoinBuildSideConstraint::Either
-            || crate::rewrite::expr::join_has_evaluation_fence(join)
-        {
-            return false;
-        }
-        match join {
-            Join::Cross(_) => true,
-            Join::Comparison(join) => {
-                join.duplicate_eliminated_columns.is_empty()
-                    && matches!(
-                        join.join_type,
-                        JoinType::Inner | JoinType::Semi | JoinType::Anti
-                    )
-                    && Self::comparison_has_binary_edge(join)
-            }
-            Join::Any(_) => false,
-        }
-    }
-
-    pub(crate) fn reduction_join_shell_is_reorderable<Child>(
-        join: &paro_planner::operator::ComparisonJoin<Child>,
+    fn comparison_join_is_reorderable(
+        join: &paro_planner::logical::operator::ComparisonJoin,
     ) -> bool {
-        matches!(join.join_type, JoinType::Semi | JoinType::Anti)
-            && join.build_side_constraint == JoinBuildSideConstraint::Either
-            && !crate::rewrite::expr::comparison_join_has_evaluation_fence(join)
-            && join.duplicate_eliminated_columns.is_empty()
-            && Self::comparison_has_binary_edge(join)
-    }
-
-    fn comparison_join_is_reorderable(join: &paro_planner::operator::ComparisonJoin) -> bool {
         !comparison_join_tree_has_evaluation_fence(join)
             && !Self::comparison_join_tree_has_build_side_boundary(join)
             && join.duplicate_eliminated_columns.is_empty()
@@ -512,7 +427,7 @@ impl RelationManager {
     }
 
     fn comparison_join_tree_has_build_side_boundary(
-        join: &paro_planner::operator::ComparisonJoin,
+        join: &paro_planner::logical::operator::ComparisonJoin,
     ) -> bool {
         join.build_side_constraint != JoinBuildSideConstraint::Either
             || [&join.left, &join.right]
@@ -538,14 +453,14 @@ impl RelationManager {
     /// join must remain an atomic relation; converting it to a root predicate
     /// would lose its existential multiplicity contract.
     pub(crate) fn reduction_join_is_reorderable(
-        join: &paro_planner::operator::ComparisonJoin,
+        join: &paro_planner::logical::operator::ComparisonJoin,
     ) -> bool {
         matches!(join.join_type, JoinType::Semi | JoinType::Anti)
             && Self::comparison_join_is_reorderable(join)
     }
 
     fn comparison_has_binary_edge<Child>(
-        join: &paro_planner::operator::ComparisonJoin<Child>,
+        join: &paro_planner::logical::operator::ComparisonJoin<Child>,
     ) -> bool {
         join.conditions.iter().any(|condition| {
             Self::expression_contains_column_ref(&condition.left)
@@ -706,17 +621,14 @@ impl RelationManager {
         true
     }
 
-    fn extract_column_binding(expr: &Expression) -> Option<paro_planner::operator::ColumnBinding> {
+    fn extract_column_binding(
+        expr: &Expression,
+    ) -> Option<paro_planner::logical::operator::ColumnBinding> {
         match expr {
             Expression::ColumnRef(colref) => Some(colref.binding),
             Expression::Cast(cast) => Self::extract_column_binding(&cast.child),
             _ => None,
         }
-    }
-
-    /// Get the relation mapping.
-    pub fn relation_mapping(&self) -> &HashMap<usize, usize> {
-        &self.relation_mapping
     }
 }
 
@@ -730,16 +642,16 @@ mod tests {
         ConstantExpression, FunctionExpression, WindowExpression, WindowFrame, WindowFrameBound,
         WindowFrameType,
     };
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ColumnBinding, ComparisonJoin, DelimGet, Get, JoinBuildSideConstraint, JoinComparisonType,
         JoinCondition, Window,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     fn create_column_ref(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
             ColumnRefExpression {
-                binding: paro_planner::operator::ColumnBinding {
+                binding: paro_planner::logical::operator::ColumnBinding {
                     table_index,
                     column_index,
                 },
@@ -767,7 +679,9 @@ mod tests {
             names: vec!["col".to_string()],
             relation_name: None,
             relation_alias: None,
-            column_sources: vec![paro_planner::operator::GetColumnSource::Stored { column_id: 0 }],
+            column_sources: vec![paro_planner::logical::operator::GetColumnSource::Stored {
+                column_id: 0,
+            }],
             column_types: vec![LogicalType::Integer],
             table: None,
             scan_order: None,

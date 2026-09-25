@@ -5,17 +5,12 @@
 //! physical plans. Optimization decisions and execution machinery live in their
 //! respective crates; this crate must not depend on either implementation.
 //!
-//! Entry points: [`crate::planner::Planner`], [`crate::binder::Binder`], [`crate::operator::LogicalOperator`].
-//! Types live in submodules (for example [`crate::visitor::LogicalOperatorVisitor`]), not at the crate root.
+//! Entry points: [`crate::binder::Planner`], [`crate::binder::Binder`], [`crate::logical::operator::LogicalOperator`].
+//! Types live in submodules (for example [`crate::logical::visitor::LogicalOperatorVisitor`]), not at the crate root.
 
 pub mod binder;
 pub mod expression;
-mod logical_properties;
-pub mod operator;
-pub mod plan;
-pub mod planner;
+pub mod logical;
 mod stack;
-pub mod verify;
-pub mod visitor;
 
 pub mod physical;

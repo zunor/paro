@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::pipeline::graph::PipelineId;
-use paro_planner::plan::PlanNodeId;
+use paro_planner::logical::plan::PlanNodeId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RuntimeOperatorId(u32);

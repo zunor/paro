@@ -1,4 +1,0 @@
--- Copyright 2024-2026 Zunor
--- SPDX-License-Identifier: Apache-2.0
-
-SET disabled_optimizer_rules = 'expensive_predicate_placement,cte_inline,cte_demand_pushdown,aggregate_post_reduction,mark_join_to_semi,join_elimination,aggregate_join_preaggregation,aggregate_join_subsumption,aggregate_non_null_input,aggregate_dimension_deferral,aggregate_input_materialization,limit_pushdown,late_payload_fetch,scalar_aggregate_window';

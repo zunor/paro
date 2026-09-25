@@ -19,7 +19,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{ConstantExpression, Expression};
-use paro_planner::operator::LogicalOperator;
+use paro_planner::logical::operator::LogicalOperator;
 
 use super::expression_matcher::ExpressionMatcher;
 use super::rule::{Rule, RuleResult};
@@ -169,6 +169,7 @@ impl Rule for ArithmeticSimplificationRule {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn name(&self) -> &'static str {
         "ArithmeticSimplificationRule"
     }
@@ -293,7 +294,7 @@ mod tests {
     use paro_common::vector::Vector;
     use paro_function::scalar::{ExpressionState, FunctionStability, ScalarFunction};
     use paro_planner::expression::{ColumnRefExpression, FunctionExpression};
-    use paro_planner::operator::ColumnBinding;
+    use paro_planner::logical::operator::ColumnBinding;
 
     fn dummy_fn(
         _input: &Chunk,

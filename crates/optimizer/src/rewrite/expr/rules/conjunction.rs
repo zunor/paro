@@ -13,7 +13,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
 use paro_planner::expression::{ConstantExpression, Expression};
-use paro_planner::operator::LogicalOperator;
+use paro_planner::logical::operator::LogicalOperator;
 
 use crate::rewrite::expr::traversal::associative_terms;
 
@@ -90,6 +90,7 @@ impl Rule for ConjunctionSimplificationRule {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn name(&self) -> &'static str {
         "ConjunctionSimplificationRule"
     }
@@ -163,6 +164,7 @@ impl Rule for CommonConjunctionFactorRule {
             .unwrap_or(RuleResult::NoChange)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn name(&self) -> &'static str {
         "CommonConjunctionFactorRule"
     }
@@ -386,7 +388,7 @@ mod tests {
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
             ColumnRefExpression {
-                binding: paro_planner::operator::ColumnBinding {
+                binding: paro_planner::logical::operator::ColumnBinding {
                     table_index,
                     column_index,
                 },

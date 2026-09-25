@@ -10,8 +10,8 @@ use crate::binder::context::BindShared;
 use crate::binder::ir::OrderByNode;
 use crate::binder::{Binder, CorrelatedColumnInfo};
 use crate::expression::*;
-use crate::operator::Window;
-use crate::operator::{
+use crate::logical::operator::Window;
+use crate::logical::operator::{
     ColumnBinding, ComparisonJoin, CrossProduct, DelimGet, DependentJoin, DependentJoinKind,
     DistinctType, Filter, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
     LogicalOperator, MarkJoinSemantics, MarkSubqueryKind, Projection,
@@ -27,7 +27,7 @@ use crate::binder::plan::subquery::{
     build_correlated_column_map, expression_has_correlated_columns_at_depth,
     operator_has_correlated_columns_at_depth, CorrelatedColumnMap, RewriteCorrelatedExpressions,
 };
-use crate::plan::OwnedLogicalPlan;
+use crate::logical::plan::OwnedLogicalPlan;
 
 use super::helpers::{
     can_push_to_left_child, can_push_to_right_child, push_filter_to_child,
@@ -620,7 +620,7 @@ impl DependentJoinFlattener {
 
     fn apply_projection_map_to_visible_columns(
         visible_columns: &[usize],
-        projection_map: &crate::operator::ProjectionMap,
+        projection_map: &crate::logical::operator::ProjectionMap,
     ) -> Vec<usize> {
         let Some(indices) = projection_map.as_columns() else {
             return visible_columns.to_vec();
@@ -642,7 +642,7 @@ impl DependentJoinFlattener {
         &self,
         child: &OwnedLogicalPlan,
         base_binding: ColumnBinding,
-        projection_map: &mut crate::operator::ProjectionMap,
+        projection_map: &mut crate::logical::operator::ProjectionMap,
     ) -> Result<()> {
         for index in self.correlation_key_positions(child, base_binding)? {
             projection_map.include(index);
@@ -758,8 +758,8 @@ impl DependentJoinFlattener {
     fn leaf_pushdown_result(
         &mut self,
         binder: &mut Binder,
-        id: crate::plan::PlanNodeId,
-        stats: crate::plan::NodeStats,
+        id: crate::logical::plan::PlanNodeId,
+        stats: crate::logical::plan::NodeStats,
         operator: LogicalOperator,
         lateral_depth: usize,
     ) -> Result<PushDownResult> {

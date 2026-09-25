@@ -8,68 +8,6 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
-/// Planning strategy, independent of semantic safety and search budgets.
-/// No strategy promises exhaustive search when an isolation limit is hit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OptimizerSearchPolicy {
-    /// Canonical plan, bounded region decisions and direct physical selection.
-    #[default]
-    Pipeline,
-    /// Ordered relational stages followed by costing a closed candidate catalog.
-    Regional,
-    QualityCoverage,
-    BudgetedSearch,
-}
-
-impl OptimizerSearchPolicy {
-    pub fn parse(value: &str) -> paro_common::error::Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "pipeline" => Ok(Self::Pipeline),
-            "regional" => Ok(Self::Regional),
-            "quality" => Ok(Self::QualityCoverage),
-            "budgeted" => Ok(Self::BudgetedSearch),
-            _ => Err(paro_common::error::invalid_input(
-                "optimizer_search_policy expects pipeline, regional, quality or budgeted",
-            )),
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pipeline => "pipeline",
-            Self::Regional => "regional",
-            Self::QualityCoverage => "quality",
-            Self::BudgetedSearch => "budgeted",
-        }
-    }
-}
-
-/// Aggregate search domain of the staged planner, not a query-specific hint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OptimizerAggregateStrategy {
-    #[default]
-    Joint,
-    SingleStage,
-}
-
-impl OptimizerAggregateStrategy {
-    pub fn parse(value: &str) -> paro_common::error::Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "joint" => Ok(Self::Joint),
-            "single_stage" => Ok(Self::SingleStage),
-            _ => Err(paro_common::error::invalid_input(
-                "optimizer_aggregate_strategy expects joint or single_stage",
-            )),
-        }
-    }
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Joint => "joint",
-            Self::SingleStage => "single_stage",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct EffectiveSettings {
     raw: HashMap<String, Value>,
@@ -97,37 +35,8 @@ impl EffectiveSettings {
         matches!(self.get("optimizer_verify"), Some(Value::Boolean(true)))
     }
 
-    pub fn disabled_optimizer_rules(&self) -> &str {
-        match self.get("disabled_optimizer_rules") {
-            Some(Value::Varchar(value)) => value,
-            _ => "",
-        }
-    }
-
-    pub fn optimizer_search_policy(&self) -> paro_common::error::Result<OptimizerSearchPolicy> {
-        match self.get("optimizer_search_policy") {
-            Some(Value::Varchar(value)) => OptimizerSearchPolicy::parse(value),
-            None => Ok(OptimizerSearchPolicy::default()),
-            _ => Err(paro_common::error::invalid_input(
-                "invalid optimizer_search_policy type",
-            )),
-        }
-    }
-
     pub fn force_external(&self) -> bool {
         matches!(self.get("force_external"), Some(Value::Boolean(true)))
-    }
-
-    pub fn optimizer_aggregate_strategy(
-        &self,
-    ) -> paro_common::error::Result<OptimizerAggregateStrategy> {
-        match self.get("optimizer_aggregate_strategy") {
-            Some(Value::Varchar(value)) => OptimizerAggregateStrategy::parse(value),
-            None => Ok(OptimizerAggregateStrategy::default()),
-            _ => Err(paro_common::error::invalid_input(
-                "invalid optimizer_aggregate_strategy type",
-            )),
-        }
     }
 
     pub fn rowset_scan_pushdown(&self) -> bool {
@@ -184,9 +93,6 @@ impl EffectiveSettings {
     pub fn planning_fingerprint(&self) -> u64 {
         const PLAN_SETTINGS: &[&str] = &[
             "default_table_cardinality",
-            "disabled_optimizer_rules",
-            "optimizer_search_policy",
-            "optimizer_aggregate_strategy",
             "force_external",
             "max_temp_directory_size",
             "memory_limit",
@@ -217,80 +123,6 @@ fn value_to_usize(value: Option<&Value>) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn aggregate_search_domain_is_validated_and_part_of_cache_identity() {
-        let settings = |value: &str| {
-            EffectiveSettings::new(HashMap::from([(
-                "optimizer_aggregate_strategy".into(),
-                Value::Varchar(value.into()),
-            )]))
-        };
-        assert_eq!(
-            settings("single_stage")
-                .optimizer_aggregate_strategy()
-                .unwrap(),
-            OptimizerAggregateStrategy::SingleStage
-        );
-        assert!(settings("force_partial")
-            .optimizer_aggregate_strategy()
-            .is_err());
-        assert_ne!(
-            settings("joint").planning_fingerprint(),
-            settings("single_stage").planning_fingerprint()
-        );
-    }
-
-    #[test]
-    fn search_policy_is_validated_and_separates_plan_cache_identity() {
-        assert_eq!(
-            OptimizerSearchPolicy::default(),
-            OptimizerSearchPolicy::Pipeline
-        );
-        let settings = |value: &str| {
-            EffectiveSettings::new(HashMap::from([(
-                "optimizer_search_policy".into(),
-                Value::Varchar(value.into()),
-            )]))
-        };
-        assert_eq!(
-            settings("quality").optimizer_search_policy().unwrap(),
-            OptimizerSearchPolicy::QualityCoverage
-        );
-        assert_eq!(
-            settings("budgeted").optimizer_search_policy().unwrap(),
-            OptimizerSearchPolicy::BudgetedSearch
-        );
-        assert_eq!(
-            settings("regional").optimizer_search_policy().unwrap(),
-            OptimizerSearchPolicy::Regional
-        );
-        assert_ne!(
-            settings("regional").planning_fingerprint(),
-            settings("budgeted").planning_fingerprint()
-        );
-        assert_ne!(
-            settings("regional").planning_fingerprint(),
-            settings("quality").planning_fingerprint()
-        );
-        assert!(settings("chain").optimizer_search_policy().is_err());
-        assert_eq!(
-            settings("pipeline").optimizer_search_policy().unwrap(),
-            OptimizerSearchPolicy::Pipeline
-        );
-        assert_ne!(
-            settings("pipeline").planning_fingerprint(),
-            settings("regional").planning_fingerprint()
-        );
-        assert_ne!(
-            settings("pipeline").planning_fingerprint(),
-            settings("quality").planning_fingerprint()
-        );
-        assert_ne!(
-            settings("quality").planning_fingerprint(),
-            settings("budgeted").planning_fingerprint()
-        );
-    }
 
     #[test]
     fn planning_fingerprint_is_order_insensitive_but_value_sensitive() {

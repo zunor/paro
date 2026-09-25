@@ -1,11 +1,6 @@
 -- Copyright 2024-2026 Zunor
 -- SPDX-License-Identifier: Apache-2.0
 
--- Dataset loading is not a claim that an experimental read planner supports
--- writes. Select the measured read policy only after the fixture is loaded.
-SET optimizer_aggregate_strategy = 'joint';
-SET optimizer_search_policy = 'quality';
-
 DROP TABLE IF EXISTS lineitem;
 DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS partsupp;
@@ -126,4 +121,3 @@ COPY orders FROM '${data_dir}/orders.tbl' WITH (FORMAT csv, DELIMITER '|');
 COPY lineitem FROM '${data_dir}/lineitem.tbl' WITH (FORMAT csv, DELIMITER '|');
 
 SET optimizer_verify = ${optimizer_verify};
-SET optimizer_search_policy = '${optimizer_search_policy}';

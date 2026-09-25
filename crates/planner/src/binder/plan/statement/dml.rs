@@ -5,7 +5,7 @@
 
 use crate::binder::ir::statement::{BoundDeleteInfo, BoundInsertInfo, BoundUpdateInfo};
 use crate::binder::Binder;
-use crate::operator::{Delete, Filter, Get, Insert, LogicalOperator, Update};
+use crate::logical::operator::{Delete, Filter, Get, Insert, LogicalOperator, Update};
 use paro_common::error::Result;
 
 impl Binder {

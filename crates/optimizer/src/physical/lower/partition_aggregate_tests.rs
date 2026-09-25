@@ -9,8 +9,8 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     AggregateExpression, Expression, ReferenceExpression, WindowExpression, WindowFrame,
 };
-use paro_planner::operator::{ExpressionGet, LogicalOperator, Window as LogicalWindow};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{ExpressionGet, LogicalOperator, Window as LogicalWindow};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use super::{PhysicalBuildContext, PhysicalNodeKind, PhysicalPlan, PhysicalPlanBuilder};
 

@@ -240,28 +240,20 @@ fn write_program_identity(
     program: &StatementProgram,
 ) -> Result<()> {
     match program {
-        StatementProgram::Portfolio(portfolio) => {
-            structure.write_bytes(b"portfolio");
-            structure.write_u64(portfolio.grant_classes.len() as u64);
-            for class in &portfolio.grant_classes {
-                structure.write_u64(u64::from(class.id.0));
-                structure.write_u64(class.hard_memory_bytes);
-                structure.write_u64(u64::from(class.max_parallel_tasks));
-                structure.write_u64(match class.spill_policy {
-                    paro_planner::physical::SpillPolicy::Forbidden => 0,
-                    paro_planner::physical::SpillPolicy::Allowed => 1,
-                });
-            }
-            structure.write_u64(portfolio.variants.len() as u64);
-            for variant in &portfolio.variants {
-                structure.write_fingerprint(variant.physical_fingerprint);
-                structure.write_u64(variant.admissible_classes.len() as u64);
-                for class in &variant.admissible_classes {
-                    structure.write_u64(u64::from(class.0));
-                }
-                write_plan_dependencies(dependencies, &variant.plan);
-            }
+        StatementProgram::Physical(artifact) => {
+            structure.write_bytes(b"physical");
+            let class = artifact.grant;
+            structure.write_u64(u64::from(class.id.0));
+            structure.write_u64(class.hard_memory_bytes);
+            structure.write_u64(u64::from(class.max_parallel_tasks));
+            structure.write_u64(match class.spill_policy {
+                paro_planner::physical::SpillPolicy::Forbidden => 0,
+                paro_planner::physical::SpillPolicy::Allowed => 1,
+            });
+            structure.write_fingerprint(artifact.physical_fingerprint);
+            write_plan_dependencies(dependencies, &artifact.plan);
         }
+
         StatementProgram::Pipeline { plan, .. } => {
             structure.write_bytes(b"pipeline");
             structure.write_fingerprint(
@@ -338,10 +330,9 @@ fn statement_program_dependencies_available(
     ctx: &StatementContext,
 ) -> bool {
     match program {
-        StatementProgram::Portfolio(portfolio) => portfolio
-            .variants
-            .iter()
-            .any(|variant| physical_plan_dependencies_available(&variant.plan, ctx)),
+        StatementProgram::Physical(artifact) => {
+            physical_plan_dependencies_available(&artifact.plan, ctx)
+        }
         StatementProgram::Pipeline { plan, .. } => physical_plan_dependencies_available(plan, ctx),
         StatementProgram::ExplainAnalyze { target, .. } => {
             statement_program_dependencies_available(target, ctx)
@@ -686,7 +677,7 @@ mod tests {
                 output_types: Box::new([]),
             })),
             children: PlanChildren::Empty,
-            label: OperatorLabel::new(paro_planner::plan::PlanNodeId::SYNTHETIC, "graph"),
+            label: OperatorLabel::new(paro_planner::logical::plan::PlanNodeId::SYNTHETIC, "graph"),
         });
         let mut plan = PhysicalPlan::new(root, nodes, Default::default(), Default::default());
         plan.dependencies

@@ -47,7 +47,7 @@ paro-transaction = { workspace = true }
 paro-storage = { workspace = true }
 paro-function = { workspace = true }
 paro-catalog = { workspace = true }
-paro-context = { workspace = true, features = ["test-support"] }
+paro-context = { workspace = true }
 paro-scheduler = { workspace = true }
 paro-parser = { version = "0.1.0", path = "../parser" }
 paro-planner = { version = "0.1.0", path = "../planner" }
@@ -63,7 +63,8 @@ smallvec = "1.13"
 arc-swap = "1.7"
 
 [dev-dependencies]
-paro-optimizer = { workspace = true }
+paro-context = { workspace = true, features = ["test-support"] }
+paro-optimizer = { workspace = true, features = ["test-support"] }
 paro-common = { workspace = true, features = ["test-support"] }
 divan = { workspace = true }
 tempfile = "3.8"

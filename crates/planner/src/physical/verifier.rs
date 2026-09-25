@@ -394,10 +394,10 @@ fn verify_hash_join_output_permutation(spec: &crate::physical::HashJoinSpec) -> 
     if !spec.output_permutation.is_identity()
         && !matches!(
             spec.join_type,
-            crate::operator::join::JoinType::Inner
-                | crate::operator::join::JoinType::Left
-                | crate::operator::join::JoinType::Right
-                | crate::operator::join::JoinType::Outer
+            crate::logical::operator::join::JoinType::Inner
+                | crate::logical::operator::join::JoinType::Left
+                | crate::logical::operator::join::JoinType::Right
+                | crate::logical::operator::join::JoinType::Outer
         )
     {
         return Err(paro_error::internal(
@@ -420,7 +420,7 @@ fn verify_hash_join_output_permutation(spec: &crate::physical::HashJoinSpec) -> 
         ));
     }
     let mut natural_types = spec.left_output_types.to_vec();
-    if spec.join_type == crate::operator::join::JoinType::Mark {
+    if spec.join_type == crate::logical::operator::join::JoinType::Mark {
         natural_types.push(paro_common::types::LogicalType::Boolean);
     } else {
         natural_types.extend(build_output_types.iter().cloned());
@@ -606,10 +606,10 @@ fn verify_acyclic(dependencies: &[Vec<PhysicalPlanNodeId>]) -> Result<()> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::plan::PlanNodeId;
+    use crate::logical::plan::PlanNodeId;
 
     use super::*;
-    use crate::physical::cost::SearchCost;
+    use crate::physical::cost::PhysicalCost;
     use crate::physical::identity::Fingerprint;
     use crate::physical::properties::{
         PhysicalCharacteristics, PhysicalGrantContract, PhysicalNodeProperties, PlanOrigin,
@@ -642,7 +642,7 @@ mod tests {
             },
             characteristics: PhysicalCharacteristics::default(),
             output_estimate: None,
-            cumulative_cost: SearchCost::ZERO,
+            cumulative_cost: PhysicalCost::ZERO,
             grant_contract: PhysicalGrantContract::Invariant,
             auxiliary_dependencies: dependencies.into(),
             region_owner: None,
@@ -676,57 +676,6 @@ mod tests {
             properties_by_node,
         );
         PhysicalPlanVerifier::verify(&plan).unwrap();
-    }
-
-    #[test]
-    fn portfolio_shares_invariant_nodes_but_not_class_specific_enforcers() {
-        use crate::physical::{
-            PhysicalPlanPortfolio, ResourceGrantClass, ResourceGrantClassId, SpillPolicy,
-        };
-
-        let classes = [1, 2].map(|id| ResourceGrantClass {
-            id: ResourceGrantClassId(id),
-            hard_memory_bytes: u64::from(id) * 1024,
-            spill_policy: SpillPolicy::Allowed,
-            max_parallel_tasks: 4,
-        });
-        for class_specific_enforcer in [false, true] {
-            let plans = classes
-                .iter()
-                .map(|class| {
-                    let mut nodes = PhysicalPlanNodeArena::default();
-                    let source = nodes.push(node(PlanChildren::Empty));
-                    let mut children = PlanChildrenArena::default();
-                    let root = nodes.push(node(children.pack(vec![source])));
-                    let mut properties_by_node = PlanPropertyMap::default();
-                    properties_by_node.insert(source, properties(&[]));
-                    let mut root_properties = properties(&[]);
-                    if class_specific_enforcer {
-                        root_properties.grant_contract = PhysicalGrantContract::Class(class.id);
-                    }
-                    properties_by_node.insert(root, root_properties);
-                    let plan = PhysicalPlan::new(root, nodes, children, properties_by_node);
-                    // The selected provider, shape, enforcer steps and price can
-                    // all be identical; the operating-point proof still matters.
-                    let fingerprint = plan.portfolio_fingerprint(Fingerprint(17)).unwrap();
-                    (class.id, plan, fingerprint, SearchCost::ZERO)
-                })
-                .collect::<Vec<_>>();
-            let portfolio = PhysicalPlanPortfolio::build(
-                crate::physical::ObjectiveProfile::Latency,
-                classes,
-                plans,
-            )
-            .unwrap();
-            portfolio.verify().unwrap();
-            assert_eq!(
-                portfolio.variants.len(),
-                if class_specific_enforcer { 2 } else { 1 }
-            );
-            if !class_specific_enforcer {
-                assert_eq!(portfolio.variants[0].admissible_classes.len(), 2);
-            }
-        }
     }
 
     #[test]

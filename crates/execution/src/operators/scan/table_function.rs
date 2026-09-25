@@ -2780,7 +2780,7 @@ mod tests {
 
     use paro_context::test_support::TestStatementContextBuilder;
     use paro_function::table::system::paro_optimizers::ParoOptimizersGlobalState;
-    use paro_optimizer::diagnostics::profile::{
+    use paro_optimizer::test_support::{
         publish_optimizer_profile_snapshot, OptimizerComponent, OptimizerProfileSnapshot,
         OptimizerProfileSnapshotEntry,
     };
@@ -2799,37 +2799,21 @@ mod tests {
                         invocation_count: 5,
                     },
                     OptimizerProfileSnapshotEntry {
-                        component: OptimizerComponent::MemoExploration,
+                        component: OptimizerComponent::RegionOptimization,
                         last_elapsed: Duration::from_micros(0),
                         invocation_count: 0,
                     },
                 ],
-                rule_attempts: Default::default(),
-                rule_insertions: Default::default(),
-                rule_elapsed: Default::default(),
-                rule_allocated_bytes: Default::default(),
-                rule_budget_exhaustions: Default::default(),
-                component_allocated_bytes: Default::default(),
-                counters: Default::default(),
-                physical_search: Default::default(),
             },
         );
         publish_optimizer_profile_snapshot(
             other.diagnostics.as_ref(),
             OptimizerProfileSnapshot {
                 entries: vec![OptimizerProfileSnapshotEntry {
-                    component: OptimizerComponent::WinnerVerification,
+                    component: OptimizerComponent::PhysicalSelection,
                     last_elapsed: Duration::from_micros(999),
                     invocation_count: 77,
                 }],
-                rule_attempts: Default::default(),
-                rule_insertions: Default::default(),
-                rule_elapsed: Default::default(),
-                rule_allocated_bytes: Default::default(),
-                rule_budget_exhaustions: Default::default(),
-                component_allocated_bytes: Default::default(),
-                counters: Default::default(),
-                physical_search: Default::default(),
             },
         );
 
@@ -2846,8 +2830,8 @@ mod tests {
         assert_eq!(state.entries[0].kind, "frontend");
         assert_eq!(state.entries[0].last_elapsed_us, 33);
         assert_eq!(state.entries[0].invocation_count, 5);
-        assert_eq!(state.entries[1].name, "memo_exploration");
-        assert_eq!(state.entries[1].kind, "search");
+        assert_eq!(state.entries[1].name, "region_optimization");
+        assert_eq!(state.entries[1].kind, "planning");
     }
 
     #[test]

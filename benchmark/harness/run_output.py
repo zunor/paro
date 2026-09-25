@@ -26,9 +26,14 @@ from typing import Any
 
 # RunOutput is part of the same current Compile Evidence contract. Historical
 # run directories are not reopened by this writer.
-RUN_OUTPUT_SCHEMA_VERSION = 3
-RUN_SUMMARY_SCHEMA_VERSION = 3
-RUN_REGISTRATION_SCHEMA_VERSION = 3
+try:
+    from .evidence_schema import EVIDENCE_SCHEMA_VERSION
+except ImportError:
+    from evidence_schema import EVIDENCE_SCHEMA_VERSION
+
+RUN_OUTPUT_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+RUN_SUMMARY_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+RUN_REGISTRATION_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 CAMPAIGN_TOTAL_LIMIT_BYTES = 64 * 1024 * 1024
 SUMMARY_LIMIT_BYTES = 200_000
 # Terminal metadata remains writable after payload capacity is exhausted so a

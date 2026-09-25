@@ -4,21 +4,22 @@
 //! Shared, read-only implementation eligibility and local cost inputs.
 //! This module does not allocate Memo groups or schedule search tasks.
 
-use super::cost::{CompactRange, ResourceDimension, ScoreSummary, SearchCost};
-use super::{ColumnId, Fingerprint, PhysicalImplementationFlavor, StableFingerprintBuilder};
-use crate::binding::BindingCatalog;
+use super::cost::{CompactRange, PhysicalCost, ResourceDimension, ScoreSummary};
+use super::{Fingerprint, PhysicalImplementationFlavor, StableFingerprintBuilder};
 use crate::cost::operator::base_table_scan_cost;
 use crate::cost::operator::RuntimeFilterProbeMultiplicity;
-use crate::cost::response::GrantDependencyDescriptor;
-use crate::cost::response::WorkSourceId;
+use crate::cost::source::GrantDependencyDescriptor;
+use crate::cost::source::WorkSourceId;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::AntiJoinMode;
-use paro_planner::operator::{ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator};
+use paro_planner::logical::operator::join::AntiJoinMode;
+use paro_planner::logical::operator::{
+    ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator,
+};
+use paro_planner::logical::plan::CardinalityEstimate;
+use paro_planner::logical::plan::{NodeStats, OwnedLogicalPlan};
 use paro_planner::physical::scalar_identity::expression_fingerprint;
-use paro_planner::plan::CardinalityEstimate;
-use paro_planner::plan::{NodeStats, OwnedLogicalPlan};
 use std::collections::BTreeMap;
 
 pub(crate) fn operator_result_guarantee<Child>(
@@ -72,13 +73,13 @@ pub(crate) fn planner_operator_cost(
     output_rows_hard_upper: Option<u64>,
     child_rows_hard_upper: &[Option<u64>],
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
-) -> Result<SearchCost> {
+) -> Result<PhysicalCost> {
     match &plan.operator {
         LogicalOperator::SearchScan(scan) => return search_decision_cost(&scan.decision),
         LogicalOperator::FullTextFilterScan(scan) => return search_decision_cost(&scan.decision),
         LogicalOperator::Get(get) => {
             let rows = plan.stats.estimated_cardinality.unwrap_or(
-                paro_planner::plan::CardinalityEstimate {
+                paro_planner::logical::plan::CardinalityEstimate {
                     min: 0,
                     expected: 1,
                     max: 4,
@@ -136,14 +137,14 @@ pub(crate) fn planner_operator_cost(
         .unwrap_or(expected_rows * 4.0)
         .max(expected_rows);
     let upper = upper_rows * width_factor + child_count as f64 + materialization_write.1;
-    let mut cost = SearchCost {
+    let mut cost = PhysicalCost {
         score: ScoreSummary {
             range: CompactRange::new(1.0, expected, upper)?,
             risk_adjusted: expected + (upper - expected) * 0.5,
         },
         work_latency: CompactRange::new(1.0, expected, upper)?,
         critical_path: CompactRange::new(1.0, expected, upper)?,
-        ..SearchCost::ZERO
+        ..PhysicalCost::ZERO
     };
     if planner_grant_dependency(&plan.operator) == GrantDependencyDescriptor::Sensitive {
         // Retained memory belongs to operator state, not to the number of rows
@@ -195,7 +196,7 @@ pub(crate) fn planner_native_operator_cost<Child>(
     output_rows_hard_upper: Option<u64>,
     child_sizes: (&[Option<u64>], &[f64], &[u64]),
     output_row_width: u64,
-) -> Result<SearchCost> {
+) -> Result<PhysicalCost> {
     let (child_rows_hard_upper, child_expected_rows, child_row_widths) = child_sizes;
     if child_count != child_rows_hard_upper.len()
         || child_count != child_expected_rows.len()
@@ -232,14 +233,14 @@ pub(crate) fn planner_native_operator_cost<Child>(
         .unwrap_or(expected_rows * 4.0)
         .max(expected_rows);
     let upper = upper_rows * width_factor + child_count as f64 + materialization_write.1;
-    let mut cost = SearchCost {
+    let mut cost = PhysicalCost {
         score: ScoreSummary {
             range: CompactRange::new(1.0, expected, upper)?,
             risk_adjusted: expected + (upper - expected) * 0.5,
         },
         work_latency: CompactRange::new(1.0, expected, upper)?,
         critical_path: CompactRange::new(1.0, expected, upper)?,
-        ..SearchCost::ZERO
+        ..PhysicalCost::ZERO
     };
     if planner_grant_dependency(operator) == GrantDependencyDescriptor::Sensitive {
         let (resident_expected_rows, resident_row_width, resident_rows_upper) = match operator {
@@ -278,9 +279,11 @@ pub(crate) fn planner_native_operator_cost<Child>(
 }
 
 pub(crate) fn search_decision_cost(
-    decision: &paro_planner::operator::SearchDecision,
-) -> Result<SearchCost> {
-    fn candidate_score(candidate: &paro_planner::operator::SearchCandidate) -> Option<f64> {
+    decision: &paro_planner::logical::operator::SearchDecision,
+) -> Result<PhysicalCost> {
+    fn candidate_score(
+        candidate: &paro_planner::logical::operator::SearchCandidate,
+    ) -> Option<f64> {
         candidate
             .estimated_cost()
             .map(|estimate| estimate.score)
@@ -288,11 +291,11 @@ pub(crate) fn search_decision_cost(
     }
 
     let (expected, upper) = match decision {
-        paro_planner::operator::SearchDecision::IndexScan { candidate, .. } => {
+        paro_planner::logical::operator::SearchDecision::IndexScan { candidate, .. } => {
             let expected = candidate_score(candidate).unwrap_or(1.0).max(1.0);
             (expected, expected * 2.0)
         }
-        paro_planner::operator::SearchDecision::Adaptive {
+        paro_planner::logical::operator::SearchDecision::Adaptive {
             candidates,
             sequential,
         } => {
@@ -318,14 +321,14 @@ pub(crate) fn search_decision_cost(
     };
     let lower = (expected * 0.5).min(expected);
     let range = CompactRange::new(lower, expected, upper.max(expected))?;
-    let mut cost = SearchCost {
+    let mut cost = PhysicalCost {
         score: ScoreSummary {
             range,
             risk_adjusted: expected + (range.upper - expected) * 0.5,
         },
         work_latency: range,
         critical_path: range,
-        ..SearchCost::ZERO
+        ..PhysicalCost::ZERO
     };
     cost.resources_expected[ResourceDimension::RandomIo as usize] = expected;
     cost.resources_risk_upper[ResourceDimension::RandomIo as usize] = range.upper;
@@ -334,10 +337,10 @@ pub(crate) fn search_decision_cost(
 }
 
 pub(crate) fn external_operator_cost(
-    estimate: paro_planner::operator::external_project::ExternalCostEstimate,
-    cardinality: Option<paro_planner::plan::CardinalityEstimate>,
-) -> Result<SearchCost> {
-    let rows = cardinality.unwrap_or(paro_planner::plan::CardinalityEstimate {
+    estimate: paro_planner::logical::operator::external_project::ExternalCostEstimate,
+    cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
+) -> Result<PhysicalCost> {
+    let rows = cardinality.unwrap_or(paro_planner::logical::plan::CardinalityEstimate {
         min: 0,
         expected: 100,
         max: 1_000_000,
@@ -354,7 +357,7 @@ pub(crate) fn external_operator_cost(
         + estimate.bytes_cost * rows.max as f64
         + estimate.queue_risk * 4.0;
     let range = CompactRange::new(lower.min(expected), expected, upper.max(expected))?;
-    let mut cost = SearchCost {
+    let mut cost = PhysicalCost {
         score: ScoreSummary {
             range,
             risk_adjusted: expected + (range.upper - expected) * 0.5,
@@ -363,7 +366,7 @@ pub(crate) fn external_operator_cost(
         critical_path: range,
         external_workers: paro_planner::physical::ExternalWorkerRequirementSetId(1),
         external_worker_slots_upper: 1,
-        ..SearchCost::ZERO
+        ..PhysicalCost::ZERO
     };
     cost.resources_expected[ResourceDimension::Cpu as usize] =
         estimate.per_row_cost * rows.expected as f64;
@@ -385,14 +388,13 @@ pub(crate) fn selected_cost_facts(
 ) -> Result<crate::cost::operator::ResolvedPlannerCostFacts> {
     use super::cost::CompactRange;
     let rows = |plan: &OwnedLogicalPlan| {
-        let r =
-            plan.stats
-                .estimated_cardinality
-                .unwrap_or(paro_planner::plan::CardinalityEstimate {
-                    min: 0,
-                    expected: 1,
-                    max: 4,
-                });
+        let r = plan.stats.estimated_cardinality.unwrap_or(
+            paro_planner::logical::plan::CardinalityEstimate {
+                min: 0,
+                expected: 1,
+                max: 4,
+            },
+        );
         CompactRange::new(r.min as f64, r.expected as f64, r.max as f64)
     };
     let output_rows = rows(plan)?;
@@ -435,7 +437,6 @@ pub(crate) fn resolve_cost_facts(
         output_row_width: template.output_row_width,
         hash_key_width: template.hash_key_width,
         scan_access_width: template.scan_access_width,
-        scan_physical_rows: template.scan_physical_rows,
         scan_work_source: template.scan_work_source,
         perfect_hash: template.perfect_hash,
         topn_capacity: template.topn_capacity,
@@ -485,8 +486,7 @@ pub(crate) fn resolve_cost_facts(
         runtime_filter_build_distinct_expected: template.runtime_filter_build_distinct_expected,
         runtime_filter_build_left_distinct_expected: template
             .runtime_filter_build_left_distinct_expected,
-        runtime_filter_build_domain_identity: None,
-        runtime_filter_build_left_domain_identity: None,
+
         runtime_filter_key_types: template.runtime_filter_key_types.clone(),
     })
 }
@@ -507,7 +507,7 @@ pub(crate) fn planner_operator_spillable<Child>(operator: &LogicalOperator<Child
             true
         }
         LogicalOperator::Join(Join::Comparison(join)) => {
-            crate::physical::lower::helpers::supports_external_hash_join_type(join.join_type)
+            crate::physical::lower::join_output::supports_external_hash_join_type(join.join_type)
         }
         // Cross product has two explicit physical implementations. This flag
         // advertises the external one; the in-memory implementation remains a
@@ -537,7 +537,7 @@ pub(crate) fn planner_implementation_set(
     match &plan.operator {
         LogicalOperator::Aggregate(aggregate) => {
             capabilities.perfect_hash_aggregate =
-                crate::physical::lower::helpers::can_use_perfect_hash_aggregate(
+                crate::physical::lower::aggregate::can_use_perfect_hash_aggregate(
                     aggregate,
                     &aggregate.groups,
                     &aggregate.aggregates,
@@ -566,7 +566,7 @@ pub(crate) fn planner_implementation_set(
         }
         LogicalOperator::Window(window) => {
             capabilities.partition_aggregate_window =
-                crate::physical::lower::misc::supports_partition_aggregate_window(window);
+                crate::physical::lower::window::supports_partition_aggregate_window(window);
         }
         _ => {}
     }
@@ -585,7 +585,7 @@ pub(crate) fn planner_native_implementation_set<Child>(
     match operator {
         LogicalOperator::Aggregate(aggregate) => {
             capabilities.perfect_hash_aggregate =
-                crate::physical::lower::helpers::can_use_perfect_hash_aggregate(
+                crate::physical::lower::aggregate::can_use_perfect_hash_aggregate(
                     aggregate,
                     &aggregate.groups,
                     &aggregate.aggregates,
@@ -746,8 +746,8 @@ fn planner_implementation_set_for_operator<Child>(
 pub(crate) enum RuntimeFilterInput<'a> {
     Owned(&'a OwnedLogicalPlan),
     Boundary {
-        layout: &'a paro_planner::operator::LogicalOutputLayout,
-        facts: &'a paro_planner::operator::bound_reference::BoundRelationFacts,
+        layout: &'a paro_planner::logical::operator::LogicalOutputLayout,
+        facts: &'a paro_planner::logical::operator::bound_reference::BoundRelationFacts,
     },
 }
 
@@ -804,7 +804,7 @@ impl<'a> RuntimeFilterInput<'a> {
 }
 
 pub(crate) fn supports_runtime_filter_auxiliary(
-    join: &paro_planner::operator::ComparisonJoin,
+    join: &paro_planner::logical::operator::ComparisonJoin,
     rowset_scan_pushdown: bool,
 ) -> bool {
     supports_runtime_filter_input(
@@ -815,7 +815,7 @@ pub(crate) fn supports_runtime_filter_auxiliary(
 }
 
 fn supports_runtime_filter_input<Child>(
-    join: &paro_planner::operator::join::ComparisonJoin<Child>,
+    join: &paro_planner::logical::operator::join::ComparisonJoin<Child>,
     probe: RuntimeFilterInput<'_>,
     rowset_scan_pushdown: bool,
 ) -> bool {
@@ -858,7 +858,7 @@ fn supports_runtime_filter_input<Child>(
 }
 
 pub(crate) fn supports_build_left_runtime_filter_auxiliary(
-    join: &paro_planner::operator::ComparisonJoin,
+    join: &paro_planner::logical::operator::ComparisonJoin,
     rowset_scan_pushdown: bool,
 ) -> bool {
     supports_build_left_runtime_filter_input(
@@ -869,7 +869,7 @@ pub(crate) fn supports_build_left_runtime_filter_auxiliary(
 }
 
 fn supports_build_left_runtime_filter_input<Child>(
-    join: &paro_planner::operator::join::ComparisonJoin<Child>,
+    join: &paro_planner::logical::operator::join::ComparisonJoin<Child>,
     probe: RuntimeFilterInput<'_>,
     rowset_scan_pushdown: bool,
 ) -> bool {
@@ -922,7 +922,7 @@ struct RuntimeFilterProbeLineage<'a> {
 struct RuntimeFilterProbeSource<'a> {
     plan: Option<&'a OwnedLogicalPlan>,
     output_index: usize,
-    boundary: Option<&'a paro_planner::operator::bound_reference::BoundSourceColumn>,
+    boundary: Option<&'a paro_planner::logical::operator::bound_reference::BoundSourceColumn>,
 }
 
 /// Freeze the existing source-lineage contract at a local relation boundary.
@@ -930,8 +930,8 @@ struct RuntimeFilterProbeSource<'a> {
 /// tree selection sees; an opaque child must not silently disable that choice.
 pub(crate) fn planner_source_lineage(
     plan: &OwnedLogicalPlan,
-) -> Vec<Option<Vec<paro_planner::operator::bound_reference::BoundSourceColumn>>> {
-    use paro_planner::operator::bound_reference::BoundSourceColumn;
+) -> Vec<Option<Vec<paro_planner::logical::operator::bound_reference::BoundSourceColumn>>> {
+    use paro_planner::logical::operator::bound_reference::BoundSourceColumn;
     (0..plan.types().len())
         .map(|ordinal| {
             runtime_filter_probe_lineages(plan, ordinal)?
@@ -1099,19 +1099,6 @@ fn runtime_filter_input_source_facts<'a>(
         .map(Vec::into_boxed_slice)
 }
 
-#[cfg(test)]
-pub(crate) fn runtime_filter_probe_sources(
-    join: &paro_planner::operator::ComparisonJoin,
-) -> Option<Box<[PlannerRuntimeFilterSource]>> {
-    runtime_filter_input_source_facts(
-        RuntimeFilterInput::Owned(&join.left),
-        join.conditions
-            .iter()
-            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-            .map(|condition| &condition.left),
-    )
-}
-
 fn runtime_filter_probe_lineages(
     plan: &OwnedLogicalPlan,
     output_index: usize,
@@ -1196,7 +1183,8 @@ fn runtime_filter_probe_lineages(
             runtime_filter_probe_lineages(&projection.child, child_index)
         }
         LogicalOperator::SetOperation(setop)
-            if setop.setop_type == paro_planner::operator::SetOpType::Union && setop.setop_all =>
+            if setop.setop_type == paro_planner::logical::operator::SetOpType::Union
+                && setop.setop_all =>
         {
             if output_index >= setop.column_count {
                 return None;
@@ -1240,7 +1228,7 @@ fn runtime_filter_probe_lineages(
 fn runtime_filter_input_source_rows<'a>(
     input: RuntimeFilterInput<'_>,
     expressions: impl IntoIterator<Item = &'a Expression>,
-) -> Option<paro_planner::plan::CardinalityEstimate> {
+) -> Option<paro_planner::logical::plan::CardinalityEstimate> {
     let probe_bindings = input.bindings();
     expressions.into_iter().find_map(|expression| {
         let output_index = match expression {
@@ -1252,7 +1240,7 @@ fn runtime_filter_input_source_rows<'a>(
         }?;
         let lineage = input.lineages(output_index)?;
         lineage.sources.into_iter().try_fold(
-            paro_planner::plan::CardinalityEstimate::exact(0),
+            paro_planner::logical::plan::CardinalityEstimate::exact(0),
             |sum, source| {
                 let rows = source.boundary.map_or(
                     source
@@ -1260,7 +1248,7 @@ fn runtime_filter_input_source_rows<'a>(
                         .and_then(|plan| plan.stats.estimated_cardinality),
                     |column| column.rows,
                 )?;
-                Some(paro_planner::plan::CardinalityEstimate {
+                Some(paro_planner::logical::plan::CardinalityEstimate {
                     min: sum.min.saturating_add(rows.min),
                     expected: sum.expected.saturating_add(rows.expected),
                     max: sum.max.saturating_add(rows.max),
@@ -1287,15 +1275,15 @@ pub(crate) struct PlannerCostFacts {
     /// Snapshot physical rows presented by a base-table source before
     /// predicates. This is task-supply evidence only: it affects duration
     /// ranking, never cardinality or a semantic upper bound.
-    pub(crate) scan_physical_rows: Option<u64>,
     pub(crate) scan_work_source: Option<WorkSourceId>,
     pub(crate) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(crate) topn_capacity: Option<u64>,
     pub(crate) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(crate) runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity,
-    pub(crate) runtime_filter_probe_source_rows: Option<paro_planner::plan::CardinalityEstimate>,
+    pub(crate) runtime_filter_probe_source_rows:
+        Option<paro_planner::logical::plan::CardinalityEstimate>,
     pub(crate) runtime_filter_build_left_probe_source_rows:
-        Option<paro_planner::plan::CardinalityEstimate>,
+        Option<paro_planner::logical::plan::CardinalityEstimate>,
     pub(crate) runtime_filter_probe_sources: Box<[PlannerRuntimeFilterSource]>,
     pub(crate) runtime_filter_build_left_probe_sources: Box<[PlannerRuntimeFilterSource]>,
     /// Snapshot estimate of the distinct build-key domain. This ranks
@@ -1303,14 +1291,14 @@ pub(crate) struct PlannerCostFacts {
     pub(crate) runtime_filter_build_distinct_expected: Option<u64>,
     /// Stable output identity used to resolve the current build domain from
     /// the right child group at cost-composition time.
-    pub(crate) runtime_filter_build_domain_column: Option<ColumnId>,
+
     /// Identity of all equality-key expressions and their input layout.
     /// Unlike a single-column NDV lookup this exists for composite keys.
     pub(crate) runtime_filter_build_key: Option<Fingerprint>,
     /// Snapshot estimate for the logical-left key domain when a physical
     /// implementation inverts build and probe.
     pub(crate) runtime_filter_build_left_distinct_expected: Option<u64>,
-    pub(crate) runtime_filter_build_left_domain_column: Option<ColumnId>,
+
     pub(crate) runtime_filter_build_left_key: Option<Fingerprint>,
     pub(crate) runtime_filter_key_types: Box<[LogicalType]>,
 }
@@ -1321,7 +1309,7 @@ pub(crate) struct PlannerCostFacts {
 #[derive(Debug, Clone)]
 pub(crate) struct PlannerRuntimeFilterSource {
     pub(crate) source: WorkSourceId,
-    pub(crate) rows: paro_planner::plan::CardinalityEstimate,
+    pub(crate) rows: paro_planner::logical::plan::CardinalityEstimate,
     pub(crate) multiplicity: RuntimeFilterProbeMultiplicity,
 }
 
@@ -1377,7 +1365,6 @@ impl PlannerImplementationSet {
 pub(crate) fn planner_cost_facts(
     plan: &OwnedLogicalPlan,
     column_stats: &dyn crate::estimate::ColumnStatisticsLookup,
-    binding_ids: &BindingCatalog,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 ) -> Result<PlannerCostFacts> {
     let children = plan.children();
@@ -1435,19 +1422,6 @@ pub(crate) fn planner_cost_facts(
         LogicalOperator::Get(get) => Some(planner_scan_access_width(get, scan_access_cost)),
         _ => None,
     };
-    let scan_physical_rows = match &plan.operator {
-        LogicalOperator::Get(get) => get
-            .table
-            .as_ref()
-            .and_then(|table| table.get_storage())
-            // Task supply describes physical source work, not an ANALYZE
-            // catalog estimate. The latter can be absent on a fully populated
-            // table, or stale after an append. Capture storage's row evidence
-            // on this cost-fact boundary; it is advisory, never a row bound.
-            .and_then(|storage| storage.total_rows().ok())
-            .map(|rows| rows as u64),
-        _ => None,
-    };
     let scan_work_source = match &plan.operator {
         LogicalOperator::Get(get) if get.table.is_some() => Some(WorkSourceId(get.table_index)),
         LogicalOperator::SearchScan(search) if search.get.table.is_some() => {
@@ -1493,7 +1467,6 @@ pub(crate) fn planner_cost_facts(
         output_row_width,
         hash_key_width,
         scan_access_width,
-        scan_physical_rows,
         scan_work_source,
         perfect_hash,
         topn_capacity,
@@ -1504,10 +1477,10 @@ pub(crate) fn planner_cost_facts(
         runtime_filter_probe_sources: Box::new([]),
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
-        runtime_filter_build_domain_column: None,
+
         runtime_filter_build_key: None,
         runtime_filter_build_left_distinct_expected: None,
-        runtime_filter_build_left_domain_column: None,
+
         runtime_filter_build_left_key: None,
         runtime_filter_key_types,
     };
@@ -1518,7 +1491,6 @@ pub(crate) fn planner_cost_facts(
             RuntimeFilterInput::Owned(&join.left),
             RuntimeFilterInput::Owned(&join.right),
             column_stats,
-            binding_ids,
         );
     }
     Ok(result)
@@ -1536,7 +1508,6 @@ pub(crate) fn planner_native_cost_facts<Child>(
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
     inputs: &[RuntimeFilterInput<'_>],
     column_stats: &dyn crate::estimate::ColumnStatisticsLookup,
-    binding_ids: &BindingCatalog,
 ) -> Result<PlannerCostFacts> {
     let (child_materialization_risk_rows, child_row_widths) = child_sizes;
     let mut operator_child_count = 0;
@@ -1620,7 +1591,6 @@ pub(crate) fn planner_native_cost_facts<Child>(
         output_row_width,
         hash_key_width,
         scan_access_width: None,
-        scan_physical_rows: None,
         scan_work_source: None,
         perfect_hash,
         topn_capacity,
@@ -1631,26 +1601,25 @@ pub(crate) fn planner_native_cost_facts<Child>(
         runtime_filter_probe_sources: Box::new([]),
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
-        runtime_filter_build_domain_column: None,
+
         runtime_filter_build_key: None,
         runtime_filter_build_left_distinct_expected: None,
-        runtime_filter_build_left_domain_column: None,
+
         runtime_filter_build_left_key: None,
         runtime_filter_key_types,
     };
     if let (LogicalOperator::Join(Join::Comparison(join)), [left, right]) = (operator, inputs) {
-        fill_runtime_filter_cost_facts(&mut result, join, *left, *right, column_stats, binding_ids);
+        fill_runtime_filter_cost_facts(&mut result, join, *left, *right, column_stats);
     }
     Ok(result)
 }
 
 fn fill_runtime_filter_cost_facts<Child>(
     result: &mut PlannerCostFacts,
-    join: &paro_planner::operator::join::ComparisonJoin<Child>,
+    join: &paro_planner::logical::operator::join::ComparisonJoin<Child>,
     left: RuntimeFilterInput<'_>,
     right: RuntimeFilterInput<'_>,
     column_stats: &dyn crate::estimate::ColumnStatisticsLookup,
-    binding_ids: &BindingCatalog,
 ) {
     let left_keys = join
         .conditions
@@ -1680,16 +1649,12 @@ fn fill_runtime_filter_cost_facts<Child>(
         join_key_distinct_expected(join, column_stats, JoinKeySide::Right, &right_bindings);
     result.runtime_filter_build_left_distinct_expected =
         join_key_distinct_expected(join, column_stats, JoinKeySide::Left, &left_bindings);
-    result.runtime_filter_build_domain_column =
-        join_key_domain_column(join, binding_ids, JoinKeySide::Right, &right_bindings);
-    result.runtime_filter_build_left_domain_column =
-        join_key_domain_column(join, binding_ids, JoinKeySide::Left, &left_bindings);
     result.runtime_filter_build_key = join_key_identity(&right_keys, &right_bindings);
     result.runtime_filter_build_left_key = join_key_identity(&left_keys, &left_bindings);
 }
 
 pub(crate) fn planner_row_width_from_layout(
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 ) -> u64 {
     layout
@@ -1716,10 +1681,10 @@ pub(crate) fn planner_row_width(
 /// tuples without reading a stored column. Derived prefixes pay only their
 /// bounded produced width; duplicate stored projections share one source.
 pub(crate) fn planner_scan_access_width(
-    get: &paro_planner::operator::Get,
+    get: &paro_planner::logical::operator::Get,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 ) -> u64 {
-    use paro_planner::operator::GetColumnSource;
+    use paro_planner::logical::operator::GetColumnSource;
 
     let mut stored_widths = std::collections::BTreeMap::<usize, u64>::new();
     for (index, source) in get.column_sources.iter().enumerate() {
@@ -1761,7 +1726,7 @@ pub(crate) enum JoinKeySide {
 }
 
 fn join_key_distinct_expected<Child>(
-    join: &paro_planner::operator::join::ComparisonJoin<Child>,
+    join: &paro_planner::logical::operator::join::ComparisonJoin<Child>,
     column_stats: &dyn crate::estimate::ColumnStatisticsLookup,
     side: JoinKeySide,
     bindings: &[ColumnBinding],
@@ -1789,39 +1754,6 @@ fn join_key_distinct_expected<Child>(
         .get(&binding)
         .map(|statistics| statistics.distinct_evidence().point)
         .filter(|distinct| *distinct > 0)
-}
-
-fn join_key_domain_column<Child>(
-    join: &paro_planner::operator::join::ComparisonJoin<Child>,
-    binding_ids: &BindingCatalog,
-    side: JoinKeySide,
-    bindings: &[ColumnBinding],
-) -> Option<ColumnId> {
-    let mut equalities = join
-        .conditions
-        .iter()
-        .filter(|condition| condition.comparison == JoinComparisonType::Equal);
-    let condition = equalities.next()?;
-    if equalities.next().is_some() {
-        return None;
-    }
-    let expression = match side {
-        JoinKeySide::Left => &condition.left,
-        JoinKeySide::Right => &condition.right,
-    };
-    let (binding, logical_type) = match expression {
-        Expression::ColumnRef(column) if column.depth == 0 => {
-            (column.binding, column.return_type.clone())
-        }
-        Expression::Reference(reference) => (
-            *bindings.get(reference.index)?,
-            reference.return_type.clone(),
-        ),
-        _ => return None,
-    };
-    binding_ids
-        .get(binding.table_index, binding.column_index, &logical_type)
-        .copied()
 }
 
 /// The key has a semantic identity even when no single-column statistic can

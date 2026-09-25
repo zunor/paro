@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Query-lifetime ownership of every resource selected by portfolio admission.
+//! Query-lifetime ownership of every resource selected by artifact admission.
 
 use paro_common::error::{self as paro_error, Result};
 use paro_external::runtime::host::{ExternalDispatchGate, ExternalWorkerLease};

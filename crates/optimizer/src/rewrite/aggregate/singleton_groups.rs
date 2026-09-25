@@ -17,11 +17,11 @@
 
 use paro_common::error::Result;
 use paro_planner::expression::Expression;
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     binding_preserving_get, Aggregate, ColumnBinding, GroupInputMultiplicity, Join,
     LogicalOperator, SingletonGroupProof,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::estimate::unique_keys::declared_unique_keys;
 
@@ -79,10 +79,10 @@ mod tests {
     use paro_function::aggregate::distributive::count::{
         get_count_function, get_count_star_function,
     };
-    use paro_planner::binder::context::BindContext;
+
     use paro_planner::binder::ir::GroupingSet;
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, ReferenceExpression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ComparisonJoin, ExpressionGet, Filter, Get, GetColumnSource, JoinComparisonType,
         JoinCondition, JoinType,
     };
@@ -247,47 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn proven_singleton_group_is_an_explicit_memo_implementation() {
-        let (plan, _) = candidate();
-        let optimized = optimize_plan(plan).unwrap();
-        let input = crate::cascades::planner::MemoBuilder::build(
-            optimized,
-            BindContext::new(),
-            crate::cascades::budget::SearchBudget::default(),
-        )
-        .expect("build Memo from singleton proof");
-        let grants = [crate::physical::ResourceGrantClass {
-            id: crate::cascades::ids::ResourceGrantClassId(0),
-            hard_memory_bytes: u64::MAX,
-            spill_policy: crate::physical::SpillPolicy::Allowed,
-            max_parallel_tasks: 1,
-        }];
-        let extraction = input.optimize(&grants).expect("optimize singleton group");
-        let variant = &extraction.variants[0];
-        let contract = variant
-            .contracts
-            .get(&variant.plan.id)
-            .expect("root winner contract");
-        assert_eq!(
-            contract.implementation,
-            crate::physical::PhysicalImplementationFlavor::SingletonAggregateProjection
-        );
-
-        let physical = crate::physical::PhysicalPlanBuilder::new(
-            crate::physical::PhysicalBuildContext::default(),
-        )
-        .with_winner_contracts(variant.contracts.clone())
-        .with_enforcer_contracts(variant.enforcers.clone())
-        .requiring_winner_contracts()
-        .extract_selected(&variant.plan)
-        .expect("lower selected singleton implementation");
-        assert!(matches!(
-            physical.node(physical.root).kind,
-            crate::physical::PhysicalNodeKind::Project(_)
-        ));
-    }
-
-    #[test]
     fn nullable_unique_key_does_not_prove_group_by_singletons() {
         let (plan, statistics) = candidate_with_nullability(false);
         assert!(
@@ -428,7 +387,7 @@ mod tests {
 
         assert!(!proof.is_valid_for(aggregate));
         assert!(aggregate.verify_group_input_multiplicity().is_err());
-        paro_planner::verify::verify_physical_planner_invariants(&optimized.operator)
+        paro_planner::logical::verify::verify_physical_planner_invariants(&optimized.operator)
             .expect("a stale optimization hint must not make compilation fail");
     }
 

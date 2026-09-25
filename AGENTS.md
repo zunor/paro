@@ -35,7 +35,7 @@ context: statement environment, resource accounting and cancellation
 This is runtime flow, not a Cargo dependency graph. The compiler entry points
 `compile_statement` and `compile_statement_with_parameter_types` consume an
 already parsed AST; session owns parsing, prepared statements and cache policy.
-A ready physical portfolio need not have materialized every execution image.
+A ready physical plan need not have materialized its execution image.
 Admission and deferred lowering remain real work, not free work outside the
 compiler timer. See [compiler/compile.rs](crates/compiler/src/compile.rs) and
 the [optimizer contracts](crates/optimizer/readme.md).
@@ -50,7 +50,7 @@ order of these rows.
 | `paro-common` | [Shared types, errors, vectors/chunks, memory and configuration](crates/common/src/lib.rs) |
 | `paro-parser` | [Tokenizer, SQL AST with source spans, parser and visitors](crates/parser/src/lib.rs) |
 | `paro-planner` | [Binding, expressions, logical plans and shared immutable physical-plan contracts](crates/planner/src/lib.rs) |
-| `paro-optimizer` | [Logical rewrites, estimation, bounded regions, costing and physical construction; explicit Memo alternative](crates/optimizer/readme.md) |
+| `paro-optimizer` | [Ordered rewrites, estimation, bounded regions, costing and physical construction](crates/optimizer/readme.md) |
 | `paro-compiler` | [Planner/optimizer/execution orchestration](crates/compiler/src/lib.rs) |
 | `paro-execution` | [Physical operators, expression evaluation, pipelines, spill and admission](crates/execution/src/lib.rs) |
 | `paro-context` | [Statement/session environment, resources, write guards and cancellation](crates/context/src/lib.rs) |

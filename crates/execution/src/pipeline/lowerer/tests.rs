@@ -14,15 +14,15 @@ use paro_planner::expression::{
     AggregateExpression, ConstantExpression, Expression, OrderByExpression, ReferenceExpression,
     WindowExpression, WindowFrame,
 };
-use paro_planner::operator::join::{
+use paro_planner::logical::operator::join::{
     ComparisonJoin, Join, JoinComparisonType, JoinCondition, JoinType,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate as LogicalAggregate, CTERef, DelimGet, Distinct, EmptyResult, ExpressionGet, Filter,
     Limit, LogicalOperator, MaterializedCTE, Order as LogicalOrder, Projection, RecursiveCTE,
     SetOperation as LogicalSetOperation, TopN as LogicalTopN, Window as LogicalWindow,
 };
-use paro_planner::plan::{OwnedLogicalPlan, PlanNodeId};
+use paro_planner::logical::plan::{OwnedLogicalPlan, PlanNodeId};
 use paro_storage::table::table_factory::TableFactory;
 
 use crate::physical::children::{PlanChildren, PlanChildrenArena};
@@ -32,7 +32,7 @@ use crate::physical::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use crate::physical::properties::{MorselCapability, PlanPropertyMap};
 use crate::physical::specs::PhysicalNodeKind;
 use crate::physical::{RowType, RowsetScanSpec};
-use paro_optimizer::physical::{PhysicalBuildContext, PhysicalPlanBuilder};
+use paro_optimizer::test_support::{PhysicalBuildContext, PhysicalPlanBuilder};
 
 use super::super::graph::{
     ClientResultSpec, ControlRegion, ControlRegionId, DelimJoinSide, DependencyKind,
@@ -1443,8 +1443,10 @@ fn rowset_spec_for_test() -> RowsetScanSpec {
         table_index: 0,
         output_names: vec!["a".to_string()].into_boxed_slice(),
         returned_types: vec![LogicalType::Integer].into_boxed_slice(),
-        output_sources: vec![paro_planner::operator::GetColumnSource::Stored { column_id: 0 }]
-            .into_boxed_slice(),
+        output_sources: vec![paro_planner::logical::operator::GetColumnSource::Stored {
+            column_id: 0,
+        }]
+        .into_boxed_slice(),
         relation_name: Some("t".to_string()),
         relation_alias: None,
         column_projection: crate::physical::specs::RowsetColumnProjection::new(vec![0]),

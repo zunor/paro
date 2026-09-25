@@ -9,7 +9,9 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
-use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics};
+use paro_planner::logical::operator::join::{
+    AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics,
+};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::{FullOuterScanState, JoinHashTable, JoinHashTableConfig};

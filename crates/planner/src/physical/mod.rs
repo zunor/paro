@@ -4,6 +4,7 @@
 //! Immutable physical-plan contracts shared by planning and execution.
 //! Algorithm selection, estimation and search state stay in the optimizer.
 
+pub mod artifact;
 pub mod children;
 pub mod cost;
 pub mod dependencies;
@@ -13,9 +14,7 @@ pub mod identity;
 pub mod ids;
 pub mod lineage;
 pub mod node;
-pub mod objective;
 pub mod plan;
-pub mod portfolio;
 mod predicate_identity;
 pub mod properties;
 pub mod requirements;
@@ -24,16 +23,15 @@ pub mod row_type;
 pub mod specs;
 pub mod verifier;
 
+pub use artifact::*;
 pub use children::{InlinePlanChildren, PlanChildren, PlanChildrenArena};
-pub use cost::{MemoryCompletion, SearchCost, UncappedMemoryDemand};
+pub use cost::{MemoryCompletion, PhysicalCost, UncappedMemoryDemand};
 pub use dependencies::PlanDependencies;
 pub use edges::{PhysicalEdge, PhysicalEdgeArena, PhysicalEdgeId, PhysicalEdgeKind};
 pub use identity::*;
 pub use ids::{PhysicalPlanNodeId, PlanChildrenId};
 pub use node::{OperatorLabel, PhysicalPlanNode};
-pub use objective::ObjectiveProfile;
 pub use plan::{PhysicalIdentityError, PhysicalPlan, PhysicalPlanNodeArena};
-pub use portfolio::*;
 pub use properties::*;
 pub use requirements::{ProvidedProperties, RequiredProperties};
 pub use resources::{

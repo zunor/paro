@@ -76,13 +76,7 @@ ORDER BY table_name, constraint_name, ordinal_position
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-data-dir", type=Path, required=True)
-    parser.add_argument("--optimizer-search-policy", choices=("pipeline", "regional", "quality", "budgeted"), default="quality")
-    parser.add_argument("--optimizer-aggregate-strategy", choices=("joint", "single_stage"), default="joint")
     parser.add_argument("--optimizer-verify", choices=("on", "off"), default="on")
-    parser.add_argument("--disabled-optimizer-rules", default="", help=(
-        "Comma-separated public rule names for a registered ablation; recorded as "
-        "a search-domain change, not a production performance improvement."
-    ))
     parser.add_argument("--listen", default="127.0.0.1:6432")
     parser.add_argument("--database", default="postgres")
     parser.add_argument("--user", default="paro")
@@ -117,47 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--paro-result-format", choices=("binary", "text"), default="binary"
     )
-    parser.add_argument(
-        "--diagnostic-strong-incumbent",
-        action="store_true",
-        help=(
-            "run the diagnostic cohort with an independent seed Memo followed by "
-            "a fresh proof Memo; never affects normal C1 samples"
-        ),
-    )
-    parser.add_argument(
-        "--strong-incumbent-c1",
-        action="store_true",
-        help=(
-            "run normal fresh-process C1 samples through the explicit two-Memo "
-            "SeedPlan experiment; source generation remains included in C1"
-        ),
-    )
-    parser.add_argument(
-        "--strong-incumbent-upper-bound",
-        action="store_true",
-        help=(
-            "when the strong-incumbent experiment is enabled, install the "
-            "re-priced SeedPlan as a destination upper bound"
-        ),
-    )
-    parser.add_argument(
-        "--strong-incumbent-logical-injection",
-        action="store_true",
-        help=(
-            "when the strong-incumbent experiment is enabled, inject the "
-            "source logical shell into the destination Memo"
-        ),
-    )
-    args = parser.parse_args()
-    if (args.strong_incumbent_upper_bound or args.strong_incumbent_logical_injection) and not (
-        args.strong_incumbent_c1 or args.diagnostic_strong_incumbent
-    ):
-        parser.error(
-            "strong-incumbent switches require --strong-incumbent-c1 or "
-            "--diagnostic-strong-incumbent"
-        )
-    return args
+    return parser.parse_args()
 
 
 def read_pre_touch(path: Path | None, repetitions: int = 1) -> dict[str, Any] | None:
@@ -537,9 +491,6 @@ class DuckDBProcess:
 def configure_paro(connection: psycopg.Connection[Any], args: argparse.Namespace) -> None:
     with connection.cursor() as cursor:
         cursor.execute(sql.SQL("SET optimizer_verify = {}").format(sql.Literal(args.optimizer_verify == "on")))
-        cursor.execute(sql.SQL("SET optimizer_search_policy = {}").format(sql.Literal(args.optimizer_search_policy)))
-        cursor.execute(sql.SQL("SET optimizer_aggregate_strategy = {}").format(sql.Literal(args.optimizer_aggregate_strategy)))
-        cursor.execute(sql.SQL("SET disabled_optimizer_rules = {}").format(sql.Literal(args.disabled_optimizer_rules)))
         cursor.execute(sql.SQL("SET threads = {}").format(sql.Literal(args.threads)))
         cursor.execute(
             sql.SQL("SET memory_limit = {}").format(sql.Literal(args.memory_limit))
@@ -892,9 +843,8 @@ def main() -> int:
                 args.process_blocks * args.measurement_rounds_per_process * 2
             ),
             "optimizer_verify": args.optimizer_verify == "on",
-            "optimizer_search_policy": args.optimizer_search_policy,
-            "optimizer_aggregate_strategy": args.optimizer_aggregate_strategy,
-            "disabled_optimizer_rules": args.disabled_optimizer_rules,
+
+
             "planning_dop": 1,
             "execution_dop": args.threads,
             "cohorts": {
@@ -903,15 +853,6 @@ def main() -> int:
                     "trace_mode": "off",
                     "statement_cache_evidence": True,
                     "allocation_profile": False,
-                    "strong_incumbent_experiment": args.strong_incumbent_c1,
-                    "strong_incumbent_provide_bound": (
-                        args.strong_incumbent_c1
-                        and args.strong_incumbent_upper_bound
-                    ),
-                    "strong_incumbent_inject_logical": (
-                        args.strong_incumbent_c1
-                        and args.strong_incumbent_logical_injection
-                    ),
                 },
                 "diagnostic": {
                     "purpose": "same-operation phase attribution",
@@ -919,15 +860,6 @@ def main() -> int:
                     "compile_document": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON)",
                     "statement_cache_evidence": True,
                     "excluded_from_c1": True,
-                    "strong_incumbent_experiment": args.diagnostic_strong_incumbent,
-                    "strong_incumbent_provide_bound": (
-                        args.diagnostic_strong_incumbent
-                        and args.strong_incumbent_upper_bound
-                    ),
-                    "strong_incumbent_inject_logical": (
-                        args.diagnostic_strong_incumbent
-                        and args.strong_incumbent_logical_injection
-                    ),
                 },
             },
             "resource_envelope": {
@@ -991,31 +923,6 @@ def main() -> int:
                 "PARO_COMPILE_WORK_EVIDENCE": os.environ.get("PARO_COMPILE_WORK_EVIDENCE"),
                 "PARO_COLD_WORK_EVIDENCE": os.environ.get("PARO_COLD_WORK_EVIDENCE"),
                 "PARO_DIAGNOSTIC_STREAM_SEQUENTIAL": os.environ.get("PARO_DIAGNOSTIC_STREAM_SEQUENTIAL"),
-                # Explicit diagnostic-only search deadline.  An absent value
-                # means the production/default policy was used; keep this in
-                # the report so a checkpoint run cannot be mistaken for a
-                # full-search C1 sample.
-                "PARO_DIAGNOSTIC_SEARCH_STOP_MS": os.environ.get(
-                    "PARO_DIAGNOSTIC_SEARCH_STOP_MS"
-                ),
-                "PARO_CERTIFIED_GROUP_PRUNING": os.environ.get(
-                    "PARO_CERTIFIED_GROUP_PRUNING"
-                ),
-                "PARO_DISABLE_PROTECTED_INCUMBENT": os.environ.get(
-                    "PARO_DISABLE_PROTECTED_INCUMBENT"
-                ),
-                "PARO_EXPORT_STRONG_INCUMBENT": os.environ.get(
-                    "PARO_EXPORT_STRONG_INCUMBENT"
-                ),
-                "PARO_STRONG_INCUMBENT_EXPERIMENT": os.environ.get(
-                    "PARO_STRONG_INCUMBENT_EXPERIMENT"
-                ),
-                "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": os.environ.get(
-                    "PARO_STRONG_INCUMBENT_PROVIDE_BOUND"
-                ),
-                "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": os.environ.get(
-                    "PARO_STRONG_INCUMBENT_INJECT_LOGICAL"
-                ),
             },
         },
         "model_gates": {
@@ -1104,9 +1011,6 @@ def main() -> int:
                 threads=args.threads,
                 statement_trace=False,
                 optimizer_environment={
-                    "PARO_STRONG_INCUMBENT_EXPERIMENT": None,
-                    "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": None,
-                    "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": None,
                 },
             )
             with oracle_server_context as oracle_server, DuckDBProcess(
@@ -1179,21 +1083,6 @@ def main() -> int:
                     statement_trace=False,
                     cache_evidence=True,
                     optimizer_environment={
-                        "PARO_STRONG_INCUMBENT_EXPERIMENT": (
-                            "1" if args.strong_incumbent_c1 else None
-                        ),
-                        "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": (
-                            "1"
-                            if args.strong_incumbent_c1
-                            and args.strong_incumbent_upper_bound
-                            else None
-                        ),
-                        "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": (
-                            "1"
-                            if args.strong_incumbent_c1
-                            and args.strong_incumbent_logical_injection
-                            else None
-                        ),
                     },
                 )
                 with block_server_context as block_server, DuckDBProcess(
@@ -1327,21 +1216,6 @@ def main() -> int:
                     statement_trace=False,
                     cache_evidence=True,
                     optimizer_environment={
-                        "PARO_STRONG_INCUMBENT_EXPERIMENT": (
-                            "1" if args.diagnostic_strong_incumbent else None
-                        ),
-                        "PARO_STRONG_INCUMBENT_PROVIDE_BOUND": (
-                            "1"
-                            if args.diagnostic_strong_incumbent
-                            and args.strong_incumbent_upper_bound
-                            else None
-                        ),
-                        "PARO_STRONG_INCUMBENT_INJECT_LOGICAL": (
-                            "1"
-                            if args.diagnostic_strong_incumbent
-                            and args.strong_incumbent_logical_injection
-                            else None
-                        ),
                     },
                 ) as diagnostic_server:
                     diagnostic_server_identity = diagnostic_server.identity()
@@ -1497,7 +1371,7 @@ def main() -> int:
                 process_blocks=blocks,
                 diagnostic_cohort={
                     "process_blocks": diagnostic_blocks,
-                    "compile_document_schema_version": 3,
+                    "compile_document_schema_version": EVIDENCE_SCHEMA_VERSION,
                     "excluded_from_c1": True,
                     "client_ms": timing_summary(
                         [item["client_ms"] for item in diagnostic_blocks]

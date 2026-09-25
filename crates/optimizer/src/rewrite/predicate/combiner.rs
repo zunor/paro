@@ -159,6 +159,7 @@ impl FilterCombiner {
     }
 
     /// Check if the combiner has any filters.
+    #[cfg(test)]
     pub fn has_filters(&self) -> bool {
         !self.remaining_filters.is_empty()
             || !self.equivalence_map.is_empty()
@@ -722,7 +723,7 @@ mod tests {
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
             ColumnRefExpression {
-                binding: paro_planner::operator::ColumnBinding {
+                binding: paro_planner::logical::operator::ColumnBinding {
                     table_index,
                     column_index,
                 },
@@ -814,7 +815,7 @@ mod tests {
         );
         let outer_column = Expression::ColumnRef(
             ColumnRefExpression::with_depth(
-                paro_planner::operator::ColumnBinding::new(0, 0),
+                paro_planner::logical::operator::ColumnBinding::new(0, 0),
                 LogicalType::Integer,
                 1,
             )
@@ -825,7 +826,7 @@ mod tests {
             ComparisonType::Equal,
             Expression::ColumnRef(
                 ColumnRefExpression::new(
-                    paro_planner::operator::ColumnBinding::new(0, 0),
+                    paro_planner::logical::operator::ColumnBinding::new(0, 0),
                     LogicalType::BigInt,
                 )
                 .into(),

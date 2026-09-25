@@ -27,14 +27,14 @@ class CompileCollectorTests(unittest.TestCase):
 
             def fetchall(self):
                 return [(
-                    "{\"schema_version\":3,\"outcome\":\"Success\","
+                    "{\"schema_version\":4,\"outcome\":\"Success\","
                     "\"artifact\":\"CompiledArtifactReady\","
                     "\"cache\":\"ForcedCompile\","
                     "\"admission\":\"NotExecuted\","
                     "\"execution\":\"NotExecuted\","
-                    "\"search_counters\":[{\"name\":\"search_complete\",\"value\":1}],"
+                    "\"search_counters\":[{\"name\":\"planning_completed\",\"value\":1}],"
                     "\"omitted_search_counters\":0,"
-                    "\"artifact_identity\":{\"Observed\":{\"schema_version\":3,"
+                    "\"artifact_identity\":{\"Observed\":{\"schema_version\":4,"
                     "\"artifact\":[1,2],\"structure\":[3,4],\"dependencies\":[5,6]}}}",
                 )]
 
@@ -50,7 +50,7 @@ class CompileCollectorTests(unittest.TestCase):
         raw, document = CompileEvidenceCollector(connection).capture(
             "SELECT 1", detail=True
         )
-        self.assertEqual(document["schema_version"], 3)
+        self.assertEqual(document["schema_version"], 4)
         self.assertEqual(document["outcome"], "Success")
         self.assertIn("EXPLAIN (COMPILE, DETAIL, FORMAT JSON)", connection.last_cursor.statement)
         self.assertTrue(raw.startswith("{"))
@@ -59,34 +59,34 @@ class CompileCollectorTests(unittest.TestCase):
 
     def test_compile_metrics_are_read_from_typed_document_not_auxiliary_receipts(self):
         document = {
-            "schema_version": 3,
+            "schema_version": 4,
             "outcome": "Success",
             "artifact": "CompiledArtifactReady",
             "cache": "ForcedCompile",
             "admission": "NotExecuted",
             "execution": "NotExecuted",
-            "artifact_identity": {"Observed": {"schema_version": 3,
+            "artifact_identity": {"Observed": {"schema_version": 4,
                                                    "artifact": [1, 2],
                                                    "structure": [3, 4],
                                                    "dependencies": [5, 6]}},
             "optimizer_ns": {"Observed": 4_000_000},
-            "search_complete": {"Observed": True},
-            "search_stop": {"Observed": "Complete"},
+
+            "planning_status": {"Observed": "Planned"},
             "search_counters": [
-                {"name": "search_complete", "value": 1},
-                {"name": "memo_group_count", "value": 2},
-                {"name": "memo_logical_expression_count", "value": 3},
-                {"name": "memo_physical_expression_count", "value": 4},
-                {"name": "settlement_local_hit_count", "value": 5},
-                {"name": "settlement_local_miss_count", "value": 6},
-                {"name": "search_rule_failure_count", "value": 0},
-                {"name": "search_deadline_reached", "value": 0},
+                {"name": "planning_completed", "value": 1},
+                {"name": "selected_nodes", "value": 2},
+                {"name": "local_alternatives", "value": 3},
+                {"name": "joint_transitions", "value": 4},
+                {"name": "response_join_transitions", "value": 5},
+                {"name": "completed_region_outputs", "value": 6},
+                {"name": "joint_budget_fallbacks", "value": 0},
+                {"name": "response_join_fallbacks", "value": 0},
             ],
             "omitted_search_counters": 0,
         }
         metrics = _typed_compile_measurements(document)
         self.assertEqual(metrics["optimizer_ms"], 4.0)
-        self.assertEqual(metrics["counters"]["memo_group_count"], 2)
+        self.assertEqual(metrics["counters"]["selected_nodes"], 2)
         self.assertEqual(metrics["compile_metrics_source"],
                          "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document")
 

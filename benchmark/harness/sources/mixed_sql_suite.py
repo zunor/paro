@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from ..evidence_schema import EVIDENCE_SCHEMA_VERSION
+
 from dataclasses import dataclass
 from datetime import datetime
 from queue import SimpleQueue
@@ -423,7 +425,7 @@ def _payload(
             "validation": scenario.validation,
             "mixed": scenario.mixed,
             "compile_receipt": {
-                "schema_version": 3,
+                "schema_version": EVIDENCE_SCHEMA_VERSION,
                 "status": "Uncovered",
                 "reason": "mixed scenario combines concurrent statements without one receipt identity",
             },

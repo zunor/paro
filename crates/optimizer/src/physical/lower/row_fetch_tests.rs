@@ -4,10 +4,10 @@
 use paro_common::types::LogicalType;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     ColumnBinding, ExpressionGet, LogicalOperator, Projection, RowFetch, RowFetchSource,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use super::*;
 

@@ -252,7 +252,6 @@ fn left_deep_hash_join_chain_stays_in_one_probe_pipeline() {
 fn left_deep_spillable_hash_join_chain_replays_every_fused_join() {
     let plan = left_deep_hash_join_plan_with_context(PhysicalBuildContext {
         grant_spill_policy: paro_planner::physical::SpillPolicy::Allowed,
-        max_memory: 64 * 1024 * 1024,
         max_threads: 4,
         ..PhysicalBuildContext::default()
     });

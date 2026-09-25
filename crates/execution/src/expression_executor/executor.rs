@@ -3052,9 +3052,9 @@ mod tests {
         OperatorExpression, OperatorType, ParameterExpression, ReferenceExpression,
         SubqueryExpression, SubqueryPlanningState, SubqueryType,
     };
-    use paro_planner::operator::ColumnBinding;
-    use paro_planner::operator::{ExpressionGet, LogicalOperator};
-    use paro_planner::plan::{OwnedLogicalPlan, PlannedStatement};
+    use paro_planner::logical::operator::ColumnBinding;
+    use paro_planner::logical::operator::{ExpressionGet, LogicalOperator};
+    use paro_planner::logical::plan::{OwnedLogicalPlan, PlannedStatement};
 
     static LOCAL_STATE_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 

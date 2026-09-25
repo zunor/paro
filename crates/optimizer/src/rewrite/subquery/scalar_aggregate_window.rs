@@ -23,11 +23,11 @@ use paro_planner::expression::{
     ExpressionVisitDecision, OperatorType, WindowExpression, WindowFrame, WindowFrameBound,
     WindowFrameType,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Filter, Get, Join, JoinType,
     LogicalOperator, MarkJoinSemantics, ProjectionMap, Window,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::rewrite::aggregate::post_reduction::alpha::AlphaBindings;
 use crate::rewrite::aggregate::semantic_kernels::aggregate_kernels_equal;
@@ -373,7 +373,7 @@ fn peel_scalar_branch(plan: &OwnedLogicalPlan) -> Option<ScalarBranch<'_>> {
 }
 
 fn plain_inner_join(join: &ComparisonJoin) -> bool {
-    join.join_type == paro_planner::operator::JoinType::Inner
+    join.join_type == paro_planner::logical::operator::JoinType::Inner
         && join.anti_join_mode == AntiJoinMode::Regular
         && join.mark_index.is_none()
         && join.mark_semantics == MarkJoinSemantics::NotMark

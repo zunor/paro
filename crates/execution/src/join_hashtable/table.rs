@@ -33,7 +33,7 @@ use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
-use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 use paro_storage::buffer::BufferPool;
 use paro_storage::buffer::MemoryTag;
 use paro_storage::row::RowLayout;

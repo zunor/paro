@@ -57,7 +57,7 @@ class RunOutputTests(unittest.TestCase):
             query_case=query_case,
             arm_id=arm_id,
             workload_name="test",
-            query_payload={"schema_version": 3, "status": "ok", **query},
+            query_payload={"schema_version": 4, "status": "ok", **query},
             compile_receipts=[
                 uncovered_receipt("test has no execution receipt")
                 for _ in range(sample_count)
@@ -68,13 +68,13 @@ class RunOutputTests(unittest.TestCase):
 
     def test_compile_document_contract_rejects_missing_or_contradictory_state(self) -> None:
         document = {
-            "schema_version": 3,
+            "schema_version": 4,
             "outcome": "Success",
             "artifact": "CompiledArtifactReady",
             "cache": "ForcedCompile",
             "admission": "NotExecuted",
             "execution": "NotExecuted",
-            "artifact_identity": {"Observed": {"schema_version": 3, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
+            "artifact_identity": {"Observed": {"schema_version": 4, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
             "search_counters": [],
             "omitted_search_counters": 0,
         }
@@ -97,12 +97,12 @@ class RunOutputTests(unittest.TestCase):
 
     def test_compile_document_accepts_rust_external_observation_markers(self) -> None:
         base = {
-            "schema_version": 3,
+            "schema_version": 4,
             "outcome": "Success",
             "artifact": "CompiledArtifactReady",
             "cache": "ForcedCompile",
             "admission": "NotExecuted",
-            "artifact_identity": {"Observed": {"schema_version": 3, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
+            "artifact_identity": {"Observed": {"schema_version": 4, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
             "search_counters": [],
             "omitted_search_counters": 0,
         }
@@ -125,20 +125,22 @@ class RunOutputTests(unittest.TestCase):
 
     def test_optimizer_work_projections_must_close_without_double_counting(self) -> None:
         document = {
-            "schema_version": 3, "outcome": "Incomplete", "artifact": "NotReady",
+            "schema_version": 4, "outcome": "Incomplete", "artifact": "NotReady",
             "cache": "ForcedCompile", "admission": "NotExecuted", "execution": "NotExecuted",
             "search_counters": [], "omitted_search_counters": 0,
             "optimizer_ns": {"Observed": 17},
         }
         work = {
             "total_ns": 17,
-            "buckets": [{"kind": "Dependencies", "exclusive_ns": 10, "entries": 2},
+            "buckets": [{"kind": "Normalization", "exclusive_ns": 10, "entries": 2},
+                        {"kind": "RegionPlanning", "exclusive_ns": 0, "entries": 0},
+                        {"kind": "PhysicalSelection", "exclusive_ns": 0, "entries": 0},
+                        {"kind": "PhysicalLowering", "exclusive_ns": 0, "entries": 0},
                         {"kind": "Unclassified", "exclusive_ns": 7, "entries": 0}],
-            "outside_search_ns": 2, "mandatory_ns": 4, "optional_ns": 11,
         }
         document["optimizer_work"] = {"Observed": work}
         self.assertEqual(validate_compile_document(document), "Summary")
-        for key in ("total_ns", "mandatory_ns", "optional_ns", "outside_search_ns"):
+        for key in ("total_ns",):
             invalid = {**document, "optimizer_work": {"Observed": {**work, key: work[key] + 1}}}
             with self.assertRaises(ReceiptContractError):
                 validate_compile_document(invalid)
@@ -515,12 +517,12 @@ class RunOutputTests(unittest.TestCase):
                 product_receipts=1,
                 summary_captures=1,
             )
-            capture = output.publish_capture_text("block-0000.json", '{"schema_version":3}\n')
+            capture = output.publish_capture_text("block-0000.json", '{"schema_version":4}\n')
             capture_ref = {
                 "status": "Captured",
                 "path": capture.relative_to(output.run.root).as_posix(),
                 "sha256": hashlib.sha256(capture.read_bytes()).hexdigest(),
-                "schema_version": 3,
+                "schema_version": 4,
             }
             output.publish_json(
                 self.cell_payload(
@@ -592,7 +594,7 @@ class RunOutputTests(unittest.TestCase):
 
             def _collect_compile_receipt(self, conn, **kwargs):
                 return {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "status": "Verified",
                     "sample": len(getattr(self, "receipts", [])) + 1,
                 }
@@ -690,24 +692,24 @@ class RunOutputTests(unittest.TestCase):
                     record_type, record_id, json.dumps(payload) if payload is not None else "")
 
         def identity(artifact: tuple[int, int]):
-            return {"schema_version": 3, "artifact": list(artifact),
+            return {"schema_version": 4, "artifact": list(artifact),
                     "structure": [3, 4], "dependencies": [5, 6]}
 
         target_identity = identity((1, 2))
         target_decision = {
-            "schema_version": 3, "decision_id": 6, "query_fingerprint": 123,
+            "schema_version": 4, "decision_id": 6, "query_fingerprint": 123,
             "occurrence": 0, "cache_hit": True,
             "artifact_identity": target_identity, "compile_work": None,
             "compile_receipt": {
-                "schema_version": 3, "artifact_identity": target_identity,
-                "search_stop": {"Observed": "QualityPolicySatisfied"},
-                "search_complete": {"Observed": False},
-                "quality_policy_satisfied": {"Observed": True},
+                "schema_version": 4, "artifact_identity": target_identity,
+                "planning_status": {"Observed": "Planned"},
+
+
                 "budget_limited": {"Observed": False},
-                "obligations": {"Observed": 0},
-                "groups": {"Observed": 1},
-                "logical_expressions": {"Observed": 1},
-                "physical_expressions": {"Observed": 1},
+
+
+
+
                 "expected_class": {"Observed": 2},
                 "variant_count": {"Observed": 1},
                 "omitted_variants": 0,
@@ -715,7 +717,7 @@ class RunOutputTests(unittest.TestCase):
             },
         }
         target_execution = {
-            "schema_version": 3, "execution_id": 7, "statement_decision_id": 6,
+            "schema_version": 4, "execution_id": 7, "statement_decision_id": 6,
             "artifact_identity": target_identity, "expected_class": 2,
             "actual_class": 2, "actual_fingerprint": [7, 8],
             "resources": {
@@ -731,12 +733,12 @@ class RunOutputTests(unittest.TestCase):
         }
         observer_identity = identity((90, 91))
         observer_decision = {
-            "schema_version": 3, "decision_id": 9, "query_fingerprint": 456,
+            "schema_version": 4, "decision_id": 9, "query_fingerprint": 456,
             "occurrence": 0, "cache_hit": False,
             "artifact_identity": observer_identity, "compile_work": None,
         }
         observer_execution = {
-            "schema_version": 3, "execution_id": 8, "statement_decision_id": 9,
+            "schema_version": 4, "execution_id": 8, "statement_decision_id": 9,
             "artifact_identity": observer_identity, "expected_class": 2,
             "actual_class": None, "actual_fingerprint": None, "resources": None,
             "admission": "Failed", "fallback": None, "reservation": "NotRequired",
@@ -761,7 +763,7 @@ class RunOutputTests(unittest.TestCase):
         self.assertEqual(result["execution_id"], 7)
         self.assertEqual(result["compilation"], "CacheHit")
         self.assertEqual(result["compile_state"], "NotExecuted")
-        self.assertEqual(result["artifact_identity"]["schema_version"], 3)
+        self.assertEqual(result["artifact_identity"]["schema_version"], 4)
 
     def test_explicit_run_id_is_exclusive_and_attempts_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -837,7 +839,7 @@ class RunOutputTests(unittest.TestCase):
             output.publish_campaign_summary()
             campaign = json.loads((output.run.root / "campaign.json").read_text())
             self.assertEqual(campaign["kind"], "CampaignSummary")
-            self.assertEqual(campaign["schema_version"], 3)
+            self.assertEqual(campaign["schema_version"], 4)
             self.assertFalse((output.run.root / "summary.md").exists())
 
     def test_manifest_index_supports_a_ninety_nine_query_campaign(self) -> None:
@@ -1125,10 +1127,10 @@ class RunOutputTests(unittest.TestCase):
 
     def test_receipt_contract_does_not_turn_uncovered_into_success(self) -> None:
         payload = {
-            "schema_version": 3,
-            "version": 3,
+            "schema_version": 4,
+            "version": 4,
             "ownership": {
-                "schema_version": 3,
+                "schema_version": 4,
                 "campaign_id": "campaign",
                 "run_id": "run",
                 "query_case": "q",
@@ -1140,7 +1142,7 @@ class RunOutputTests(unittest.TestCase):
                 "queries": [{
                     "id": "q",
                     "compile_receipt": {
-                        "schema_version": 3,
+                        "schema_version": 4,
                         "status": "Uncovered",
                         "reason": "historical source has no receipt",
                         "sample_id": "q-sample-0000",
@@ -1156,10 +1158,10 @@ class RunOutputTests(unittest.TestCase):
 
     def test_verified_receipt_requires_nested_identity(self) -> None:
         payload = {
-            "schema_version": 3,
-            "version": 3,
+            "schema_version": 4,
+            "version": 4,
             "ownership": {
-                "schema_version": 3,
+                "schema_version": 4,
                 "campaign_id": "campaign",
                 "run_id": "run",
                 "query_case": "q",
@@ -1171,7 +1173,7 @@ class RunOutputTests(unittest.TestCase):
                 "queries": [{
                     "id": "q",
                     "compile_receipt": {
-                        "schema_version": 3,
+                        "schema_version": 4,
                         "status": "Verified",
                         "sample_id": "q-sample-0000",
                         "query_case": "q",
@@ -1184,48 +1186,48 @@ class RunOutputTests(unittest.TestCase):
                         "compile_state": "Executed",
                         "execution_id": 1,
                         "artifact_identity": {
-                            "schema_version": 3,
+                            "schema_version": 4,
                             "artifact": [1, 2],
                             "structure": [3, 4],
                             "dependencies": [5, 6],
                         },
                         "compile": {"artifact_identity": {
-                            "schema_version": 3,
+                            "schema_version": 4,
                             "artifact": [1, 2],
                             "structure": [3, 4],
                             "dependencies": [5, 6],
                         }, "decision_id": 4, "cache_hit": False, "receipt": {
-                            "schema_version": 3,
+                            "schema_version": 4,
                             "artifact_identity": {
-                                "schema_version": 3,
+                                "schema_version": 4,
                                 "artifact": [1, 2],
                                 "structure": [3, 4],
                                 "dependencies": [5, 6],
                             },
-                            "search_stop": {"Observed": "QualityPolicySatisfied"},
-                            "search_complete": {"Observed": False},
-                            "quality_policy_satisfied": {"Observed": True},
+                            "planning_status": {"Observed": "Planned"},
+
+
                             "budget_limited": {"Observed": False},
-                            "obligations": {"Observed": 0},
-                            "groups": {"Observed": 1},
-                            "logical_expressions": {"Observed": 1},
-                            "physical_expressions": {"Observed": 1},
+
+
+
+
                             "expected_class": {"Observed": 2},
                             "variant_count": {"Observed": 1},
                             "omitted_variants": 0,
                             "compile_work": None,
                         }},
                         "execution": {"execution_id": 1, "artifact_identity": {
-                            "schema_version": 3,
+                            "schema_version": 4,
                             "artifact": [1, 2],
                             "structure": [3, 4],
                             "dependencies": [5, 6],
                         }, "raw": {
-                            "schema_version": 3,
+                            "schema_version": 4,
                             "execution_id": 1,
                             "statement_decision_id": 4,
                             "artifact_identity": {
-                                "schema_version": 3,
+                                "schema_version": 4,
                                 "artifact": [1, 2],
                                 "structure": [3, 4],
                                 "dependencies": [5, 6],

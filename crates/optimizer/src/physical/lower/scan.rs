@@ -46,11 +46,11 @@ impl PhysicalPlanBuilder {
         let mut emit_row_id = false;
         for source in &get.column_sources {
             match source {
-                paro_planner::operator::GetColumnSource::Stored { column_id } => {
+                paro_planner::logical::operator::GetColumnSource::Stored { column_id } => {
                     column_ids.push(*column_id);
                     value_projections.push(RowsetColumnValueProjection::Stored);
                 }
-                paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                paro_planner::logical::operator::GetColumnSource::MatchedUtf8Prefix {
                     source_column,
                     byte_width,
                 } => {
@@ -61,7 +61,9 @@ impl PhysicalPlanBuilder {
                         predicate.as_ref(),
                     )?);
                 }
-                paro_planner::operator::GetColumnSource::VirtualRowId => emit_row_id = true,
+                paro_planner::logical::operator::GetColumnSource::VirtualRowId => {
+                    emit_row_id = true
+                }
             }
         }
 
@@ -129,7 +131,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_empty_result(
         &mut self,
-        empty: &LogicalEmptyResult<SelectedChild>,
+        empty: &LogicalEmptyResult<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(empty.child.as_ref())?;
         Ok((PhysicalNodeKind::EmptyResult(EmptyResultSpec), vec![child]))
@@ -137,8 +139,8 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_filter(
         &mut self,
-        filter: &LogicalFilter<SelectedChild>,
-        filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+        filter: &LogicalFilter<PreparedChild>,
+        filter_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         // These are deterministic post-winner canonicalizations. They preserve
         // the selected aggregate/scan implementation while removing a carrier
@@ -192,14 +194,14 @@ impl PhysicalPlanBuilder {
     /// it owns the final carrier shape.
     fn lower_aggregate_filter(
         &mut self,
-        filter: &LogicalFilter<SelectedChild>,
-        aggregate: &LogicalAggregate<SelectedChild>,
+        filter: &LogicalFilter<PreparedChild>,
+        aggregate: &LogicalAggregate<PreparedChild>,
         having_filter: Box<[Expression]>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let aggregate_width = aggregate.returned_types.len();
         let projection = filter.projection_map.to_indices(aggregate_width);
         let implementation = self
-            .winner_contracts
+            .implementation_contracts
             .get(&filter.child.id)
             .map(|contract| contract.implementation)
             .unwrap_or(crate::physical::PhysicalImplementationFlavor::Structural);
@@ -265,9 +267,9 @@ impl PhysicalPlanBuilder {
 
     fn lower_filter_over_get(
         &mut self,
-        filter: &LogicalFilter<SelectedChild>,
+        filter: &LogicalFilter<PreparedChild>,
         get: &Get,
-        filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+        filter_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let (filter_predicate, mut residual) =
             predicate_builder::build_predicate_tree(&filter.expressions, get)?;
@@ -317,7 +319,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_project(
         &mut self,
-        project: &LogicalProjection<SelectedChild>,
+        project: &LogicalProjection<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(project.child.as_ref())?;
         let spec = ProjectSpec {
@@ -335,7 +337,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_limit(
         &mut self,
-        limit: &LogicalLimit<SelectedChild>,
+        limit: &LogicalLimit<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(limit.child.as_ref())?;
         let spec = LimitSpec {
@@ -348,7 +350,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_topn(
         &mut self,
-        topn: &LogicalTopN<SelectedChild>,
+        topn: &LogicalTopN<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(topn.child.as_ref())?;
         let child_types = topn.child.types();
@@ -370,7 +372,7 @@ impl PhysicalPlanBuilder {
     pub(crate) fn lower_search_scan(
         &mut self,
         scan: &LogicalSearchScan,
-        logical: &SelectedNode,
+        logical: &PreparedNode,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let table =
             scan.get.get_table().cloned().ok_or_else(|| {
@@ -378,7 +380,7 @@ impl PhysicalPlanBuilder {
             })?;
         let candidate = selected_search_candidate(&scan.decision)?;
         if let SearchIntent::FullText(intent) = &candidate.intent {
-            let logical_intent = crate::physical::access::optimizer::extract_fulltext_score_intent(
+            let logical_intent = crate::physical::access::index::extract_fulltext_score_intent(
                 &scan.score_expression,
                 &scan.get,
             )?;
@@ -469,7 +471,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_order(
         &mut self,
-        order: &LogicalOrder<SelectedChild>,
+        order: &LogicalOrder<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(order.child.as_ref())?;
         let child_types = order.child.types();
@@ -933,12 +935,12 @@ fn project_rowset_scan_spec(
         returned_types.push(returned_type);
         output_sources.push(source);
         match source {
-            paro_planner::operator::GetColumnSource::Stored { column_id } => {
+            paro_planner::logical::operator::GetColumnSource::Stored { column_id } => {
                 column_ids.push(column_id);
                 value_projections.push(RowsetColumnValueProjection::Stored);
                 column_types.push(get.column_types[idx].clone());
             }
-            paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+            paro_planner::logical::operator::GetColumnSource::MatchedUtf8Prefix {
                 source_column,
                 byte_width,
             } => {
@@ -950,7 +952,7 @@ fn project_rowset_scan_spec(
                 )?);
                 column_types.push(get.column_types[idx].clone());
             }
-            paro_planner::operator::GetColumnSource::VirtualRowId => emit_row_id = true,
+            paro_planner::logical::operator::GetColumnSource::VirtualRowId => emit_row_id = true,
         }
     }
 
@@ -981,8 +983,8 @@ fn rowset_value_projection(
 }
 
 fn estimated_filter_selectivity(
-    filter: &LogicalFilter<SelectedChild>,
-    filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    filter: &LogicalFilter<PreparedChild>,
+    filter_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
 ) -> Option<f64> {
     let input = filter.child.stats.estimated_cardinality?.expected;
     let output = filter_cardinality?.expected;
@@ -990,4 +992,55 @@ fn estimated_filter_selectivity(
         return Some(0.0);
     }
     Some((output as f64 / input as f64).clamp(0.0, 1.0))
+}
+
+pub(crate) fn is_read_csv_table_function(plan: &PreparedNode) -> bool {
+    matches!(
+        &plan.operator,
+        LogicalOperator::TableFunctionGet(get) if get.function.name.eq_ignore_ascii_case("read_csv")
+    )
+}
+
+impl PhysicalPlanBuilder {
+    pub(crate) fn lower_table_function(
+        &mut self,
+        get: &LogicalTableFunctionGet,
+    ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        if get.is_in_out_function() {
+            return self.reject_unimplemented(
+                "TABLE_FUNCTION_GET",
+                "table-in-out function transform execution",
+            );
+        }
+        let spec = TableFunctionScanSpec {
+            function: get.function.clone(),
+            bind_data: get.bind_data.clone(),
+            table_index: get.table_index,
+            arguments: get.arguments.clone().into_boxed_slice(),
+            projection_ids: get
+                .projection_ids
+                .as_ref()
+                .map(|ids| ids.clone().into_boxed_slice()),
+            input_table_types: get.input_table_types.clone().into_boxed_slice(),
+            input_table_names: get.input_table_names.clone().into_boxed_slice(),
+            output_names: get.get_names().into_boxed_slice(),
+            output_types: get.get_types().into_boxed_slice(),
+            with_ordinality: get.with_ordinality,
+        };
+        Ok((PhysicalNodeKind::TableFunctionScan(spec), Vec::new()))
+    }
+
+    pub(crate) fn lower_delim_get(
+        &mut self,
+        get: &LogicalDelimGet,
+    ) -> (PhysicalNodeKind, Vec<PhysicalPlanNodeId>) {
+        let spec = DelimScanSpec {
+            target: DelimScanTarget::Values {
+                table_index: get.table_index,
+            },
+            output_names: get.chunk_names.clone().into_boxed_slice(),
+            output_types: get.chunk_types.clone().into_boxed_slice(),
+        };
+        (PhysicalNodeKind::DelimScan(spec), Vec::new())
+    }
 }

@@ -17,11 +17,11 @@ use paro_planner::expression::{
     ColumnRefExpression, ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
     ExpressionIterator, ReferenceExpression, WindowExpression, WindowFrameBound, WindowInvocation,
 };
-use paro_planner::operator::join::{
+use paro_planner::logical::operator::join::{
     AntiJoinMode, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinType,
     MarkJoinSemantics,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate as LogicalAggregate, CTERef as LogicalCteRef, CopyTo as LogicalCopyTo,
     CreateIndex as LogicalCreateIndex, Delete as LogicalDelete, DelimGet as LogicalDelimGet,
     Distinct as LogicalDistinct, EmptyResult as LogicalEmptyResult, Explain as LogicalExplain,
@@ -35,9 +35,10 @@ use paro_planner::operator::{
     SetOpType, SetOperation as LogicalSetOperation, TableFunctionGet as LogicalTableFunctionGet,
     TopN as LogicalTopN, Update as LogicalUpdate, Window as LogicalWindow,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 use paro_storage::search::{SearchIntent, SearchRequestMode};
 
+use self::input::{PreparedChild, PreparedNode};
 use super::children::PlanChildrenArena;
 use super::edges::{PhysicalEdgeArena, PhysicalEdgeKind};
 use super::ids::PhysicalPlanNodeId;
@@ -45,7 +46,6 @@ use super::node::{OperatorLabel, PhysicalPlanNode};
 use super::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use super::properties::PlanPropertyMap;
 use super::row_type::{ColumnIdentity, RowType};
-use super::selected::{SelectedChild, SelectedNode};
 use super::specs::{
     AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ClassicIeJoinSpec,
     CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec, CteScanSpec, DeleteSpec,
@@ -70,29 +70,39 @@ pub(crate) mod predicate_builder;
 
 pub(crate) mod aggregate;
 mod dml;
+pub(crate) mod explain;
 mod external;
 mod graph;
-pub(crate) mod helpers;
+pub(crate) mod graph_layout;
 pub(crate) mod inequality_join_gate;
 mod join;
-pub(crate) mod misc;
+pub(crate) mod join_output;
+pub(crate) mod labels;
+pub(crate) mod layout;
+pub(crate) mod payload;
 mod row_fetch;
 mod scan;
 mod set;
+pub(crate) mod values;
+pub(crate) mod window;
 
-use helpers::*;
+use explain::*;
+use graph_layout::*;
 use inequality_join_gate::*;
+use join_output::*;
+use labels::*;
+use layout::*;
+use payload::*;
+use scan::is_read_csv_table_function;
+use values::*;
 
 #[derive(Debug, Clone)]
 pub struct PhysicalBuildContext {
     pub force_external: bool,
-    /// Spill capability admitted for this portfolio class. Physical lowering
+    /// Spill capability admitted for this artifact class. Physical lowering
     /// must preserve it in operator specs instead of consulting runtime state.
     pub grant_spill_policy: crate::physical::SpillPolicy,
     pub rowset_scan_pushdown: bool,
-    /// Query-scoped memory available to physical operators. Zero means the
-    /// planner has no budget information and must use conservative defaults.
-    pub max_memory: usize,
     pub max_threads: usize,
     pub scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
     /// Versioned compile inputs copied into every extracted physical plan
@@ -106,7 +116,6 @@ impl Default for PhysicalBuildContext {
             force_external: false,
             grant_spill_policy: crate::physical::SpillPolicy::Forbidden,
             rowset_scan_pushdown: true,
-            max_memory: 0,
             max_threads: 1,
             scan_access_cost: Default::default(),
             dependency_template: Default::default(),
@@ -133,10 +142,10 @@ pub struct PhysicalPlanBuilder {
     pub children: PlanChildrenArena,
     pub properties: PlanPropertyMap,
     pub edges: PhysicalEdgeArena,
-    winner_contracts: crate::physical::WinnerPhysicalContracts,
-    enforcer_contracts: crate::physical::ExtractedEnforcerContracts,
+    implementation_contracts: crate::physical::ImplementationContracts,
+    mutation_barriers: crate::physical::MutationBarriers,
     statement_write_contracts: crate::physical::StatementWriteContracts,
-    require_winner_contracts: bool,
+    require_implementation_contracts: bool,
 }
 
 type BoxedLoweredNode = (Box<PhysicalNodeKind>, Vec<PhysicalPlanNodeId>);
@@ -161,26 +170,26 @@ impl PhysicalPlanBuilder {
             children: PlanChildrenArena::default(),
             properties: PlanPropertyMap::default(),
             edges: PhysicalEdgeArena::default(),
-            winner_contracts: Default::default(),
-            enforcer_contracts: Default::default(),
+            implementation_contracts: Default::default(),
+            mutation_barriers: Default::default(),
             statement_write_contracts: Default::default(),
-            require_winner_contracts: false,
+            require_implementation_contracts: false,
         }
     }
 
-    pub(crate) fn with_winner_contracts(
+    pub(crate) fn with_implementation_contracts(
         mut self,
-        contracts: crate::physical::WinnerPhysicalContracts,
+        contracts: crate::physical::ImplementationContracts,
     ) -> Self {
-        self.winner_contracts = contracts;
+        self.implementation_contracts = contracts;
         self
     }
 
-    pub(crate) fn with_enforcer_contracts(
+    pub(crate) fn with_mutation_barriers(
         mut self,
-        contracts: crate::physical::ExtractedEnforcerContracts,
+        contracts: crate::physical::MutationBarriers,
     ) -> Self {
-        self.enforcer_contracts = contracts;
+        self.mutation_barriers = contracts;
         self
     }
 
@@ -195,17 +204,17 @@ impl PhysicalPlanBuilder {
     /// Query extraction requires an explicit implementation/resource contract
     /// for every selected occurrence, from either Memo or direct selection.
     /// Utility lowering does not enable this relational contract requirement.
-    pub(crate) fn requiring_winner_contracts(mut self) -> Self {
-        self.require_winner_contracts = true;
+    pub(crate) fn requiring_implementation_contracts(mut self) -> Self {
+        self.require_implementation_contracts = true;
         self
     }
 
     pub fn build(&mut self, logical: OwnedLogicalPlan) -> Result<PhysicalPlan> {
-        let selected = SelectedNode::from_owned(logical)?;
+        let selected = PreparedNode::from_owned(logical)?;
         self.extract_selected(&selected)
     }
 
-    pub(crate) fn extract_selected(&mut self, logical: &SelectedNode) -> Result<PhysicalPlan> {
+    pub(crate) fn extract_selected(&mut self, logical: &PreparedNode) -> Result<PhysicalPlan> {
         self.arena = PhysicalPlanNodeArena::default();
         self.children = PlanChildrenArena::default();
         self.properties = PlanPropertyMap::default();
@@ -218,16 +227,16 @@ impl PhysicalPlanBuilder {
             mem::take(&mut self.properties),
         );
         plan.edges = mem::take(&mut self.edges);
-        super::rewrite::rewrite_projection_chains(&mut plan);
+        super::finalize::rewrite_projection_chains(&mut plan);
         plan.compact_reachable();
         populate_plan_dependencies(&mut plan, &self.ctx.dependency_template);
         PhysicalPlanVerifier::verify(&plan)?;
         Ok(plan)
     }
 
-    fn extract_node(&mut self, logical: &SelectedNode) -> Result<PhysicalPlanNodeId> {
-        let winner_contract = self.winner_contracts.get(&logical.id);
-        if self.require_winner_contracts && winner_contract.is_none() {
+    fn extract_node(&mut self, logical: &PreparedNode) -> Result<PhysicalPlanNodeId> {
+        let winner_contract = self.implementation_contracts.get(&logical.id);
+        if self.require_implementation_contracts && winner_contract.is_none() {
             return Err(paro_error::internal(format!(
                 "query extraction has no verified winner contract for logical node {}",
                 logical.id.0
@@ -362,11 +371,14 @@ impl PhysicalPlanBuilder {
             crate::physical::PhysicalImplementationFlavor::HashJoinRuntimeFilter
                 | crate::physical::PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
         ) {
-            let contract = self.winner_contracts.get(&logical.id).ok_or_else(|| {
-                paro_error::internal(
-                    "runtime-filter implementation lost its region-owned artifact identity",
-                )
-            })?;
+            let contract = self
+                .implementation_contracts
+                .get(&logical.id)
+                .ok_or_else(|| {
+                    paro_error::internal(
+                        "runtime-filter implementation lost its region-owned artifact identity",
+                    )
+                })?;
             let mut artifacts = contract
                 .owned_artifacts
                 .iter()
@@ -463,7 +475,7 @@ impl PhysicalPlanBuilder {
             label,
             logical.stats.estimated_cardinality,
         );
-        if let Some(contract) = self.winner_contracts.get(&logical.id) {
+        if let Some(contract) = self.implementation_contracts.get(&logical.id) {
             let properties = self
                 .properties
                 .get_mut(id)
@@ -492,64 +504,44 @@ impl PhysicalPlanBuilder {
                 properties.auxiliary_dependencies = dependencies.into_boxed_slice();
             }
         }
-        self.apply_extracted_enforcers(logical, id)
+        self.attach_mutation_barrier(logical, id)
     }
 
-    fn apply_extracted_enforcers(
+    fn attach_mutation_barrier(
         &mut self,
-        logical: &SelectedNode,
+        logical: &PreparedNode,
         mut child: PhysicalPlanNodeId,
     ) -> Result<PhysicalPlanNodeId> {
-        let Some(enforcers) = self.enforcer_contracts.get(&logical.id).cloned() else {
+        let Some(barrier) = self.mutation_barriers.get(&logical.id).cloned() else {
             return Ok(child);
         };
-        for extracted in enforcers.iter() {
-            let child_node = self
-                .arena
-                .get(child)
-                .ok_or_else(|| paro_error::internal("physical enforcer lost its child node"))?;
-            let output = child_node.output.clone();
-            let cardinality = child_node.cardinality;
-            let kind = match &extracted.enforcer {
-                crate::physical::ExtractedPhysicalEnforcer::Sort { orders } => {
-                    PhysicalNodeKind::Sort(SortSpec {
-                        orders: orders.clone(),
-                        projection_map: (0..output.column_count())
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
-                        output_names: output.names.clone(),
-                        output_types: output.types.clone(),
-                        spill_policy: self.ctx.spill_execution_policy(true),
-                    })
-                }
-                crate::physical::ExtractedPhysicalEnforcer::MutationInputSpool {
-                    barrier,
-                    targets,
-                    snapshot,
-                } => PhysicalNodeKind::MutationInputSpool(MutationInputSpoolSpec {
-                    barrier: *barrier,
-                    targets: targets.clone(),
-                    snapshot: *snapshot,
-                }),
-            };
-            child = self.push_node(
-                kind,
-                output,
-                vec![child],
-                OperatorLabel::new(logical.id, "PROPERTY_ENFORCER"),
-                cardinality,
-            );
-            let properties = self
-                .properties
-                .get_mut(child)
-                .expect("new physical enforcer must have a property contract");
-            properties.required_from_parent = extracted.contract.required.clone();
-            properties.provided = extracted.contract.provided.clone();
-            properties.cumulative_cost = extracted.contract.cost;
-            properties.grant_contract = extracted.contract.grant;
-            properties.origin = extracted.contract.origin;
-            properties.winner_goal = extracted.contract.goal_fingerprint;
-        }
+        let child_node = self
+            .arena
+            .get(child)
+            .ok_or_else(|| paro_error::internal("mutation barrier lost its input"))?;
+        let output = child_node.output.clone();
+        let cardinality = child_node.cardinality;
+        child = self.push_node(
+            PhysicalNodeKind::MutationInputSpool(MutationInputSpoolSpec {
+                barrier: barrier.barrier,
+                targets: barrier.targets,
+                snapshot: barrier.snapshot,
+            }),
+            output,
+            vec![child],
+            OperatorLabel::new(logical.id, "MUTATION_INPUT"),
+            cardinality,
+        );
+        let properties = self
+            .properties
+            .get_mut(child)
+            .expect("new physical mutation node");
+        properties.required_from_parent = barrier.implementation.required;
+        properties.provided = barrier.implementation.provided;
+        properties.cumulative_cost = barrier.implementation.cost;
+        properties.grant_contract = barrier.implementation.grant;
+        properties.origin = barrier.implementation.origin;
+
         Ok(child)
     }
 
@@ -559,9 +551,9 @@ impl PhysicalPlanBuilder {
         output: RowType,
         children: Vec<PhysicalPlanNodeId>,
         label: OperatorLabel,
-        cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+        cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
     ) -> PhysicalPlanNodeId {
-        use crate::physical::cost::{CompactRange, ScoreSummary, SearchCost};
+        use crate::physical::cost::{CompactRange, PhysicalCost, ScoreSummary};
         use crate::physical::identity::Fingerprint;
         use crate::physical::properties::{
             PhysicalCharacteristics, PhysicalGrantContract, PhysicalNodeProperties, PlanOrigin,
@@ -624,14 +616,14 @@ impl PhysicalPlanBuilder {
             .unwrap_or(1.0)
             .max(0.0);
         let range = CompactRange::point(expected).unwrap_or(CompactRange::ZERO);
-        let cumulative_cost = SearchCost {
+        let cumulative_cost = PhysicalCost {
             score: ScoreSummary {
                 range,
                 risk_adjusted: expected,
             },
             work_latency: range,
             critical_path: range,
-            ..SearchCost::ZERO
+            ..PhysicalCost::ZERO
         };
         let children = self.children.pack(children);
         let id = self.arena.push(PhysicalPlanNode {
@@ -813,3 +805,5 @@ mod post_reduction_tests;
 mod row_fetch_tests;
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod input;

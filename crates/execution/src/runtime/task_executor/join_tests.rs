@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use paro_planner::operator::MarkJoinSemantics;
+use paro_planner::logical::operator::MarkJoinSemantics;
 
 fn value_to_i32(value: &Value) -> Option<i32> {
     match value {
@@ -71,7 +71,7 @@ fn run_null_aware_anti_join(
                     covering_runtime_filter_key: None,
                     join_type: JoinType::Anti,
                     anti_join_mode: AntiJoinMode::NullAware,
-                    mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
@@ -230,7 +230,7 @@ fn hash_join_output_more_yields_between_output_chunks() {
                     covering_runtime_filter_key: None,
                     join_type: JoinType::Inner,
                     anti_join_mode: AntiJoinMode::Regular,
-                    mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
@@ -399,7 +399,7 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                         covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
-                        mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: vec![join_condition()].into_boxed_slice(),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
@@ -420,7 +420,7 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                         covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
-                        mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: vec![join_condition()].into_boxed_slice(),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
@@ -636,7 +636,7 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                         covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
-                        mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: vec![join_condition()].into_boxed_slice(),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
@@ -981,7 +981,7 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                     covering_runtime_filter_key: None,
                     join_type: JoinType::Single,
                     anti_join_mode: AntiJoinMode::Regular,
-                    mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
@@ -1123,7 +1123,7 @@ fn hash_join_full_outer_applies_output_permutation_to_all_row_classes() {
                     covering_runtime_filter_key: None,
                     join_type: JoinType::Outer,
                     anti_join_mode: AntiJoinMode::Regular,
-                    mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,

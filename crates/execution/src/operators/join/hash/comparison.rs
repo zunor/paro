@@ -5,7 +5,7 @@
 
 use paro_common::types::PhysicalType;
 use paro_planner::expression::ComparisonType;
-use paro_planner::operator::join::JoinComparisonType;
+use paro_planner::logical::operator::join::JoinComparisonType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FixedKind {

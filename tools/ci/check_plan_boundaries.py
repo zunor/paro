@@ -9,6 +9,7 @@ not turn into a production dependency, directly or through another crate.
 """
 
 from pathlib import Path
+import re
 import sys
 import tomllib
 
@@ -52,6 +53,35 @@ def check(root):
         path = dependency_path(graph, source, forbidden)
         if path:
             errors.append(" -> ".join(path))
+    errors.extend(check_optimizer_surface(root))
+    return errors
+
+
+def check_optimizer_surface(root):
+    """Keep the public facade small; test fixtures are an explicit feature.
+
+    This is a deliberately small source guard, not a Rust parser. rustc checks
+    actual reachability; Cargo dependency checks above protect its consumers.
+    """
+    source = root / "crates/optimizer/src"
+    facade = (source / "lib.rs").read_text()
+    allowed = {
+        "pub use optimizer::{OptimizedStatement, Optimizer};",
+        "pub use diagnostics::work::begin as begin_optimizer_observation;",
+        "pub mod test_support {",
+    }
+    exports = re.findall(r"^pub (?:use|mod|struct|enum|trait|fn|type|const) .*$", facade, re.M)
+    errors = [f"unreviewed optimizer public surface: {item}" for item in exports if item not in allowed]
+    if '#[cfg(feature = "test-support")]\npub mod test_support' not in facade:
+        errors.append("optimizer fixtures must be gated by test-support")
+    for path in sorted(source.rglob("*.rs")):
+        if path.stem in {"misc", "helpers", "common"}:
+            errors.append(f"optimizer module needs a responsibility name: {path.relative_to(root)}")
+        lines = len(path.read_text().splitlines())
+        if lines > 1500:
+            print(f"warning: {path.relative_to(root)} has {lines} lines; consider a responsibility split", file=sys.stderr)
+    if (source / "cascades").exists():
+        errors.append("production optimizer has a second global search engine")
     return errors
 
 

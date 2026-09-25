@@ -3,5 +3,6 @@
 
 //! Limit and TopN optimization.
 
+#[cfg(test)]
 pub mod pushdown;
 pub mod topn;

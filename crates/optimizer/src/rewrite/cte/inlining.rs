@@ -5,8 +5,8 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::binder::deep_copy::deep_copy_plan_preserving_statistics;
 use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::{LogicalOperator, Projection};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{LogicalOperator, Projection};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use std::ops::ControlFlow;
 
@@ -54,6 +54,7 @@ impl<'a> CTEInlining<'a> {
     /// nested owners. Memo combines this local choice with each child group's
     /// winner; recursively rewriting here would collapse independent sharing
     /// decisions into only "all inline" and "all materialized" shapes.
+    #[cfg(test)]
     pub fn optimize_root_with_change(
         &mut self,
         plan: OwnedLogicalPlan,
@@ -234,11 +235,11 @@ mod tests {
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::CTEMaterialize;
     use paro_planner::expression::{ColumnRefExpression, ConstantExpression, Expression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         CTERef, CrossProduct, ExpressionGet, Filter, Join, LogicalOperator, MaterializedCTE,
         Projection,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     fn values(ctx: &BindContext, table_index: usize, vals: &[i32]) -> OwnedLogicalPlan {
         OwnedLogicalPlan::new(
@@ -291,7 +292,7 @@ mod tests {
                     cte_ref(&bind_context, 10, 2),
                     vec![Expression::ColumnRef(
                         ColumnRefExpression::new(
-                            paro_planner::operator::ColumnBinding::new(2, 0),
+                            paro_planner::logical::operator::ColumnBinding::new(2, 0),
                             LogicalType::Integer,
                         )
                         .into(),
@@ -326,7 +327,7 @@ mod tests {
                     values(&bind_context, 1, &[1, 2, 3]),
                     vec![Expression::ColumnRef(
                         ColumnRefExpression::new(
-                            paro_planner::operator::ColumnBinding::new(1, 0),
+                            paro_planner::logical::operator::ColumnBinding::new(1, 0),
                             LogicalType::Integer,
                         )
                         .into(),

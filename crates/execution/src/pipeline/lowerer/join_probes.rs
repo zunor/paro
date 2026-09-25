@@ -707,7 +707,7 @@ impl<'a> PipelineLowerer<'a> {
                     pending.push((self.only_child(root)?, upper_transforms));
                 }
                 PhysicalNodeKind::SetOperation(spec)
-                    if spec.op == paro_planner::operator::SetOpType::Union && spec.all =>
+                    if spec.op == paro_planner::logical::operator::SetOpType::Union && spec.all =>
                 {
                     found_union = true;
                     let children = self.plan.child_ids(&node.children);

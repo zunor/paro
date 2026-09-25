@@ -7,8 +7,8 @@ use std::collections::HashSet;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::{ColumnBinding, Join, LogicalOperator, ProjectionMap};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{ColumnBinding, Join, LogicalOperator, ProjectionMap};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::rewrite::expr::traversal::visit_expression as traverse_expression;
 
@@ -471,20 +471,20 @@ impl ColumnLifetimeAnalyzer {
         Ok(ProjectionMap::new(indices))
     }
 
-    fn join_outputs_left(join_type: paro_planner::operator::JoinType) -> bool {
+    fn join_outputs_left(join_type: paro_planner::logical::operator::JoinType) -> bool {
         !matches!(
             join_type,
-            paro_planner::operator::JoinType::RightSemi
-                | paro_planner::operator::JoinType::RightAnti
+            paro_planner::logical::operator::JoinType::RightSemi
+                | paro_planner::logical::operator::JoinType::RightAnti
         )
     }
 
-    fn join_outputs_right(join_type: paro_planner::operator::JoinType) -> bool {
+    fn join_outputs_right(join_type: paro_planner::logical::operator::JoinType) -> bool {
         !matches!(
             join_type,
-            paro_planner::operator::JoinType::Semi
-                | paro_planner::operator::JoinType::Anti
-                | paro_planner::operator::JoinType::Mark
+            paro_planner::logical::operator::JoinType::Semi
+                | paro_planner::logical::operator::JoinType::Anti
+                | paro_planner::logical::operator::JoinType::Mark
         )
     }
 
@@ -508,11 +508,11 @@ mod tests {
         ColumnRefExpression, ComparisonExpression, ComparisonType, Expression, WindowExpression,
         WindowFrame, WindowFrameBound, WindowFrameType,
     };
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ColumnBinding, ComparisonJoin, CrossProduct, Distinct, ExpressionGet, Filter, Join,
         JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Order, Projection, Window,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     #[test]
     fn extract_column_bindings_visits_window_frame_offsets() {

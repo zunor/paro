@@ -17,7 +17,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::vector::VECTOR_SIZE;
-use paro_planner::operator::SetOpType;
+use paro_planner::logical::operator::SetOpType;
 
 use crate::physical::specs::{SetOperationInputSide, SetOperationSpec};
 use crate::runtime::context::OperatorCleanupContext;

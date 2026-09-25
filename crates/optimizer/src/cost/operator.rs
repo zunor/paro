@@ -10,13 +10,13 @@ use crate::cost::calibration::{
     LocalOperatorWork, MachineCalibrationBundle, OP_HASH_KEY_BYTE_BLOCK,
     OP_RUNTIME_FILTER_APPLY_ROW, OP_RUNTIME_FILTER_BUILD_ROW, OP_TUPLE_BYTE_BLOCK,
 };
-use crate::cost::response::WorkSourceId;
-use crate::physical::{Fingerprint, PhysicalImplementationFlavor};
+use crate::cost::source::WorkSourceId;
+use crate::physical::PhysicalImplementationFlavor;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::task_supply::useful_pipeline_tasks;
 use paro_common::types::LogicalType;
-use paro_planner::operator::LogicalOperatorType;
-use paro_planner::physical::cost::{CompactRange, ResourceDimension, ScoreSummary, SearchCost};
+use paro_planner::logical::operator::LogicalOperatorType;
+use paro_planner::physical::cost::{CompactRange, PhysicalCost, ResourceDimension, ScoreSummary};
 use paro_planner::physical::OpClassId;
 
 #[cfg(test)]
@@ -133,11 +133,11 @@ mod tests {
 
 /// Fit one local implementation to its actual resource envelope.
 pub(crate) fn fit_local_cost(
-    mut cost: SearchCost,
+    mut cost: PhysicalCost,
     spillable: bool,
     class: paro_planner::physical::ResourceGrantClass,
     force_spill: bool,
-) -> Result<Option<SearchCost>> {
+) -> Result<Option<PhysicalCost>> {
     if cost.minimum_memory_bytes > class.hard_memory_bytes {
         return Ok(None);
     }
@@ -173,7 +173,7 @@ pub(crate) fn fit_local_cost(
         if cost.memory_completion.is_runtime_capped() {
             // The query allocator is the resident-memory proof for this
             // explicitly best-effort implementation.  This does not promote
-            // it to a forward-progress guarantee: portfolio selection keeps
+            // it to a forward-progress guarantee: artifact selection keeps
             // preferring any fully bounded or spillable alternative.
             cost.apply_runtime_cap(class.hard_memory_bytes, cost.minimum_memory_bytes)?;
             return Ok(Some(cost));
@@ -220,7 +220,7 @@ pub(crate) fn fit_local_cost(
 
 pub(crate) struct LocalCostModel<'a> {
     pub operator_type: LogicalOperatorType,
-    pub local_cost: SearchCost,
+    pub local_cost: PhysicalCost,
     pub baseline: PhysicalImplementationFlavor,
     pub resource_sensitive: bool,
     pub spillable: bool,
@@ -239,7 +239,6 @@ pub(crate) struct ResolvedPlannerCostFacts {
     pub(crate) output_row_width: u64,
     pub(crate) hash_key_width: Option<u64>,
     pub(crate) scan_access_width: Option<u64>,
-    pub(crate) scan_physical_rows: Option<u64>,
     pub(crate) scan_work_source: Option<WorkSourceId>,
     pub(crate) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(crate) topn_capacity: Option<u64>,
@@ -255,8 +254,6 @@ pub(crate) struct ResolvedPlannerCostFacts {
     /// fingerprint and from the evaluation occurrence: two physical
     /// implementations of one Memo group share it, while nested joins with
     /// the same operator shape do not alias one another.
-    pub(crate) runtime_filter_build_domain_identity: Option<Fingerprint>,
-    pub(crate) runtime_filter_build_left_domain_identity: Option<Fingerprint>,
     pub(crate) runtime_filter_build_left_distinct_expected: Option<u64>,
     pub(crate) runtime_filter_key_types: Box<[LogicalType]>,
 }
@@ -301,13 +298,10 @@ pub(crate) fn flavor_spillable(
         | PhysicalImplementationFlavor::PerfectHashAggregate
         | PhysicalImplementationFlavor::SingletonAggregateProjection
         | PhysicalImplementationFlavor::SortRangeJoin
-        | PhysicalImplementationFlavor::ClassicIeJoin
-        | PhysicalImplementationFlavor::SearchProvider => false,
+        | PhysicalImplementationFlavor::ClassicIeJoin => false,
     }
 }
 
-const OP_HASH_BUILD_ROW: OpClassId = crate::cost::join::HASH_BUILD;
-const OP_HASH_PROBE_ROW: OpClassId = crate::cost::join::HASH_PROBE;
 const OP_NESTED_LOOP_PAIR: OpClassId = OpClassId(3);
 const OP_SORT_COMPARE: OpClassId = OpClassId(4);
 pub(crate) const OP_RANGE_JOIN_ROW: OpClassId = OpClassId(5);
@@ -357,17 +351,12 @@ pub(crate) fn implementation_cost(
     flavor: PhysicalImplementationFlavor,
     calibration: &MachineCalibrationBundle,
     max_concurrent_tasks: u16,
-) -> Result<SearchCost> {
+) -> Result<PhysicalCost> {
     let mut work = LocalOperatorWork::default();
     let peak_memory_upper;
     match flavor {
         PhysicalImplementationFlavor::Structural => {
             return refreshed_structural_cost(metadata, facts, max_concurrent_tasks);
-        }
-        PhysicalImplementationFlavor::SearchProvider => {
-            return Err(paro_error::internal(
-                "search provider cost must come from its physical payload",
-            ));
         }
         PhysicalImplementationFlavor::HashJoin
         | PhysicalImplementationFlavor::HashJoinBuildLeft
@@ -376,7 +365,7 @@ pub(crate) fn implementation_cost(
         _ => add_tuple_byte_work(&mut work, facts)?,
     }
     match flavor {
-        PhysicalImplementationFlavor::Structural | PhysicalImplementationFlavor::SearchProvider => {
+        PhysicalImplementationFlavor::Structural => {
             unreachable!()
         }
         PhysicalImplementationFlavor::AdaptiveSort => {
@@ -761,67 +750,6 @@ pub(crate) fn implementation_cost(
     Ok(cost)
 }
 
-/// Isolate the full-source predicate-evaluation work already charged by a
-/// runtime-filter implementation. Candidate composition removes this term and
-/// rebuilds all predicates on the same source in selectivity order, matching
-/// the staged rowset evaluator without discounting independent join work.
-pub(crate) fn runtime_filter_apply_cost(
-    facts: &ResolvedPlannerCostFacts,
-    flavor: PhysicalImplementationFlavor,
-    calibration: &MachineCalibrationBundle,
-    _max_concurrent_tasks: u16,
-) -> Result<Option<SearchCost>> {
-    let rows = match flavor {
-        PhysicalImplementationFlavor::HashJoinRuntimeFilter => {
-            facts.runtime_filter_probe_source_rows.unwrap_or_else(|| {
-                facts
-                    .child_rows
-                    .first()
-                    .copied()
-                    .unwrap_or(CompactRange::ZERO)
-            })
-        }
-        PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter => facts
-            .runtime_filter_build_left_probe_source_rows
-            .or_else(|| facts.child_rows.get(1).copied())
-            .unwrap_or(CompactRange::ZERO),
-        _ => return Ok(None),
-    };
-    let mut work = LocalOperatorWork::default();
-    work.add(OP_RUNTIME_FILTER_APPLY_ROW, rows)?;
-    // This is a replaceable decomposition of `implementation_cost`, not an
-    // independently scheduled operator. Fold it at the exact same physical
-    // operating point so every score/span dimension remains a valid subset
-    // of the complete local candidate.
-    Ok(Some(calibration.fold(&work)?))
-}
-
-/// Derive an operator's executable task supply independently from its grant.
-///
-/// The runtime starts workers from physical source/breaker work, not from the
-/// session thread setting alone. A local phase cannot exploit more workers
-/// than its largest input/output stream can feed at the shared amortization
-/// boundary. Base scans use pre-predicate physical rows because decoding and
-/// visibility work still occur for rejected tuples.
-pub(crate) fn useful_parallel_tasks_for_facts(
-    facts: &ResolvedPlannerCostFacts,
-    max_concurrent_tasks: u16,
-) -> u16 {
-    let Some(physical_rows) = facts.scan_physical_rows else {
-        // A non-source operator inherits supply from a child winner. Returning
-        // one here is intentional: its own wider output cannot create tasks.
-        return 1;
-    };
-    let scan_width = facts.scan_access_width.unwrap_or(facts.output_row_width);
-    let largest_stream_bytes = physical_rows.saturating_mul(scan_width.saturating_add(8).max(1));
-    u16::try_from(useful_pipeline_tasks(
-        largest_stream_bytes,
-        usize::from(max_concurrent_tasks.max(1)),
-    ))
-    .unwrap_or(max_concurrent_tasks.max(1))
-    .max(1)
-}
-
 pub(crate) fn useful_output_tasks(
     facts: &ResolvedPlannerCostFacts,
     max_concurrent_tasks: u16,
@@ -834,113 +762,13 @@ pub(crate) fn useful_output_tasks(
     .max(1)
 }
 
-/// Calibrated share of hash-join work executed by the build pipeline. Runtime
-/// predicate application is deliberately excluded: it executes in the traced
-/// source pipeline and is repriced independently during source composition.
-pub(crate) fn hash_join_build_work_ppm(
-    facts: &ResolvedPlannerCostFacts,
-    flavor: PhysicalImplementationFlavor,
-    calibration: &MachineCalibrationBundle,
-) -> Result<u32> {
-    let left = facts
-        .child_rows
-        .first()
-        .copied()
-        .unwrap_or(CompactRange::ZERO);
-    let right = facts
-        .child_rows
-        .get(1)
-        .copied()
-        .unwrap_or(CompactRange::ZERO);
-    let build_left = matches!(
-        flavor,
-        PhysicalImplementationFlavor::HashJoinBuildLeft
-            | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
-    );
-    let (build, probe, build_index, probe_index) = if build_left {
-        (left, right, 0, 1)
-    } else {
-        (right, left, 1, 0)
-    };
-    let build_materialization_risk = facts
-        .child_materialization_risk_rows
-        .get(build_index)
-        .copied()
-        .unwrap_or(0) as f64;
-    let build = CompactRange::new(
-        build.lower,
-        build.expected,
-        build.upper.max(build_materialization_risk),
-    )?;
-    let mut build_work = LocalOperatorWork::default();
-    build_work.add(OP_HASH_BUILD_ROW, build)?;
-    if matches!(
-        flavor,
-        PhysicalImplementationFlavor::HashJoinRuntimeFilter
-            | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
-    ) {
-        build_work.add(OP_RUNTIME_FILTER_BUILD_ROW, build)?;
-    }
-    add_hash_key_byte_work(&mut build_work, build, facts.hash_key_width)?;
-    add_stream_byte_work(
-        &mut build_work,
-        build,
-        facts
-            .child_row_widths
-            .get(build_index)
-            .copied()
-            .unwrap_or(facts.output_row_width),
-    )?;
-    add_stream_byte_work(
-        &mut build_work,
-        build,
-        crate::cost::join::hash_build_width(
-            facts
-                .child_row_widths
-                .get(build_index)
-                .copied()
-                .unwrap_or(facts.output_row_width) as f64,
-            facts.hash_key_width.unwrap_or(8) as f64,
-        ) as u64,
-    )?;
-
-    let mut probe_work = LocalOperatorWork::default();
-    add_hash_key_byte_work(&mut probe_work, probe, facts.hash_key_width)?;
-    probe_work.add(OP_HASH_PROBE_ROW, probe.checked_add(facts.output_rows)?)?;
-    add_stream_byte_work(
-        &mut probe_work,
-        probe,
-        facts
-            .child_row_widths
-            .get(probe_index)
-            .copied()
-            .unwrap_or(facts.output_row_width),
-    )?;
-    add_stream_byte_work(&mut probe_work, facts.output_rows, facts.output_row_width)?;
-    let build_score = calibration.fold(&build_work)?.score.range.expected;
-    let probe_score = calibration.fold(&probe_work)?.score.range.expected;
-    let total = build_score + probe_score;
-    if total <= 0.0 {
-        return Ok(0);
-    }
-    Ok(((build_score / total * 1_000_000.0).round() as u32).min(1_000_000))
-}
-
-fn add_stream_byte_work(
-    work: &mut LocalOperatorWork,
-    rows: CompactRange,
-    width: u64,
-) -> Result<()> {
-    work.add(OP_TUPLE_BYTE_BLOCK, scaled_work(rows, width as f64 / 32.0)?)
-}
-
 fn apply_execution_memory_contract(
     metadata: &LocalCostModel<'_>,
     flavor: PhysicalImplementationFlavor,
     retained_memory_upper: u64,
     retained_memory_target: u64,
     max_concurrent_tasks: u16,
-    cost: &mut SearchCost,
+    cost: &mut PhysicalCost,
 ) -> Result<()> {
     use crate::physical::resources::{
         ExecutionMemoryContract, BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES,
@@ -1072,7 +900,7 @@ fn apply_execution_memory_contract(
 }
 
 fn publish_execution_memory_contract(
-    cost: &mut SearchCost,
+    cost: &mut PhysicalCost,
     contract: crate::physical::resources::ExecutionMemoryContract,
     non_revocable_memory_upper: u64,
     peak_memory_upper: u64,
@@ -1151,8 +979,7 @@ fn expected_retained_memory_target(
         PhysicalImplementationFlavor::PerfectHashAggregate
         | PhysicalImplementationFlavor::SingletonAggregateProjection
         | PhysicalImplementationFlavor::CrossProductExternal
-        | PhysicalImplementationFlavor::Structural
-        | PhysicalImplementationFlavor::SearchProvider => retained_memory_upper,
+        | PhysicalImplementationFlavor::Structural => retained_memory_upper,
     };
     expected.min(retained_memory_upper)
 }
@@ -1171,7 +998,7 @@ fn refreshed_structural_cost(
     metadata: &LocalCostModel<'_>,
     facts: &ResolvedPlannerCostFacts,
     max_concurrent_tasks: u16,
-) -> Result<SearchCost> {
+) -> Result<PhysicalCost> {
     if matches!(
         metadata.operator_type,
         LogicalOperatorType::SearchScan
@@ -1222,14 +1049,14 @@ fn refreshed_structural_cost(
         + child_count
         + materialization_write.upper;
     let range = CompactRange::new(1.0_f64.min(expected), expected, upper.max(expected))?;
-    let mut cost = SearchCost {
+    let mut cost = PhysicalCost {
         score: ScoreSummary {
             range,
             risk_adjusted: expected + (upper - expected) * 0.5,
         },
         work_latency: range,
         critical_path: range,
-        ..SearchCost::ZERO
+        ..PhysicalCost::ZERO
     };
     if metadata.resource_sensitive {
         let retained_child = match metadata.operator_type {
@@ -1427,19 +1254,19 @@ pub(crate) fn runtime_filter_build_domain(
     CompactRange::new(0.0, expected, build_rows.upper)
 }
 
-pub(crate) fn base_table_scan_cost(rows: CompactRange, access_width: u64) -> Result<SearchCost> {
+pub(crate) fn base_table_scan_cost(rows: CompactRange, access_width: u64) -> Result<PhysicalCost> {
     // A scan pays one fixed cursor/vector unit per row plus actual storage
     // source bytes. Do not floor the byte component: doing so makes a virtual
     // rowid indistinguishable from another stored fixed-width column.
     let range = scaled_work(rows, 1.0 + access_width as f64 / 32.0)?;
-    let mut cost = SearchCost {
+    let mut cost = PhysicalCost {
         score: ScoreSummary {
             range,
             risk_adjusted: range.expected + (range.upper - range.expected) * 0.5,
         },
         work_latency: range,
         critical_path: range,
-        ..SearchCost::ZERO
+        ..PhysicalCost::ZERO
     };
     cost.resources_expected[ResourceDimension::Cpu as usize] = range.expected;
     cost.resources_risk_upper[ResourceDimension::Cpu as usize] = range.upper;
@@ -1447,7 +1274,7 @@ pub(crate) fn base_table_scan_cost(rows: CompactRange, access_width: u64) -> Res
     Ok(cost)
 }
 
-fn add_spill_cost(cost: &mut SearchCost, spilled: u64) -> Result<()> {
+fn add_spill_cost(cost: &mut PhysicalCost, spilled: u64) -> Result<()> {
     cost.spill_bytes_expected = cost.spill_bytes_expected.saturating_add(spilled);
     let io_work = (spilled as f64 / 4096.0).max(1.0);
     let spill_range = CompactRange::new(io_work, io_work * 2.0, io_work * 6.0)?;

@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 
 use paro_planner::expression::{Expression, ExpressionIterator, ExpressionVisitDecision};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     ColumnBinding, ComparisonJoin, Filter, Get, Join, LogicalOperator, Projection,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use super::{clean_inner_join, is_movable};
 use crate::rewrite::aggregate::semantic_kernels::{

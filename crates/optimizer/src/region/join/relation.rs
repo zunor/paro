@@ -28,6 +28,7 @@ impl JoinRelationSet {
     }
 
     /// Create a JoinRelationSet from a single relation index.
+    #[cfg(test)]
     pub fn single(index: usize) -> Self {
         Self {
             relations: vec![index],
@@ -35,6 +36,7 @@ impl JoinRelationSet {
     }
 
     /// Create an empty JoinRelationSet.
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             relations: Vec::new(),
@@ -47,6 +49,7 @@ impl JoinRelationSet {
     }
 
     /// Check if this set is empty.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.relations.is_empty()
     }
@@ -85,6 +88,7 @@ impl JoinRelationSet {
     }
 
     /// Check if two sets are disjoint (have no common elements).
+    #[cfg(test)]
     pub fn is_disjoint(&self, other: &JoinRelationSet) -> bool {
         let mut i = 0;
         let mut j = 0;
@@ -135,6 +139,7 @@ impl JoinRelationSet {
     }
 
     /// Compute the intersection of two sets.
+    #[cfg(test)]
     pub fn intersection(&self, other: &JoinRelationSet) -> JoinRelationSet {
         let mut result = Vec::new();
         let mut i = 0;
@@ -156,6 +161,7 @@ impl JoinRelationSet {
     }
 
     /// Compute the difference of two sets (self - other).
+    #[cfg(test)]
     pub fn difference(&self, other: &JoinRelationSet) -> JoinRelationSet {
         let mut result = Vec::new();
         let mut i = 0;

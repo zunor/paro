@@ -12,28 +12,34 @@ use std::collections::{HashMap, HashSet};
 
 use paro_catalog::entry::ConstraintType;
 use paro_common::error::Result;
-use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::{
-    ColumnBinding, Get, Join, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
+use paro_planner::expression::Expression;
+use paro_planner::logical::operator::{
+    ColumnBinding, Get, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
-use paro_planner::plan::{
+use paro_planner::logical::plan::{
     OwnedLogicalPlan, UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, UniqueKeyProvenance,
 };
+#[cfg(test)]
+use paro_planner::{expression::ColumnRefExpression, logical::operator::JoinCondition};
 
 /// Evidence that every candidate key binding is evaluated by an ordinary
 /// equality predicate and therefore rejects NULL before uniqueness is used.
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct NullRejectedKeyProof {
     keys: Box<[NullRejectedRightKey]>,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct NullRejectedRightKey {
     left: Expression,
     right: ColumnRefExpression,
 }
 
+#[cfg(test)]
 impl NullRejectedKeyProof {
+    #[cfg(test)]
     pub(crate) fn from_equal_right_keys(conditions: &[JoinCondition]) -> Option<Self> {
         if conditions.is_empty() {
             return None;
@@ -60,6 +66,7 @@ impl NullRejectedKeyProof {
         Some(Self { keys: keys.into() })
     }
 
+    #[cfg(test)]
     pub(crate) fn bindings(&self) -> impl Iterator<Item = ColumnBinding> + '_ {
         self.keys.iter().map(|key| key.right.binding)
     }
@@ -77,6 +84,7 @@ impl NullRejectedKeyProof {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn right_keys(&self) -> impl Iterator<Item = (&Expression, &ColumnRefExpression)> {
         self.keys.iter().map(|key| (&key.left, &key.right))
     }
@@ -88,6 +96,7 @@ pub(crate) struct DeclaredUniqueKey {
 }
 
 impl DeclaredUniqueKey {
+    #[cfg(test)]
     pub(crate) fn is_unique_with_nulls_rejected(&self, proof: &NullRejectedKeyProof) -> bool {
         self.bindings
             .iter()
@@ -192,7 +201,7 @@ fn expressions_cover_key(
 }
 
 pub(crate) fn expressions_cover_unique_key_from_facts(
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
     keys: &[UniqueKey],
     expressions: &[&Expression],
 ) -> bool {
@@ -200,7 +209,7 @@ pub(crate) fn expressions_cover_unique_key_from_facts(
 }
 
 pub(crate) fn expressions_cover_key_in_layout(
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
     keys: &[UniqueKey],
     expressions: &[&Expression],
     required_provenance: Option<UniqueKeyProvenance>,
@@ -228,7 +237,7 @@ pub(crate) fn expressions_cover_key_in_layout(
 /// uniqueness proof.
 fn key_matches_layout(
     key: &UniqueKey,
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
 ) -> bool {
     key.columns
         .iter()
@@ -237,10 +246,11 @@ fn key_matches_layout(
 
 /// Derive and cache keys for one node whose children have already completed
 /// the statistics post-order fold.
+#[cfg(test)]
 pub(crate) fn derive_local_unique_keys(
     operator: &LogicalOperator,
-    layout: &paro_planner::operator::LogicalOutputLayout,
-    child_layouts: &[paro_planner::operator::LogicalOutputLayout],
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
+    child_layouts: &[paro_planner::logical::operator::LogicalOutputLayout],
 ) -> Vec<UniqueKey> {
     let children = operator.children();
     let keys = children
@@ -259,8 +269,8 @@ pub(crate) fn derive_local_unique_keys(
 /// Inputs are schemas and proof sets, never representative child trees.
 pub(crate) fn derive_unique_keys_from_facts<Child>(
     operator: &LogicalOperator<Child>,
-    layout: &paro_planner::operator::LogicalOutputLayout,
-    child_layouts: &[&paro_planner::operator::LogicalOutputLayout],
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
+    child_layouts: &[&paro_planner::logical::operator::LogicalOutputLayout],
     children: &[&[UniqueKey]],
 ) -> Vec<UniqueKey> {
     let mut keys = match operator {
@@ -357,10 +367,10 @@ pub(crate) fn refresh_unique_keys(plan: OwnedLogicalPlan) -> Result<OwnedLogical
 }
 
 fn comparison_join_unique_keys<Child>(
-    join: &paro_planner::operator::ComparisonJoin<Child>,
+    join: &paro_planner::logical::operator::ComparisonJoin<Child>,
     children: &[&[UniqueKey]],
-    child_layouts: &[&paro_planner::operator::LogicalOutputLayout],
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    child_layouts: &[&paro_planner::logical::operator::LogicalOutputLayout],
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
 ) -> Vec<UniqueKey> {
     let left_layout = child_layout(child_layouts, 0);
     let right_layout = child_layout(child_layouts, 1);
@@ -446,7 +456,7 @@ fn declared_key_null_semantics(get: &Get, key: &DeclaredUniqueKey) -> UniqueKeyN
 
 fn declared_keys_in_layout(
     get: &Get,
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
 ) -> Vec<UniqueKey> {
     declared_unique_keys(get)
         .into_iter()
@@ -477,7 +487,7 @@ fn declared_keys_in_layout(
 fn declared_keys_through_projection(
     get: &Get,
     expressions: &[Expression],
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
 ) -> Vec<UniqueKey> {
     declared_unique_keys(get)
         .into_iter()
@@ -521,7 +531,7 @@ fn declared_keys_through_projection(
 fn project_unique_keys(
     keys: &[UniqueKey],
     projected_child_indices: &[usize],
-    output_layout: &paro_planner::operator::LogicalOutputLayout,
+    output_layout: &paro_planner::logical::operator::LogicalOutputLayout,
 ) -> Vec<UniqueKey> {
     keys.iter()
         .filter_map(|key| {
@@ -552,7 +562,7 @@ fn project_unique_keys(
 fn remap_unique_keys(
     keys: &[UniqueKey],
     source_by_output: &[Option<usize>],
-    output_layout: &paro_planner::operator::LogicalOutputLayout,
+    output_layout: &paro_planner::logical::operator::LogicalOutputLayout,
 ) -> Vec<UniqueKey> {
     keys.iter()
         .filter_map(|key| {
@@ -582,7 +592,7 @@ fn remap_unique_keys(
 
 fn expression_output_index(
     expression: &Expression,
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
 ) -> Option<usize> {
     match expression {
         Expression::Reference(reference) => {
@@ -640,9 +650,9 @@ pub(super) fn normalize_unique_keys(keys: &mut Vec<UniqueKey>) {
 }
 
 fn child_layout<'a>(
-    children: &[&'a paro_planner::operator::LogicalOutputLayout],
+    children: &[&'a paro_planner::logical::operator::LogicalOutputLayout],
     index: usize,
-) -> &'a paro_planner::operator::LogicalOutputLayout {
+) -> &'a paro_planner::logical::operator::LogicalOutputLayout {
     children
         .get(index)
         .expect("unique-key derivation requires its logical child layout")
@@ -657,7 +667,7 @@ fn child_keys<'a>(children: &'a [&[UniqueKey]], index: usize) -> &'a [UniqueKey]
 
 fn key_from_indices(
     indices: impl IntoIterator<Item = usize>,
-    layout: &paro_planner::operator::LogicalOutputLayout,
+    layout: &paro_planner::logical::operator::LogicalOutputLayout,
     provenance: UniqueKeyProvenance,
 ) -> UniqueKey {
     UniqueKey::new(
@@ -672,7 +682,7 @@ fn key_from_indices(
 
 fn remap_unique_keys_by_binding(
     keys: &[UniqueKey],
-    output_layout: &paro_planner::operator::LogicalOutputLayout,
+    output_layout: &paro_planner::logical::operator::LogicalOutputLayout,
     structural: bool,
 ) -> Vec<UniqueKey> {
     // A ColumnBinding names one logical value even when a projection exposes
@@ -715,13 +725,13 @@ mod tests {
     };
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, ReferenceExpression};
-    use paro_planner::operator::ExpressionGet;
+    use paro_planner::logical::operator::ExpressionGet;
 
     use super::*;
 
     #[test]
     fn null_extension_key_proofs_match_an_independent_bag_oracle() {
-        use paro_planner::operator::{ComparisonJoin, LogicalOutputLayout};
+        use paro_planner::logical::operator::{ComparisonJoin, LogicalOutputLayout};
         let layouts = [1, 2].map(|table| {
             LogicalOutputLayout::new(
                 vec![LogicalType::BigInt],

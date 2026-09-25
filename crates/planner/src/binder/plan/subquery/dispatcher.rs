@@ -5,7 +5,7 @@
 
 use crate::binder::Binder;
 use crate::expression::*;
-use crate::operator::{
+use crate::logical::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Join, JoinComparisonType,
     JoinCondition, JoinType, Limit, LogicalOperator, Projection,
 };
@@ -438,7 +438,7 @@ impl Binder {
 mod tests {
     use super::*;
     use crate::binder::test_utils::test_session as binder_test_session;
-    use crate::planner::Planner;
+    use crate::binder::Planner;
     use paro_context::StatementContext;
     use std::process::Output;
 
@@ -774,7 +774,7 @@ mod tests {
     fn uncorrelated_any_with_correlated_scalar_plans_all_correlation_layers() {
         let plan =
             planned_logical_operator(nested_case_sql("uncorrelated_any_with_correlated_scalar"));
-        crate::verify::verify_physical_planner_invariants(&plan)
+        crate::logical::verify::verify_physical_planner_invariants(&plan)
             .expect("all nested correlation must be flattened before physical planning");
     }
 
@@ -785,7 +785,7 @@ mod tests {
                  SELECT CAST(x AS INTEGER) FROM (VALUES (1)) AS t(x)\
              )",
         );
-        crate::verify::verify_physical_planner_invariants(&plan)
+        crate::logical::verify::verify_physical_planner_invariants(&plan)
             .expect("ANY lowering must retain the binder's common comparison type");
 
         let mut pending = vec![&plan];

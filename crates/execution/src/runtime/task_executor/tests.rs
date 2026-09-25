@@ -25,7 +25,9 @@ use paro_planner::expression::{
     AggregateExpression, AggregateType, ComparisonExpression, ComparisonType, ConstantExpression,
     Expression, OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame,
 };
-use paro_planner::operator::join::{AntiJoinMode, JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{
+    AntiJoinMode, JoinComparisonType, JoinCondition, JoinType,
+};
 
 use crate::explain::profiler::{ExplainProfileSnapshot, ExplainProfiler, OperatorProfiler};
 use crate::memory_runtime::QueryMemoryPool;

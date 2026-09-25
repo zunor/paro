@@ -4,8 +4,10 @@
 //! Canonicalize null-safe join equalities under executable non-NULL proofs.
 
 use paro_planner::expression::{ColumnRefExpression, ConjunctionType, Expression, OperatorType};
-use paro_planner::operator::{Join, JoinComparisonType, LogicalOperator, MarkJoinSemantics};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{
+    Join, JoinComparisonType, LogicalOperator, MarkJoinSemantics,
+};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 /// Replace `IS NOT DISTINCT FROM` with strict equality under the proof required
 /// by the comparison's observable semantics.
@@ -205,7 +207,7 @@ mod tests {
     use super::*;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, OperatorExpression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ColumnBinding, ComparisonJoin, ExpressionGet, Filter, JoinCondition, JoinType,
         MarkJoinSemantics, Projection,
     };

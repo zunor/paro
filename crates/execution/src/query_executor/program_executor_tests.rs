@@ -19,11 +19,11 @@ use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{
     AggregateExpression, ConstantExpression, Expression, ParameterExpression, ReferenceExpression,
 };
-use paro_planner::operator::join::{Join, JoinCondition, JoinType};
-use paro_planner::operator::{
+use paro_planner::logical::operator::join::{Join, JoinCondition, JoinType};
+use paro_planner::logical::operator::{
     Aggregate as LogicalAggregate, ExpressionGet, LogicalOperator, Order as LogicalOrder,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::physical::children::{PlanChildren, PlanChildrenArena};
@@ -53,7 +53,7 @@ use crate::runtime::{
     BreakerHandleRegistry, CleanupStatus, ParameterBindingEpoch, ParameterBindings,
     QueryOutputPort, QueryOutputPortStats, QueryRuntimeContext,
 };
-use paro_optimizer::physical::{PhysicalBuildContext, PhysicalPlanBuilder};
+use paro_optimizer::test_support::{PhysicalBuildContext, PhysicalPlanBuilder};
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -1346,7 +1346,7 @@ fn single_node_plan(kind: PhysicalNodeKind, output: RowType) -> PhysicalPlan {
         cardinality: None,
         kind,
         children: PlanChildren::Empty,
-        label: OperatorLabel::new(paro_planner::plan::PlanNodeId::SYNTHETIC, "TEST"),
+        label: OperatorLabel::new(paro_planner::logical::plan::PlanNodeId::SYNTHETIC, "TEST"),
     });
     PhysicalPlan::new(
         root,

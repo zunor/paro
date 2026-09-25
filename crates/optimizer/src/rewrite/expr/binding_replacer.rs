@@ -5,8 +5,8 @@
 
 use paro_common::types::LogicalType;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::{ColumnBinding, LogicalOperator};
-use paro_planner::visitor::LogicalOperatorVisitor;
+use paro_planner::logical::operator::{ColumnBinding, LogicalOperator};
+use paro_planner::logical::visitor::LogicalOperatorVisitor;
 
 #[derive(Debug, Clone)]
 pub struct ReplacementBinding {
@@ -26,6 +26,7 @@ impl ReplacementBinding {
         }
     }
 
+    #[cfg(test)]
     pub fn with_type(
         old_binding: ColumnBinding,
         new_binding: ColumnBinding,

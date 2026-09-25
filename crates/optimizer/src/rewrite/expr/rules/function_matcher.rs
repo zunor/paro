@@ -20,6 +20,7 @@ pub struct SpecificFunctionMatcher {
 }
 
 impl SpecificFunctionMatcher {
+    #[cfg(test)]
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
@@ -37,6 +38,7 @@ pub struct ManyFunctionMatcher {
 }
 
 impl ManyFunctionMatcher {
+    #[cfg(test)]
     pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             names: names.into_iter().map(|s| s.into()).collect(),

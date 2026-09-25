@@ -151,18 +151,14 @@ fn compile_query_cte_and_reject_unimplemented_options() {
             let detail_record: serde_json::Value = serde_json::from_str(&detail).unwrap();
             assert_eq!(detail_record["capture_level"], "Detail");
             let detail_events = detail_record["detail"].as_array().unwrap();
-            assert!(detail_events.is_empty(), "pipeline must not invent Memo proposals");
+            assert_eq!(detail_events.len(), 4);
+            assert!(detail_events.iter().all(|event| event["type"] == "Stage"));
             assert!(detail_record["search_counters"].as_array().unwrap().iter()
-                .any(|counter| counter["name"] == "pipeline_selected_nodes"));
-            let mut policy_sink = CollectingSink::new();
-            session.execute_simple_query("SET optimizer_search_policy='quality'", &mut policy_sink).await.unwrap();
-            let memo_detail = document(&mut session, "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) SELECT 1").await;
-            let memo_record: serde_json::Value = serde_json::from_str(&memo_detail).unwrap();
-            let detail_events = memo_record["detail"].as_array().unwrap();
-            assert!(!detail_events.is_empty());
-            assert!(detail_events.iter().any(|event| {
-                event["type"] == "Proposal"
-            }));
+                .any(|counter| counter["name"] == "selected_nodes"));
+            for setting in ["optimizer_search_policy", "disabled_optimizer_rules", "optimizer_aggregate_strategy"] {
+                let mut sink = CollectingSink::new();
+                assert!(session.execute_simple_query(&format!("SET {setting}='quality'"), &mut sink).await.is_err());
+            }
             assert!(receipt_payloads.iter().any(|payload| payload.contains("schema_version")));
             for sql in ["EXPLAIN (COMPILE) CREATE TABLE forbidden (x INT)", "EXPLAIN (COMPILE) SELECT 1 FORMAT JSON", "EXPLAIN (COMPILE) EXPLAIN SELECT 1"] {
                 let mut sink = CollectingSink::new();

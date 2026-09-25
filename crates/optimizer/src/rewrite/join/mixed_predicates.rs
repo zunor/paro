@@ -12,11 +12,11 @@
 use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, ExpressionIterator};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
     LogicalOperator,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::rewrite::expr::traversal::{expression_join_side, into_associative_terms};
 
@@ -227,10 +227,10 @@ mod tests {
     use paro_planner::expression::{
         ColumnRefExpression, ComparisonExpression, ReferenceExpression,
     };
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, Filter, JoinCondition,
     };
-    use paro_planner::plan::CardinalityEstimate;
+    use paro_planner::logical::plan::CardinalityEstimate;
 
     fn column(table: usize, column: usize) -> Expression {
         Expression::ColumnRef(
@@ -342,7 +342,7 @@ mod tests {
                     .into(),
             )],
         );
-        filter.projection_map = paro_planner::operator::ProjectionMap::new(vec![3, 0]);
+        filter.projection_map = paro_planner::logical::operator::ProjectionMap::new(vec![3, 0]);
         let plan = OwnedLogicalPlan::new(&context, LogicalOperator::Filter(filter));
         let expected = plan.output_layout();
         let actual = JoinPredicateNormalizer::new(&context)

@@ -23,7 +23,7 @@ use crate::binder::Binder;
 use crate::expression::{
     Expression, ExpressionIterator, SharedExpressionPayload, WindowExpression,
 };
-use crate::operator::{
+use crate::logical::operator::{
     Aggregate, ColumnBinding, Distinct, ExpressionGet, Filter, LogicalOperator, Projection,
 };
 use paro_common::error::{self as paro_error, Result};
@@ -245,8 +245,11 @@ impl Binder {
             // Each physical window runtime owns one partition/order layout. Stack groups so prior
             // outputs remain attached to their rows while the next group applies its own ordering.
             for (window_index, expressions) in planned_groups {
-                let window =
-                    crate::operator::Window::new(window_index, expressions, self.wrap_plan(root));
+                let window = crate::logical::operator::Window::new(
+                    window_index,
+                    expressions,
+                    self.wrap_plan(root),
+                );
                 root = LogicalOperator::Window(window);
             }
         }
@@ -327,7 +330,7 @@ impl Binder {
 mod tests {
     use super::group_window_expressions;
     use crate::expression::{ColumnRefExpression, Expression, WindowExpression, WindowFrame};
-    use crate::operator::ColumnBinding;
+    use crate::logical::operator::ColumnBinding;
     use paro_common::types::LogicalType;
     use paro_function::window::WindowFunction;
 

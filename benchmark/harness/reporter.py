@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from .evidence_schema import EVIDENCE_SCHEMA_VERSION
+
 from datetime import datetime
 import json
 import math
@@ -71,7 +73,7 @@ class BenchmarkReporter:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "schema_version": EVIDENCE_SCHEMA_VERSION,
-            "version": 3,
+            "version": EVIDENCE_SCHEMA_VERSION,
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
             "git": self._collect_git_info(),
             "system": self._collect_system_info(),
@@ -316,7 +318,7 @@ class BenchmarkReporter:
                 sample_cursor = end
         if sample_cursor != len(sample_ids):
             raise ValueError("registered sample_ids do not match payload samples")
-        payload["version"] = 3
+        payload["version"] = EVIDENCE_SCHEMA_VERSION
         payload["schema_version"] = EVIDENCE_SCHEMA_VERSION
         payload["ownership"] = {
             "schema_version": EVIDENCE_SCHEMA_VERSION,

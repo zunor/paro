@@ -9,7 +9,7 @@ use crate::binder::ir::statement::{
     BoundDropInfo, BoundDropPropertyGraphInfo, BoundRefreshPropertyGraphInfo,
 };
 use crate::binder::ir::CTEMaterialize;
-use crate::operator::SetOpType;
+use crate::logical::operator::SetOpType;
 use paro_catalog::entry::{CreateIndexInfo, TableCatalogEntry};
 use paro_common::types::LogicalType;
 use paro_function::copy::{CopyFunctionBindData, CopyToFunction};

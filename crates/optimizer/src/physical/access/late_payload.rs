@@ -13,11 +13,11 @@ use paro_common::types::LogicalType;
 use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, ConjunctionType, Expression, OperatorType};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection, ProjectionMap, RowFetch,
     RowFetchSource,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::diagnostics::rejection::{
     reject, RejectionReasons, TransformationRejectionGuard as Guard,
@@ -443,8 +443,8 @@ fn append_prefix_through_operator(
 fn append_prefix_join_child(
     left: &mut OwnedLogicalPlan,
     right: &mut OwnedLogicalPlan,
-    left_projection: Option<&mut paro_planner::operator::ProjectionMap>,
-    right_projection: Option<&mut paro_planner::operator::ProjectionMap>,
+    left_projection: Option<&mut paro_planner::logical::operator::ProjectionMap>,
+    right_projection: Option<&mut paro_planner::logical::operator::ProjectionMap>,
     table_index: usize,
     source_binding: ColumnBinding,
     byte_width: usize,
@@ -549,7 +549,7 @@ fn prove_selective_projection_candidate_profiled(
 pub(crate) fn prove_selective_projection_inputs<'a>(
     expressions: &[Expression],
     child_is_fetch: bool,
-    child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    child_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
     unique_source: impl Fn(usize) -> Option<&'a Get>,
     path_for_source: impl Fn(usize) -> Option<RowIdPath>,
     source_rows: impl Fn(usize) -> Option<u64>,
@@ -793,8 +793,8 @@ pub(crate) struct AggregateTopNInputs<'a, Child> {
     pub orders: &'a [paro_planner::binder::ir::OrderByNode],
     pub output: &'a Projection<Child>,
     pub child_operator: &'a LogicalOperator<Child>,
-    pub child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
-    pub aggregate_input_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    pub child_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
+    pub aggregate_input_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
 }
 
 pub(crate) fn prove_aggregate_topn_inputs<'a, Child>(
@@ -1009,7 +1009,7 @@ pub(crate) struct RowPreservingInputs<'a, Child> {
     pub projection_map: &'a ProjectionMap,
     pub output: &'a Projection<Child>,
     pub child_is_fetch: bool,
-    pub child_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    pub child_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
 }
 
 pub(crate) fn prove_row_preserving_inputs<'a, Child>(
@@ -2262,8 +2262,8 @@ fn append_virtual_rowid(
 fn append_projected_join_rowid(
     left: &mut Box<OwnedLogicalPlan>,
     right: &mut Box<OwnedLogicalPlan>,
-    left_projection: &mut paro_planner::operator::ProjectionMap,
-    right_projection: &mut paro_planner::operator::ProjectionMap,
+    left_projection: &mut paro_planner::logical::operator::ProjectionMap,
+    right_projection: &mut paro_planner::logical::operator::ProjectionMap,
     side: RowIdJoinSide,
     path: &RowIdPath,
     table_index: usize,
@@ -2298,7 +2298,7 @@ fn append_projected_join_rowid(
 
 fn include_required_join_outputs(
     child: &OwnedLogicalPlan,
-    projection: &mut paro_planner::operator::ProjectionMap,
+    projection: &mut paro_planner::logical::operator::ProjectionMap,
     required: &HashSet<ColumnBinding>,
 ) {
     for (index, binding) in child.get_column_bindings().into_iter().enumerate() {

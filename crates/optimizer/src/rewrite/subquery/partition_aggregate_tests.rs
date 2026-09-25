@@ -24,12 +24,12 @@ use paro_function::scalar::cast::{
 };
 use paro_function::scalar::string::get_substring_functions;
 use paro_function::scalar::ScalarFunctionSet;
+use paro_planner::binder::Planner;
 use paro_planner::expression::{
     ColumnRefExpression, Expression, ExpressionIterator, ExpressionVisitDecision, OperatorType,
 };
-use paro_planner::operator::LogicalOperator;
-use paro_planner::operator::{ColumnBinding, Projection};
-use paro_planner::planner::Planner;
+use paro_planner::logical::operator::LogicalOperator;
+use paro_planner::logical::operator::{ColumnBinding, Projection};
 use paro_storage::table::table_factory::TableFactory;
 
 use super::partition_aggregate::CorrelatedPartitionAggregate;
@@ -619,8 +619,8 @@ impl PlanInspection {
     }
 }
 
-fn inspect_plan(plan: &paro_planner::plan::OwnedLogicalPlan) -> PlanInspection {
-    fn visit(plan: &paro_planner::plan::OwnedLogicalPlan, result: &mut PlanInspection) {
+fn inspect_plan(plan: &paro_planner::logical::plan::OwnedLogicalPlan) -> PlanInspection {
+    fn visit(plan: &paro_planner::logical::plan::OwnedLogicalPlan, result: &mut PlanInspection) {
         match &plan.operator {
             LogicalOperator::RowFetch(fetch) => {
                 result.late_fetches += 1;
@@ -647,11 +647,11 @@ fn inspect_plan(plan: &paro_planner::plan::OwnedLogicalPlan) -> PlanInspection {
                 result.aggregate_groups.push(aggregate.groups.len());
                 result.group_dependencies += aggregate.group_dependencies.len();
             }
-            LogicalOperator::Join(paro_planner::operator::Join::Comparison(join)) => {
+            LogicalOperator::Join(paro_planner::logical::operator::Join::Comparison(join)) => {
                 if !join.duplicate_eliminated_columns.is_empty() {
                     result.delim_joins += 1;
                 }
-                if join.join_type == paro_planner::operator::JoinType::Left {
+                if join.join_type == paro_planner::logical::operator::JoinType::Left {
                     result.left_joins += 1;
                 }
                 if matches!(join.left.operator, LogicalOperator::Filter(_))
@@ -906,7 +906,7 @@ fn scalar_binding_visible_above_filter_does_not_rewrite() {
     let scalar_binding = find_single_scalar_binding(&plan).expect("correlated scalar binding");
     let scalar_type = find_binding_type(&plan, scalar_binding).expect("scalar type");
     let parent_index = planner.binder.bind_context.generate_table_index();
-    plan = paro_planner::plan::OwnedLogicalPlan::new(
+    plan = paro_planner::logical::plan::OwnedLogicalPlan::new(
         &planner.binder.bind_context,
         LogicalOperator::Projection(Projection::new(
             parent_index,
@@ -929,10 +929,12 @@ fn scalar_binding_visible_above_filter_does_not_rewrite() {
 }
 
 fn find_single_scalar_binding(
-    plan: &paro_planner::plan::OwnedLogicalPlan,
+    plan: &paro_planner::logical::plan::OwnedLogicalPlan,
 ) -> Option<ColumnBinding> {
-    if let LogicalOperator::Join(paro_planner::operator::Join::Comparison(join)) = &plan.operator {
-        if join.join_type == paro_planner::operator::JoinType::Single {
+    if let LogicalOperator::Join(paro_planner::logical::operator::Join::Comparison(join)) =
+        &plan.operator
+    {
+        if join.join_type == paro_planner::logical::operator::JoinType::Single {
             return join.right.get_column_bindings().first().copied();
         }
     }
@@ -942,7 +944,7 @@ fn find_single_scalar_binding(
 }
 
 fn find_binding_type(
-    plan: &paro_planner::plan::OwnedLogicalPlan,
+    plan: &paro_planner::logical::plan::OwnedLogicalPlan,
     binding: ColumnBinding,
 ) -> Option<LogicalType> {
     plan.get_column_bindings()
@@ -956,7 +958,7 @@ fn find_binding_type(
         })
 }
 
-fn optimize_sql(sql: &str) -> paro_planner::plan::OwnedLogicalPlan {
+fn optimize_sql(sql: &str) -> paro_planner::logical::plan::OwnedLogicalPlan {
     let session = setup_session();
     let statement = paro_parser::parse_one(sql)
         .expect("parse negative case")

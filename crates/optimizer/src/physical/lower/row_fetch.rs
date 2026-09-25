@@ -8,8 +8,8 @@ use super::*;
 impl PhysicalPlanBuilder {
     pub(crate) fn lower_row_fetch(
         &mut self,
-        fetch: &LogicalRowFetch<SelectedChild>,
-        project: Option<&LogicalProjection<SelectedChild>>,
+        fetch: &LogicalRowFetch<PreparedChild>,
+        project: Option<&LogicalProjection<PreparedChild>>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(fetch.child.as_ref())?;
         let mut mappings = Vec::with_capacity(fetch.sources.len());

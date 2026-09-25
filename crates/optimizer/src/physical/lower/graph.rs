@@ -22,7 +22,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_graph_expand(
         &mut self,
-        expand: &LogicalGraphExpand<SelectedChild>,
+        expand: &LogicalGraphExpand<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let (min_hops, max_hops) = graph_hop_range(expand)?;
         if (min_hops != 1 || max_hops != 1) && expand.source_label != expand.target_label {
@@ -128,7 +128,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_graph_project(
         &mut self,
-        project: &LogicalProjection<SelectedChild>,
+        project: &LogicalProjection<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(project.child.as_ref())?;
         let schema_name = extract_schema_name_from_logical(project.child.as_ref())

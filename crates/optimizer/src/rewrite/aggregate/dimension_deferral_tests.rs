@@ -1,11 +1,11 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
-use paro_planner::plan::{
+use paro_planner::binder::Planner;
+use paro_planner::logical::operator::{ColumnBinding, Join, LogicalOperator};
+use paro_planner::logical::plan::{
     CardinalityEstimate, CardinalityProvenance, NodeStats, OwnedLogicalPlan, PlanNodeId,
 };
-use paro_planner::planner::Planner;
 
 use super::dimension_deferral;
 use crate::rewrite::expr::traversal::visit_expression;
@@ -256,7 +256,7 @@ fn assert_expression_bindings_belong_to(
 
 fn collect_bindings(
     expression: &paro_planner::expression::Expression,
-    bindings: &mut Vec<paro_planner::operator::ColumnBinding>,
+    bindings: &mut Vec<paro_planner::logical::operator::ColumnBinding>,
 ) {
     visit_expression(expression, &mut |expression| {
         if let paro_planner::expression::Expression::ColumnRef(column) = expression {

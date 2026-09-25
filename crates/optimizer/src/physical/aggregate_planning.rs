@@ -18,7 +18,7 @@ use paro_function::aggregate::{
     AggregateDirectUpdate, DecimalDirectUpdate, DirectGroupedAggregateProgram,
 };
 use paro_planner::expression::Expression;
-use paro_planner::operator::Aggregate as LogicalAggregate;
+use paro_planner::logical::operator::Aggregate as LogicalAggregate;
 
 use super::specs::aggregate::{PerfectHashAggregatePlan, PerfectHashResourceContract};
 

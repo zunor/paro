@@ -15,11 +15,11 @@ use paro_planner::expression::{
     ComparisonType, ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
     ReferenceExpression,
 };
-use paro_planner::operator::aggregate::GroupDependency;
-use paro_planner::operator::{
+use paro_planner::logical::operator::aggregate::GroupDependency;
+use paro_planner::logical::operator::{
     Aggregate, ColumnBinding, ExpressionGet, Filter, LogicalOperator, PostAggregateReduction,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 use paro_storage::statistics::NumericStats;
 
 use super::*;

@@ -8,8 +8,8 @@ pub mod in_clause;
 pub mod rewriter;
 pub(crate) mod traversal;
 
-use paro_planner::operator::{ComparisonJoin, Join, LogicalOperator};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{ComparisonJoin, Join, LogicalOperator};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::rewrite::expr::rules::arithmetic::ArithmeticSimplificationRule;
 use crate::rewrite::expr::rules::comparison::ComparisonSimplificationRule;
@@ -65,7 +65,7 @@ impl CanonicalScalars {
             self.next_sweep = self.completed.len().saturating_mul(2).max(256);
         }
         let mut changed = false;
-        paro_planner::visitor::enumerate_expressions(operator, |expression| {
+        paro_planner::logical::visitor::enumerate_expressions(operator, |expression| {
             if self
                 .completed
                 .get(&expression.allocation_identity())

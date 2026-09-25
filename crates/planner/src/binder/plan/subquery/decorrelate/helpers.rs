@@ -5,8 +5,8 @@
 
 use crate::binder::Binder;
 use crate::expression::Expression;
-use crate::operator::{Filter, JoinType, LogicalOperator};
-use crate::plan::OwnedLogicalPlan;
+use crate::logical::operator::{Filter, JoinType, LogicalOperator};
+use crate::logical::plan::OwnedLogicalPlan;
 use paro_common::runtime_value::Value;
 
 pub(super) fn can_push_to_left_child(join_type: JoinType) -> bool {

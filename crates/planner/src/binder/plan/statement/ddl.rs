@@ -15,7 +15,7 @@ use crate::binder::bind::statement::drop::BoundDropInfo;
 use crate::binder::bind::statement::drop_property_graph::BoundDropPropertyGraphInfo;
 use crate::binder::bind::statement::refresh_property_graph::BoundRefreshPropertyGraphInfo;
 use crate::binder::Binder;
-use crate::operator::{
+use crate::logical::operator::{
     Alter, CreateIndex, CreatePropertyGraph, CreateRoutine, CreateSchema, CreateSequence,
     CreateTable, CreateView, Drop, DropPropertyGraph, LogicalOperator, RefreshPropertyGraph,
 };

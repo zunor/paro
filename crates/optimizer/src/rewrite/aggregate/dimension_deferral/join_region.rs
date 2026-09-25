@@ -9,21 +9,21 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{AggregateType, Expression};
-use paro_planner::operator::{
-    ColumnBinding, ComparisonJoin, JoinComparisonType, JoinCondition, JoinType,
-};
-use paro_planner::operator::{Join, LogicalOperator};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{ColumnBinding, ComparisonJoin, JoinCondition, JoinType};
+use paro_planner::logical::operator::{Join, LogicalOperator};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::rewrite::expr::traversal::visit_expression;
 
 use super::inline_projections;
+use super::is_plain_inner_equi_join;
 use super::{expression_domain, ExpressionDomain};
 
 /// Rotate one pure inner-equi region so the dimension carrying the widest SQL
 /// grouping payload is the direct right child. This is semantic region
 /// decomposition, not a join-order decision: the fact-side joins retain all
 /// predicates, and Memo still costs both the original and deferred forms.
+#[cfg(test)]
 pub(super) fn isolate_widest_dimension(
     mut plan: OwnedLogicalPlan,
     bind_context: &BindContext,
@@ -47,6 +47,7 @@ pub(super) fn isolate_widest_dimension(
     Ok(plan)
 }
 
+#[cfg(test)]
 fn widest_dimension_candidate(plan: &OwnedLogicalPlan) -> Option<(usize, usize)> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
@@ -98,6 +99,7 @@ fn widest_dimension_candidate(plan: &OwnedLogicalPlan) -> Option<(usize, usize)>
 /// Ownership-independent selection. Callers supply exact visible relation
 /// bindings; no plan traversal, allocation identity, or cached statistics enter
 /// the payload-width/tie-break decision.
+#[cfg(test)]
 pub(crate) fn select_dimension(
     expanded_groups: &[Expression],
     expanded_aggregates: &[Expression],
@@ -165,6 +167,7 @@ pub(crate) fn select_dimension(
 /// the recognizer at this semantic boundary lets a separate sharing rule
 /// materialize a repeated dimension without disabling fact-side
 /// preaggregation.
+#[cfg(test)]
 fn dimension_relation_table_index(relation: &OwnedLogicalPlan) -> Option<usize> {
     match &relation.operator {
         LogicalOperator::Get(get) => Some(get.table_index),
@@ -178,6 +181,7 @@ fn is_movable(expression: &Expression) -> bool {
     properties.can_share_evaluation() && !properties.is_reorder_fence()
 }
 
+#[cfg(test)]
 fn group_width(expression: &Expression) -> usize {
     match expression.return_type() {
         LogicalType::Varchar => 32,
@@ -186,6 +190,7 @@ fn group_width(expression: &Expression) -> usize {
     }
 }
 
+#[cfg(test)]
 fn collect_inner_equi_region<'a>(
     plan: &'a OwnedLogicalPlan,
     relations: &mut Vec<&'a OwnedLogicalPlan>,
@@ -202,20 +207,7 @@ fn collect_inner_equi_region<'a>(
     Some(())
 }
 
-pub(crate) fn is_plain_inner_equi_join<Child>(join: &ComparisonJoin<Child>) -> bool {
-    join.join_type == JoinType::Inner
-        && join.build_side_constraint == paro_planner::operator::JoinBuildSideConstraint::Either
-        && !join.conditions.is_empty()
-        && join.mark_index.is_none()
-        && join.duplicate_eliminated_columns.is_empty()
-        && !join.delim_flipped
-        && join.conditions.iter().all(|condition| {
-            condition.comparison == JoinComparisonType::Equal
-                && is_movable(&condition.left)
-                && is_movable(&condition.right)
-        })
-}
-
+#[cfg(test)]
 pub(crate) fn condition_crosses_boundary(
     condition: &JoinCondition,
     fact: &HashSet<ColumnBinding>,
@@ -231,6 +223,7 @@ pub(crate) fn condition_crosses_boundary(
     )
 }
 
+#[cfg(test)]
 fn isolate_below_projections(
     mut plan: OwnedLogicalPlan,
     projection_depth: usize,
@@ -258,6 +251,7 @@ fn isolate_below_projections(
     Ok(plan)
 }
 
+#[cfg(test)]
 fn isolate_join_region(
     plan: OwnedLogicalPlan,
     table_index: usize,
@@ -314,6 +308,7 @@ fn isolate_join_region(
     })
 }
 
+#[cfg(test)]
 fn flatten_inner_equi_region(
     plan: OwnedLogicalPlan,
     relations: &mut Vec<OwnedLogicalPlan>,
@@ -335,6 +330,7 @@ fn flatten_inner_equi_region(
     Ok(())
 }
 
+#[cfg(test)]
 fn rebuild_inner_equi_region(
     mut relations: Vec<OwnedLogicalPlan>,
     mut conditions: Vec<JoinCondition>,
@@ -403,6 +399,7 @@ fn rebuild_inner_equi_region(
 /// evaluates it. A flattened inner-join predicate retains the orientation of
 /// its former tree, which is not necessarily the orientation of the rebuilt
 /// tree.
+#[cfg(test)]
 pub(crate) fn orient_condition(
     mut condition: JoinCondition,
     left_bindings: &HashSet<ColumnBinding>,
@@ -424,6 +421,7 @@ pub(crate) fn orient_condition(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn expression_references_any(
     expression: &Expression,
     bindings: &HashSet<ColumnBinding>,

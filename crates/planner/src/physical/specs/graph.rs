@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::expression::Expression;
-use crate::operator::graph_expand::ExpandDirection;
+use crate::logical::operator::graph_expand::ExpandDirection;
 use paro_catalog::entry::{EdgeTableInfo, VertexTableInfo};
 use paro_common::types::LogicalType;
 use paro_parser::ast::PathMode;

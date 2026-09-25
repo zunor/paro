@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use crate::binder::bind::expr::ExpressionBinder;
 use crate::binder::ir::BoundSelect;
 use crate::expression::{ColumnRefExpression, Expression};
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnRef, Expr, FunctionCall};

@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 from pathlib import Path
 import json
 import sys
@@ -14,7 +17,7 @@ from tpcds_compare import (read_pre_touch, require_first_target_miss, collect_pr
 class PreTouchTests(unittest.TestCase):
     def test_explicit_second_occurrence_does_not_relax_first_miss_gate(self):
         fp = statement_fingerprint('SELECT 1')
-        identity = {"schema_version": 3, "artifact": [1, 2],
+        identity = {"schema_version": 4, "artifact": [1, 2],
                     "structure": [3, 4], "dependencies": [5, 6]}
         cursor = Mock()
         cursor.description = []
@@ -27,24 +30,24 @@ class PreTouchTests(unittest.TestCase):
             return (record_type, 'receipt', 0, 0, 'receipt', 1,
                     record_type, record_id, json.dumps(payload))
         compile_receipt = {
-            'schema_version': 3, 'artifact_identity': identity,
-            'search_stop': {'Observed': 'QualityPolicySatisfied'},
-            'search_complete': {'Observed': False},
-            'quality_policy_satisfied': {'Observed': True},
+            'schema_version': 4, 'artifact_identity': identity,
+            'planning_status': {'Observed': 'Planned'},
+
+
             'budget_limited': {'Observed': False},
-            'obligations': {'Observed': 0}, 'groups': {'Observed': 1},
-            'logical_expressions': {'Observed': 1},
-            'physical_expressions': {'Observed': 1},
+
+
+
             'expected_class': {'Observed': 2}, 'variant_count': {'Observed': 1},
             'omitted_variants': 0, 'compile_work': None,
         }
         cursor.fetchall.return_value = [
             row('statement_cache', 6, {
-                'schema_version': 3, 'decision_id': 6, 'query_fingerprint': fp,
+                'schema_version': 4, 'decision_id': 6, 'query_fingerprint': fp,
                 'occurrence': 9, 'cache_hit': True, 'artifact_identity': identity,
                 'compile_work': None, 'compile_receipt': compile_receipt}),
             row('execution_receipt', 7, {
-            'schema_version': 3, 'execution_id': 7, 'statement_decision_id': 6,
+            'schema_version': 4, 'execution_id': 7, 'statement_decision_id': 6,
                 'artifact_identity': identity, 'expected_class': 2,
                 'actual_class': 2, 'actual_fingerprint': [7, 8],
                 'resources': {

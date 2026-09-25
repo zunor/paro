@@ -12,7 +12,7 @@ use crate::binder::ir::BoundFromItem;
 use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;
 use crate::expression::Expression;
-use crate::operator::{CopyTo, Filter, Insert, LogicalOperator, TableFunctionGet};
+use crate::logical::operator::{CopyTo, Filter, Insert, LogicalOperator, TableFunctionGet};
 use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;

@@ -26,11 +26,11 @@ use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression, ExpressionIterator,
     ExpressionVisitDecision, OperatorType,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, ColumnBinding, CrossProduct, Filter, Get, Join, JoinBuildSideConstraint,
     LogicalOperator, Projection,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::rewrite::aggregate::post_reduction::alpha::AlphaBindings;
 use crate::rewrite::aggregate::semantic_kernels::aggregate_kernels_equal;
@@ -40,52 +40,6 @@ pub fn optimize_plan(
     bind_context: &BindContext,
 ) -> Result<OwnedLogicalPlan> {
     optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
-}
-
-/// Clone-free structural prefilter for optional-candidate construction. Exact
-/// source and expression equivalence remains the responsibility of
-/// [`recognize`]; a false positive here only creates a declined candidate.
-pub(crate) fn contains_candidate_root(plan: &OwnedLogicalPlan) -> bool {
-    let mut pending = vec![plan];
-    while let Some(candidate) = pending.pop() {
-        if let LogicalOperator::Projection(projection) = &candidate.operator {
-            let mut leaves = Vec::new();
-            if collect_cross_leaves(projection.child.as_ref(), &mut leaves).is_some()
-                && leaves
-                    .into_iter()
-                    .filter(|leaf| has_scalar_branch_shape(leaf))
-                    .take(2)
-                    .count()
-                    == 2
-            {
-                return true;
-            }
-        }
-        pending.extend(candidate.children());
-    }
-    false
-}
-
-fn has_scalar_branch_shape(plan: &OwnedLogicalPlan) -> bool {
-    let LogicalOperator::Projection(wrapper) = &plan.operator else {
-        return false;
-    };
-    let LogicalOperator::Aggregate(wrapper) = &wrapper.child.operator else {
-        return false;
-    };
-    let LogicalOperator::Projection(scalar) = &wrapper.child.operator else {
-        return false;
-    };
-    let LogicalOperator::Aggregate(reduction) = &scalar.child.operator else {
-        return false;
-    };
-    match &reduction.child.operator {
-        LogicalOperator::Get(_) => true,
-        LogicalOperator::Filter(filter) => {
-            matches!(filter.child.operator, LogicalOperator::Get(_))
-        }
-        _ => false,
-    }
 }
 
 pub fn optimize_plan_with_change(
@@ -686,8 +640,8 @@ fn expression_mentions_any(expression: &Expression, bindings: &HashSet<ColumnBin
 
 #[cfg(test)]
 mod tests {
-    use paro_planner::operator::LogicalOperator;
-    use paro_planner::planner::Planner;
+    use paro_planner::binder::Planner;
+    use paro_planner::logical::operator::LogicalOperator;
 
     use super::super::partition_aggregate_tests::setup_session;
     use crate::optimizer::Optimizer as TestOptimizer;

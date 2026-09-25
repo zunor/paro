@@ -8,14 +8,14 @@ use std::collections::{HashMap, HashSet};
 use paro_common::runtime_value::Value;
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::expression::{ComparisonType, ConjunctionType, OperatorType};
-use paro_planner::operator::empty_result::EmptyResult;
-use paro_planner::operator::Filter as PlannerFilter;
-use paro_planner::operator::{
+use paro_planner::logical::operator::empty_result::EmptyResult;
+use paro_planner::logical::operator::Filter as PlannerFilter;
+use paro_planner::logical::operator::{
     AnyJoin, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinSide, JoinType,
     LogicalOperator, Projection,
 };
-use paro_planner::plan::OwnedLogicalPlan;
-use paro_planner::visitor::LogicalOperatorVisitor;
+use paro_planner::logical::plan::OwnedLogicalPlan;
+use paro_planner::logical::visitor::LogicalOperatorVisitor;
 
 use crate::rewrite::expr::binding_replacer::{ColumnBindingReplacer, ReplacementBinding};
 use crate::rewrite::expr::join_has_evaluation_fence;
@@ -228,7 +228,7 @@ impl FilterPushdown {
 
     fn pushdown_materialized_cte(
         &mut self,
-        mut cte: paro_planner::operator::MaterializedCTE,
+        mut cte: paro_planner::logical::operator::MaterializedCTE,
     ) -> LogicalOperator {
         let mut cte_query_pushdown = FilterPushdown::new();
         cte.cte_query = Box::new(cte_query_pushdown.rewrite_plan(*cte.cte_query));
@@ -679,7 +679,7 @@ impl FilterPushdown {
     /// SEMI/ANTI joins without retaining a materialized marker column.
     fn lower_consumed_exists_marker(&mut self, join: &mut ComparisonJoin) {
         if join.join_type != JoinType::Mark
-            || join.mark_semantics != paro_planner::operator::MarkJoinSemantics::TwoValued
+            || join.mark_semantics != paro_planner::logical::operator::MarkJoinSemantics::TwoValued
         {
             return;
         }
@@ -698,7 +698,7 @@ impl FilterPushdown {
     /// represented by a semi/anti join before removing the returned filter.
     fn consumed_marker_truth_filter(&self, join: &ComparisonJoin) -> Option<(usize, bool)> {
         let mark_index = join.mark_index?;
-        let mark_binding = paro_planner::operator::ColumnBinding::new(mark_index, 0);
+        let mark_binding = paro_planner::logical::operator::ColumnBinding::new(mark_index, 0);
         let mut marker_filters = self
             .filters
             .iter()
@@ -825,7 +825,7 @@ impl FilterPushdown {
         }
 
         let mut common_domains: Option<
-            HashMap<paro_planner::operator::ColumnBinding, Vec<Expression>>,
+            HashMap<paro_planner::logical::operator::ColumnBinding, Vec<Expression>>,
         > = None;
         for branch in branches {
             let mut branch_domains = HashMap::new();
@@ -876,7 +876,7 @@ impl FilterPushdown {
 
     fn collect_branch_equalities(
         expr: &Expression,
-        domains: &mut HashMap<paro_planner::operator::ColumnBinding, Vec<Expression>>,
+        domains: &mut HashMap<paro_planner::logical::operator::ColumnBinding, Vec<Expression>>,
     ) {
         for term in associative_terms(expr, ConjunctionType::And) {
             let Expression::Comparison(comparison) = term else {
@@ -914,7 +914,7 @@ impl FilterPushdown {
     /// Push down through an Aggregate operator.
     fn pushdown_aggregate(
         &mut self,
-        mut agg: paro_planner::operator::Aggregate,
+        mut agg: paro_planner::logical::operator::Aggregate,
     ) -> LogicalOperator {
         let mut child_pushdown = FilterPushdown::new();
         let mut remaining_filters = Vec::new();
@@ -967,7 +967,7 @@ impl FilterPushdown {
     /// The expression contract for crossing an aggregate output boundary.
     /// Callers that require an ordinary grouping domain check that separately.
     pub(crate) fn group_filter_can_move<Child>(
-        agg: &paro_planner::operator::Aggregate<Child>,
+        agg: &paro_planner::logical::operator::Aggregate<Child>,
         predicate: &Expression,
     ) -> bool {
         let mut pushable = !predicate.evaluation_properties().is_reorder_fence();
@@ -991,7 +991,7 @@ impl FilterPushdown {
     /// Push down through a Distinct operator.
     fn pushdown_distinct(
         &mut self,
-        mut distinct: paro_planner::operator::Distinct,
+        mut distinct: paro_planner::logical::operator::Distinct,
     ) -> LogicalOperator {
         // Distinct passes through all filters
         let mut child_pushdown = FilterPushdown::new();
@@ -1009,7 +1009,10 @@ impl FilterPushdown {
     }
 
     /// Push down through an Order operator.
-    fn pushdown_order(&mut self, mut order: paro_planner::operator::Order) -> LogicalOperator {
+    fn pushdown_order(
+        &mut self,
+        mut order: paro_planner::logical::operator::Order,
+    ) -> LogicalOperator {
         // Order passes through all filters
         let mut child_pushdown = FilterPushdown::new();
 
@@ -1026,7 +1029,10 @@ impl FilterPushdown {
     }
 
     /// Push down through a Limit operator.
-    fn pushdown_limit(&mut self, mut limit: paro_planner::operator::Limit) -> LogicalOperator {
+    fn pushdown_limit(
+        &mut self,
+        mut limit: paro_planner::logical::operator::Limit,
+    ) -> LogicalOperator {
         // LIMIT is a cardinality boundary: filtering its input can replace rows that the LIMIT
         // would otherwise have selected. Keep caller predicates above it while still optimizing
         // the child with an independent pushdown pass.
@@ -1036,7 +1042,10 @@ impl FilterPushdown {
     }
 
     /// Push down through a Window operator.
-    fn pushdown_window(&mut self, mut window: paro_planner::operator::Window) -> LogicalOperator {
+    fn pushdown_window(
+        &mut self,
+        mut window: paro_planner::logical::operator::Window,
+    ) -> LogicalOperator {
         let mut child_pushdown = FilterPushdown::new();
         let mut remaining_filters = Vec::new();
 
@@ -1075,7 +1084,7 @@ impl FilterPushdown {
     /// Push down through a SetOperation operator.
     fn pushdown_set_operation(
         &mut self,
-        mut setop: paro_planner::operator::SetOperation,
+        mut setop: paro_planner::logical::operator::SetOperation,
     ) -> LogicalOperator {
         // Selection distributes over UNION, INTERSECT, and EXCEPT, including
         // their ALL variants. Rebinding is ordinal because a set operation
@@ -1110,7 +1119,7 @@ impl FilterPushdown {
                 left_bindings.iter().zip(right_bindings.iter()).enumerate()
             {
                 let output_binding =
-                    paro_planner::operator::ColumnBinding::new(setop.table_index, ordinal);
+                    paro_planner::logical::operator::ColumnBinding::new(setop.table_index, ordinal);
                 left_replacer
                     .replacement_bindings
                     .push(ReplacementBinding::new(output_binding, *left_binding));
@@ -1177,7 +1186,7 @@ impl Default for FilterPushdown {
 
 fn marker_truth_test(
     expression: &Expression,
-    marker: paro_planner::operator::ColumnBinding,
+    marker: paro_planner::logical::operator::ColumnBinding,
 ) -> Option<bool> {
     match expression {
         Expression::ColumnRef(column) if column.depth == 0 && column.binding == marker => {
@@ -1228,18 +1237,18 @@ fn lower_mark_join_for_truth(join: &mut ComparisonJoin, expected: bool) -> bool 
     if expected {
         join.join_type = JoinType::Semi;
         join.mark_index = None;
-        join.mark_semantics = paro_planner::operator::MarkJoinSemantics::NotMark;
+        join.mark_semantics = paro_planner::logical::operator::MarkJoinSemantics::NotMark;
         return true;
     }
-    if join.mark_semantics == paro_planner::operator::MarkJoinSemantics::TwoValued {
+    if join.mark_semantics == paro_planner::logical::operator::MarkJoinSemantics::TwoValued {
         // EXISTS is two-valued, so its negative truth test is an ordinary anti
         // join.
         join.join_type = JoinType::Anti;
         join.mark_index = None;
-        join.mark_semantics = paro_planner::operator::MarkJoinSemantics::NotMark;
+        join.mark_semantics = paro_planner::logical::operator::MarkJoinSemantics::NotMark;
         return true;
     }
-    if join.mark_semantics == paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(0)
+    if join.mark_semantics == paro_planner::logical::operator::MarkJoinSemantics::ThreeValuedFrom(0)
         && join.conditions.len() == 1
         && join.conditions[0].comparison == JoinComparisonType::Equal
     {

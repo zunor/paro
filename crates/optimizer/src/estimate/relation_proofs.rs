@@ -5,11 +5,11 @@
 //! module. CTE publication uses definition identities, not compacted ordinals.
 
 use paro_planner::expression::Expression;
-use paro_planner::operator::cte::{CteColumnId, CteOutputColumn};
-use paro_planner::operator::{LogicalOperator, LogicalOutputLayout, SetOpType};
-use paro_planner::plan::finite_domain::{DomainValue, FiniteDomains, MAX_DOMAIN_VALUES};
-use paro_planner::plan::{LogicalPlanPostOrderFolder, OwnedLogicalPlan};
-use paro_planner::plan::{NodeStats, UniqueKey, UniqueKeyColumn, UniqueKeyProvenance};
+use paro_planner::logical::operator::cte::{CteColumnId, CteOutputColumn};
+use paro_planner::logical::operator::{LogicalOperator, LogicalOutputLayout, SetOpType};
+use paro_planner::logical::plan::finite_domain::{DomainValue, FiniteDomains, MAX_DOMAIN_VALUES};
+use paro_planner::logical::plan::{LogicalPlanPostOrderFolder, OwnedLogicalPlan};
+use paro_planner::logical::plan::{NodeStats, UniqueKey, UniqueKeyColumn, UniqueKeyProvenance};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub(crate) struct Input<'a> {
@@ -90,8 +90,8 @@ impl RelationProofs {
                 result = domains(0).cloned().unwrap_or_default()
             }
             LogicalOperator::MaterializedCTE(_) => result = domains(1).cloned().unwrap_or_default(),
-            LogicalOperator::Join(paro_planner::operator::Join::Comparison(j))
-                if j.join_type == paro_planner::operator::JoinType::Inner =>
+            LogicalOperator::Join(paro_planner::logical::operator::Join::Comparison(j))
+                if j.join_type == paro_planner::logical::operator::JoinType::Inner =>
             {
                 for input in inputs {
                     result.extend(input.domains.clone());
@@ -244,7 +244,8 @@ fn refine(expression: &Expression, domains: &mut FiniteDomains) {
             return;
         }
     }
-    let Some((binding, values)) = super::gathering::finite_equality_domain(expression) else {
+    let Some((binding, values)) = super::annotate::relation::finite_equality_domain(expression)
+    else {
         return;
     };
     let Some(values) = values
@@ -266,7 +267,7 @@ fn refine(expression: &Expression, domains: &mut FiniteDomains) {
 impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for RelationProofs {
     fn child_completed(
         &mut self,
-        parent: &paro_planner::plan::arena::LogicalPlanNode<()>,
+        parent: &paro_planner::logical::plan::arena::LogicalPlanNode<()>,
         completed: &[Box<OwnedLogicalPlan>],
         _: &[LogicalOutputLayout],
         _: &[Box<OwnedLogicalPlan>],
@@ -304,8 +305,8 @@ pub(crate) fn refresh(plan: OwnedLogicalPlan) -> paro_common::error::Result<Owne
 mod tests {
     use super::*;
     use paro_common::types::LogicalType;
-    use paro_planner::operator::{CTERef, ColumnBinding, SetOperation};
-    use paro_planner::plan::UniqueKeyNullSemantics;
+    use paro_planner::logical::operator::{CTERef, ColumnBinding, SetOperation};
+    use paro_planner::logical::plan::UniqueKeyNullSemantics;
 
     fn layout(table: usize) -> LogicalOutputLayout {
         LogicalOutputLayout::new(
@@ -409,10 +410,10 @@ mod tests {
         let keys = [key(&output)];
         for (value, expected_width) in [(DomainValue::Integer(2001), 1), (DomainValue::Null, 2)] {
             let domains = FiniteDomains::from([(output.bindings()[1], BTreeSet::from([value]))]);
-            let operator = LogicalOperator::Filter(paro_planner::operator::Filter {
+            let operator = LogicalOperator::Filter(paro_planner::logical::operator::Filter {
                 expressions: vec![],
                 child: (),
-                projection_map: paro_planner::operator::ProjectionMap::all(),
+                projection_map: paro_planner::logical::operator::ProjectionMap::all(),
             });
             let mut stats = NodeStats::default();
             RelationProofs::default().derive(

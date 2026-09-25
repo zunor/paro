@@ -13,11 +13,11 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     AggregateExpression, ConstantExpression, Expression, ReferenceExpression,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, ColumnBinding, ExpressionGet, Get, GroupInputMultiplicity, LogicalOperator,
     SingletonGroupProof,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 use paro_storage::table::table_factory::TableFactory;
 
 use super::{PhysicalBuildContext, PhysicalNodeKind, PhysicalPlanBuilder};

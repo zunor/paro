@@ -20,6 +20,7 @@ pub struct SpecificTypeMatcher {
 }
 
 impl SpecificTypeMatcher {
+    #[cfg(test)]
     pub fn new(target_type: LogicalType) -> Self {
         Self { target_type }
     }
@@ -37,6 +38,7 @@ pub struct SetTypeMatcher {
 }
 
 impl SetTypeMatcher {
+    #[cfg(test)]
     pub fn new(types: Vec<LogicalType>) -> Self {
         Self { types }
     }

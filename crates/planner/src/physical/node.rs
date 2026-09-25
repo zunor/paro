@@ -3,7 +3,7 @@
 
 //! Physical plan node and debug labels.
 
-use crate::plan::{CardinalityEstimate, PlanNodeId};
+use crate::logical::plan::{CardinalityEstimate, PlanNodeId};
 
 use super::children::PlanChildren;
 use super::ids::PhysicalPlanNodeId;

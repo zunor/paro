@@ -12,12 +12,11 @@ pub mod work;
 /// The only current Compile Evidence wire/schema version. Older documents are
 /// historical artifacts and are intentionally rejected by every current
 /// reader; there is no compatibility decoder in the producer path.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const ENCODED_LIMIT: usize = 200_000;
 pub const RETAINED_LIMIT: usize = 1 << 20;
 pub const PROCESS_LIMIT: usize = 64 << 20;
 pub const MAX_CAPTURES: usize = 8;
-pub const MAX_RULES: usize = 64;
 pub const MAX_SEARCH_COUNTERS: usize = 256;
 pub const MAX_VARIANTS: usize = 16;
 pub const MAX_DETAIL_EVENTS: usize = 2_048;
@@ -44,25 +43,11 @@ pub enum UncoveredReason {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SearchStop {
-    Complete,
-    Incomplete,
-    Deadline,
-    BudgetLimited,
-    RuleFailure,
-    QualityPolicySatisfied,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuleSummary {
-    pub id: u32,
-    pub binding_calls: u64,
-    pub binding_ns: u64,
-    pub attempts: u64,
-    pub inserted: u64,
-    /// A different projection of optimizer time; never add to phases.
-    pub elapsed_ns: u64,
+pub enum PlanningStatus {
+    /// The finite planning program returned a plan; not a global optimality proof.
+    Planned,
+    /// The program returned a plan after a bounded regional fallback.
+    PlannedWithFallback,
 }
 
 /// A bounded, typed search counter exported by the compiler producer.  The
@@ -99,205 +84,29 @@ pub enum CaptureLevel {
     Detail,
 }
 
-/// Typed, scoped references used by Detail.  Keeping these as distinct Rust
-/// types prevents a logical expression, physical expression, group, and
-/// fingerprint from silently occupying the same integer slot in a report.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct MemoGroupRef(pub u64);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct LogicalExprRef(pub u64);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct PhysicalExprRef(pub u64);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct CandidateRef(pub u64);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct RuleRef(pub u32);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct BindingRef(pub [u64; 2]);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct FingerprintRef(pub [u64; 2]);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct GoalRef {
-    pub required: u64,
-    pub grant: u64,
-    pub context: u64,
-}
-
-/// A bounded lifecycle record. `source_sequence` is local to the producer
-/// stream named by the variant; it is never the order in which the renderer
-/// happened to visit categories. `event_time_us` is the actual monotonic
-/// search timestamp when the source supplied one. Aggregate snapshots keep a
-/// zero timestamp and are explicitly typed as such.
+/// A producer-sequenced stage completion. Detail is bounded and optional;
+/// aggregate stage time is not added to the exclusive work ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "data", deny_unknown_fields)]
 pub enum DetailEvent {
-    RuleSummary {
+    Stage {
         source_sequence: u64,
-        rule: RuleRef,
-        binding_calls: u64,
-        binding_ns: u64,
-        attempts: u64,
-        inserted: u64,
+        stage: work::WorkKind,
         elapsed_ns: u64,
-    },
-    Proposal {
-        source_sequence: u64,
-        event_time_us: u64,
-        stage: u8,
-        group: MemoGroupRef,
-        source: Option<LogicalExprRef>,
-        logical: Option<LogicalExprRef>,
-        physical: Option<PhysicalExprRef>,
-        binding: Option<BindingRef>,
-        rule: Option<RuleRef>,
-    },
-    Candidate {
-        source_sequence: u64,
-        event_time_us: u64,
-        stage: u8,
-        group: MemoGroupRef,
-        goal: Option<GoalRef>,
-        candidate: Option<CandidateRef>,
-        source: Option<LogicalExprRef>,
-        source_child: Option<LogicalExprRef>,
-        logical: Option<LogicalExprRef>,
-        physical: Option<PhysicalExprRef>,
-        recipe: Option<FingerprintRef>,
-        rule: Option<RuleRef>,
-        expected_cost_bits: Option<u64>,
-        upper_cost_bits: Option<u64>,
-    },
-    CandidateChild {
-        source_sequence: u64,
-        parent_event_id: u64,
-        ordinal: u32,
-        event_time_us: u64,
-        stage: u8,
-        candidate: Option<CandidateRef>,
-        child_group: MemoGroupRef,
-        child_candidate: CandidateRef,
-        goal: GoalRef,
-    },
-    Fact {
-        source_sequence: u64,
-        parent_event_id: u64,
-        ordinal: u32,
-        event_time_us: u64,
-        candidate: Option<CandidateRef>,
-        group: MemoGroupRef,
-        logical_fact: FingerprintRef,
-        statistics_snapshot: FingerprintRef,
-    },
-    Task {
-        source_sequence: u64,
-        event_time_us: u64,
-        group: MemoGroupRef,
-        expression: LogicalExprRef,
-        rule: RuleRef,
-        first_binding: Option<BindingRef>,
-        first_run_us: Option<u64>,
-        first_published_us: Option<u64>,
-        match_count: u64,
-        applicable_count: u64,
-        published_count: u64,
-        no_match_count: u64,
-        no_output_count: u64,
-        budget_rejected_count: u64,
-    },
-    Grant {
-        source_sequence: u64,
-        class: u32,
-        physical_fingerprint: FingerprintRef,
-        expected_cost_bits: u64,
-        max_parallel_tasks: u16,
-    },
-    /// A real quality-policy evaluation snapshot.  This is emitted only from
-    /// the planner's quality decision point; a candidate carrying a goal is
-    /// deliberately not treated as a quality decision.
-    Quality {
-        source_sequence: u64,
-        event_time_us: u64,
-        candidate: Option<CandidateRef>,
-        goal: Option<GoalRef>,
-        completed: u64,
-        not_applicable: u64,
-        missing_evidence: u64,
-        suspended: u64,
-        missing_facts: u64,
-        missing_bundles: Box<[u32]>,
-        missing_fact_kinds: Box<[u64]>,
-        policy_satisfied: bool,
-    },
-    Search {
-        source_sequence: u64,
-        groups: u64,
-        logical_expressions: u64,
-        physical_expressions: u64,
-        obligations: u64,
-        stop: SearchStop,
+        items: u64,
+        fallbacks: u64,
     },
 }
-
 impl DetailEvent {
     pub fn source_sequence(&self) -> u64 {
         match self {
-            Self::RuleSummary {
-                source_sequence, ..
-            }
-            | Self::Proposal {
-                source_sequence, ..
-            }
-            | Self::Candidate {
-                source_sequence, ..
-            }
-            | Self::CandidateChild {
-                source_sequence, ..
-            }
-            | Self::Fact {
-                source_sequence, ..
-            }
-            | Self::Task {
-                source_sequence, ..
-            }
-            | Self::Grant {
-                source_sequence, ..
-            }
-            | Self::Quality {
-                source_sequence, ..
-            }
-            | Self::Search {
+            Self::Stage {
                 source_sequence, ..
             } => *source_sequence,
         }
     }
-
     pub fn stream_name(&self) -> &'static str {
-        match self {
-            Self::RuleSummary { .. } => "rule-summary",
-            Self::Proposal { .. } => "proposal-lifecycle",
-            Self::Candidate { .. } => "candidate-lifecycle",
-            Self::CandidateChild { .. } => "candidate-child-lifecycle",
-            Self::Fact { .. } => "fact-lifecycle",
-            Self::Task { .. } => "task-lifecycle",
-            Self::Grant { .. } => "grant-snapshot",
-            Self::Quality { .. } => "quality-evaluation",
-            Self::Search { .. } => "search-snapshot",
-        }
+        "planning-stage"
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -339,7 +148,7 @@ pub struct CompiledArtifactId(pub [u64; 2]);
 
 /// Identity of the admission decision/receipt, distinct from the execution
 /// handle and from the immutable artifact.  The value is allocated at the
-/// admission boundary, not inferred from a portfolio ordinal.
+/// admission boundary, not inferred from a artifact ordinal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct AdmissionReceiptId(pub u64);
@@ -382,9 +191,9 @@ pub enum ExecutionTerminal {
     Dropped,
 }
 
-/// Admission selects a portfolio member before the executable image is
+/// Admission selects a artifact member before the executable image is
 /// lowered.  Keep that lifecycle edge explicit instead of treating a
-/// selected portfolio entry as an executable image.
+/// selected artifact entry as an executable image.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub enum ExecutionImageStatus {
@@ -436,8 +245,8 @@ pub struct ResourceReceipt {
     pub external_worker_slots: u16,
 }
 
-/// The only record that may claim an actual portfolio choice.  It is created
-/// at admission, not while a portfolio is compiled or rendered.
+/// The only record that may claim an actual artifact choice.  It is created
+/// at admission, not while a artifact is compiled or rendered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionReceipt {
@@ -518,8 +327,7 @@ impl CompileDocument {
 pub struct CompileRecord {
     #[serde(flatten)]
     fields: CompileFields,
-    pub rules: Vec<RuleSummary>,
-    pub omitted_rules: u64,
+
     pub search_counters: Vec<SearchCounter>,
     pub omitted_search_counters: u64,
     pub variants: Vec<VariantSummary>,
@@ -576,14 +384,10 @@ pub struct CompileFields {
     pub compiler_ns: Observation<u64>,
     pub compiler_other_ns: Observation<u64>,
     pub safety_verified: Observation<bool>,
-    pub search_stop: Observation<SearchStop>,
-    pub search_complete: Observation<bool>,
-    pub quality_policy_satisfied: Observation<bool>,
+    pub planning_status: Observation<PlanningStatus>,
+
     pub budget_limited: Observation<bool>,
-    pub obligations: Observation<u64>,
-    pub groups: Observation<u64>,
-    pub logical_expressions: Observation<u64>,
-    pub physical_expressions: Observation<u64>,
+
     pub output_columns: Observation<usize>,
     pub artifact: ArtifactStatus,
     pub expected_class: Observation<u32>,
@@ -666,16 +470,10 @@ impl CompileCapture {
                     compiler_ns: unknown,
                     compiler_other_ns: unknown,
                     safety_verified: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                    search_stop: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                    search_complete: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                    quality_policy_satisfied: Observation::Uncovered(
-                        UncoveredReason::NotInstrumented,
-                    ),
+                    planning_status: Observation::Uncovered(UncoveredReason::NotInstrumented),
+
                     budget_limited: Observation::Uncovered(UncoveredReason::NotInstrumented),
-                    obligations: unknown,
-                    groups: unknown,
-                    logical_expressions: unknown,
-                    physical_expressions: unknown,
+
                     output_columns: Observation::Uncovered(UncoveredReason::NotInstrumented),
                     artifact: ArtifactStatus::NotReady,
                     expected_class: Observation::Uncovered(UncoveredReason::NotInstrumented),
@@ -686,8 +484,7 @@ impl CompileCapture {
                     response_terminal: Observation::Uncovered(UncoveredReason::FutureBoundary),
                     outcome: CompileOutcome::Incomplete,
                 },
-                rules: Vec::new(),
-                omitted_rules: 0,
+
                 search_counters: Vec::new(),
                 omitted_search_counters: 0,
                 variants: Vec::new(),
@@ -726,27 +523,6 @@ impl CompileCapture {
         f(&self.record.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    pub fn rule(&self, rule: RuleSummary) {
-        let mut r = self.record.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.sealed.load(Ordering::Acquire) {
-            if r.rules.len() < MAX_RULES {
-                let at = r.rules.partition_point(|existing| existing.id < rule.id);
-                r.rules.insert(at, rule);
-            } else {
-                r.omitted_rules = r.omitted_rules.saturating_add(1);
-                // Retain the same bounded subset regardless of map iteration order.
-                if r.rules.last().is_some_and(|last| rule.id < last.id) {
-                    r.rules.pop();
-                    let at = r.rules.partition_point(|existing| existing.id < rule.id);
-                    r.rules.insert(at, rule);
-                }
-            }
-        }
-    }
-
-    /// Replace the bounded search-counter snapshot before sealing.  The
-    /// planner supplies an ordered map of static counter names, so sorting and
-    /// truncation are deterministic and do not depend on hash/map iteration.
     pub fn search_counters(&self, counters: impl IntoIterator<Item = (&'static str, u64)>) {
         let mut values: Vec<_> = counters
             .into_iter()
@@ -835,26 +611,6 @@ mod tests {
             .collect();
         assert!(CompileCapture::try_start().is_none());
         let retained = captures[0].clone();
-        for id in 0..809_720 {
-            retained.rule(RuleSummary {
-                id,
-                binding_calls: 0,
-                binding_ns: 0,
-                attempts: 1,
-                inserted: 0,
-                elapsed_ns: 0,
-            });
-        }
-        retained.read(|r| {
-            assert_eq!(r.rules.len(), MAX_RULES);
-            assert_eq!(r.omitted_rules, 809_720 - MAX_RULES as u64);
-            assert!(
-                std::mem::size_of::<CompileRecord>()
-                    + r.rules.capacity() * std::mem::size_of::<RuleSummary>()
-                    < RETAINED_LIMIT - 4096
-            );
-            assert_eq!(r.execution, Observation::NotExecuted);
-        });
         retained.variants(
             70_000,
             (0..70_000).map(|ordinal| VariantSummary {
@@ -868,7 +624,6 @@ mod tests {
             assert_eq!(r.omitted_variants, 70_000 - MAX_VARIANTS as u64);
             assert!(
                 std::mem::size_of::<CompileRecord>()
-                    + r.rules.capacity() * std::mem::size_of::<RuleSummary>()
                     + r.variants.capacity() * std::mem::size_of::<VariantSummary>()
                     < RETAINED_LIMIT
             );
@@ -888,14 +643,12 @@ mod tests {
     fn detail_is_opt_in_bounded_and_summary_has_no_event_buffer() {
         let _lock = capture_test_lock();
         let summary = CompileCapture::try_start().unwrap();
-        summary.detail(DetailEvent::RuleSummary {
+        summary.detail(DetailEvent::Stage {
             source_sequence: 1,
-            rule: RuleRef(1),
-            binding_calls: 2,
-            binding_ns: 3,
-            attempts: 4,
-            inserted: 5,
+            stage: work::WorkKind::Normalization,
             elapsed_ns: 6,
+            items: 4,
+            fallbacks: 0,
         });
         summary.read(|record| {
             assert_eq!(record.capture_level, CaptureLevel::Summary);
@@ -907,21 +660,12 @@ mod tests {
         let detail = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
         const DETAIL_ATTEMPTS: usize = 809_720;
         for sequence in 0..DETAIL_ATTEMPTS {
-            detail.detail(DetailEvent::Task {
+            detail.detail(DetailEvent::Stage {
                 source_sequence: sequence as u64,
-                event_time_us: sequence as u64,
-                group: MemoGroupRef(sequence as u64),
-                expression: LogicalExprRef(sequence as u64),
-                rule: RuleRef(1),
-                first_binding: None,
-                first_run_us: None,
-                first_published_us: None,
-                match_count: 0,
-                applicable_count: 0,
-                published_count: 0,
-                no_match_count: 0,
-                no_output_count: 0,
-                budget_rejected_count: 0,
+                stage: work::WorkKind::RegionPlanning,
+                elapsed_ns: 0,
+                items: 1,
+                fallbacks: 0,
             });
         }
         detail.read(|record| {

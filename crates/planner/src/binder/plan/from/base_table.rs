@@ -3,7 +3,7 @@
 
 use crate::binder::ir::BoundBaseTable;
 use crate::binder::Binder;
-use crate::operator::{Get, LogicalOperator};
+use crate::logical::operator::{Get, LogicalOperator};
 use paro_common::error::Result;
 
 impl Binder {

@@ -163,11 +163,6 @@ def _sample(
                     connect_timeout=10,
                 ) as connection:
                     connection.execute("SET optimizer_verify=true")
-                    connection.execute(
-                        sql.SQL("SET optimizer_search_policy={}").format(
-                            sql.Literal(args.optimizer_search_policy)
-                        )
-                    )
                     connection.execute(sql.SQL("SET threads={}").format(sql.Literal(args.threads)))
                     connection.execute(
                         sql.SQL("SET memory_limit={}").format(sql.Literal(args.memory_limit))
@@ -240,11 +235,6 @@ def main() -> int:
     parser.add_argument("--process-blocks", type=int, default=2)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--memory-limit", default="2GB")
-    parser.add_argument(
-        "--optimizer-search-policy",
-        choices=("pipeline", "regional", "quality", "budgeted"),
-        default="quality",
-    )
     parser.add_argument("--watchdog-seconds", type=int, default=300)
     parser.add_argument("--rss-limit-mb", type=int, default=2048)
     parser.add_argument("--build-jobs", type=int, default=4)
@@ -272,7 +262,7 @@ def main() -> int:
             "process_blocks": args.process_blocks,
             "threads": args.threads,
             "memory_limit": args.memory_limit,
-            "optimizer_search_policy": args.optimizer_search_policy,
+
             "watchdog_seconds": args.watchdog_seconds,
             "rss_limit_mb": args.rss_limit_mb,
             "cohort": "diagnostic",

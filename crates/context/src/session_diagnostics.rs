@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use crate::compile_diagnostics::{
     AdmissionFallback, AdmissionReceiptId, AdmissionResult, ArtifactIdentity, ExecutionImageStatus,
     ExecutionReceipt, ExecutionReceiptId, ExecutionTerminal, LoweringStatus, Observation,
-    ResourceReceipt, ResourceReservationStatus, SearchStop, SelectionIdentity,
+    PlanningStatus, ResourceReceipt, ResourceReservationStatus, SelectionIdentity,
     RECEIPT_SCHEMA_VERSION,
 };
 use crate::StatementTraceSnapshot;
@@ -78,8 +78,8 @@ pub struct StatementCacheDecision {
 pub struct CompileWork {
     pub compiler_elapsed_us: u64,
     pub optimizer_elapsed_us: u64,
-    pub rule_elapsed_us: u64,
-    pub child_combination_cost_synthesis_count: u64,
+    pub normalization_elapsed_us: u64,
+    pub physical_alternatives: u64,
 }
 
 /// Immutable compiler-side context retained by a shareable artifact. This is
@@ -90,14 +90,10 @@ pub struct CompileWork {
 pub struct CompileReceiptSummary {
     pub schema_version: u32,
     pub artifact_identity: Option<ArtifactIdentity>,
-    pub search_stop: Observation<SearchStop>,
-    pub search_complete: Observation<bool>,
-    pub quality_policy_satisfied: Observation<bool>,
+    pub planning_status: Observation<PlanningStatus>,
+
     pub budget_limited: Observation<bool>,
-    pub obligations: Observation<u64>,
-    pub groups: Observation<u64>,
-    pub logical_expressions: Observation<u64>,
-    pub physical_expressions: Observation<u64>,
+
     pub expected_class: Observation<u32>,
     pub variant_count: Observation<usize>,
     pub omitted_variants: u64,
@@ -718,8 +714,8 @@ mod tests {
         let work = CompileWork {
             compiler_elapsed_us: 20,
             optimizer_elapsed_us: 10,
-            rule_elapsed_us: 3,
-            child_combination_cost_synthesis_count: 7,
+            normalization_elapsed_us: 3,
+            physical_alternatives: 7,
         };
         diagnostics.publish_compile_work(first, work);
         diagnostics.publish_compile_work(first, CompileWork::default());

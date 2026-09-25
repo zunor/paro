@@ -396,7 +396,7 @@ fn find_column_in_tableref(
         column_index: usize,
         return_type: LogicalType,
     ) -> ColumnRefExpression {
-        use crate::operator::ColumnBinding;
+        use crate::logical::operator::ColumnBinding;
         ColumnRefExpression::new(ColumnBinding::new(table_index, column_index), return_type)
     }
 

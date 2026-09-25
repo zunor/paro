@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::operator::InsertOnConflict;
+use crate::logical::operator::InsertOnConflict;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 

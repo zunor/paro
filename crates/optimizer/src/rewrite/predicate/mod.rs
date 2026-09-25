@@ -4,8 +4,12 @@
 //! Filter combination, propagation, pushdown and pullup.
 
 pub mod combiner;
-#[cfg(test)]
-pub(crate) mod domain_transfer;
 pub mod propagate_result;
+#[cfg(test)]
 pub mod pullup;
 pub mod pushdown;
+
+pub(crate) mod column_transfer;
+pub(crate) mod restriction;
+
+pub(crate) mod canonical;

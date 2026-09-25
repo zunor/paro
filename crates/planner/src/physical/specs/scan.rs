@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::expression::Expression;
-use crate::operator::GetColumnSource;
+use crate::logical::operator::GetColumnSource;
 use paro_catalog::entry::{ColumnDefinition, TableCatalogEntry};
 use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;

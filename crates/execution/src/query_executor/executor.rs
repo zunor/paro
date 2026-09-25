@@ -187,7 +187,7 @@ impl Executor {
         Ok(handler)
     }
 
-    /// Resolve one immutable portfolio and acquire every selected resource.
+    /// Resolve one immutable artifact and acquire every selected resource.
     ///
     /// External capacity is acquired before memory so a worker race cannot
     /// strand a capacity floor. A memory race drops the external lease and

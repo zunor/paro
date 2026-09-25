@@ -13,7 +13,7 @@ use std::sync::Arc;
 use paro_planner::expression::{
     ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
 };
-use paro_planner::operator::{ColumnBinding, JoinType};
+use paro_planner::logical::operator::{ColumnBinding, JoinType};
 
 use super::query_graph::FilterInfo;
 use super::relation::JoinRelationSetManager;

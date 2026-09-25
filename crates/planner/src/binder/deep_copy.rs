@@ -11,7 +11,7 @@ use paro_common::error::{self as paro_error, Result};
 use crate::binder::context::BindShared;
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::{ColumnRefExpression, Expression, SubqueryExpression};
-use crate::operator::{
+use crate::logical::operator::{
     Aggregate as AggNode, AnyJoin, CTERef, ColumnBinding, ComparisonJoin, CopyTo as CopyToNode,
     CrossProduct, Delete as DelNode, DelimGet as DelimGetNode, DependentJoin as DepJoinNode,
     Distinct as DistNode, EmptyResult as EmptyResNode, Explain as ExplNode,
@@ -22,8 +22,8 @@ use crate::operator::{
     SearchScan as SearchScanNode, SetOperation as SetOpNode, TableFunctionGet as TblFnGetNode,
     TopN as TopNNode, Update as UpdNode, Window as WinNode,
 };
-use crate::plan::{NodeStats, OwnedLogicalPlan, PlannedStatement};
-use crate::visitor::LogicalOperatorVisitor;
+use crate::logical::plan::{NodeStats, OwnedLogicalPlan, PlannedStatement};
+use crate::logical::visitor::LogicalOperatorVisitor;
 
 /// Deep-copy a logical plan root while remapping all logical indices owned by
 /// the embedded operator tree and clearing statistics on the copy.
@@ -311,7 +311,7 @@ impl LogicalPlanDeepCopy {
                 LogicalOperator::Get(g)
             }
             LogicalOperator::BoundReference(reference) => {
-                let mut copied = crate::operator::BoundReference::new(
+                let mut copied = crate::logical::operator::BoundReference::new(
                     reference.reference_id,
                     reference.bindings.clone(),
                     reference.types().to_vec(),
@@ -349,7 +349,7 @@ impl LogicalPlanDeepCopy {
                 for source in &mut sources {
                     self.remap_table_index(bind_shared, &mut source.materialized_table_index);
                 }
-                LogicalOperator::RowFetch(crate::operator::RowFetch {
+                LogicalOperator::RowFetch(crate::logical::operator::RowFetch {
                     carrier_table_index,
                     sources,
                     child: Box::new(child),
@@ -359,7 +359,7 @@ impl LogicalPlanDeepCopy {
                 let child = self.copy_plan(p.child.as_ref(), bind_shared);
                 let mut project_index = p.project_index;
                 self.remap_table_index(bind_shared, &mut project_index);
-                LogicalOperator::ExternalProject(crate::operator::LogicalExternalProject {
+                LogicalOperator::ExternalProject(crate::logical::operator::LogicalExternalProject {
                     project_index,
                     expressions: p.expressions.clone(),
                     output_names: p.output_names.clone(),
@@ -371,20 +371,22 @@ impl LogicalPlanDeepCopy {
             LogicalOperator::ExternalTable(t) => {
                 let mut table_index = t.table_index;
                 self.remap_table_index(bind_shared, &mut table_index);
-                LogicalOperator::ExternalTable(Box::new(crate::operator::LogicalExternalTable {
-                    table_index,
-                    output_columns: t.output_columns.clone(),
-                    returned_types: t.returned_types.clone(),
-                    call_expression: t.call_expression.clone(),
-                    call: t.call.clone(),
-                    child: t
-                        .child
-                        .as_ref()
-                        .map(|child| Box::new(self.copy_plan(child.as_ref(), bind_shared))),
-                    lateral: t.lateral,
-                    parameterized: t.parameterized,
-                    cost: t.cost,
-                }))
+                LogicalOperator::ExternalTable(Box::new(
+                    crate::logical::operator::LogicalExternalTable {
+                        table_index,
+                        output_columns: t.output_columns.clone(),
+                        returned_types: t.returned_types.clone(),
+                        call_expression: t.call_expression.clone(),
+                        call: t.call.clone(),
+                        child: t
+                            .child
+                            .as_ref()
+                            .map(|child| Box::new(self.copy_plan(child.as_ref(), bind_shared))),
+                        lateral: t.lateral,
+                        parameterized: t.parameterized,
+                        cost: t.cost,
+                    },
+                ))
             }
             LogicalOperator::Limit(l) => {
                 let child = self.copy_plan(l.child.as_ref(), bind_shared);
@@ -564,18 +566,18 @@ impl LogicalPlanDeepCopy {
                 let right = self.copy_plan(dj.right.as_ref(), bind_shared);
                 let mut kind = dj.kind.clone();
                 match &mut kind {
-                    crate::operator::DependentJoinKind::Mark { mark_index, .. } => {
+                    crate::logical::operator::DependentJoinKind::Mark { mark_index, .. } => {
                         self.remap_table_index(bind_shared, mark_index);
                     }
-                    crate::operator::DependentJoinKind::Scalar {
+                    crate::logical::operator::DependentJoinKind::Scalar {
                         presence_binding: Some(binding),
                     } => {
                         self.remap_table_index(bind_shared, &mut binding.table_index);
                     }
-                    crate::operator::DependentJoinKind::Scalar {
+                    crate::logical::operator::DependentJoinKind::Scalar {
                         presence_binding: None,
                     }
-                    | crate::operator::DependentJoinKind::Lateral { .. } => {}
+                    | crate::logical::operator::DependentJoinKind::Lateral { .. } => {}
                 }
                 LogicalOperator::DependentJoin(Box::new(DepJoinNode {
                     left: Box::new(left),
@@ -962,11 +964,11 @@ mod tests {
         AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, Expression,
         ReferenceExpression, WindowExpression, WindowFrame,
     };
-    use crate::operator::{
+    use crate::logical::operator::{
         Aggregate, CTERef, ColumnBinding, ExpressionGet, Filter, LogicalOperator, MaterializedCTE,
         PostAggregateReduction, Projection, Window,
     };
-    use crate::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan, PlanNodeId};
+    use crate::logical::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan, PlanNodeId};
     use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::aggregate::distributive::minmax::{get_max_function, get_min_function};
 
@@ -994,7 +996,7 @@ mod tests {
                     OwnedLogicalPlan::new(&bind_context, expression_get(7)),
                     vec![Expression::ColumnRef(
                         ColumnRefExpression::new(
-                            crate::operator::ColumnBinding::new(7, 0),
+                            crate::logical::operator::ColumnBinding::new(7, 0),
                             LogicalType::Integer,
                         )
                         .into(),
@@ -1040,7 +1042,7 @@ mod tests {
                 OwnedLogicalPlan::new(&bind_context, expression_get(7)),
                 vec![Expression::ColumnRef(
                     ColumnRefExpression::new(
-                        crate::operator::ColumnBinding::new(7, 0),
+                        crate::logical::operator::ColumnBinding::new(7, 0),
                         LogicalType::Integer,
                     )
                     .into(),
@@ -1210,7 +1212,7 @@ mod tests {
                 child,
                 vec![Expression::ColumnRef(
                     ColumnRefExpression::new(
-                        crate::operator::ColumnBinding::new(7, 0),
+                        crate::logical::operator::ColumnBinding::new(7, 0),
                         LogicalType::Integer,
                     )
                     .into(),

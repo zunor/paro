@@ -14,11 +14,11 @@ use paro_planner::expression::{
     FunctionExpression, OperatorExpression, WindowExpression, WindowFrame, WindowFrameBound,
     WindowFrameType,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType,
     JoinCondition, MarkJoinSemantics, SetOperation,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 fn plan(ctx: &BindContext, op: LogicalOperator) -> OwnedLogicalPlan {
     OwnedLogicalPlan::new(ctx, op)
@@ -27,7 +27,7 @@ fn plan(ctx: &BindContext, op: LogicalOperator) -> OwnedLogicalPlan {
 fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
     Expression::ColumnRef(
         ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
+            binding: paro_planner::logical::operator::ColumnBinding {
                 table_index,
                 column_index,
             },
@@ -883,10 +883,10 @@ fn marker_equals_true_lowers_mark_join_to_semi_join() {
 fn test_pushdown_through_order() {
     let ctx = BindContext::new();
     let get = make_get(0);
-    let order = paro_planner::operator::Order {
+    let order = paro_planner::logical::operator::Order {
         child: Box::new(plan(&ctx, get)),
         orders: vec![],
-        projection_map: paro_planner::operator::ProjectionMap::all(),
+        projection_map: paro_planner::logical::operator::ProjectionMap::all(),
     };
 
     let filter_expr = make_comparison(
@@ -916,7 +916,8 @@ fn test_pushdown_through_order() {
 fn test_filter_stays_above_limit() {
     let ctx = BindContext::new();
     let get = make_get(0);
-    let limit = paro_planner::operator::Limit::new(plan(&ctx, get), Some(make_constant(10)), None);
+    let limit =
+        paro_planner::logical::operator::Limit::new(plan(&ctx, get), Some(make_constant(10)), None);
 
     let filter_expr = make_comparison(
         ComparisonType::GreaterThan,

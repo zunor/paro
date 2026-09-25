@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stable, arena-local optimizer identifiers shared with extracted plans.
+//! Typed plan-local ids and cross-run canonical fingerprint encoding.
 
 use std::fmt;
 
@@ -40,7 +40,6 @@ macro_rules! id_type {
 
 id_type!(ColumnId);
 id_type!(ResourceGrantClassId);
-id_type!(EnforcerRecipeId);
 id_type!(FactorizationSpecId);
 id_type!(QualityPolicyId);
 id_type!(BaseRelationId);
@@ -66,10 +65,8 @@ impl fmt::Debug for Fingerprint {
 
 /// Deterministic, domain-delimited structural identity builder.
 ///
-/// Logical operator fingerprints are themselves part of Memo equality, so a
-/// collision cannot rely on a later structural comparison to repair it. Use a
-/// cryptographic digest and retain 128 bits rather than composing correlated
-/// non-cryptographic lanes.
+/// Use a cryptographic digest with explicit field boundaries. Equal digests
+/// locate a structure; they do not establish SQL semantic equivalence.
 #[derive(Debug, Clone)]
 pub struct StableFingerprintBuilder {
     hasher: blake3::Hasher,
@@ -94,8 +91,8 @@ impl StableFingerprintBuilder {
     const I64_TAG: u8 = 4;
 
     /// Record the exact domain-delimited byte stream alongside its hash.
-    /// Memo operator interning uses this form so a digest collision only
-    /// selects a bucket and can never establish logical equivalence.
+    /// Consumers that need exact structural equality can compare transcripts
+    /// after a hash match rather than treating a digest as an equality proof.
     pub fn recording() -> Self {
         let mut builder = Self::default();
         builder.transcript = Some(b"paro.stable-fingerprint.v4.typed-stream".to_vec());

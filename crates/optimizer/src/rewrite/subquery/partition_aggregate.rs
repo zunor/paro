@@ -23,11 +23,11 @@ use paro_planner::expression::{
     ExpressionIterator, ExpressionVisitDecision, OperatorExpression, OperatorType,
     WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Get, Join, JoinComparisonType,
     JoinCondition, JoinType, LogicalOperator, MarkJoinSemantics, Projection, Window,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::estimate::unique_keys::{declared_unique_keys, NullRejectedKeyProof};
 use crate::rewrite::aggregate::semantic_kernels::{cast_kernels_equal, scalar_kernels_equal};
@@ -176,8 +176,8 @@ struct GroupedJoinRewrite {
 }
 
 struct ScalarBranch<'a> {
-    projection: &'a paro_planner::operator::Projection,
-    aggregate: &'a paro_planner::operator::Aggregate,
+    projection: &'a paro_planner::logical::operator::Projection,
+    aggregate: &'a paro_planner::logical::operator::Aggregate,
     aggregate_expression: &'a AggregateExpression,
     scalar_binding: ColumnBinding,
     presence_binding: Option<ColumnBinding>,
@@ -185,10 +185,10 @@ struct ScalarBranch<'a> {
 }
 
 struct DelimShape<'a> {
-    filter: &'a paro_planner::operator::Filter,
+    filter: &'a paro_planner::logical::operator::Filter,
     join: &'a ComparisonJoin,
     scalar: ScalarBranch<'a>,
-    delim: &'a paro_planner::operator::DelimGet,
+    delim: &'a paro_planner::logical::operator::DelimGet,
     correlation: Correlation,
 }
 
@@ -620,7 +620,7 @@ fn peel_scalar_branch(plan: &OwnedLogicalPlan) -> Option<ScalarBranch<'_>> {
 fn validate_delim_binding_contract(
     join: &ComparisonJoin,
     scalar: &ScalarBranch<'_>,
-    delim: &paro_planner::operator::DelimGet,
+    delim: &paro_planner::logical::operator::DelimGet,
 ) -> bool {
     let key_count = join.duplicate_eliminated_columns.len();
     if scalar.aggregate.groups.len() != key_count
@@ -1196,7 +1196,7 @@ fn apply_rewrite(
         })
         .collect();
     filter.child = Box::new(window);
-    filter.projection_map = paro_planner::operator::ProjectionMap::all();
+    filter.projection_map = paro_planner::logical::operator::ProjectionMap::all();
     Ok(OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Filter(filter),
@@ -1631,7 +1631,7 @@ fn clean_inner_join(join: &ComparisonJoin) -> bool {
 fn smallest_extensible_inner_owner(
     plan: &OwnedLogicalPlan,
     required: &HashSet<ColumnBinding>,
-) -> paro_planner::plan::PlanNodeId {
+) -> paro_planner::logical::plan::PlanNodeId {
     let mut target = plan;
     loop {
         let LogicalOperator::Join(Join::Comparison(join)) = &target.operator else {
@@ -1671,7 +1671,7 @@ fn smallest_extensible_inner_owner(
 fn smallest_filter_owner(
     plan: &OwnedLogicalPlan,
     required: &HashSet<ColumnBinding>,
-) -> paro_planner::plan::PlanNodeId {
+) -> paro_planner::logical::plan::PlanNodeId {
     fn owns(plan: &OwnedLogicalPlan, required: &HashSet<ColumnBinding>) -> bool {
         let bindings = plan
             .get_column_bindings()
@@ -1716,7 +1716,9 @@ fn smallest_filter_owner(
     }
 }
 
-fn find_only_delim_get(plan: &OwnedLogicalPlan) -> Option<&paro_planner::operator::DelimGet> {
+fn find_only_delim_get(
+    plan: &OwnedLogicalPlan,
+) -> Option<&paro_planner::logical::operator::DelimGet> {
     let mut found = Vec::new();
     collect_delim_gets(plan, &mut found);
     (found.len() == 1).then(|| found[0])
@@ -1724,7 +1726,7 @@ fn find_only_delim_get(plan: &OwnedLogicalPlan) -> Option<&paro_planner::operato
 
 fn collect_delim_gets<'a>(
     plan: &'a OwnedLogicalPlan,
-    found: &mut Vec<&'a paro_planner::operator::DelimGet>,
+    found: &mut Vec<&'a paro_planner::logical::operator::DelimGet>,
 ) {
     if let LogicalOperator::DelimGet(delim) = &plan.operator {
         found.push(delim);
@@ -1833,7 +1835,7 @@ fn is_movable(expression: &Expression) -> bool {
 mod proof_tests {
     use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
-    use paro_planner::operator::{DelimGet, Filter, ProjectionMap};
+    use paro_planner::logical::operator::{DelimGet, Filter, ProjectionMap};
 
     use super::*;
 

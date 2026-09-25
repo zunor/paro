@@ -10,11 +10,11 @@ use std::collections::HashSet;
 use crate::binder::context::BindContext;
 use crate::binder::ir::JoinType as BinderJoinType;
 use crate::expression::*;
-use crate::operator::{
+use crate::logical::operator::{
     AnyJoin, ComparisonJoin, Filter, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
     LogicalOperator,
 };
-use crate::plan::OwnedLogicalPlan;
+use crate::logical::plan::OwnedLogicalPlan;
 use paro_common::error::Result;
 
 pub fn convert_join_type(binder_type: BinderJoinType) -> JoinType {
@@ -255,7 +255,7 @@ mod tests {
         ColumnRefExpression, ComparisonExpression, ComparisonType, Expression, WindowExpression,
         WindowFrame, WindowFrameBound, WindowFrameType,
     };
-    use crate::operator::{ColumnBinding, JoinComparisonType, JoinSide};
+    use crate::logical::operator::{ColumnBinding, JoinComparisonType, JoinSide};
     use paro_function::window::WindowFunction;
 
     fn col(table_index: usize, column_index: usize) -> Expression {

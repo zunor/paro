@@ -6,7 +6,7 @@ use paro_common::{runtime_value::Value, types::LogicalType};
 use paro_planner::expression::{
     ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
 };
-use paro_planner::operator::Filter;
+use paro_planner::logical::operator::Filter;
 
 fn boolean(value: bool) -> Expression {
     Expression::Constant(
@@ -49,7 +49,7 @@ fn canonical_roots_reuse_only_unchanged_allocations() {
             .shared()
             .as_ref(),
     );
-    oracle.visit_post_order_mut(|node| node.id = paro_planner::plan::PlanNodeId(0));
+    oracle.visit_post_order_mut(|node| node.id = paro_planner::logical::plan::PlanNodeId(0));
     scalar_normalizer().rewrite_plan(&mut oracle);
     construction.normalize_plan(&mut plan);
     assert_eq!(construction.rewrites, first + 1);
@@ -67,7 +67,7 @@ fn scalar_reuse_does_not_merge_volatile_occurrences() {
     let mut operator = LogicalOperator::Filter(Filter {
         child: (),
         expressions: vec![expression.clone(), expression],
-        projection_map: paro_planner::operator::ProjectionMap::all(),
+        projection_map: paro_planner::logical::operator::ProjectionMap::all(),
     });
     let mut oracle = operator.clone();
     scalar_normalizer().visit_operator_expressions(&mut oracle);
@@ -91,7 +91,7 @@ fn routing_reopens_for_changes_not_for_unseen_or_detached_roots() {
     let mut operator = LogicalOperator::Filter(Filter {
         child: (),
         expressions: vec![boolean(true)],
-        projection_map: paro_planner::operator::ProjectionMap::all(),
+        projection_map: paro_planner::logical::operator::ProjectionMap::all(),
     });
     // An unseen, but already canonical root is not a change.
     assert!(!construction.normalize_operator(&mut operator));

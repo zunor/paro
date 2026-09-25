@@ -69,16 +69,7 @@ except ModuleNotFoundError:  # pragma: no cover - script-only import path
         validate_compile_document,
     )
 
-_REQUIRED_COMPILE_COUNTERS = {
-    "search_complete",
-    "memo_group_count",
-    "memo_logical_expression_count",
-    "memo_physical_expression_count",
-    "settlement_local_hit_count",
-    "settlement_local_miss_count",
-    "search_rule_failure_count",
-    "search_deadline_reached",
-}
+_REQUIRED_COMPILE_COUNTERS = {'response_join_transitions', 'response_join_fallbacks', 'local_alternatives', 'joint_budget_fallbacks', 'joint_transitions', 'selected_nodes'}
 
 
 def _observed(document: dict[str, Any], field: str) -> Any:
@@ -89,14 +80,14 @@ def _observed(document: dict[str, Any], field: str) -> Any:
 
 
 def _typed_compile_measurements(document: dict[str, Any]) -> dict[str, Any]:
-    """Read all cold-planning metrics from one Rust-owned v3 document.
+    """Read all cold-planning metrics from one Rust-owned v4 document.
 
     ``paro_optimizers()`` is intentionally not consulted here.  Its receipt
     rows describe ordinary execution and may have a different schema; they
     are never a source for compile timing or optimizer counters.
     """
     if validate_compile_document(document) != "Summary":
-        raise ValueError("cold planning requires a v3 compile summary")
+        raise ValueError("cold planning requires a v4 compile summary")
     omitted_counters = document.get("omitted_search_counters")
     if omitted_counters != 0:
         raise ValueError("cold planning requires a complete search counter snapshot")
@@ -118,19 +109,14 @@ def _typed_compile_measurements(document: dict[str, Any]) -> dict[str, Any]:
         for value in counters.values()
     ):
         raise ValueError("compile document has a non-integer search counter")
-    search_complete = _observed(document, "search_complete")
-    if not isinstance(search_complete, bool):
-        raise ValueError("compile document has invalid search completion state")
-    counters["search_complete"] = int(search_complete)
-    stop = _observed(document, "search_stop")
-    if not isinstance(stop, str) or not stop:
-        raise ValueError("compile document has invalid search stop reason")
+    stop = _observed(document, "planning_status")
+    if stop not in {"Planned", "PlannedWithFallback"}:
+        raise ValueError("compile document has invalid planning status")
     return {
         "optimizer_ms": optimizer_ns / 1_000_000,
         "counters": counters,
         "omitted_search_counters": omitted_counters,
-        "rules": document.get("rules", []),
-        "search_stop": stop,
+        "planning_status": stop,
         "compile_metrics_source": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document",
         "diagnostics": [],
         "diagnostics_source": "not_collected; paro_optimizers is execution-only auxiliary",
@@ -191,7 +177,6 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
                 with psycopg.connect(host=host, port=int(port), dbname=args.database,
                                      user=args.user, autocommit=True, connect_timeout=10) as connection:
                     connection.execute(sql.SQL("SET optimizer_verify={}").format(sql.Literal(args.optimizer_verify == "on")))
-                    connection.execute(sql.SQL("SET optimizer_search_policy={}").format(sql.Literal(args.optimizer_search_policy)))
                     connection.execute(sql.SQL("SET threads={}").format(sql.Literal(args.threads)))
                     connection.execute(sql.SQL("SET memory_limit={}").format(sql.Literal(args.memory_limit)))
                     connection.execute(sql.SQL("SET statement_timeout={}").format(
@@ -262,7 +247,6 @@ def main() -> int:
     parser.add_argument("--user", default="paro")
     parser.add_argument("--process-blocks", type=int, default=5)
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--optimizer-search-policy", choices=("regional", "quality", "budgeted"), default="quality")
     parser.add_argument("--optimizer-verify", choices=("on", "off"), default="on")
     parser.add_argument("--memory-limit", default="2GB")
     parser.add_argument("--watchdog-seconds", type=int, default=30)
@@ -296,7 +280,7 @@ def main() -> int:
                      "samples": []} for path in args.query],
     }
     report["configuration"].update({
-        "optimizer_search_policy": args.optimizer_search_policy,
+
         "optimizer_verify": args.optimizer_verify == "on",
         "planning_dop": 1,
         "execution_dop": args.threads,

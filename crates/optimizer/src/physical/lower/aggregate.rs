@@ -10,11 +10,11 @@ use paro_function::aggregate::distributive::first_last::get_first_function;
 use paro_function::aggregate::{AggregateDirectUpdate, AggregateFunction, AggregateSingletonMerge};
 use paro_function::scalar::function_data_equals;
 use paro_planner::expression::{OperatorExpression, OperatorType};
-use paro_planner::operator::{DistinctType, GroupInputMultiplicity};
+use paro_planner::logical::operator::{DistinctType, GroupInputMultiplicity};
 use paro_storage::statistics::{NumericStats, StringStats};
 
 fn plan_group_key_encodings(
-    aggregate: &LogicalAggregate<SelectedChild>,
+    aggregate: &LogicalAggregate<PreparedChild>,
     group_indices: &[usize],
 ) -> Box<[GroupKeyEncoding]> {
     let supports_physical_keys = aggregate.aggregates.iter().all(|expression| {
@@ -71,7 +71,7 @@ struct DependentGroupLayout {
 }
 
 fn plan_dependent_groups(
-    aggregate: &LogicalAggregate<SelectedChild>,
+    aggregate: &LogicalAggregate<PreparedChild>,
 ) -> Option<DependentGroupLayout> {
     if aggregate.groups.len() < 2
         || !aggregate.grouping_functions.is_empty()
@@ -448,7 +448,7 @@ fn split_strict_conditional_input(expression: Expression) -> (Expression, Option
 impl PhysicalPlanBuilder {
     pub(crate) fn lower_aggregate(
         &mut self,
-        aggregate: &LogicalAggregate<SelectedChild>,
+        aggregate: &LogicalAggregate<PreparedChild>,
         implementation: crate::physical::PhysicalImplementationFlavor,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         self.lower_aggregate_with_having(aggregate, Box::new([]), implementation)
@@ -456,7 +456,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_aggregate_with_having(
         &mut self,
-        aggregate: &LogicalAggregate<SelectedChild>,
+        aggregate: &LogicalAggregate<PreparedChild>,
         having_filter: Box<[Expression]>,
         implementation: crate::physical::PhysicalImplementationFlavor,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
@@ -632,7 +632,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_distinct(
         &mut self,
-        distinct: &LogicalDistinct<SelectedChild>,
+        distinct: &LogicalDistinct<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if distinct.distinct_type != DistinctType::Distinct {
             return self.reject_unimplemented(
@@ -698,7 +698,7 @@ impl PhysicalPlanBuilder {
 /// probe irreversibly promotes flat lookup to the complete key. Statistics
 /// therefore affect only bounded startup work, never physical semantics.
 fn plan_initial_lookup_hash_key_count(
-    aggregate: &LogicalAggregate<SelectedChild>,
+    aggregate: &LogicalAggregate<PreparedChild>,
     group_indices: &[usize],
 ) -> usize {
     if group_indices.len() <= 1 || !aggregate.grouping_sets.is_empty() {
@@ -752,7 +752,9 @@ fn hash_aggregate_spill_supported(spec: &AggregateSpec) -> bool {
 /// Pure admission predicate shared by Memo registration and physical
 /// extraction. The proof is revalidated against the final aggregate payload;
 /// a stale annotation therefore never creates a physical candidate.
-pub(crate) fn supports_singleton_aggregate_projection<Child: paro_planner::plan::LogicalChild>(
+pub(crate) fn supports_singleton_aggregate_projection<
+    Child: paro_planner::logical::plan::LogicalChild,
+>(
     aggregate: &LogicalAggregate<Child>,
 ) -> bool {
     matches!(
@@ -841,7 +843,7 @@ fn singleton_group_projection<Child>(
 }
 
 fn lower_post_aggregate_reduction(
-    aggregate: &LogicalAggregate<SelectedChild>,
+    aggregate: &LogicalAggregate<PreparedChild>,
 ) -> Result<Option<PostAggregateReductionSpec>> {
     aggregate.verify_post_reduction()?;
     let Some(reduction) = &aggregate.post_reduction else {
@@ -1120,6 +1122,18 @@ fn can_execute_post_input_rollup(spec: &AggregateSpec) -> bool {
 #[cfg(test)]
 #[path = "aggregate_payload_tests.rs"]
 mod payload_tests;
+
+pub(crate) fn can_use_perfect_hash_aggregate<Child>(
+    aggregate: &LogicalAggregate<Child>,
+    groups: &[Expression],
+    aggregate_exprs: &[Expression],
+) -> Option<PerfectHashAggregatePlan> {
+    crate::physical::aggregate_planning::plan_perfect_hash_aggregate(
+        aggregate,
+        groups,
+        aggregate_exprs,
+    )
+}
 
 #[cfg(test)]
 mod hash_planning_tests {

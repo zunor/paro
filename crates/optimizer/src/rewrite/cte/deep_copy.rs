@@ -11,11 +11,11 @@ mod tests {
     use paro_planner::binder::deep_copy::deep_copy_plan;
     use paro_planner::binder::ir::CTEMaterialize;
     use paro_planner::expression::{ColumnRefExpression, Expression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         CTERef, ComparisonJoin, Join, JoinComparisonType, JoinCondition, LogicalOperator,
         MaterializedCTE, Projection, SetOpType, SetOperation,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     fn expr_get(table_index: usize, values: &[i32]) -> LogicalOperator {
         let expressions = values
@@ -30,7 +30,7 @@ mod tests {
                 )]
             })
             .collect();
-        LogicalOperator::ExpressionGet(paro_planner::operator::ExpressionGet::new(
+        LogicalOperator::ExpressionGet(paro_planner::logical::operator::ExpressionGet::new(
             table_index,
             expressions,
             vec!["v".to_string()],
@@ -50,7 +50,7 @@ mod tests {
             plan_expr_get(&bind_context, 2, &[1, 2]),
             vec![Expression::ColumnRef(
                 ColumnRefExpression::new(
-                    paro_planner::operator::ColumnBinding::new(2, 0),
+                    paro_planner::logical::operator::ColumnBinding::new(2, 0),
                     LogicalType::Integer,
                 )
                 .into(),
@@ -90,20 +90,20 @@ mod tests {
             vec![LogicalType::Integer],
         ));
         let join = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
-            paro_planner::operator::JoinType::Inner,
+            paro_planner::logical::operator::JoinType::Inner,
             OwnedLogicalPlan::new(&bind_context, left_ref),
             OwnedLogicalPlan::new(&bind_context, right_ref),
             vec![JoinCondition::new(
                 Expression::ColumnRef(
                     ColumnRefExpression::new(
-                        paro_planner::operator::ColumnBinding::new(6, 0),
+                        paro_planner::logical::operator::ColumnBinding::new(6, 0),
                         LogicalType::Integer,
                     )
                     .into(),
                 ),
                 Expression::ColumnRef(
                     ColumnRefExpression::new(
-                        paro_planner::operator::ColumnBinding::new(7, 0),
+                        paro_planner::logical::operator::ColumnBinding::new(7, 0),
                         LogicalType::Integer,
                     )
                     .into(),

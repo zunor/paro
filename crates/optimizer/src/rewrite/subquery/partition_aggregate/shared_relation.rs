@@ -179,7 +179,7 @@ pub(super) fn recognize_shared_relation_filter(
 fn collect_cte_refs<'a>(
     plan: &'a OwnedLogicalPlan,
     cte_index: usize,
-    refs: &mut Vec<&'a paro_planner::operator::CTERef>,
+    refs: &mut Vec<&'a paro_planner::logical::operator::CTERef>,
 ) {
     if let LogicalOperator::CTERef(reference) = &plan.operator {
         if reference.cte_index == cte_index {
@@ -351,14 +351,14 @@ pub(super) fn apply_shared_relation_rewrite(
         localized = true;
         Ok(OwnedLogicalPlan::new(
             bind_context,
-            LogicalOperator::Filter(paro_planner::operator::Filter {
+            LogicalOperator::Filter(paro_planner::logical::operator::Filter {
                 expressions: expressions.take().ok_or_else(|| {
                     paro_error::internal(
                         "shared-relation partition filter was consumed more than once",
                     )
                 })?,
                 child: Box::new(target),
-                projection_map: paro_planner::operator::ProjectionMap::all(),
+                projection_map: paro_planner::logical::operator::ProjectionMap::all(),
             }),
         ))
     })?;

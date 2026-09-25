@@ -3,12 +3,10 @@
 
 //! Cost-based join order optimization using dynamic programming.
 
-pub mod cardinality;
+pub(crate) mod candidate;
 pub(crate) mod connected;
-pub mod cost_model;
 pub mod enumerator;
-mod equality_graph;
-pub mod optimizer;
+pub mod planner;
 mod predicate_inference;
 pub mod query_graph;
 pub mod relation;

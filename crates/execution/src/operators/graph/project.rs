@@ -10,7 +10,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::SelectionVector;
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 use paro_storage::tablet::TabletRowIdReader;
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 use paro_transaction::TableId;

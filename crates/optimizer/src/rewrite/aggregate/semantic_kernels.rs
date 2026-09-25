@@ -10,6 +10,7 @@ use paro_planner::expression::AggregateExpression;
 /// Compare the complete bound aggregate execution contract, never its display
 /// name. Extensions may reuse a built-in signature with different state
 /// transitions or bind payload.
+#[cfg(test)]
 pub(crate) fn aggregate_kernels_equal(
     left: &AggregateExpression,
     right: &AggregateExpression,
@@ -22,6 +23,7 @@ pub(crate) fn aggregate_kernels_equal(
         }
 }
 
+#[cfg(test)]
 pub(crate) fn scalar_kernels_equal(
     left: &BoundScalarFunction,
     right: &BoundScalarFunction,
@@ -49,6 +51,7 @@ pub(crate) fn scalar_kernels_equal(
         }
 }
 
+#[cfg(test)]
 pub(crate) fn scalar_dispatch_equal(left: ScalarDispatch, right: ScalarDispatch) -> bool {
     match (left, right) {
         (ScalarDispatch::Direct(left), ScalarDispatch::Direct(right))
@@ -59,6 +62,7 @@ pub(crate) fn scalar_dispatch_equal(left: ScalarDispatch, right: ScalarDispatch)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn cast_kernels_equal(left: &BoundCastInfo, right: &BoundCastInfo) -> bool {
     left.type_contract() == right.type_contract()
         && left.context_dependency() == right.context_dependency()
@@ -73,6 +77,7 @@ pub(crate) fn cast_kernels_equal(left: &BoundCastInfo, right: &BoundCastInfo) ->
         }
 }
 
+#[cfg(test)]
 pub(crate) fn cast_dispatch_equal(left: CastDispatch, right: CastDispatch) -> bool {
     match (left, right) {
         (CastDispatch::Fixed(left), CastDispatch::Fixed(right)) => {

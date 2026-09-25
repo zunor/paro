@@ -4,10 +4,10 @@
 //! Push constant `LIMIT` nodes below projections when the rewrite is cheap.
 
 use paro_planner::expression::Expression;
-use paro_planner::operator::LogicalOperator;
+use paro_planner::logical::operator::LogicalOperator;
 #[cfg(test)]
-use paro_planner::operator::LogicalOperatorType;
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::LogicalOperatorType;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 pub struct LimitPushdown;
 
@@ -141,7 +141,7 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ConstantExpression, Expression, FunctionExpression};
-    use paro_planner::operator::{Get, Limit, Projection};
+    use paro_planner::logical::operator::{Get, Limit, Projection};
 
     fn create_test_get() -> LogicalOperator {
         LogicalOperator::Get(Box::new(Get {
@@ -151,8 +151,8 @@ mod tests {
             relation_name: None,
             relation_alias: None,
             column_sources: vec![
-                paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
-                paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
+                paro_planner::logical::operator::GetColumnSource::Stored { column_id: 0 },
+                paro_planner::logical::operator::GetColumnSource::Stored { column_id: 1 },
             ],
             column_types: vec![LogicalType::Integer, LogicalType::Varchar],
             table: None,

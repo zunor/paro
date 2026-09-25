@@ -12,7 +12,7 @@ use paro_common::identity::GraphId;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::tablet::{TabletReader, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;

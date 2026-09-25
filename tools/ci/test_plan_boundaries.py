@@ -2,11 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+import tempfile
+from pathlib import Path
 
-from check_plan_boundaries import dependency_path, production_dependencies
+from check_plan_boundaries import dependency_path, production_dependencies, check_optimizer_surface
 
 
 class PlanBoundaryTests(unittest.TestCase):
+    def test_public_api_and_fixture_feature_are_explicit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "crates/optimizer/src"
+            source.mkdir(parents=True)
+            facade = source / "lib.rs"
+            fixture = '#[cfg(feature = "test-support")]\npub mod test_support {}\n'
+            # Match a real block declaration, not a one-line lookalike.
+            fixture = fixture.replace('{}', '{\n}')
+            facade.write_text(fixture)
+            self.assertEqual(check_optimizer_surface(root), [])
+            facade.write_text(fixture + "pub mod cost;\n")
+            self.assertTrue(check_optimizer_surface(root))
+            facade.write_text(fixture.replace('#[cfg(feature = "test-support")]\n', ''))
+            self.assertTrue(check_optimizer_surface(root))
+
     def test_transitive_dependency_is_not_hidden(self):
         graph = {"execution": {"helper"}, "helper": {"optimizer"}}
         self.assertEqual(

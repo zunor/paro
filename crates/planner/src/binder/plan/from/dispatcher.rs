@@ -3,7 +3,7 @@
 
 use crate::binder::ir::BoundFromItem;
 use crate::binder::Binder;
-use crate::operator::LogicalOperator;
+use crate::logical::operator::LogicalOperator;
 use paro_common::error::Result;
 
 impl Binder {
@@ -26,8 +26,8 @@ impl Binder {
 mod tests {
     use super::*;
     use crate::binder::test_utils::{test_binder, test_binder_with_search_path};
-    use crate::operator::{ComparisonJoin, Join, LogicalExternalTable};
-    use crate::verify::verify_physical_planner_invariants;
+    use crate::logical::operator::{ComparisonJoin, Join, LogicalExternalTable};
+    use crate::logical::verify::verify_physical_planner_invariants;
     use paro_catalog::catalog::Catalog;
     use paro_catalog::entry::{CreateRoutineInfo, OnCreateConflict};
     use paro_catalog::mvcc::CatalogSnapshot;
@@ -191,7 +191,7 @@ mod tests {
         assert!(!contains_dependent_join(&bound.plan.operator));
 
         let join = find_first_comparison_join(&bound.plan.operator).expect("comparison join");
-        assert_eq!(join.join_type, crate::operator::JoinType::Inner);
+        assert_eq!(join.join_type, crate::logical::operator::JoinType::Inner);
         assert_eq!(join.duplicate_eliminated_columns.len(), 1);
         assert_eq!(join.conditions.len(), 1);
     }
@@ -208,7 +208,7 @@ mod tests {
         assert!(!contains_dependent_join(&bound.plan.operator));
 
         let join = find_first_comparison_join(&bound.plan.operator).expect("comparison join");
-        assert_eq!(join.join_type, crate::operator::JoinType::Inner);
+        assert_eq!(join.join_type, crate::logical::operator::JoinType::Inner);
         assert_eq!(join.duplicate_eliminated_columns.len(), 1);
         assert_eq!(join.conditions.len(), 1);
     }
@@ -224,7 +224,7 @@ mod tests {
         let bound = binder.bind(statement).expect("bind");
 
         let join = find_first_comparison_join(&bound.plan.operator).expect("comparison join");
-        assert_eq!(join.join_type, crate::operator::JoinType::Left);
+        assert_eq!(join.join_type, crate::logical::operator::JoinType::Left);
         assert_eq!(join.duplicate_eliminated_columns.len(), 1);
         assert_eq!(join.conditions.len(), 1);
     }
@@ -302,7 +302,7 @@ mod tests {
 
         assert!(!contains_dependent_join(&bound.plan.operator));
         let join = find_first_comparison_join(&bound.plan.operator).expect("comparison join");
-        assert_eq!(join.join_type, crate::operator::JoinType::Inner);
+        assert_eq!(join.join_type, crate::logical::operator::JoinType::Inner);
 
         let table = find_external_table(&bound.plan.operator).expect("external table");
         assert!(table.lateral);

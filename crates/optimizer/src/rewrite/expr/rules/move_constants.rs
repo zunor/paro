@@ -16,7 +16,7 @@
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::Expression;
 use paro_planner::expression::{ComparisonExpression, ComparisonType};
-use paro_planner::operator::LogicalOperator;
+use paro_planner::logical::operator::LogicalOperator;
 
 use super::expression_matcher::ExpressionMatcher;
 use super::rule::{Rule, RuleResult};
@@ -97,6 +97,7 @@ impl Rule for MoveConstantsRule {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn name(&self) -> &'static str {
         "MoveConstantsRule"
     }
@@ -177,7 +178,7 @@ mod tests {
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
             ColumnRefExpression {
-                binding: paro_planner::operator::ColumnBinding {
+                binding: paro_planner::logical::operator::ColumnBinding {
                     table_index,
                     column_index,
                 },

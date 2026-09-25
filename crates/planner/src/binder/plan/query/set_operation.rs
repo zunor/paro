@@ -7,7 +7,7 @@ use crate::binder::ir::{BoundQuery, BoundSetOperation, SetOperationType};
 use crate::binder::plan::subquery::RecursiveSubqueryPlanner;
 use crate::binder::Binder;
 use crate::expression::{CastExpression, ColumnRefExpression, Expression};
-use crate::operator::{
+use crate::logical::operator::{
     LogicalOperator, MaterializedCTE, Projection, RecursiveCTE, SetOpType, SetOperation,
 };
 use paro_common::error::Result;

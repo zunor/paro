@@ -12,6 +12,8 @@ pub mod context;
 pub mod deep_copy;
 pub mod ir;
 pub mod plan;
+mod planning;
+pub use planning::{Planner, StatementProperties};
 #[cfg(test)]
 pub(crate) mod test_utils;
 
@@ -20,8 +22,8 @@ use crate::binder::context::BindContext;
 use crate::binder::ir::from::BoundFromItem;
 use crate::binder::ir::BoundStatementKind;
 use crate::expression::{Expression, ParameterExpression};
-use crate::operator::LogicalOperator;
-use crate::plan::{OwnedLogicalPlan, PlannedStatement};
+use crate::logical::operator::LogicalOperator;
+use crate::logical::plan::{OwnedLogicalPlan, PlannedStatement};
 use crate::stack::maybe_grow_planner_stack;
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogObjectId, Dependency, DependencyList, DependencyType};
@@ -150,8 +152,8 @@ impl Binder {
 
     /// Wrap a logical operator as a child [`OwnedLogicalPlan`] using the current bind context.
     #[inline]
-    pub(crate) fn wrap_plan(&self, op: LogicalOperator) -> crate::plan::OwnedLogicalPlan {
-        crate::plan::OwnedLogicalPlan::new(&self.bind_context, op)
+    pub(crate) fn wrap_plan(&self, op: LogicalOperator) -> crate::logical::plan::OwnedLogicalPlan {
+        crate::logical::plan::OwnedLogicalPlan::new(&self.bind_context, op)
     }
 
     /// Create a child binder for nested scopes (e.g., subqueries).

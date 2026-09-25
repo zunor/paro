@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::operator::external_project::{ExternalCostEstimate, ExternalProjectExpression};
+use crate::logical::operator::external_project::{ExternalCostEstimate, ExternalProjectExpression};
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::RoutineCallIdentity;
 use paro_external::routine::spec::{RoutineSemantics, RoutineSpec};

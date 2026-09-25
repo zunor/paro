@@ -29,104 +29,63 @@ impl CompileResources {
         }
     }
 
-    pub fn expected_grant(
-        self,
-        max_memory: usize,
-        max_threads: usize,
-        max_classes: u8,
-    ) -> Option<CompileGrant> {
-        compile_grant_classes(max_memory, max_threads, max_classes)
-            .into_iter()
-            .filter(|class| {
-                class.hard_memory_bytes <= self.available_memory_bytes
-                    && class.max_parallel_tasks <= self.available_parallel_tasks
-            })
-            .max_by_key(|class| {
-                (
-                    class.max_parallel_tasks,
-                    class.hard_memory_bytes,
-                    class.index,
-                )
-            })
-    }
-}
-
-/// Keep the existing bounded operating points identical across the cache and
-/// optimizer. This does not change the configured number of grant classes.
-pub fn compile_grant_classes(
-    max_memory: usize,
-    max_threads: usize,
-    max_classes: u8,
-) -> Vec<CompileGrant> {
-    let full = u64::try_from(max_memory).unwrap_or(u64::MAX).max(1);
-    let hard_limits = if max_memory == 0 {
-        vec![u64::MAX]
-    } else {
-        match max_classes.clamp(1, 3) {
-            1 => vec![full],
-            2 => vec![(full / 2).max(1), full],
-            _ => vec![(full / 4).max(1), (full / 2).max(1), full],
-        }
-    };
-    let count = hard_limits.len();
-    let threads = max_threads.clamp(1, u16::MAX as usize);
-    let mut previous = None;
-    hard_limits
-        .into_iter()
-        .filter(|hard| previous.replace(*hard) != Some(*hard))
-        .enumerate()
-        .map(|(index, hard_memory_bytes)| CompileGrant {
-            index,
+    /// One operating point shared by the compiler and cache key. A zero
+    /// configured memory limit means no session cap, not infinite availability.
+    pub fn expected_grant(self, max_memory: usize, max_threads: usize) -> Option<CompileGrant> {
+        let configured_memory = if max_memory == 0 {
+            u64::MAX
+        } else {
+            max_memory as u64
+        };
+        let hard_memory_bytes = configured_memory.min(self.available_memory_bytes);
+        let max_parallel_tasks = max_threads.clamp(1, u16::MAX as usize) as u16;
+        let max_parallel_tasks = max_parallel_tasks.min(self.available_parallel_tasks);
+        (hard_memory_bytes > 0 && max_parallel_tasks > 0).then_some(CompileGrant {
+            index: 0,
             hard_memory_bytes,
-            max_parallel_tasks: match count {
-                1 => threads,
-                2 if index == 0 => 1,
-                2 => threads,
-                _ if index == 0 => 1,
-                _ if index + 1 == count => threads,
-                _ => threads.div_ceil(2),
-            } as u16,
+            max_parallel_tasks,
         })
-        .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn expected_grant_uses_both_frozen_availability_and_limits() {
+    fn one_operating_point_is_bounded_by_settings_and_frozen_availability() {
         let full = CompileResources::capture(1024, 4);
-        assert_eq!(full.expected_grant(1024, 4, 3).unwrap().index, 2);
         assert_eq!(
-            CompileResources::capture(512, 4)
-                .expected_grant(1024, 4, 3)
-                .unwrap()
-                .index,
-            1
+            full.expected_grant(1024, 4).unwrap(),
+            CompileGrant {
+                index: 0,
+                hard_memory_bytes: 1024,
+                max_parallel_tasks: 4
+            }
         );
         assert_eq!(
-            CompileResources::capture(1024, 1)
-                .expected_grant(1024, 4, 3)
-                .unwrap()
-                .index,
-            0
+            CompileResources::capture(512, 1)
+                .expected_grant(1024, 4)
+                .unwrap(),
+            CompileGrant {
+                index: 0,
+                hard_memory_bytes: 512,
+                max_parallel_tasks: 1
+            }
         );
-        assert!(CompileResources::capture(128, 4)
-            .expected_grant(1024, 4, 3)
+        assert_eq!(
+            full.expected_grant(512, 2).unwrap(),
+            CompileGrant {
+                index: 0,
+                hard_memory_bytes: 512,
+                max_parallel_tasks: 2
+            }
+        );
+        assert_eq!(full.expected_grant(0, 4).unwrap().hard_memory_bytes, 1024);
+        assert!(CompileResources::capture(0, 4)
+            .expected_grant(1024, 4)
             .is_none());
         assert!(CompileResources::capture(1024, 0)
-            .expected_grant(1024, 4, 3)
+            .expected_grant(1024, 4)
             .is_none());
-        assert!(
-            CompileResources::capture(1024, 4)
-                .expected_grant(0, 4, 3)
-                .is_none(),
-            "an unbounded setting is not observed infinite availability"
-        );
-        assert_eq!(
-            full.expected_grant(512, 2, 3).unwrap().hard_memory_bytes,
-            512
-        );
     }
 }

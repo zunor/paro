@@ -9,18 +9,20 @@ binder or plan crate.
 | Module | Responsibility |
 | --- | --- |
 | `binder/` | Names, scopes, types, parameters and bound statement semantics |
-| `expression/`, `operator/`, `plan/` | Bound expressions, logical operators, plan arenas and column identities |
+| `expression/` | Typed expressions shared by both plan forms |
+| `logical/` | Logical operators, plan arenas, properties, visitors and column identities |
 | `physical/` | Executable topology, typed operator payloads, dependencies, canonical identity, properties and resource/admission contracts |
 
 The optimizer constructs physical plans. Execution consumes the finalized
 contracts to admit work, lower executable images and run operators. Neither
 consumer needs to own another copy of the plan types.
 
-Physical cost values and their composition/comparison laws are shared data
-contracts. Calibrated operator formulas, cardinality estimation, candidate
-enumeration, Memo identities and task scheduling belong to `paro-optimizer`,
-not here. `physical/scalar_identity.rs` encodes expression semantics without
-constructing Memo scalar objects. Query-local interning stays with its owner.
+Published physical work/resource values are shared data contracts. Candidate
+ranking, calibrated formulas, cardinality estimation and bounded enumeration
+belong to `paro-optimizer`, not here. `physical/artifact.rs` represents one
+verified plan and its resource requirements: admission checks availability and
+dependencies, never ranks alternatives. `physical/scalar_identity.rs` encodes
+expression semantics without a second expression representation.
 
 ## Boundaries
 

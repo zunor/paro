@@ -334,7 +334,7 @@ impl OrderByBinding {
         return_type: paro_common::types::LogicalType,
     ) -> crate::expression::Expression {
         use crate::expression::ColumnRefExpression;
-        use crate::operator::ColumnBinding;
+        use crate::logical::operator::ColumnBinding;
 
         crate::expression::Expression::ColumnRef(
             ColumnRefExpression::new(

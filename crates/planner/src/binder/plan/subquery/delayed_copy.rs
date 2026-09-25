@@ -5,8 +5,8 @@ use crate::binder::context::BindSnapshot;
 use crate::binder::deep_copy::{
     deep_copy_operator_shallow_subqueries, deep_copy_plan_shallow_subqueries,
 };
-use crate::operator::LogicalOperator;
-use crate::plan::PlannedStatement;
+use crate::logical::operator::LogicalOperator;
+use crate::logical::plan::PlannedStatement;
 
 pub fn copy_subquery_top_level(
     op: &LogicalOperator,
@@ -37,8 +37,8 @@ mod tests {
     use crate::expression::{
         ComparisonType, Expression, SubqueryExpression, SubqueryPlanningState, SubqueryType,
     };
-    use crate::operator::{ExpressionGet, LogicalOperator, Projection};
-    use crate::plan::OwnedLogicalPlan;
+    use crate::logical::operator::{ExpressionGet, LogicalOperator, Projection};
+    use crate::logical::plan::OwnedLogicalPlan;
 
     fn expression_get(table_index: usize) -> LogicalOperator {
         LogicalOperator::ExpressionGet(ExpressionGet::new(

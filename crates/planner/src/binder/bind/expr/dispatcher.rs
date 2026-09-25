@@ -6,7 +6,7 @@ use crate::expression::{
     CastExpression, ColumnRefExpression, ComparisonType, ConjunctionType, ConstantExpression,
     Expression, OperatorExpression, OperatorType, SubqueryType,
 };
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 use paro_common::error::{self as paro_error, ParoError, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;

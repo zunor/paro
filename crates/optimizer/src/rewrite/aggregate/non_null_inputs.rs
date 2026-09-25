@@ -11,38 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use paro_planner::expression::{AggregateType, Expression};
-use paro_planner::operator::{binding_preserving_get, ColumnBinding, LogicalOperator};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{binding_preserving_get, ColumnBinding, LogicalOperator};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 use paro_storage::statistics::ColumnStatistics;
-
-pub fn optimize_plan(
-    plan: OwnedLogicalPlan,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> OwnedLogicalPlan {
-    optimize_plan_with_change(plan, column_stats).0
-}
-
-pub fn optimize_plan_with_change(
-    plan: OwnedLogicalPlan,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> (OwnedLogicalPlan, bool) {
-    let mut changed = false;
-    let plan = plan.map_children(|child| {
-        let (child, child_changed) = optimize_plan_with_change(child, column_stats);
-        changed |= child_changed;
-        child
-    });
-    let plan = plan.map_operator(|operator| match operator {
-        LogicalOperator::Aggregate(mut aggregate) => {
-            for expression in &mut aggregate.aggregates {
-                changed |= rewrite_aggregate(expression, aggregate.child.as_ref(), column_stats);
-            }
-            LogicalOperator::Aggregate(aggregate)
-        }
-        operator => operator,
-    });
-    (plan, changed)
-}
 
 fn rewrite_aggregate(
     expression: &mut Expression,
@@ -106,7 +77,7 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_function::aggregate::distributive::count::get_count_function;
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ComparisonJoin, Filter, Get, Join, JoinComparisonType, JoinCondition, JoinType, Limit,
         Order, TopN,
     };

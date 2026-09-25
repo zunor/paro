@@ -9,8 +9,11 @@ pub mod conjunction;
 mod constant_evaluator;
 pub mod constant_folding;
 pub mod expression_matcher;
+#[cfg(test)]
 pub mod function_matcher;
 pub mod move_constants;
 pub mod rule;
+#[cfg(test)]
 pub mod set_matcher;
+#[cfg(test)]
 pub mod type_matcher;

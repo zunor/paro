@@ -11,8 +11,8 @@
 //! streaming (left/probe) side of every containing inner join.
 
 use paro_common::error::{self as paro_error, Result};
-use paro_planner::operator::{Join, JoinType, LogicalOperator};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{Join, JoinType, LogicalOperator};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 /// Normalize every recursive member's join ownership without affecting CTE
 /// references that consume the completed result outside the iteration.
@@ -59,7 +59,7 @@ fn orient_recursive_member(
                 // changing delta on its streaming side. This is a logical join
                 // property, independent of predicate representation.
                 join.set_build_side_constraint(
-                    paro_planner::operator::JoinBuildSideConstraint::Right,
+                    paro_planner::logical::operator::JoinBuildSideConstraint::Right,
                 );
             }
         }
@@ -103,12 +103,12 @@ fn move_recursive_input_to_probe(join: &mut Join, cte_name: &str) -> Result<()> 
 mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, Expression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         AnyJoin, CTERef, ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, Join,
         JoinBuildSideConstraint, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
         RecursiveCTE,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     use super::normalize_iteration_ownership;
 

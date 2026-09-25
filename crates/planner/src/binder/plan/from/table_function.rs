@@ -3,8 +3,10 @@
 
 use crate::binder::ir::{BoundExternalRoutine, BoundTableFunction};
 use crate::binder::Binder;
-use crate::operator::{LogicalExternalTable, LogicalOperator, Projection, TableFunctionGet};
-use crate::plan::OwnedLogicalPlan;
+use crate::logical::operator::{
+    LogicalExternalTable, LogicalOperator, Projection, TableFunctionGet,
+};
+use crate::logical::plan::OwnedLogicalPlan;
 use paro_common::error::Result;
 
 impl Binder {

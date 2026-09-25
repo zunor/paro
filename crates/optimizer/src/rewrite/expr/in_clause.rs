@@ -5,8 +5,8 @@ use paro_planner::expression::{
     ComparisonExpression, ComparisonType, Expression, OperatorExpression, OperatorType,
     WindowExpression, WindowFrameBound, WindowInvocation,
 };
-use paro_planner::operator::{Filter, Join, LogicalOperator, Projection};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{Filter, Join, LogicalOperator, Projection};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 pub struct InClauseRewriter;
 
@@ -336,7 +336,7 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::ColumnRefExpression;
-    use paro_planner::operator::{ColumnBinding, ExpressionGet, JoinType};
+    use paro_planner::logical::operator::{ColumnBinding, ExpressionGet, JoinType};
 
     use super::*;
     fn integer_get(bind_context: &BindContext, table_index: usize) -> OwnedLogicalPlan {

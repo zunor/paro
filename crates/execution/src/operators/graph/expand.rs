@@ -8,7 +8,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VectorSelection, VECTOR_SIZE};
-use paro_planner::operator::graph_expand::ExpandDirection;
+use paro_planner::logical::operator::graph_expand::ExpandDirection;
 use paro_storage::index::graph::NeighborView;
 
 use crate::operators::graph::state::{graph_path_list_value, GraphExpandRow, GraphPathPayload};

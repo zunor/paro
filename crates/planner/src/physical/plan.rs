@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 
+use super::artifact::ExecutionResourceContract;
 use super::children::{PlanChildren, PlanChildrenArena};
 use super::dependencies::PlanDependencies;
 use super::edges::{PhysicalEdgeArena, PhysicalEdgeKind};
@@ -17,16 +18,15 @@ use super::explain::types::{
 use super::identity::{Fingerprint, StableFingerprintBuilder};
 use super::ids::PhysicalPlanNodeId;
 use super::node::PhysicalPlanNode;
-use super::portfolio::ExecutionResourceContract;
 use super::properties::{PhysicalGrantContract, PlanPropertyMap};
 use super::row_type::{ColumnIdentity, RowType};
 use super::specs::{AggregateSpec, NestedLoopJoinSpec, PhysicalNodeKind, SearchSourceSpec};
 use crate::expression::{
     AggregateExpression, AggregateType, Expression, OperatorType, WindowFrameBound, WindowFrameType,
 };
-use crate::operator::join::{JoinComparisonType, JoinCondition};
-use crate::operator::ExplainSpec;
-use crate::plan::CardinalityEstimate;
+use crate::logical::operator::join::{JoinComparisonType, JoinCondition};
+use crate::logical::operator::ExplainSpec;
+use crate::logical::plan::CardinalityEstimate;
 use paro_catalog::entry::{StandardEntry, TableCatalogEntry};
 use paro_common::types::LogicalType;
 use paro_storage::index::{Predicate, PredicateTree};
@@ -77,8 +77,8 @@ pub struct PhysicalPlan {
     pub edges: PhysicalEdgeArena,
     pub properties: PlanPropertyMap,
     pub dependencies: PlanDependencies,
-    /// Bound only after portfolio admission. It is not an optimizer input and
-    /// therefore does not participate in the portfolio fingerprint.
+    /// Bound only after artifact admission. It is not an optimizer input and
+    /// therefore does not participate in the artifact fingerprint.
     pub execution_resources: Option<ExecutionResourceContract>,
 }
 
@@ -154,26 +154,22 @@ impl PhysicalPlan {
         children.as_slice(&self.children)
     }
 
-    /// Portfolio identity includes the selected implementation's operating
-    /// points, not merely its Memo expression and enforcer shape. Two equal-cost
-    /// sorts can have the same structural fingerprint while being proved for
-    /// different memory classes. Merging those plans would keep only one of
-    /// the proofs and advertise it for both classes.
+    /// Artifact identity includes the selected implementation's resource
+    /// contract, not merely its operator shape. Identical operators compiled
+    /// for different task or memory requirements are not interchangeable.
     ///
     /// Admission is the intersection of every node's contract. Canonicalize
     /// that conjunction independently of arena ids, node order and duplicate
     /// constraints. Auxiliary producers are included: extraction has already
     /// compacted the complete executable arena before this method is called.
-    pub fn portfolio_fingerprint(
+    pub fn artifact_fingerprint(
         &self,
         structural: Fingerprint,
     ) -> paro_common::error::Result<Fingerprint> {
         let mut contracts = BTreeSet::new();
         for node in self.nodes.iter() {
             let properties = self.properties.get(node.id).ok_or_else(|| {
-                paro_common::error::internal(
-                    "portfolio identity requires every node grant contract",
-                )
+                paro_common::error::internal("artifact identity requires every node grant contract")
             })?;
             if properties.grant_contract != PhysicalGrantContract::Invariant {
                 contracts.insert(properties.grant_contract);
@@ -1135,9 +1131,9 @@ fn write_semantic_kind_fields(
 
     fn write_mark(
         builder: &mut StableFingerprintBuilder,
-        semantics: crate::operator::join::MarkJoinSemantics,
+        semantics: crate::logical::operator::join::MarkJoinSemantics,
     ) {
-        use crate::operator::join::MarkJoinSemantics;
+        use crate::logical::operator::join::MarkJoinSemantics;
         match semantics {
             MarkJoinSemantics::NotMark => builder.write_u64(0),
             MarkJoinSemantics::TwoValued => builder.write_u64(1),
@@ -1353,13 +1349,15 @@ fn write_semantic_kind_fields(
             builder.write_u64(7);
             builder.write_bytes(spec.join_type.to_string().as_bytes());
             builder.write_u64(match spec.anti_join_mode {
-                crate::operator::join::AntiJoinMode::Regular => 0,
-                crate::operator::join::AntiJoinMode::NullAware => 1,
+                crate::logical::operator::join::AntiJoinMode::Regular => 0,
+                crate::logical::operator::join::AntiJoinMode::NullAware => 1,
             });
             match spec.mark_semantics {
-                crate::operator::join::MarkJoinSemantics::NotMark => builder.write_u64(0),
-                crate::operator::join::MarkJoinSemantics::TwoValued => builder.write_u64(1),
-                crate::operator::join::MarkJoinSemantics::ThreeValuedFrom(index) => {
+                crate::logical::operator::join::MarkJoinSemantics::NotMark => builder.write_u64(0),
+                crate::logical::operator::join::MarkJoinSemantics::TwoValued => {
+                    builder.write_u64(1)
+                }
+                crate::logical::operator::join::MarkJoinSemantics::ThreeValuedFrom(index) => {
                     builder.write_u64(2);
                     builder.write_u64(index as u64);
                 }
@@ -1540,8 +1538,10 @@ fn write_semantic_kind_fields(
             if let Some(conflict) = &spec.on_conflict {
                 write_hashed_slice(builder, b"conflict-target", &conflict.target_columns);
                 match &conflict.action {
-                    crate::operator::InsertOnConflictAction::DoNothing => builder.write_u64(0),
-                    crate::operator::InsertOnConflictAction::DoUpdate {
+                    crate::logical::operator::InsertOnConflictAction::DoNothing => {
+                        builder.write_u64(0)
+                    }
+                    crate::logical::operator::InsertOnConflictAction::DoUpdate {
                         target_columns,
                         source_columns,
                     } => {
@@ -2138,11 +2138,11 @@ fn push_aggregate_properties(
     }
 }
 
-fn expand_direction_name(direction: crate::operator::ExpandDirection) -> &'static str {
+fn expand_direction_name(direction: crate::logical::operator::ExpandDirection) -> &'static str {
     match direction {
-        crate::operator::ExpandDirection::Forward => "forward",
-        crate::operator::ExpandDirection::Backward => "backward",
-        crate::operator::ExpandDirection::Both => "both",
+        crate::logical::operator::ExpandDirection::Forward => "forward",
+        crate::logical::operator::ExpandDirection::Backward => "backward",
+        crate::logical::operator::ExpandDirection::Both => "both",
     }
 }
 
@@ -3573,12 +3573,12 @@ fn format_search_predicate(
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    use crate::logical::plan::PlanNodeId;
     use crate::physical::cost::MemoryCompletion;
     use crate::physical::identity::{MutationBarrierId, SnapshotId};
     use crate::physical::specs::{DummyScanSpec, MutationInputSpoolSpec};
     use crate::physical::{InlinePlanChildren, ResourceGrantClassId};
     use crate::physical::{OperatorLabel, RowType};
-    use crate::plan::PlanNodeId;
     use paro_common::types::LogicalType;
 
     fn dummy_plan(prefix_unreachable: bool, label: &str, output_name: &str) -> PhysicalPlan {

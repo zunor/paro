@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use crate::expression::Expression;
-use crate::operator::join::JoinComparisonType;
+use crate::logical::operator::join::JoinComparisonType;
 
 use super::{
     HashJoinSpec, PhysicalNodeKind, PhysicalPlan, PhysicalPlanNodeArena, PhysicalPlanNodeId,
@@ -79,7 +79,7 @@ pub fn trace_rowset_lineage_in(
             trace_rowset_lineage_in(arena, children, *child, child_index)
         }
         PhysicalNodeKind::SetOperation(spec)
-            if spec.op == crate::operator::SetOpType::Union && spec.all =>
+            if spec.op == crate::logical::operator::SetOpType::Union && spec.all =>
         {
             current
                 .children

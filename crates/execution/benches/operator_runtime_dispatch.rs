@@ -41,7 +41,7 @@ use paro_execution::runtime::{
 };
 use paro_execution::thread_context::ThreadContext;
 use paro_planner::expression::{Expression, ReferenceExpression};
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinCondition, JoinType};
 use paro_planner::physical::properties::PipelineProperties;
 use paro_planner::physical::row_type::RowType;
 use paro_planner::physical::specs::{ChunkScanSpec, FilterSpec, ProjectSpec, SpillExecutionPolicy};

@@ -298,8 +298,8 @@ impl<'a> PipelineLowerer<'a> {
         &self,
         source: SourceSpec,
         mut transforms: Vec<TransformSpec>,
-        mut transform_lineage: Vec<Option<paro_planner::plan::PlanNodeId>>,
-        source_node: paro_planner::plan::PlanNodeId,
+        mut transform_lineage: Vec<Option<paro_planner::logical::plan::PlanNodeId>>,
+        source_node: paro_planner::logical::plan::PlanNodeId,
     ) -> (SourceSpec, Vec<TransformSpec>, PipelineOperatorLineage) {
         transforms.reverse();
         transform_lineage.reverse();

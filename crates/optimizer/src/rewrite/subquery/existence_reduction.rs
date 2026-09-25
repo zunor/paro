@@ -13,10 +13,10 @@ use std::collections::HashSet;
 
 use paro_common::error::Result;
 use paro_planner::expression::{Expression, ExpressionIterator, ExpressionVisitDecision};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     AntiJoinMode, ColumnBinding, Join, JoinType, LogicalOperator, MarkJoinSemantics, ProjectionMap,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 pub(crate) fn optimize_plan(plan: OwnedLogicalPlan) -> Result<(OwnedLogicalPlan, bool)> {
     let mut changed = false;
@@ -290,7 +290,7 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{ColumnRefExpression, ConstantExpression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ComparisonJoin, ExpressionGet, JoinComparisonType, JoinCondition, Projection, SetOperation,
     };
 

@@ -7,7 +7,7 @@
 use crate::binder::bind::expr;
 use crate::binder::Binder;
 use crate::expression::{ColumnRefExpression, Expression};
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_parser::ast::Expr;

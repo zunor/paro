@@ -7,7 +7,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
 use crate::physical::properties::PipelineProperties;
 use crate::physical::row_type::RowType;
@@ -765,8 +765,8 @@ pub struct NljUnmatchedSourceSpec {
 pub struct HashJoinSpillReplaySourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
-    pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
-    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
+    pub anti_join_mode: paro_planner::logical::operator::join::AntiJoinMode,
+    pub mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
@@ -973,8 +973,8 @@ pub struct HashJoinProbeSpec {
     /// filter remains exact.
     pub covering_runtime_filter_key: Option<usize>,
     pub join_type: JoinType,
-    pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
-    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
+    pub anti_join_mode: paro_planner::logical::operator::join::AntiJoinMode,
+    pub mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
@@ -990,7 +990,7 @@ pub struct NestedLoopJoinProbeSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
+    pub mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     pub arbitrary_condition: Option<Expression>,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
@@ -1004,7 +1004,7 @@ pub struct SortRangeJoinProbeSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
+    pub mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
     pub right_output_types: Box<[LogicalType]>,

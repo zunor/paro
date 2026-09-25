@@ -4,7 +4,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::operator::SearchDecision;
+use crate::logical::operator::SearchDecision;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::runtime_value::Value;
 use paro_common::typed_parameters::ParameterSlot;

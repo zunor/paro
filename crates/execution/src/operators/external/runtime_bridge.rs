@@ -19,7 +19,7 @@ use paro_external::routine::spec::{
 };
 use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
 use paro_external::runtime::host::default_python_binary;
-use paro_planner::operator::external_project::ExternalProjectExpression;
+use paro_planner::logical::operator::external_project::ExternalProjectExpression;
 use paro_planner::physical::ExternalRoutineDescriptor;
 use serde_json::{json, Value as JsonValue};
 
@@ -816,7 +816,7 @@ mod tests {
     };
     use paro_function::scalar::ScalarFunction;
     use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
-    use paro_planner::operator::external_project::ExternalProjectExpression;
+    use paro_planner::logical::operator::external_project::ExternalProjectExpression;
     use paro_planner::physical::{ExecutionResourceContract, ResourceGrantClassId};
     use std::sync::Arc;
 

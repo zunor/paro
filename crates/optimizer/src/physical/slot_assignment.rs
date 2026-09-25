@@ -6,8 +6,8 @@
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::expression::{ColumnRefExpression, Expression, ReferenceExpression};
-use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
-use paro_planner::visitor::LogicalOperatorVisitor;
+use paro_planner::logical::operator::{ColumnBinding, Join, LogicalOperator};
+use paro_planner::logical::visitor::LogicalOperatorVisitor;
 
 /// Assigns physical chunk ordinals to stable planner bindings in an already
 /// selected winner skeleton.

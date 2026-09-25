@@ -14,10 +14,10 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 /// Enumerate the semantics-preserving pre-aggregation alternative. Whether it
 /// is profitable belongs to Memo costing, not to the transformation itself.
 pub fn optimize_plan(
@@ -197,8 +197,8 @@ impl JoinPreaggregation {
         // input cannot be carried across that boundary. Expose the semantic
         // result here and let the canonical column-lifetime pass derive the
         // final demand projection from the rewritten parent expressions.
-        join.left_projection_map = paro_planner::operator::ProjectionMap::all();
-        join.right_projection_map = paro_planner::operator::ProjectionMap::all();
+        join.left_projection_map = paro_planner::logical::operator::ProjectionMap::all();
+        join.right_projection_map = paro_planner::logical::operator::ProjectionMap::all();
 
         let group_ref = Expression::ColumnRef(
             ColumnRefExpression::new(
@@ -242,11 +242,11 @@ mod tests {
     use paro_function::aggregate::distributive::count::get_count_function;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         Aggregate, ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinCondition, JoinType,
         LogicalOperator, PostAggregateReduction,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     use super::{optimize_plan, JoinPreaggregation};
 

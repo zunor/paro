@@ -5,8 +5,8 @@
 //! unchanged; no source-rule identity is used as a quality certificate.
 use super::predicate_domain::{derive_producer_predicates, FilteredCTERef};
 use paro_planner::expression::Expression;
-use paro_planner::operator::{ColumnBinding, Filter, LogicalOperator};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{ColumnBinding, Filter, LogicalOperator};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 use std::collections::HashSet;
 
 #[cfg(test)]
@@ -23,7 +23,7 @@ fn push_producer_domain(
     predicates: Vec<Expression>,
 ) -> paro_common::error::Result<OwnedLogicalPlan> {
     use paro_common::error as paro_error;
-    use paro_planner::plan::arena::LogicalPlanNode;
+    use paro_planner::logical::plan::arena::LogicalPlanNode;
 
     enum Work {
         Visit(OwnedLogicalPlan, Vec<Expression>),
@@ -59,7 +59,7 @@ fn push_producer_domain(
                     .map(|child| child.output_layout())
                     .collect::<Vec<_>>();
                 let refs = layouts.iter().collect::<Vec<_>>();
-                let Some(routed) = crate::cascades::planner::domain_transfer::transfer_predicates(
+                let Some(routed) = crate::rewrite::predicate::column_transfer::transfer_predicates(
                     &plan.operator,
                     &refs,
                     &predicates,
@@ -139,7 +139,7 @@ pub(crate) fn normalize(plan: OwnedLogicalPlan) -> paro_common::error::Result<Ow
 fn collect_filtered_cte_refs(
     plan: &OwnedLogicalPlan,
     cte_index: usize,
-    output_columns: &[paro_planner::operator::cte::CteOutputColumn],
+    output_columns: &[paro_planner::logical::operator::cte::CteOutputColumn],
     references: &mut Vec<FilteredCTERef>,
     invalid_reference: &mut bool,
 ) {
@@ -169,9 +169,9 @@ fn collect_filtered_cte_refs(
 }
 
 pub(crate) fn filtered_cte_ref<Child>(
-    reference: &paro_planner::operator::CTERef,
+    reference: &paro_planner::logical::operator::CTERef,
     filter: &Filter<Child>,
-    output_columns: &[paro_planner::operator::cte::CteOutputColumn],
+    output_columns: &[paro_planner::logical::operator::cte::CteOutputColumn],
 ) -> Option<FilteredCTERef> {
     if reference.definition_columns.len() != output_columns.len() || filter.expressions.is_empty() {
         return None;

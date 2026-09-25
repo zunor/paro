@@ -3,7 +3,7 @@
 
 use crate::binder::Binder;
 use crate::expression::{ConstantExpression, ExpressionIterator, WindowExpression};
-use crate::operator::{Join, LogicalOperator};
+use crate::logical::operator::{Join, LogicalOperator};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;

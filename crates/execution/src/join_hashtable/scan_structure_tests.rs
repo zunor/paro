@@ -10,7 +10,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
 use paro_planner::expression::{ConstantExpression, Expression};
-use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 use paro_storage::buffer::BufferPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -425,7 +425,7 @@ fn test_next_semi_anti_and_mark_join() {
             &ht,
             &[0],
             &OutputPermutation::identity(2),
-            paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(0),
+            paro_planner::logical::operator::MarkJoinSemantics::ThreeValuedFrom(0),
         )
         .unwrap();
     assert_eq!(mark_count, 2);

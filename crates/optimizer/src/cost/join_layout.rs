@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
-use paro_planner::operator::{Join, LogicalOperator};
+use paro_planner::logical::operator::{Join, LogicalOperator};
 #[cfg(test)]
-use paro_planner::operator::{JoinBuildSideConstraint, JoinType, ProjectionMap};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{JoinBuildSideConstraint, JoinType, ProjectionMap};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 /// Choose a cheaper build side for joins.
 #[cfg(test)]
@@ -63,7 +63,7 @@ impl BuildProbeSideOptimizer {
         }
     }
 
-    fn try_flip_comparison_join(&self, join: &mut paro_planner::operator::ComparisonJoin) {
+    fn try_flip_comparison_join(&self, join: &mut paro_planner::logical::operator::ComparisonJoin) {
         // Reduction joins have explicit right-preserving inverses, so they can
         // choose the smaller build relation without changing multiplicity or
         // their one-side output contract. Outer joins retain their current
@@ -86,8 +86,8 @@ impl BuildProbeSideOptimizer {
         let has_hash_key = join.conditions.iter().any(|condition| {
             matches!(
                 condition.comparison,
-                paro_planner::operator::JoinComparisonType::Equal
-                    | paro_planner::operator::JoinComparisonType::NotDistinctFrom
+                paro_planner::logical::operator::JoinComparisonType::Equal
+                    | paro_planner::logical::operator::JoinComparisonType::NotDistinctFrom
             )
         });
         let left_cost = self.comparison_build_cost(
@@ -149,7 +149,7 @@ impl BuildProbeSideOptimizer {
         }
     }
 
-    fn try_flip_cross_product(&self, join: &mut paro_planner::operator::CrossProduct) {
+    fn try_flip_cross_product(&self, join: &mut paro_planner::logical::operator::CrossProduct) {
         let left_cost = self.build_cost(join.left.as_ref());
         let right_cost = self.build_cost(join.right.as_ref());
         let build_left = match join.build_side_constraint {
@@ -390,11 +390,11 @@ mod tests {
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{ColumnRefExpression, Expression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, Get, Join,
         JoinBuildSideConstraint, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
     };
-    use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan};
+    use paro_planner::logical::plan::{CardinalityEstimate, OwnedLogicalPlan};
     use paro_storage::table::table_factory::TableFactory;
     use std::sync::Arc;
 

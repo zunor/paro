@@ -14,7 +14,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
 use paro_context::test_support::TestStatementContextBuilder;
 use paro_planner::expression::{Expression, ReferenceExpression};
-use paro_planner::operator::join::JoinComparisonType;
+use paro_planner::logical::operator::join::JoinComparisonType;
 use paro_storage::buffer::{BufferPool, MemoryTag};
 use paro_storage::index::{Predicate, PredicateTree};
 use paro_storage::row::RowValidityType;

@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use paro_planner::plan::LogicalPlanRead;
+use paro_planner::logical::plan::LogicalPlanRead;
 
 impl PhysicalPlanBuilder {
     pub(crate) fn lower_join(
         &mut self,
-        join: &Join<SelectedChild>,
-        join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+        join: &Join<PreparedChild>,
+        join_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
         implementation: crate::physical::PhysicalImplementationFlavor,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         match join {
@@ -143,8 +143,8 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_comparison_join(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
-        join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+        join: &ComparisonJoin<PreparedChild>,
+        join_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if join.anti_join_mode == AntiJoinMode::NullAware
             && (join.join_type != JoinType::Anti
@@ -195,7 +195,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_nested_loop_join(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
+        join: &ComparisonJoin<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(join.left.as_ref())?;
         let right = self.extract_node(join.right.as_ref())?;
@@ -229,7 +229,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_sort_range_join(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
+        join: &ComparisonJoin<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(join.left.as_ref())?;
         let right = self.extract_node(join.right.as_ref())?;
@@ -270,7 +270,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_classic_ie_join(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
+        join: &ComparisonJoin<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(join.left.as_ref())?;
         let right = self.extract_node(join.right.as_ref())?;
@@ -311,7 +311,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_any_join(
         &mut self,
-        any: &paro_planner::operator::join::AnyJoin<SelectedChild>,
+        any: &paro_planner::logical::operator::join::AnyJoin<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if !supports_typed_hash_join_type(any.join_type) {
             return self.reject_unimplemented(
@@ -352,7 +352,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_cross_product(
         &mut self,
-        cross: &CrossProduct<SelectedChild>,
+        cross: &CrossProduct<PreparedChild>,
         spill_policy: SpillExecutionPolicy,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(cross.left.as_ref())?;
@@ -380,7 +380,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_comparison_hash_join(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
+        join: &ComparisonJoin<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(join.left.as_ref())?;
         let right = self.extract_node(join.right.as_ref())?;
@@ -449,7 +449,7 @@ impl PhysicalPlanBuilder {
     /// `[logical left, logical right]` contract during result construction.
     pub(crate) fn lower_comparison_hash_join_build_left(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
+        join: &ComparisonJoin<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let probe = self.extract_node(join.right.as_ref())?;
         let build = self.extract_node(join.left.as_ref())?;
@@ -548,7 +548,7 @@ impl PhysicalPlanBuilder {
     /// reduction while the preserved relation is stored once.
     fn try_lower_reduction_cascade(
         &mut self,
-        root: &ComparisonJoin<SelectedChild>,
+        root: &ComparisonJoin<PreparedChild>,
     ) -> Result<Option<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)>> {
         let mut joins = Vec::new();
         let mut current = root;
@@ -637,7 +637,7 @@ impl PhysicalPlanBuilder {
         merged_get.column_sources = merged_column_ids
             .iter()
             .copied()
-            .map(|column_id| paro_planner::operator::GetColumnSource::Stored { column_id })
+            .map(|column_id| paro_planner::logical::operator::GetColumnSource::Stored { column_id })
             .collect();
         merged_get.names = merged_column_ids
             .iter()
@@ -874,7 +874,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_comparison_delim_join(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
+        join: &ComparisonJoin<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if join.duplicate_eliminated_columns.is_empty() {
             return self.reject_unimplemented(
@@ -955,7 +955,7 @@ impl PhysicalPlanBuilder {
     pub(crate) fn synthetic_cached_outer_scan(
         &mut self,
         output: RowType,
-        logical_id: paro_planner::plan::PlanNodeId,
+        logical_id: paro_planner::logical::plan::PlanNodeId,
     ) -> PhysicalPlanNodeId {
         let spec = DelimScanSpec {
             target: DelimScanTarget::CachedOuter,
@@ -973,7 +973,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn push_wrapped_hash_join(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
+        join: &ComparisonJoin<PreparedChild>,
         left: PhysicalPlanNodeId,
         right: PhysicalPlanNodeId,
     ) -> Result<PhysicalPlanNodeId> {
@@ -1058,7 +1058,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn push_wrapped_nlj(
         &mut self,
-        join: &ComparisonJoin<SelectedChild>,
+        join: &ComparisonJoin<PreparedChild>,
         left: PhysicalPlanNodeId,
         right: PhysicalPlanNodeId,
     ) -> Result<PhysicalPlanNodeId> {
@@ -1193,7 +1193,7 @@ struct ReductionScanBranch<'a> {
 }
 
 impl<'a> ReductionScanBranch<'a> {
-    fn inspect(plan: &'a SelectedNode) -> Option<Self> {
+    fn inspect(plan: &'a PreparedNode) -> Option<Self> {
         match &plan.operator {
             LogicalOperator::Get(get) => {
                 let output_column_ids = (0..get.returned_types.len())
@@ -1270,7 +1270,10 @@ fn remap_reduction_expression(
                     return false;
                 };
                 **column = ColumnRefExpression::new(
-                    paro_planner::operator::ColumnBinding::new(target_table_index, target_index),
+                    paro_planner::logical::operator::ColumnBinding::new(
+                        target_table_index,
+                        target_index,
+                    ),
                     column.return_type.clone(),
                 );
                 true
@@ -1497,7 +1500,7 @@ fn same_reduction_key_expression(left: &Expression, right: &Expression) -> bool 
 }
 
 fn partition_hash_join_conditions(
-    join: &ComparisonJoin<SelectedChild>,
+    join: &ComparisonJoin<PreparedChild>,
 ) -> (Box<[JoinCondition]>, Box<[JoinCondition]>) {
     let (keys, residuals): (Vec<_>, Vec<_>) = join
         .conditions
@@ -1512,7 +1515,7 @@ fn partition_hash_join_conditions(
 /// tracing a column back to a base-table declaration. The shared proof tracks
 /// duplicate-preserving projections, windows, aggregates, and key-preserving
 /// joins; ordinary equality supplies the required NULL rejection.
-fn hash_join_build_keys_are_declared_unique<P: paro_planner::plan::LogicalInput>(
+fn hash_join_build_keys_are_declared_unique<P: paro_planner::logical::plan::LogicalInput>(
     build: &P,
     key_conditions: &[JoinCondition],
 ) -> bool {
@@ -1531,7 +1534,7 @@ fn hash_join_build_keys_are_declared_unique<P: paro_planner::plan::LogicalInput>
         &build.output_layout(),
         &build.node_stats().unique_keys,
         &expressions,
-        Some(paro_planner::plan::UniqueKeyProvenance::CatalogEnforced),
+        Some(paro_planner::logical::plan::UniqueKeyProvenance::CatalogEnforced),
     )
 }
 
@@ -1540,7 +1543,7 @@ fn hash_join_build_keys_are_declared_unique<P: paro_planner::plan::LogicalInput>
 /// concurrent builder invalidates itself on any runtime domain/count drift and
 /// hash-join finish falls back to the canonical retained-row path.
 fn plan_build_time_integer_join_index(
-    build: &SelectedNode,
+    build: &PreparedNode,
     key_conditions: &[JoinCondition],
 ) -> Option<BuildTimeIntegerJoinIndexSpec> {
     let [condition] = key_conditions else {
@@ -1572,7 +1575,7 @@ fn plan_build_time_integer_join_index(
 fn resolve_base_get_column<'a, P: LogicalPlanRead>(
     build: &'a P,
     expression: &Expression,
-) -> Option<(&'a paro_planner::operator::Get, usize)> {
+) -> Option<(&'a paro_planner::logical::operator::Get, usize)> {
     match expression {
         Expression::Reference(reference) => resolve_base_get_output(build, reference.index),
         Expression::ColumnRef(column) if column.depth == 0 => resolve_bound_get_column(
@@ -1587,7 +1590,7 @@ fn resolve_base_get_column<'a, P: LogicalPlanRead>(
 fn resolve_base_get_output<P: LogicalPlanRead>(
     build: &P,
     output_index: usize,
-) -> Option<(&paro_planner::operator::Get, usize)> {
+) -> Option<(&paro_planner::logical::operator::Get, usize)> {
     match build.operator() {
         LogicalOperator::Get(get) => Some((get, get.stored_column(output_index)?)),
         LogicalOperator::Filter(filter) => {
@@ -1646,7 +1649,7 @@ fn resolve_bound_get_column<P: LogicalPlanRead>(
     build: &P,
     table_index: usize,
     column_index: usize,
-) -> Option<(&paro_planner::operator::Get, usize)> {
+) -> Option<(&paro_planner::logical::operator::Get, usize)> {
     match build.operator() {
         LogicalOperator::Get(get) if get.table_index == table_index => {
             Some((get, get.stored_column(column_index)?))

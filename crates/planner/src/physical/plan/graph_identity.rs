@@ -28,8 +28,11 @@ fn edge(b: &mut StableFingerprintBuilder, e: &paro_catalog::entry::EdgeTableInfo
     }
 }
 
-fn direction(b: &mut StableFingerprintBuilder, d: crate::operator::graph_expand::ExpandDirection) {
-    use crate::operator::graph_expand::ExpandDirection;
+fn direction(
+    b: &mut StableFingerprintBuilder,
+    d: crate::logical::operator::graph_expand::ExpandDirection,
+) {
+    use crate::logical::operator::graph_expand::ExpandDirection;
     b.write_u64(match d {
         ExpandDirection::Forward => 0,
         ExpandDirection::Backward => 1,

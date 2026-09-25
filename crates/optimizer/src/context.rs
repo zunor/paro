@@ -8,7 +8,7 @@ use paro_common::identity::GraphId;
 use paro_common::runtime_value::Value;
 use paro_context::StatementContext;
 use paro_planner::binder::context::BindContext;
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 use paro_storage::index::graph::GraphStatistics;
 use paro_storage::statistics::ColumnStatistics;
 
@@ -84,59 +84,6 @@ pub struct OptimizationContext {
     pub cost_model: SelectivityModel,
     pub verify_enabled: bool,
     pub profiler: OptimizerProfiler,
-    pub invalidations: OptimizerInvalidations,
-}
-
-/// Structural invalidations consumed by explicit pipeline segments.
-///
-/// Producers only mark bits; they never clear another producer's work. The
-/// pipeline driver consumes an invalidation before its complete segment runs;
-/// a producer inside that segment can therefore mark the bit again and request
-/// another observable fixed-point round. This avoids a linear-list sentinel
-/// whose scope changes when passes move.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct OptimizerInvalidations {
-    aggregate_schema: bool,
-    late_materialization: bool,
-    scan_projection: bool,
-}
-
-impl OptimizerInvalidations {
-    pub fn mark_aggregate_schema(&mut self) {
-        self.aggregate_schema = true;
-    }
-
-    pub fn aggregate_schema_pending(self) -> bool {
-        self.aggregate_schema
-    }
-
-    pub fn consume_aggregate_schema(&mut self) {
-        self.aggregate_schema = false;
-    }
-
-    pub fn mark_late_materialization(&mut self) {
-        self.late_materialization = true;
-    }
-
-    pub fn late_materialization_pending(self) -> bool {
-        self.late_materialization
-    }
-
-    pub fn consume_late_materialization(&mut self) {
-        self.late_materialization = false;
-    }
-
-    pub fn mark_scan_projection(&mut self) {
-        self.scan_projection = true;
-    }
-
-    pub fn scan_projection_pending(self) -> bool {
-        self.scan_projection
-    }
-
-    pub fn consume_scan_projection(&mut self) {
-        self.scan_projection = false;
-    }
 }
 
 impl OptimizationContext {
@@ -152,7 +99,6 @@ impl OptimizationContext {
             cost_model: SelectivityModel::default(),
             verify_enabled,
             profiler: OptimizerProfiler::default(),
-            invalidations: OptimizerInvalidations::default(),
         }
     }
 

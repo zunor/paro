@@ -10,13 +10,14 @@ from typing import Any
 
 try:
     from .run_output import SUMMARY_LIMIT_BYTES
+    from .evidence_schema import EVIDENCE_SCHEMA_VERSION
 except ImportError:  # pragma: no cover - documented script invocation
+    from evidence_schema import EVIDENCE_SCHEMA_VERSION
     from run_output import SUMMARY_LIMIT_BYTES  # type: ignore[no-redef]
 
 
 # One current producer/consumer contract. Historical v1/v2/v5 documents are
 # archival evidence and are intentionally rejected by this reader.
-EVIDENCE_SCHEMA_VERSION = 3
 RECEIPT_ASSOCIATION_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 COMPILE_DOCUMENT_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 BENCHMARK_CELL_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
@@ -100,11 +101,11 @@ def validate_compile_document(value: Any, *, require_analyze: bool = False) -> s
     if isinstance(work, dict) and set(work) == {"Observed"}:
         work = work["Observed"]
         if not isinstance(work, dict) or set(work) != {
-            "total_ns", "buckets", "outside_search_ns", "mandatory_ns", "optional_ns"
+            "total_ns", "buckets"
         }:
             raise ReceiptContractError("malformed optimizer work accounting")
         buckets = work["buckets"]
-        if not isinstance(buckets, list) or not 0 < len(buckets) <= 64:
+        if not isinstance(buckets, list) or [b.get("kind") for b in buckets if isinstance(b, dict)] != ["Normalization", "RegionPlanning", "PhysicalSelection", "PhysicalLowering", "Unclassified"]:
             raise ReceiptContractError("invalid optimizer work bucket count")
         names = set()
         for bucket in buckets:
@@ -115,11 +116,8 @@ def validate_compile_document(value: Any, *, require_analyze: bool = False) -> s
             names.add(bucket["kind"])
             if any(type(bucket[k]) is not int or bucket[k] < 0 for k in ("exclusive_ns", "entries")):
                 raise ReceiptContractError("invalid optimizer work measurement")
-        if any(type(work[k]) is not int or work[k] < 0 for k in (
-            "total_ns", "outside_search_ns", "mandatory_ns", "optional_ns"
-        )) or sum(b["exclusive_ns"] for b in buckets) != work["total_ns"] or sum(
-            work[k] for k in ("outside_search_ns", "mandatory_ns", "optional_ns")
-        ) != work["total_ns"]:
+        if (type(work["total_ns"]) is not int or work["total_ns"] < 0
+                or sum(b["exclusive_ns"] for b in buckets) != work["total_ns"]):
             raise ReceiptContractError("optimizer work accounting does not close")
         if value.get("optimizer_ns") != {"Observed": work["total_ns"]}:
             raise ReceiptContractError("optimizer work interval mismatch")
@@ -533,7 +531,7 @@ def validate_benchmark_payload(payload: dict[str, Any], *, require_receipts: boo
     if not isinstance(payload, dict):
         raise ReceiptContractError("benchmark payload must be an object")
     if payload.get("version") != BENCHMARK_CELL_SCHEMA_VERSION:
-        raise ReceiptContractError("benchmark payload must use schema version 3")
+        raise ReceiptContractError("benchmark payload must use current schema version")
     ownership = payload.get("ownership")
     if not isinstance(ownership, dict) or ownership.get("schema_version") != OWNERSHIP_SCHEMA_VERSION:
         raise ReceiptContractError("benchmark payload lacks ownership schema")
@@ -828,76 +826,26 @@ def _validate_compile_receipt(value: Any, identity: dict[str, Any]) -> None:
         raise ReceiptContractError("unsupported compile receipt schema version")
     if value.get("artifact_identity") != identity:
         raise ReceiptContractError("compile receipt identity differs from the artifact")
-    for field in (
-        "search_stop",
-        "search_complete",
-        "quality_policy_satisfied",
-        "budget_limited",
-        "obligations",
-        "groups",
-        "logical_expressions",
-        "physical_expressions",
-        "expected_class",
-        "variant_count",
-    ):
-        if field not in value:
-            raise ReceiptContractError(f"compile receipt lacks {field}")
-    if not isinstance(value.get("omitted_variants"), int) or value["omitted_variants"] < 0:
-        raise ReceiptContractError("compile receipt has invalid omitted variant count")
-    if not isinstance(value.get("search_stop"), dict) or set(value["search_stop"]) != {"Observed"}:
-        raise ReceiptContractError("compile receipt has no observed search stop")
-    allowed_stops = {"Complete", "Incomplete", "Deadline", "BudgetLimited", "RuleFailure", "QualityPolicySatisfied"}
-    if value["search_stop"]["Observed"] not in allowed_stops:
-        raise ReceiptContractError("compile receipt has an unsupported search stop")
-    for field in ("search_complete", "quality_policy_satisfied", "budget_limited"):
-        observed = value[field]
-        if not isinstance(observed, dict) or set(observed) != {"Observed"} or not isinstance(observed["Observed"], bool):
-            raise ReceiptContractError(f"compile receipt has invalid {field}")
-    for field in ("obligations", "groups", "logical_expressions", "physical_expressions"):
-        observed = value[field]
+    retired = {"search_stop", "search_complete", "quality_policy_satisfied", "obligations",
+               "groups", "logical_expressions", "physical_expressions"}
+    if retired.intersection(value):
+        raise ReceiptContractError("compile receipt contains retired search facts")
+    status = value.get("planning_status")
+    if not isinstance(status, dict) or set(status) != {"Observed"} or status["Observed"] not in {"Planned", "PlannedWithFallback"}:
+        raise ReceiptContractError("compile receipt lacks a valid planning status")
+    limited = value.get("budget_limited")
+    if not isinstance(limited, dict) or set(limited) != {"Observed"} or type(limited["Observed"]) is not bool:
+        raise ReceiptContractError("compile receipt has invalid budget_limited")
+    if limited["Observed"] != (status["Observed"] == "PlannedWithFallback"):
+        raise ReceiptContractError("planning status contradicts regional fallback")
+    for field in ("expected_class", "variant_count"):
+        observed = value.get(field)
         if not isinstance(observed, dict) or set(observed) != {"Observed"}:
             raise ReceiptContractError(f"compile receipt has invalid {field}")
-        number = observed["Observed"]
-        if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+        if type(observed["Observed"]) is not int or observed["Observed"] < 0:
             raise ReceiptContractError(f"compile receipt has invalid {field} value")
-    for field in ("expected_class", "variant_count"):
-        observed = value[field]
-        if not isinstance(observed, dict):
-            raise ReceiptContractError(f"compile receipt has invalid {field}")
-        if isinstance(observed, dict):
-            if set(observed) == {"Uncovered"}:
-                if observed["Uncovered"] not in {"NotInstrumented", "FutureBoundary", "Capacity"}:
-                    raise ReceiptContractError(f"compile receipt has invalid {field}")
-                continue
-            if set(observed) != {"Observed"}:
-                raise ReceiptContractError(f"compile receipt has invalid {field}")
-            number = observed["Observed"]
-            if not isinstance(number, int) or isinstance(number, bool) or number < 0:
-                raise ReceiptContractError(f"compile receipt has invalid {field} value")
-    stop = value["search_stop"]["Observed"]
-    search_complete = value["search_complete"]["Observed"]
-    quality_satisfied = value["quality_policy_satisfied"]["Observed"]
-    budget_limited = value["budget_limited"]["Observed"]
-    obligations = value["obligations"]["Observed"]
-    if stop == "Complete" and (
-        not search_complete or budget_limited or obligations != 0
-    ):
-        raise ReceiptContractError("Complete search stop has incomplete compile facts")
-    if search_complete and stop != "Complete":
-        raise ReceiptContractError("search_complete is true for a non-complete stop")
-    if stop == "QualityPolicySatisfied" and not quality_satisfied:
-        raise ReceiptContractError("quality stop lacks quality_policy_satisfied")
-    # The budget flag describes unresolved work, not necessarily the selected
-    # stop policy. The engine may satisfy quality after some optional task has
-    # exhausted its budget, or terminate its diagnostic obligation lane first.
-    if budget_limited and stop not in {
-        "BudgetLimited", "Deadline", "QualityPolicySatisfied", "Incomplete"
-    }:
-        raise ReceiptContractError("budget_limited is inconsistent with search stop")
-    if budget_limited and obligations == 0:
-        raise ReceiptContractError("budget_limited lacks an outstanding obligation")
-    if stop == "BudgetLimited" and not budget_limited:
-        raise ReceiptContractError("BudgetLimited stop lacks budget_limited")
+    if value["variant_count"]["Observed"] != 1 or value.get("omitted_variants") != 0:
+        raise ReceiptContractError("compiled statement must carry exactly one physical plan")
     compile_work = value.get("compile_work")
     if compile_work is not None:
         if not isinstance(compile_work, dict) or any(
@@ -905,8 +853,8 @@ def _validate_compile_receipt(value: Any, identity: dict[str, Any]) -> None:
             for field in (
                 "compiler_elapsed_us",
                 "optimizer_elapsed_us",
-                "rule_elapsed_us",
-                "child_combination_cost_synthesis_count",
+                "normalization_elapsed_us",
+                "physical_alternatives",
             )
         ):
             raise ReceiptContractError("compile receipt has invalid work summary")

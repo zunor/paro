@@ -26,11 +26,11 @@ use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression, ExpressionIterator,
     ExpressionVisitDecision, OperatorType, ReferenceExpression,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType,
     LogicalOperator, MarkJoinSemantics, MaterializedCTE, PostAggregateReduction, Projection,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 pub(crate) mod alpha;
 
@@ -269,7 +269,7 @@ fn map_definition_aggregate_output(
 fn collect_cte_references<'a>(
     plan: &'a OwnedLogicalPlan,
     cte_index: usize,
-) -> Vec<&'a paro_planner::operator::CTERef> {
+) -> Vec<&'a paro_planner::logical::operator::CTERef> {
     let mut references = Vec::new();
     if let LogicalOperator::CTERef(reference) = &plan.operator {
         if reference.cte_index == cte_index {
@@ -597,7 +597,7 @@ fn rewrite_cte_consumer(
 fn find_scalar_wrapper_id(
     plan: &OwnedLogicalPlan,
     cte_index: usize,
-) -> Option<paro_planner::plan::PlanNodeId> {
+) -> Option<paro_planner::logical::plan::PlanNodeId> {
     let mut ids = Vec::new();
     if peel_cte_scalar_max(plan, cte_index).is_some() {
         ids.push(plan.id);
@@ -612,7 +612,7 @@ fn find_scalar_wrapper_id(
 
 fn remove_scalar_join(
     plan: &mut OwnedLogicalPlan,
-    scalar_root_id: paro_planner::plan::PlanNodeId,
+    scalar_root_id: paro_planner::logical::plan::PlanNodeId,
     wrapper_binding: ColumnBinding,
 ) -> bool {
     let mut replacement = None;

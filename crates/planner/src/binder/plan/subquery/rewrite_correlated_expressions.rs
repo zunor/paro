@@ -9,8 +9,8 @@ use std::sync::Arc;
 use crate::binder::plan::subquery::copy_subquery_top_level_plan;
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::{Expression, ExpressionIterator};
-use crate::operator::{ColumnBinding, LogicalOperator};
-use crate::plan::{OwnedLogicalPlan, PlannedStatement};
+use crate::logical::operator::{ColumnBinding, LogicalOperator};
+use crate::logical::plan::{OwnedLogicalPlan, PlannedStatement};
 
 pub type CorrelatedColumnMap = HashMap<ColumnBinding, usize>;
 
@@ -297,7 +297,7 @@ impl RewriteCorrelatedExpressions {
                 LogicalOperator::EmptyResult(empty)
             }
             LogicalOperator::Join(join) => {
-                use crate::operator::Join;
+                use crate::logical::operator::Join;
                 match join {
                     Join::Comparison(mut comp) => {
                         comp.conditions = comp
@@ -432,10 +432,10 @@ mod tests {
         ColumnRefExpression, ComparisonType, Expression, SubqueryExpression, SubqueryPlanningState,
         SubqueryType,
     };
-    use crate::operator::{DependentJoin, ExpressionGet, LogicalOperator};
-    use crate::plan::OwnedLogicalPlan;
+    use crate::logical::operator::{DependentJoin, ExpressionGet, LogicalOperator};
+    use crate::logical::plan::OwnedLogicalPlan;
     use crate::{
-        binder::context::BindContext, binder::CorrelatedColumnInfo, plan::PlannedStatement,
+        binder::context::BindContext, binder::CorrelatedColumnInfo, logical::plan::PlannedStatement,
     };
     use paro_common::types::LogicalType;
     use std::sync::Arc;
@@ -636,7 +636,7 @@ mod tests {
             OwnedLogicalPlan::new(&ctx, expression_get(1)),
             OwnedLogicalPlan::new(
                 &ctx,
-                LogicalOperator::Projection(crate::operator::Projection::new(
+                LogicalOperator::Projection(crate::logical::operator::Projection::new(
                     2,
                     OwnedLogicalPlan::new(&ctx, expression_get(3)),
                     vec![Expression::ColumnRef(

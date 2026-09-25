@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::expression::Expression;
-use crate::operator::join::{AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics};
+use crate::logical::operator::join::{AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use std::sync::Arc;
@@ -172,7 +172,7 @@ impl HashJoinRuntimeFilterSpec {
                     "runtime-filter condition mapping references a missing join key",
                 )
             })?;
-            if condition.comparison != crate::operator::join::JoinComparisonType::Equal {
+            if condition.comparison != crate::logical::operator::join::JoinComparisonType::Equal {
                 return Err(paro_common::error::internal(
                     "runtime-filter condition mapping contains a non-equality join key",
                 ));

@@ -14,7 +14,7 @@ use paro_planner::expression::{
     AggregateExpression, ColumnRefExpression, ConstantExpression, Expression, OrderByExpression,
     ReferenceExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
 };
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 
 use super::build_window_output_chunks;
 use crate::physical::specs::WindowSpec;

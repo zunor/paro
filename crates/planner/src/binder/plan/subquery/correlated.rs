@@ -13,9 +13,11 @@ use crate::expression::{
     CaseExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression,
     Expression, OperatorExpression, OperatorType, SubqueryExpression, SubqueryType,
 };
-use crate::logical_properties::{normalize_scalar_singleton_wrappers, EmptyInputBehavior};
-use crate::operator::{AnyAllPayload, ColumnBinding, DependentJoin, LogicalOperator, Projection};
-use crate::plan::PlannedStatement;
+use crate::logical::operator::{
+    AnyAllPayload, ColumnBinding, DependentJoin, LogicalOperator, Projection,
+};
+use crate::logical::plan::PlannedStatement;
+use crate::logical::properties::{normalize_scalar_singleton_wrappers, EmptyInputBehavior};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -280,13 +282,13 @@ mod tests {
         OrderByExpression, SubqueryExpression, SubqueryPlanningState, WindowExpression,
         WindowFrame,
     };
-    use crate::operator::{
+    use crate::logical::operator::{
         Aggregate, ColumnBinding, CrossProduct, DependentJoinKind, Distinct, ExpressionGet, Join,
         JoinComparisonType, JoinType, MarkSubqueryKind, Projection, SetOpType, SetOperation,
         Window,
     };
-    use crate::plan::OwnedLogicalPlan;
-    use crate::plan::PlannedStatement;
+    use crate::logical::plan::OwnedLogicalPlan;
+    use crate::logical::plan::PlannedStatement;
     use paro_function::aggregate::distributive::first_last::get_first_function;
     use paro_function::window::WindowFunction;
     use std::sync::Arc;
@@ -811,7 +813,7 @@ mod tests {
         );
         let subquery = subquery_expression(
             SubqueryType::Exists,
-            LogicalOperator::Filter(crate::operator::Filter::new(
+            LogicalOperator::Filter(crate::logical::operator::Filter::new(
                 wrapped(&binder, expression_get(210, vec![LogicalType::Integer])),
                 vec![filter_expr],
             )),

@@ -14,9 +14,9 @@ const SORT_RANGE_JOIN_VERY_LARGE_SELECTIVITY_LIMIT: f64 = 0.90;
 const CLASSIC_IE_JOIN_MIN_INPUT_PAIRS: u128 = SORT_RANGE_JOIN_DENSE_INPUT_PAIRS;
 const CLASSIC_IE_JOIN_SELECTIVITY_LIMIT: f64 = SORT_RANGE_JOIN_SPARSE_SELECTIVITY_LIMIT;
 
-pub(crate) fn is_classic_ie_join_candidate<Child: paro_planner::plan::LogicalChild>(
+pub(crate) fn is_classic_ie_join_candidate<Child: paro_planner::logical::plan::LogicalChild>(
     join: &ComparisonJoin<Child>,
-    join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    join_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
 ) -> bool {
     join.join_type == JoinType::Inner
         && sort_range_join_conditions_pass_gate(&join.conditions)
@@ -24,9 +24,9 @@ pub(crate) fn is_classic_ie_join_candidate<Child: paro_planner::plan::LogicalChi
         && classic_ie_join_selectivity_passes_gate(join, join_cardinality)
 }
 
-pub(crate) fn is_sort_range_join_candidate<Child: paro_planner::plan::LogicalChild>(
+pub(crate) fn is_sort_range_join_candidate<Child: paro_planner::logical::plan::LogicalChild>(
     join: &ComparisonJoin<Child>,
-    join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    join_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
 ) -> bool {
     sort_range_join_conditions_pass_gate(&join.conditions)
         && sort_range_join_cardinality_passes_gate(join, join_cardinality)
@@ -76,9 +76,9 @@ fn sort_range_join_key_kind(logical_type: &LogicalType) -> Option<SortRangeJoinK
     }
 }
 
-fn sort_range_join_cardinality_passes_gate<Child: paro_planner::plan::LogicalChild>(
+fn sort_range_join_cardinality_passes_gate<Child: paro_planner::logical::plan::LogicalChild>(
     join: &ComparisonJoin<Child>,
-    join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    join_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
 ) -> bool {
     let (Some(left), Some(right), Some(output)) = (
         join.left.node_stats().estimated_cardinality,
@@ -99,9 +99,9 @@ fn sort_range_join_cardinality_passes_gate<Child: paro_planner::plan::LogicalChi
     selectivity <= sort_range_join_selectivity_limit(input_pairs)
 }
 
-fn classic_ie_join_selectivity_passes_gate<Child: paro_planner::plan::LogicalChild>(
+fn classic_ie_join_selectivity_passes_gate<Child: paro_planner::logical::plan::LogicalChild>(
     join: &ComparisonJoin<Child>,
-    join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+    join_cardinality: Option<paro_planner::logical::plan::CardinalityEstimate>,
 ) -> bool {
     if let (Some(left), Some(right), Some(output)) = (
         join.left.node_stats().estimated_cardinality,
@@ -120,7 +120,7 @@ fn classic_ie_join_selectivity_passes_gate<Child: paro_planner::plan::LogicalChi
     classic_ie_join_column_stats_passes_gate(join)
 }
 
-fn classic_ie_join_shared_right_bound_shape<Child: paro_planner::plan::LogicalChild>(
+fn classic_ie_join_shared_right_bound_shape<Child: paro_planner::logical::plan::LogicalChild>(
     join: &ComparisonJoin<Child>,
 ) -> bool {
     let [first, second] = join.conditions.as_slice() else {
@@ -149,7 +149,7 @@ fn classic_ie_join_shared_right_bound_shape<Child: paro_planner::plan::LogicalCh
         )
 }
 
-fn classic_ie_join_column_stats_passes_gate<Child: paro_planner::plan::LogicalChild>(
+fn classic_ie_join_column_stats_passes_gate<Child: paro_planner::logical::plan::LogicalChild>(
     join: &ComparisonJoin<Child>,
 ) -> bool {
     let mut predicates = Vec::with_capacity(join.conditions.len());
@@ -187,7 +187,7 @@ fn classic_ie_join_column_stats_passes_gate_for_predicates(
     selectivity <= CLASSIC_IE_JOIN_SELECTIVITY_LIMIT
 }
 
-fn sort_range_join_column_stats_passes_gate<Child: paro_planner::plan::LogicalChild>(
+fn sort_range_join_column_stats_passes_gate<Child: paro_planner::logical::plan::LogicalChild>(
     join: &ComparisonJoin<Child>,
 ) -> bool {
     let mut predicates = Vec::with_capacity(join.conditions.len());
@@ -422,7 +422,7 @@ fn probability_of(condition: bool) -> f64 {
     }
 }
 
-fn sort_range_column_stats_for_expr<P: paro_planner::plan::LogicalPlanRead>(
+fn sort_range_column_stats_for_expr<P: paro_planner::logical::plan::LogicalPlanRead>(
     plan: &P,
     expression: &Expression,
 ) -> Option<SortRangeColumnStats> {
@@ -432,7 +432,7 @@ fn sort_range_column_stats_for_expr<P: paro_planner::plan::LogicalPlanRead>(
     sort_range_column_stats_for_output(plan, reference.index)
 }
 
-fn sort_range_column_stats_for_output<P: paro_planner::plan::LogicalPlanRead>(
+fn sort_range_column_stats_for_output<P: paro_planner::logical::plan::LogicalPlanRead>(
     plan: &P,
     output_idx: usize,
 ) -> Option<SortRangeColumnStats> {
@@ -471,7 +471,7 @@ fn sort_range_column_stats_for_output<P: paro_planner::plan::LogicalPlanRead>(
 }
 
 fn projected_child_index(
-    projection_map: &paro_planner::operator::ProjectionMap,
+    projection_map: &paro_planner::logical::operator::ProjectionMap,
     child_width: usize,
     output_idx: usize,
 ) -> Option<usize> {
@@ -560,25 +560,31 @@ mod tests {
         let small = range_join_with_rows(32, 32);
         assert!(!is_sort_range_join_candidate(
             &small,
-            Some(paro_planner::plan::CardinalityEstimate::exact(64)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(64)),
         ));
 
         let large_selective = range_join_with_rows(512, 512);
         assert!(is_sort_range_join_candidate(
             &large_selective,
-            Some(paro_planner::plan::CardinalityEstimate::exact(8_056)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(
+                8_056
+            )),
         ));
 
         let large_dense = range_join_with_rows(512, 512);
         assert!(is_sort_range_join_candidate(
             &large_dense,
-            Some(paro_planner::plan::CardinalityEstimate::exact(130_816)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(
+                130_816
+            )),
         ));
 
         let too_dense = range_join_with_rows(512, 512);
         assert!(!is_sort_range_join_candidate(
             &too_dense,
-            Some(paro_planner::plan::CardinalityEstimate::exact(250_000)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(
+                250_000
+            )),
         ));
 
         let missing_stats = range_join_with_rows(0, 0);
@@ -590,23 +596,31 @@ mod tests {
         let selective = point_window_join_with_rows(512, 512);
         assert!(is_classic_ie_join_candidate(
             &selective,
-            Some(paro_planner::plan::CardinalityEstimate::exact(8_056)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(
+                8_056
+            )),
         ));
 
         let dense = point_window_join_with_rows(512, 512);
         assert!(!is_classic_ie_join_candidate(
             &dense,
-            Some(paro_planner::plan::CardinalityEstimate::exact(130_816)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(
+                130_816
+            )),
         ));
         assert!(is_sort_range_join_candidate(
             &dense,
-            Some(paro_planner::plan::CardinalityEstimate::exact(130_816)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(
+                130_816
+            )),
         ));
 
         let general_two_bound_range = range_join_with_rows(512, 512);
         assert!(!is_classic_ie_join_candidate(
             &general_two_bound_range,
-            Some(paro_planner::plan::CardinalityEstimate::exact(8_056)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(
+                8_056
+            )),
         ));
 
         let missing_stats = range_join_with_rows(0, 0);
@@ -620,7 +634,9 @@ mod tests {
         );
         assert!(!is_classic_ie_join_candidate(
             &right_join,
-            Some(paro_planner::plan::CardinalityEstimate::exact(8_056)),
+            Some(paro_planner::logical::plan::CardinalityEstimate::exact(
+                8_056
+            )),
         ));
     }
 
@@ -744,8 +760,9 @@ mod tests {
     fn plan_with_cardinality(rows: u64) -> OwnedLogicalPlan {
         let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan);
         if rows > 0 {
-            plan.stats.estimated_cardinality =
-                Some(paro_planner::plan::CardinalityEstimate::exact(rows));
+            plan.stats.estimated_cardinality = Some(
+                paro_planner::logical::plan::CardinalityEstimate::exact(rows),
+            );
         }
         plan
     }

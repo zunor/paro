@@ -10,7 +10,9 @@ use paro_common::identity::GraphId;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VectorSelection};
 use paro_parser::ast::PathMode;
-use paro_planner::operator::graph_expand::{graph_path_element_list_type, ExpandDirection};
+use paro_planner::logical::operator::graph_expand::{
+    graph_path_element_list_type, ExpandDirection,
+};
 
 use crate::operators::graph::state::{graph_path_list_value, GraphPathPayload};
 use crate::physical::specs::GraphShortestPathSpec;

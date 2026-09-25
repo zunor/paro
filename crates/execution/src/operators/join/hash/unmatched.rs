@@ -7,7 +7,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
-use paro_planner::operator::join::JoinType;
+use paro_planner::logical::operator::join::JoinType;
 
 use crate::operators::join::join_result_helpers::{
     construct_permuted_right_outer_scan_result, construct_semi_join_result,

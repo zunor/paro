@@ -23,11 +23,11 @@ use paro_function::aggregate::AggregateAlgebra;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Get, Join, JoinComparisonType, JoinType,
     LogicalOperator, Projection, ProjectionMap,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 #[derive(Clone)]
 struct OuterSum {
@@ -69,12 +69,6 @@ pub fn optimize_plan_with_change(plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, b
         Ok((plan, changed || children.into_iter().any(|changed| changed)))
     })
     .expect("detail subsumption traversal cannot fail")
-}
-
-/// Executable-IR oracle for differential testing of native scalar evidence.
-#[cfg(test)]
-pub(crate) fn recognizes_outer_aggregate<Child>(operator: &LogicalOperator<Child>) -> bool {
-    matches!(operator, LogicalOperator::Aggregate(aggregate) if AggregateJoinSubsumption::outer_sum(aggregate).is_some())
 }
 
 /// Memo schedules descendant groups independently; a firing changes only
@@ -688,7 +682,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn detail_join_keys(
-        condition: &paro_planner::operator::JoinCondition,
+        condition: &paro_planner::logical::operator::JoinCondition,
         detail_table_index: usize,
     ) -> Option<(ColumnBinding, ColumnBinding)> {
         if condition.comparison != JoinComparisonType::Equal {
@@ -755,11 +749,11 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_function::aggregate::distributive::sum::get_sum_function;
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         Aggregate, ColumnBinding, ExpressionGet, Get, Join, JoinCondition, JoinType,
         LogicalOperator, PostAggregateReduction, Projection, ProjectionMap,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
 
     use super::optimize_plan;

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from ..evidence_schema import EVIDENCE_SCHEMA_VERSION
+
 from datetime import datetime
 import json
 import math
@@ -166,7 +168,7 @@ def normalize_divan_payload(
                 "items": _optional_positive_int(bench.get("items")),
             },
             "compile_receipt": {
-                "schema_version": 3,
+                "schema_version": EVIDENCE_SCHEMA_VERSION,
                 "status": "Uncovered",
                 "reason": "rust micro benchmark has no SQL compiled-statement receipt",
             },

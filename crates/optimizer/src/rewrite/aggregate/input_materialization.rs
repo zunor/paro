@@ -19,11 +19,13 @@ use paro_planner::binder::context::BindContext;
 #[cfg(test)]
 use paro_planner::expression::ColumnRefExpression;
 use paro_planner::expression::{Expression, ExpressionIterator, ExpressionVisitDecision};
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 #[cfg(test)]
-use paro_planner::operator::{ComparisonJoin, Join, JoinType, LogicalOperator, Projection};
+use paro_planner::logical::operator::{
+    ComparisonJoin, Join, JoinType, LogicalOperator, Projection,
+};
 #[cfg(test)]
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::rewrite::expr::traversal::visit_expression;
 
@@ -50,40 +52,6 @@ pub fn optimize_plan(
         Ok(plan)
     })?;
     Ok((plan, changed))
-}
-
-/// Executable-IR oracle for differential testing of native scalar evidence.
-#[cfg(test)]
-pub(crate) fn recognizes_aggregate<Child>(operator: &LogicalOperator<Child>) -> bool {
-    let LogicalOperator::Aggregate(aggregate) = operator else {
-        return false;
-    };
-    aggregate.aggregates.iter().any(|expression| {
-        let Expression::Aggregate(aggregate_expression) = expression else {
-            return false;
-        };
-        aggregate_expression.children.iter().any(|candidate| {
-            aggregate_input_is_narrowing_total(candidate)
-                && inputs_are_dead_outside_candidate(
-                    candidate,
-                    &aggregate.groups,
-                    &aggregate.aggregates,
-                )
-        })
-    })
-}
-
-/// Share the exact scalar/liveness contract with native transformation
-/// producers.  Placement remains a relational proof owned by the caller, but
-/// the decision that an aggregate input is safe and actually narrowing must
-/// not be reimplemented in a second rule path.
-pub(crate) fn is_materializable_candidate(
-    candidate: &Expression,
-    groups: &[Expression],
-    aggregates: &[Expression],
-) -> bool {
-    aggregate_input_is_narrowing_total(candidate)
-        && inputs_are_dead_outside_candidate(candidate, groups, aggregates)
 }
 
 #[cfg(test)]
@@ -300,7 +268,7 @@ fn expression_uses_any_binding(expression: &Expression, bindings: &HashSet<Colum
 #[cfg(test)]
 fn include_materialized_binding(
     child: &OwnedLogicalPlan,
-    projection: &mut paro_planner::operator::ProjectionMap,
+    projection: &mut paro_planner::logical::operator::ProjectionMap,
     binding: ColumnBinding,
 ) {
     let output_ordinal = child

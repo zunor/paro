@@ -1,8 +1,8 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_planner::operator::LogicalOperator;
-use paro_planner::planner::Planner;
+use paro_planner::binder::Planner;
+use paro_planner::logical::operator::LogicalOperator;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -98,14 +98,14 @@ fn matched_prefix_has_an_independent_binding_from_the_stored_value() {
                         .position(|source| {
                             matches!(
                                 source,
-                                paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                                paro_planner::logical::operator::GetColumnSource::MatchedUtf8Prefix {
                                     source_column: _,
                                     byte_width: 2
                                 }
                             )
                         })
                         .expect("independent matched-prefix output");
-                    let paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                    let paro_planner::logical::operator::GetColumnSource::MatchedUtf8Prefix {
                         source_column,
                         ..
                     } = get.column_sources[matched]
@@ -119,7 +119,7 @@ fn matched_prefix_has_an_independent_binding_from_the_stored_value() {
                         .any(|(index, source)| {
                             matches!(
                                 source,
-                                paro_planner::operator::GetColumnSource::Stored { column_id }
+                                paro_planner::logical::operator::GetColumnSource::Stored { column_id }
                                     if *column_id == source_column
                             ) && index != matched
                         }));
@@ -173,7 +173,7 @@ fn matched_prefix_requires_a_direct_pushdown_witness() {
                 if let LogicalOperator::Get(get) = &plan.operator {
                     assert!(get.column_sources.iter().all(|source| matches!(
                         source,
-                        paro_planner::operator::GetColumnSource::Stored { .. }
+                        paro_planner::logical::operator::GetColumnSource::Stored { .. }
                     )));
                 }
                 Ok(())
@@ -228,7 +228,7 @@ fn tpch_q22_uses_one_customer_scan_inner() {
                         .filter(|source| {
                             matches!(
                                 source,
-                                paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                                paro_planner::logical::operator::GetColumnSource::MatchedUtf8Prefix {
                                     source_column: _,
                                     byte_width: 2
                                 }

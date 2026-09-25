@@ -4,7 +4,7 @@
 //! Fold bound, context-independent expressions at rewrite time.
 
 use paro_planner::expression::{ConstantExpression, Expression};
-use paro_planner::operator::LogicalOperator;
+use paro_planner::logical::operator::LogicalOperator;
 
 use super::constant_evaluator::evaluate_constant;
 use super::expression_matcher::{ExpressionMatcher, FoldableConstantMatcher};
@@ -69,6 +69,7 @@ impl Rule for ConstantFoldingRule {
         )))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn name(&self) -> &'static str {
         "ConstantFoldingRule"
     }

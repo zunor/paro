@@ -7,7 +7,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
-use paro_planner::operator::join::{AntiJoinMode, JoinType, MarkJoinSemantics};
+use paro_planner::logical::operator::join::{AntiJoinMode, JoinType, MarkJoinSemantics};
 
 use crate::join_hashtable::scan_structure::ScanStructure;
 use crate::join_hashtable::JoinHashTable;

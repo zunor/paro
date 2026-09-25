@@ -14,10 +14,10 @@
 
 use paro_parser::ast::EdgeDirection;
 use paro_planner::binder::bind::graph::BoundPatternElement;
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     ExpandDirection, GraphExpand, GraphMatch, GraphScan, LogicalOperator, Projection,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 use std::collections::HashMap;
 
 /// Decomposes `GraphMatch` into Scan + Expand chain + Projection.
@@ -188,8 +188,8 @@ mod tests {
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::{BoundGraphColumn, BoundGraphPattern};
     use paro_planner::expression::{ColumnRefExpression, Expression};
-    use paro_planner::operator::ColumnBinding;
-    use paro_planner::operator::{GraphMatch, LogicalOperator, LogicalOperatorType};
+    use paro_planner::logical::operator::ColumnBinding;
+    use paro_planner::logical::operator::{GraphMatch, LogicalOperator, LogicalOperatorType};
     use std::sync::Arc;
 
     fn make_vertex(name: &str, label: &str, table_index: usize) -> BoundVertexVariable {
@@ -491,7 +491,7 @@ mod tests {
         let columns = vec![make_column(10, 1)];
         let graph_match = make_graph_match(elements, columns, 100);
 
-        let plan = LogicalOperator::Filter(paro_planner::operator::Filter::new(
+        let plan = LogicalOperator::Filter(paro_planner::logical::operator::Filter::new(
             OwnedLogicalPlan::synthetic(graph_match),
             vec![],
         ));

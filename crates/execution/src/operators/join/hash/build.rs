@@ -12,7 +12,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, ErrorClass, Result};
 use paro_common::types::LogicalType;
 use paro_function::scalar::FunctionExecContext;
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinCondition, JoinType};
 
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;

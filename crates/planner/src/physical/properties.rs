@@ -5,10 +5,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::plan::{CardinalityEstimate, PlanNodeId};
+use crate::logical::plan::{CardinalityEstimate, PlanNodeId};
 use paro_common::vector::VECTOR_SIZE;
 
-use crate::physical::cost::SearchCost;
+use crate::physical::cost::PhysicalCost;
 use crate::physical::identity::{Fingerprint, ResourceGrantClassId};
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::requirements::{ProvidedProperties, RequiredProperties};
@@ -78,7 +78,7 @@ pub struct PhysicalNodeProperties {
     pub provided: ProvidedProperties,
     pub characteristics: PhysicalCharacteristics,
     pub output_estimate: Option<CardinalityEstimate>,
-    pub cumulative_cost: SearchCost,
+    pub cumulative_cost: PhysicalCost,
     pub grant_contract: PhysicalGrantContract,
     pub auxiliary_dependencies: Box<[u32]>,
     pub region_owner: Option<Fingerprint>,

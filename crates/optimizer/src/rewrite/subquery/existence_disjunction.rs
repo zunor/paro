@@ -18,13 +18,13 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     ColumnRefExpression, ConjunctionType, Expression, ExpressionIterator, ExpressionVisitDecision,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinBuildSideConstraint, JoinComparisonType,
     JoinCondition, JoinType, LogicalOperator, MarkJoinSemantics, Projection, ProjectionMap,
     SetOperation,
 };
-use paro_planner::plan::OwnedLogicalPlan;
-use paro_planner::visitor::LogicalOperatorVisitor;
+use paro_planner::logical::plan::OwnedLogicalPlan;
+use paro_planner::logical::visitor::LogicalOperatorVisitor;
 
 pub(crate) fn optimize_plan(
     mut plan: OwnedLogicalPlan,
@@ -221,7 +221,7 @@ fn marker_binding(join: &ComparisonJoin) -> Option<ColumnBinding> {
     let marker_index = join.mark_index?;
     (join.join_type == JoinType::Mark
         && join.mark_semantics == MarkJoinSemantics::TwoValued
-        && join.anti_join_mode == paro_planner::operator::AntiJoinMode::Regular)
+        && join.anti_join_mode == paro_planner::logical::operator::AntiJoinMode::Regular)
         .then(|| ColumnBinding::new(marker_index, 0))
 }
 
@@ -439,7 +439,7 @@ mod tests {
     use paro_planner::expression::{
         ComparisonExpression, ComparisonType, ConjunctionExpression, ConstantExpression,
     };
-    use paro_planner::operator::{ExpressionGet, Filter, MarkJoinSemantics};
+    use paro_planner::logical::operator::{ExpressionGet, Filter, MarkJoinSemantics};
 
     fn value_plan(ctx: &BindContext, table_index: usize, width: usize) -> OwnedLogicalPlan {
         OwnedLogicalPlan::new(

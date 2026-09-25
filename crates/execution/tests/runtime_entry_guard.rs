@@ -101,7 +101,7 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
     assert!(
         compiler.contains("paro_optimizer::Optimizer::new")
             && compiler.contains("paro_optimizer::OptimizedStatement::Physical(plan)")
-            && compiler.contains("StatementProgram::deferred_physical_portfolio"),
+            && compiler.contains("StatementProgram::deferred_physical_plan"),
         "compiler must receive the typed physical plan image from the optimizer"
     );
     assert!(
@@ -113,8 +113,8 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
     let program = read(&manifest, "src/pipeline/program.rs");
     assert!(
         program.contains("pub fn select_for_execution")
-            && program.contains("pub fn from_physical_portfolio"),
-        "execution must select a verified optimizer portfolio before lowering"
+            && program.contains("pub fn from_compiled_physical_plan"),
+        "execution must select a verified optimizer artifact before lowering"
     );
     assert!(
         !compiler.contains(".plan(&mut optimized_plan)"),

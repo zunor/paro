@@ -15,8 +15,8 @@ from harness.run_output import CampaignOutput
 
 def report():
     return {
-        "schema_version": 3,
-        "compile_evidence_schema_version": 3,
+        "schema_version": 4,
+        "compile_evidence_schema_version": 4,
         "configuration": {
             "process_blocks": 3,
             "runtime_environment": {"RUST_LOG": None, "PARO_STATEMENT_TRACE": "0"},
@@ -35,26 +35,26 @@ def report():
                                    "seed_sha256": "data", "initial_sha256": "data"}},
              "explain_wall_ms": 20, "optimizer_ms": 15, "peak_rss_bytes": 1000, "plan_structure_id": "00112233445566778899aabbccddeeff",
              "compile_metrics_source": "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) typed document",
-             "counters": {counter: 0 if counter in ("search_rule_failure_count", "search_deadline_reached") else 1
+             "counters": {counter: 0 if counter in ("joint_budget_fallbacks", "response_join_fallbacks") else 1
                           for counter in COUNTERS},
              "compile_query_fingerprint": 123,
              "compile_document": {
-                 "schema_version": 3,
+                 "schema_version": 4,
                  "outcome": "Success",
                  "artifact": "CompiledArtifactReady",
                  "cache": "ForcedCompile",
                  "admission": "NotExecuted",
                  "execution": "NotExecuted",
-                 "artifact_identity": {"Observed": {"schema_version": 3, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
+                 "artifact_identity": {"Observed": {"schema_version": 4, "artifact": [1, 2], "structure": [3, 4], "dependencies": [5, 6]}},
                  "search_counters": [
-                     {"name": "memo_group_count", "value": 1},
-                     {"name": "memo_logical_expression_count", "value": 1},
-                     {"name": "memo_physical_expression_count", "value": 1},
-                     {"name": "search_complete", "value": 1},
-                     {"name": "search_rule_failure_count", "value": 0},
-                     {"name": "search_deadline_reached", "value": 0},
-                     {"name": "settlement_local_hit_count", "value": 0},
-                     {"name": "settlement_local_miss_count", "value": 0},
+                     {"name": "selected_nodes", "value": 1},
+                     {"name": "local_alternatives", "value": 1},
+                     {"name": "joint_transitions", "value": 1},
+                     {"name": "planning_completed", "value": 1},
+                     {"name": "joint_budget_fallbacks", "value": 0},
+                     {"name": "response_join_fallbacks", "value": 0},
+                     {"name": "response_join_transitions", "value": 0},
+                     {"name": "completed_region_outputs", "value": 0},
                  ],
                  "omitted_search_counters": 0,
              }}
@@ -149,9 +149,8 @@ class ColdPlanningGateTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     evaluate(current)
         current = report()
-        current["queries"][0]["samples"][0]["counters"]["search_deadline_reached"] = 1
-        with self.assertRaises(ValueError):
-            evaluate(current, report())
+        current["queries"][0]["samples"][0]["counters"]["response_join_fallbacks"] = 1
+        self.assertFalse(evaluate(current, report())["passed"])
 
     def test_same_report_passes(self):
         self.assertTrue(evaluate(report(), report())["passed"])
@@ -184,7 +183,7 @@ class ColdPlanningGateTests(unittest.TestCase):
             lambda r: r["queries"][0]["samples"][0].update(status="error"),
             lambda r: r["queries"][0]["samples"][0].update(block=1),
             lambda r: r["queries"][0]["samples"][0].update(optimizer_ms=math.nan),
-            lambda r: r["queries"][0]["samples"][0]["counters"].pop("search_complete"),
+            lambda r: r["queries"][0]["samples"][0]["counters"].pop("selected_nodes"),
             lambda r: r.update(invalidated="source changed"),
         ):
             with self.subTest(mutation=mutation):
@@ -204,7 +203,7 @@ class ColdPlanningGateTests(unittest.TestCase):
         current = report()
         for sample in current["queries"][0]["samples"]:
             sample.update(optimizer_ms=1, explain_wall_ms=2)
-            sample["counters"].update(search_complete=0, budget_exhaustion_deadline=1)
+            sample["counters"].update(planning_completed=0, budget_exhaustion_deadline=1)
         self.assertFalse(evaluate(current, report())["passed"])
 
     def test_time_and_memory_are_both_gated(self):

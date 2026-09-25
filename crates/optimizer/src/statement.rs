@@ -18,11 +18,11 @@ use paro_common::types::LogicalType;
 use paro_function::copy::{CopyFunctionBindData, CopyOptions, CopyToFunction};
 use paro_parser::ast::CopySource;
 use paro_planner::expression::Expression;
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     CopyTo, Delete, Explain, ExplainSpec, Insert, InsertOnConflict, LogicalOperator, Update,
 };
+use paro_planner::logical::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan, PlanNodeId};
 use paro_planner::physical::{ReturningImageContract, WriteContract};
-use paro_planner::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan, PlanNodeId};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExplainEnvelope {

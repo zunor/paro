@@ -7,7 +7,7 @@ use paro_external::routine::spec::{
     RoutineId, RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability,
     RowSemantics,
 };
-use paro_planner::operator::external_project::ExternalCostEstimate;
+use paro_planner::logical::operator::external_project::ExternalCostEstimate;
 
 use crate::physical::specs::{ExternalProjectSpec, ExternalRoutineDescriptor, ExternalTableSpec};
 

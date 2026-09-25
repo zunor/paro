@@ -13,7 +13,7 @@ use paro_common::task_supply::MIN_USEFUL_PIPELINE_WORK_BYTES;
 use paro_common::types::LogicalType;
 use paro_function::scalar::FunctionExecContext;
 
-use paro_planner::operator::JoinComparisonType;
+use paro_planner::logical::operator::JoinComparisonType;
 use paro_storage::index::{collect_predicate_columns, Predicate, PredicateTree};
 use paro_storage::rowset::{RowsetSharedPtr, SegmentOptions, SegmentSharedPtr};
 use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptions};

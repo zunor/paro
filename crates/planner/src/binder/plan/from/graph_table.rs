@@ -3,7 +3,7 @@
 
 use crate::binder::ir::BoundFromGraphTable;
 use crate::binder::Binder;
-use crate::operator::{GraphMatch, LogicalOperator};
+use crate::logical::operator::{GraphMatch, LogicalOperator};
 use paro_common::error::Result;
 
 impl Binder {

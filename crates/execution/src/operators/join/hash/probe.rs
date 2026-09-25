@@ -5,7 +5,9 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
-use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics};
+use paro_planner::logical::operator::join::{
+    AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics,
+};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::join::hash::hashing::compute_hashes_for_keys_into;

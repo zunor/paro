@@ -7,7 +7,7 @@
 
 use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;
-use crate::operator::{
+use crate::logical::operator::{
     Explain, ExplainDetail, ExplainFormat, ExplainMode, ExplainSpec, LogicalOperator,
 };
 use paro_common::error::{self as paro_error, Result};

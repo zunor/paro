@@ -5,7 +5,7 @@
 //!
 //! Cost estimators for vector and full-text search operations.
 
-use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
+use paro_planner::logical::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::index::hnsw::{
     estimate_filtered_search_strategy, HnswDistanceCostModel, HnswExactScanWorkload,
     HnswFilteredSearchStrategy, HnswQueryOptions, HnswSearchObjective, HnswSearchPolicy,
@@ -14,64 +14,6 @@ use paro_storage::search::ExactFilterMaterialization;
 use paro_storage::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
 };
-
-/// Strategy chosen for a search operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchStrategy {
-    Hnsw,
-    Sparse,
-    FullTextFilter,
-    FullTextBm25,
-}
-
-/// Estimated cost for a search operation.
-#[derive(Debug, Clone, Copy)]
-pub struct SearchCostEstimate {
-    pub table_index: usize,
-    pub column_id: u32,
-    pub estimated_cost: f64,
-    pub strategy: SearchStrategy,
-    pub filter_selectivity: f64,
-    pub k: Option<usize>,
-    pub query_terms: Option<usize>,
-    pub query_nnz: Option<usize>,
-}
-
-impl SearchCostEstimate {
-    pub fn new(
-        table_index: usize,
-        column_id: u32,
-        strategy: SearchStrategy,
-        estimated_cost: f64,
-        filter_selectivity: f64,
-    ) -> Self {
-        Self {
-            table_index,
-            column_id,
-            estimated_cost,
-            strategy,
-            filter_selectivity,
-            k: None,
-            query_terms: None,
-            query_nnz: None,
-        }
-    }
-
-    pub fn with_k(mut self, k: usize) -> Self {
-        self.k = Some(k);
-        self
-    }
-
-    pub fn with_query_terms(mut self, terms: usize) -> Self {
-        self.query_terms = Some(terms);
-        self
-    }
-
-    pub fn with_query_nnz(mut self, nnz: usize) -> Self {
-        self.query_nnz = Some(nnz);
-        self
-    }
-}
 
 fn clamp_selectivity(value: f64) -> f64 {
     if value.is_finite() {
@@ -262,23 +204,6 @@ impl FullTextScanCostModel {
             FullTextScoreMode::CoverDensityV1 => 1.25,
         };
         match_count * query_terms.max(1.0) * score_mode_factor
-    }
-
-    /// Choose the cheaper strategy between filter and BM25 modes.
-    pub fn choose_strategy(
-        stats: &FullTextIndexStatistics,
-        query_stats: &FullTextQueryStats,
-        score_mode: FullTextScoreMode,
-        filter_selectivity: f64,
-    ) -> (SearchStrategy, f64) {
-        let filter_cost = Self::estimate_filter_cost(stats, query_stats, filter_selectivity);
-        let bm25_cost =
-            Self::estimate_bm25_cost(stats, query_stats, score_mode, filter_selectivity);
-        if filter_cost <= bm25_cost {
-            (SearchStrategy::FullTextFilter, filter_cost)
-        } else {
-            (SearchStrategy::FullTextBm25, bm25_cost)
-        }
     }
 }
 

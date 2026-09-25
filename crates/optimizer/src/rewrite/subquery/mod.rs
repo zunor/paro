@@ -7,9 +7,13 @@ pub mod delim_join_elimination;
 pub mod empty_result;
 pub(crate) mod existence_disjunction;
 pub(crate) mod existence_reduction;
+#[cfg(test)]
 pub(crate) mod output_contract;
+#[cfg(test)]
 pub mod partition_aggregate;
+#[cfg(test)]
 pub mod scalar_aggregate_fusion;
+#[cfg(test)]
 pub mod scalar_aggregate_window;
 
 #[cfg(test)]

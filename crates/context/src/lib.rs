@@ -47,9 +47,7 @@ pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
 pub use diagnostic_environment::{
     initialize_diagnostic_environment, snapshot as diagnostic_environment,
 };
-pub use effective_settings::{
-    EffectiveSettings, OptimizerAggregateStrategy, OptimizerSearchPolicy,
-};
+pub use effective_settings::EffectiveSettings;
 pub use execution_resources::ExecutionResources;
 pub use memory_governance::{
     QueryMemoryBudgetSpec, QueryMemoryCoordinator, QueryMemoryRegistration, QueryMemoryTarget,
@@ -82,7 +80,7 @@ pub use statement_cancellation::{
 };
 pub use statement_context::{CompileEnvironmentKey, CompileNamespace, StatementContext};
 mod compile_resources;
-pub use compile_resources::{compile_grant_classes, CompileGrant, CompileResources};
+pub use compile_resources::{CompileGrant, CompileResources};
 pub use statement_environment::{StatementAuthContext, StatementEnvironment};
 pub use statement_graphs::StatementGraphSnapshots;
 pub use statement_input::StatementInput;

@@ -7,7 +7,7 @@ use crate::physical::specs::SetOperationSpec;
 impl PhysicalPlanBuilder {
     pub(crate) fn lower_set_operation(
         &mut self,
-        setop: &LogicalSetOperation<SelectedChild>,
+        setop: &LogicalSetOperation<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if setop.setop_type == SetOpType::Union && setop.setop_all {
             if let Some(rows) = collect_union_all_row_literals(setop)? {
@@ -46,7 +46,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_materialized_cte(
         &mut self,
-        cte: &LogicalMaterializedCte<SelectedChild>,
+        cte: &LogicalMaterializedCte<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let producer = self.extract_node(cte.cte_query.as_ref())?;
         let consumer = self.extract_node(cte.child.as_ref())?;
@@ -67,7 +67,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_recursive_cte(
         &mut self,
-        cte: &LogicalRecursiveCte<SelectedChild>,
+        cte: &LogicalRecursiveCte<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let anchor = self.extract_node(cte.anchor.as_ref())?;
         let recursive = self.extract_node(cte.recursive.as_ref())?;
@@ -100,7 +100,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_explain(
         &mut self,
-        explain: &LogicalExplain<SelectedChild>,
+        explain: &LogicalExplain<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if explain.spec.mode == ExplainMode::Analyze {
             return self.reject_unimplemented(
@@ -110,11 +110,11 @@ impl PhysicalPlanBuilder {
         }
 
         let mut child_extractor = PhysicalPlanBuilder::new(self.ctx.clone())
-            .with_winner_contracts(self.winner_contracts.clone())
-            .with_enforcer_contracts(self.enforcer_contracts.clone())
+            .with_implementation_contracts(self.implementation_contracts.clone())
+            .with_mutation_barriers(self.mutation_barriers.clone())
             .with_statement_write_contracts(self.statement_write_contracts.clone());
-        if self.require_winner_contracts {
-            child_extractor = child_extractor.requiring_winner_contracts();
+        if self.require_implementation_contracts {
+            child_extractor = child_extractor.requiring_implementation_contracts();
         }
         let child_plan = child_extractor.extract_selected(explain.child.as_ref())?;
         let rows = match explain.spec.format {
@@ -142,7 +142,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_unsupported(
         &mut self,
-        op: &LogicalOperator<SelectedChild>,
+        op: &LogicalOperator<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         self.reject_unimplemented(logical_name(op), "typed physical spec is not implemented")
     }

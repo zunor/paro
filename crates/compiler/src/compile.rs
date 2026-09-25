@@ -7,7 +7,7 @@ use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
 use paro_parser::ast::Statement;
-use paro_planner::planner::Planner;
+use paro_planner::binder::Planner;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error};
@@ -90,13 +90,12 @@ pub fn compile_statement_with_parameter_types(
     );
 
     let optimizer_started = Instant::now();
-    let partition = paro_optimizer::diagnostics::work::begin(
+    let partition = paro_optimizer::begin_optimizer_observation(
         optimizer_started,
         ctx.options.compile_capture.as_ref().is_some_and(|capture| {
             capture.level() == paro_context::compile_diagnostics::CaptureLevel::Detail
         }),
     );
-    paro_optimizer::cascades::memo::diagnostic_snapshot::clear();
     let mut optimizer = paro_optimizer::Optimizer::new(planner.binder, ctx.clone());
     let optimized = match optimizer.optimize(logical_plan) {
         Ok(plan) => plan,
@@ -109,7 +108,6 @@ pub fn compile_statement_with_parameter_types(
                         )
                     });
                 }
-                let _ = report.write(&statement_tag, false);
             }
             if let Some(trace) = &statement_trace {
                 trace.record_span("compile", "optimizer", optimizer_started);
@@ -149,18 +147,12 @@ pub fn compile_statement_with_parameter_types(
     if let Some(trace) = &statement_trace {
         trace.record_span("compile", "optimizer", optimizer_started);
     }
-    if let Err(error) = paro_optimizer::cascades::memo::diagnostic_snapshot::flush(&statement_tag) {
-        tracing::warn!(%error, "frontier diagnostic snapshot write failed");
-    }
     if let Some(report) = partition_report {
         if let Some(capture) = &ctx.options.compile_capture {
             capture.update(|r| {
                 r.optimizer_work =
                     paro_context::compile_diagnostics::Observation::Observed(report.snapshot())
             });
-        }
-        if let Err(error) = report.write(&statement_tag, true) {
-            tracing::warn!(%error, "optimizer work partition write failed");
         }
     }
     debug!(
@@ -171,9 +163,9 @@ pub fn compile_statement_with_parameter_types(
 
     let verify_started = Instant::now();
     let verification = match &optimized {
-        paro_optimizer::OptimizedStatement::Physical(portfolio) => portfolio
+        paro_optimizer::OptimizedStatement::Physical(artifact) => artifact
             .verify_result_types(&result_types)
-            .and_then(|()| portfolio.verify()),
+            .and_then(|()| artifact.verify()),
         paro_optimizer::OptimizedStatement::ExplainAnalyze { target, .. } => target.verify(),
     };
     if let Err(error) = verification {
@@ -198,63 +190,41 @@ pub fn compile_statement_with_parameter_types(
             );
             r.safety_verified = Observed(true);
             r.output_columns = Observed(result_names.len());
-            if let paro_optimizer::OptimizedStatement::Physical(portfolio) = &optimized {
-                if let Some(class) = portfolio
-                    .grant_search
-                    .as_ref()
-                    .and_then(|s| s.expected_class)
-                {
-                    r.expected_class = Observed(class.0);
-                    let mut matches = portfolio
-                        .variants
-                        .iter()
-                        .filter(|v| v.admissible_classes.contains(&class));
-                    if let Some(variant) = matches.next() {
-                        if matches.next().is_none() {
-                            r.selected_fingerprint = Observed([
-                                (variant.physical_fingerprint.0 >> 64) as u64,
-                                variant.physical_fingerprint.0 as u64,
-                            ]);
-                        }
-                    }
-                }
+            if let paro_optimizer::OptimizedStatement::Physical(artifact) = &optimized {
+                r.expected_class = Observed(artifact.grant.id.0);
+                r.selected_fingerprint = Observed([
+                    (artifact.physical_fingerprint.0 >> 64) as u64,
+                    artifact.physical_fingerprint.0 as u64,
+                ]);
             }
         });
-        if let paro_optimizer::OptimizedStatement::Physical(portfolio) = &optimized {
-            use paro_context::compile_diagnostics::{VariantSummary, MAX_VARIANTS};
+        if let paro_optimizer::OptimizedStatement::Physical(artifact) = &optimized {
+            use paro_context::compile_diagnostics::VariantSummary;
             capture.variants(
-                portfolio.variants.len(),
-                portfolio
-                    .variants
-                    .iter()
-                    .take(MAX_VARIANTS)
-                    .enumerate()
-                    .filter_map(|(ordinal, variant)| {
-                        let admissible_classes = variant
-                            .admissible_classes
-                            .iter()
-                            .try_fold(0u64, |mask, class| {
-                                1u64.checked_shl(class.0).map(|bit| mask | bit)
-                            })?;
-                        Some(VariantSummary {
-                            ordinal: ordinal as u16,
-                            physical_fingerprint: [
-                                (variant.physical_fingerprint.0 >> 64) as u64,
-                                variant.physical_fingerprint.0 as u64,
-                            ],
-                            admissible_classes,
-                        })
-                    }),
+                1,
+                std::iter::once(VariantSummary {
+                    ordinal: 0,
+                    physical_fingerprint: [
+                        (artifact.physical_fingerprint.0 >> 64) as u64,
+                        artifact.physical_fingerprint.0 as u64,
+                    ],
+                    admissible_classes: 1u64.checked_shl(artifact.grant.id.0).ok_or_else(|| {
+                        paro_common::error::internal(
+                            "resource contract id exceeds receipt capacity",
+                        )
+                    })?,
+                }),
             );
         }
     }
+
     let executable = match optimized {
         paro_optimizer::OptimizedStatement::Physical(plan) => {
-            paro_execution::pipeline::StatementProgram::deferred_physical_portfolio(plan)?
+            paro_execution::pipeline::StatementProgram::deferred_physical_plan(plan)?
         }
         paro_optimizer::OptimizedStatement::ExplainAnalyze { target, spec } => {
             let target =
-                paro_execution::pipeline::StatementProgram::deferred_physical_portfolio(target)?;
+                paro_execution::pipeline::StatementProgram::deferred_physical_plan(target)?;
             paro_execution::pipeline::StatementProgram::ExplainAnalyze {
                 target: Box::new(target),
                 spec,

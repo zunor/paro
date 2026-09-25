@@ -10,12 +10,12 @@ use paro_planner::expression::{
     ColumnRefExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
     OperatorExpression, OperatorType,
 };
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     ColumnBinding, ComparisonJoin, DelimGet, Filter, Join, JoinBuildSideConstraint,
     JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
 };
-use paro_planner::plan::OwnedLogicalPlan;
-use paro_planner::visitor::LogicalOperatorVisitor;
+use paro_planner::logical::plan::OwnedLogicalPlan;
+use paro_planner::logical::visitor::LogicalOperatorVisitor;
 
 use crate::rewrite::expr::binding_replacer::{ColumnBindingReplacer, ReplacementBinding};
 
@@ -131,14 +131,14 @@ impl DelimJoinElimination {
     ) -> Option<ExistenceDecorrelation> {
         let consumed_existence = matches!(join.join_type, JoinType::Semi | JoinType::Anti)
             && join.mark_index.is_none()
-            && join.mark_semantics == paro_planner::operator::MarkJoinSemantics::NotMark;
+            && join.mark_semantics == paro_planner::logical::operator::MarkJoinSemantics::NotMark;
         let two_valued_marker = self.projected_existence
             && join.join_type == JoinType::Mark
             && join.mark_index.is_some()
-            && join.mark_semantics == paro_planner::operator::MarkJoinSemantics::TwoValued;
+            && join.mark_semantics == paro_planner::logical::operator::MarkJoinSemantics::TwoValued;
         if !(consumed_existence || two_valued_marker)
             || join.delim_flipped
-            || join.anti_join_mode != paro_planner::operator::AntiJoinMode::Regular
+            || join.anti_join_mode != paro_planner::logical::operator::AntiJoinMode::Regular
             || join.conditions.len() != join.duplicate_eliminated_columns.len()
             || join
                 .conditions
@@ -897,7 +897,7 @@ fn expression_references_table(expression: &Expression, table_index: usize) -> b
 
 fn expression_references_only_bindings(
     expression: &Expression,
-    bindings: &HashSet<paro_planner::operator::ColumnBinding>,
+    bindings: &HashSet<paro_planner::logical::operator::ColumnBinding>,
 ) -> bool {
     match expression {
         Expression::ColumnRef(column) => column.depth == 0 && bindings.contains(&column.binding),
@@ -1019,12 +1019,12 @@ mod tests {
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
         FunctionExpression,
     };
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         ColumnBinding, ComparisonJoin, CrossProduct, DelimGet, ExpressionGet, Filter, Join,
         JoinComparisonType, JoinCondition, JoinType, LogicalOperator, MarkJoinSemantics,
         Projection,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     fn noop_scalar_execute(
         _input: &Chunk,

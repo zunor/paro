@@ -12,7 +12,7 @@ use paro_function::scalar::cast::BoundCastInfo;
 use paro_planner::expression::{
     CastExpression, ComparisonExpression, ComparisonType, ConstantExpression, OperatorExpression,
 };
-use paro_planner::operator::{Aggregate, CrossProduct, Filter, Get, Projection};
+use paro_planner::logical::operator::{Aggregate, CrossProduct, Filter, Get, Projection};
 use paro_storage::table::table_factory::TableFactory;
 
 use super::*;
@@ -280,7 +280,7 @@ fn source_equivalence_maps_compacted_ordinals_by_physical_column_id() {
         panic!("scalar Get");
     };
     scalar_get.column_sources =
-        vec![paro_planner::operator::GetColumnSource::Stored { column_id: 1 }];
+        vec![paro_planner::logical::operator::GetColumnSource::Stored { column_id: 1 }];
     scalar_get.column_types = vec![LogicalType::Integer];
     scalar_get.returned_types = vec![LogicalType::Integer];
     scalar_get.names = vec!["value".to_string()];

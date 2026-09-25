@@ -12,14 +12,16 @@
 
 use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
+#[cfg(test)]
 use paro_planner::binder::deep_copy::fork_plan_preserving_indices;
 use paro_planner::expression::{AggregateType, ColumnRefExpression, Expression};
-use paro_planner::operator::{Aggregate, ColumnBinding, LogicalOperator};
-use paro_planner::plan::{NodeStats, OwnedLogicalPlan};
+use paro_planner::logical::operator::{Aggregate, ColumnBinding, LogicalOperator};
+use paro_planner::logical::plan::{NodeStats, OwnedLogicalPlan};
 
 /// Keep the baseline in place unless there is a legal resource-feasibility
 /// alternative. The read-only admission and rewrite share the same predicate;
 /// absence of DISTINCT must not require an owned copy of the query.
+#[cfg(test)]
 pub fn fork_candidate(
     plan: OwnedLogicalPlan,
     bind_context: &BindContext,
@@ -189,8 +191,10 @@ mod tests {
     use paro_planner::expression::{
         AggregateExpression, AggregateType, ColumnRefExpression, Expression,
     };
-    use paro_planner::operator::{Aggregate, ColumnBinding, ExpressionGet, LogicalOperator};
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::operator::{
+        Aggregate, ColumnBinding, ExpressionGet, LogicalOperator,
+    };
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     use super::{fork_candidate, optimize_plan};
 

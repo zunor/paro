@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use paro_planner::expression::{Expression, ExpressionIterator, ExpressionVisitDecision};
-use paro_planner::operator::{ColumnBinding, Join, JoinType, LogicalOperator};
+use paro_planner::logical::operator::{ColumnBinding, Join, JoinType, LogicalOperator};
 
 /// The output-layout guarantee made by the rewrite consuming this contract.
 ///
@@ -149,8 +149,8 @@ pub(crate) fn child_output_contracts(
 
 fn extend_stored_projection(
     contract: &mut OutputContract,
-    child: &paro_planner::plan::OwnedLogicalPlan,
-    projection: &paro_planner::operator::ProjectionMap,
+    child: &paro_planner::logical::plan::OwnedLogicalPlan,
+    projection: &paro_planner::logical::operator::ProjectionMap,
     rewrite_shape: RewriteOutputShape,
 ) -> bool {
     if projection.is_all() {

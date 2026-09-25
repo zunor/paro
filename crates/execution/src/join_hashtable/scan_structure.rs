@@ -436,7 +436,7 @@ impl ScanStructure {
             .any(|(col_idx, condition)| {
                 !matches!(
                     condition.comparison,
-                    paro_planner::operator::join::JoinComparisonType::NotDistinctFrom
+                    paro_planner::logical::operator::join::JoinComparisonType::NotDistinctFrom
                 ) && keys.data[col_idx].is_null(row_idx)
             })
     }
@@ -751,7 +751,8 @@ impl ScanStructure {
         left_projection_map: &[usize],
         output_permutation: &OutputPermutation,
     ) -> Result<usize> {
-        if self.exact_key_matches && hash_table.join_type == paro_planner::operator::JoinType::Inner
+        if self.exact_key_matches
+            && hash_table.join_type == paro_planner::logical::operator::JoinType::Inner
         {
             return self.next_exact_inner_join(
                 left,
@@ -797,7 +798,7 @@ impl ScanStructure {
         debug_assert!(self.exact_key_matches);
         debug_assert_eq!(
             hash_table.join_type,
-            paro_planner::operator::JoinType::Inner
+            paro_planner::logical::operator::JoinType::Inner
         );
         if self.finished {
             result.try_set_cardinality(0)?;
@@ -1111,7 +1112,7 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
         output_permutation: &OutputPermutation,
-        mark_semantics: paro_planner::operator::MarkJoinSemantics,
+        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     ) -> Result<usize> {
         self.next_mark_join_with_filter(
             keys,
@@ -1133,17 +1134,17 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
         output_permutation: &OutputPermutation,
-        mark_semantics: paro_planner::operator::MarkJoinSemantics,
+        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
         residual_filter: F,
     ) -> Result<usize>
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
         let nulls_produce_unknown = match mark_semantics {
-            paro_planner::operator::MarkJoinSemantics::TwoValued => false,
-            paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(0) => true,
-            paro_planner::operator::MarkJoinSemantics::NotMark
-            | paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(_) => {
+            paro_planner::logical::operator::MarkJoinSemantics::TwoValued => false,
+            paro_planner::logical::operator::MarkJoinSemantics::ThreeValuedFrom(0) => true,
+            paro_planner::logical::operator::MarkJoinSemantics::NotMark
+            | paro_planner::logical::operator::MarkJoinSemantics::ThreeValuedFrom(_) => {
                 return Err(paro_error::internal(
                     "hash MARK probe received an unsupported truth-value contract",
                 ));

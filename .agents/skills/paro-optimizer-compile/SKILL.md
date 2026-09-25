@@ -1,11 +1,11 @@
 ---
 name: paro-optimizer-compile
-description: Diagnose Paro optimizer search with bounded EXPLAIN (COMPILE, DETAIL) and controlled Q04/Q11/Q74 cold/warm measurements.
+description: Diagnose Paro planning stages with bounded EXPLAIN (COMPILE, DETAIL) and controlled cold/warm measurements.
 ---
 
 # Optimizer compile workflow
 
-Use this skill for optimizer design, chain replay, and compile-latency evidence.
+Use this skill for optimizer design, historical replay, and compile-latency evidence.
 It complements `paro-evidence`; it does not authorize baseline updates, result
 blessing, or history cleanup.
 
@@ -27,11 +27,10 @@ blessing, or history cleanup.
 4. Before collection, register EvidenceId, source and binary identities,
    DuckDB identity from `benchmark/requirements.txt` plus the actual runtime,
    SQL/data seed, resource envelope, process-block/sample counts, and timer
-   boundaries. Record the effective optional-search deadline and budget source
-   (`PARO_DIAGNOSTIC_SEARCH_STOP_MS`, config, or an explicit `SearchBudget`);
-   if the receipt does not expose it, preserve the process/config value in the
-   manifest rather than inferring it from a source default. Discover current
-   collector flags from `--help`.
+   boundaries. Record regional enumeration limits and actual resource settings
+   from the selected revision. There is one production planning path; do not
+   set retired search-policy or rule-disable options. Discover collector flags
+   from `--help`, not a historical invocation.
    Normal compile timing currently requires `PARO_COMPILE_WORK_EVIDENCE=1`
    (`crates/context/src/session_diagnostics.rs`). Register this observer and check
    the first completed cell's cold receipts for non-null `compile_work` before
@@ -44,17 +43,18 @@ blessing, or history cleanup.
    typed results, multiplicities, and required ordering outside the timer.
 6. Use `EXPLAIN (COMPILE, DETAIL, FORMAT JSON)` only as bounded structural
    evidence. Associate it with the same compile/admission receipt as the normal
-   sample and record plan identity, search counters, rule/work ledger,
-   candidates, grant, quality state, and stop reason. `SearchIncomplete` or
-   `BudgetLimited` is not `ProofComplete`; fingerprints locate plans but do not
-   prove equivalence. Detail time is never C1.
+   sample and record plan identity, stage work, regional transitions/fallbacks
+   and the actual resource contract. `Planned` means a physical artifact was
+   constructed, not globally optimal search; `PlannedWithFallback` exposes
+   bounded enumeration fallback. Fingerprints locate plans but do not prove
+   equivalence. Detail time is never C1.
    A historical arm may predate the typed `COMPILE` protocol. In that case a
    plain `EXPLAIN` is an exploratory fallback only: record the protocol and
    source mismatch, keep its plan text/timing in a separate cell, and mark the
-   arm `Uncovered`/`Incomparable` for receipt, search-state, and C1 claims. Do
+   arm `Uncovered`/`Incomparable` for receipt and joint-attribution claims. Do
    not infer typed counters or pair its wall time with a normal C1 sample.
-7. Run registered Q04, Q11, and Q74 cells with identical resources and source
-   policy. Preserve slow samples, failures, missing receipts, and unsupported
+7. Run the registered query scope (Q04/Q11/Q74 are useful pilots, not corpus
+   acceptance) with identical resources. Preserve slow samples, failures, missing receipts, and unsupported
    modes. Report `Uncovered`, `Incomparable`, or `NotCertified` instead of
    filling missing fields or comparing stale builds.
 8. Archive a bounded campaign (`manifest`, cell timings/receipts, one compile

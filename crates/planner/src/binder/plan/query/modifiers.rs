@@ -6,7 +6,7 @@
 use crate::binder::ir::BoundQueryModifiers;
 use crate::binder::Binder;
 use crate::expression::{ColumnRefExpression, Expression};
-use crate::operator::{Limit, LogicalOperator, Order, Projection};
+use crate::logical::operator::{Limit, LogicalOperator, Order, Projection};
 use paro_common::error::{self as paro_error, Result};
 
 impl Binder {

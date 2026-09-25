@@ -243,17 +243,17 @@ mod tests {
                             paro_compiler::compile_statement(Arc::new(observed_ctx), stmt.clone())
                                 .unwrap();
                         assert_eq!(ordinary.result_schema(), observed.result_schema());
-                        let (StatementProgram::Portfolio(a), StatementProgram::Portfolio(b)) =
+                        let (StatementProgram::Physical(a), StatementProgram::Physical(b)) =
                             (ordinary.program(), observed.program())
                         else {
-                            panic!("expected deferred portfolios")
+                            panic!("expected deferred physical artifacts")
                         };
-                        assert_eq!(a.variants.len(), b.variants.len());
-                        for (a, b) in a.variants.iter().zip(b.variants.iter()) {
-                            assert_eq!(a.physical_fingerprint, b.physical_fingerprint);
-                            assert_eq!(a.cost, b.cost);
-                            assert_eq!(a.admissible_classes, b.admissible_classes);
-                        }
+                        assert_eq!(a.physical_fingerprint, b.physical_fingerprint);
+                        assert_eq!(a.grant, b.grant);
+                        assert_eq!(
+                            a.plan.properties.get(a.plan.root).unwrap().cumulative_cost,
+                            b.plan.properties.get(b.plan.root).unwrap().cumulative_cost
+                        );
                         assert!(session
                             .reusable_instance_query_plan(&stmt, &[], &ctx)
                             .is_none());

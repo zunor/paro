@@ -9,7 +9,8 @@ use std::sync::Arc;
 use paro_common::logging::targets;
 use tracing::debug;
 
-use crate::region::join::cost_model::{DPJoinNode, SelectivityModel};
+use crate::cost::region::RegionCostModel;
+use crate::region::join::candidate::DPJoinNode;
 use crate::region::join::query_graph::{
     CutPredicateResolution, JoinPredicateSet, NeighborInfo, QueryGraphEdges,
 };
@@ -43,7 +44,7 @@ pub(crate) struct PlanEnumerator<'a> {
     /// The set manager for creating/looking up relation sets.
     set_manager: &'a mut JoinRelationSetManager,
     /// The cost model for evaluating join costs.
-    cost_model: &'a mut SelectivityModel,
+    cost_model: &'a mut RegionCostModel,
     /// Number of relations in the query.
     num_relations: usize,
     /// Bounded non-dominated work/memory frontier for each relation set.
@@ -85,7 +86,7 @@ impl<'a> PlanEnumerator<'a> {
     pub fn new(
         query_graph: &'a QueryGraphEdges,
         set_manager: &'a mut JoinRelationSetManager,
-        cost_model: &'a mut SelectivityModel,
+        cost_model: &'a mut RegionCostModel,
         num_relations: usize,
     ) -> Self {
         Self::with_budget(
@@ -102,7 +103,7 @@ impl<'a> PlanEnumerator<'a> {
     pub fn with_budget(
         query_graph: &'a QueryGraphEdges,
         set_manager: &'a mut JoinRelationSetManager,
-        cost_model: &'a mut SelectivityModel,
+        cost_model: &'a mut RegionCostModel,
         num_relations: usize,
         exact_relation_limit: usize,
         max_pairs: usize,
@@ -573,7 +574,7 @@ mod tests {
     use crate::region::join::relation_manager::{DistinctCount, RelationStats};
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
-    use paro_planner::operator::{AntiJoinMode, ColumnBinding, JoinType};
+    use paro_planner::logical::operator::{AntiJoinMode, ColumnBinding, JoinType};
 
     fn column_distinct_counts(
         table_index: usize,
@@ -592,7 +593,7 @@ mod tests {
     ) -> paro_planner::expression::Expression {
         paro_planner::expression::Expression::ColumnRef(
             ColumnRefExpression {
-                binding: paro_planner::operator::ColumnBinding {
+                binding: paro_planner::logical::operator::ColumnBinding {
                     table_index,
                     column_index,
                 },
@@ -703,7 +704,7 @@ mod tests {
             query_graph.create_edge(&right, Arc::clone(&left), Some(filter));
         }
         let mut cost_model =
-            SelectivityModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
         cost_model.init_cost_model(
             &mut set_manager,
             &[
@@ -762,7 +763,7 @@ mod tests {
     fn test_plan_enumerator_init_leaf_plans() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model =
-            SelectivityModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
         let query_graph = QueryGraphEdges::new();
 
         // Initialize cost model
@@ -790,7 +791,7 @@ mod tests {
     fn greedy_missing_input_is_not_reported_as_semantic_ineligibility() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model =
-            SelectivityModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
         let query_graph = QueryGraphEdges::new();
         cost_model.init_cost_model(
             &mut set_manager,
@@ -821,7 +822,7 @@ mod tests {
             leaves: &[DPJoinNode],
             filters: &[Arc<FilterInfo>],
             sets: &mut JoinRelationSetManager,
-            costs: &mut SelectivityModel,
+            costs: &mut RegionCostModel,
         ) -> Vec<DPJoinNode> {
             if mask.count_ones() == 1 {
                 return vec![leaves[mask.trailing_zeros() as usize].clone()];
@@ -854,7 +855,7 @@ mod tests {
         }
         for rows in [[10, 200, 3, 800], [1000, 2, 400, 30]] {
             let mut sets = JoinRelationSetManager::new();
-            let mut costs = SelectivityModel::new(Default::default());
+            let mut costs = RegionCostModel::new(Default::default());
             costs.regional_pricing = Some(
                 crate::cost::join::JoinWorkPricing::new(
                     &crate::cost::calibration::MachineCalibrationBundle::builtin_production(),
@@ -897,7 +898,7 @@ mod tests {
     fn test_plan_enumerator_two_relations() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model =
-            SelectivityModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
         let mut query_graph = QueryGraphEdges::new();
 
         // Create join filter
@@ -937,7 +938,7 @@ mod tests {
     fn test_plan_enumerator_three_relations_chain() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model =
-            SelectivityModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
         let mut query_graph = QueryGraphEdges::new();
 
         // Create chain: A - B - C
@@ -990,7 +991,7 @@ mod tests {
     fn test_plan_enumerator_cross_product() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model =
-            SelectivityModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
         let query_graph = QueryGraphEdges::new();
 
         // No join conditions - will need cross product
@@ -1017,7 +1018,7 @@ mod tests {
     fn test_plan_enumerator_approximate() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model =
-            SelectivityModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
         let query_graph = QueryGraphEdges::new();
 
         // Create many relations to trigger approximate algorithm

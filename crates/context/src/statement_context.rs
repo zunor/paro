@@ -65,15 +65,9 @@ impl CompileEnvironmentKey {
             visible_generation,
             catalog_epochs,
             planning_settings_fingerprint: settings.planning_fingerprint(),
-            // The cached compiler uses SearchBudget::default() (three
-            // operating points). Direct engine callers with a custom budget
-            // choose explicitly and do not produce cached compiler images.
-            // The optimizer coupling test guards this default contract.
-            expected_grant: compile_resources.expected_grant(
-                limits.max_memory,
-                limits.max_threads,
-                3,
-            ),
+            // The staged planner produces one operating point. Runtime
+            // admission must honor this exact operating point.
+            expected_grant: compile_resources.expected_grant(limits.max_memory, limits.max_threads),
             compile_resources,
             grant_limits: (limits.max_memory, limits.max_threads),
         }

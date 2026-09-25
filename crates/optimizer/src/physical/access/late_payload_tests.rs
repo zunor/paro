@@ -9,12 +9,12 @@ use paro_function::aggregate::distributive::sum::get_sum_function;
 use paro_planner::binder::context::BindContext;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
-use paro_planner::operator::aggregate::GroupDependency;
-use paro_planner::operator::{
+use paro_planner::logical::operator::aggregate::GroupDependency;
+use paro_planner::logical::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Get, GetColumnSource, Join,
     JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Projection, ProjectionMap, TopN,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 use paro_storage::table::table_factory::TableFactory;
 
 use super::late_payload::optimize_plan;
@@ -35,8 +35,9 @@ fn rejection_guards_observe_actual_late_payload_proofs_without_changing_results(
     let LogicalOperator::Projection(output) = &mut no_reduction.operator else {
         unreachable!()
     };
-    output.child.stats.estimated_cardinality =
-        Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    output.child.stats.estimated_cardinality = Some(
+        paro_planner::logical::plan::CardinalityEstimate::exact(100_000),
+    );
     let cases = [
         (
             selective_join_projection_candidate(JoinType::Inner, true),
@@ -160,12 +161,14 @@ fn candidate(order_by_payload: bool) -> OwnedLogicalPlan {
         determinants: vec![0].into_boxed_slice(),
         dependents: vec![1, 2].into_boxed_slice(),
     });
-    aggregate.child.stats.estimated_cardinality =
-        Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    aggregate.child.stats.estimated_cardinality = Some(
+        paro_planner::logical::plan::CardinalityEstimate::exact(100_000),
+    );
     let mut aggregate_plan =
         OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate)));
-    aggregate_plan.stats.estimated_cardinality =
-        Some(paro_planner::plan::CardinalityEstimate::exact(10_000));
+    aggregate_plan.stats.estimated_cardinality = Some(
+        paro_planner::logical::plan::CardinalityEstimate::exact(10_000),
+    );
     let projection = Projection::new(
         OUTPUT,
         aggregate_plan,
@@ -191,8 +194,9 @@ fn candidate(order_by_payload: bool) -> OwnedLogicalPlan {
         nulls_first: true,
     };
     let mut projection_plan = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(projection));
-    projection_plan.stats.estimated_cardinality =
-        Some(paro_planner::plan::CardinalityEstimate::exact(10_000));
+    projection_plan.stats.estimated_cardinality = Some(
+        paro_planner::logical::plan::CardinalityEstimate::exact(10_000),
+    );
     OwnedLogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
         projection_plan,
         vec![order],
@@ -252,9 +256,12 @@ fn selective_projection_candidate(source: GetColumnSource) -> OwnedLogicalPlan {
     );
     get.column_sources[1] = source;
     let mut get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(get)));
-    get.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    get.stats.estimated_cardinality = Some(
+        paro_planner::logical::plan::CardinalityEstimate::exact(100_000),
+    );
     let mut filter = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(get, vec![])));
-    filter.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100));
+    filter.stats.estimated_cardinality =
+        Some(paro_planner::logical::plan::CardinalityEstimate::exact(100));
     OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         OUTPUT,
         filter,
@@ -281,8 +288,9 @@ fn selective_join_projection_candidate(
             .collect(),
         table,
     ))));
-    source.stats.estimated_cardinality =
-        Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    source.stats.estimated_cardinality = Some(
+        paro_planner::logical::plan::CardinalityEstimate::exact(100_000),
+    );
     let dimension = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
         Get::new_without_table(11, vec!["key".to_string()], vec![LogicalType::BigInt]),
     )));
@@ -313,7 +321,8 @@ fn selective_join_projection_candidate(
             )],
         ),
     )));
-    join.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100));
+    join.stats.estimated_cardinality =
+        Some(paro_planner::logical::plan::CardinalityEstimate::exact(100));
     OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         OUTPUT,
         join,
@@ -324,7 +333,7 @@ fn selective_join_projection_candidate(
 fn selective_join_topn_candidate() -> OwnedLogicalPlan {
     let mut projection = selective_join_projection_candidate(JoinType::Inner, true);
     projection.stats.estimated_cardinality =
-        Some(paro_planner::plan::CardinalityEstimate::exact(100));
+        Some(paro_planner::logical::plan::CardinalityEstimate::exact(100));
     OwnedLogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
         projection,
         vec![OrderByNode {
@@ -359,7 +368,9 @@ fn row_preserving_candidate(
     let derived =
         include_derived_prefix.then(|| get.append_matched_utf8_prefix(1, 2, LogicalType::Varchar));
     let mut get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(get)));
-    get.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    get.stats.estimated_cardinality = Some(
+        paro_planner::logical::plan::CardinalityEstimate::exact(100_000),
+    );
 
     let expressions = if let Some(derived) = derived {
         vec![
@@ -390,8 +401,9 @@ fn row_preserving_candidate(
     let order_index = if hidden_order_key { 2 } else { 0 };
     let projection = Projection::new(OUTPUT, get, expressions).with_visible_names(visible_names);
     let mut projection = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(projection));
-    projection.stats.estimated_cardinality =
-        Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    projection.stats.estimated_cardinality = Some(
+        paro_planner::logical::plan::CardinalityEstimate::exact(100_000),
+    );
     let mut topn = TopN::new(
         projection,
         vec![OrderByNode {
@@ -663,11 +675,12 @@ fn selective_projection_prices_uncertain_fanout_at_its_upper_bound() {
     let LogicalOperator::Projection(output) = &mut plan.operator else {
         unreachable!()
     };
-    output.child.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate {
-        min: 0,
-        expected: 100,
-        max: 100_000,
-    });
+    output.child.stats.estimated_cardinality =
+        Some(paro_planner::logical::plan::CardinalityEstimate {
+            min: 0,
+            expected: 100,
+            max: 100_000,
+        });
 
     let (optimized, changed) = optimize_plan(plan, &context, &SelectivityModel::default()).unwrap();
     assert!(!changed);

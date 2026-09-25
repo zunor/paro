@@ -6,16 +6,14 @@
 use divan::Bencher;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_optimizer::rewrite::expr::rewriter::ExpressionRewriter;
-use paro_optimizer::rewrite::expr::rules::expression_matcher::{
-    AnyExpressionMatcher, ExpressionMatcher,
-};
-use paro_optimizer::rewrite::expr::rules::rule::{Rule, RuleResult};
+use paro_optimizer::test_support::ExpressionRewriter;
+use paro_optimizer::test_support::{AnyExpressionMatcher, ExpressionMatcher};
+use paro_optimizer::test_support::{Rule, RuleResult};
 use paro_planner::expression::{
     ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
 };
-use paro_planner::operator::{LogicalOperator, Projection};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{LogicalOperator, Projection};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 const DEPTH: usize = 10;
 

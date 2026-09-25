@@ -3,7 +3,7 @@
 
 use crate::binder::ir::BoundFromCTE;
 use crate::binder::Binder;
-use crate::operator::{CTERef, LogicalOperator};
+use crate::logical::operator::{CTERef, LogicalOperator};
 use paro_common::error::Result;
 
 impl Binder {

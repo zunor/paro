@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 
-use paro_planner::operator::{ExplainFormat, ExplainSpec};
+use paro_planner::logical::operator::{ExplainFormat, ExplainSpec};
 
 use crate::explain::profiler::{
     ExplainProfileEvent, ExplainProfileSnapshot, ExplainProfiler, ProfileMorselRange,
@@ -89,7 +89,7 @@ fn render_explain_analyze_text(
             lines.push(format!("UTILITY {:?}", utility.spec));
             render_profile_summary_text(snapshot, elapsed_ms, &mut lines);
         }
-        StatementProgram::Portfolio(_) | StatementProgram::ExplainAnalyze { .. } => {
+        StatementProgram::Physical(_) | StatementProgram::ExplainAnalyze { .. } => {
             unreachable!("unadmitted or nested EXPLAIN ANALYZE target reached rendering");
         }
     }
@@ -145,7 +145,7 @@ fn render_explain_analyze_json(
             "role": "utility",
             "operator": format!("{:?}", utility.spec),
         })],
-        StatementProgram::Portfolio(_) | StatementProgram::ExplainAnalyze { .. } => {
+        StatementProgram::Physical(_) | StatementProgram::ExplainAnalyze { .. } => {
             unreachable!("unadmitted or nested EXPLAIN ANALYZE target reached rendering");
         }
     };
@@ -504,7 +504,7 @@ fn operator_json(
     runtime_id: usize,
     role: &'static str,
     operator: &str,
-    logical_plan_node: Option<paro_planner::plan::PlanNodeId>,
+    logical_plan_node: Option<paro_planner::logical::plan::PlanNodeId>,
     stats: &HashMap<ExplainNodeId, ExplainActualStats>,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -517,7 +517,9 @@ fn operator_json(
     })
 }
 
-fn logical_node_suffix(logical_plan_node: Option<paro_planner::plan::PlanNodeId>) -> String {
+fn logical_node_suffix(
+    logical_plan_node: Option<paro_planner::logical::plan::PlanNodeId>,
+) -> String {
     logical_plan_node
         .map(|node| format!(" logical_node_id={}", node.0))
         .unwrap_or_default()

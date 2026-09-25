@@ -33,8 +33,8 @@ use std::collections::HashSet;
 use paro_planner::expression::{
     ColumnRefExpression, ConjunctionExpression, ConjunctionType, Expression,
 };
-use paro_planner::operator::{Filter, LogicalOperator, Projection};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{Filter, LogicalOperator, Projection};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 /// Pushes predicates from outer WHERE into graph scan/expand operators.
 pub struct GraphPredicatePushdown;
@@ -386,8 +386,8 @@ mod tests {
     use paro_planner::expression::{
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
     };
-    use paro_planner::operator::ColumnBinding;
-    use paro_planner::operator::{GraphMatch, LogicalOperator, LogicalOperatorType};
+    use paro_planner::logical::operator::ColumnBinding;
+    use paro_planner::logical::operator::{GraphMatch, LogicalOperator, LogicalOperatorType};
     use std::sync::Arc;
 
     use crate::rewrite::graph::match_decompose::GraphMatchDecompose;
@@ -867,7 +867,7 @@ mod tests {
         );
         let filtered =
             LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![pred]));
-        let ordered = LogicalOperator::Order(paro_planner::operator::Order::new(
+        let ordered = LogicalOperator::Order(paro_planner::logical::operator::Order::new(
             OwnedLogicalPlan::synthetic(filtered),
             vec![],
         ));

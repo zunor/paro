@@ -5,59 +5,10 @@ use std::collections::{HashMap, HashSet};
 
 use paro_planner::expression::ComparisonType;
 use paro_planner::expression::{ConjunctionExpression, ConjunctionType, Expression};
-use paro_planner::operator::ColumnBinding;
-use paro_planner::visitor::LogicalOperatorVisitor;
+use paro_planner::logical::operator::ColumnBinding;
+use paro_planner::logical::visitor::LogicalOperatorVisitor;
 
 use crate::rewrite::expr::binding_replacer::{ColumnBindingReplacer, ReplacementBinding};
-
-/// Consumer join enumeration can change the order/association of a necessary
-/// boolean domain. That is not a new restriction. Compare the AND/OR sets
-/// structurally, retaining exact leaf equality (never hash-only equality).
-/// Only total, reorderable predicates are admitted to CTE domains upstream.
-pub(crate) fn predicate_domains_equal(left: &[Expression], right: &[Expression]) -> bool {
-    fn equal(left: &Expression, right: &Expression) -> bool {
-        match (left, right) {
-            (Expression::Conjunction(left), Expression::Conjunction(right))
-                if left.conjunction_type == right.conjunction_type =>
-            {
-                fn flatten(
-                    expressions: &[Expression],
-                    kind: paro_planner::expression::ConjunctionType,
-                ) -> Vec<&Expression> {
-                    let mut pending = expressions.iter().collect::<Vec<_>>();
-                    let mut leaves = Vec::new();
-                    while let Some(expression) = pending.pop() {
-                        if let Expression::Conjunction(conjunction) = expression {
-                            if conjunction.conjunction_type == kind {
-                                pending.extend(conjunction.children.iter());
-                                continue;
-                            }
-                        }
-                        leaves.push(expression);
-                    }
-                    leaves
-                }
-                fn dedup<'a>(expressions: Vec<&'a Expression>) -> Vec<&'a Expression> {
-                    let mut unique: Vec<&Expression> = Vec::with_capacity(expressions.len());
-                    for expression in expressions {
-                        if !unique.iter().any(|candidate| expression.equals(candidate)) {
-                            unique.push(expression);
-                        }
-                    }
-                    unique
-                }
-                let a = dedup(flatten(&left.children, left.conjunction_type));
-                let b = dedup(flatten(&right.children, right.conjunction_type));
-                a.len() == b.len()
-                    && a.iter().all(|a| b.iter().any(|b| a.equals(b)))
-                    && b.iter().all(|b| a.iter().any(|a| b.equals(a)))
-            }
-            _ => left.equals(right),
-        }
-    }
-    left.iter().all(|a| right.iter().any(|b| equal(a, b)))
-        && right.iter().all(|b| left.iter().any(|a| equal(a, b)))
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct FilteredCTERef {
@@ -275,7 +226,10 @@ mod tests {
                 ComparisonType::Equal,
                 Expression::ColumnRef(
                     ColumnRefExpression::new(
-                        paro_planner::operator::ColumnBinding::new(table_index, column_index),
+                        paro_planner::logical::operator::ColumnBinding::new(
+                            table_index,
+                            column_index,
+                        ),
                         LogicalType::Integer,
                     )
                     .into(),
@@ -323,23 +277,23 @@ mod tests {
             filtered_refs: vec![
                 FilteredCTERef {
                     old_bindings: vec![
-                        paro_planner::operator::ColumnBinding::new(2, 0),
-                        paro_planner::operator::ColumnBinding::new(2, 1),
+                        paro_planner::logical::operator::ColumnBinding::new(2, 0),
+                        paro_planner::logical::operator::ColumnBinding::new(2, 1),
                     ],
                     filters: vec![integer_equality(2, 0, 2001), integer_equality(2, 1, 1)],
                 },
                 FilteredCTERef {
                     old_bindings: vec![
-                        paro_planner::operator::ColumnBinding::new(3, 0),
-                        paro_planner::operator::ColumnBinding::new(3, 1),
+                        paro_planner::logical::operator::ColumnBinding::new(3, 0),
+                        paro_planner::logical::operator::ColumnBinding::new(3, 1),
                     ],
                     filters: vec![integer_equality(3, 0, 2002)],
                 },
             ],
         };
         let producer_bindings = [
-            paro_planner::operator::ColumnBinding::new(10, 0),
-            paro_planner::operator::ColumnBinding::new(10, 1),
+            paro_planner::logical::operator::ColumnBinding::new(10, 0),
+            paro_planner::logical::operator::ColumnBinding::new(10, 1),
         ];
 
         let domain = build_common_equality_domain(&info, &producer_bindings)

@@ -4,8 +4,8 @@
 //! Rewrite `ORDER BY ... LIMIT/OFFSET` into `TopN`.
 
 use paro_planner::expression::Expression;
-use paro_planner::operator::{LogicalOperator, LogicalOperatorType, Projection, TopN};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::{LogicalOperator, LogicalOperatorType, Projection, TopN};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 type ProjectionLayer = (usize, Vec<Expression>, Vec<String>, usize, Option<String>);
 
@@ -141,8 +141,9 @@ impl TopNOptimizer {
             LogicalOperator::Order(o) => o,
             other => {
                 child_lp.operator = other;
-                let mut result =
-                    LogicalOperator::Order(paro_planner::operator::Order::new(child_lp, vec![]));
+                let mut result = LogicalOperator::Order(
+                    paro_planner::logical::operator::Order::new(child_lp, vec![]),
+                );
                 while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
                     projections.pop()
                 {
@@ -210,7 +211,7 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::binder::ir::OrderByNode;
     use paro_planner::expression::{ConstantExpression, Expression, FunctionExpression};
-    use paro_planner::operator::{Get, Limit, Order, Projection};
+    use paro_planner::logical::operator::{Get, Limit, Order, Projection};
 
     fn create_test_get() -> LogicalOperator {
         LogicalOperator::Get(Box::new(Get {
@@ -220,8 +221,8 @@ mod tests {
             relation_name: None,
             relation_alias: None,
             column_sources: vec![
-                paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
-                paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
+                paro_planner::logical::operator::GetColumnSource::Stored { column_id: 0 },
+                paro_planner::logical::operator::GetColumnSource::Stored { column_id: 1 },
             ],
             column_types: vec![LogicalType::Integer, LogicalType::Integer],
             table: None,

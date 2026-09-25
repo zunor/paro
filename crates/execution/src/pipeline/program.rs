@@ -44,7 +44,7 @@ use super::handles::{BreakerHandleCatalog, BreakerHandleKind};
 pub enum StatementProgram {
     /// Immutable physical alternatives retained until a query has entered
     /// workload admission and owns its actual memory capacity.
-    Portfolio(paro_planner::physical::PhysicalPlanPortfolio),
+    Physical(paro_planner::physical::CompiledPhysicalPlan),
     Pipeline {
         plan: Arc<PhysicalPlan>,
         graph: Arc<PipelineGraph>,
@@ -52,13 +52,13 @@ pub enum StatementProgram {
     },
     ExplainAnalyze {
         target: Box<StatementProgram>,
-        spec: paro_planner::operator::ExplainSpec,
+        spec: paro_planner::logical::operator::ExplainSpec,
     },
     Utility(UtilityProgram),
 }
 
-/// The exact selection made by portfolio admission.  This is intentionally
-/// not part of the compiled portfolio: it only exists after resources and
+/// The exact selection made by artifact admission.  This is intentionally
+/// not part of the compiled artifact: it only exists after resources and
 /// dependencies have been checked for this execution.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionSelection {
@@ -77,7 +77,7 @@ pub enum SelectedStatementProgram {
     },
     ExplainAnalyze {
         target: Box<SelectedStatementProgram>,
-        spec: paro_planner::operator::ExplainSpec,
+        spec: paro_planner::logical::operator::ExplainSpec,
     },
     Ready(StatementProgram),
 }
@@ -239,20 +239,8 @@ impl UtilityProgram {
 impl StatementProgram {
     pub fn expected_grant_class(&self) -> Option<u32> {
         match self {
-            Self::Portfolio(portfolio) => portfolio
-                .grant_search
-                .as_ref()
-                .and_then(|coverage| coverage.expected_class)
-                .map(|class| class.0),
+            Self::Physical(plan) => Some(plan.grant.id.0),
             Self::ExplainAnalyze { target, .. } => target.expected_grant_class(),
-            Self::Pipeline { .. } | Self::Utility(_) => None,
-        }
-    }
-
-    pub fn portfolio_variant_count(&self) -> Option<usize> {
-        match self {
-            Self::Portfolio(portfolio) => Some(portfolio.variants.len()),
-            Self::ExplainAnalyze { target, .. } => target.portfolio_variant_count(),
             Self::Pipeline { .. } | Self::Utility(_) => None,
         }
     }
@@ -261,7 +249,7 @@ impl StatementProgram {
         match self {
             Self::Pipeline { plan, .. } => plan.execution_resources,
             Self::ExplainAnalyze { target, .. } => target.execution_resources(),
-            Self::Portfolio(_) | Self::Utility(_) => None,
+            Self::Physical(_) | Self::Utility(_) => None,
         }
     }
 
@@ -293,8 +281,8 @@ impl StatementProgram {
         Ok(Self::pipeline(plan, graph, programs))
     }
 
-    pub fn from_physical_portfolio<F>(
-        portfolio: paro_planner::physical::PhysicalPlanPortfolio,
+    pub fn from_compiled_physical_plan<F>(
+        artifact: paro_planner::physical::CompiledPhysicalPlan,
         available_memory_bytes: u64,
         available_parallel_tasks: u16,
         available_external_worker_slots: u16,
@@ -303,8 +291,8 @@ impl StatementProgram {
     where
         F: Fn(&PhysicalPlan) -> bool,
     {
-        portfolio.verify()?;
-        let mut admitted = portfolio.admit(
+        artifact.verify()?;
+        let mut admitted = artifact.admit(
             available_memory_bytes,
             available_parallel_tasks,
             available_external_worker_slots,
@@ -317,11 +305,11 @@ impl StatementProgram {
         Self::from_physical_plan(admitted.plan)
     }
 
-    pub fn deferred_physical_portfolio(
-        portfolio: paro_planner::physical::PhysicalPlanPortfolio,
+    pub fn deferred_physical_plan(
+        artifact: paro_planner::physical::CompiledPhysicalPlan,
     ) -> Result<Self> {
-        portfolio.verify()?;
-        Ok(Self::Portfolio(portfolio))
+        artifact.verify()?;
+        Ok(Self::Physical(artifact))
     }
 
     /// Resolve an immutable compiled image against execution-time resources.
@@ -380,9 +368,9 @@ impl StatementProgram {
         F: Fn(&PhysicalPlan) -> bool,
     {
         match self {
-            Self::Portfolio(portfolio) => {
-                portfolio.verify()?;
-                let mut admitted = portfolio.admit(
+            Self::Physical(artifact) => {
+                artifact.verify()?;
+                let mut admitted = artifact.admit(
                     available_memory_bytes,
                     available_parallel_tasks,
                     available_external_worker_slots,
@@ -1081,7 +1069,7 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ConstantExpression, Expression, ReferenceExpression};
-    use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
+    use paro_planner::logical::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
     use crate::physical::properties::PipelineProperties;
     use crate::physical::row_type::RowType;
@@ -1243,7 +1231,7 @@ mod tests {
                 label: "KNOWS".to_string(),
                 property_column_ids: vec![],
             },
-            direction: paro_planner::operator::ExpandDirection::Forward,
+            direction: paro_planner::logical::operator::ExpandDirection::Forward,
             source_label: "Person".to_string(),
             edge_filter: None,
             target_filter: None,
@@ -1544,7 +1532,7 @@ mod tests {
                         handle: join,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
-                        mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: Box::new([join_condition()]),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
@@ -1562,7 +1550,7 @@ mod tests {
                         covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
-                        mark_semantics: paro_planner::operator::MarkJoinSemantics::NotMark,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: Box::new([join_condition()]),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,

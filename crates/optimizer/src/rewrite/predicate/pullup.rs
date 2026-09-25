@@ -9,11 +9,11 @@
 //! - Preparing filters for pushdown in a subsequent pass
 
 use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, Expression};
-use paro_planner::operator::{
+use paro_planner::logical::operator::{
     AnyJoin, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinType, LogicalOperator,
     Projection, SetOpType, SetOperation,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::rewrite::expr::join_has_evaluation_fence;
 use crate::rewrite::expr::traversal::visit_expression;
@@ -448,7 +448,7 @@ impl FilterPullup {
     fn pullup_distinct(
         &mut self,
 
-        mut distinct: paro_planner::operator::Distinct,
+        mut distinct: paro_planner::logical::operator::Distinct,
     ) -> LogicalOperator {
         // Can pull up through DISTINCT (but not DISTINCT ON)
         // For now, we assume all DISTINCT can be pulled through
@@ -457,7 +457,10 @@ impl FilterPullup {
     }
 
     /// Pull up through an Order operator.
-    fn pullup_order(&mut self, mut order: paro_planner::operator::Order) -> LogicalOperator {
+    fn pullup_order(
+        &mut self,
+        mut order: paro_planner::logical::operator::Order,
+    ) -> LogicalOperator {
         // Can pull directly through ORDER BY
         order.child = Box::new(self.rewrite_plan(*order.child));
         LogicalOperator::Order(order)
@@ -601,10 +604,10 @@ impl FilterPullup {
 
     /// Convert JoinComparisonType to ComparisonType.
     fn join_comparison_to_comparison_type(
-        jct: paro_planner::operator::JoinComparisonType,
+        jct: paro_planner::logical::operator::JoinComparisonType,
     ) -> paro_planner::expression::ComparisonType {
         use paro_planner::expression::ComparisonType;
-        use paro_planner::operator::JoinComparisonType;
+        use paro_planner::logical::operator::JoinComparisonType;
         match jct {
             JoinComparisonType::Equal => ComparisonType::Equal,
             JoinComparisonType::NotEqual => ComparisonType::NotEqual,
@@ -631,7 +634,7 @@ mod tests {
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::ComparisonType;
     use paro_planner::expression::{ConstantExpression, FunctionExpression};
-    use paro_planner::operator::{Get, JoinComparisonType, JoinCondition};
+    use paro_planner::logical::operator::{Get, JoinComparisonType, JoinCondition};
 
     fn plan(ctx: &BindContext, op: LogicalOperator) -> OwnedLogicalPlan {
         OwnedLogicalPlan::new(ctx, op)
@@ -640,7 +643,7 @@ mod tests {
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
             ColumnRefExpression {
-                binding: paro_planner::operator::ColumnBinding {
+                binding: paro_planner::logical::operator::ColumnBinding {
                     table_index,
                     column_index,
                 },
@@ -762,10 +765,10 @@ mod tests {
             make_constant(5),
         );
         let filter = Filter::new(plan(&ctx, get), vec![filter_expr]);
-        let order = paro_planner::operator::Order {
+        let order = paro_planner::logical::operator::Order {
             child: Box::new(plan(&ctx, LogicalOperator::Filter(filter))),
             orders: vec![],
-            projection_map: paro_planner::operator::ProjectionMap::all(),
+            projection_map: paro_planner::logical::operator::ProjectionMap::all(),
         };
         let op = LogicalOperator::Order(order);
 
@@ -793,8 +796,10 @@ mod tests {
             make_constant(5),
         );
         let filter = Filter::new(plan(&ctx, get), vec![filter_expr]);
-        let distinct =
-            paro_planner::operator::Distinct::new(plan(&ctx, LogicalOperator::Filter(filter)));
+        let distinct = paro_planner::logical::operator::Distinct::new(plan(
+            &ctx,
+            LogicalOperator::Filter(filter),
+        ));
         let op = LogicalOperator::Distinct(distinct);
 
         let mut pullup = FilterPullup::with_settings(true, false);
@@ -944,7 +949,7 @@ mod tests {
             make_constant(5),
         );
         let filter = Filter::new(plan(&ctx, get), vec![filter_expr]);
-        let agg = paro_planner::operator::Aggregate::new(
+        let agg = paro_planner::logical::operator::Aggregate::new(
             1,
             2,
             3,

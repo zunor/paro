@@ -14,7 +14,7 @@ use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::{
     ComparisonExpression, ConjunctionExpression, ConjunctionType, Expression, ReferenceExpression,
 };
-use paro_planner::operator::join::JoinCondition;
+use paro_planner::logical::operator::join::JoinCondition;
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::JoinHashTable;

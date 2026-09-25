@@ -7,15 +7,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 pub(crate) use paro_planner::physical::*;
-pub mod enforcer;
+pub(crate) mod mutation;
 
 pub(crate) mod aggregate_planning;
 
+pub(crate) mod choose;
+mod finalize;
 pub(crate) mod implementation;
 pub mod lower;
-mod rewrite;
-pub(crate) mod select;
-pub(crate) mod selected;
 
 pub use lower::{PhysicalBuildContext, PhysicalPlanBuilder};
 
@@ -57,16 +56,13 @@ pub(crate) enum PhysicalImplementationFlavor {
     SingletonAggregateProjection,
     Window,
     PartitionAggregateWindow,
-    /// Capability-bound access selected for logical Filter/Rank/TopK
-    /// semantics. The capability token exists only in its physical payload.
-    SearchProvider,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WinnerPhysicalContract {
+pub(crate) struct ImplementationContract {
     pub required: RequiredProperties,
     pub provided: ProvidedProperties,
-    pub cost: SearchCost,
+    pub cost: PhysicalCost,
     pub grant: PhysicalGrantContract,
     pub origin: PlanOrigin,
     pub goal_fingerprint: Fingerprint,
@@ -76,36 +72,25 @@ pub(crate) struct WinnerPhysicalContract {
     pub owned_artifacts: Box<[OwnedAuxiliaryArtifact]>,
 }
 
-/// Extraction-local contract lookup. Planner node ids never participate in
-/// Memo equivalence; they only reconnect a verified winner with its bound
-/// semantic payload during the optimizer's two-stage extraction.
-pub(crate) type WinnerPhysicalContracts =
-    Arc<HashMap<paro_planner::plan::PlanNodeId, WinnerPhysicalContract>>;
+/// Construction-local contracts keyed by occurrences in the committed tree.
+/// Node ids connect implementation choices to bound payloads; they are not
+/// semantic equivalence claims or cross-run identities.
+pub(crate) type ImplementationContracts =
+    Arc<HashMap<paro_planner::logical::plan::PlanNodeId, ImplementationContract>>;
 
-/// Property conversions selected during winner extraction. They are physical
-/// nodes, never logical Memo expressions.
+/// A self-reading write requires a materialized relation at this exact node.
 #[derive(Debug, Clone)]
-pub(crate) enum ExtractedPhysicalEnforcer {
-    Sort {
-        orders: Box<[paro_planner::binder::ir::OrderByNode]>,
-    },
-    MutationInputSpool {
-        barrier: MutationBarrierId,
-        targets: BTreeSet<BaseRelationId>,
-        snapshot: SnapshotId,
-    },
+pub(crate) struct MutationBarrierContract {
+    pub barrier: MutationBarrierId,
+    pub targets: BTreeSet<BaseRelationId>,
+    pub snapshot: SnapshotId,
+    pub implementation: ImplementationContract,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ExtractedEnforcerContract {
-    pub enforcer: ExtractedPhysicalEnforcer,
-    pub contract: WinnerPhysicalContract,
-}
-
-pub(crate) type ExtractedEnforcerContracts =
-    Arc<HashMap<paro_planner::plan::PlanNodeId, Box<[ExtractedEnforcerContract]>>>;
+pub(crate) type MutationBarriers =
+    Arc<HashMap<paro_planner::logical::plan::PlanNodeId, MutationBarrierContract>>;
 
 pub(crate) type StatementWriteContracts =
-    Arc<HashMap<paro_planner::plan::PlanNodeId, WriteContract>>;
+    Arc<HashMap<paro_planner::logical::plan::PlanNodeId, WriteContract>>;
 
 pub mod access;

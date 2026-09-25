@@ -6,9 +6,9 @@
 //! Keep `EmptyResult` as a schema-preserving marker and bubble it upward
 //! through operators that cannot produce rows once one of their inputs is empty.
 
-use paro_planner::operator::empty_result::EmptyResult;
-use paro_planner::operator::{Join, JoinType, LogicalOperator};
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::operator::empty_result::EmptyResult;
+use paro_planner::logical::operator::{Join, JoinType, LogicalOperator};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 /// Pull empty-result markers upward through the logical plan.
 pub struct EmptyResultPullup;
@@ -95,17 +95,17 @@ impl EmptyResultPullup {
             LogicalOperator::SetOperation(setop) => {
                 if setop.left.is_empty_result() || setop.right.is_empty_result() {
                     match setop.setop_type {
-                        paro_planner::operator::SetOpType::Union => {
+                        paro_planner::logical::operator::SetOpType::Union => {
                             if setop.left.is_empty_result() && setop.right.is_empty_result() {
                                 Self::empty_result(LogicalOperator::SetOperation(setop))
                             } else {
                                 LogicalOperator::SetOperation(setop)
                             }
                         }
-                        paro_planner::operator::SetOpType::Intersect => {
+                        paro_planner::logical::operator::SetOpType::Intersect => {
                             Self::empty_result(LogicalOperator::SetOperation(setop))
                         }
-                        paro_planner::operator::SetOpType::Except => {
+                        paro_planner::logical::operator::SetOpType::Except => {
                             if setop.right.is_empty_result() {
                                 let left = *setop.left;
                                 left.into_operator()
@@ -223,12 +223,12 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{ColumnRefExpression, Expression};
-    use paro_planner::operator::empty_result::EmptyResult;
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::empty_result::EmptyResult;
+    use paro_planner::logical::operator::{
         ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinComparisonType, JoinCondition,
         JoinType, LogicalOperator,
     };
-    use paro_planner::plan::OwnedLogicalPlan;
+    use paro_planner::logical::plan::OwnedLogicalPlan;
 
     fn expression_get(ctx: &BindContext, table_index: usize) -> OwnedLogicalPlan {
         OwnedLogicalPlan::new(

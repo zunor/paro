@@ -1,8 +1,8 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_planner::operator::LogicalOperator;
-use paro_planner::planner::Planner;
+use paro_planner::binder::Planner;
+use paro_planner::logical::operator::LogicalOperator;
 
 use super::input_materialization;
 use crate::rewrite::subquery::partition_aggregate_tests::setup_session;
@@ -62,7 +62,7 @@ fn source_binding_used_outside_candidate_declines_width_proof() {
     assert_eq!(materialized_projection_count(&rewritten), 0);
 }
 
-fn optimize_sql(sql: &str) -> (paro_planner::plan::OwnedLogicalPlan, bool) {
+fn optimize_sql(sql: &str) -> (paro_planner::logical::plan::OwnedLogicalPlan, bool) {
     let session = setup_session();
     let statement = paro_parser::parse_one(sql)
         .expect("parse aggregate input materialization")
@@ -80,7 +80,7 @@ fn optimize_sql(sql: &str) -> (paro_planner::plan::OwnedLogicalPlan, bool) {
     .expect("optimize aggregate input materialization")
 }
 
-fn materialized_projection_count(plan: &paro_planner::plan::OwnedLogicalPlan) -> usize {
+fn materialized_projection_count(plan: &paro_planner::logical::plan::OwnedLogicalPlan) -> usize {
     let mut count = 0;
     plan.try_visit_pre_order(|plan| {
         if matches!(&plan.operator,

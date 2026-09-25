@@ -5,8 +5,8 @@
 
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::{Expression, ExpressionIterator};
-use crate::operator::LogicalOperator;
-use crate::plan::OwnedLogicalPlan;
+use crate::logical::operator::LogicalOperator;
+use crate::logical::plan::OwnedLogicalPlan;
 
 pub struct HasCorrelatedExpressions {
     has_correlated: bool,
@@ -135,7 +135,7 @@ impl HasCorrelatedExpressions {
                 }
             }
             LogicalOperator::Join(join) => {
-                use crate::operator::Join;
+                use crate::logical::operator::Join;
                 match join {
                     Join::Comparison(comp) => {
                         for cond in &comp.conditions {
@@ -190,7 +190,7 @@ pub fn operator_has_correlated_columns_at_depth(
 mod tests {
     use super::*;
     use crate::expression::{ColumnRefExpression, Expression};
-    use crate::operator::{ColumnBinding, ExpressionGet};
+    use crate::logical::operator::{ColumnBinding, ExpressionGet};
     use paro_common::types::LogicalType;
 
     fn correlated_column(depth: usize) -> CorrelatedColumnInfo {
@@ -249,21 +249,22 @@ mod tests {
     fn nested_dependent_join_right_child_is_treated_as_local_to_nested_scope() {
         use crate::binder::context::BindContext;
         let ctx = BindContext::new();
-        let nested_right = LogicalOperator::Projection(crate::operator::Projection::new(
+        let nested_right = LogicalOperator::Projection(crate::logical::operator::Projection::new(
             20,
-            crate::plan::OwnedLogicalPlan::new(&ctx, expression_get(30)),
+            crate::logical::plan::OwnedLogicalPlan::new(&ctx, expression_get(30)),
             vec![Expression::ColumnRef(
                 ColumnRefExpression::with_depth(ColumnBinding::new(10, 0), LogicalType::Integer, 2)
                     .into(),
             )],
         ));
-        let dependent =
-            LogicalOperator::DependentJoin(Box::new(crate::operator::DependentJoin::scalar(
-                crate::plan::OwnedLogicalPlan::new(&ctx, expression_get(11)),
-                crate::plan::OwnedLogicalPlan::new(&ctx, nested_right),
+        let dependent = LogicalOperator::DependentJoin(Box::new(
+            crate::logical::operator::DependentJoin::scalar(
+                crate::logical::plan::OwnedLogicalPlan::new(&ctx, expression_get(11)),
+                crate::logical::plan::OwnedLogicalPlan::new(&ctx, nested_right),
                 vec![correlated_column(1)],
                 None,
-            )));
+            ),
+        ));
 
         assert!(!operator_has_correlated_columns_at_depth(
             &dependent,

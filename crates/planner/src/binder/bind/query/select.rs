@@ -29,7 +29,7 @@ use crate::binder::ir::{
 };
 use crate::binder::{Binder, GroupingBindingContext};
 use crate::expression::*;
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_parser::ast::{
@@ -1048,7 +1048,7 @@ mod tests {
     use crate::expression::{
         ColumnRefExpression, Expression, FunctionExpression, WindowExpression, WindowFrame,
     };
-    use crate::operator::ColumnBinding;
+    use crate::logical::operator::ColumnBinding;
     use paro_common::types::LogicalType;
     use paro_function::window::WindowFunction;
     use paro_parser::ast::{Expr as AstExpr, Literal as AstLiteral};

@@ -17,7 +17,7 @@ use std::time::Instant;
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
 use paro_context::StatementContext;
-use paro_planner::operator::ExplainSpec;
+use paro_planner::logical::operator::ExplainSpec;
 
 use crate::explain::analyze_render::render_explain_analyze;
 use crate::explain::profiler::ExplainProfiler;
@@ -118,9 +118,9 @@ fn start_program_with_output(
 ) -> Result<ProgramExecution> {
     let requires_background_input = session.input.requires_background_execution();
     let output = match program {
-        StatementProgram::Portfolio(_) => {
+        StatementProgram::Physical(_) => {
             return Err(paro_error::internal(
-                "physical portfolio reached execution before resource admission",
+                "physical artifact reached execution before resource admission",
             ));
         }
         StatementProgram::Pipeline { .. } if fetch_driven && requires_background_input => {
@@ -149,7 +149,7 @@ fn start_program_with_output(
     };
     let query = QueryRuntimeContext::new(session, params, memory, output);
     match program {
-        StatementProgram::Portfolio(_) => unreachable!("portfolio was rejected before execution"),
+        StatementProgram::Physical(_) => unreachable!("artifact was rejected before execution"),
         StatementProgram::Utility(utility) => run_utility(utility, &query)?,
         StatementProgram::ExplainAnalyze { target, spec } => {
             run_explain_analyze(target, *spec, &query, allocator)?
@@ -368,7 +368,7 @@ fn run_explain_analyze(
 
     let started_at = Instant::now();
     match target {
-        StatementProgram::Portfolio(_) => {
+        StatementProgram::Physical(_) => {
             return Err(paro_error::internal(
                 "EXPLAIN ANALYZE target reached execution before admission",
             ));

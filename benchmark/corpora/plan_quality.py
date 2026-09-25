@@ -174,7 +174,6 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--listen", default="127.0.0.1:6442")
     parser.add_argument("--build-jobs", type=int, default=4)
-    parser.add_argument("--optimizer-search-policy", choices=("pipeline", "quality", "regional", "budgeted"), default="quality")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     corpus = Path(__file__).with_suffix("")
@@ -184,7 +183,7 @@ def main() -> int:
                repo / "benchmark/harness/quality_gate.py", repo / "benchmark/harness/executor.py"]
     original_hashes = {str(path): content_digest(path) for path in [*tracked, cases_path, setup_path]}
     settings = {"threads": 4, "memory_limit": "1GB", "optimizer_verify": True,
-                "optimizer_search_policy": args.optimizer_search_policy,
+
                 "statement_timeout_ms": 30000}
     binary, build = build_benchmark_server(repo, args.build_jobs)
     report: dict[str, Any] = {
@@ -222,7 +221,6 @@ def main() -> int:
                 connection.execute("SET statement_timeout=30000")
                 for statement in _split_sql_statements(setup_path.read_text()):
                     connection.execute(statement, prepare=False)
-                connection.execute(sql.SQL("SET optimizer_search_policy = {}").format(sql.Literal(args.optimizer_search_policy)))
                 for case in cases:
                     try:
                         result = capture(connection, case)

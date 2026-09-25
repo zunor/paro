@@ -15,7 +15,7 @@ use super::{
     SharedExpressionPayload, SubqueryExpression, WindowExpression, WindowFrameBound,
     WindowInvocation,
 };
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 
 /// Expression represents a semantic-aware version of a SQL expression.
 #[derive(Debug, Clone)]
@@ -526,7 +526,7 @@ mod tests {
         ConstantExpression, FunctionExpression, OrderByExpression, WindowExpression, WindowFrame,
         WindowFrameBound, WindowFrameType,
     };
-    use crate::operator::ColumnBinding;
+    use crate::logical::operator::ColumnBinding;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_function::aggregate::distributive::count::get_count_star_function;

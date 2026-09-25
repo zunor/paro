@@ -7,8 +7,8 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_context::TestStatementContextBuilder;
 use paro_planner::expression::{Expression, ReferenceExpression};
-use paro_planner::operator::{ExplainFormat, ExplainSpec};
-use paro_planner::plan::PlanNodeId;
+use paro_planner::logical::operator::{ExplainFormat, ExplainSpec};
+use paro_planner::logical::plan::PlanNodeId;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::physical::children::{PlanChildren, PlanChildrenArena};

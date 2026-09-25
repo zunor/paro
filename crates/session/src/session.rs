@@ -2160,12 +2160,9 @@ mod tests {
     }
 
     #[test]
-    fn lazy_grants_cache_isolates_frozen_resource_expectations() {
+    fn resource_contract_cache_isolates_frozen_expectations() {
         let instance = Instance::new_in_memory();
         let mut session = Session::new(1, instance.clone());
-        session
-            .set_session_setting("optimizer_search_policy", Value::Varchar("quality".into()))
-            .unwrap();
         session
             .set_session_setting("threads", Value::Integer(1))
             .unwrap();
@@ -2178,20 +2175,14 @@ mod tests {
         let statement = paro_parser::parse_one("SELECT 42").unwrap().stmt;
         let full = session.freeze_query_context();
         let full_key = full.compile_environment_key();
-        assert_eq!(full_key.expected_grant.unwrap().index, 2);
+        assert_eq!(full_key.expected_grant.unwrap().index, 0);
         let full_plan = paro_compiler::compile_statement(full.clone(), statement.clone()).unwrap();
-        let paro_execution::pipeline::StatementProgram::Portfolio(portfolio) = full_plan.program()
+        let paro_execution::pipeline::StatementProgram::Physical(artifact) = full_plan.program()
         else {
-            panic!("expected immutable portfolio")
+            panic!("expected immutable artifact")
         };
         assert_eq!(
-            portfolio
-                .grant_search
-                .as_ref()
-                .unwrap()
-                .expected_class
-                .unwrap()
-                .0 as usize,
+            artifact.grant.id.0 as usize,
             full_key.expected_grant.unwrap().index
         );
         session.publish_instance_query_plan(statement.clone(), vec![], &full, full_plan.clone());
@@ -2217,19 +2208,12 @@ mod tests {
             .is_none());
         let limited_plan =
             paro_compiler::compile_statement(limited.clone(), statement.clone()).unwrap();
-        let paro_execution::pipeline::StatementProgram::Portfolio(portfolio) =
-            limited_plan.program()
+        let paro_execution::pipeline::StatementProgram::Physical(artifact) = limited_plan.program()
         else {
-            panic!("expected immutable portfolio")
+            panic!("expected immutable artifact")
         };
         assert_eq!(
-            portfolio
-                .grant_search
-                .as_ref()
-                .unwrap()
-                .expected_class
-                .unwrap()
-                .0 as usize,
+            artifact.grant.id.0 as usize,
             limited_key.expected_grant.unwrap().index
         );
         session.publish_instance_query_plan(
@@ -2252,16 +2236,13 @@ mod tests {
     }
 
     #[test]
-    fn lazy_grants_verified_safe_portfolio_executes_under_reduced_resources() {
+    fn compiled_plan_rejects_reduced_dop_without_relabeling_and_executes_with_its_contract() {
         use paro_execution::pipeline::StatementProgram;
         use paro_execution::query_executor::{compiled::ExecutionRequest, executor::Executor};
 
         let instance = Instance::new_in_memory();
         instance.set_threads(4).unwrap();
         let mut session = Session::new(1, instance.clone());
-        session
-            .set_session_setting("optimizer_search_policy", Value::Varchar("quality".into()))
-            .unwrap();
         session
             .set_session_setting("threads", Value::Integer(4))
             .unwrap();
@@ -2279,46 +2260,39 @@ mod tests {
         .unwrap()
         .stmt;
         let compiled = paro_compiler::compile_statement(full.clone(), statement).unwrap();
-        let StatementProgram::Portfolio(portfolio) = compiled.program() else {
-            panic!("expected portfolio")
+        let StatementProgram::Physical(artifact) = compiled.program() else {
+            panic!("expected artifact")
         };
-        portfolio.verify().unwrap();
-        let coverage = portfolio.grant_search.as_ref().unwrap();
-        let small = portfolio.grant_classes[0];
-        assert_ne!(coverage.expected_class, Some(small.id));
-        assert!(!coverage.optional_classes.contains(&small.id));
-        let admitted = portfolio
-            .admit(small.hard_memory_bytes, 1, 0, |_| true)
-            .unwrap();
-        assert_eq!(admitted.resources.class, small.id);
-        paro_planner::physical::PhysicalPlanVerifier::verify(&admitted.plan).unwrap();
-        let safe_variant = portfolio
-            .variants
-            .iter()
-            .find(|variant| {
-                variant.admissible_classes.contains(&small.id)
-                    && variant.physical_fingerprint == admitted.physical_fingerprint
-            })
-            .unwrap();
-        assert_eq!(
-            safe_variant.cost,
-            admitted
-                .plan
-                .properties
-                .get(admitted.plan.root)
-                .unwrap()
-                .cumulative_cost
+        artifact.verify().unwrap();
+        let grant = artifact.grant;
+        assert!(
+            artifact
+                .admit(grant.hard_memory_bytes, 0, 0, |_| true)
+                .is_err(),
+            "zero available tasks is unavailable, not an implicit serial grant"
         );
-
-        // Execute the original immutable compiled image, not a relabeled or
-        // reconstructed plan. Both quota and worker availability tighten;
-        // the engine test separately forces fallback by memory alone.
-        instance
-            .get_memory_arbitrator()
-            .set_system_reserve_bytes(48 << 20);
-        session
-            .set_session_setting("threads", Value::Integer(1))
+        assert!(
+            artifact.admit(0, 4, 0, |_| true).is_err(),
+            "a sort cannot be admitted with no memory"
+        );
+        assert!(
+            artifact
+                .admit(grant.hard_memory_bytes, 1, 0, |_| true)
+                .is_err(),
+            "a four-task compiled contract cannot be relabeled as one task"
+        );
+        assert!(
+            artifact
+                .admit(grant.hard_memory_bytes, 4, 0, |_| false)
+                .is_err(),
+            "missing dependencies cannot be admitted"
+        );
+        let admitted = artifact
+            .admit(grant.hard_memory_bytes, 4, 0, |_| true)
             .unwrap();
+        assert_eq!(admitted.resources.class, grant.id);
+        assert_eq!(admitted.physical_fingerprint, artifact.physical_fingerprint);
+        paro_planner::physical::PhysicalPlanVerifier::verify(&admitted.plan).unwrap();
         let runtime = session.freeze_query_context();
         let mut stream = Executor::new(runtime)
             .execute(ExecutionRequest::unparameterized(compiled).unwrap())
@@ -2337,7 +2311,7 @@ mod tests {
                 Value::Integer(3),
                 Value::Null(LogicalType::Integer)
             ],
-            "duplicates and NULL survive safe fallback execution"
+            "duplicates and NULL survive execution under the compiled resource contract"
         );
     }
 

@@ -4,7 +4,7 @@
 use crate::binder::ir::BoundFromSubquery;
 use crate::binder::Binder;
 use crate::expression::{ColumnRefExpression, Expression};
-use crate::operator::{LogicalOperator, Projection};
+use crate::logical::operator::{LogicalOperator, Projection};
 use paro_common::error::Result;
 
 impl Binder {

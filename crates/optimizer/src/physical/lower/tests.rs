@@ -16,13 +16,13 @@ use paro_planner::expression::{
     ConjunctionType, ConstantExpression, Expression, OperatorExpression, OperatorType,
     OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame,
 };
-use paro_planner::operator::aggregate::GroupDependency;
-use paro_planner::operator::join::{Join, JoinCondition, JoinType};
-use paro_planner::operator::{
+use paro_planner::logical::operator::aggregate::GroupDependency;
+use paro_planner::logical::operator::join::{Join, JoinCondition, JoinType};
+use paro_planner::logical::operator::{
     Aggregate, ExplainSpec, ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit,
     LogicalOperator, Order, Projection, SetOperation, Window as LogicalWindow,
 };
-use paro_planner::plan::OwnedLogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 use paro_storage::index::PredicateTree;
 use paro_storage::search::{
     CapabilityToken, FullTextIntent, FullTextQueryKind, FullTextQueryStats, FullTextScoreMode,
@@ -47,7 +47,7 @@ fn query_extraction_rejects_a_node_without_a_winner_contract() {
     let logical = OwnedLogicalPlan::new(&ctx, LogicalOperator::DummyScan);
 
     let error = PhysicalPlanBuilder::new(PhysicalBuildContext::default())
-        .requiring_winner_contracts()
+        .requiring_implementation_contracts()
         .build(logical)
         .expect_err("query extraction must never invent an implicit physical implementation");
 
@@ -360,7 +360,7 @@ fn arena_extractor_lowers_distinct_to_hash_aggregate() {
     );
     let distinct = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Distinct(paro_planner::operator::Distinct::new(values)),
+        LogicalOperator::Distinct(paro_planner::logical::operator::Distinct::new(values)),
     );
 
     let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
@@ -861,9 +861,10 @@ fn zero_column_rowset_projection_never_enables_late_materialization() {
             int_const(42),
         )],
     );
-    filter.projection_map = paro_planner::operator::ProjectionMap::none();
+    filter.projection_map = paro_planner::logical::operator::ProjectionMap::none();
     let mut plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
-    plan.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(1));
+    plan.stats.estimated_cardinality =
+        Some(paro_planner::logical::plan::CardinalityEstimate::exact(1));
 
     let physical = PhysicalPlanBuilder::new(PhysicalBuildContext::default())
         .build(plan)
@@ -881,8 +882,9 @@ fn rowset_scan_materialization_policy_uses_estimated_filter_density() {
     let build_scan = |filtered_rows: u64| {
         let ctx = BindContext::new();
         let mut get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
-        get.stats.estimated_cardinality =
-            Some(paro_planner::plan::CardinalityEstimate::exact(1_000_000));
+        get.stats.estimated_cardinality = Some(
+            paro_planner::logical::plan::CardinalityEstimate::exact(1_000_000),
+        );
         let filter = Filter::new(
             get,
             vec![comparison(
@@ -892,9 +894,9 @@ fn rowset_scan_materialization_policy_uses_estimated_filter_density() {
             )],
         );
         let mut plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
-        plan.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(
-            filtered_rows,
-        ));
+        plan.stats.estimated_cardinality = Some(
+            paro_planner::logical::plan::CardinalityEstimate::exact(filtered_rows),
+        );
         let physical = PhysicalPlanBuilder::new(PhysicalBuildContext::default())
             .build(plan)
             .expect("filter should lower");
@@ -1039,7 +1041,7 @@ fn arena_extractor_hands_graph_expand_filters_to_graph_project() {
             label: "e".to_string(),
             property_column_ids: vec![],
         },
-        paro_planner::operator::graph_expand::ExpandDirection::Forward,
+        paro_planner::logical::operator::graph_expand::ExpandDirection::Forward,
         "v".to_string(),
         0,
         1,
@@ -1129,7 +1131,7 @@ fn arena_extractor_lowers_graph_path_functions_with_path_history() {
             label: "e".to_string(),
             property_column_ids: vec![],
         },
-        paro_planner::operator::graph_expand::ExpandDirection::Forward,
+        paro_planner::logical::operator::graph_expand::ExpandDirection::Forward,
         "v".to_string(),
         0,
         1,
@@ -1219,14 +1221,14 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
     let condition = JoinCondition::equality(
         Expression::ColumnRef(
             paro_planner::expression::ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(0, 0),
+                paro_planner::logical::operator::ColumnBinding::new(0, 0),
                 LogicalType::Integer,
             )
             .into(),
         ),
         Expression::ColumnRef(
             paro_planner::expression::ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(1, 0),
+                paro_planner::logical::operator::ColumnBinding::new(1, 0),
                 LogicalType::Integer,
             )
             .into(),
@@ -1244,7 +1246,7 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
     crate::physical::slot_assignment::assign_expression_slots(&mut join.operator)
         .expect("runtime-filter extraction requires the selected positional ABI");
     let artifact = crate::physical::identity::Fingerprint(77);
-    let contract = crate::physical::WinnerPhysicalContract {
+    let contract = crate::physical::ImplementationContract {
         required: crate::physical::RequiredProperties::default(),
         provided: crate::physical::ProvidedProperties {
             ordering: crate::physical::requirements::ProvidedOrdering::Unordered,
@@ -1255,7 +1257,7 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
             replayability: crate::physical::requirements::ProvidedReplayability::OnePass,
             result_guarantee: crate::physical::requirements::ResultGuarantee::Exact,
         },
-        cost: crate::physical::SearchCost::ZERO,
+        cost: crate::physical::PhysicalCost::ZERO,
         grant: crate::physical::PhysicalGrantContract::Invariant,
         origin: crate::physical::PlanOrigin::SpecializedRegion(
             crate::physical::identity::Fingerprint(88),
@@ -1274,7 +1276,7 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
     contracts.insert(join.id, contract);
 
     let plan = PhysicalPlanBuilder::new(PhysicalBuildContext::default())
-        .with_winner_contracts(Arc::new(contracts))
+        .with_implementation_contracts(Arc::new(contracts))
         .build(join)
         .expect("auxiliary runtime-filter winner should lower");
     let PhysicalNodeKind::HashJoin(spec) = &plan.node(plan.root).kind else {
@@ -1311,14 +1313,14 @@ fn build_left_runtime_filter_keeps_artifact_ownership_on_the_hash_join() {
     let condition = JoinCondition::equality(
         Expression::ColumnRef(
             paro_planner::expression::ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(0, 0),
+                paro_planner::logical::operator::ColumnBinding::new(0, 0),
                 LogicalType::Integer,
             )
             .into(),
         ),
         Expression::ColumnRef(
             paro_planner::expression::ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(1, 0),
+                paro_planner::logical::operator::ColumnBinding::new(1, 0),
                 LogicalType::Integer,
             )
             .into(),
@@ -1337,7 +1339,7 @@ fn build_left_runtime_filter_keeps_artifact_ownership_on_the_hash_join() {
         .expect("runtime-filter extraction requires the selected positional ABI");
     let artifact = crate::physical::identity::Fingerprint(177);
     let owner = crate::physical::identity::Fingerprint(188);
-    let contract = crate::physical::WinnerPhysicalContract {
+    let contract = crate::physical::ImplementationContract {
         required: crate::physical::RequiredProperties::default(),
         provided: crate::physical::ProvidedProperties {
             ordering: crate::physical::requirements::ProvidedOrdering::Unordered,
@@ -1348,7 +1350,7 @@ fn build_left_runtime_filter_keeps_artifact_ownership_on_the_hash_join() {
             replayability: crate::physical::requirements::ProvidedReplayability::OnePass,
             result_guarantee: crate::physical::requirements::ResultGuarantee::Exact,
         },
-        cost: crate::physical::SearchCost::ZERO,
+        cost: crate::physical::PhysicalCost::ZERO,
         grant: crate::physical::PhysicalGrantContract::Invariant,
         origin: crate::physical::PlanOrigin::SpecializedRegion(owner),
         goal_fingerprint: artifact,
@@ -1366,7 +1368,7 @@ fn build_left_runtime_filter_keeps_artifact_ownership_on_the_hash_join() {
     contracts.insert(join.id, contract);
 
     let plan = PhysicalPlanBuilder::new(PhysicalBuildContext::default())
-        .with_winner_contracts(Arc::new(contracts))
+        .with_implementation_contracts(Arc::new(contracts))
         .build(join)
         .expect("build-left runtime-filter winner should lower");
     let PhysicalNodeKind::HashJoin(spec) = &plan.node(plan.root).kind else {
@@ -1454,7 +1456,7 @@ fn build_left_output_permutation_covers_every_reversible_join_type() {
         };
         let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
         let join = join
-            .try_map_child_links(&mut |child| SelectedNode::from_owned(*child))
+            .try_map_child_links(&mut |child| PreparedNode::from_owned(*child))
             .unwrap();
         let (kind, children) = extractor
             .lower_comparison_hash_join_build_left(&join)
@@ -1579,7 +1581,7 @@ fn arena_extractor_lowers_search_scan_with_planned_token() {
                 estimated_cost: None,
                 exact_filter_materialization: None,
             },
-            confidence: paro_planner::operator::Confidence::High,
+            confidence: paro_planner::logical::operator::Confidence::High,
         },
         vec![ref_expr(2, LogicalType::Varchar), score_expr.clone()],
         9,
@@ -1697,7 +1699,7 @@ fn arena_extractor_projects_derived_values_from_the_canonical_search_score() {
                 estimated_cost: None,
                 exact_filter_materialization: None,
             },
-            confidence: paro_planner::operator::Confidence::High,
+            confidence: paro_planner::logical::operator::Confidence::High,
         },
         vec![
             ref_expr(2, LogicalType::Varchar),
@@ -1803,9 +1805,9 @@ pub(super) fn test_get() -> Get {
         relation_name: Some("scan_t".to_string()),
         relation_alias: None,
         column_sources: vec![
-            paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
-            paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
-            paro_planner::operator::GetColumnSource::Stored { column_id: 2 },
+            paro_planner::logical::operator::GetColumnSource::Stored { column_id: 0 },
+            paro_planner::logical::operator::GetColumnSource::Stored { column_id: 1 },
+            paro_planner::logical::operator::GetColumnSource::Stored { column_id: 2 },
         ],
         column_types: vec![
             LogicalType::Integer,

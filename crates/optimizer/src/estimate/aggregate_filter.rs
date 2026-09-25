@@ -18,7 +18,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::aggregate::AggregateAlgebra;
 use paro_planner::expression::{AggregateType, ComparisonType, Expression};
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 use paro_storage::statistics::{ColumnStatistics, EstimatedNumericDistribution, NumericStats};
 
 /// Derive the aggregate output once, at its producer. Consumers read these
@@ -151,10 +151,10 @@ mod tests {
         AggregateExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
         ReferenceExpression,
     };
-    use paro_planner::operator::{
+    use paro_planner::logical::operator::{
         Aggregate, ColumnBinding, ExpressionGet, Filter, LogicalOperator,
     };
-    use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan};
+    use paro_planner::logical::plan::{CardinalityEstimate, OwnedLogicalPlan};
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats};
 
     use super::{estimate_grouped_sum_distribution, normal_cdf, normal_comparison_selectivity};

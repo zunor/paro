@@ -8,8 +8,8 @@ use paro_catalog::entry::CatalogEntry;
 impl PhysicalPlanBuilder {
     pub(crate) fn lower_insert(
         &mut self,
-        logical_id: paro_planner::plan::PlanNodeId,
-        insert: &LogicalInsert<SelectedChild>,
+        logical_id: paro_planner::logical::plan::PlanNodeId,
+        insert: &LogicalInsert<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(insert.child.as_ref())?;
         let spec = InsertSpec {
@@ -25,8 +25,8 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_delete(
         &mut self,
-        logical_id: paro_planner::plan::PlanNodeId,
-        delete: &LogicalDelete<SelectedChild>,
+        logical_id: paro_planner::logical::plan::PlanNodeId,
+        delete: &LogicalDelete<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(delete.child.as_ref())?;
         let child_width = self
@@ -69,8 +69,8 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_update(
         &mut self,
-        logical_id: paro_planner::plan::PlanNodeId,
-        update: &LogicalUpdate<SelectedChild>,
+        logical_id: paro_planner::logical::plan::PlanNodeId,
+        update: &LogicalUpdate<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(update.child.as_ref())?;
         let Some(child_node) = self.arena.get(child) else {
@@ -200,7 +200,7 @@ impl PhysicalPlanBuilder {
 
     fn statement_write_contract(
         &self,
-        logical_id: paro_planner::plan::PlanNodeId,
+        logical_id: paro_planner::logical::plan::PlanNodeId,
         statement: &str,
     ) -> Result<crate::physical::WriteContract> {
         self.statement_write_contracts
@@ -215,7 +215,7 @@ impl PhysicalPlanBuilder {
 
     pub(crate) fn lower_copy_to(
         &mut self,
-        copy: &LogicalCopyTo<SelectedChild>,
+        copy: &LogicalCopyTo<PreparedChild>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(copy.child.as_ref())?;
         let spec = CopyToFileSpec {

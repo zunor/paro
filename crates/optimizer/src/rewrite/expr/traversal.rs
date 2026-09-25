@@ -6,7 +6,7 @@
 use paro_planner::expression::{
     ConjunctionType, Expression, ExpressionIterator, ExpressionVisitDecision,
 };
-use paro_planner::operator::JoinSide;
+use paro_planner::logical::operator::JoinSide;
 
 /// Visit an expression and all of its descendants in pre-order.
 pub(crate) fn visit_expression(expression: &Expression, visitor: &mut impl FnMut(&Expression)) {

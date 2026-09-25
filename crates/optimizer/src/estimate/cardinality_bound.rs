@@ -7,7 +7,7 @@
 //! expression. Snapshot row counts, selectivity estimates, and HLL domains do
 //! not belong here.
 
-use paro_planner::operator::{Join, JoinType, LogicalOperator, SetOpType};
+use paro_planner::logical::operator::{Join, JoinType, LogicalOperator, SetOpType};
 
 pub(crate) fn derive_maximum_cardinality<Child>(
     operator: &LogicalOperator<Child>,

@@ -8,10 +8,12 @@ pub mod cte;
 pub mod expr;
 pub mod external;
 pub mod limit;
-pub(crate) mod normalize;
+
 pub mod predicate;
 pub mod subquery;
 
 pub mod aggregate;
 pub mod graph;
 pub mod join;
+
+pub(crate) mod program;

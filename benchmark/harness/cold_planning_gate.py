@@ -32,9 +32,7 @@ except ImportError:  # pragma: no cover - documented script invocation
     )
 
 VERSION = EVIDENCE_SCHEMA_VERSION
-COUNTERS = ("search_complete", "memo_group_count", "memo_logical_expression_count",
-            "memo_physical_expression_count", "settlement_local_hit_count", "settlement_local_miss_count",
-            "search_rule_failure_count", "search_deadline_reached")
+COUNTERS = ('selected_nodes', 'local_alternatives', 'joint_transitions', 'response_join_transitions', 'joint_budget_fallbacks', 'response_join_fallbacks')
 METRICS = ("explain_wall_ms", "optimizer_ms", "peak_rss_bytes")
 
 
@@ -249,12 +247,6 @@ def validate(
                 value = sample["counters"][counter]
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     raise ValueError("invalid search counter")
-            if sample["counters"]["search_complete"] not in (0, 1):
-                raise ValueError("invalid completion state")
-            if sample["counters"]["search_rule_failure_count"]:
-                raise ValueError("advisory rule failure in a performance sample")
-            if sample["counters"]["search_deadline_reached"]:
-                raise ValueError("deadline-limited search is not qualifying latency evidence")
             document = _sample_compile_document(sample, report_root=report_root)
             try:
                 validate_compile_document(document)
@@ -299,10 +291,9 @@ def evaluate(
             new = summary[name][metric]["median"]
             if new > old * max_ratio:
                 result["regressions"].append(f"{name}: {metric} {new / old:.3f}x")
-        # Faster incomplete search is not silently accepted as optimization.
-        if min(s["counters"]["search_complete"] for s in block) < min(
-                s["counters"]["search_complete"] for s in previous[name]):
-            result["regressions"].append(f"{name}: lost complete search")
+        for key in ("joint_budget_fallbacks", "response_join_fallbacks"):
+            if max(s["counters"][key] for s in block) > max(s["counters"][key] for s in previous[name]):
+                result["regressions"].append(f"{name}: increased {key}")
         reasons = {key for s in block for key in s["counters"] if key.startswith("budget_exhaustion_")}
         for reason in reasons:
             if max(s["counters"].get(reason, 0) for s in block) > max(

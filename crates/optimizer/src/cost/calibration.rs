@@ -8,10 +8,9 @@ use std::collections::BTreeMap;
 use paro_common::error::{self as paro_error, Result};
 
 use crate::physical::cost::{
-    CompactRange, ResourceDimension, ScoreSummary, SearchCost, RESOURCE_DIMS,
+    CompactRange, PhysicalCost, ResourceDimension, ScoreSummary, RESOURCE_DIMS,
 };
 use crate::physical::identity::{CalibrationRevisionId, OpClassId};
-use crate::physical::identity::{Fingerprint, StableFingerprintBuilder};
 
 #[path = "calibration/generated.rs"]
 mod generated;
@@ -81,33 +80,6 @@ impl LocalOperatorWork {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpClassSchema {
-    pub id: OpClassId,
-    pub stable_name: String,
-}
-
-#[derive(Debug, Default)]
-pub struct OpClassRegistry {
-    classes: BTreeMap<OpClassId, OpClassSchema>,
-}
-
-impl OpClassRegistry {
-    pub fn register(&mut self, schema: OpClassSchema) -> Result<()> {
-        if schema.stable_name.is_empty() {
-            return Err(paro_error::internal("OpClass stable name is empty"));
-        }
-        if self.classes.insert(schema.id, schema).is_some() {
-            return Err(paro_error::internal("duplicate OpClassId"));
-        }
-        Ok(())
-    }
-
-    pub fn contains(&self, id: OpClassId) -> bool {
-        self.classes.contains_key(&id)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CalibratedOpCost {
     pub expected_resources_per_unit: [f64; RESOURCE_DIMS],
@@ -124,8 +96,6 @@ pub enum ParallelWorkProfile {
     /// Workers consume independent packets and only synchronize at the phase
     /// boundary.
     Pipeline,
-    /// Workers consume packets, followed by a material merge/finalize phase.
-    BlockingMerge,
 }
 
 #[derive(Debug, Clone)]
@@ -188,35 +158,7 @@ impl MachineCalibrationBundle {
         Ok(())
     }
 
-    /// Stable identity of every value consumed by costing.  The revision is
-    /// an attestation label, not a substitute for the payload: callers may
-    /// construct a bundle with an unchanged revision while replacing a
-    /// coefficient or a parallelism parameter.  Priced incumbents must be
-    /// invalidated in that case as well.
-    pub fn stable_fingerprint(&self) -> Fingerprint {
-        let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.machine-calibration.v1");
-        builder.write_u64(self.revision.0 as u64);
-        builder.write_bytes(self.hardware_class.as_bytes());
-        builder.write_bytes(self.corpus_id.as_bytes());
-        builder.write_bytes(self.provenance.as_bytes());
-        builder.write_u64(self.coefficients.len() as u64);
-        for (class, cost) in &self.coefficients {
-            builder.write_u64(class.0 as u64);
-            write_calibration_cost_fingerprint(&mut builder, *cost);
-        }
-        write_calibration_cost_fingerprint(&mut builder, self.conservative_fallback);
-        write_calibration_f64(&mut builder, self.risk_weight);
-        write_calibration_f64(&mut builder, self.expected_worker_efficiency);
-        write_calibration_f64(&mut builder, self.risk_worker_efficiency);
-        write_calibration_f64(&mut builder, self.coordination_latency_expected);
-        write_calibration_f64(&mut builder, self.coordination_latency_upper);
-        write_calibration_f64(&mut builder, self.pipeline_serial_fraction);
-        write_calibration_f64(&mut builder, self.blocking_merge_serial_fraction);
-        builder.finish()
-    }
-
-    pub fn fold(&self, work: &LocalOperatorWork) -> Result<SearchCost> {
+    pub fn fold(&self, work: &LocalOperatorWork) -> Result<PhysicalCost> {
         let mut resources_expected = [0.0; RESOURCE_DIMS];
         let mut resources_risk_upper = [0.0; RESOURCE_DIMS];
         let mut critical_path = CompactRange::ZERO;
@@ -241,7 +183,7 @@ impl MachineCalibrationBundle {
         let expected_score: f64 = resources_expected.iter().sum();
         let risk_score: f64 = resources_risk_upper.iter().sum();
         let score = CompactRange::new(expected_score.min(risk_score), expected_score, risk_score)?;
-        let result = SearchCost {
+        let result = PhysicalCost {
             score: ScoreSummary {
                 range: score,
                 risk_adjusted: expected_score + self.risk_weight * (risk_score - expected_score),
@@ -250,7 +192,7 @@ impl MachineCalibrationBundle {
             resources_risk_upper,
             work_latency: critical_path,
             critical_path,
-            ..SearchCost::ZERO
+            ..PhysicalCost::ZERO
         };
         result.validate()?;
         Ok(result)
@@ -265,17 +207,17 @@ impl MachineCalibrationBundle {
         work: &LocalOperatorWork,
         profile: ParallelWorkProfile,
         max_parallel_tasks: u16,
-    ) -> Result<SearchCost> {
+    ) -> Result<PhysicalCost> {
         let cost = self.fold(work)?;
         self.apply_parallelism(cost, profile, max_parallel_tasks)
     }
 
     pub fn apply_parallelism(
         &self,
-        mut cost: SearchCost,
+        mut cost: PhysicalCost,
         profile: ParallelWorkProfile,
         max_parallel_tasks: u16,
-    ) -> Result<SearchCost> {
+    ) -> Result<PhysicalCost> {
         cost.max_parallel_tasks = max_parallel_tasks.max(1);
         let tasks = f64::from(max_parallel_tasks.max(1));
         if tasks == 1.0 || profile == ParallelWorkProfile::Serial {
@@ -284,7 +226,6 @@ impl MachineCalibrationBundle {
         let serial_fraction = match profile {
             ParallelWorkProfile::Serial => 1.0,
             ParallelWorkProfile::Pipeline => self.pipeline_serial_fraction,
-            ParallelWorkProfile::BlockingMerge => self.blocking_merge_serial_fraction,
         };
         let parallel_fraction = 1.0 - serial_fraction;
         let expected_workers = 1.0 + (tasks - 1.0) * self.expected_worker_efficiency;
@@ -298,57 +239,6 @@ impl MachineCalibrationBundle {
             cost.critical_path.expected * expected_factor
                 + extra_tasks * self.coordination_latency_expected,
             cost.critical_path.upper * risk_factor + extra_tasks * self.coordination_latency_upper,
-        )?;
-        cost.validate()?;
-        Ok(cost)
-    }
-
-    /// Reprice a serial-folded phase at its resolved physical task supply.
-    /// Resource work remains unchanged; only phase span and worker evidence
-    /// are replaced. Calling this twice is idempotent because `work_latency`
-    /// is the invariant serial work term.
-    pub fn rephase(
-        &self,
-        mut cost: SearchCost,
-        profile: ParallelWorkProfile,
-        max_parallel_tasks: u16,
-        output_pipeline_tasks: u16,
-    ) -> Result<SearchCost> {
-        cost.critical_path = cost.work_latency;
-        cost.max_parallel_tasks = 1;
-        cost.output_pipeline_tasks = output_pipeline_tasks.max(1);
-        let mut cost = self.apply_parallelism(cost, profile, max_parallel_tasks)?;
-        cost.output_pipeline_tasks = output_pipeline_tasks.max(1);
-        cost.validate()?;
-        Ok(cost)
-    }
-
-    /// Price work which joins an already running pipeline. A transparent
-    /// streaming operator inherits the scheduler domain created by its input;
-    /// it contributes parallel work but does not launch another worker set or
-    /// pay a second coordination charge.
-    pub fn continue_pipeline(
-        &self,
-        mut cost: SearchCost,
-        max_parallel_tasks: u16,
-    ) -> Result<SearchCost> {
-        let tasks = max_parallel_tasks.max(1);
-        cost.critical_path = cost.work_latency;
-        cost.max_parallel_tasks = tasks;
-        cost.output_pipeline_tasks = tasks;
-        if tasks == 1 {
-            cost.validate()?;
-            return Ok(cost);
-        }
-        let task_count = f64::from(tasks);
-        let serial_fraction = self.pipeline_serial_fraction;
-        let parallel_fraction = 1.0 - serial_fraction;
-        let expected_workers = 1.0 + (task_count - 1.0) * self.expected_worker_efficiency;
-        let risk_workers = 1.0 + (task_count - 1.0) * self.risk_worker_efficiency;
-        cost.critical_path = CompactRange::new(
-            cost.critical_path.lower * (serial_fraction + parallel_fraction / task_count),
-            cost.critical_path.expected * (serial_fraction + parallel_fraction / expected_workers),
-            cost.critical_path.upper * (serial_fraction + parallel_fraction / risk_workers),
         )?;
         cost.validate()?;
         Ok(cost)
@@ -374,25 +264,6 @@ fn validate_calibrated_cost(cost: CalibratedOpCost) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn write_calibration_cost_fingerprint(
-    builder: &mut StableFingerprintBuilder,
-    cost: CalibratedOpCost,
-) {
-    for value in cost.expected_resources_per_unit {
-        write_calibration_f64(builder, value);
-    }
-    for value in cost.risk_resources_per_unit {
-        write_calibration_f64(builder, value);
-    }
-    write_calibration_f64(builder, cost.latency_per_unit.lower);
-    write_calibration_f64(builder, cost.latency_per_unit.expected);
-    write_calibration_f64(builder, cost.latency_per_unit.upper);
-}
-
-fn write_calibration_f64(builder: &mut StableFingerprintBuilder, value: f64) {
-    builder.write_u64(value.to_bits());
 }
 
 impl Default for MachineCalibrationBundle {
