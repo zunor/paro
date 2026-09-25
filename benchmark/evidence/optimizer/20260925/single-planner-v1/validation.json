@@ -1,0 +1,109 @@
+{
+  "baseline": "5ba483059",
+  "scope": "refactor correctness comparison, not latency/parity certification",
+  "implementation_commit": "9f242d4d8",
+  "detail_smoke": {
+    "queries": ["Q04", "SELECT 1"],
+    "real_pgwire": true,
+    "schema_version": 4,
+    "ordered_stage_completions": 4,
+    "consumer_validator": "passed",
+    "performance_claim": false
+  },
+  "tpcds": {
+    "queries": 99,
+    "results": {
+      "Exact": 98,
+      "DifferentOrUncovered": 1
+    },
+    "same_selected": 0,
+    "same_plan_rendering": 99
+  },
+  "tpch": {
+    "queries": 22,
+    "results": {
+      "Exact": 22
+    },
+    "same_selected": 0,
+    "same_plan_rendering": 22
+  },
+  "q39": {
+    "contract": "integer-welford-schedules-v1",
+    "input_groups": 90000,
+    "input_rows": 360000,
+    "selected_groups": 6250,
+    "exact_threshold_groups_excluded": 1,
+    "reference_rows": 243,
+    "raw_exact_status": "raw strict floating comparison retained separately",
+    "engines": {
+      "actual": {
+        "rows": 243,
+        "relational_bag_and_order": "pass",
+        "numeric_schedule_enclosure": "pass",
+        "max_ulp_from_exact_reference": 2,
+        "checked_numeric_cells": 972
+      },
+      "expected": {
+        "rows": 243,
+        "relational_bag_and_order": "pass",
+        "numeric_schedule_enclosure": "pass",
+        "max_ulp_from_exact_reference": 2,
+        "checked_numeric_cells": 972
+      }
+    },
+    "manifest": {
+      "seed": "256bf479ca982e30c96f9109fb9920d04233c9643b7bcc6a5fd3f5a50554c927",
+      "spec_sha256": "9d3943455795b768c4b7641442846c1fa645f20583813a0098559ff0235ddbf3",
+      "inputs_sql_sha256": "7d8ca809099587685795a19d0a409d9d8324186601044ae2e253dd8a093bb073",
+      "query_sha256": "a8b5c4867a595122e52f3823ceb116729c8ea4ad80cb446bab230982e96bd6be",
+      "arms": [
+        {
+          "arm": "expected",
+          "binary_sha256": "61b881f078b1f4a52ad6169d809efb24253237bae0afe5ab605e2e9eebf076b0",
+          "input_sha256": "2b1c585003ec55a2c51c97a2be789968ebc21f75e8e941cd0495a496639bea60"
+        },
+        {
+          "arm": "actual",
+          "binary_sha256": "0daa85d5dc3c7ff045917154a47382fd3a21fa3d5a1effb2c8fa282edfa256cc",
+          "input_sha256": "2b1c585003ec55a2c51c97a2be789968ebc21f75e8e941cd0495a496639bea60"
+        }
+      ],
+      "claim": "bounded numerical/relational certification; not strict binary64 identity"
+    }
+  },
+  "regress": {
+    "control": {
+      "passed": 164,
+      "failed": 21
+    },
+    "probe": {
+      "passed": 162,
+      "failed": 23
+    },
+    "expected_updated": false,
+    "new_failures": [
+      "system/optimizer_observability",
+      "system/optimizer_profile"
+    ],
+    "adjudication": "retired diagnostic API; remaining differences are retired setting behavior and fixture paths; common remaining 17 actual transcripts byte-identical"
+  },
+  "tests": {
+    "workspace_passed": 6368,
+    "workspace_ignored": 85,
+    "benchmark_passed": 219,
+    "strict_clippy": true,
+    "workspace_check": true,
+    "skill_quick_validate": "NotRun: PyYAML unavailable",
+    "header_full_tree_findings": 148,
+    "header_changed_files_findings": 0
+  },
+  "raw_evidence_sha256": {
+    "tests-complete.log": "148127cfa116333c8d362db21122194af8cd2cccb1c1ec69524657662ceb7681",
+    "clippy-final.log": "8e3f9b29449b910f21685a8e3f4277544f50df6c7d6c8ff46a36700b46c22665",
+    "regress-block-audit.json": "1daa2426cc89e97ccd45a2d2617bb0db9de6225e906f8b5d2ae6f38747aef79e",
+    "q39-independent-certification.json": "33b84c01fdd1460051805df6469479b197ddd4912ad02a25bcfefc7542ded457",
+    "q39-independent-results.json": "6eb76037b22631fce3a46e9b1f7f37eb827a3b8f31ccf06a2390dcc569130939",
+    "tpcds-refactor-final/results.json": "29a25835e5536b1ec166e55b0043ff705c432f12aaa7880f4c6947940344daa0",
+    "tpch-refactor-final/results.json": "3452557526a9d683ba026f9e42dd2c0dd885f115671bd1d14e6062fad3a5708d"
+  }
+}
