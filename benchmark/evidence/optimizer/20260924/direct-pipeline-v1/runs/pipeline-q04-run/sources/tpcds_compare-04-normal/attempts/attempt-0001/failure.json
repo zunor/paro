@@ -1,1 +1,0 @@
-{"arm_id":"normal","attempt_id":"attempt-0001","campaign_id":"campaign-20260924T143649930800Z-61811-f0585aafa3","error":"InternalError_: pipeline physical identity: physical identity has no typed canonical encoder for TABLE_FUNCTION_SCAN","query_case":"04","run_id":"pipeline-q04-run","schema_version":3,"source_id":"tpcds_compare-04-normal","status":"Incomplete"}

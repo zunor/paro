@@ -1,1 +1,0 @@
-{"arm_id":"normal","attempt_id":"attempt-0001","campaign_id":"campaign-20260924T155554568202Z-25310-9c8d8bb27c","error":"RuntimeError: measurement inputs changed: source","query_case":"04","run_id":"pipeline-q04-run","schema_version":3,"source_id":"tpcds_compare-04-normal","status":"Incomplete"}

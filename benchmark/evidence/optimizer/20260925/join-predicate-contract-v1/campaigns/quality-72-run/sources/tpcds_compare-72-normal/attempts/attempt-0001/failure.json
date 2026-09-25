@@ -1,1 +1,0 @@
-{"arm_id":"normal","attempt_id":"attempt-0001","campaign_id":"campaign-20260925T052155603482Z-68628-708c3a60b2","error":"OutOfMemory: memory quota exhausted in Host: requested 262085 bytes, available 56421 bytes","query_case":"72","run_id":"quality-72-run","schema_version":3,"source_id":"tpcds_compare-72-normal","status":"Incomplete"}

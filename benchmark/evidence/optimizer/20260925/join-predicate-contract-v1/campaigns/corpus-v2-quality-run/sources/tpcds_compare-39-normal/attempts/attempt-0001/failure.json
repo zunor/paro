@@ -1,1 +1,0 @@
-{"arm_id":"normal","attempt_id":"attempt-0001","campaign_id":"campaign-20260925T055715081450Z-58942-f6860ae742","error":"ResultContractError: row multiset mismatch: missing=43, unexpected=43","query_case":"39","run_id":"corpus-v2-quality-run","schema_version":3,"source_id":"tpcds_compare-39-normal","status":"Incomplete"}

@@ -1,2 +1,0 @@
-[cases/database/database_ops.sql] COST : 0.142s, TOTAL :13, SUCCESS :13, FAILED :0, IGNORED :0, ABNORMAL :0, SUCCESS RATE : 100%
-[cases/ddl/create_index_art.sql] COST : 0.091s, TOTAL :11, SUCCESS :0, FAILED :1, IGNORED :0, ABNORMAL :0, SUCCESS RATE : 0%

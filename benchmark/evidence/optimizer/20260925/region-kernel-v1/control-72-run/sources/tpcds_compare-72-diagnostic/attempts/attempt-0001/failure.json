@@ -1,1 +1,0 @@
-{"arm_id":"diagnostic","attempt_id":"attempt-0001","campaign_id":"campaign-20260925T025223152769Z-67101-85a3d4b894","error":"InternalError_: Block handle is None","query_case":"72","run_id":"control-72-run","schema_version":3,"source_id":"tpcds_compare-72-diagnostic","status":"Incomplete"}
