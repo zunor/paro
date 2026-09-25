@@ -1,5 +1,10 @@
 # Single staged planner
 
+This is the historical engine-removal record. The subsequent
+[planner cleanup](planner-cleanup.md) records dormant-code disposition and
+the reviewed all-green SQL regression suite; the original results below are
+preserved rather than rewritten retroactively.
+
 Implementation commit: `9f242d4d8`.
 
 This change removes the production Cascades engine, not the executor's resource,

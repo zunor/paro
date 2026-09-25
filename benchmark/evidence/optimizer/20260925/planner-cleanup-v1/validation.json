@@ -1,0 +1,78 @@
+{
+  "EvidenceId": "planner-cleanup-20260925-v1",
+  "implementation_commit": "00e2c2df2c522c9992ff23b5e9b7daae0f963fd2",
+  "baseline": "85440a138",
+  "build_scope": "Dirty-source release builds; corpus manifests record actual source state and binary hashes. This does not relabel the binaries as clean-commit builds.",
+  "delivery_binary_sha256": "e4b16b36fa8ecbc1ca93bb0b651b3781c7c17f4d16382c95c73def73c964c413",
+  "checks": [
+    {
+      "command": "cargo test --workspace --locked",
+      "status": "Passed",
+      "log_sha256": "18b46d552b93c7698c4dd4883a79e9d48f976a52fb6f0f864cd2bfeb206769b3"
+    },
+    {
+      "command": "cargo check --workspace --locked",
+      "status": "Passed",
+      "log_sha256": "6dce394e499e59971ba68f0fca2a491707ff6d08ddfcdf8967aa7547ab296249"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+      "status": "Passed",
+      "log_sha256": "a6dbb8277d58969453f0eaa4b04cb9088ff917e8fac06a241a6dd5c7c8d0da65"
+    },
+    {
+      "command": "cargo build --release -p paro-server --bin parod --locked",
+      "status": "Passed",
+      "log_sha256": "f0d0abf3c192d4f8d7b588f44e140b64a41eb3a1e6a9630b225d804aa0313727"
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "status": "Passed",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": "PYTHONPATH=benchmark benchmark/.venv/bin/python -m pytest benchmark/tests -q",
+      "status": "Passed",
+      "log_sha256": "eb690f23de24594e662e04d6710e54de319590687dc77ccf6bae6723309263d7"
+    },
+    {
+      "command": "PYTHONPATH=regress benchmark/.venv/bin/python -m pytest regress/unit -q",
+      "status": "Passed",
+      "log_sha256": "3dcdc07b6fe176e5a6aae25fd56074fe2f46bfa3e843028561e4102d9590fc62"
+    }
+  ],
+  "workspace": {
+    "passed": 6259,
+    "failed": 0,
+    "ignored": 85
+  },
+  "benchmark": {
+    "passed": 241,
+    "warnings": 1
+  },
+  "regress_unit": {
+    "passed": 105,
+    "skipped": 1
+  },
+  "sql_regress": {
+    "passed": 185,
+    "failed": 0,
+    "ignored": 0,
+    "abnormal": 0,
+    "report_sha256": "a640e3e2f95eb716518515cde36c4f11839d928cb2a4594982ac0c4510ca5770"
+  },
+  "changed_source_header_check": {
+    "checked": 106,
+    "errors": 0,
+    "scope": "existing checker, changed/new files only; not a full repository header pass"
+  },
+  "performance": "NotCertified",
+  "new_ci_checks": false,
+  "archival_scope": "No server logs, seed copies or repeated Detail captures; historical worktrees and recovery refs untouched",
+  "harness_sha256": {
+    "corpus_equivalence.py": "8b6b104c5b0b849a60e6df2813be286038ccfcce12e96b69ee4420e7004c1949",
+    "q39_certify.py": "37fac84fb61f2ad65f602574dabb6a0a1061ac092e6d195b49581d6c9fcd1491",
+    "validate_regress.py": "2550d2bc62b12d718b32aeadfec473898b2c61f85443e935ea383622ee5ef607",
+    "warm_audit.py": "f397be4f58774b427b9284eebb3aa643da405555925f1b19e7a06e58b3978e54"
+  }
+}
