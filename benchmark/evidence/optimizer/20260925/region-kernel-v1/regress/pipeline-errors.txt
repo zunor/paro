@@ -1,0 +1,13 @@
+[ERROR]
+[SCRIPT   FILE]: cases/ddl/create_index_art.sql
+[ROW    NUMBER]: 14
+[SQL STATEMENT]: INSERT INTO art_orders VALUES
+    (1, 10, 'new'),
+    (2, 20, 'paid'),
+    (3, 20, 'shipped'),
+    (4, 30, 'paid');
+[EXPECT RESULT]:
+INSERT 0 4
+[ACTUAL RESULT]:
+ERROR: pipeline write planning is not yet supported is not yet implemented (SQLSTATE=0A000; HINT=This feature may be added in a future release.)
+

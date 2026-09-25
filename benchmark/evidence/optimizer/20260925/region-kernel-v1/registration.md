@@ -87,14 +87,3 @@ execution); it does not replace the failed normal sample or establish a causal
 latency comparison. A successful probe is not proof that the storage failure is
 fixed. Keep the default policy unchanged until broad correctness/quality gates
 close.
-
-## Final-source verification amendment
-
-The new mixed-comparison Session test exposed a quality-reference Filter
-projection check against its output width rather than its input width. Keep the
-first probe unchanged. After the input-namespace correction and final checks,
-collect a separately named `verified` matrix for all four queries and both
-policies, with the same sample counts/resources/observers above. Do not pool the
-two probes. Full pipeline SQL regress is blocked by its explicit unsupported
-write-planning boundary; setup errors are not SELECT result comparisons and
-must not be hidden by automatic quality fallback.
