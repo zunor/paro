@@ -21,8 +21,9 @@ semantic barriers. Default promotion and removal of Cascades are separate gates.
 5. Verify real SQL and independent small-region oracles before measuring the
    Q04/Q11/Q74/Q72 matrix. Preserve wrong results and unsupported contracts.
 
-The first refactoring cohort must not silently bundle a new estimation model.
-If model/coverage changes are necessary, record them as separate interventions.
+Refactoring must not silently bundle a new estimation model. Model/coverage
+changes are recorded as separate interventions below, not attributed to the
+representation change.
 Winner construction must preserve chosen orientation, grouping grain, output
 layout and resource feasibility. Complete a small declared enumeration scope
 only when the state equivalence/dominance law justifies it; no global optimality
@@ -47,3 +48,42 @@ Q04 region time <=1ms is an engineering target, not an asserted result. Compare
 normal compiler/C1/warm, selected plans, work counts and allocations separately.
 Bound ordinary packages at 4MiB/cell, 64MiB/task; no raw event/log archival.
 No baseline blessing, result tolerance changes, data cleanup or extra worktrees.
+
+## Registered probe scope (before probe collection)
+
+The probe includes three separately reviewable interventions: native local
+response preparation with borrowed column lookup and delayed output settlement;
+the shared connected-subgraph traversal with grain-aware candidate admission;
+and source-scoped output-materialization response costing. No performance
+sample isolates just one of these changes, so a combined result cannot be
+attributed to one intervention. The scan access/decode term stays fully charged;
+only an additional, explicit output-vector materialization term responds to RF.
+Repeated demands use the strongest response, not independence multiplication.
+
+Ordinary inner regions now accept mixed equality/range predicates with
+single-relation scalar operands and at most 12 atomic inputs. Outer/reduction
+boundaries, volatile/error-sensitive fences and imposed build contracts remain
+barriers. Existing legal fallback domains reuse the same connected traversal;
+this is not permission to flatten an outer join. Partial aggregation retains
+its narrower proven merge-law domain. Borrowed join pricing is admitted only
+for known-NDV equalities without a newly activated residual. Other transitions
+still require completed output facts. Neither domain is global ProofComplete.
+
+An independent subset traversal checks small connected/grain cases against the
+production traversal; retained borrowed responses are checked against full
+native settlement in tests. Include unknown-domain, orientation, resource,
+predicate support, repeated-RF and cancellation/budget cases in validation.
+
+The probe also collects a same-binary `quality` policy reference for each of
+Q04/Q11/Q74/Q72 with the same registered resources, repetitions and diagnostics.
+It is a policy comparison, not an oracle of global optimality. Keep per-policy
+fresh processes and counterbalanced warm rounds; the sequential version builds
+and concurrent external host load keep the before/after comparison exploratory.
+
+The pre-change Q72 normal campaign failed with `Block handle is None`. Preserve
+that error and its package. An independent diagnostic execution completed and
+showed a 16,425,000-row hash build followed by spill replay (~10.5s diagnostic
+execution); it does not replace the failed normal sample or establish a causal
+latency comparison. A successful probe is not proof that the storage failure is
+fixed. Keep the default policy unchanged until broad correctness/quality gates
+close.

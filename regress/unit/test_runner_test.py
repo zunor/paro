@@ -34,7 +34,7 @@ def test_optimizer_verifier_is_reapplied_to_each_connection(tmp_path, monkeypatc
     from types import SimpleNamespace
     (tmp_path / "config.toml").write_text("[connection]\n[test]\n")
     config = runner.resolve_config(runner.parse_args(["--optimizer-verify", "on",
-                                   "--optimizer-search-policy", "regional"]),
+                                   "--optimizer-search-policy", "pipeline"]),
                                    env={}, root_dir=tmp_path)
     statements = []
 
@@ -54,7 +54,7 @@ def test_optimizer_verifier_is_reapplied_to_each_connection(tmp_path, monkeypatc
     for _ in range(3):
         assert runner._open_connection(config).autocommit
     assert statements == ["SET optimizer_verify = true",
-                          "SET optimizer_search_policy = 'regional'"] * 3
+                          "SET optimizer_search_policy = 'pipeline'"] * 3
 
 
 def test_discover_case_files_and_filter(tmp_path: Path) -> None:

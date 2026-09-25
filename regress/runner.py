@@ -232,7 +232,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report-dir", type=Path, help="Owned output directory for this run")
     parser.add_argument("--optimizer-verify", choices=("on", "off"),
                         help="Set optimizer verification on every connection, including restarts")
-    parser.add_argument("--optimizer-search-policy", choices=("quality", "budgeted", "regional"),
+    parser.add_argument("--optimizer-search-policy", choices=("quality", "budgeted", "regional", "pipeline"),
                         help="Set the optimizer policy on every connection, including restarts")
     parser.add_argument(
         "--update",
@@ -775,7 +775,7 @@ def _open_connection(
                     cursor.execute("SET optimizer_verify = " +
                                    ("true" if config.optimizer_verify else "false"))
                 if config.optimizer_search_policy is not None:
-                    if config.optimizer_search_policy not in ("quality", "budgeted", "regional"):
+                    if config.optimizer_search_policy not in ("quality", "budgeted", "regional", "pipeline"):
                         raise RunnerError("invalid optimizer search policy")
                     cursor.execute("SET optimizer_search_policy = '" +
                                    config.optimizer_search_policy + "'")
