@@ -1417,6 +1417,15 @@ class RunOutput:
         self._manifest["sealed_at"] = _now()
         try:
             self._persist_manifest()
+            # A published campaign index is a projection of this owner, not
+            # an independent lifecycle. Capacity failure must not leave its
+            # last Running projection looking live. Use reserved control
+            # capacity; never retry through the exhausted cell writer.
+            if (self.root / "campaign.json").exists():
+                ControlWriter(self, self.root, allow_terminal=True).write_json(
+                    "campaign.json", CampaignSummary.from_run(self).to_payload(),
+                    overwrite=True,
+                )
         except Exception as exc:
             self._mark_publication_unknown(self.root / "manifest.json", exc)
             raise

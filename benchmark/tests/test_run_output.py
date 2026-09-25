@@ -1072,6 +1072,8 @@ class RunOutputTests(unittest.TestCase):
                 arm_id="control",
             )
             attempt = run.begin_attempt("source", query_case="q", arm_id="control")
+            campaign = CampaignOutput(run, {("q", "control"): attempt})
+            campaign.publish_campaign_summary()
             run._manifest["registration"]["total_limit_bytes"] = 64
             with self.assertRaises(RunOutputError):
                 attempt.cell_writer().write_text("too-large.txt", "x" * 200)
@@ -1081,6 +1083,9 @@ class RunOutputTests(unittest.TestCase):
             self.assertEqual(run._manifest["status"], "Incomplete")
             self.assertEqual(registration["omitted_count"], 1)
             self.assertGreater(registration["omitted_bytes"], 0)
+            summary = json.loads((run.root / "campaign.json").read_text())
+            self.assertEqual(summary["status"], "Incomplete")
+            self.assertEqual(summary["registration_status"], "CapacityExceeded")
             with self.assertRaises(RunOutputError):
                 run.register_cell(
                     cell_id="q--probe",
