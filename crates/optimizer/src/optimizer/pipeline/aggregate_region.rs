@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use paro_common::error::Result;
 use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
-use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
+use paro_planner::expression::{
+    AggregateExpression, ColumnRefExpression, ConjunctionType, Expression,
+};
 use paro_planner::operator::bound_reference::{BoundRelationFactValues, BoundRelationFacts};
 use paro_planner::operator::{
     Aggregate, BoundReference, BoundReferenceId, ColumnBinding, ComparisonJoin, Join,
@@ -23,7 +25,8 @@ use crate::aggregate::dimension_deferral::{
     inline_projections, join_region::is_plain_inner_equi_join, partial_merge,
 };
 use crate::context::OptimizationContext;
-use crate::expression::traversal::visit_expression;
+use crate::expression::traversal::{into_associative_terms, visit_expression};
+use crate::join::mixed_predicates::{join_comparison_type, movable};
 use crate::physical::{direct, ObjectiveProfile, PhysicalImplementationFlavor, ResourceGrantClass};
 use crate::statistics::gathering::StatisticsGathering;
 
@@ -121,13 +124,9 @@ fn columns(expression: &Expression) -> Option<BTreeSet<ColumnBinding>> {
             valid &= c.depth == 0;
             result.insert(c.binding);
         }
+        valid &= !matches!(e, Expression::Reference(_));
     });
     valid.then_some(result)
-}
-
-fn movable(expression: &Expression) -> bool {
-    let properties = expression.evaluation_properties();
-    properties.can_share_evaluation() && !properties.is_reorder_fence()
 }
 
 fn movable_inner<Child>(join: &ComparisonJoin<Child>) -> bool {
@@ -343,19 +342,39 @@ impl<'a> Region<'a> {
                 return None;
             }
         }
-        let residuals = predicates
+        // Predicate ownership is decided once, before constructing the graph.
+        // Otherwise an equality can affect cardinality only in a late Filter
+        // while neither connecting its relations nor becoming a hash key.
+        // The binary domain requires each operand to belong to one atomic
+        // input. General multi-input expressions remain explicit residuals.
+        let mut residuals = Vec::new();
+        for expression in predicates
             .into_iter()
-            .map(|expression| {
-                if !movable(&expression) {
-                    return None;
+            .flat_map(|e| into_associative_terms(e, ConjunctionType::And))
+        {
+            if !movable(&expression) {
+                return None;
+            }
+            let support = |e: &Expression| {
+                columns(e)?
+                    .iter()
+                    .try_fold(0_u16, |mask, b| Some(mask | owners.get(b)?))
+            };
+            let mask = support(&expression)?;
+            if let Expression::Comparison(c) = &expression {
+                let left = support(&c.left)?;
+                let right = support(&c.right)?;
+                if left.is_power_of_two() && right.is_power_of_two() && left != right {
+                    conditions.push(JoinCondition::new(
+                        (*c.left).clone(),
+                        (*c.right).clone(),
+                        join_comparison_type(c.comparison_type),
+                    ));
+                    continue;
                 }
-                let mut support = 0;
-                for binding in columns(&expression)? {
-                    support |= *owners.get(&binding)?;
-                }
-                Some((support, expression))
-            })
-            .collect::<Option<Vec<_>>>()?;
+            }
+            residuals.push((mask, expression));
+        }
         let condition_support = condition_supports(&conditions, &owners)?;
         Some(Self {
             aggregate: None,
@@ -1259,6 +1278,94 @@ mod tests {
     use super::*;
     use crate::optimizer::Optimizer;
     use paro_planner::planner::Planner;
+
+    #[test]
+    fn filter_comparisons_connect_region_and_become_exact_cut_conditions() {
+        use paro_common::types::LogicalType;
+        use paro_planner::expression::{
+            ComparisonExpression, ComparisonType, ConjunctionExpression,
+        };
+        use paro_planner::operator::{ExpressionGet, Filter, JoinComparisonType};
+        let column = |table, index| {
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table, index), LogicalType::Integer)
+                    .into(),
+            )
+        };
+        let input = |table| {
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                table,
+                vec![],
+                vec!["key".into(), "value".into()],
+                vec![LogicalType::Integer; 2],
+            )))
+        };
+        let equality = |l, r| JoinCondition::new(l, r, JoinComparisonType::Equal);
+        let ab = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Inner,
+                input(1),
+                input(2),
+                vec![equality(column(1, 0), column(2, 0))],
+            ),
+        )));
+        let abc = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Inner,
+                ab,
+                input(3),
+                vec![equality(column(1, 1), column(3, 0))],
+            ),
+        )));
+        let expressions = [
+            Expression::Comparison(
+                ComparisonExpression::new(ComparisonType::Equal, column(2, 1), column(3, 1)).into(),
+            ),
+            Expression::Comparison(
+                ComparisonExpression::new(ComparisonType::LessThan, column(1, 1), column(2, 1))
+                    .into(),
+            ),
+        ];
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            abc,
+            vec![Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, expressions.to_vec()).into(),
+            )],
+        )));
+        let region = Region::recognize_joins(&plan).unwrap();
+        assert_eq!(region.conditions.len(), 4);
+        assert!(region.residuals.is_empty());
+        // B-C is now a real edge, not a residual waiting for A-B-C. Joining
+        // A with B-C owns two equality keys and the range residual exactly once.
+        assert_eq!(region.cut(2, 4).len(), 1);
+        let cut = region.cut(1, 6);
+        assert_eq!(cut.len(), 3);
+        assert_eq!(
+            cut.iter()
+                .filter(|c| c.comparison == JoinComparisonType::Equal)
+                .count(),
+            2
+        );
+        assert_eq!(
+            region.cut(6, 1).last().unwrap().comparison,
+            JoinComparisonType::GreaterThan
+        );
+
+        let LogicalOperator::Filter(mut filter) = plan.into_parts().2 else {
+            unreachable!()
+        };
+        filter.expressions = vec![Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, expressions.to_vec()).into(),
+        )];
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(filter));
+        let region = Region::recognize_joins(&plan).unwrap();
+        assert_eq!(region.conditions.len(), 2);
+        assert_eq!(
+            region.residuals.len(),
+            1,
+            "OR must remain one predicate, not two hash keys"
+        );
+    }
 
     fn exercise(sql: &str, budget: usize) -> Work {
         exercise_domain(sql, budget, false)

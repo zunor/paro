@@ -1180,7 +1180,8 @@ impl JoinOrderOptimizer {
         predicate: &crate::join_order::query_graph::OrientedJoinPredicate,
     ) -> Option<JoinCondition> {
         let invert = predicate.orientation()? == JoinEdgeOrientation::Inverted;
-        let comparison_type = Self::to_join_comparison_type(comparison.comparison_type)?;
+        let comparison_type =
+            crate::join::mixed_predicates::join_comparison_type(comparison.comparison_type);
         Some(JoinCondition::new(
             if invert {
                 (*comparison.right).clone()
@@ -1211,19 +1212,6 @@ impl JoinOrderOptimizer {
             JoinComparisonType::NotDistinctFrom => ComparisonType::NotDistinctFrom,
             JoinComparisonType::DistinctFrom => ComparisonType::DistinctFrom,
         }
-    }
-
-    fn to_join_comparison_type(comparison: ComparisonType) -> Option<JoinComparisonType> {
-        Some(match comparison {
-            ComparisonType::Equal => JoinComparisonType::Equal,
-            ComparisonType::NotEqual => JoinComparisonType::NotEqual,
-            ComparisonType::LessThan => JoinComparisonType::LessThan,
-            ComparisonType::GreaterThan => JoinComparisonType::GreaterThan,
-            ComparisonType::LessThanOrEqual => JoinComparisonType::LessThanOrEqual,
-            ComparisonType::GreaterThanOrEqual => JoinComparisonType::GreaterThanOrEqual,
-            ComparisonType::DistinctFrom => JoinComparisonType::DistinctFrom,
-            ComparisonType::NotDistinctFrom => JoinComparisonType::NotDistinctFrom,
-        })
     }
 }
 

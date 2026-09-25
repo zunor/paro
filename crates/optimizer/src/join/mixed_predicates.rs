@@ -5,17 +5,16 @@
 //!
 //! Cross products with equality filters and comparison joins with mixed predicates are two
 //! representations of the same logical operation. This pass gives the physical planner one
-//! canonical form: equality predicates live on an inner comparison join, while non-hashable
-//! predicates remain as a filter over the joined rows.
+//! canonical form: orientable comparisons live on the inner comparison join.
+//! Hash extraction partitions equality keys from residual comparisons; moving
+//! residuals back above that join would materialize rejected matches.
 
 use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
-use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
-};
+use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, ExpressionIterator};
 use paro_planner::operator::{
-    ColumnBinding, ComparisonJoin, Filter, Join, JoinComparisonType, JoinCondition, JoinSide,
-    JoinType, LogicalOperator,
+    ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
+    LogicalOperator,
 };
 use paro_planner::plan::OwnedLogicalPlan;
 
@@ -31,38 +30,49 @@ impl<'a> JoinPredicateNormalizer<'a> {
     }
 
     pub fn optimize_plan(&self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
-        plan.try_map_post_order(|plan| Ok(self.normalize_join(self.normalize_cross_product(plan))))
+        plan.try_map_post_order(|plan| Ok(self.normalize_filter(plan)))
     }
 
-    fn normalize_cross_product(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
+    fn normalize_filter(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let LogicalOperator::Filter(filter) = &plan.operator else {
             return plan;
         };
-        let LogicalOperator::Join(Join::Cross(cross)) = &filter.child.operator else {
-            return plan;
+        let (left, right) = match &filter.child.operator {
+            LogicalOperator::Join(Join::Cross(cross)) => (&cross.left, &cross.right),
+            LogicalOperator::Join(Join::Comparison(join))
+                if join.join_type == JoinType::Inner
+                    && join.mark_index.is_none()
+                    && join.duplicate_eliminated_columns.is_empty()
+                    && !join.delim_flipped
+                    // Explicit maps belong to the preceding output namespace
+                    // until column-demand settlement rebinds them. Only All
+                    // certifies that Filter positions are child positions here.
+                    && join.left_projection_map.is_all()
+                    && join.right_projection_map.is_all() =>
+            {
+                (&join.left, &join.right)
+            }
+            _ => return plan,
         };
         if filter
             .expressions
             .iter()
-            .any(|expression| expression.evaluation_properties().is_reorder_fence())
+            .any(|expression| !movable(expression))
+            || crate::expression::join_region_has_evaluation_fence(&filter.child.operator)
         {
             return plan;
         }
 
-        let left_bindings = cross.left.get_column_bindings();
-        let right_bindings = cross.right.get_column_bindings();
+        let left_bindings = left.get_column_bindings();
+        let right_bindings = right.get_column_bindings();
         let left_width = left_bindings.len();
         plan.map_operator(|operator| {
-            Self::normalize_cross_filter_operator(
-                operator,
-                left_width,
-                &left_bindings,
-                &right_bindings,
-            )
+            self.normalize_filter_operator(operator, left_width, &left_bindings, &right_bindings)
         })
     }
 
-    fn normalize_cross_filter_operator(
+    fn normalize_filter_operator(
+        &self,
         operator: LogicalOperator,
         left_width: usize,
         left_bindings: &[ColumnBinding],
@@ -71,125 +81,64 @@ impl<'a> JoinPredicateNormalizer<'a> {
         let LogicalOperator::Filter(mut filter) = operator else {
             return operator;
         };
-        let (cross_id, cross_stats, cross_operator) = (*filter.child).into_parts();
-        let LogicalOperator::Join(Join::Cross(cross)) = cross_operator else {
-            filter.child = Box::new(OwnedLogicalPlan {
-                id: cross_id,
-                stats: cross_stats,
-                operator: cross_operator,
-            });
-            return LogicalOperator::Filter(filter);
-        };
-
         let mut conditions = Vec::new();
         let mut residuals = Vec::new();
         for expression in filter.expressions {
             for term in into_associative_terms(expression, ConjunctionType::And) {
-                match cross_product_hash_condition(term, left_width, left_bindings, right_bindings)
-                {
-                    HashCondition::Join(condition) => conditions.push(*condition),
-                    HashCondition::Residual(expression) => residuals.push(*expression),
+                match oriented_condition(term, left_width, left_bindings, right_bindings) {
+                    OrientedCondition::Join(condition) => conditions.push(*condition),
+                    OrientedCondition::Residual(expression) => residuals.push(*expression),
                 }
             }
         }
         if conditions.is_empty() {
             filter.expressions = residuals;
-            filter.child = Box::new(OwnedLogicalPlan {
-                id: cross_id,
-                stats: cross_stats,
-                operator: LogicalOperator::Join(Join::Cross(cross)),
-            });
             return LogicalOperator::Filter(filter);
         }
 
-        let join = ComparisonJoin::new(JoinType::Inner, *cross.left, *cross.right, conditions);
-        if residuals.is_empty() {
+        let child_width = filter.child.types().len();
+        let join = match (*filter.child).into_parts().2 {
+            LogicalOperator::Join(Join::Cross(cross)) => {
+                let mut join =
+                    ComparisonJoin::new(JoinType::Inner, *cross.left, *cross.right, conditions);
+                join.build_side_constraint = cross.build_side_constraint;
+                join
+            }
+            LogicalOperator::Join(Join::Comparison(mut join)) => {
+                join.conditions.extend(conditions);
+                join
+            }
+            _ => unreachable!("normalize_filter established an inner join"),
+        };
+        if residuals.is_empty() && filter.projection_map.is_identity(child_width) {
             LogicalOperator::Join(Join::Comparison(join))
         } else {
-            LogicalOperator::Filter(Filter::new(
-                OwnedLogicalPlan {
-                    id: cross_id,
-                    // The equality join has a different cardinality from the cross product it
-                    // replaces. Preserve the enclosing filter estimate, but make the new child
-                    // explicitly unknown until statistics are derived for its actual predicate.
-                    stats: Default::default(),
-                    operator: LogicalOperator::Join(Join::Comparison(join)),
-                },
-                residuals,
-            ))
+            filter.child = Box::new(OwnedLogicalPlan {
+                id: self.bind_context.next_plan_id(),
+                stats: Default::default(),
+                operator: LogicalOperator::Join(Join::Comparison(join)),
+            });
+            filter.expressions = residuals;
+            LogicalOperator::Filter(filter)
         }
-    }
-
-    fn normalize_join(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
-        plan.map_operator(|operator| self.normalize_join_operator(operator))
-    }
-
-    fn normalize_join_operator(&self, operator: LogicalOperator) -> LogicalOperator {
-        let LogicalOperator::Join(Join::Comparison(mut join)) = operator else {
-            return operator;
-        };
-        if join.join_type != JoinType::Inner {
-            return LogicalOperator::Join(Join::Comparison(join));
-        }
-
-        let mut hash_keys = Vec::new();
-        let mut residuals = Vec::new();
-        for condition in std::mem::take(&mut join.conditions) {
-            if is_hash_key(condition.comparison) {
-                hash_keys.push(condition);
-            } else {
-                residuals.push(condition);
-            }
-        }
-
-        if hash_keys.is_empty() || residuals.is_empty() {
-            join.conditions = hash_keys;
-            join.conditions.extend(residuals);
-            return LogicalOperator::Join(Join::Comparison(join));
-        }
-
-        join.conditions = hash_keys;
-        let residuals = residuals
-            .into_iter()
-            .map(|condition| {
-                Expression::Comparison(
-                    ComparisonExpression::new(
-                        comparison_type(condition.comparison),
-                        condition.left,
-                        condition.right,
-                    )
-                    .into(),
-                )
-            })
-            .collect();
-        let join_plan = OwnedLogicalPlan {
-            id: self.bind_context.next_plan_id(),
-            // The original estimate includes the residual predicate. It belongs to the outer
-            // filter, not to this less selective hash-join child.
-            stats: Default::default(),
-            operator: LogicalOperator::Join(Join::Comparison(join)),
-        };
-        LogicalOperator::Filter(Filter::new(join_plan, residuals))
     }
 }
 
-enum HashCondition {
+enum OrientedCondition {
     Join(Box<JoinCondition>),
     Residual(Box<Expression>),
 }
 
-fn cross_product_hash_condition(
+fn oriented_condition(
     expression: Expression,
     left_width: usize,
     left_bindings: &[ColumnBinding],
     right_bindings: &[ColumnBinding],
-) -> HashCondition {
+) -> OrientedCondition {
     let Expression::Comparison(comparison) = expression else {
-        return HashCondition::Residual(Box::new(expression));
+        return OrientedCondition::Residual(Box::new(expression));
     };
-    let Some(comparison_type) = hash_comparison_type(comparison.comparison_type) else {
-        return HashCondition::Residual(Box::new(Expression::Comparison(comparison)));
-    };
+    let mut comparison_type = join_comparison_type(comparison.comparison_type);
     let left_input = expression_input(&comparison.left, left_width, left_bindings, right_bindings);
     let right_input =
         expression_input(&comparison.right, left_width, left_bindings, right_bindings);
@@ -199,12 +148,13 @@ fn cross_product_hash_condition(
             (*comparison.left, *comparison.right)
         }
         (JoinSide::Right, JoinSide::Left) => {
+            comparison_type = comparison_type.flip();
             let comparison = comparison.into_inner();
             (*comparison.right, *comparison.left)
         }
-        _ => return HashCondition::Residual(Box::new(Expression::Comparison(comparison))),
+        _ => return OrientedCondition::Residual(Box::new(Expression::Comparison(comparison))),
     };
-    HashCondition::Join(Box::new(JoinCondition::new(
+    OrientedCondition::Join(Box::new(JoinCondition::new(
         left,
         rebase_right_expression(right, left_width),
         comparison_type,
@@ -252,31 +202,21 @@ fn rebase_right_expression(mut expression: Expression, left_width: usize) -> Exp
     expression
 }
 
-fn hash_comparison_type(comparison: ComparisonType) -> Option<JoinComparisonType> {
-    match comparison {
-        ComparisonType::Equal => Some(JoinComparisonType::Equal),
-        ComparisonType::NotDistinctFrom => Some(JoinComparisonType::NotDistinctFrom),
-        _ => None,
-    }
+pub(crate) fn movable(expression: &Expression) -> bool {
+    let properties = expression.evaluation_properties();
+    properties.can_share_evaluation() && !properties.is_reorder_fence()
 }
 
-fn is_hash_key(comparison: JoinComparisonType) -> bool {
-    matches!(
-        comparison,
-        JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
-    )
-}
-
-fn comparison_type(comparison: JoinComparisonType) -> ComparisonType {
+pub(crate) fn join_comparison_type(comparison: ComparisonType) -> JoinComparisonType {
     match comparison {
-        JoinComparisonType::Equal => ComparisonType::Equal,
-        JoinComparisonType::NotEqual => ComparisonType::NotEqual,
-        JoinComparisonType::LessThan => ComparisonType::LessThan,
-        JoinComparisonType::GreaterThan => ComparisonType::GreaterThan,
-        JoinComparisonType::LessThanOrEqual => ComparisonType::LessThanOrEqual,
-        JoinComparisonType::GreaterThanOrEqual => ComparisonType::GreaterThanOrEqual,
-        JoinComparisonType::NotDistinctFrom => ComparisonType::NotDistinctFrom,
-        JoinComparisonType::DistinctFrom => ComparisonType::DistinctFrom,
+        ComparisonType::Equal => JoinComparisonType::Equal,
+        ComparisonType::NotEqual => JoinComparisonType::NotEqual,
+        ComparisonType::LessThan => JoinComparisonType::LessThan,
+        ComparisonType::GreaterThan => JoinComparisonType::GreaterThan,
+        ComparisonType::LessThanOrEqual => JoinComparisonType::LessThanOrEqual,
+        ComparisonType::GreaterThanOrEqual => JoinComparisonType::GreaterThanOrEqual,
+        ComparisonType::NotDistinctFrom => JoinComparisonType::NotDistinctFrom,
+        ComparisonType::DistinctFrom => JoinComparisonType::DistinctFrom,
     }
 }
 
@@ -284,9 +224,11 @@ fn comparison_type(comparison: JoinComparisonType) -> ComparisonType {
 mod tests {
     use super::*;
     use paro_common::types::LogicalType;
-    use paro_planner::expression::{ColumnRefExpression, ReferenceExpression};
+    use paro_planner::expression::{
+        ColumnRefExpression, ComparisonExpression, ReferenceExpression,
+    };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, JoinCondition,
+        ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, Filter, JoinCondition,
     };
     use paro_planner::plan::CardinalityEstimate;
 
@@ -330,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn inner_join_keeps_hash_keys_and_moves_residuals_to_filter() {
+    fn inner_join_keeps_hash_keys_and_residuals_in_the_join() {
         let context = BindContext::new();
         let mut plan = join(&context, JoinType::Inner);
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(7));
@@ -342,15 +284,10 @@ mod tests {
             optimized.stats.estimated_cardinality,
             Some(CardinalityEstimate::exact(7))
         );
-        let LogicalOperator::Filter(filter) = &optimized.operator else {
-            panic!("expected residual filter");
-        };
-        assert_eq!(filter.expressions.len(), 1);
-        assert_eq!(filter.child.stats.estimated_cardinality, None);
-        let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
             panic!("expected comparison join");
         };
-        assert_eq!(join.conditions.len(), 1);
+        assert_eq!(join.conditions.len(), 2);
         assert_eq!(join.conditions[0].comparison, JoinComparisonType::Equal);
     }
 
@@ -365,6 +302,67 @@ mod tests {
             panic!("expected comparison join");
         };
         assert_eq!(join.conditions.len(), 2);
+    }
+
+    #[test]
+    fn outer_where_is_not_on_and_projecting_filter_keeps_its_layout() {
+        let context = BindContext::new();
+        for kind in [
+            JoinType::Left,
+            JoinType::Outer,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let plan = OwnedLogicalPlan::new(
+                &context,
+                LogicalOperator::Filter(Filter::new(
+                    join(&context, kind),
+                    vec![Expression::Comparison(
+                        ComparisonExpression::new(
+                            ComparisonType::Equal,
+                            column(1, 0),
+                            column(2, 0),
+                        )
+                        .into(),
+                    )],
+                )),
+            );
+            let actual = JoinPredicateNormalizer::new(&context)
+                .optimize_plan(plan)
+                .unwrap();
+            assert!(
+                matches!(actual.operator, LogicalOperator::Filter(_)),
+                "{kind:?}"
+            );
+        }
+        let mut filter = Filter::new(
+            join(&context, JoinType::Inner),
+            vec![Expression::Comparison(
+                ComparisonExpression::new(ComparisonType::LessThan, column(2, 1), column(1, 1))
+                    .into(),
+            )],
+        );
+        filter.projection_map = paro_planner::operator::ProjectionMap::new(vec![3, 0]);
+        let plan = OwnedLogicalPlan::new(&context, LogicalOperator::Filter(filter));
+        let expected = plan.output_layout();
+        let actual = JoinPredicateNormalizer::new(&context)
+            .optimize_plan(plan)
+            .unwrap();
+        assert_eq!(actual.output_layout(), expected);
+        let LogicalOperator::Filter(filter) = actual.into_parts().2 else {
+            panic!("projection is not disposable")
+        };
+        assert!(filter.expressions.is_empty());
+        let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
+            panic!()
+        };
+        assert_eq!(join.conditions.len(), 3);
+        assert_eq!(
+            join.conditions[2].comparison,
+            JoinComparisonType::GreaterThan
+        );
+        assert!(join.conditions[2].left.equals(&column(1, 1)));
+        assert!(join.conditions[2].right.equals(&column(2, 1)));
     }
 
     #[test]
@@ -431,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_product_residual_stays_above_normalized_hash_join() {
+    fn cross_product_residual_is_consumed_inside_normalized_hash_join() {
         let context = BindContext::new();
         let cross = OwnedLogicalPlan::new(
             &context,
@@ -457,14 +455,15 @@ mod tests {
             .optimize_plan(plan)
             .expect("normalize cross product residual");
 
-        let LogicalOperator::Filter(filter) = &optimized.operator else {
-            panic!("expected residual filter");
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
+            panic!("expected comparison join");
         };
-        assert_eq!(filter.expressions.len(), 1);
-        assert!(filter.expressions[0].equals(&residual));
-        assert!(matches!(
-            &filter.child.operator,
-            LogicalOperator::Join(Join::Comparison(_))
-        ));
+        assert_eq!(join.conditions.len(), 2);
+        assert_eq!(
+            join.conditions[1].comparison,
+            JoinComparisonType::GreaterThan
+        );
+        assert!(join.conditions[1].left.equals(&reference(1)));
+        assert!(join.conditions[1].right.equals(&reference(1)));
     }
 }
