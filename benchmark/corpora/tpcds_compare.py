@@ -484,7 +484,13 @@ class DuckDBProcess:
         )
         self._process.start()
         child.close()
-        ready = self._parent.recv()
+        try:
+            ready = self._parent.recv()
+        except BaseException:
+            # Construction can be cancelled before __enter__ owns the worker.
+            # Do not leave multiprocessing's exit hook waiting on that child.
+            self.close()
+            raise
         if ready.get("status") != "ready":
             self.close()
             raise RuntimeError(ready.get("error", "DuckDB worker did not become ready"))

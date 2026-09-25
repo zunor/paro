@@ -32,6 +32,19 @@ from tpcds_result_contract import (  # noqa: E402
 
 
 class TpcdsResultContractTests(unittest.TestCase):
+    def test_worker_construction_cancellation_closes_unentered_worker(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from tpcds_compare import DuckDBProcess
+        context, parent, child = MagicMock(), MagicMock(), MagicMock()
+        context.Pipe.return_value = (parent, child)
+        parent.recv.side_effect = KeyboardInterrupt
+        with patch("tpcds_compare.multiprocessing.get_context", return_value=context), \
+             patch.object(DuckDBProcess, "close") as close:
+            with self.assertRaises(KeyboardInterrupt):
+                DuckDBProcess(Path("unused.duckdb"), 4, "2GB")
+        close.assert_called_once()
+        child.close.assert_called_once()
+
     def test_corpus_impact_preserves_failures_and_ranks_absolute_excess(self) -> None:
         def measured(query, paro, duck):
             return {"query": query, "status": "passed", "warmup_and_steady_state": {

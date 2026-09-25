@@ -85,3 +85,19 @@ operator causes. A ratio above three recommends a separate execution diagnostic,
 not an automatic performance failure. TPC-H's maintained 22-query workload is
 a separate result/coverage check against its audited oracle, not a fresh C1 or
 same-process cross-policy comparison.
+
+### Coverage amendment: wide-result metadata capacity
+
+The initial pipeline coverage stopped while publishing Q66: its wide result
+schema exceeded the registered 36,096-byte normal-cell lease. Q01–Q65 remain
+partial evidence (Q39/Q58 failed); Q66 has no published normal result and is
+not counted as passed. The quality campaign was interrupted before repeating
+this known publication defect. Preserve both incomplete manifests.
+
+Reserve a fixed 16,384 bytes per query contract for typed output/ORDER metadata
+in the shared RunOutput formula, instead of 1,024; retain the 64MiB total and
+all capture/receipt limits. Do not inflate sample counts or reopen old leases.
+Replacement collection uses new run IDs: pipeline Q66–Q99 and quality Q01–Q99,
+with the same Rust binary and sampling settings. The pipeline coverage union
+has different harness identities and is a screening inventory, not a pooled
+confirmatory campaign. Capacity failure and interruption remain recorded.

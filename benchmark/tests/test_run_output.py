@@ -22,6 +22,20 @@ from harness.loader import QueryDef  # noqa: E402
 
 
 class RunOutputTests(unittest.TestCase):
+    def test_wide_query_metadata_has_a_fixed_bounded_lease(self) -> None:
+        from harness.run_output import _cell_budget_bytes, _encode_json, CapacityExceededError
+        limit = _cell_budget_bytes(query_cases=1, sample_rows=6, product_receipts=6,
+                                   calibration_rows=0, summary_captures=0, attempts=1)
+        self.assertEqual(limit, 51_456)
+        schema = [{"name": f"month_{i}_sales_per_square_foot",
+                   "logical_type": "decimal", "engine_type": "DECIMAL(38,12)"}
+                  for i in range(44)]
+        payload = {"schema": {"paro": schema, "duckdb": schema},
+                   "receipts_and_samples": "x" * 30_000}
+        self.assertLess(len(_encode_json(payload, limit_bytes=limit)), limit)
+        with self.assertRaises(CapacityExceededError):
+            _encode_json({"unbounded_schema": "x" * limit}, limit_bytes=limit)
+
     @staticmethod
     def cell_payload(
         query_case: str = "q",
@@ -417,7 +431,7 @@ class RunOutputTests(unittest.TestCase):
                         campaign_id=output.run.campaign_id,
                         run_id=output.run.run_id,
                         source_id="collector-q11-normal",
-                        payload="x" * 20_000,
+                        payload="x" * 100_000,
                     ),
                 )
             output.finish(status="Completed")

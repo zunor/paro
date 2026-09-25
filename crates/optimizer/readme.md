@@ -444,7 +444,9 @@ Keep this README short-lived-data free:
 - Register finite volume limits before collection. For A arms, Q query cases,
   N cells and D Summary captures, manifest budget M is
   32,000 + 1,024*(A+Q+N+D) bytes. Per-cell budget T_i is
-  4,096 + 1,024*S_i + 4,096*P_i + 512*R_i: S_i counts scheduled timing/error
+  4,096 + 16,384*Q_i + 1,024*S_i + 4,096*P_i + 512*R_i: Q_i counts query
+  contracts (typed schemas and ordering metadata, normally one per cell),
+  S_i counts scheduled timing/error
   rows including warm/retries, P_i bounds artifact/candidate receipts, and R_i
   bounds registered scalar calibration rows, never events. README is bounded
   at 20,000 bytes; each Summary at 200,000. Total registered budget

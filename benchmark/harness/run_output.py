@@ -79,7 +79,10 @@ def _cell_budget_bytes(
     """Charge every registered unit through one deterministic formula."""
     return (
         4_096
-        + 1_024 * query_cases
+        # Query metadata includes both engines' typed output schemas and ORDER
+        # contracts. Wide analytical results (for example 44-column Q66) need
+        # a fixed metadata allowance independent of sample/receipt counts.
+        + 16_384 * query_cases
         + 1_024 * sample_rows
         # A v3 association retains compile, admission and execution payloads.
         # Real producer receipts exceed 2 KiB even with compact JSON. Reserve
