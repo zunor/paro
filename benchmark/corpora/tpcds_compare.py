@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing
 import os
 import random
@@ -320,6 +321,55 @@ def timing_summary(samples: list[float]) -> dict[str, Any]:
         "minimum_ms": round(min(samples), 6),
         "median_ms": round(statistics.median(samples), 6),
         "p95_ms": round(percentile(samples, 0.95), 6),
+    }
+
+
+def corpus_impact_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Bounded within-campaign triage, never a pooled performance gate.
+
+    Sum-of-medians is an equal-frequency prioritization proxy, not elapsed
+    campaign time. Failed/uncovered cases have unknown weight and stay visible;
+    they are not silently assigned zero or included in the denominator.
+    """
+    if len(results) > 99 or len({r["query"] for r in results}) != len(results):
+        raise ValueError("corpus impact requires at most 99 distinct query cases")
+    measured, uncovered = [], []
+    for result in results:
+        key = result["query"]
+        if result.get("status") != "passed":
+            uncovered.append({"query": key, "status": result.get("status", "Uncovered")})
+            continue
+        warm = result.get("warmup_and_steady_state", {})
+        paro = warm.get("paro", {}).get("median_ms")
+        duck = warm.get("duckdb", {}).get("median_ms")
+        if not all(type(x) in (int, float) and math.isfinite(x) and x > 0 for x in (paro, duck)):
+            uncovered.append({"query": key, "status": "Uncovered"})
+            continue
+        measured.append({
+            "query": key, "paro_warm_median_ms": paro, "duckdb_warm_median_ms": duck,
+            "median_ratio": paro / duck,
+            "excess_warm_median_ms": max(0.0, paro - duck),
+            # Selection for a future, separately identified diagnostic cohort.
+            # This does not assert that an execution profile was collected.
+            "execution_diagnosis_recommended": paro / duck > 3.0,
+        })
+    total = sum(row["paro_warm_median_ms"] for row in measured)
+    for row in measured:
+        row["measured_warm_share"] = row["paro_warm_median_ms"] / total
+    measured.sort(key=lambda row: (-row["excess_warm_median_ms"], row["query"]))
+    slowest = sorted(measured, key=lambda row: -row["paro_warm_median_ms"])[:5]
+    return {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "kind": "CorpusImpactTriage",
+        "scope": "single campaign; equal query frequency; not a performance gate",
+        "complete_measured_coverage": not uncovered and bool(measured),
+        "registered_results": len(results), "measured_queries": len(measured),
+        "sum_of_measured_warm_medians_ms": total if measured else None,
+        "top_five_measured_warm_share": (
+            sum(row["paro_warm_median_ms"] for row in slowest) / total if measured else None
+        ),
+        "ranked_by_excess_warm_ms": measured, "uncovered": uncovered,
+        "evidence": "samples, failures and receipts remain in their registered cells",
     }
 
 
@@ -1555,6 +1605,7 @@ def main() -> int:
         else:
             print(f"TPC-DS {query_id}: failed: {result['error']}", flush=True)
 
+    output.control.write_json("corpus-impact.json", corpus_impact_summary(report["queries"]))
     output.publish_campaign_summary()
     output.finish(
         status="Incomplete" if failures else "Completed",

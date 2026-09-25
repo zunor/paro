@@ -15,7 +15,9 @@ from benchmark_evidence import (  # noqa: E402
     hierarchical_abba_ratio,
     paired_order_balanced_ratio,
 )
-from tpcds_compare import hierarchical_cold_ratio, normal_cell_evidence, configure_paro  # noqa: E402
+from tpcds_compare import (  # noqa: E402
+    hierarchical_cold_ratio, normal_cell_evidence, configure_paro, corpus_impact_summary,
+)
 from bound_result_contract import BoundResult  # noqa: E402
 from tpcds_result_contract import (  # noqa: E402
     ColumnContract,
@@ -30,6 +32,26 @@ from tpcds_result_contract import (  # noqa: E402
 
 
 class TpcdsResultContractTests(unittest.TestCase):
+    def test_corpus_impact_preserves_failures_and_ranks_absolute_excess(self) -> None:
+        def measured(query, paro, duck):
+            return {"query": query, "status": "passed", "warmup_and_steady_state": {
+                "paro": {"median_ms": paro}, "duckdb": {"median_ms": duck},
+            }}
+        result = corpus_impact_summary([
+            measured("01", 1000, 500), measured("02", 20, 1), measured("03", 1, 2),
+            {"query": "04", "status": "failed", "error": "timeout"},
+            measured("05", float("nan"), 1), measured("06", 1, 0),
+        ])
+        self.assertFalse(result["complete_measured_coverage"])
+        self.assertEqual(result["measured_queries"], 3)
+        self.assertEqual(result["sum_of_measured_warm_medians_ms"], 1021)
+        self.assertEqual([r["query"] for r in result["ranked_by_excess_warm_ms"]], ["01", "02", "03"])
+        self.assertEqual([r["query"] for r in result["uncovered"]], ["04", "05", "06"])
+        self.assertTrue(result["ranked_by_excess_warm_ms"][1]["execution_diagnosis_recommended"])
+        self.assertIsNone(corpus_impact_summary([])["top_five_measured_warm_share"])
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            corpus_impact_summary([measured("01", 1, 1), measured("01", 2, 1)])
+
     def test_verifier_and_search_policy_are_explicit_runtime_settings(self) -> None:
         from unittest.mock import MagicMock
         for verify, literal in (("on", "true"), ("off", "false")):

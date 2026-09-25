@@ -65,3 +65,23 @@ operators rather than marking a DP point estimate as an exact row bound.
 Rerun Q72 quality before completing the same eight-query policy comparison.
 Replacement cells use new run IDs and the original sampling envelope; they
 are not retries accepted in place of the failed initial arm.
+
+## Coverage cohort and corpus triage
+
+After the reconstruction fix, run the maintained TPC-DS collector for Q01–Q99
+under pipeline and quality separately: 2 fresh process blocks, 1 warmup,
+1 measurement round, 1 diagnostic block, timeout 30s, bootstrap 1000, otherwise
+the same envelope. This is exploratory coverage/triage, not confirmation:
+retain each failure and continue to other queries to identify blockers.
+Do not compare failed cells or pool them as zero-time observations. The shared
+host and sequential policy campaigns prevent a causal cross-policy speedup claim.
+The same binary and DuckDB oracle validate both arms. Archive cap is 64MiB
+across this coverage cohort, replacing the smaller pilot-only 32MiB allowance.
+
+The collector's bounded corpus-impact summary ranks absolute warm excess over
+DuckDB, reports the top-five share among measured queries, and exposes missing
+coverage. It points to original cells; it does not replace samples or infer
+operator causes. A ratio above three recommends a separate execution diagnostic,
+not an automatic performance failure. TPC-H's maintained 22-query workload is
+a separate result/coverage check against its audited oracle, not a fresh C1 or
+same-process cross-policy comparison.
