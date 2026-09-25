@@ -125,3 +125,27 @@ and selected physical structure; the shared host and sequential builds still
 make the latency contrast exploratory, not a certified speedup. Keep the same
 64MiB structured archive cap. No default-policy, result-oracle, aggregate
 algebra or compile-timer changes are part of this slice.
+
+### Full regression amendment: delimiter substitution
+
+The first post-window SQL suite exposed three new correlated-query result
+failures (EXISTS, LATERAL and projected MARK), plus one intentional mixed-join
+EXPLAIN change and two pre-existing Python IMPORTS fixture path differences.
+The retained pre-task binary returns the correct six-row MARK result; both
+current planning policies were wrong. Do not run the window performance cohort
+until this is fixed. Keep the failed run and do not update expected results.
+
+Canonical comparison placement exposed delimiter elimination treating range
+comparisons as column identities. Require equality and complete, non-repeated
+delimiter-column coverage for substitution. Existence decorrelation must also
+accept the canonical join without an empty Filter. Preserve real delimiter
+execution for LATERAL and encode its capture/scan payload explicitly in physical
+identity, rather than falling back to debug formatting or disabling validation.
+Validate independent expected results under both policies, then rerun full
+regress and the registered performance/coverage cohorts on the final binary.
+
+The first TPC-H setup did not execute queries: decimal `2GB` (2,000,000,000
+bytes) did not meet that workload's declared 2GiB minimum. Keep that environment
+failure. Use a separate `tpch-v2` coverage run with exactly 2,147,483,648 bytes;
+this does not change the TPC-DS envelope or establish cross-workload timing
+comparability.

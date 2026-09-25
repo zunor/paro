@@ -1346,6 +1346,28 @@ fn write_semantic_kind_fields(
             write_hashed_slice(builder, b"cross-output-types", &spec.output_types);
             write_spill_policy(builder, spec.spill_policy);
         }
+        PhysicalNodeKind::DelimJoin(spec) => {
+            builder.write_u64(20);
+            builder.write_u64(match spec.side {
+                super::specs::DelimJoinSideSpec::Left => 0,
+                super::specs::DelimJoinSideSpec::Right => 1,
+            });
+            write_expressions(builder, spec.duplicate_keys.iter());
+            write_strings(builder, spec.output_names.iter());
+            write_hashed_slice(builder, b"delim-join-output-types", &spec.output_types);
+        }
+        PhysicalNodeKind::DelimScan(spec) => {
+            builder.write_u64(21);
+            match spec.target {
+                super::specs::DelimScanTarget::CachedOuter => builder.write_u64(0),
+                super::specs::DelimScanTarget::Values { table_index } => {
+                    builder.write_u64(1);
+                    builder.write_u64(table_index as u64);
+                }
+            }
+            write_strings(builder, spec.output_names.iter());
+            write_hashed_slice(builder, b"delim-scan-output-types", &spec.output_types);
+        }
         PhysicalNodeKind::PartitionAggregateWindow(spec) => {
             builder.write_u64(19);
             builder.write_u64(match spec.domain {
@@ -3463,6 +3485,51 @@ mod identity_tests {
             left.structural_identity_fingerprint().unwrap(),
             right.structural_identity_fingerprint().unwrap()
         );
+    }
+
+    #[test]
+    fn structural_identity_covers_delimiter_capture_and_scan_contracts() {
+        use crate::physical::specs::{
+            DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec, DelimScanTarget,
+        };
+        use paro_planner::expression::{Expression, ReferenceExpression};
+        fn fingerprint(kind: PhysicalNodeKind) -> Fingerprint {
+            let mut builder = StableFingerprintBuilder::default();
+            write_semantic_kind_fields(&mut builder, &kind).unwrap();
+            builder.finish()
+        }
+        let scan = |target| {
+            PhysicalNodeKind::DelimScan(DelimScanSpec {
+                target,
+                output_names: Box::new(["k".into()]),
+                output_types: Box::new([LogicalType::Integer]),
+            })
+        };
+        assert_ne!(
+            fingerprint(scan(DelimScanTarget::CachedOuter)),
+            fingerprint(scan(DelimScanTarget::Values { table_index: 0 }))
+        );
+        assert_ne!(
+            fingerprint(scan(DelimScanTarget::Values { table_index: 1 })),
+            fingerprint(scan(DelimScanTarget::Values { table_index: 0 }))
+        );
+        let mut join = DelimJoinSpec {
+            side: DelimJoinSideSpec::Left,
+            duplicate_keys: Box::new([Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )]),
+            output_names: Box::new(["k".into()]),
+            output_types: Box::new([LogicalType::Integer]),
+        };
+        let original = fingerprint(PhysicalNodeKind::DelimJoin(join.clone()));
+        join.side = DelimJoinSideSpec::Right;
+        assert_ne!(
+            original,
+            fingerprint(PhysicalNodeKind::DelimJoin(join.clone()))
+        );
+        join.side = DelimJoinSideSpec::Left;
+        join.duplicate_keys = Box::new([]);
+        assert_ne!(original, fingerprint(PhysicalNodeKind::DelimJoin(join)));
     }
 
     #[test]

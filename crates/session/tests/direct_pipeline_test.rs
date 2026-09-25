@@ -105,6 +105,52 @@ async fn direct_pipeline_executes_relational_boundaries_without_memo() {
 }
 
 #[tokio::test]
+async fn correlated_ranges_survive_predicate_canonicalization() {
+    let instance = Instance::new_in_memory_with_config(
+        InstanceConfig::in_memory().with_max_memory(256 * 1024 * 1024),
+    )
+    .unwrap();
+    let mut session = Session::new(1, instance);
+    let mut sink = CollectingSink::new();
+    for sql in [
+        "CREATE TABLE corr_o(id INT, grp INT, threshold INT)",
+        "CREATE TABLE corr_d(grp INT, seq INT, score INT)",
+        "INSERT INTO corr_o VALUES (1,10,6),(2,20,5),(3,20,8),(4,30,2),(5,NULL,4),(6,40,1)",
+        "INSERT INTO corr_d VALUES (10,1,4),(10,2,9),(10,3,7),(20,1,5),(20,2,8),(20,3,6),(20,4,8),(30,1,3),(30,2,1),(NULL,1,50)",
+    ] { exec_ok(&mut session, &mut sink, sql).await; }
+    for policy in ["quality", "pipeline"] {
+        exec_ok(
+            &mut session,
+            &mut sink,
+            &format!("SET optimizer_search_policy='{policy}'"),
+        )
+        .await;
+        exec_ok(&mut session, &mut sink,
+            "SELECT o.id, EXISTS(SELECT 1 FROM corr_d d WHERE d.grp=o.grp AND d.score>=o.threshold) FROM corr_o o ORDER BY o.id").await;
+        assert_eq!(
+            rows(&sink),
+            (1..=6)
+                .map(|id| vec![Value::Integer(id), Value::Boolean(id <= 4)])
+                .collect::<Vec<_>>(),
+            "{policy}"
+        );
+        exec_ok(&mut session, &mut sink,
+            "SELECT o.id FROM corr_o o WHERE EXISTS(SELECT 1 FROM corr_d d WHERE d.grp=o.grp AND d.score>=o.threshold) ORDER BY o.id").await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1, 2, 3, 4], "{policy}");
+        exec_ok(&mut session, &mut sink,
+            "SELECT o.id,p.score FROM corr_o o CROSS JOIN LATERAL (SELECT d.score FROM corr_d d WHERE d.grp=o.grp AND d.score>=o.threshold ORDER BY d.score DESC,d.seq LIMIT 1) p ORDER BY o.id").await;
+        assert_eq!(
+            rows(&sink),
+            [(1, 9), (2, 8), (3, 8), (4, 3)]
+                .into_iter()
+                .map(|(id, score)| vec![Value::Integer(id), Value::Integer(score)])
+                .collect::<Vec<_>>(),
+            "{policy}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn direct_pipeline_keeps_real_external_cte_execution() {
     let instance = Instance::new_in_memory_with_config(
         InstanceConfig::in_memory().with_max_memory(32 * 1024 * 1024),

@@ -148,15 +148,21 @@ impl DelimJoinElimination {
             return None;
         }
 
-        let Some(filter_plan) = passive_projection_child(join.right.as_ref()) else {
+        let Some(region) = passive_projection_child(join.right.as_ref()) else {
             return None;
         };
-        let LogicalOperator::Filter(filter) = &filter_plan.operator else {
-            return None;
+        // Canonical predicate placement may consume the last Filter into the
+        // comparison join. Decorrelation depends on predicate ownership, not
+        // on the continued presence of an empty wrapper.
+        let (region, filters) = match &region.operator {
+            LogicalOperator::Filter(filter) => {
+                (filter.child.as_ref(), filter.expressions.as_slice())
+            }
+            _ => (region, &[][..]),
         };
-        let (delim, base_bindings, correlated_join_conditions) = match &filter.child.operator {
+        let (delim, base_bindings, correlated_join_conditions) = match &region.operator {
             LogicalOperator::Join(Join::Cross(_)) if self.projected_existence => {
-                let (delim, base_bindings) = cross_delim_region(filter.child.as_ref())?;
+                let (delim, base_bindings) = cross_delim_region(region)?;
                 (delim, base_bindings, None)
             }
             LogicalOperator::Join(Join::Cross(cross)) => {
@@ -244,7 +250,7 @@ impl DelimJoinElimination {
         }
 
         let mut local_filters = Vec::new();
-        for expression in filter.expressions.iter().flat_map(conjunction_terms) {
+        for expression in filters.iter().flat_map(conjunction_terms) {
             if !expression.evaluation_properties().can_share_evaluation() {
                 return None;
             }
@@ -475,7 +481,16 @@ impl DelimJoinElimination {
         }
 
         let mut replacements = Vec::with_capacity(join.conditions.len());
+        let mut covered_columns = HashSet::with_capacity(delim_types.len());
         for cond in &join.conditions {
+            // Only equality proves substitution. A range comparison (or
+            // DISTINCT FROM) cannot identify a delimiter value with its mate.
+            if !matches!(
+                cond.comparison,
+                JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
+            ) {
+                return None;
+            }
             let (delim_expr, other_expr) = if delim_idx == 0 {
                 (&cond.left, &cond.right)
             } else {
@@ -488,7 +503,13 @@ impl DelimJoinElimination {
             let Expression::ColumnRef(other_colref) = other_expr else {
                 return None;
             };
-            if delim_colref.binding.table_index != delim_table_index {
+            if delim_colref.depth != 0
+                || other_colref.depth != 0
+                || delim_colref.binding.table_index != delim_table_index
+                || delim_colref.binding.column_index >= delim_types.len()
+                || !covered_columns.insert(delim_colref.binding.column_index)
+                || delim_colref.return_type != other_colref.return_type
+            {
                 return None;
             }
 
@@ -497,11 +518,7 @@ impl DelimJoinElimination {
                 other_colref.binding,
             ));
 
-            if !matches!(
-                cond.comparison,
-                paro_planner::operator::JoinComparisonType::NotDistinctFrom
-                    | paro_planner::operator::JoinComparisonType::DistinctFrom
-            ) {
+            if cond.comparison == JoinComparisonType::Equal {
                 filter_expressions.push(Expression::Operator(
                     OperatorExpression::new_unary(
                         OperatorType::IsNotNull,
@@ -665,6 +682,14 @@ fn take_existence_base(
                 }
             }
         }
+        operator @ LogicalOperator::Join(_) => take_existence_join_base(
+            OwnedLogicalPlan {
+                id,
+                stats,
+                operator,
+            },
+            projected_existence,
+        ),
         operator => Err(Box::new(OwnedLogicalPlan {
             id,
             stats,
@@ -1213,6 +1238,38 @@ mod tests {
             join.right.operator,
             LogicalOperator::Projection(_)
         ));
+    }
+
+    #[test]
+    fn delimiter_substitution_requires_equalities_covering_each_column() {
+        for kind in [
+            JoinComparisonType::LessThan,
+            JoinComparisonType::GreaterThanOrEqual,
+            JoinComparisonType::NotEqual,
+            JoinComparisonType::DistinctFrom,
+        ] {
+            let mut node = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                JoinType::Inner,
+                expression_get(1),
+                OwnedLogicalPlan::synthetic(LogicalOperator::DelimGet(DelimGet::new(
+                    99,
+                    vec![LogicalType::Integer],
+                ))),
+                vec![JoinCondition::new(column(1), column(99), kind)],
+            )));
+            assert!(DelimJoinElimination::try_remove_join_with_delim_get(&mut node).is_none());
+            assert!(matches!(node, LogicalOperator::Join(_)));
+        }
+        let mut node = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+            JoinType::Inner,
+            expression_get(1),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DelimGet(DelimGet::new(
+                99,
+                vec![LogicalType::Integer, LogicalType::Integer],
+            ))),
+            vec![JoinCondition::new(column(1), column(99), JoinComparisonType::Equal); 2],
+        )));
+        assert!(DelimJoinElimination::try_remove_join_with_delim_get(&mut node).is_none());
     }
 
     #[test]
