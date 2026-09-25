@@ -24,6 +24,11 @@ verified plan and its resource requirements: admission checks availability and
 dependencies, never ranks alternatives. `physical/scalar_identity.rs` encodes
 expression semantics without a second expression representation.
 
+Within `physical/plan`, `identity.rs` owns canonical graph traversal,
+`encoding.rs` owns typed payload bytes, and `render/` owns bounded EXPLAIN
+presentation. `plan.rs` holds the plan and arena operations; the existing
+`physical/verifier.rs` remains the single physical invariant checker.
+
 ## Boundaries
 
 - No production dependency on optimizer or execution, directly or transitively.
@@ -44,5 +49,6 @@ expression semantics without a second expression representation.
   lifecycle states; a physical-plan type does not imply completed execution.
 
 The [optimizer guide](../optimizer/readme.md) describes stage ordering and
-diagnostic/evidence contracts. Actual Cargo edges are defined by each manifest,
+diagnostic contracts. Contributor workflows live in `.agents/skills/` at the
+repository root. Actual Cargo edges are defined by each manifest,
 not by the order of the query lifecycle.

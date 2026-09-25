@@ -5,6 +5,7 @@
 //! semantic identities; column mappings, predicates and path semantics are.
 
 use super::*;
+use crate::expression::Expression;
 
 fn edge(b: &mut StableFingerprintBuilder, e: &paro_catalog::entry::EdgeTableInfo) {
     for value in [

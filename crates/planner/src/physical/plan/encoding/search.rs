@@ -6,6 +6,8 @@
 
 use super::*;
 use crate::physical::specs::*;
+use paro_catalog::entry::TableCatalogEntry;
+use paro_storage::search::CapabilityToken;
 
 fn predicate(b: &mut StableFingerprintBuilder, p: &Option<SearchPredicateTemplate>) {
     b.write_u64(p.is_some() as u64);
