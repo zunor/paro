@@ -373,29 +373,35 @@ fn populate_paro_pg_settings(
         .downcast_mut::<ParoPgSettingsGlobalState>()
     {
         let mut rows: Vec<SettingRowData> = provider
-                .current_settings()
-                .into_iter()
-                .map(|row| SettingRowData {
-                    name: row.name,
-                    setting: row.setting,
-                    unit: row.unit,
-                    category: row.category,
-                    short_desc: row.short_desc,
-                    source: row.source,
-                    vartype: row.vartype,
-                    context: row.context,
-                })
-                .collect();
-        rows.extend(paro_context::diagnostic_environment().iter().map(|setting| SettingRowData {
-            name: format!("paro_diagnostic/{}", setting.name),
-            setting: setting.value.as_deref().unwrap_or("<unset>").to_string(),
-            unit: None,
-            category: "Server Diagnostics".to_string(),
-            short_desc: Some("Effective process-start diagnostic environment (read-only)".to_string()),
-            source: "server_startup".to_string(),
-            vartype: "string".to_string(),
-            context: "internal".to_string(),
-        }));
+            .current_settings()
+            .into_iter()
+            .map(|row| SettingRowData {
+                name: row.name,
+                setting: row.setting,
+                unit: row.unit,
+                category: row.category,
+                short_desc: row.short_desc,
+                source: row.source,
+                vartype: row.vartype,
+                context: row.context,
+            })
+            .collect();
+        rows.extend(
+            paro_context::diagnostic_environment()
+                .iter()
+                .map(|setting| SettingRowData {
+                    name: format!("paro_diagnostic/{}", setting.name),
+                    setting: setting.value.as_deref().unwrap_or("<unset>").to_string(),
+                    unit: None,
+                    category: "Server Diagnostics".to_string(),
+                    short_desc: Some(
+                        "Effective process-start diagnostic environment (read-only)".to_string(),
+                    ),
+                    source: "server_startup".to_string(),
+                    vartype: "string".to_string(),
+                    context: "internal".to_string(),
+                }),
+        );
         populate_settings_data(state, rows);
     }
 }
@@ -1111,16 +1117,19 @@ fn populate_paro_optimizers(
                 invocation_count: 1,
                 record_type: "statement_cache".into(),
                 record_id: decision.decision_id,
-                payload_json: Some(serde_json::json!({
-                    "schema_version": 1,
-                    "decision_id": decision.decision_id,
-                    "query_fingerprint": decision.query_fingerprint,
-                    "occurrence": decision.occurrence,
-                    "cache_hit": decision.cache_hit,
-                    "artifact_identity": decision.artifact_identity,
-                    "compile_work": decision.compile_work,
-                    "compile_receipt": decision.compile_receipt,
-                }).to_string()),
+                payload_json: Some(
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "decision_id": decision.decision_id,
+                        "query_fingerprint": decision.query_fingerprint,
+                        "occurrence": decision.occurrence,
+                        "cache_hit": decision.cache_hit,
+                        "artifact_identity": decision.artifact_identity,
+                        "compile_work": decision.compile_work,
+                        "compile_receipt": decision.compile_receipt,
+                    })
+                    .to_string(),
+                ),
             });
         }
         for receipt in ctx.diagnostics.execution_receipts_snapshot() {
@@ -1148,13 +1157,16 @@ fn populate_paro_optimizers(
                 invocation_count: 1,
                 record_type: "execution_work".into(),
                 record_id: record.execution_id,
-                payload_json: Some(serde_json::json!({
-                    "schema_version": 1,
-                    "execution_id": record.execution_id,
-                    "query_fingerprint": record.query_fingerprint,
-                    "image_id": record.image_id,
-                    "metrics": record.snapshot.rows(),
-                }).to_string()),
+                payload_json: Some(
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "execution_id": record.execution_id,
+                        "query_fingerprint": record.query_fingerprint,
+                        "image_id": record.image_id,
+                        "metrics": record.snapshot.rows(),
+                    })
+                    .to_string(),
+                ),
             });
         }
         populate_optimizer_data(state, entries);
@@ -2768,7 +2780,7 @@ mod tests {
 
     use paro_context::test_support::TestStatementContextBuilder;
     use paro_function::table::system::paro_optimizers::ParoOptimizersGlobalState;
-    use paro_optimizer::profiler::{
+    use paro_optimizer::diagnostics::profile::{
         publish_optimizer_profile_snapshot, OptimizerComponent, OptimizerProfileSnapshot,
         OptimizerProfileSnapshotEntry,
     };

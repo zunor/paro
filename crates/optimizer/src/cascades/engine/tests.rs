@@ -10,7 +10,7 @@ use std::sync::Arc;
 use paro_common::types::LogicalType;
 
 use super::*;
-use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
+use crate::binding::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::ids::{
     AdmissibleGrantSetId, CalibrationRevisionId, CandidateId, ColumnId, LogicalPayloadId,
@@ -32,12 +32,14 @@ use crate::cascades::region::{
 };
 use crate::cascades::rules::ReadScope;
 use crate::cascades::rules::{
-    DomainProofId, EquivalentExpression, EvaluationOccurrenceId, GrantDependencyDescriptor,
-    PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PhysicalImplementation,
-    QualityDependency, RulePromise, SidewaysFilterSource, TransformationBudgetClass,
+    EquivalentExpression, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
+    PhysicalImplementation, QualityDependency, RulePromise, TransformationBudgetClass,
     TransformationPreflight, TransformationRule,
 };
 use crate::cascades::tasks::TaskState;
+use crate::cost::response::{
+    DomainProofId, EvaluationOccurrenceId, GrantDependencyDescriptor, SidewaysFilterSource,
+};
 use crate::physical::ObjectiveProfile;
 
 #[path = "tests/closure.rs"]
@@ -517,7 +519,7 @@ fn binding_preflight_skips_rule_construction_transaction() {
             .rejection_guards
             .iter()
             .find(|(guard, _)| {
-                *guard == crate::transformation_rejection::TransformationRejectionGuard::NoOutput
+                *guard == crate::diagnostics::rejection::TransformationRejectionGuard::NoOutput
             })
             .map(|(_, count)| count),
         Some(1)
@@ -2508,7 +2510,7 @@ fn rule_work_profile_is_opt_in_for_diagnostic_cohorts() {
 
 #[test]
 fn rejection_guards_are_diagnostic_only_and_exclude_successful_proof_branches() {
-    use crate::transformation_rejection::{reject, TransformationRejectionGuard as Guard};
+    use crate::diagnostics::rejection::{reject, TransformationRejectionGuard as Guard};
     struct WitnessRule {
         emit: bool,
     }

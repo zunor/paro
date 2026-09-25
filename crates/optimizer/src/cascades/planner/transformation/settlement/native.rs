@@ -22,12 +22,14 @@ impl SettlementCache {
         arena: &mut LogicalPlanArena,
         identity: &mut PlannerResidentIdentity<'_>,
     ) -> Result<Option<SettledNative>> {
-        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
-        let _site = crate::work_partition::cache_site(crate::work_partition::CacheSite::Native);
+        let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Settlement);
+        let _site =
+            crate::diagnostics::work::cache_site(crate::diagnostics::work::CacheSite::Native);
         let checkpoint = arena.checkpoint();
         let result = self.settle_native_impl(shell, environment, arena, identity);
         if !matches!(result, Ok(Some(_))) {
-            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Rollback);
+            let _b3 =
+                crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Rollback);
             arena.rollback_to(checkpoint)?;
             self.discard_stale_recipes(arena);
         }
@@ -266,12 +268,10 @@ mod tests {
         environment.control.begin_optional();
         let mut arena = LogicalPlanArena::default();
         let mut cache = SettlementCache::default();
-        assert!(
-            cache
-                .settle_native_test_in(values(&environment, 4), &environment, &mut arena)
-                .unwrap()
-                .is_none()
-        );
+        assert!(cache
+            .settle_native_test_in(values(&environment, 4), &environment, &mut arena)
+            .unwrap()
+            .is_none());
         assert!(arena.is_empty());
         assert!(cache.locals.is_empty());
         environment.control = Arc::new(crate::cascades::control::SearchControl::new(None));
@@ -286,18 +286,16 @@ mod tests {
             }),
             source_proofs: Box::new([]),
         });
-        assert!(
-            cache
-                .settle_native_test_in(
-                    NativeShell {
-                        nodes: invalid.into_boxed_slice(),
-                        root: 1
-                    },
-                    &environment,
-                    &mut arena
-                )
-                .is_err()
-        );
+        assert!(cache
+            .settle_native_test_in(
+                NativeShell {
+                    nodes: invalid.into_boxed_slice(),
+                    root: 1
+                },
+                &environment,
+                &mut arena
+            )
+            .is_err());
         assert!(arena.is_empty());
         assert!(cache.locals.is_empty());
     }

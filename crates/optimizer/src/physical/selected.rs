@@ -117,7 +117,7 @@ impl SelectedNode {
         // only their frozen schemas, never recurses over the selected DAG.
         paro_planner::verify::verify_physical_planner_invariants(&local.operator)?;
         if replay_keys {
-            local.stats.unique_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
+            local.stats.unique_keys = crate::estimate::unique_keys::derive_unique_keys_from_facts(
                 &local.operator,
                 &layout,
                 &child_layouts,

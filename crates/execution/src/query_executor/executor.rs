@@ -423,24 +423,22 @@ impl Executor {
     }
 }
 
-fn fingerprint_words(fingerprint: paro_optimizer::physical::Fingerprint) -> [u64; 2] {
+fn fingerprint_words(fingerprint: paro_planner::physical::Fingerprint) -> [u64; 2] {
     [(fingerprint.0 >> 64) as u64, fingerprint.0 as u64]
 }
 
 fn resource_receipt(
-    resources: paro_optimizer::physical::ExecutionResourceContract,
+    resources: paro_planner::physical::ExecutionResourceContract,
 ) -> ResourceReceipt {
     let memory_completion = match resources.memory_completion {
-        paro_optimizer::physical::MemoryCompletion::Guaranteed => {
-            MemoryCompletionReceipt::Guaranteed
-        }
+        paro_planner::physical::MemoryCompletion::Guaranteed => MemoryCompletionReceipt::Guaranteed,
         completion => match completion.uncapped_memory_demand() {
-            Some(paro_optimizer::physical::UncappedMemoryDemand::KnownBytes(bytes)) => {
+            Some(paro_planner::physical::UncappedMemoryDemand::KnownBytes(bytes)) => {
                 MemoryCompletionReceipt::RuntimeCappedKnown {
                     uncapped_memory_bytes: bytes,
                 }
             }
-            Some(paro_optimizer::physical::UncappedMemoryDemand::Unbounded) | None => {
+            Some(paro_planner::physical::UncappedMemoryDemand::Unbounded) | None => {
                 MemoryCompletionReceipt::RuntimeCappedUnbounded
             }
         },

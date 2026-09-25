@@ -7,20 +7,20 @@ use std::collections::BTreeSet;
 
 use paro_common::error::{self as paro_error, Result};
 
-use super::column::ColumnCatalog;
-use super::enforcer::replay_enforcer_chain;
 use super::ids::{Fingerprint, GroupId, OptimizationContextId};
 use super::memo::{EquivalenceProof, Memo, OptimizationContext};
 use super::region::{
     FacetCriticality, RegionArtifactKind, RegionBoundaryEndpoint, RegionDependencyEdge,
     RegionDependencyKind, RegionFacet, RegionFacetKind, RegionScopeContract,
 };
+use crate::binding::column::ColumnCatalog;
+use crate::physical::enforcer::replay_enforcer_chain;
 
 pub struct MemoVerifier;
 
 impl MemoVerifier {
     pub fn verify(memo: &Memo, columns: Option<&ColumnCatalog>) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Finish);
         verify_region_forest(memo)?;
         for group in memo.groups() {
             if let Some(columns) = columns {
@@ -99,7 +99,7 @@ pub struct WinnerVerifier;
 
 impl WinnerVerifier {
     pub fn verify(memo: &Memo) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Finish);
         for group in memo.groups() {
             for (goal, frontier) in group.winner_frontiers() {
                 if frontier.candidates().is_empty() {
@@ -116,7 +116,8 @@ impl WinnerVerifier {
     /// Replay the precise immutable DAG selected for extraction, including
     /// archived incumbent children no longer retained by a cost frontier.
     pub fn verify_candidate_tree(memo: &Memo, root: super::memo::ChildWinnerRef) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityFreeze);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityFreeze);
         let mut pending = vec![root];
         let mut seen = std::collections::BTreeSet::new();
         while let Some(reference) = pending.pop() {
@@ -214,7 +215,7 @@ impl WinnerVerifier {
             winner.enforcer_cost_input,
         )?
         .ok_or_else(|| paro_error::internal("winner composition exceeds its resource grant"))?;
-        let enforcer_phase = super::engine::enforcer_cost(
+        let enforcer_phase = crate::cost::enforcer::enforcer_cost(
             &winner.enforcers,
             winner.enforcer_cost_input,
             memo.calibration(),
@@ -242,14 +243,20 @@ fn verify_region_forest(memo: &Memo) -> Result<()> {
     for facet in &forest.deferred_facets {
         facet.validate_contract()?;
         if facet.criticality != FacetCriticality::Optional
-            || facet.scope.iter().any(|group| memo.group(*group).is_none()
-                || memo.canonical_group(*group) != *group)
+            || facet
+                .scope
+                .iter()
+                .any(|group| memo.group(*group).is_none() || memo.canonical_group(*group) != *group)
         {
-            return Err(paro_error::internal("deferred facet has invalid contract or scope"));
+            return Err(paro_error::internal(
+                "deferred facet has invalid contract or scope",
+            ));
         }
     }
     if dropped.len() != forest.deferred_facets.len() {
-        return Err(paro_error::internal("deferred facet has duplicate declarations"));
+        return Err(paro_error::internal(
+            "deferred facet has duplicate declarations",
+        ));
     }
     for node in forest.nodes.iter() {
         if node.scope.is_empty()
@@ -698,7 +705,7 @@ mod tests {
     use paro_common::types::LogicalType;
 
     use super::*;
-    use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
+    use crate::binding::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
     use crate::cascades::cost::{CompactRange, SearchCost};
     use crate::cascades::ids::{
         AdmissibleGrantSetId, ColumnId, LogicalPayloadId, PhysicalPayloadId, RegionId,
@@ -868,7 +875,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             enforcers: Box::new([]),
-            enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(
+            enforcer_cost_input: crate::cost::enforcer::EnforcerCostInput::unbounded(
                 CompactRange::point(1.0).unwrap(),
                 8,
             ),
@@ -1086,7 +1093,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             enforcers: Box::new([]),
-            enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(
+            enforcer_cost_input: crate::cost::enforcer::EnforcerCostInput::unbounded(
                 CompactRange::point(1.0).unwrap(),
                 8,
             ),

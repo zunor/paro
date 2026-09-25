@@ -90,7 +90,7 @@ pub fn compile_statement_with_parameter_types(
     );
 
     let optimizer_started = Instant::now();
-    let partition = paro_optimizer::work_partition::begin(
+    let partition = paro_optimizer::diagnostics::work::begin(
         optimizer_started,
         ctx.options.compile_capture.as_ref().is_some_and(|capture| {
             capture.level() == paro_context::compile_diagnostics::CaptureLevel::Detail

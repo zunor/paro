@@ -151,8 +151,9 @@ fn export_local(node: &ScalarNode, children: Vec<Expression>) -> Result<Expressi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cascades::column::ColumnCatalog;
-    use crate::cascades::scalar_lowering::{intern_expression, BindingCatalog};
+    use crate::binding::column::ColumnCatalog;
+    use crate::binding::BindingCatalog;
+    use crate::cascades::scalar_lowering::intern_expression;
     use paro_common::runtime_value::Value;
     use paro_common::typed_parameters::{ParameterSlot, RuntimeParamId};
     use paro_function::aggregate::distributive::count::get_count_star_function;

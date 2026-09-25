@@ -8,7 +8,7 @@
 //! changes ownership while retaining that exact producer group.
 
 use super::*;
-use crate::cte::predicate_domain::predicate_domains_equal;
+use crate::rewrite::cte::predicate_domain::predicate_domains_equal;
 use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{ColumnRefExpression, ComparisonType};
 use paro_planner::operator::{CTERef, MaterializedCTE, Projection};
@@ -342,7 +342,7 @@ fn key_demand(
             continue;
         }
         let mut referenced = Vec::new();
-        crate::column::lifetime::ColumnLifetimeAnalyzer::extract_column_bindings(
+        crate::rewrite::column::lifetime::ColumnLifetimeAnalyzer::extract_column_bindings(
             demand_expression,
             &mut referenced,
         );
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn engine_admits_every_partition_discriminator_from_one_binding() {
-        let session = crate::subquery::partition_aggregate_tests::setup_session();
+        let session = crate::rewrite::subquery::partition_aggregate_tests::setup_session();
         let binder = Binder::new(session.clone());
         for _ in 0..20 {
             binder.bind_context.generate_table_index();
@@ -1570,7 +1570,7 @@ impl CteRequirement {
             .occurrences
             .iter()
             .map(|occurrence| {
-                Some(crate::cte::predicate_domain::FilteredCTERef {
+                Some(crate::rewrite::cte::predicate_domain::FilteredCTERef {
                     old_bindings: occurrence.output.bindings().to_vec(),
                     filters: occurrence.predicates.as_ref()?.to_vec(),
                 })
@@ -1579,7 +1579,7 @@ impl CteRequirement {
         else {
             return Ok(None);
         };
-        let Some(predicates) = crate::cte::predicate_domain::derive_producer_predicates(
+        let Some(predicates) = crate::rewrite::cte::predicate_domain::derive_producer_predicates(
             references,
             &producer_reference.bindings,
         ) else {
@@ -2052,20 +2052,24 @@ impl CteRequirement {
                 .clone();
             let mut domains = Vec::with_capacity(partitions.len());
             for occurrences in &partitions {
-                let Some(predicates) = crate::cte::predicate_domain::derive_producer_predicates(
-                    occurrences
-                        .iter()
-                        .map(|occurrence| crate::cte::predicate_domain::FilteredCTERef {
-                            old_bindings: occurrence.output.bindings().to_vec(),
-                            filters: occurrence
-                                .predicates
-                                .as_deref()
-                                .unwrap_or_default()
-                                .to_vec(),
-                        })
-                        .collect(),
-                    &producer_bindings,
-                ) else {
+                let Some(predicates) =
+                    crate::rewrite::cte::predicate_domain::derive_producer_predicates(
+                        occurrences
+                            .iter()
+                            .map(|occurrence| {
+                                crate::rewrite::cte::predicate_domain::FilteredCTERef {
+                                    old_bindings: occurrence.output.bindings().to_vec(),
+                                    filters: occurrence
+                                        .predicates
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                        .to_vec(),
+                                }
+                            })
+                            .collect(),
+                        &producer_bindings,
+                    )
+                else {
                     domains.clear();
                     break;
                 };
@@ -2488,20 +2492,24 @@ impl CteRequirement {
         }
         let mut domains = Vec::new();
         for occurrences in &partitions {
-            let Some(predicates) = crate::cte::predicate_domain::derive_producer_predicates(
-                occurrences
-                    .iter()
-                    .map(|occurrence| crate::cte::predicate_domain::FilteredCTERef {
-                        old_bindings: occurrence.output.bindings().to_vec(),
-                        filters: occurrence
-                            .predicates
-                            .as_deref()
-                            .unwrap_or_default()
-                            .to_vec(),
-                    })
-                    .collect(),
-                &producer.bindings,
-            ) else {
+            let Some(predicates) =
+                crate::rewrite::cte::predicate_domain::derive_producer_predicates(
+                    occurrences
+                        .iter()
+                        .map(
+                            |occurrence| crate::rewrite::cte::predicate_domain::FilteredCTERef {
+                                old_bindings: occurrence.output.bindings().to_vec(),
+                                filters: occurrence
+                                    .predicates
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .to_vec(),
+                            },
+                        )
+                        .collect(),
+                    &producer.bindings,
+                )
+            else {
                 return Ok(None);
             };
             domains.push(predicates);
@@ -2748,7 +2756,7 @@ impl CteRequirement {
         memo: &Memo,
         state: &PlannerTransformState,
     ) -> Result<Option<(OwnedLogicalPlan, CteDomainProof)>> {
-        use crate::cte::predicate_domain::{derive_producer_predicates, FilteredCTERef};
+        use crate::rewrite::cte::predicate_domain::{derive_producer_predicates, FilteredCTERef};
         let LogicalOperator::MaterializedCTE(cte) = &mut plan.operator else {
             return Err(paro_error::internal("CTE requirement lost its owner"));
         };

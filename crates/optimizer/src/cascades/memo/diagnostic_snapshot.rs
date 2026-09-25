@@ -15,7 +15,7 @@ struct Frontier {
     goal: OptimizationGoal,
     high_water: usize,
     truncations: u64,
-    sources: BTreeSet<super::super::rules::WorkSourceId>,
+    sources: BTreeSet<crate::cost::response::WorkSourceId>,
     candidates: Vec<Arc<Winner>>,
 }
 struct Snapshot {
@@ -78,7 +78,11 @@ fn collect(memo: &Memo) -> Snapshot {
 #[cfg(test)]
 pub(super) fn counts(memo: &Memo) -> (u64, usize, usize) {
     let snapshot = collect(memo);
-    (snapshot.published, snapshot.frontiers.iter().map(|f| f.candidates.len()).sum(), snapshot.omitted)
+    (
+        snapshot.published,
+        snapshot.frontiers.iter().map(|f| f.candidates.len()).sum(),
+        snapshot.omitted,
+    )
 }
 
 /// Called after recording optimizer elapsed time. File I/O remains inside the

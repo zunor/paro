@@ -449,11 +449,11 @@ fn hash_join_merges_optional_branches_before_stateful_transforms() {
 fn forced_external_hash_join_keeps_spill_replay_pipeline() {
     let plan = hash_join_plan_with_context(
         JoinType::Inner,
-        ExtractionContext {
+        PhysicalBuildContext {
             force_external: true,
-            grant_spill_policy: paro_optimizer::physical::SpillPolicy::Allowed,
+            grant_spill_policy: paro_planner::physical::SpillPolicy::Allowed,
             rowset_scan_pushdown: true,
-            ..ExtractionContext::default()
+            ..PhysicalBuildContext::default()
         },
     );
     let mut lowerer = PipelineLowerer::new(&plan);

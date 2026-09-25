@@ -111,7 +111,7 @@ pub(in super::super) fn execution_demand<Child>(
     let mut execution = wanted.clone();
     let mut positional = false;
     paro_planner::visitor::enumerate_expression_refs(operator, |expression| {
-        crate::expression::traversal::visit_expression(expression, &mut |expression| {
+        crate::rewrite::expr::traversal::visit_expression(expression, &mut |expression| {
             if let Expression::ColumnRef(column) = expression {
                 if column.depth == 0 {
                     execution.insert(column.binding);
@@ -238,13 +238,7 @@ pub(in super::super) fn apply(
     scan_bindings: &mut ScanBindings,
     bind: &BindContext,
 ) -> Result<(LogicalPlanNode<()>, BindingMap)> {
-    let (operator, bindings) = apply_operator(
-        shell.operator,
-        inputs,
-        wanted,
-        scan_bindings,
-        bind,
-    )?;
+    let (operator, bindings) = apply_operator(shell.operator, inputs, wanted, scan_bindings, bind)?;
     shell.operator = operator;
     shell.stats.invalidate_structural_facts();
     Ok((shell, bindings))
@@ -286,7 +280,7 @@ pub(in super::super) fn apply_operator<Child>(
     if let LogicalOperator::Get(get) = &mut operator {
         let mut retained = wanted.clone();
         for expression in &get.runtime_filter_expressions {
-            crate::expression::traversal::visit_expression(expression, &mut |expression| {
+            crate::rewrite::expr::traversal::visit_expression(expression, &mut |expression| {
                 if let Expression::ColumnRef(column) = expression {
                     if column.depth == 0 {
                         retained.insert(column.binding);

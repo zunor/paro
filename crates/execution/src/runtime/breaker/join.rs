@@ -172,7 +172,7 @@ impl JoinBuildHandle {
         });
         let runtime_filter = runtime_filter_enabled
             .then(|| {
-                paro_optimizer::physical::RuntimeFilterResourceContract::for_keys(
+                paro_planner::physical::RuntimeFilterResourceContract::for_keys(
                     runtime_filter_key_types
                         .as_deref()
                         .expect("enabled runtime filter has key types"),
@@ -205,7 +205,7 @@ impl JoinBuildHandle {
         join_type: JoinType,
         build_keys_unique: bool,
         runtime_filter: Option<(
-            &paro_optimizer::physical::RuntimeFilterResourceContract,
+            &paro_planner::physical::RuntimeFilterResourceContract,
             &[LogicalType],
         )>,
         memory: MemoryAccountingContext,
@@ -289,7 +289,7 @@ impl JoinBuildHandle {
     pub fn initialize_runtime_filter_builder(
         &self,
         key_types: &[LogicalType],
-        contract: &paro_optimizer::physical::RuntimeFilterResourceContract,
+        contract: &paro_planner::physical::RuntimeFilterResourceContract,
         memory: MemoryAccountingContext,
     ) {
         let mut builder = self.runtime_filter_builder.lock();

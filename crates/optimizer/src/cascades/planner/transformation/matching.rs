@@ -293,7 +293,7 @@ pub(super) fn dimension_sharing_pattern_bindings(
             {
                 return false;
             }
-            if !crate::aggregate::dimension_sharing::equivalent_dimension_gets(
+            if !crate::rewrite::aggregate::dimension_sharing::equivalent_dimension_gets(
                 left.dimension,
                 right.dimension,
             ) {
@@ -429,7 +429,9 @@ pub(super) fn dimension_sharing_pattern_bindings(
             self.dimension_get(left.dimension)
                 .zip(self.dimension_get(right.dimension))
                 .is_some_and(|(left, right)| {
-                    crate::aggregate::dimension_sharing::equivalent_dimension_gets(left, right)
+                    crate::rewrite::aggregate::dimension_sharing::equivalent_dimension_gets(
+                        left, right,
+                    )
                 })
         }
 
@@ -815,7 +817,7 @@ pub(super) fn dimension_sharing_pattern_bindings(
     ) -> bool {
         let mut valid = true;
         let mut read = false;
-        crate::expression::traversal::visit_expression(expression, &mut |expression| {
+        crate::rewrite::expr::traversal::visit_expression(expression, &mut |expression| {
             if let Expression::ColumnRef(column) = expression {
                 read = true;
                 valid &= column.depth == 0 && allowed.contains(&column.binding);
@@ -1335,8 +1337,8 @@ impl PatternScope {
             },
             Self::JoinRegion => match operator {
                 LogicalOperator::Filter(_) => repeat(Self::JoinRegion),
-                LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_shell_is_reorderable(join)
-                    || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_shell_is_reorderable(join)) => repeat(Self::JoinRegion),
+                LogicalOperator::Join(join) if crate::region::join::relation_manager::RelationManager::join_shell_is_reorderable(join)
+                    || matches!(join, Join::Comparison(join) if crate::region::join::relation_manager::RelationManager::reduction_join_shell_is_reorderable(join)) => repeat(Self::JoinRegion),
                 _ => repeat(Self::Hole),
             },
             Self::AggregateRegion => matches!(operator, LogicalOperator::Aggregate(_)).then(|| vec![Self::DimensionRegion]),
@@ -2052,8 +2054,8 @@ fn enumerate_pattern_bindings(
                             operator,
                             LogicalOperator::Get(_) | LogicalOperator::Filter(_)
                         )
-                        && !matches!(operator, LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_shell_is_reorderable(join)
-                        || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_shell_is_reorderable(join)))
+                        && !matches!(operator, LogicalOperator::Join(join) if crate::region::join::relation_manager::RelationManager::join_shell_is_reorderable(join)
+                        || matches!(join, Join::Comparison(join) if crate::region::join::relation_manager::RelationManager::reduction_join_shell_is_reorderable(join)))
                     {
                         if active.len() == 1 {
                             return Ok(Vec::new());
@@ -2469,7 +2471,7 @@ pub(super) fn matches_transformation_root(
         // Only immutable root shape is negative here. Do not consult a child
         // representative or cache a failed native direct-child proof: scoped
         // matching still subscribes to the direct input frontier below.
-        return crate::aggregate::dimension_deferral::root_eligible(aggregate);
+        return crate::rewrite::aggregate::dimension_deferral::root_eligible(aggregate);
     }
     if matches!(
         transformation,
@@ -2703,7 +2705,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_eq!(
-                crate::aggregate::dimension_deferral::root_eligible(aggregate),
+                crate::rewrite::aggregate::dimension_deferral::root_eligible(aggregate),
                 expected,
                 "{case}"
             );

@@ -4,9 +4,10 @@
 //! Logical/physical property contracts, grant sensitivity, and guarantees.
 
 use super::*;
-use crate::cascades::rules::{DomainProofId, EvaluationOccurrenceId};
+use crate::cost::response::{DomainProofId, EvaluationOccurrenceId};
 #[cfg(test)]
 use crate::physical::MemoryCompletion;
+use paro_planner::physical::access_identity::encode_search_request;
 
 pub(super) fn optimization_goal_fingerprint(goal: OptimizationGoal) -> Fingerprint {
     let mut fingerprint = StableFingerprintBuilder::default();
@@ -102,7 +103,7 @@ pub(super) fn derive_logical_properties<Child>(
     // Group properties describe the output relation, never a particular
     // expression's relationship to its children.  Only publish bounds that
     // survive substitution by an equivalent expression.
-    let maximum_cardinality = crate::statistics::cardinality_bound::derive_maximum_cardinality(
+    let maximum_cardinality = crate::estimate::cardinality_bound::derive_maximum_cardinality(
         operator,
         child_maximum_cardinalities,
     );
@@ -163,7 +164,7 @@ pub(super) fn implementation_spillable(
     metadata: &PlannerOperatorMetadata,
     flavor: PhysicalImplementationFlavor,
 ) -> bool {
-    crate::physical::local_cost::flavor_spillable(&metadata.local_cost_model(), flavor)
+    crate::cost::operator::flavor_spillable(&metadata.local_cost_model(), flavor)
 }
 
 pub(super) fn planner_structural_retained_children<Child>(
@@ -528,11 +529,9 @@ mod tests {
     use crate::cascades::ids::{AdmissibleGrantSetId, ResourceGrantClassId};
     use crate::cascades::memo::GrantGoalKey;
     use crate::cascades::planner::costing::RuntimeFilterExactness;
-    use crate::cascades::rules::GrantDependencyDescriptor;
-    use crate::cascades::rules::WorkSourceId;
-    use crate::physical::local_cost::{
-        ResolvedRuntimeFilterSource, RuntimeFilterProbeMultiplicity,
-    };
+    use crate::cost::operator::{ResolvedRuntimeFilterSource, RuntimeFilterProbeMultiplicity};
+    use crate::cost::response::GrantDependencyDescriptor;
+    use crate::cost::response::WorkSourceId;
     use crate::physical::PhysicalGrantContract;
 
     #[test]
@@ -687,15 +686,15 @@ pub(super) fn cost_for_grant(
     let class = classes.get(&class_id).ok_or_else(|| {
         paro_error::internal("physical implementation references an unknown grant class")
     })?;
-    crate::physical::local_cost::fit_local_cost(cost, spillable, *class, force_spill)
+    crate::cost::operator::fit_local_cost(cost, spillable, *class, force_spill)
 }
 
 pub(super) fn planner_enforcer_cost_input(
     facts: &ResolvedPlannerCostFacts,
     grant: GrantGoalKey,
     classes: &BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>,
-) -> Result<crate::cascades::engine::EnforcerCostInput> {
-    let mut input = crate::cascades::engine::EnforcerCostInput::unbounded(
+) -> Result<crate::cost::enforcer::EnforcerCostInput> {
+    let mut input = crate::cost::enforcer::EnforcerCostInput::unbounded(
         facts.output_rows,
         facts.output_row_width,
     );

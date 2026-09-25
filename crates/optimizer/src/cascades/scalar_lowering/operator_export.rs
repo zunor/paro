@@ -133,7 +133,7 @@ pub(crate) fn export_operator_scalars<Child>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cascades::column::ColumnCatalog;
+    use crate::binding::column::ColumnCatalog;
     use crate::cascades::scalar::{ScalarLocalProperties, ScalarSpec};
     use crate::cascades::scalar_lowering::intern_expression;
     use paro_common::runtime_value::Value;

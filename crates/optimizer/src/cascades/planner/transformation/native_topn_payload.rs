@@ -3,10 +3,10 @@
 
 //! Detail TopN's two row-fetch frontiers, operating only on selected native nodes.
 
-use super::PlannerTransformState;
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use crate::aggregate::late_payload::{
-    RowIdJoinSide, RowIdPath, RowIdPathPolicy, prove_rowid_operator,
+use super::PlannerTransformState;
+use crate::physical::access::late_payload::{
+    prove_rowid_operator, RowIdJoinSide, RowIdPath, RowIdPathPolicy,
 };
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::error::{self as error, Result};
@@ -126,8 +126,8 @@ pub(super) fn rewrite(
     let Some(input) = node(&output.child) else {
         return Ok(None);
     };
-    let Some(candidate) = crate::aggregate::late_payload::prove_row_preserving_inputs(
-        crate::aggregate::late_payload::RowPreservingInputs {
+    let Some(candidate) = crate::physical::access::late_payload::prove_row_preserving_inputs(
+        crate::physical::access::late_payload::RowPreservingInputs {
             total_rows,
             orders: &topn.orders,
             projection_map: &topn.projection_map,

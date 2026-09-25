@@ -28,11 +28,11 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::NodeStats;
 
-use crate::aggregate::post_reduction::alpha::AlphaBindings;
-use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
+use crate::rewrite::aggregate::post_reduction::alpha::AlphaBindings;
+use crate::rewrite::aggregate::semantic_kernels::aggregate_kernels_equal;
 
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use super::{PatternOperand, PlannerTransformState, boundary};
+use super::{boundary, PatternOperand, PlannerTransformState};
 
 pub(super) fn try_native_scalar_aggregate_window(
     binding: &PatternOperand,
@@ -737,10 +737,8 @@ fn peel_scalar_branch(nodes: &[NativeNode], scalar_index: usize) -> Result<Optio
     ) {
         return Ok(None);
     }
-    let [
-        Expression::ColumnRef(first_output),
-        Expression::ColumnRef(count_output),
-    ] = checked.children.as_slice()
+    let [Expression::ColumnRef(first_output), Expression::ColumnRef(count_output)] =
+        checked.children.as_slice()
     else {
         return Ok(None);
     };
@@ -1021,10 +1019,10 @@ mod tests {
     use paro_storage::table::table_factory::TableFactory;
 
     use crate::cascades::budget::{BudgetDimension, SearchBudget};
-    use crate::cascades::planner::MemoBuilder;
     use crate::cascades::planner::transformation::{
-        PlannerTransformation, TransformContext, matching,
+        matching, PlannerTransformation, TransformContext,
     };
+    use crate::cascades::planner::MemoBuilder;
     use crate::cascades::rules::TransformationRule;
 
     fn table() -> Arc<TableCatalogEntry> {
@@ -1413,15 +1411,13 @@ mod tests {
             MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
         let state = input.planner_state.read().unwrap();
         let mut ctx = TransformContext::new(&mut input.memo, input.root);
-        assert!(
-            try_native_scalar_aggregate_window(
-                &PatternOperand::Group(input.root),
-                &mut ctx,
-                &state
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(try_native_scalar_aggregate_window(
+            &PatternOperand::Group(input.root),
+            &mut ctx,
+            &state
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -1435,15 +1431,13 @@ mod tests {
             MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
         let state = input.planner_state.read().unwrap();
         let mut ctx = TransformContext::new(&mut input.memo, input.root);
-        assert!(
-            try_native_scalar_aggregate_window(
-                &PatternOperand::Group(input.root),
-                &mut ctx,
-                &state,
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(try_native_scalar_aggregate_window(
+            &PatternOperand::Group(input.root),
+            &mut ctx,
+            &state,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -1698,15 +1692,13 @@ mod tests {
                 .set_limit(BudgetDimension::RuleWorkPerGroup, 2);
             {
                 let mut ctx = TransformContext::new(&mut input.memo, input.root);
-                assert!(
-                    try_native_scalar_aggregate_window(
-                        &PatternOperand::Group(input.root),
-                        &mut ctx,
-                        &state,
-                    )
-                    .unwrap()
-                    .is_none()
-                );
+                assert!(try_native_scalar_aggregate_window(
+                    &PatternOperand::Group(input.root),
+                    &mut ctx,
+                    &state,
+                )
+                .unwrap()
+                .is_none());
             }
             assert_eq!(input.memo.group_count(), groups_before);
             assert_eq!(state.staging_arena.len(), arena_before);
@@ -1717,15 +1709,13 @@ mod tests {
                 .set_limit(BudgetDimension::RuleWorkPerGroup, 65_536);
             let reads = {
                 let mut ctx = TransformContext::new(&mut input.memo, input.root);
-                assert!(
-                    try_native_scalar_aggregate_window(
-                        &PatternOperand::Group(input.root),
-                        &mut ctx,
-                        &state,
-                    )
-                    .unwrap()
-                    .is_some()
-                );
+                assert!(try_native_scalar_aggregate_window(
+                    &PatternOperand::Group(input.root),
+                    &mut ctx,
+                    &state,
+                )
+                .unwrap()
+                .is_some());
                 ctx.take_fact_reads()
             };
             assert_eq!(
@@ -1733,11 +1723,9 @@ mod tests {
                 groups_before,
                 "all expanded source groups must be subscribed"
             );
-            assert!(
-                reads
-                    .iter()
-                    .all(|read| read.is_current(&input.memo).unwrap())
-            );
+            assert!(reads
+                .iter()
+                .all(|read| read.is_current(&input.memo).unwrap()));
             let source = reads
                 .iter()
                 .find(|read| {

@@ -27,9 +27,10 @@ use paro_planner::expression::{
     WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType, WindowInvocation,
 };
 
-use super::super::ids::{Fingerprint, StableFingerprintBuilder};
-use super::super::scalar_lowering::{
-    aggregate_binding_fingerprint, encode_signature, function_binding_fingerprint,
+use super::super::ids::Fingerprint;
+use paro_planner::physical::scalar_identity::{
+    aggregate_binding_fingerprint, function_binding_fingerprint, FrameBoundIdentity,
+    WindowBindingIdentity, WindowInvocationIdentity,
 };
 
 macro_rules! shared_descriptor {
@@ -463,35 +464,31 @@ shared_descriptor!(ScalarWindow, WindowBinding);
 
 impl ScalarWindow {
     pub fn new(spec: ScalarWindowSpec) -> Self {
-        let mut builder = StableFingerprintBuilder::default();
-        builder.write_u64(42);
-        match &spec.invocation {
-            ScalarWindowInvocation::Native { function, .. } => {
-                builder.write_u64(0);
-                builder.write_bytes(function.name.as_bytes());
-                encode_signature(&mut builder, &function.arguments, &function.return_type);
-            }
-            ScalarWindowInvocation::Aggregate(aggregate) => {
-                builder.write_u64(1);
-                builder.write_fingerprint(aggregate.fingerprint());
-            }
+        let bound = |bound| match bound {
+            ScalarFrameBound::Unbounded => FrameBoundIdentity::Unbounded,
+            ScalarFrameBound::CurrentRow => FrameBoundIdentity::CurrentRow,
+            ScalarFrameBound::Offset => FrameBoundIdentity::Offset,
+        };
+        let fingerprint = WindowBindingIdentity {
+            invocation: match &spec.invocation {
+                ScalarWindowInvocation::Native { function, .. } => {
+                    WindowInvocationIdentity::Native(function)
+                }
+                ScalarWindowInvocation::Aggregate(aggregate) => {
+                    WindowInvocationIdentity::Aggregate(aggregate.fingerprint())
+                }
+            },
+            partition_count: spec.partition_count,
+            orders: spec.orders.iter().map(|o| (o.ascending, o.nulls_first)),
+            frame_type: spec.frame_type,
+            start: bound(spec.start),
+            end: bound(spec.end),
+            start_is_preceding: spec.start_is_preceding,
+            end_is_preceding: spec.end_is_preceding,
+            ignore_nulls: spec.ignore_nulls,
         }
-        builder.write_u64(spec.partition_count as u64);
-        builder.write_u64(spec.orders.len() as u64);
-        for order in &spec.orders {
-            builder.write_u64(order.ascending as u64);
-            builder.write_u64(order.nulls_first as u64);
-        }
-        builder.write_u64(spec.frame_type as u64);
-        builder.write_u64(spec.start_is_preceding as u64);
-        builder.write_u64(spec.end_is_preceding as u64);
-        builder.write_u64(spec.ignore_nulls as u64);
-        builder.write_u64(spec.start as u64);
-        builder.write_u64(spec.end as u64);
-        Self(Arc::new(WindowBinding {
-            fingerprint: builder.finish(),
-            spec,
-        }))
+        .fingerprint();
+        Self(Arc::new(WindowBinding { fingerprint, spec }))
     }
 
     pub(crate) fn from_bound(window: &WindowExpression) -> Self {

@@ -130,7 +130,7 @@ fn verify_predicate_order(
 use paro_planner::expression::ReferenceExpression;
 use paro_planner::operator::Projection as LogicalProjection;
 
-use crate::cascades::calibration::{LocalOperatorWork, OP_ENFORCER_STREAM_ROW};
+use crate::cost::calibration::{LocalOperatorWork, OP_ENFORCER_STREAM_ROW};
 
 type WinnerContractMap =
     std::collections::HashMap<paro_planner::plan::PlanNodeId, WinnerPhysicalContract>;
@@ -252,8 +252,8 @@ pub(super) fn extract_frozen_planner_tree(
         payload: PhysicalPayloadId,
         child_count: usize,
         output_columns: Box<[ColumnId]>,
-        enforcers: Box<[crate::cascades::enforcer::EnforcerStep]>,
-        enforcer_cost_input: crate::cascades::engine::EnforcerCostInput,
+        enforcers: Box<[crate::physical::enforcer::EnforcerStep]>,
+        enforcer_cost_input: crate::cost::enforcer::EnforcerCostInput,
         base_contract: WinnerPhysicalContract,
         final_contract: WinnerPhysicalContract,
         output_estimate: Option<paro_planner::plan::CardinalityEstimate>,
@@ -370,7 +370,9 @@ pub(super) fn extract_frozen_planner_tree(
                 } else {
                     match mode {
                         SearchMode::Direct => crate::physical::properties::PlanOrigin::Direct,
-                        SearchMode::Memo | SearchMode::Regional => crate::physical::properties::PlanOrigin::Memo,
+                        SearchMode::Memo | SearchMode::Regional => {
+                            crate::physical::properties::PlanOrigin::Memo
+                        }
                     }
                 };
                 let (region_owner, mut owned_artifacts) = extracted_region_ownership(memo, winner)?;
@@ -565,7 +567,7 @@ pub(super) fn extract_frozen_planner_tree(
                 contracts.insert(plan.id, base_contract.clone());
                 let mut provided = base_contract.provided;
                 let mut cumulative_cost = base_contract.cost;
-                let enforcer_phase = crate::cascades::engine::enforcer_cost(
+                let enforcer_phase = crate::cost::enforcer::enforcer_cost(
                     enforcers.as_ref(),
                     enforcer_cost_input,
                     memo.calibration(),
@@ -583,7 +585,7 @@ pub(super) fn extract_frozen_planner_tree(
                 for (index, enforcer) in enforcers.iter().enumerate() {
                     let is_final = index + 1 == enforcers.len();
                     provided = enforcer.apply(provided, &final_contract.required)?;
-                    let single_phase = crate::cascades::engine::enforcer_cost(
+                    let single_phase = crate::cost::enforcer::enforcer_cost(
                         std::slice::from_ref(enforcer),
                         enforcer_cost_input,
                         memo.calibration(),
@@ -681,12 +683,12 @@ mod occurrence_tests;
 
 pub(super) fn extract_physical_enforcer(
     child: &OwnedLogicalPlan,
-    enforcer: &crate::cascades::enforcer::EnforcerStep,
+    enforcer: &crate::physical::enforcer::EnforcerStep,
     output_columns: &[ColumnId],
     required: &RequiredProperties,
 ) -> Result<ExtractedPhysicalEnforcer> {
     match enforcer {
-        crate::cascades::enforcer::EnforcerStep::Sort(ordering) => {
+        crate::physical::enforcer::EnforcerStep::Sort(ordering) => {
             if ordering.scope != OrderingScope::Global {
                 return Err(paro_error::not_implemented(
                     "partition-local sort requires an exchange-aware physical ABI",
@@ -725,7 +727,7 @@ pub(super) fn extract_physical_enforcer(
                 orders: orders.into_boxed_slice(),
             })
         }
-        crate::cascades::enforcer::EnforcerStep::MutationInputSpool { barrier } => {
+        crate::physical::enforcer::EnforcerStep::MutationInputSpool { barrier } => {
             let MutationSafetyRequirement::StableReadBeforeWrite { targets, snapshot } =
                 &required.mutation_safety
             else {

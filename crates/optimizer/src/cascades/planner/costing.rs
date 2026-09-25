@@ -85,7 +85,7 @@ pub(super) fn planner_runtime_filter_region_contract(
     })
 }
 
-pub(super) use crate::physical::local_cost::*;
+pub(super) use crate::cost::operator::*;
 
 pub(super) fn is_contextual_operator(operator: &LogicalOperator) -> bool {
     matches!(

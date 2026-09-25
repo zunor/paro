@@ -260,7 +260,7 @@ fn trace_probe_reference_to_rowset(
     output_index: usize,
     target: PhysicalPlanNodeId,
 ) -> Option<usize> {
-    paro_optimizer::physical::lineage::trace_rowset_lineage(plan, node, output_index)
+    paro_planner::physical::lineage::trace_rowset_lineage(plan, node, output_index)
         .into_iter()
         .find_map(|(scan, source_index)| (scan == target).then_some(source_index))
 }

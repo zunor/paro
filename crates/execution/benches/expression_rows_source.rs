@@ -22,9 +22,9 @@ use paro_execution::runtime::{
     ValuesSourceExec, WakeGeneration,
 };
 use paro_execution::thread_context::ThreadContext;
-use paro_optimizer::physical::properties::PipelineProperties;
-use paro_optimizer::physical::specs::ValuesSpec;
 use paro_planner::expression::{ConstantExpression, Expression};
+use paro_planner::physical::properties::PipelineProperties;
+use paro_planner::physical::specs::ValuesSpec;
 
 const ROWS: usize = 2_048;
 const COLUMNS: usize = 4;

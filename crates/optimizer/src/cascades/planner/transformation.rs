@@ -410,7 +410,7 @@ impl TransformationRule for PlannerTransformationRule {
         expr: &crate::cascades::memo::LogicalExpr,
         ctx: &RuleContext<'_>,
     ) -> Result<RootDispatch> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Match);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Match);
         let state = self
             .planner_state
             .read()
@@ -510,7 +510,7 @@ impl TransformationRule for PlannerTransformationRule {
     }
 
     fn bindings(&self, expr: LogicalExprId, ctx: &RuleContext<'_>) -> Result<PatternBindingSet> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Match);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Match);
         let state = self
             .planner_state
             .read()
@@ -577,11 +577,11 @@ impl TransformationRule for PlannerTransformationRule {
         binding: &PatternBinding,
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Apply);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Apply);
         let expr = binding.root_expression();
         let target_group = ctx.group();
         let facts = {
-            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Staging);
+            let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Staging);
             let state = self
                 .planner_state
                 .read()
@@ -593,7 +593,7 @@ impl TransformationRule for PlannerTransformationRule {
                 self.budget_class().work_dimension(),
             )?
             else {
-                crate::transformation_rejection::reject::<()>(&mut ctx.rejection_reasons, crate::transformation_rejection::TransformationRejectionGuard::BoundaryUnavailable);
+                crate::diagnostics::rejection::reject::<()>(&mut ctx.rejection_reasons, crate::diagnostics::rejection::TransformationRejectionGuard::BoundaryUnavailable);
                 return Ok(Box::new([]));
             };
             facts
@@ -662,8 +662,9 @@ impl TransformationRule for PlannerTransformationRule {
             None
         };
         let direct_native = {
-            let _b3 =
-                crate::work_partition::enter_b3(crate::work_partition::Bucket::NativeConstruct);
+            let _b3 = crate::diagnostics::work::enter_b3(
+                crate::diagnostics::work::Bucket::NativeConstruct,
+            );
             if matches!(
                 self.transformation,
                 PlannerTransformation::CteInline
@@ -927,13 +928,17 @@ impl TransformationRule for PlannerTransformationRule {
         // constrained joins stay opaque and group holes are never expanded.
         // Native rejection covers the complete selected rewrite, not a
         // request to rebuild that binding as owned IR.
-        if matches!(self.transformation, PlannerTransformation::AggregateNonNullInput
-            | PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown
-            | PlannerTransformation::MarkJoinToSemi | PlannerTransformation::KeyDomainTransfer
-            | PlannerTransformation::AggregateJoinPreaggregation
-            | PlannerTransformation::AggregateInputMaterialization
-            | PlannerTransformation::AggregateDimensionDeferral)
-            && direct_native.is_empty()
+        if matches!(
+            self.transformation,
+            PlannerTransformation::AggregateNonNullInput
+                | PlannerTransformation::TopNIntroduction
+                | PlannerTransformation::LimitPushdown
+                | PlannerTransformation::MarkJoinToSemi
+                | PlannerTransformation::KeyDomainTransfer
+                | PlannerTransformation::AggregateJoinPreaggregation
+                | PlannerTransformation::AggregateInputMaterialization
+                | PlannerTransformation::AggregateDimensionDeferral
+        ) && direct_native.is_empty()
         {
             return Ok(Box::new([]));
         }
@@ -958,7 +963,7 @@ impl TransformationRule for PlannerTransformationRule {
             selected_proofs,
             environment,
         ) = {
-            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Staging);
+            let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Staging);
             let state = self
                 .planner_state
                 .read()
@@ -1007,7 +1012,9 @@ impl TransformationRule for PlannerTransformationRule {
             let (plan, nested_group_holes, selected_proofs) = if native_direct_only {
                 (None, BTreeMap::new(), HashMap::new())
             } else {
-                let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::OwnedRewrite);
+                let _b3 = crate::diagnostics::work::enter_b3(
+                    crate::diagnostics::work::Bucket::OwnedRewrite,
+                );
                 let Some(instantiated) = semantic_plan::instantiate_bound_plan_with_group_holes(
                     ctx.memo(),
                     &state,
@@ -1070,7 +1077,8 @@ impl TransformationRule for PlannerTransformationRule {
             )
         };
         let plans = if let Some(plan) = plan {
-            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::OwnedRewrite);
+            let _b3 =
+                crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::OwnedRewrite);
             if matches!(
                 self.transformation,
                 PlannerTransformation::CteInline
@@ -1159,7 +1167,7 @@ impl TransformationRule for PlannerTransformationRule {
         if plans.is_empty() && direct_native.is_empty() {
             return Ok(Box::new([]));
         }
-        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Staging);
+        let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Staging);
 
         // These rules produce a bounded shell whose leaves are opaque Memo
         // operands. Re-settling that shell only to turn it back into
@@ -1213,7 +1221,10 @@ impl TransformationRule for PlannerTransformationRule {
             let (prepared_plan, root_operator, output_layout, retained_group_holes) =
                 match candidate {
                     PlanCandidate::Native(shell)
-                        if matches!(self.transformation, PlannerTransformation::CteFilterPushdown) =>
+                        if matches!(
+                            self.transformation,
+                            PlannerTransformation::CteFilterPushdown
+                        ) =>
                     {
                         // Native rewrites that change a producer domain or
                         // aggregate namespace must derive their facts before
@@ -1431,7 +1442,8 @@ impl TransformationRule for PlannerTransformationRule {
                         }
                     }
                 };
-            let guard_partition = crate::work_partition::enter_b3(crate::work_partition::Bucket::SemanticGuard);
+            let guard_partition =
+                crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::SemanticGuard);
             let mut preserved_region_facet = None;
             let mut extended_required_region_facets = enclosing_required_region_facets.clone();
             let output_input_context = source_input_context;
@@ -1797,8 +1809,7 @@ fn binding_is_structurally_impossible_for_subsumption(
                     && join.left_projection_map.is_all()
                     && join.right_projection_map.is_all();
                 *has_clean_inner |= clean;
-                *has_reduction |=
-                    matches!(join.join_type, JoinType::Semi | JoinType::RightSemi);
+                *has_reduction |= matches!(join.join_type, JoinType::Semi | JoinType::RightSemi);
             }
             _ => {}
         }
@@ -2120,7 +2131,7 @@ struct PlannerRuleEnvironment {
     control: Arc<super::super::control::SearchControl>,
     bind_context: BindContext,
     session: Arc<paro_context::StatementContext>,
-    cost_model: crate::cost_model::CostModel,
+    cost_model: crate::estimate::selectivity::SelectivityModel,
     budget: SearchBudget,
     verify_enabled: bool,
 }
@@ -2186,7 +2197,7 @@ fn try_native_predicate_transfer(
             if join.join_type == JoinType::Inner
                 && join.duplicate_eliminated_columns.is_empty()
                 && !join.delim_flipped
-                && !crate::expression::comparison_join_has_evaluation_fence(&join) =>
+                && !crate::rewrite::expr::comparison_join_has_evaluation_fence(&join) =>
         {
             (join.left, join.right, true)
         }
@@ -2239,7 +2250,7 @@ fn try_native_predicate_transfer(
             continue;
         }
         let mut tables = SmallVec::<[usize; 4]>::new();
-        crate::expression::traversal::visit_expression(&expression, &mut |candidate| {
+        crate::rewrite::expr::traversal::visit_expression(&expression, &mut |candidate| {
             if let Expression::ColumnRef(column) = candidate {
                 if !tables.contains(&column.binding.table_index) {
                     tables.push(column.binding.table_index);
@@ -2423,12 +2434,8 @@ fn native_predicate_transfer_is_complete(
         && expressions
             .iter()
             .filter(|expression| {
-                !left_filters
-                    .iter()
-                    .any(|local| local.equals(expression))
-                    && !right_filters
-                        .iter()
-                        .any(|local| local.equals(expression))
+                !left_filters.iter().any(|local| local.equals(expression))
+                    && !right_filters.iter().any(|local| local.equals(expression))
             })
             .zip(remaining)
             .all(|(source, residual)| source.equals(residual))
@@ -2602,7 +2609,7 @@ fn native_shell_layouts_for_nodes(
 fn native_expression_bindings(expression: &Expression) -> Option<HashSet<ColumnBinding>> {
     let mut bindings = HashSet::new();
     let mut valid = true;
-    crate::expression::traversal::visit_expression(expression, &mut |expression| {
+    crate::rewrite::expr::traversal::visit_expression(expression, &mut |expression| {
         if let Expression::ColumnRef(column) = expression {
             if column.depth != 0 {
                 valid = false;
@@ -2619,7 +2626,7 @@ fn native_expression_uses_any_binding(
     bindings: &HashSet<ColumnBinding>,
 ) -> bool {
     let mut used = false;
-    crate::expression::traversal::visit_expression(expression, &mut |expression| {
+    crate::rewrite::expr::traversal::visit_expression(expression, &mut |expression| {
         if matches!(
             expression,
             Expression::ColumnRef(column)
@@ -2705,7 +2712,9 @@ fn native_materialize_candidate(
         }
         let left_layout = native_shell_child_layout(&next_join.left, layouts)?;
         let right_layout = native_shell_child_layout(&next_join.right, layouts)?;
-        let Some(side) = native_materialization_side(next_join, candidate, &left_layout, &right_layout) else {
+        let Some(side) =
+            native_materialization_side(next_join, candidate, &left_layout, &right_layout)
+        else {
             break;
         };
         path.push((*next, side));
@@ -2857,7 +2866,8 @@ fn native_materialize_candidate(
     reset_native_aggregate_output(&mut rewritten_aggregate);
     rewritten_aggregate.verify_post_reduction()?;
     let rewritten_aggregate = LogicalOperator::Aggregate(Box::new(rewritten_aggregate));
-    let root_layout = rewritten_aggregate.output_layout_from_child_refs(&[&layouts[root_join_index]]);
+    let root_layout =
+        rewritten_aggregate.output_layout_from_child_refs(&[&layouts[root_join_index]]);
     nodes[root_index].operator = rewritten_aggregate;
     nodes[root_index].source_proofs = Box::new([]);
     layouts[root_index] = root_layout;
@@ -3139,7 +3149,7 @@ fn try_native_key_domain_transfer(
         {
             let mut keys = Vec::new();
             for condition in &conditions {
-                crate::column::lifetime::ColumnLifetimeAnalyzer::extract_column_bindings(
+                crate::rewrite::column::lifetime::ColumnLifetimeAnalyzer::extract_column_bindings(
                     &condition.left,
                     &mut keys,
                 );
@@ -3389,12 +3399,13 @@ fn freeze_native_topn_output(
         let PatternOperand::Expression { expression, .. } = binding else {
             return Err(paro_error::internal("native TopN has no source occurrence"));
         };
-        let logical = memo.logical_expr(*expression).ok_or_else(|| {
-            paro_error::internal("native TopN lost its source expression")
-        })?;
-        let metadata = state.metadata.get(&logical.payload).ok_or_else(|| {
-            paro_error::internal("native TopN lost its source output contract")
-        })?;
+        let logical = memo
+            .logical_expr(*expression)
+            .ok_or_else(|| paro_error::internal("native TopN lost its source expression"))?;
+        let metadata = state
+            .metadata
+            .get(&logical.payload)
+            .ok_or_else(|| paro_error::internal("native TopN lost its source output contract"))?;
         let projection = semantic_plan::projection_for_bindings(
             input.bindings(),
             input.types(),
@@ -3757,19 +3768,17 @@ fn try_native_dimension_deferral(
             // Plain aggregation proves its output grouping key structurally,
             // even when the selected boundary snapshot has not derived it.
             if matches!(shell.nodes[*index].operator, LogicalOperator::Aggregate(_)) {
-                keys.extend(
-                    crate::statistics::unique_keys::derive_unique_keys_from_facts(
-                        &shell.nodes[*index].operator,
-                        &left_layout,
-                        &[],
-                        &[],
-                    ),
-                );
+                keys.extend(crate::estimate::unique_keys::derive_unique_keys_from_facts(
+                    &shell.nodes[*index].operator,
+                    &left_layout,
+                    &[],
+                    &[],
+                ));
             }
             keys
         }
     };
-    if crate::statistics::unique_keys::expressions_cover_unique_key_from_facts(
+    if crate::estimate::unique_keys::expressions_cover_unique_key_from_facts(
         &left_layout,
         &keys,
         &partial_groups.iter().collect::<Vec<_>>(),
@@ -3818,9 +3827,15 @@ fn try_native_dimension_deferral(
     let partial_input = if let NativeChild::Node(index) = &join.left {
         if let Some(group) = native_deferral_region::selected_group(&shell, binding, *index) {
             NativeChild::memo_group(
-                memo, state, facts, group, &Arc::new(left_layout.clone()),
-                (0..left_layout.len()).map(|i| format!("__bound_reference_{i}"))
-                    .collect::<Vec<_>>().into(),
+                memo,
+                state,
+                facts,
+                group,
+                &Arc::new(left_layout.clone()),
+                (0..left_layout.len())
+                    .map(|i| format!("__bound_reference_{i}"))
+                    .collect::<Vec<_>>()
+                    .into(),
             )?
         } else {
             // Region isolation synthesized this join. It has no resident
@@ -4033,7 +4048,7 @@ fn native_collect_union_arms(
 fn native_expression_reads_only(expression: &Expression, allowed: &HashSet<ColumnBinding>) -> bool {
     let mut valid = true;
     let mut read = false;
-    crate::expression::traversal::visit_expression(expression, &mut |expression| {
+    crate::rewrite::expr::traversal::visit_expression(expression, &mut |expression| {
         if let Expression::ColumnRef(column) = expression {
             read = true;
             valid &= column.depth == 0 && allowed.contains(&column.binding);
@@ -4489,7 +4504,7 @@ fn try_native_dimension_sharing(
             all_compatible = false;
             continue;
         };
-        if !crate::aggregate::dimension_sharing::equivalent_dimension_gets(
+        if !crate::rewrite::aggregate::dimension_sharing::equivalent_dimension_gets(
             left_dimension,
             right_dimension,
         ) || right_outer.groups.len() != first_outer.groups.len()
@@ -5123,7 +5138,7 @@ fn native_dimension_expression_domain(
     dimension: &HashSet<ColumnBinding>,
 ) -> NativeDimensionExpressionDomain {
     let mut domain = NativeDimensionExpressionDomain::Constant;
-    crate::expression::traversal::visit_expression(expression, &mut |expression| {
+    crate::rewrite::expr::traversal::visit_expression(expression, &mut |expression| {
         let Expression::ColumnRef(column) = expression else {
             return;
         };
@@ -5281,7 +5296,7 @@ fn native_predicate_transfer_may_apply(
             join.join_type == JoinType::Inner
                 && join.duplicate_eliminated_columns.is_empty()
                 && !join.delim_flipped
-                && !crate::expression::comparison_join_has_evaluation_fence(join)
+                && !crate::rewrite::expr::comparison_join_has_evaluation_fence(join)
         }
         LogicalOperator::Join(Join::Cross(_)) => true,
         _ => false,
@@ -5322,7 +5337,7 @@ fn native_predicate_transfer_may_apply(
     };
     Ok(filter.expressions.iter().any(|expression| {
         let mut tables = SmallVec::<[usize; 4]>::new();
-        crate::expression::traversal::visit_expression(expression, &mut |candidate| {
+        crate::rewrite::expr::traversal::visit_expression(expression, &mut |candidate| {
             if let Expression::ColumnRef(column) = candidate {
                 if !tables.contains(&column.binding.table_index) {
                     tables.push(column.binding.table_index);
@@ -5712,7 +5727,7 @@ fn refresh_native_shell_statistics(
     source_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     environment: &PlannerRuleEnvironment,
 ) -> OwnedLogicalPlan {
-    let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
+    let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Statistics);
     let children = plan.children();
     let child_layouts = children
         .iter()
@@ -5796,10 +5811,10 @@ fn rewrite_planner_expressions(
     plan: OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     environment: &PlannerRuleEnvironment,
-    rejection_reasons: &mut Option<crate::transformation_rejection::RejectionReasons>,
+    rejection_reasons: &mut Option<crate::diagnostics::rejection::RejectionReasons>,
 ) -> Result<Vec<OwnedLogicalPlan>> {
     if matches!(transformation, PlannerTransformation::JoinRegionEnumeration) {
-        return crate::join_order::optimizer::JoinOrderOptimizer::new(
+        return crate::region::join::optimizer::JoinOrderOptimizer::new(
             environment.cost_model.defaults.clone(),
         )
         .with_search_budget(&environment.budget)
@@ -5821,7 +5836,7 @@ fn rewrite_planner_expression(
     transformation: PlannerTransformation,
     plan: OwnedLogicalPlan,
     environment: &PlannerRuleEnvironment,
-    rejection_reasons: &mut Option<crate::transformation_rejection::RejectionReasons>,
+    rejection_reasons: &mut Option<crate::diagnostics::rejection::RejectionReasons>,
 ) -> Result<Option<OwnedLogicalPlan>> {
     let rewritten = match transformation {
         PlannerTransformation::PredicateTransfer => FilterPushdown::new().rewrite_plan(plan),
@@ -5904,9 +5919,9 @@ fn rewrite_planner_expression(
         PlannerTransformation::LatePayloadFetch => {
             let (plan, prefix_changed) = late_payload::rewrite_matched_prefix_node(plan)?;
             if !prefix_changed {
-                crate::transformation_rejection::reject::<()>(
+                crate::diagnostics::rejection::reject::<()>(
                     rejection_reasons,
-                    crate::transformation_rejection::TransformationRejectionGuard::PrefixNoWitness,
+                    crate::diagnostics::rejection::TransformationRejectionGuard::PrefixNoWitness,
                 );
             }
             let (plan, payload_changed) = late_payload::rewrite_node_profiled(
@@ -6337,12 +6352,9 @@ mod tests {
         }
         {
             let state = state.read().unwrap();
-            assert!(native_predicate_transfer_may_apply(
-                &binding.root,
-                &input.memo,
-                &state,
-            )
-            .unwrap());
+            assert!(
+                native_predicate_transfer_may_apply(&binding.root, &input.memo, &state,).unwrap()
+            );
         }
         let before = semantic_plan::owned_binding_instantiation_count();
         let mut context = TransformContext::new(&mut input.memo, input.root);
@@ -6431,7 +6443,8 @@ mod tests {
         input = MemoBuilder::build(filter, BindContext::new(), SearchBudget::default()).unwrap();
         let filter_expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
         let filter_logical = input.memo.logical_expr(filter_expression).unwrap().clone();
-        let filter_binding = PatternBinding::root_only(input.root, filter_expression, &filter_logical);
+        let filter_binding =
+            PatternBinding::root_only(input.root, filter_expression, &filter_logical);
         let state = input.planner_state.clone();
         assert!(binding_is_structurally_impossible(
             PlannerTransformation::PredicateTransfer,

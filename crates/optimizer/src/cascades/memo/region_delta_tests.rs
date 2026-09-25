@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility};
+use crate::binding::column::{ColumnDesc, ColumnOrigin, ColumnVisibility};
 use crate::cascades::ids::ColumnId;
 use crate::cascades::region::{FacetCriticality, RegionFacetKind, RegionScopeContract};
 use paro_common::types::LogicalType;

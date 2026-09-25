@@ -7,33 +7,29 @@
 //! executable call descriptors, while explicit binding domains preserve the
 //! meaning of positional operands at the import/export boundary.
 
+use paro_planner::physical::scalar_identity::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use paro_common::error::{self as paro_error, Result};
+#[cfg(test)]
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_external::routine::identity::{
-    BuiltinIntrinsicId, BuiltinSemanticTag, RoutineCallIdentity,
-};
-use paro_planner::expression::{
-    ComparisonType, ConjunctionType, Expression, ExpressionIdentity, ExpressionIterator,
-};
+use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, ExpressionIterator};
 use paro_planner::operator::join::JoinComparisonType;
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
 
-use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility};
 use super::ids::{ColumnId, Fingerprint, ScalarExprId, StableFingerprintBuilder};
 use super::scalar::{
     ComparisonOp, ScalarAggregate, ScalarArena, ScalarCast, ScalarFunction, ScalarKind,
     ScalarLiteral, ScalarLocalProperties, ScalarSpec, ScalarWindow, Volatility,
 };
+use crate::binding::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility};
 
-mod bindings;
 mod fields;
 pub(super) mod imports;
 mod operator_export;
-pub(crate) use bindings::BindingCatalog;
+use crate::binding::BindingCatalog;
 pub(crate) use operator_export::export_operator_scalars;
 
 pub(crate) fn intern_operator_scalars<Child>(
@@ -629,7 +625,7 @@ fn intern_comparison(
     }
 }
 
-fn intern_column_binding(
+pub(crate) fn intern_column_binding(
     binding: ColumnBinding,
     logical_type: LogicalType,
     binding_ids: &mut BindingCatalog,
@@ -704,509 +700,6 @@ fn join_comparison(comparison: JoinComparisonType) -> ComparisonOp {
     }
 }
 
-pub(crate) fn function_fingerprint(
-    function: &paro_planner::expression::FunctionExpression,
-) -> Fingerprint {
-    function_binding_fingerprint(
-        &function.function,
-        &function.return_type,
-        function.routine_identity(),
-    )
-}
-
-pub(crate) fn function_binding_fingerprint(
-    function: &paro_function::scalar::BoundScalarFunction,
-    return_type: &LogicalType,
-    identity: Option<&RoutineCallIdentity>,
-) -> Fingerprint {
-    let mut builder = StableFingerprintBuilder::default();
-    builder.write_u64(40);
-    if let Some(identity) = identity {
-        encode_routine_identity(&mut builder, identity);
-    } else {
-        builder.write_bytes(function.name.as_bytes());
-    }
-    encode_signature(&mut builder, &function.arguments, return_type);
-    if let Some(data) = &function.bind_data {
-        builder.write_u64(1);
-        builder.write_u64(data.fingerprint());
-    }
-    builder.finish()
-}
-
-pub(crate) fn aggregate_fingerprint(
-    aggregate: &paro_planner::expression::AggregateExpression,
-) -> Fingerprint {
-    aggregate_binding_fingerprint(
-        &aggregate.function,
-        &aggregate.return_type,
-        aggregate.aggr_type,
-        aggregate.filter.is_some(),
-        aggregate
-            .order_bys
-            .iter()
-            .map(|order| (order.ascending, order.nulls_first)),
-        aggregate.bind_info.as_ref(),
-    )
-}
-
-pub(crate) fn aggregate_binding_fingerprint(
-    function: &paro_function::aggregate::AggregateFunction,
-    return_type: &LogicalType,
-    distinct: paro_planner::expression::AggregateType,
-    has_filter: bool,
-    orders: impl ExactSizeIterator<Item = (bool, bool)>,
-    bind_info: Option<&std::sync::Arc<dyn paro_function::scalar::FunctionData>>,
-) -> Fingerprint {
-    let mut builder = StableFingerprintBuilder::default();
-    builder.write_u64(41);
-    builder.write_bytes(function.name.as_bytes());
-    encode_signature(&mut builder, &function.arguments, return_type);
-    builder.write_u64(distinct as u64);
-    builder.write_u64(has_filter as u64);
-    builder.write_u64(orders.len() as u64);
-    for (ascending, nulls_first) in orders {
-        builder.write_u64(ascending as u64);
-        builder.write_u64(nulls_first as u64);
-    }
-    for (role, data) in [(0, function.bind_data.as_ref()), (1, bind_info)] {
-        if let Some(data) = data {
-            builder.write_u64(role);
-            builder.write_u64(data.fingerprint());
-        }
-    }
-    builder.finish()
-}
-
-pub(crate) fn window_fingerprint(
-    window: &paro_planner::expression::WindowExpression,
-) -> Fingerprint {
-    ScalarWindow::from_bound(window).fingerprint()
-}
-
-pub(crate) fn encode_signature(
-    builder: &mut StableFingerprintBuilder,
-    arguments: &[LogicalType],
-    return_type: &LogicalType,
-) {
-    builder.write_u64(arguments.len() as u64);
-    for argument in arguments {
-        super::scalar::encode_logical_type(builder, argument);
-    }
-    super::scalar::encode_logical_type(builder, return_type);
-}
-
-pub(crate) fn encode_routine_identity(
-    builder: &mut StableFingerprintBuilder,
-    identity: &RoutineCallIdentity,
-) {
-    match identity {
-        RoutineCallIdentity::Catalog {
-            routine_id,
-            generation,
-        } => {
-            builder.write_u64(0);
-            builder.write_u64(routine_id.raw());
-            builder.write_u64(*generation);
-        }
-        RoutineCallIdentity::Builtin {
-            intrinsic,
-            semantic_tags,
-        } => {
-            builder.write_u64(1);
-            encode_intrinsic(builder, intrinsic);
-            builder.write_u64(semantic_tags.len() as u64);
-            for tag in semantic_tags {
-                encode_semantic_tag(builder, tag);
-            }
-        }
-    }
-}
-
-fn encode_intrinsic(builder: &mut StableFingerprintBuilder, intrinsic: &BuiltinIntrinsicId) {
-    let (tag, other) = match intrinsic {
-        BuiltinIntrinsicId::Add => (0, None),
-        BuiltinIntrinsicId::Subtract => (1, None),
-        BuiltinIntrinsicId::Multiply => (2, None),
-        BuiltinIntrinsicId::Divide => (3, None),
-        BuiltinIntrinsicId::IntegerDivide => (4, None),
-        BuiltinIntrinsicId::FullTextMatch => (5, None),
-        BuiltinIntrinsicId::FullTextMatchInternal => (6, None),
-        BuiltinIntrinsicId::Bm25 => (7, None),
-        BuiltinIntrinsicId::Bm25ScoreInternal => (8, None),
-        BuiltinIntrinsicId::TsRank => (9, None),
-        BuiltinIntrinsicId::TsRankCd => (10, None),
-        BuiltinIntrinsicId::ToTsVector => (11, None),
-        BuiltinIntrinsicId::PlainToTsQuery => (12, None),
-        BuiltinIntrinsicId::ToTsQuery => (13, None),
-        BuiltinIntrinsicId::PhraseToTsQuery => (14, None),
-        BuiltinIntrinsicId::WebSearchToTsQuery => (15, None),
-        BuiltinIntrinsicId::L2Distance => (16, None),
-        BuiltinIntrinsicId::L1Distance => (17, None),
-        BuiltinIntrinsicId::CosineDistance => (18, None),
-        BuiltinIntrinsicId::NegativeInnerProduct => (19, None),
-        BuiltinIntrinsicId::SparseDistance => (20, None),
-        BuiltinIntrinsicId::Other(value) => (21, Some(value.as_str())),
-    };
-    builder.write_u64(tag);
-    if let Some(other) = other {
-        builder.write_bytes(other.as_bytes());
-    }
-}
-
-fn encode_semantic_tag(builder: &mut StableFingerprintBuilder, tag: &BuiltinSemanticTag) {
-    let (tag, other) = match tag {
-        BuiltinSemanticTag::Deterministic => (0, None),
-        BuiltinSemanticTag::NoSideEffects => (1, None),
-        BuiltinSemanticTag::Foldable => (2, None),
-        BuiltinSemanticTag::SearchOptimized => (3, None),
-        BuiltinSemanticTag::VectorOptimized => (4, None),
-        BuiltinSemanticTag::Other(value) => (5, Some(value.as_str())),
-    };
-    builder.write_u64(tag);
-    if let Some(other) = other {
-        builder.write_bytes(other.as_bytes());
-    }
-}
-
-pub(crate) fn value_fingerprint(value: &Value) -> Fingerprint {
-    let mut builder = StableFingerprintBuilder::default();
-    encode_value(&mut builder, value);
-    builder.finish()
-}
-
-/// Stable structural identity for a bound expression used by planner-side
-/// domain proofs.  This deliberately does not depend on arena-local
-/// `ColumnId`s, insertion order, or pointer addresses.  Conjunction children
-/// are normalized as a multiset because CTE domain equality treats nested
-/// AND/OR arms as commutative and idempotent.
-pub(crate) fn expression_fingerprint(expression: &Expression) -> Fingerprint {
-    // Expression trees can be generated from very long IN/OR lists.  Keep
-    // this identity path explicitly post-order just like logical-plan
-    // staging; a query must not be able to exhaust the native stack merely by
-    // asking the CTE domain interner for a fingerprint.
-    let mut pending = vec![(expression, false)];
-    let mut fingerprints = HashMap::<ExpressionIdentity, Fingerprint>::new();
-    while let Some((current, visited)) = pending.pop() {
-        if fingerprints.contains_key(&current.allocation_identity()) {
-            continue;
-        }
-        if visited {
-            let mut builder = StableFingerprintBuilder::default();
-            encode_expression_node_fingerprint(&mut builder, current, &fingerprints);
-            fingerprints.insert(current.allocation_identity(), builder.finish());
-            continue;
-        }
-        pending.push((current, true));
-        let mut children = Vec::new();
-        if let Expression::Conjunction(conjunction) = current {
-            // Fingerprint only maximal associative runs. Fingerprinting each
-            // nested prefix and then flattening it again is quadratic on a
-            // generated OR chain, even with an explicit traversal stack.
-            let mut run = conjunction.children.iter().collect::<Vec<_>>();
-            let mut expanded = HashSet::new();
-            while let Some(child) = run.pop() {
-                if !expanded.insert(child.allocation_identity()) {
-                    continue;
-                }
-                if let Expression::Conjunction(nested) = child {
-                    if nested.conjunction_type == conjunction.conjunction_type {
-                        run.extend(nested.children.iter());
-                        continue;
-                    }
-                }
-                children.push(child);
-            }
-        } else {
-            ExpressionIterator::enumerate_children(current, |child| children.push(child));
-        }
-        pending.extend(children.into_iter().rev().map(|child| (child, false)));
-    }
-    fingerprints[&expression.allocation_identity()]
-}
-
-/// Physical evaluation identity preserves child order and multiplicity. Domain
-/// proofs intentionally flatten AND/OR as sets; using that normalization for
-/// execution would erase short-circuit order and repeated volatile operands.
-pub(crate) fn physical_expression_fingerprint(expression: &Expression) -> Fingerprint {
-    let mut pending = vec![(expression, false)];
-    let mut fingerprints = HashMap::<ExpressionIdentity, Fingerprint>::new();
-    while let Some((current, visited)) = pending.pop() {
-        if fingerprints.contains_key(&current.allocation_identity()) {
-            continue;
-        }
-        if !visited {
-            pending.push((current, true));
-            ExpressionIterator::enumerate_children(current, |child| pending.push((child, false)));
-            continue;
-        }
-        let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.physical-expression.v1");
-        super::scalar::encode_logical_type(&mut builder, &current.return_type());
-        if let Expression::Conjunction(conjunction) = current {
-            builder.write_u64(match conjunction.conjunction_type {
-                ConjunctionType::And => 4,
-                ConjunctionType::Or => 5,
-            });
-            builder.write_u64(conjunction.children.len() as u64);
-            for child in &conjunction.children {
-                builder.write_fingerprint(expression_child_fingerprint(&fingerprints, child));
-            }
-        } else {
-            encode_expression_node_fingerprint(&mut builder, current, &fingerprints);
-        }
-        fingerprints.insert(current.allocation_identity(), builder.finish());
-    }
-    fingerprints[&expression.allocation_identity()]
-}
-
-fn expression_child_fingerprint(
-    fingerprints: &HashMap<ExpressionIdentity, Fingerprint>,
-    expression: &Expression,
-) -> Fingerprint {
-    *fingerprints
-        .get(&expression.allocation_identity())
-        .expect("expression post-order must fingerprint every child")
-}
-
-fn encode_expression_node_fingerprint(
-    builder: &mut StableFingerprintBuilder,
-    expression: &Expression,
-    fingerprints: &HashMap<ExpressionIdentity, Fingerprint>,
-) {
-    let child_fp = |expression: &Expression| expression_child_fingerprint(fingerprints, expression);
-    match expression {
-        Expression::Constant(constant) => {
-            builder.write_u64(0);
-            builder.write_fingerprint(value_fingerprint(&constant.value));
-        }
-        Expression::ColumnRef(column) => {
-            builder.write_u64(1);
-            builder.write_u64(column.binding.table_index as u64);
-            builder.write_u64(column.binding.column_index as u64);
-            builder.write_u64(column.depth as u64);
-        }
-        Expression::Function(function) => {
-            builder.write_u64(2);
-            builder.write_fingerprint(function_fingerprint(function));
-            builder.write_u64(function.children.len() as u64);
-            for child in &function.children {
-                builder.write_fingerprint(child_fp(child));
-            }
-        }
-        Expression::Cast(cast) => {
-            builder.write_u64(3);
-            super::scalar::encode_logical_type(builder, &cast.target_type);
-            builder.write_u64(cast.try_cast as u64);
-            builder.write_fingerprint(child_fp(&cast.child));
-        }
-        Expression::Conjunction(conjunction) => {
-            builder.write_u64(match conjunction.conjunction_type {
-                ConjunctionType::And => 4,
-                ConjunctionType::Or => 5,
-            });
-            // Domain proofs flatten nested conjunctions of the same kind and
-            // compare their arms as an idempotent set.  Encode that exact
-            // normalization here so the fingerprint remains a necessary
-            // condition for the structural proof (never a source of false
-            // negatives).
-            let mut leaves = Vec::new();
-            let mut pending = conjunction.children.iter().collect::<Vec<_>>();
-            let mut expanded = HashSet::new();
-            while let Some(child) = pending.pop() {
-                if !expanded.insert(child.allocation_identity()) {
-                    continue;
-                }
-                if let Expression::Conjunction(nested) = child {
-                    if nested.conjunction_type == conjunction.conjunction_type {
-                        pending.extend(nested.children.iter());
-                        continue;
-                    }
-                }
-                leaves.push(child);
-            }
-            let mut children = leaves.into_iter().map(child_fp).collect::<Vec<_>>();
-            children.sort_unstable();
-            children.dedup();
-            builder.write_u64(children.len() as u64);
-            for fingerprint in children {
-                builder.write_fingerprint(fingerprint);
-            }
-        }
-        Expression::Case(case) => {
-            builder.write_u64(6);
-            builder.write_fingerprint(child_fp(&case.check));
-            builder.write_fingerprint(child_fp(&case.result_if_true));
-            builder.write_fingerprint(child_fp(&case.result_if_false));
-        }
-        Expression::Comparison(comparison) => {
-            builder.write_u64(7);
-            builder.write_u64(comparison.comparison_type as u64);
-            builder.write_fingerprint(child_fp(&comparison.left));
-            builder.write_fingerprint(child_fp(&comparison.right));
-        }
-        Expression::Operator(operator) => {
-            builder.write_u64(8);
-            builder.write_u64(operator.operator_type as u64);
-            builder.write_u64(operator.children.len() as u64);
-            for child in &operator.children {
-                builder.write_fingerprint(child_fp(child));
-            }
-        }
-        Expression::Parameter(parameter) => {
-            builder.write_u64(9);
-            builder.write_u64(parameter.slot.index.index() as u64);
-            super::scalar::encode_logical_type(builder, &parameter.slot.ty);
-        }
-        Expression::Reference(reference) => {
-            builder.write_u64(10);
-            builder.write_u64(reference.index as u64);
-        }
-        Expression::Aggregate(aggregate) => {
-            builder.write_u64(11);
-            builder.write_fingerprint(aggregate_fingerprint(aggregate));
-            for child in &aggregate.children {
-                builder.write_fingerprint(child_fp(child));
-            }
-            if let Some(filter) = &aggregate.filter {
-                builder.write_u64(1);
-                builder.write_fingerprint(child_fp(filter));
-            } else {
-                builder.write_u64(0);
-            }
-            for order in &aggregate.order_bys {
-                builder.write_u64(order.ascending as u64);
-                builder.write_u64(order.nulls_first as u64);
-                builder.write_fingerprint(child_fp(&order.expression));
-            }
-        }
-        Expression::Subquery(subquery) => {
-            // Unplanned scalar subqueries are rejected at the Query IR
-            // boundary. Keep a typed marker here so a malformed proof cannot
-            // alias a scalar expression of another variant.
-            builder.write_u64(12);
-            builder.write_bytes(format!("{subquery:?}").as_bytes());
-        }
-        Expression::Window(window) => {
-            builder.write_u64(13);
-            builder.write_fingerprint(window_fingerprint(window));
-            for partition in &window.partitions {
-                builder.write_fingerprint(child_fp(partition));
-            }
-            for order in &window.orders {
-                builder.write_u64(order.ascending as u64);
-                builder.write_u64(order.nulls_first as u64);
-                builder.write_fingerprint(child_fp(&order.expression));
-            }
-            encode_frame_bound_fingerprint(builder, &window.frame.start_bound, fingerprints);
-            encode_frame_bound_fingerprint(builder, &window.frame.end_bound, fingerprints);
-        }
-    }
-}
-
-fn encode_frame_bound_fingerprint(
-    builder: &mut StableFingerprintBuilder,
-    bound: &paro_planner::expression::WindowFrameBound,
-    fingerprints: &HashMap<ExpressionIdentity, Fingerprint>,
-) {
-    match bound {
-        paro_planner::expression::WindowFrameBound::Unbounded => builder.write_u64(0),
-        paro_planner::expression::WindowFrameBound::CurrentRow => builder.write_u64(1),
-        paro_planner::expression::WindowFrameBound::Offset(expression) => {
-            builder.write_u64(2);
-            builder.write_fingerprint(expression_child_fingerprint(fingerprints, expression));
-        }
-    }
-}
-
-pub(crate) fn encode_value(builder: &mut StableFingerprintBuilder, value: &Value) {
-    macro_rules! integer {
-        ($tag:expr, $value:expr) => {{
-            builder.write_u64($tag);
-            builder.write_bytes(&$value.to_le_bytes());
-        }};
-    }
-    // Nested values are user-visible constants and can be arbitrarily deep.
-    // Encode them with an explicit work stack, preserving the exact order of
-    // the previous recursive representation while making fingerprinting safe
-    // for generated LIST/STRUCT/ARRAY literals.
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        match value {
-            Value::Null(ty) => {
-                builder.write_u64(0);
-                super::scalar::encode_logical_type(builder, ty);
-            }
-            Value::Boolean(value) => {
-                builder.write_u64(1);
-                builder.write_u64(*value as u64);
-            }
-            Value::TinyInt(value) => integer!(2, value),
-            Value::SmallInt(value) => integer!(3, value),
-            Value::Integer(value) => integer!(4, value),
-            Value::BigInt(value) => integer!(5, value),
-            Value::HugeInt(value) => integer!(6, value),
-            Value::UTinyInt(value) => integer!(7, value),
-            Value::USmallInt(value) => integer!(8, value),
-            Value::UInteger(value) => integer!(9, value),
-            Value::UBigInt(value) => integer!(10, value),
-            Value::UHugeInt(value) => integer!(11, value),
-            Value::Float(value) => integer!(12, value.to_bits()),
-            Value::Double(value) => integer!(13, value.to_bits()),
-            Value::Decimal(value, precision, scale) => {
-                integer!(14, value);
-                builder.write_u64(*precision as u64);
-                builder.write_u64(*scale as u64);
-            }
-            Value::Varchar(value) => {
-                builder.write_u64(15);
-                builder.write_bytes(value.as_bytes());
-            }
-            Value::Blob(value) => {
-                builder.write_u64(16);
-                builder.write_bytes(value);
-            }
-            Value::Uuid(value) => integer!(17, value),
-            Value::Date(value) => integer!(18, value),
-            Value::Timestamp(value) => integer!(19, value),
-            Value::TimestampTz(value) => integer!(20, value),
-            Value::Time(value) => integer!(21, value),
-            Value::Interval(months, days, micros) => {
-                integer!(22, months);
-                builder.write_bytes(&days.to_le_bytes());
-                builder.write_bytes(&micros.to_le_bytes());
-            }
-            Value::List(values, ty) => {
-                builder.write_u64(23);
-                super::scalar::encode_logical_type(builder, ty);
-                builder.write_u64(values.len() as u64);
-                pending.extend(values.iter().rev());
-            }
-            Value::Struct(values, fields) => {
-                builder.write_u64(24);
-                builder.write_u64(fields.len() as u64);
-                for (name, ty) in fields {
-                    builder.write_bytes(name.as_bytes());
-                    super::scalar::encode_logical_type(builder, ty);
-                }
-                pending.extend(values.iter().rev());
-            }
-            Value::Array(values, ty, size) => {
-                builder.write_u64(25);
-                super::scalar::encode_logical_type(builder, ty);
-                builder.write_u64(*size as u64);
-                pending.extend(values.iter().rev());
-            }
-        }
-    }
-}
-
-pub(crate) fn logical_type_fingerprint(logical_type: &LogicalType) -> Fingerprint {
-    let mut fingerprint = StableFingerprintBuilder::default();
-    super::scalar::encode_logical_type(&mut fingerprint, logical_type);
-    fingerprint.finish()
-}
-
 fn typed_binding_fingerprint(binding: ColumnBinding, type_domain: Fingerprint) -> Fingerprint {
     let mut fingerprint = StableFingerprintBuilder::default();
     fingerprint.write_u64(binding.table_index as u64);
@@ -1227,7 +720,7 @@ mod tests {
         };
         use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats};
         use std::sync::Arc;
-        let model = crate::cost_model::CostModel::default();
+        let model = crate::estimate::selectivity::SelectivityModel::default();
         let binding = ColumnBinding::new(1, 0);
         let mut stats = ColumnStatistics::with_estimated_distinct(
             BaseStatistics::create_empty(LogicalType::Integer),
@@ -1339,7 +832,7 @@ mod tests {
 
     #[test]
     fn native_selectivity_never_publishes_an_interrupted_dag_analysis() {
-        let model = crate::cost_model::CostModel::default();
+        let model = crate::estimate::selectivity::SelectivityModel::default();
         let mut arena = ScalarArena::default();
         let bindings = BindingCatalog::default();
         for kind in [ScalarKind::And, ScalarKind::Or] {

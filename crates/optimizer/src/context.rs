@@ -12,8 +12,8 @@ use paro_planner::operator::ColumnBinding;
 use paro_storage::index::graph::GraphStatistics;
 use paro_storage::statistics::ColumnStatistics;
 
-use crate::cost_model::CostModel;
-use crate::profiler::OptimizerProfiler;
+use crate::diagnostics::profile::OptimizerProfiler;
+use crate::estimate::selectivity::SelectivityModel;
 
 /// Immutable column statistics shared by candidate-local optimizer contexts.
 pub type SharedColumnStatistics = Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>;
@@ -81,7 +81,7 @@ pub struct OptimizationContext {
     pub bind_context: BindContext,
     pub column_stats: SharedColumnStatistics,
     pub graph_stats: GraphStatsCache,
-    pub cost_model: CostModel,
+    pub cost_model: SelectivityModel,
     pub verify_enabled: bool,
     pub profiler: OptimizerProfiler,
     pub invalidations: OptimizerInvalidations,
@@ -149,7 +149,7 @@ impl OptimizationContext {
             session,
             bind_context,
             column_stats: Arc::new(HashMap::new()),
-            cost_model: CostModel::default(),
+            cost_model: SelectivityModel::default(),
             verify_enabled,
             profiler: OptimizerProfiler::default(),
             invalidations: OptimizerInvalidations::default(),

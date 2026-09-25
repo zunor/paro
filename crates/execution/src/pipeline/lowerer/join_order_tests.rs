@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use paro_optimizer::physical::{OutputPermutation, ProjectSpec};
+use paro_planner::physical::{OutputPermutation, ProjectSpec};
 
 fn enable_runtime_filter(mut spec: HashJoinSpec) -> HashJoinSpec {
-    spec.runtime_filter = Some(paro_optimizer::physical::HashJoinRuntimeFilterSpec {
-        artifact: paro_optimizer::physical::identity::Fingerprint(7),
-        wait_policy: paro_optimizer::physical::RuntimeFilterWaitPolicy::WaitComplete,
+    spec.runtime_filter = Some(paro_planner::physical::HashJoinRuntimeFilterSpec {
+        artifact: paro_planner::physical::identity::Fingerprint(7),
+        wait_policy: paro_planner::physical::RuntimeFilterWaitPolicy::WaitComplete,
         condition_indices: Box::new([0]),
-        resource: paro_optimizer::physical::RuntimeFilterResourceContract::for_keys(
+        resource: paro_planner::physical::RuntimeFilterResourceContract::for_keys(
             &[paro_common::types::LogicalType::Integer],
             1,
         )
@@ -75,7 +75,7 @@ fn union_all_probe_sources_share_one_build_and_runtime_filter_artifact() {
     }
     assert_eq!(probe_scans.len(), 3);
 
-    let artifact = paro_optimizer::physical::identity::Fingerprint(7);
+    let artifact = paro_planner::physical::identity::Fingerprint(7);
     let PhysicalNodeKind::HashJoin(spec) = &mut plan.nodes.get_mut(plan.root).unwrap().kind else {
         panic!("expected hash join root");
     };
@@ -84,7 +84,7 @@ fn union_all_probe_sources_share_one_build_and_runtime_filter_artifact() {
         plan.edges.push(
             *build_root,
             scan,
-            paro_optimizer::physical::PhysicalEdgeKind::RuntimeFilter(artifact),
+            paro_planner::physical::PhysicalEdgeKind::RuntimeFilter(artifact),
         );
     }
 
@@ -205,7 +205,7 @@ fn union_all_probe_source_collection_uses_an_explicit_stack() {
 
 #[test]
 fn left_deep_hash_join_chain_stays_in_one_probe_pipeline() {
-    let plan = left_deep_hash_join_plan_with_context(ExtractionContext::default());
+    let plan = left_deep_hash_join_plan_with_context(PhysicalBuildContext::default());
     let mut lowerer = PipelineLowerer::new(&plan);
     let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
 
@@ -250,11 +250,11 @@ fn left_deep_hash_join_chain_stays_in_one_probe_pipeline() {
 
 #[test]
 fn left_deep_spillable_hash_join_chain_replays_every_fused_join() {
-    let plan = left_deep_hash_join_plan_with_context(ExtractionContext {
-        grant_spill_policy: paro_optimizer::physical::SpillPolicy::Allowed,
+    let plan = left_deep_hash_join_plan_with_context(PhysicalBuildContext {
+        grant_spill_policy: paro_planner::physical::SpillPolicy::Allowed,
         max_memory: 64 * 1024 * 1024,
         max_threads: 4,
-        ..ExtractionContext::default()
+        ..PhysicalBuildContext::default()
     });
     let mut lowerer = PipelineLowerer::new(&plan);
     let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
@@ -319,7 +319,7 @@ fn direct_rowset_probe_gets_hash_join_runtime_filter_gate() {
     assert_eq!(rowset.dynamic_runtime_filters[0].probe_column_id, 0);
     assert_eq!(
         rowset.dynamic_runtime_filters[0].artifact,
-        paro_optimizer::physical::identity::Fingerprint(7)
+        paro_planner::physical::identity::Fingerprint(7)
     );
 }
 
@@ -626,9 +626,9 @@ fn rowset_source_properties_keep_morsel_partitioning() {
 #[test]
 fn dummy_and_empty_sources_are_single_task() {
     let ctx = BindContext::new();
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
     let dummy = extractor
-        .extract(OwnedLogicalPlan::new(&ctx, LogicalOperator::DummyScan))
+        .build(OwnedLogicalPlan::new(&ctx, LogicalOperator::DummyScan))
         .unwrap();
     let mut dummy_lowerer = PipelineLowerer::new(&dummy);
     let dummy_graph = dummy_lowerer.lower_to_pipeline_graph(dummy.root).unwrap();
@@ -651,9 +651,9 @@ fn dummy_and_empty_sources_are_single_task() {
             vec![LogicalType::Integer],
         )),
     );
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
     let empty = extractor
-        .extract(OwnedLogicalPlan::new(
+        .build(OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::EmptyResult(EmptyResult::new(values)),
         ))
@@ -733,6 +733,6 @@ fn physical_extraction_rejects_unimplemented_nodes_before_lowering() {
             values,
         )),
     );
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    assert!(extractor.extract(distinct).is_err());
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    assert!(extractor.build(distinct).is_err());
 }

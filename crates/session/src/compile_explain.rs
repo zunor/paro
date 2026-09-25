@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Request-level, non-executing compilation. No logical Explain wrapper or cache.
+use crate::prepared::typed_parameters::TypedParameterEnv;
 use crate::{ProtocolResultSink, Session, StatementCompletion};
 use paro_common::{
     chunk::Chunk,
@@ -9,12 +10,14 @@ use paro_common::{
     types::LogicalType,
     vector::Vector,
 };
-use paro_context::{StatementOptions, compile_diagnostics::{CaptureLevel, CompileCapture}};
 use paro_context::ExecutionTerminal;
+use paro_context::{
+    compile_diagnostics::{CaptureLevel, CompileCapture},
+    StatementOptions,
+};
 use paro_execution::query_executor::compiled::ExecutionRequest;
 use paro_execution::query_executor::executor::Executor;
 use paro_parser::ast::{ExplainOption, Statement};
-use crate::prepared::typed_parameters::TypedParameterEnv;
 
 /// Own only the implicit transaction started by this request. Dropping a
 /// backpressured request must not leave it attached to the next statement.
@@ -86,11 +89,12 @@ impl Session {
             auto,
         };
         let session = &mut *transaction.session;
-        let capture = CompileCapture::try_start_with_level(if options.contains(&ExplainOption::Detail) {
-            CaptureLevel::Detail
-        } else {
-            CaptureLevel::Summary
-        });
+        let capture =
+            CompileCapture::try_start_with_level(if options.contains(&ExplainOption::Detail) {
+                CaptureLevel::Detail
+            } else {
+                CaptureLevel::Summary
+            });
         let cancellation = session
             .current_statement_cancellation()
             .expect("compile request scope");
@@ -105,11 +109,8 @@ impl Session {
         // Calling the production compiler exactly once preserves binding, settings,
         // verifier, budgets and cancellation. ANALYZE admits and executes this
         // same immutable artifact below; it never recompiles the target.
-        let result = paro_compiler::compile_statement_with_parameter_types(
-            ctx,
-            target,
-            parameter_types,
-        );
+        let result =
+            paro_compiler::compile_statement_with_parameter_types(ctx, target, parameter_types);
         let compiled = match result {
             Ok(compiled) => compiled,
             Err(e) => {
@@ -253,11 +254,9 @@ mod tests {
                             assert_eq!(a.cost, b.cost);
                             assert_eq!(a.admissible_classes, b.admissible_classes);
                         }
-                        assert!(
-                            session
-                                .reusable_instance_query_plan(&stmt, &[], &ctx)
-                                .is_none()
-                        );
+                        assert!(session
+                            .reusable_instance_query_plan(&stmt, &[], &ctx)
+                            .is_none());
                         let mut sink = crate::CollectingSink::new();
                         session
                             .execute_simple_query(
@@ -266,11 +265,9 @@ mod tests {
                             )
                             .await
                             .unwrap();
-                        assert!(
-                            session
-                                .reusable_instance_query_plan(&stmt, &[], &ctx)
-                                .is_none()
-                        );
+                        assert!(session
+                            .reusable_instance_query_plan(&stmt, &[], &ctx)
+                            .is_none());
                         let token = CancellationToken::new();
                         token.cancel();
                         let mut cancelled = ctx.as_ref().clone();

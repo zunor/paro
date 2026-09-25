@@ -446,7 +446,10 @@ impl SettlementCache {
     pub(super) fn native_column_fingerprint(column: &ColumnStatistics) -> Result<Fingerprint> {
         let mut encoder = StableFingerprintBuilder::default();
         encoder.write_bytes(b"paro.native.relation-column.v1");
-        crate::cascades::scalar::encode_logical_type(&mut encoder, column.statistics().get_type());
+        paro_planner::physical::scalar_identity::encode_logical_type(
+            &mut encoder,
+            column.statistics().get_type(),
+        );
         encoder.write_bytes(&column.to_bytes()?);
         let distinct = column.distinct_evidence();
         encoder.write_u64(distinct.lower);
@@ -581,7 +584,7 @@ impl SettlementCache {
                         });
                 if layout_matches {
                     self.hits += 1;
-                    crate::work_partition::local_lookup(None);
+                    crate::diagnostics::work::local_lookup(None);
                     return Ok(entry);
                 }
             }
@@ -662,13 +665,13 @@ impl SettlementCache {
         if maybe_cached {
             if let Some(entry) = self.locals.get(&key) {
                 self.hits += 1;
-                crate::work_partition::local_lookup(None);
+                crate::diagnostics::work::local_lookup(None);
                 return Ok(entry.clone());
             }
         }
         self.misses += 1;
-        if crate::work_partition::enabled() {
-            crate::work_partition::local_lookup(Some(self.classify_local_miss(
+        if crate::diagnostics::work::enabled() {
+            crate::diagnostics::work::local_lookup(Some(self.classify_local_miss(
                 &key,
                 &shell.operator,
                 recipes,
@@ -686,8 +689,8 @@ impl SettlementCache {
                 .collect::<Result<Vec<_>>>()?,
         )?;
         let statistics_partition =
-            crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
-        crate::expression::scalar_normalizer().visit_operator_expressions(&mut plan.operator);
+            crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Statistics);
+        crate::rewrite::expr::scalar_normalizer().visit_operator_expressions(&mut plan.operator);
         let mut context = crate::context::OptimizationContext::new(
             environment.session.clone(),
             environment.bind_context.clone(),
@@ -792,7 +795,7 @@ impl SettlementCache {
         // in which the last visited branch overwrote the first.
         if let LogicalOperator::SetOperation(_) = &plan.operator {
             if inputs.len() == 2 {
-                crate::statistics::gathering::merge_set_operation_column_statistics(
+                crate::estimate::gathering::merge_set_operation_column_statistics(
                     &output_layout,
                     &self.facts[inputs[0]].columns,
                     &self.facts[inputs[1]].columns,
@@ -1062,12 +1065,14 @@ impl SettlementCache {
         arena: &mut LogicalPlanArena,
         identity: &mut PlannerResidentIdentity<'_>,
     ) -> Result<Option<SettledExpression>> {
-        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
-        let _site = crate::work_partition::cache_site(crate::work_partition::CacheSite::Owned);
+        let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Settlement);
+        let _site =
+            crate::diagnostics::work::cache_site(crate::diagnostics::work::CacheSite::Owned);
         let checkpoint = arena.checkpoint();
         let result = self.settle_arena_impl(plan, environment, arena, identity);
         if !matches!(result, Ok(Some(_))) {
-            let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Rollback);
+            let _b3 =
+                crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Rollback);
             arena.rollback_to(checkpoint)?;
             self.discard_stale_recipes(arena);
         }
@@ -2000,13 +2005,13 @@ mod tests {
             .unwrap();
         assert!(matches!(
             cache.classify_local_miss(key, &annotated.operator, &arena),
-            crate::work_partition::MissKind::SameContentDifferentKey
+            crate::diagnostics::work::MissKind::SameContentDifferentKey
         ));
         let mut changed_input = key.clone();
         changed_input.inputs = Box::new([usize::MAX]);
         assert!(matches!(
             cache.classify_local_miss(&changed_input, &annotated.operator, &arena),
-            crate::work_partition::MissKind::NewContent
+            crate::diagnostics::work::MissKind::NewContent
         ));
     }
 
@@ -2056,7 +2061,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 cache.classify_local_miss(key, &shell.operator, &arena),
-                crate::work_partition::MissKind::NewContent
+                crate::diagnostics::work::MissKind::NewContent
             ));
         }
         assert_ne!(results[0], results[1]);

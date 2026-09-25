@@ -3,48 +3,39 @@
 
 //! Deterministic bounded Cascades optimizer core.
 //!
-//! This module owns the long-term optimizer contracts. It intentionally does
-//! not expose the legacy ordered-pass pipeline: adapters may translate bound
-//! plans into these types, while all equivalence, property, cost, budget and
-//! winner decisions live here.
+//! Explicit alternative to staged planning. Memo equivalence, task lifecycles
+//! and candidate archives live here; plan contracts, binding catalogs and cost
+//! equations have strategy-independent owners. The default driver does not
+//! enter this engine or silently fall back to it.
 
 pub mod bounds;
 pub mod budget;
-pub mod calibration;
-mod catalog_identity;
-pub mod column;
 pub mod control;
 pub mod cost {
     pub use crate::physical::cost::*;
 }
-pub mod enforcer;
 pub mod engine;
 pub mod governor;
 pub mod grant;
-pub mod planner;
-pub mod quality;
-pub mod ids {
-    pub use crate::physical::identity::*;
-}
+pub mod ids;
 pub mod memo;
 pub mod oracle;
-pub mod properties {
-    pub use crate::physical::requirements::*;
-}
+pub mod planner;
+pub mod properties;
+pub mod quality;
 pub mod region;
 pub mod rules;
 pub mod scalar;
 pub(crate) mod scalar_lowering;
 pub mod tasks;
-pub(crate) use scalar_lowering::BindingCatalog;
-pub(crate) use scalar_lowering::{encode_value, physical_expression_fingerprint};
+pub(crate) use crate::binding::BindingCatalog;
 pub mod verifier;
 
-pub use budget::{BudgetDecision, SearchBudget, SearchLedger};
-pub use calibration::{LocalOperatorWork, MachineCalibrationBundle, OpClassRegistry};
-pub use column::{
+pub use crate::binding::column::{
     ColumnCatalog, ColumnDesc, ColumnOrigin, ColumnVisibility, GroupColumn, GroupSchema,
 };
+pub use crate::cost::calibration::{LocalOperatorWork, MachineCalibrationBundle, OpClassRegistry};
+pub use budget::{BudgetDecision, SearchBudget, SearchLedger};
 pub use cost::{CompactRange, SearchCost};
 pub use engine::{
     CascadesEngine, CostContext, DiagnosticStopReason, GrantOptimization, GrantWinner,

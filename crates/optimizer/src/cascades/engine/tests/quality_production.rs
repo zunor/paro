@@ -464,17 +464,16 @@ fn quality_production_dispatches_a_group_hole_continuation_with_its_reads() {
         )
         .unwrap();
     assert_eq!(
-        f.engine.quality_domain_continuation_enqueued_count,
-        1,
+        f.engine.quality_domain_continuation_enqueued_count, 1,
         "same continuation is published once"
     );
     let mut agenda = f.agenda(&[(group, crate::cascades::rules::PREDICATE_TRANSFER_RULE.0, 0)]);
-    assert!(f.engine.pop_transformation_task(&mut agenda).unwrap().is_some());
-    assert_eq!(
-        f.engine
-            .quality_active_forced_transform_goal,
-        Some(f.goal)
-    );
+    assert!(f
+        .engine
+        .pop_transformation_task(&mut agenda)
+        .unwrap()
+        .is_some());
+    assert_eq!(f.engine.quality_active_forced_transform_goal, Some(f.goal));
     let continuation = f
         .engine
         .quality_active_domain_continuation
@@ -553,12 +552,11 @@ fn quality_production_aggregate_coverage_does_not_hide_missing_domain_work() {
         f.engine.pop_transformation_task(&mut agenda).unwrap(),
         Some(f.task(a, 101))
     );
-    assert!(
-        f.engine
-            .pop_transformation_task(&mut agenda)
-            .unwrap()
-            .is_none()
-    );
+    assert!(f
+        .engine
+        .pop_transformation_task(&mut agenda)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -619,12 +617,11 @@ fn quality_production_does_not_promote_other_alternatives_of_the_selected_group(
         Some(other),
         "the nonselected alternative remains in the legal agenda"
     );
-    assert!(
-        f.engine
-            .pop_transformation_task(&mut agenda)
-            .unwrap()
-            .is_none()
-    );
+    assert!(f
+        .engine
+        .pop_transformation_task(&mut agenda)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -675,12 +672,11 @@ fn quality_production_exact_frozen_root_requests_only_its_uncovered_anchor() {
         Some(f.task(a, 101)),
         "covered region stays runnable but is not preferred"
     );
-    assert!(
-        f.engine
-            .pop_transformation_task(&mut agenda)
-            .unwrap()
-            .is_none()
-    );
+    assert!(f
+        .engine
+        .pop_transformation_task(&mut agenda)
+        .unwrap()
+        .is_none());
     assert_eq!(f.engine.quality_producer_dispatch_count, 1);
 
     f.record(&f.evidence([true, true]));
@@ -756,12 +752,11 @@ fn quality_production_round_robin_preserves_the_entire_finite_agenda_under_id_pe
             );
             assert_eq!(seen, exact);
             assert_eq!(order.iter().copied().collect::<BTreeSet<_>>(), expected);
-            assert!(
-                f.engine
-                    .pop_transformation_task(&mut agenda)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(f
+                .engine
+                .pop_transformation_task(&mut agenda)
+                .unwrap()
+                .is_none());
             assert!(agenda.keys.is_empty() && agenda.tasks.is_empty());
             assert_eq!(f.engine.quality_producer_dispatch_count, 4);
             orders.insert(order);
@@ -778,14 +773,13 @@ fn quality_production_child_fact_change_revokes_old_readset_priority() {
     let mut f = Fixture::new(false, [101, 102, 103]);
     let [a, b] = f.regions;
     f.record(&f.evidence([true, false]));
-    assert!(
-        f.engine
-            .task_registry
-            .read_set(f.reads)
-            .unwrap()
-            .is_current(f.engine.memo())
-            .unwrap()
-    );
+    assert!(f
+        .engine
+        .task_registry
+        .read_set(f.reads)
+        .unwrap()
+        .is_current(f.engine.memo())
+        .unwrap());
     let root_read =
         PatternRead::facts_from_group(f.engine.memo(), f.frozen.reference.group).unwrap();
     // Change only a child's facts, not the root, expression IDs, or frozen DAG.
@@ -799,14 +793,13 @@ fn quality_production_child_fact_change_revokes_old_readset_priority() {
         PatternRead::facts_from_group(f.engine.memo(), f.frozen.reference.group).unwrap(),
         root_read
     );
-    assert!(
-        !f.engine
-            .task_registry
-            .read_set(f.reads)
-            .unwrap()
-            .is_current(f.engine.memo())
-            .unwrap()
-    );
+    assert!(!f
+        .engine
+        .task_registry
+        .read_set(f.reads)
+        .unwrap()
+        .is_current(f.engine.memo())
+        .unwrap());
     let mut agenda = f.agenda(&[(f.unrelated, 101, 0), (a, 5, 1), (b, 101, 2)]);
     assert_eq!(
         f.engine.pop_transformation_task(&mut agenda).unwrap(),
@@ -821,12 +814,11 @@ fn quality_production_child_fact_change_revokes_old_readset_priority() {
         f.engine.pop_transformation_task(&mut agenda).unwrap(),
         Some(f.task(b, 101))
     );
-    assert!(
-        f.engine
-            .pop_transformation_task(&mut agenda)
-            .unwrap()
-            .is_none()
-    );
+    assert!(f
+        .engine
+        .pop_transformation_task(&mut agenda)
+        .unwrap()
+        .is_none());
     assert_eq!(f.engine.quality_producer_dispatch_count, 0);
 }
 
@@ -842,12 +834,11 @@ fn quality_production_wrapped_arms_rotate_by_region_and_refresh_same_candidate_c
     }
     let missing = f.evidence([false, false]);
     for witness in missing.aggregate_regions.iter() {
-        assert!(
-            f.frozen
-                .children
-                .iter()
-                .any(|arm| arm.reference.candidate == witness.anchor)
-        );
+        assert!(f
+            .frozen
+            .children
+            .iter()
+            .any(|arm| arm.reference.candidate == witness.anchor));
     }
     f.record(&missing);
     let candidate = f.frozen.reference.candidate;
@@ -927,12 +918,11 @@ fn quality_production_wrapped_arms_rotate_by_region_and_refresh_same_candidate_c
         assert!(seen.insert(task));
     }
     assert_eq!(seen, exact);
-    assert!(
-        f.engine
-            .pop_transformation_task(&mut agenda)
-            .unwrap()
-            .is_none()
-    );
+    assert!(f
+        .engine
+        .pop_transformation_task(&mut agenda)
+        .unwrap()
+        .is_none());
     assert!(agenda.keys.is_empty() && agenda.tasks.is_empty());
     assert_eq!(f.engine.quality_producer_dispatch_count, 2);
 }

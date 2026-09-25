@@ -182,7 +182,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                     .map(|child| child.output_layout())
                     .collect::<Vec<_>>();
                 let layout = plan.operator.output_layout_from_children(&child_layouts);
-                plan.stats.unique_keys = crate::statistics::unique_keys::derive_local_unique_keys(
+                plan.stats.unique_keys = crate::estimate::unique_keys::derive_local_unique_keys(
                     &plan.operator,
                     &layout,
                     &child_layouts,

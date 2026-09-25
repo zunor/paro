@@ -30,7 +30,11 @@ impl TransformationRule for Rewrite {
     }
 
     fn output_bound(&self, _: &PatternBinding, _: &RuleContext<'_>) -> usize {
-        if self.from == 50 { 9 } else { 1 }
+        if self.from == 50 {
+            9
+        } else {
+            1
+        }
     }
 
     fn apply(
@@ -89,10 +93,20 @@ struct Implementation;
 struct NoBinding;
 
 impl TransformationRule for NoBinding {
-    fn id(&self) -> RuleId { RuleId(800) }
-    fn matches_root(&self, _: &crate::cascades::memo::LogicalExpr) -> bool { true }
-    fn matches(&self, _: &crate::cascades::memo::LogicalExpr, _: &RuleContext<'_>) -> bool { false }
-    fn apply(&self, _: LogicalExprId, _: &mut TransformContext<'_>) -> Result<Box<[EquivalentExpression]>> {
+    fn id(&self) -> RuleId {
+        RuleId(800)
+    }
+    fn matches_root(&self, _: &crate::cascades::memo::LogicalExpr) -> bool {
+        true
+    }
+    fn matches(&self, _: &crate::cascades::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        false
+    }
+    fn apply(
+        &self,
+        _: LogicalExprId,
+        _: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
         panic!("a no-match must never reach apply")
     }
 }
@@ -173,7 +187,9 @@ fn search(
     if limited {
         budget.max_rule_firings_per_group = 0;
     }
-    if output_limited { budget.max_optional_logical_exprs_per_group = 0; }
+    if output_limited {
+        budget.max_optional_logical_exprs_per_group = 0;
+    }
     let mut memo = Memo::new(budget);
     let mut groups = (0..3)
         .map(|_| {
@@ -251,15 +267,24 @@ fn search(
     let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
     if !limited {
         assert!(!engine.rule_binding_work().is_empty());
-        assert!(engine.rule_binding_work().get(&RuleId(800)).is_some_and(|work| work.calls > 0));
+        assert!(engine
+            .rule_binding_work()
+            .get(&RuleId(800))
+            .is_some_and(|work| work.calls > 0));
     }
     assert!(!engine.rule_attempts().contains_key(&RuleId(800)));
     if limited || output_limited {
         assert!(engine.rule_attempts().is_empty());
     }
     if output_limited {
-        assert!(engine.rule_binding_work().values().any(|work| work.calls > 0));
-        assert!(engine.rule_budget_exhaustions().values().any(|count| *count > 0));
+        assert!(engine
+            .rule_binding_work()
+            .values()
+            .any(|work| work.calls > 0));
+        assert!(engine
+            .rule_budget_exhaustions()
+            .values()
+            .any(|count| *count > 0));
     }
     let closure = engine
         .memo()
@@ -290,8 +315,14 @@ fn complete_closure_and_optimum_ignore_schedule_ids_and_fingerprints() {
         for reverse_rules in [false, true] {
             for reverse_groups in [false, true] {
                 for reverse_seeds in [false, true] {
-                    let (closure, cost, obligations) =
-                        search(salt, reverse_rules, reverse_groups, reverse_seeds, false, false);
+                    let (closure, cost, obligations) = search(
+                        salt,
+                        reverse_rules,
+                        reverse_groups,
+                        reverse_seeds,
+                        false,
+                        false,
+                    );
                     assert_eq!(closure, expected);
                     assert_eq!(cost, oracle);
                     assert!(obligations.is_empty(), "{obligations:?}");

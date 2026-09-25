@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 #[cfg(test)]
-use crate::cascades::{rules::WorkSourceId, LocalOperatorWork};
+use crate::cost::{calibration::LocalOperatorWork, response::WorkSourceId};
 #[cfg(test)]
 use crate::physical::SpillPolicy;
 use crate::physical::{ObjectiveProfile, ResourceGrantClass};
@@ -37,20 +37,18 @@ use paro_planner::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan};
 use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
-use crate::aggregate::{
-    dimension_deferral, dimension_sharing, input_materialization, join_subsumption, late_payload,
-    post_reduction,
-};
 use crate::context::SharedColumnStatistics;
-use crate::filter::pushdown::FilterPushdown;
-use crate::join::elimination::JoinElimination;
-use crate::statistics::gathering::StatisticsGathering;
-use crate::statistics::propagator::StatisticsPropagator;
-use crate::subquery::scalar_aggregate_window;
+use crate::estimate::gathering::StatisticsGathering;
+use crate::estimate::propagator::StatisticsPropagator;
+use crate::physical::access::late_payload;
+use crate::rewrite::aggregate::{
+    dimension_deferral, dimension_sharing, input_materialization, join_subsumption, post_reduction,
+};
+use crate::rewrite::join::elimination::JoinElimination;
+use crate::rewrite::predicate::pushdown::FilterPushdown;
+use crate::rewrite::subquery::scalar_aggregate_window;
 
 use super::budget::{BudgetDimension, SearchBudget};
-use super::calibration::{MachineCalibrationBundle, ParallelWorkProfile};
-use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility, GroupSchema};
 #[cfg(test)]
 use super::cost::ResourceDimension;
 use super::cost::{CompactRange, SearchCost};
@@ -88,29 +86,32 @@ use super::region::{
     RegionOwnedArtifact,
 };
 use super::rules::{
-    CostComposition, DomainContinuation, EquivalentExpression, GrantDependencyDescriptor,
-    ImplementationContext, ImplementationRegistry, PatternBinding, PatternBindingSet,
-    PatternEnumerationCompletion, PatternOperand, PatternRead, PhysicalCandidate,
-    PhysicalImplementation, QualityDependency, RootDispatch, RuleContext, RulePromise,
-    SidewaysFilterSource, TaskSupplyContract, TransformContext, TransformationBudgetClass,
-    TransformationPreflight, TransformationRule, AGGREGATE_DIMENSION_DEFERRAL_RULE,
-    AGGREGATE_DIMENSION_SHARING_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
-    AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
-    AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_DEMAND_PUSHDOWN_RULE,
-    CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE, CTE_PARTITIONED_MATERIALIZATION_RULE,
-    JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE, KEY_DOMAIN_TRANSFER_RULE,
-    LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE, PREDICATE_TRANSFER_RULE,
-    SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
+    CostComposition, DomainContinuation, EquivalentExpression, ImplementationContext,
+    ImplementationRegistry, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
+    PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, QualityDependency,
+    RootDispatch, RuleContext, RulePromise, TaskSupplyContract, TransformContext,
+    TransformationBudgetClass, TransformationPreflight, TransformationRule,
+    AGGREGATE_DIMENSION_DEFERRAL_RULE, AGGREGATE_DIMENSION_SHARING_RULE,
+    AGGREGATE_INPUT_MATERIALIZATION_RULE, AGGREGATE_JOIN_PREAGGREGATION_RULE,
+    AGGREGATE_JOIN_SUBSUMPTION_RULE, AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE,
+    CTE_DEMAND_PUSHDOWN_RULE, CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE,
+    CTE_PARTITIONED_MATERIALIZATION_RULE, JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE,
+    KEY_DOMAIN_TRANSFER_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
+    PREDICATE_TRANSFER_RULE, SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
 };
 use super::scalar::ScalarArena;
-use super::scalar_lowering::{
-    encode_routine_identity, expression_fingerprint, intern_operator_scalars,
-    logical_type_fingerprint, BindingCatalog,
-};
+use super::scalar_lowering::intern_operator_scalars;
 use super::tasks::ReadSet;
+use crate::binding::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility, GroupSchema};
+use crate::binding::BindingCatalog;
+use crate::cost::calibration::{MachineCalibrationBundle, ParallelWorkProfile};
+use crate::cost::response::{GrantDependencyDescriptor, SidewaysFilterSource};
 use crate::physical::{
     ExtractedEnforcerContract, ExtractedEnforcerContracts, ExtractedPhysicalEnforcer,
     PhysicalImplementationFlavor, WinnerPhysicalContract, WinnerPhysicalContracts,
+};
+use paro_planner::physical::scalar_identity::{
+    encode_routine_identity, expression_fingerprint, logical_type_fingerprint,
 };
 
 mod contracts;
@@ -132,7 +133,6 @@ mod transformation;
 use contracts::*;
 use costing::*;
 use extraction::*;
-pub(crate) use identity::encode_search_request;
 use identity::*;
 use state::*;
 
@@ -612,7 +612,8 @@ fn planner_quality_evidence(
     properties: &mut quality_properties::SelectedQualityProperties,
     policy: &super::quality::QualityBundleRegistry,
 ) -> Result<Option<SelectedQualityEvidence>> {
-    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityEvidence);
+    let _partition =
+        crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityEvidence);
     let goal = reference.goal;
     if winner.candidate != reference.candidate {
         return Ok(None);
@@ -1541,7 +1542,7 @@ impl OptimizationInput {
 
     pub fn optimize(mut self, grant_classes: &[ResourceGrantClass]) -> Result<OptimizationOutput> {
         let preparation_partition =
-            crate::work_partition::enter(crate::work_partition::Bucket::Pre);
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Pre);
         if grant_classes.is_empty() {
             return Err(paro_error::internal(
                 "planner optimization requires at least one resource grant class",
@@ -1753,7 +1754,8 @@ impl OptimizationInput {
             )?
         };
         drop(regional_pricing);
-        let _finish_partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
+        let _finish_partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Finish);
         engine.note_search_return();
         let export_strong_incumbents = self.export_strong_incumbent
             || std::env::var_os("PARO_EXPORT_STRONG_INCUMBENT")
@@ -2528,7 +2530,7 @@ impl MemoBuilder {
                                 LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
                             ) =>
                         {
-                            crate::search::optimizer::SearchOptimizer::new()
+                            crate::physical::access::optimizer::SearchOptimizer::new()
                                 .physical_candidate_for_root(&plan, search_context)?
                         }
                         _ => None,

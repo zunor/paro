@@ -43,7 +43,7 @@ fn hot_path_files_stay_split_and_role_files_stay_thin() {
     );
     let physical = read(&manifest, "src/physical/mod.rs");
     assert!(
-        physical.contains("pub use paro_optimizer::physical::*") && physical.lines().count() <= 12,
+        physical.contains("pub use paro_planner::physical::*") && physical.lines().count() <= 12,
         "execution must keep physical-plan ownership in the optimizer facade"
     );
 }

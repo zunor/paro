@@ -472,12 +472,10 @@ fn domain_closure_reaches_an_exact_aggregate_behind_projection() {
         rebound_columns(&result),
         vec![vec![ColumnBinding::new(0, 7)]]
     );
-    assert!(
-        result
-            .nodes
-            .iter()
-            .any(|node| { matches!(node.operator, LogicalOperator::Aggregate(_)) })
-    );
+    assert!(result
+        .nodes
+        .iter()
+        .any(|node| { matches!(node.operator, LogicalOperator::Aggregate(_)) }));
 }
 
 #[test]
@@ -700,11 +698,7 @@ fn production_binding_records_a_resumable_continuation_at_a_memo_group_hole() {
         .unwrap()
         .key
         .children[0];
-    let aggregate_expression = input
-        .memo
-        .group(aggregate_group)
-        .unwrap()
-        .logical_exprs()[0];
+    let aggregate_expression = input.memo.group(aggregate_group).unwrap().logical_exprs()[0];
     let inner_group = input
         .memo
         .logical_expr(aggregate_expression)
@@ -747,9 +741,10 @@ fn production_binding_records_a_resumable_continuation_at_a_memo_group_hole() {
     assert_eq!(continuation.hole, inner_group);
     assert_eq!(continuation.occurrence, aggregate_expression);
     assert!(!continuation.predicates.is_empty());
-    assert!(continuation.reads.iter().any(|read| {
-        read.group == inner_group && read.logical_frontier_revision.is_some()
-    }));
+    assert!(continuation
+        .reads
+        .iter()
+        .any(|read| { read.group == inner_group && read.logical_frontier_revision.is_some() }));
     let PatternOperand::Expression {
         children: aggregate_children,
         ..
@@ -1093,7 +1088,9 @@ fn domain_refresh_prunes_child_filter_to_parent_aggregate_demand() {
         ),
     )));
     let shell = transfer_shell(shell, &state).unwrap().unwrap();
-    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo).unwrap().unwrap();
+    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo)
+        .unwrap()
+        .unwrap();
     let LogicalOperator::Aggregate(aggregate) = shell.root_operator() else {
         panic!("group-only aggregate must remain the root");
     };
@@ -1141,7 +1138,9 @@ fn repeated_native_refresh_reuses_relation_facts_without_reusing_stale_stats() {
         ),
     )));
     let shell = transfer_shell(shell, &state).unwrap().unwrap();
-    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo).unwrap().unwrap();
+    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo)
+        .unwrap()
+        .unwrap();
     let evaluations = state.settlement_cache.native_relation_fact_evaluations;
     let hits = state.settlement_cache.native_relation_hits;
     let evidence_reuses = state
@@ -1150,7 +1149,9 @@ fn repeated_native_refresh_reuses_relation_facts_without_reusing_stale_stats() {
     let view_reuses = state
         .settlement_cache
         .native_relation_ordered_column_view_reuses;
-    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo).unwrap().unwrap();
+    let (shell, _, _) = refresh_statistics(shell, &mut state, &memo)
+        .unwrap()
+        .unwrap();
     assert!(
         state.settlement_cache.native_relation_hits > hits,
         "the second occurrence should reuse an immutable relation fact entry"
@@ -1160,11 +1161,17 @@ fn repeated_native_refresh_reuses_relation_facts_without_reusing_stale_stats() {
         "a repeated relation must not rerun propagation/gathering"
     );
     assert!(
-        state.settlement_cache.native_relation_cached_evidence_reuses > evidence_reuses,
+        state
+            .settlement_cache
+            .native_relation_cached_evidence_reuses
+            > evidence_reuses,
         "a cached relation must reuse its immutable completed evidence"
     );
     assert!(
-        state.settlement_cache.native_relation_ordered_column_view_reuses > view_reuses,
+        state
+            .settlement_cache
+            .native_relation_ordered_column_view_reuses
+            > view_reuses,
         "a repeated parent edge must reuse the completed positional column view"
     );
     assert!(!shell.nodes.is_empty());
@@ -1299,7 +1306,7 @@ fn production_selected_binding_derives_mixed_aggregate_domain_through_constant_p
 
 #[test]
 fn production_selected_two_domains_publish_one_filter_at_original_hole() {
-    use crate::expression::traversal::associative_terms;
+    use crate::rewrite::expr::traversal::associative_terms;
     use paro_planner::expression::ConjunctionType;
 
     let value = |value: Option<i32>| {

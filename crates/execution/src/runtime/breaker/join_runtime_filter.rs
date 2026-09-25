@@ -18,7 +18,7 @@ use paro_common::memory::{
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, SelectionVector, Vector, VECTOR_SIZE};
-use paro_optimizer::physical::{RuntimeFilterKeyRepresentation, RuntimeFilterResourceContract};
+use paro_planner::physical::{RuntimeFilterKeyRepresentation, RuntimeFilterResourceContract};
 use paro_storage::index::{
     ColumnId, FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateTree,
 };

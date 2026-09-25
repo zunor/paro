@@ -4,15 +4,15 @@
 //! Aggregate TopN construction over the exact selected shell. Admission is
 //! shared with the owned rule; this adapter supplies evidence, not new policy.
 
-use super::PlannerTransformState;
 use super::native_topn_payload::{
     append_rowid, column, node, occurrences, projection, push, source_get,
 };
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use crate::aggregate::late_payload::{
-    RowIdPathPolicy, prove_aggregate_topn_inputs, prove_rowid_operator,
+use super::PlannerTransformState;
+use crate::physical::access::late_payload::{
+    prove_aggregate_topn_inputs, prove_rowid_operator, RowIdPathPolicy,
 };
-use crate::expression::traversal::visit_expression;
+use crate::rewrite::expr::traversal::visit_expression;
 use paro_common::error::{self as error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::expression::Expression;
@@ -52,7 +52,7 @@ pub(super) fn rewrite(
         return Ok(None);
     };
     let Some(candidate) = prove_aggregate_topn_inputs(
-        crate::aggregate::late_payload::AggregateTopNInputs {
+        crate::physical::access::late_payload::AggregateTopNInputs {
             total_rows: topn.limit.saturating_add(topn.offset),
             orders: &topn.orders,
             output: &output,

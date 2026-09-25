@@ -395,8 +395,8 @@ impl CascadesEngine {
                             .iter()
                             .zip(continuation.predicates.iter())
                             .all(|(left, right)| {
-                                crate::cascades::scalar_lowering::expression_fingerprint(left)
-                                    == crate::cascades::scalar_lowering::expression_fingerprint(
+                                paro_planner::physical::scalar_identity::expression_fingerprint(left)
+                                    == paro_planner::physical::scalar_identity::expression_fingerprint(
                                         right,
                                     )
                             })
@@ -431,7 +431,7 @@ impl CascadesEngine {
     ) -> Result<()> {
         let (goal, reference, winner) = selected;
         let _partition =
-            crate::work_partition::enter(crate::work_partition::Bucket::QualityProduction);
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityProduction);
         let Some(mut request) = QualityProductionRequest::from_preflight(
             &self.memo,
             reference,
@@ -476,7 +476,7 @@ impl CascadesEngine {
         missing: &[BundleFact],
     ) -> Result<()> {
         let _partition =
-            crate::work_partition::enter(crate::work_partition::Bucket::QualityProduction);
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityProduction);
         let Some(mut request) =
             QualityProductionRequest::from_candidate(&self.memo, frozen, reads, evidence, missing)
         else {

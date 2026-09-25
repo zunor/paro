@@ -3,32 +3,19 @@
 
 //! Query optimizer passes and supporting infrastructure.
 
+pub(crate) mod binding;
 pub mod cascades;
-mod construction;
 pub mod context;
-pub mod cost_model;
+pub mod cost;
 pub mod optimizer;
 pub mod physical;
-pub mod profiler;
-pub mod statement;
-pub mod transformation_rejection;
+pub(crate) mod statement;
 pub(crate) mod verify;
-pub mod work_partition;
-
-pub mod aggregate;
-pub mod column;
-pub mod cte;
-pub mod expression;
-pub mod external;
-pub mod filter;
-pub mod graph;
-pub mod join;
-pub mod join_order;
-pub mod limit;
-pub mod rules;
-pub mod search;
-pub mod statistics;
-pub mod subquery;
 
 pub use optimizer::{OptimizedStatement, Optimizer};
-pub use statement::{ReturningImageContract, WriteContract};
+
+pub mod estimate;
+pub mod region;
+pub mod rewrite;
+
+pub mod diagnostics;

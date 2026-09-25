@@ -9,10 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use paro_common::error::{self as paro_error, Result};
 
 use super::budget::{BudgetDimension, SearchBudget, SearchLedger};
-use super::calibration::MachineCalibrationBundle;
-use super::column::GroupSchema;
 use super::cost::SearchCost;
-use super::enforcer::{replay_enforcer_chain, EnforcerStep};
 use super::ids::{
     AdmissibleGrantSetId, CandidateId, Fingerprint, GroupId, ImplementationId, LogicalExprId,
     LogicalPayloadId, OptimizationContextId, PhysicalExprId, PhysicalPayloadId, PropertySetId,
@@ -21,6 +18,9 @@ use super::ids::{
 use super::properties::{PropertyInterner, ProvidedProperties, RequiredProperties};
 use super::region::{JointCostProof, RegionFacet, RegionForest};
 use super::rules::CostComposition;
+use crate::binding::column::GroupSchema;
+use crate::cost::calibration::MachineCalibrationBundle;
+use crate::physical::enforcer::{replay_enforcer_chain, EnforcerStep};
 use crate::physical::ObjectiveProfile;
 use paro_planner::operator::cte::CteColumnId;
 use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
@@ -744,7 +744,7 @@ pub enum ContinuationContract {
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OptimizationContext {
     required_region_facets: Box<[Fingerprint]>,
-    filterable_sources: BTreeSet<super::rules::WorkSourceId>,
+    filterable_sources: BTreeSet<crate::cost::response::WorkSourceId>,
     phase: OptimizationPhase,
     ownership: SharedOwnership,
     continuation: ContinuationContract,
@@ -793,7 +793,7 @@ impl OptimizationContext {
         &self.required_region_facets
     }
 
-    pub fn filterable_sources(&self) -> &BTreeSet<super::rules::WorkSourceId> {
+    pub fn filterable_sources(&self) -> &BTreeSet<crate::cost::response::WorkSourceId> {
         &self.filterable_sources
     }
 
@@ -829,7 +829,7 @@ pub struct Winner {
     pub expression: PhysicalExprId,
     pub children: Box<[ChildWinnerRef]>,
     pub enforcers: Box<[EnforcerStep]>,
-    pub enforcer_cost_input: super::engine::EnforcerCostInput,
+    pub enforcer_cost_input: crate::cost::enforcer::EnforcerCostInput,
     pub provided: ProvidedProperties,
     /// Operator-local cost retained so WinnerVerifier can independently
     /// replay composition instead of trusting the enumerator's total.
@@ -840,7 +840,7 @@ pub struct Winner {
     /// Disjoint base-source work retained for safe non-local selectivity
     /// composition. This evidence is replayed with the winner tree and is not
     /// embedded in the fixed-size hot SearchCost value.
-    pub source_work: Box<[super::rules::SourceWork]>,
+    pub source_work: Box<[crate::cost::response::SourceWork]>,
     pub physical_fingerprint: Fingerprint,
     pub joint_cost_proof: Option<JointCostProof>,
 }
@@ -870,7 +870,7 @@ pub struct FrozenCandidate {
 pub(crate) struct CandidateSummary<'a> {
     pub(crate) expression: PhysicalExprId,
     pub(crate) cost: SearchCost,
-    pub(crate) source_work: &'a [super::rules::SourceWork],
+    pub(crate) source_work: &'a [crate::cost::response::SourceWork],
     pub(crate) physical_fingerprint: Fingerprint,
 }
 
@@ -898,7 +898,7 @@ pub struct WinnerFrontier {
     // The frontier indexes immutable published candidates. Its reordering and
     // pruning must neither copy their proof trees nor retire parent references.
     candidates: Vec<Arc<Winner>>,
-    filterable_sources: BTreeSet<super::rules::WorkSourceId>,
+    filterable_sources: BTreeSet<crate::cost::response::WorkSourceId>,
     proposals: u64,
     truncations: u64,
     high_water: usize,
@@ -1097,7 +1097,7 @@ impl WinnerFrontier {
 fn source_response_equal(
     left: &Winner,
     right: &Winner,
-    sources: &BTreeSet<super::rules::WorkSourceId>,
+    sources: &BTreeSet<crate::cost::response::WorkSourceId>,
 ) -> bool {
     if sources.is_empty() {
         return true;
@@ -1114,7 +1114,7 @@ fn source_response_equal(
 fn winner_continuation_cmp(
     left: &Winner,
     right: &Winner,
-    sources: &BTreeSet<super::rules::WorkSourceId>,
+    sources: &BTreeSet<crate::cost::response::WorkSourceId>,
     objective: ObjectiveProfile,
 ) -> Option<std::cmp::Ordering> {
     // A physical goal declares every source an ancestor may filter. Preserve
@@ -1127,7 +1127,7 @@ fn winner_continuation_cmp(
 fn winner_continuation_cmp_summary(
     winner: &Winner,
     summary: &CandidateSummary<'_>,
-    sources: &BTreeSet<super::rules::WorkSourceId>,
+    sources: &BTreeSet<crate::cost::response::WorkSourceId>,
     objective: ObjectiveProfile,
 ) -> Option<std::cmp::Ordering> {
     let order = winner.cost.continuation_cmp_for(&summary.cost, objective)?;
@@ -1149,7 +1149,7 @@ fn winner_continuation_cmp_summary(
 fn summary_continuation_cmp_winner(
     summary: &CandidateSummary<'_>,
     winner: &Winner,
-    sources: &BTreeSet<super::rules::WorkSourceId>,
+    sources: &BTreeSet<crate::cost::response::WorkSourceId>,
     objective: ObjectiveProfile,
 ) -> Option<std::cmp::Ordering> {
     let order = summary.cost.continuation_cmp_for(&winner.cost, objective)?;
@@ -1491,7 +1491,9 @@ impl Memo {
             group.physical_implementation_version = group
                 .physical_implementation_version
                 .checked_add(1)
-                .ok_or_else(|| paro_error::internal("Memo physical implementation revision overflow"))?;
+                .ok_or_else(|| {
+                    paro_error::internal("Memo physical implementation revision overflow")
+                })?;
         }
         Ok(())
     }
@@ -1618,7 +1620,11 @@ impl Memo {
             .expect("Memo statistics read cache poisoned");
         if let Some(previous) = cached.as_ref() {
             if previous.registry_revision == revision
-                && previous.producers.iter().copied().eq(self.statistics_read_producers(group))
+                && previous
+                    .producers
+                    .iter()
+                    .copied()
+                    .eq(self.statistics_read_producers(group))
             {
                 return previous.fingerprint;
             }
@@ -1636,11 +1642,25 @@ impl Memo {
         &'a self,
         group: &'a Group,
     ) -> impl Iterator<Item = Option<(Fingerprint, Fingerprint)>> + 'a {
-        group.logical_properties.cte_references.iter()
-            .flat_map(move |reference| self.cte_producers.get(&reference.cte_index).into_iter().flatten())
-            .map(move |producer| self.group(self.canonical_group(producer.group)).map(|group| (
-                group.logical_fact_fingerprint(), group.statistics_snapshot_fingerprint(),
-            )))
+        group
+            .logical_properties
+            .cte_references
+            .iter()
+            .flat_map(move |reference| {
+                self.cte_producers
+                    .get(&reference.cte_index)
+                    .into_iter()
+                    .flatten()
+            })
+            .map(move |producer| {
+                self.group(self.canonical_group(producer.group))
+                    .map(|group| {
+                        (
+                            group.logical_fact_fingerprint(),
+                            group.statistics_snapshot_fingerprint(),
+                        )
+                    })
+            })
     }
 
     fn advance_cte_registry_revision(&mut self) -> Result<()> {
@@ -2665,7 +2685,10 @@ impl Memo {
         // the input remains available. Such a cyclic alternative is not a
         // replacement representation. Conservatively retain the input if
         // any path can lead back to this group.
-        let mut pending = self.logical_exprs[replacement.index()].key.children.to_vec();
+        let mut pending = self.logical_exprs[replacement.index()]
+            .key
+            .children
+            .to_vec();
         let mut seen = BTreeSet::new();
         while let Some(child) = pending.pop() {
             let child = self.canonical_group(child);
@@ -2778,7 +2801,7 @@ impl Memo {
     pub(super) fn intern_source_demand_context(
         &mut self,
         base: OptimizationContextId,
-        sources: BTreeSet<super::rules::WorkSourceId>,
+        sources: BTreeSet<crate::cost::response::WorkSourceId>,
     ) -> Result<OptimizationContextId> {
         let mut context = self
             .optimization_context(base)
@@ -2802,7 +2825,7 @@ impl Memo {
     pub(super) fn intern_demand_context(
         &mut self,
         base: OptimizationContextId,
-        sources: BTreeSet<super::rules::WorkSourceId>,
+        sources: BTreeSet<crate::cost::response::WorkSourceId>,
         phase: OptimizationPhase,
         ownership: SharedOwnership,
         continuation: ContinuationContract,
@@ -2897,13 +2920,9 @@ impl Memo {
             cardinality,
         } = contract;
         let logical = match operator_encoding {
-            Some(encoding) => self.insert_logical_with_operator_encoding(
-                target,
-                key,
-                payload,
-                proof,
-                encoding,
-            )?,
+            Some(encoding) => {
+                self.insert_logical_with_operator_encoding(target, key, payload, proof, encoding)?
+            }
             None => self.insert_logical(target, key, payload, proof)?,
         };
         self.merge_derived_group_facts(target, &logical_properties, cardinality)?;
@@ -3151,7 +3170,7 @@ impl Memo {
                 .get_mut()
                 .insert_with_limit(goal, proposal, frontier_limit),
         };
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Publish);
         let frontier_changed =
             insertion.selected_changed || insertion.truncated || insertion.published.is_some();
         if insertion.truncated {
@@ -3172,10 +3191,7 @@ impl Memo {
                 .groups
                 .get_mut(group.index())
                 .ok_or_else(|| paro_error::internal("winner group disappeared"))?;
-            let revision = group
-                .physical_frontier_versions
-                .entry(goal)
-                .or_default();
+            let revision = group.physical_frontier_versions.entry(goal).or_default();
             *revision = revision
                 .checked_add(1)
                 .ok_or_else(|| paro_error::internal("Memo physical goal revision overflow"))?;
@@ -3271,7 +3287,8 @@ impl Memo {
     /// is rejected at the handoff boundary instead of being repaired by a
     /// later search pass.
     pub fn freeze_candidate_tree(&self, root: ChildWinnerRef) -> Result<Arc<FrozenCandidate>> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityFreeze);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityFreeze);
         fn visit(
             memo: &Memo,
             reference: ChildWinnerRef,
@@ -3478,9 +3495,8 @@ impl Memo {
             group.physical_index.clear();
             group.winner_frontiers.clear();
             group.physical_frontier_versions.clear();
-            group.physical_implementation_version = group
-                .physical_implementation_version
-                .saturating_add(1);
+            group.physical_implementation_version =
+                group.physical_implementation_version.saturating_add(1);
             group.logical_exprs.sort_unstable();
             let mut unique = BTreeMap::<(LogicalExprKey, Option<Arc<[u8]>>), LogicalExprId>::new();
             for expression in std::mem::take(&mut group.logical_exprs) {

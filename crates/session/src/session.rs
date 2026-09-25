@@ -2291,7 +2291,7 @@ mod tests {
             .admit(small.hard_memory_bytes, 1, 0, |_| true)
             .unwrap();
         assert_eq!(admitted.resources.class, small.id);
-        paro_optimizer::physical::PhysicalPlanVerifier::verify(&admitted.plan).unwrap();
+        paro_planner::physical::PhysicalPlanVerifier::verify(&admitted.plan).unwrap();
         let safe_variant = portfolio
             .variants
             .iter()

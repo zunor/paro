@@ -19,8 +19,8 @@ use paro_external::routine::spec::{
 };
 use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
 use paro_external::runtime::host::default_python_binary;
-use paro_optimizer::physical::ExternalRoutineDescriptor;
 use paro_planner::operator::external_project::ExternalProjectExpression;
+use paro_planner::physical::ExternalRoutineDescriptor;
 use serde_json::{json, Value as JsonValue};
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
@@ -815,9 +815,9 @@ mod tests {
         ExternalRuntimeHost, PythonRuntimeProbe, PythonRuntimeProbeResult, PythonRuntimeProvider,
     };
     use paro_function::scalar::ScalarFunction;
-    use paro_optimizer::physical::{ExecutionResourceContract, ResourceGrantClassId};
     use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
     use paro_planner::operator::external_project::ExternalProjectExpression;
+    use paro_planner::physical::{ExecutionResourceContract, ResourceGrantClassId};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -996,7 +996,7 @@ mod tests {
                         working_set_memory_bytes: 0,
                         memory_ceiling_bytes: u64::try_from(ctx.memory.capacity_bytes())
                             .unwrap_or(u64::MAX),
-                        memory_completion: paro_optimizer::physical::MemoryCompletion::Guaranteed,
+                        memory_completion: paro_planner::physical::MemoryCompletion::Guaranteed,
                         max_parallel_tasks: 1,
                         external_worker_slots: 1,
                     },

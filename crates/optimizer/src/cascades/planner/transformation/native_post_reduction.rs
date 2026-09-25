@@ -18,9 +18,9 @@
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_function::aggregate::AggregateAlgebra;
 use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_function::aggregate::distributive::first_last::get_first_function;
+use paro_function::aggregate::AggregateAlgebra;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression, ExpressionIterator,
     ExpressionVisitDecision, OperatorType, ReferenceExpression,
@@ -29,11 +29,11 @@ use paro_planner::operator::{
     Aggregate, ColumnBinding, Join, LogicalOperator, PostAggregateReduction, Projection,
 };
 
-use crate::aggregate::post_reduction::alpha::AlphaBindings;
-use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
+use crate::rewrite::aggregate::post_reduction::alpha::AlphaBindings;
+use crate::rewrite::aggregate::semantic_kernels::aggregate_kernels_equal;
 
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use super::{Memo, PatternOperand, PlannerTransformState, boundary};
+use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 
 pub(super) fn try_native_aggregate_post_reduction(
     binding: &PatternOperand,
@@ -339,10 +339,8 @@ fn peel_scalar_wrapper(
     ) {
         return None;
     }
-    let [
-        Expression::ColumnRef(first_result),
-        Expression::ColumnRef(count_result),
-    ] = checked.children.as_slice()
+    let [Expression::ColumnRef(first_result), Expression::ColumnRef(count_result)] =
+        checked.children.as_slice()
     else {
         return None;
     };
@@ -639,8 +637,8 @@ mod tests {
     use paro_storage::table::table_factory::TableFactory;
 
     use crate::cascades::budget::SearchBudget;
-    use crate::cascades::planner::MemoBuilder;
     use crate::cascades::planner::transformation::{PlannerTransformation, TransformContext};
+    use crate::cascades::planner::MemoBuilder;
     use crate::cascades::rules::TransformationRule;
     use paro_planner::binder::context::BindContext;
     use paro_planner::plan::OwnedLogicalPlan;

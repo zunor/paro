@@ -11,8 +11,8 @@
 //! expressions or make a quality decision.
 
 use super::*;
-use crate::expression::traversal::visit_expression;
-use crate::filter::pushdown::FilterPushdown;
+use crate::rewrite::expr::traversal::visit_expression;
+use crate::rewrite::predicate::pushdown::FilterPushdown;
 use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
 use std::collections::BTreeSet;
 #[cfg(test)]
@@ -150,13 +150,13 @@ impl DomainFixedPoint {
 /// transfer contract above/below this helper.
 pub(super) fn normalized_domain_identity(expression: &Expression) -> Fingerprint {
     let mut normalized = expression.clone();
-    crate::expression::scalar_normalizer()
+    crate::rewrite::expr::scalar_normalizer()
         .rewrite_expression(&mut normalized, &LogicalOperator::DummyScan);
     let mut fingerprint = StableFingerprintBuilder::default();
     fingerprint.write_bytes(b"paro.necessary-domain.v1");
-    fingerprint.write_fingerprint(crate::cascades::scalar_lowering::expression_fingerprint(
-        &normalized,
-    ));
+    fingerprint.write_fingerprint(
+        paro_planner::physical::scalar_identity::expression_fingerprint(&normalized),
+    );
     fingerprint.finish()
 }
 
@@ -283,7 +283,7 @@ fn projection_predicate<Child>(
             .get(column.binding.column_index)
             .cloned()
     });
-    crate::expression::scalar_normalizer()
+    crate::rewrite::expr::scalar_normalizer()
         .rewrite_expression(&mut mapped, &LogicalOperator::DummyScan);
     Some(mapped)
 }
@@ -380,7 +380,7 @@ fn join_shape_is_transferable<Child>(
             join.join_type == JoinType::Inner
                 && join.duplicate_eliminated_columns.is_empty()
                 && !join.delim_flipped
-                && !crate::expression::comparison_join_has_evaluation_fence(join)
+                && !crate::rewrite::expr::comparison_join_has_evaluation_fence(join)
         }
         LogicalOperator::Join(Join::Cross(_)) => true,
         _ => false,

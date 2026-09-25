@@ -1,62 +1,23 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Immutable physical-plan IR and lowering from selected physical contracts.
+//! Implementation selection and construction of planner-owned physical contracts.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-pub mod children;
-pub mod cost;
-pub mod dependencies;
-pub mod edges;
-pub mod explain;
-pub mod identity;
-pub mod ids;
-pub mod lineage;
-pub mod node;
-pub mod objective;
-pub mod plan;
-pub mod portfolio;
-mod predicate_identity;
-pub mod properties;
-pub mod requirements;
-pub mod resources;
-pub mod row_type;
-pub mod specs;
-pub mod verifier;
-
-pub use children::{InlinePlanChildren, PlanChildren, PlanChildrenArena};
-pub use cost::{MemoryCompletion, SearchCost, UncappedMemoryDemand};
-pub use dependencies::PlanDependencies;
-pub use edges::{PhysicalEdge, PhysicalEdgeArena, PhysicalEdgeId, PhysicalEdgeKind};
-pub use identity::*;
-pub use ids::{PhysicalPlanNodeId, PlanChildrenId};
-pub use node::{OperatorLabel, PhysicalPlanNode};
-pub use objective::ObjectiveProfile;
-pub use plan::{PhysicalIdentityError, PhysicalPlan, PhysicalPlanNodeArena};
-pub use portfolio::*;
-pub use properties::*;
-pub use requirements::{ProvidedProperties, RequiredProperties};
-pub use resources::{
-    ExecutionMemoryContract, RuntimeFilterCapability, RuntimeFilterKeyRepresentation,
-    RuntimeFilterResourceContract,
-};
-pub use row_type::{ColumnIdentity, RowType};
-pub use specs::*;
-pub use verifier::PhysicalPlanVerifier;
+pub(crate) use paro_planner::physical::*;
+pub mod enforcer;
 
 pub(crate) mod aggregate_planning;
 
-pub(crate) mod direct;
-pub mod extraction;
 pub(crate) mod implementation;
-pub(crate) mod join_work;
-pub(crate) mod local_cost;
+pub mod lower;
 mod rewrite;
+pub(crate) mod select;
 pub(crate) mod selected;
 
-pub use extraction::{ExtractionContext, PhysicalPlanExtractor};
+pub use lower::{PhysicalBuildContext, PhysicalPlanBuilder};
 
 pub(crate) mod slot_assignment;
 
@@ -146,3 +107,5 @@ pub(crate) type ExtractedEnforcerContracts =
 
 pub(crate) type StatementWriteContracts =
     Arc<HashMap<paro_planner::plan::PlanNodeId, WriteContract>>;
+
+pub mod access;

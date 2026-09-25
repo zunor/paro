@@ -86,6 +86,8 @@ jobs:
               - '.clippy.toml'
               - '.cargo/**'
               - 'tools/ci/check_memory_runtime_api.py'
+              - 'tools/ci/check_plan_boundaries.py'
+              - 'tools/ci/test_plan_boundaries.py'
               - 'tools/ci/check_operator_runtime_baseline.py'
               - 'tools/ci/generate_optimizer_calibration.py'
               - 'tools/ci/check_policy_evolution.py'
@@ -145,6 +147,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 tools/ci/check_memory_runtime_api.py
+      - run: python3 tools/ci/check_plan_boundaries.py
+      - run: python3 -m unittest discover -s tools/ci -p 'test_plan_boundaries.py'
       - run: python3 tools/ci/check_vector_copy_fallible_api.py
       - run: python3 tools/ci/check_operator_runtime_baseline.py
 

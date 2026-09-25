@@ -67,7 +67,7 @@ fn production_key_domain_respects_the_entire_probe_evaluation_barrier() {
     for control in [false, true] {
         for volatile in [false, true] {
             assert_eq!(
-                crate::filter::domain_transfer::transfer(candidate(volatile, control))
+                crate::rewrite::predicate::domain_transfer::transfer(candidate(volatile, control))
                     .unwrap()
                     .is_some(),
                 !volatile

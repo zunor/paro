@@ -5,7 +5,7 @@
 
 use paro_common::error::{self as paro_error, Result};
 use paro_external::runtime::host::{ExternalDispatchGate, ExternalWorkerLease};
-use paro_optimizer::physical::ExecutionResourceContract;
+use paro_planner::physical::ExecutionResourceContract;
 
 /// The executable counterpart of an optimizer resource contract.
 ///

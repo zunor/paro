@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::native_topn_payload::restore_root_output;
-use super::super::{PlannerTransformation, TransformContext, boundary, matching};
+use super::super::{boundary, matching, PlannerTransformation, TransformContext};
 use super::*;
 use crate::cascades::budget::{BudgetDimension, SearchBudget};
 use crate::cascades::planner::MemoBuilder;
@@ -201,10 +201,10 @@ fn check(plan: OwnedLogicalPlan, expected: bool, inspect: impl FnOnce(&NativeShe
 
 #[test]
 fn native_aggregate_topn_exact_group_remap_apply_and_rollback() {
-    let (_, changed) = crate::aggregate::late_payload::rewrite_node(
+    let (_, changed) = crate::physical::access::late_payload::rewrite_node(
         fixture(None, false),
         &BindContext::new(),
-        &crate::cost_model::CostModel::default(),
+        &crate::estimate::selectivity::SelectivityModel::default(),
     )
     .unwrap();
     assert!(changed);
@@ -284,12 +284,10 @@ fn native_aggregate_topn_exact_group_remap_apply_and_rollback() {
 #[test]
 fn native_aggregate_topn_omits_fetch_when_payload_not_projected() {
     check(fixture(Some(vec![0]), false), true, |_, result| {
-        assert!(
-            !result
-                .nodes
-                .iter()
-                .any(|n| matches!(n.operator, LogicalOperator::RowFetch(_)))
-        );
+        assert!(!result
+            .nodes
+            .iter()
+            .any(|n| matches!(n.operator, LogicalOperator::RowFetch(_))));
         let LogicalOperator::Projection(output) = result.root_operator() else {
             unreachable!()
         };
@@ -299,10 +297,10 @@ fn native_aggregate_topn_omits_fetch_when_payload_not_projected() {
 
 #[test]
 fn native_aggregate_topn_shared_admission_rejects_payload_order() {
-    let (_, changed) = crate::aggregate::late_payload::rewrite_node(
+    let (_, changed) = crate::physical::access::late_payload::rewrite_node(
         fixture(None, true),
         &BindContext::new(),
-        &crate::cost_model::CostModel::default(),
+        &crate::estimate::selectivity::SelectivityModel::default(),
     )
     .unwrap();
     assert!(!changed);

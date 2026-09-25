@@ -230,12 +230,10 @@ fn nonnull_negative_invocation_does_not_hide_new_get_or_changed_facts() {
     let changed = fixture.match_paths();
     assert!(changed.bindings.is_empty());
     assert_eq!(changed.completion, PatternEnumerationCompletion::Complete);
-    assert!(
-        changed
-            .reads
-            .iter()
-            .all(|read| read.is_current(&fixture.memo).unwrap())
-    );
+    assert!(changed
+        .reads
+        .iter()
+        .all(|read| read.is_current(&fixture.memo).unwrap()));
     let changed_leaf = *changed
         .reads
         .iter()

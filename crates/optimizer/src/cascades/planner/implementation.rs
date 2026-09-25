@@ -121,7 +121,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             .map(|metadata| {
                 if metadata.child_required.iter().any(|required| {
                     ctx.memo.required(*required).is_none_or(
-                        crate::cascades::enforcer::EnforcementPlanner::requires_memory_class,
+                        crate::physical::enforcer::EnforcementPlanner::requires_memory_class,
                     )
                 }) {
                     GrantDependencyDescriptor::Sensitive

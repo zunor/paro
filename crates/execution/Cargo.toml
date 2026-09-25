@@ -51,7 +51,6 @@ paro-context = { workspace = true, features = ["test-support"] }
 paro-scheduler = { workspace = true }
 paro-parser = { version = "0.1.0", path = "../parser" }
 paro-planner = { version = "0.1.0", path = "../planner" }
-paro-optimizer = { version = "0.1.0", path = "../optimizer" }
 paro-external = { workspace = true }
 tracing = { workspace = true }
 parking_lot = "0.12"
@@ -64,6 +63,7 @@ smallvec = "1.13"
 arc-swap = "1.7"
 
 [dev-dependencies]
+paro-optimizer = { workspace = true }
 paro-common = { workspace = true, features = ["test-support"] }
 divan = { workspace = true }
 tempfile = "3.8"

@@ -80,13 +80,13 @@ fn native_limit_positive_and_negative_bindings_never_export_owned_ir() {
                 let reference = plan(topn, count, offset, control);
                 let reference_changed = if topn {
                     matches!(
-                        crate::limit::topn::TopNOptimizer::new()
+                        crate::rewrite::limit::topn::TopNOptimizer::new()
                             .optimize_plan(reference)
                             .operator,
                         LogicalOperator::TopN(_)
                     )
                 } else {
-                    crate::limit::pushdown::LimitPushdown::new()
+                    crate::rewrite::limit::pushdown::LimitPushdown::new()
                         .optimize_plan_with_change(reference)
                         .1
                 };

@@ -61,8 +61,14 @@ fn bind_explain_impl(
     for option in &options {
         match option {
             ExplainOption::Verbose => detail.verbose = true,
-            ExplainOption::Compile | ExplainOption::Analyze | ExplainOption::Detail | ExplainOption::FormatText | ExplainOption::FormatJson => {
-                return Err(paro_error::not_supported("EXPLAIN (COMPILE) requires the simple-query request entry"));
+            ExplainOption::Compile
+            | ExplainOption::Analyze
+            | ExplainOption::Detail
+            | ExplainOption::FormatText
+            | ExplainOption::FormatJson => {
+                return Err(paro_error::not_supported(
+                    "EXPLAIN (COMPILE) requires the simple-query request entry",
+                ));
             }
             ExplainOption::Logical | ExplainOption::Optimized | ExplainOption::Decorrelated => {
                 return Err(paro_error::not_implemented(format!(

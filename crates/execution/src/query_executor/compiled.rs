@@ -15,7 +15,7 @@ use paro_context::{
     ArtifactIdentity, CompileEnvironmentKey, CompileReceiptSummary, CompiledArtifactId,
     PlanStructureId, StatementContext,
 };
-use paro_optimizer::physical::{
+use paro_planner::physical::{
     Fingerprint, PhysicalNodeKind, SearchSourceSpec, StableFingerprintBuilder,
 };
 use paro_storage::search::OpenSearchCursorResult;
@@ -198,7 +198,7 @@ fn write_dependency_map(
 
 fn write_plan_dependencies(
     builder: &mut StableFingerprintBuilder,
-    plan: &paro_optimizer::physical::PhysicalPlan,
+    plan: &paro_planner::physical::PhysicalPlan,
 ) {
     let dependencies = &plan.dependencies;
     write_dependency_map(builder, b"catalog", &dependencies.catalog_versions);
@@ -248,8 +248,8 @@ fn write_program_identity(
                 structure.write_u64(class.hard_memory_bytes);
                 structure.write_u64(u64::from(class.max_parallel_tasks));
                 structure.write_u64(match class.spill_policy {
-                    paro_optimizer::physical::SpillPolicy::Forbidden => 0,
-                    paro_optimizer::physical::SpillPolicy::Allowed => 1,
+                    paro_planner::physical::SpillPolicy::Forbidden => 0,
+                    paro_planner::physical::SpillPolicy::Allowed => 1,
                 });
             }
             structure.write_u64(portfolio.variants.len() as u64);
@@ -351,7 +351,7 @@ fn statement_program_dependencies_available(
 }
 
 pub(crate) fn physical_plan_dependencies_available(
-    plan: &paro_optimizer::physical::PhysicalPlan,
+    plan: &paro_planner::physical::PhysicalPlan,
     ctx: &StatementContext,
 ) -> bool {
     fn domain_fingerprint(domain: u64, value: u64) -> Fingerprint {
@@ -362,7 +362,7 @@ pub(crate) fn physical_plan_dependencies_available(
     }
 
     fn table_search_planning_state_available(
-        plan: &paro_optimizer::physical::PhysicalPlan,
+        plan: &paro_planner::physical::PhysicalPlan,
         table: &paro_catalog::entry::TableCatalogEntry,
     ) -> bool {
         let key = domain_fingerprint(1, table.object_id().raw());
@@ -396,7 +396,7 @@ pub(crate) fn physical_plan_dependencies_available(
     }
 
     fn graph_available(
-        plan: &paro_optimizer::physical::PhysicalPlan,
+        plan: &paro_planner::physical::PhysicalPlan,
         ctx: &StatementContext,
         schema_name: &str,
         graph_name: &str,
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn graph_dependency_admission_uses_the_statement_pin_not_the_live_publication() {
         use paro_common::identity::GraphId;
-        use paro_optimizer::physical::{
+        use paro_planner::physical::{
             GraphScanSpec, OperatorLabel, PhysicalPlan, PhysicalPlanNode, PhysicalPlanNodeArena,
             PhysicalPlanNodeId, PlanChildren, RowType,
         };

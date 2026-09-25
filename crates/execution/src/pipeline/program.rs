@@ -44,7 +44,7 @@ use super::handles::{BreakerHandleCatalog, BreakerHandleKind};
 pub enum StatementProgram {
     /// Immutable physical alternatives retained until a query has entered
     /// workload admission and owns its actual memory capacity.
-    Portfolio(paro_optimizer::physical::PhysicalPlanPortfolio),
+    Portfolio(paro_planner::physical::PhysicalPlanPortfolio),
     Pipeline {
         plan: Arc<PhysicalPlan>,
         graph: Arc<PipelineGraph>,
@@ -62,8 +62,8 @@ pub enum StatementProgram {
 /// dependencies have been checked for this execution.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionSelection {
-    pub physical_fingerprint: paro_optimizer::physical::Fingerprint,
-    pub resources: paro_optimizer::physical::ExecutionResourceContract,
+    pub physical_fingerprint: paro_planner::physical::Fingerprint,
+    pub resources: paro_planner::physical::ExecutionResourceContract,
 }
 
 /// A resource-selected program whose physical image has not been lowered yet.
@@ -91,9 +91,7 @@ impl SelectedStatementProgram {
         }
     }
 
-    pub fn execution_resources(
-        &self,
-    ) -> Option<paro_optimizer::physical::ExecutionResourceContract> {
+    pub fn execution_resources(&self) -> Option<paro_planner::physical::ExecutionResourceContract> {
         match self {
             Self::Physical { plan, .. } => plan.execution_resources,
             Self::ExplainAnalyze { target, .. } => target.execution_resources(),
@@ -259,9 +257,7 @@ impl StatementProgram {
         }
     }
 
-    pub fn execution_resources(
-        &self,
-    ) -> Option<paro_optimizer::physical::ExecutionResourceContract> {
+    pub fn execution_resources(&self) -> Option<paro_planner::physical::ExecutionResourceContract> {
         match self {
             Self::Pipeline { plan, .. } => plan.execution_resources,
             Self::ExplainAnalyze { target, .. } => target.execution_resources(),
@@ -282,7 +278,7 @@ impl StatementProgram {
     }
 
     pub fn from_physical_plan(plan: PhysicalPlan) -> Result<Self> {
-        paro_optimizer::physical::PhysicalPlanVerifier::verify(&plan)?;
+        paro_planner::physical::PhysicalPlanVerifier::verify(&plan)?;
         if let crate::physical::specs::PhysicalNodeKind::Utility(spec) = &plan.node(plan.root).kind
         {
             return Ok(Self::Utility(UtilityProgram { spec: spec.clone() }));
@@ -298,7 +294,7 @@ impl StatementProgram {
     }
 
     pub fn from_physical_portfolio<F>(
-        portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
+        portfolio: paro_planner::physical::PhysicalPlanPortfolio,
         available_memory_bytes: u64,
         available_parallel_tasks: u16,
         available_external_worker_slots: u16,
@@ -322,7 +318,7 @@ impl StatementProgram {
     }
 
     pub fn deferred_physical_portfolio(
-        portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
+        portfolio: paro_planner::physical::PhysicalPlanPortfolio,
     ) -> Result<Self> {
         portfolio.verify()?;
         Ok(Self::Portfolio(portfolio))
@@ -416,7 +412,6 @@ impl StatementProgram {
             }
         }
     }
-
 }
 
 #[derive(Debug, Default)]
@@ -1288,15 +1283,15 @@ mod tests {
                     table: test_table(),
                     row_id_index: 1,
                     is_full_table_delete: false,
-                    write: paro_optimizer::physical::WriteContract {
-                        target_relation: paro_optimizer::physical::BaseRelationId(0),
+                    write: paro_planner::physical::WriteContract {
+                        target_relation: paro_planner::physical::BaseRelationId(0),
                         target_object_id: 0,
                         modified_columns: Default::default(),
                         modified_key_columns: Default::default(),
                         snapshot_version: 0,
                         mutation_safety:
-                            paro_optimizer::physical::requirements::MutationSafetyRequirement::None,
-                        returning: paro_optimizer::physical::ReturningImageContract::CountOnly,
+                            paro_planner::physical::requirements::MutationSafetyRequirement::None,
+                        returning: paro_planner::physical::ReturningImageContract::CountOnly,
                     },
                 },
             }),

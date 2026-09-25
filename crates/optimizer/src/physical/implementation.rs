@@ -5,17 +5,18 @@
 //! This module does not allocate Memo groups or schedule search tasks.
 
 use super::cost::{CompactRange, ResourceDimension, ScoreSummary, SearchCost};
-use super::local_cost::base_table_scan_cost;
-use super::local_cost::RuntimeFilterProbeMultiplicity;
 use super::{ColumnId, Fingerprint, PhysicalImplementationFlavor, StableFingerprintBuilder};
-use crate::cascades::rules::GrantDependencyDescriptor;
-use crate::cascades::rules::WorkSourceId;
-use crate::cascades::scalar_lowering::{expression_fingerprint, BindingCatalog};
+use crate::binding::BindingCatalog;
+use crate::cost::operator::base_table_scan_cost;
+use crate::cost::operator::RuntimeFilterProbeMultiplicity;
+use crate::cost::response::GrantDependencyDescriptor;
+use crate::cost::response::WorkSourceId;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::expression::Expression;
 use paro_planner::operator::join::AntiJoinMode;
 use paro_planner::operator::{ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator};
+use paro_planner::physical::scalar_identity::expression_fingerprint;
 use paro_planner::plan::CardinalityEstimate;
 use paro_planner::plan::{NodeStats, OwnedLogicalPlan};
 use std::collections::BTreeMap;
@@ -360,7 +361,7 @@ pub(crate) fn external_operator_cost(
         },
         work_latency: range,
         critical_path: range,
-        external_workers: crate::cascades::ids::ExternalWorkerRequirementSetId(1),
+        external_workers: paro_planner::physical::ExternalWorkerRequirementSetId(1),
         external_worker_slots_upper: 1,
         ..SearchCost::ZERO
     };
@@ -381,7 +382,7 @@ pub(crate) fn selected_cost_facts(
     plan: &OwnedLogicalPlan,
     template: &PlannerCostFacts,
     child_rows_hard_upper: Box<[Option<u64>]>,
-) -> Result<super::local_cost::ResolvedPlannerCostFacts> {
+) -> Result<crate::cost::operator::ResolvedPlannerCostFacts> {
     use super::cost::CompactRange;
     let rows = |plan: &OwnedLogicalPlan| {
         let r =
@@ -401,7 +402,7 @@ pub(crate) fn selected_cost_facts(
         .map(|p| rows(p))
         .collect::<Result<Vec<_>>>()?
         .into_boxed_slice();
-    let output_rows_hard_upper = crate::statistics::cardinality_bound::derive_maximum_cardinality(
+    let output_rows_hard_upper = crate::estimate::cardinality_bound::derive_maximum_cardinality(
         &plan.operator,
         &child_rows_hard_upper,
     );
@@ -422,8 +423,8 @@ pub(crate) fn resolve_cost_facts(
     child_rows: Box<[CompactRange]>,
     output_rows_hard_upper: Option<u64>,
     child_rows_hard_upper: Box<[Option<u64>]>,
-) -> Result<super::local_cost::ResolvedPlannerCostFacts> {
-    use super::local_cost::{ResolvedPlannerCostFacts, ResolvedRuntimeFilterSource};
+) -> Result<crate::cost::operator::ResolvedPlannerCostFacts> {
+    use crate::cost::operator::{ResolvedPlannerCostFacts, ResolvedRuntimeFilterSource};
     Ok(ResolvedPlannerCostFacts {
         output_rows,
         child_rows,
@@ -506,7 +507,7 @@ pub(crate) fn planner_operator_spillable<Child>(operator: &LogicalOperator<Child
             true
         }
         LogicalOperator::Join(Join::Comparison(join)) => {
-            crate::physical::extraction::helpers::supports_external_hash_join_type(join.join_type)
+            crate::physical::lower::helpers::supports_external_hash_join_type(join.join_type)
         }
         // Cross product has two explicit physical implementations. This flag
         // advertises the external one; the in-memory implementation remains a
@@ -536,14 +537,14 @@ pub(crate) fn planner_implementation_set(
     match &plan.operator {
         LogicalOperator::Aggregate(aggregate) => {
             capabilities.perfect_hash_aggregate =
-                crate::physical::extraction::helpers::can_use_perfect_hash_aggregate(
+                crate::physical::lower::helpers::can_use_perfect_hash_aggregate(
                     aggregate,
                     &aggregate.groups,
                     &aggregate.aggregates,
                 )
                 .is_some();
             capabilities.singleton_aggregate_projection =
-                crate::physical::extraction::aggregate::supports_singleton_aggregate_projection(
+                crate::physical::lower::aggregate::supports_singleton_aggregate_projection(
                     aggregate,
                 );
         }
@@ -553,19 +554,19 @@ pub(crate) fn planner_implementation_set(
             capabilities.hash_join_runtime_filter =
                 supports_runtime_filter_auxiliary(join, rowset_scan_pushdown);
             capabilities.sort_range_join =
-                crate::physical::extraction::inequality_join_gate::is_sort_range_join_candidate(
+                crate::physical::lower::inequality_join_gate::is_sort_range_join_candidate(
                     join,
                     plan.stats.estimated_cardinality,
                 );
             capabilities.classic_ie_join =
-                crate::physical::extraction::inequality_join_gate::is_classic_ie_join_candidate(
+                crate::physical::lower::inequality_join_gate::is_classic_ie_join_candidate(
                     join,
                     plan.stats.estimated_cardinality,
                 );
         }
         LogicalOperator::Window(window) => {
             capabilities.partition_aggregate_window =
-                crate::physical::extraction::misc::supports_partition_aggregate_window(window);
+                crate::physical::lower::misc::supports_partition_aggregate_window(window);
         }
         _ => {}
     }
@@ -584,7 +585,7 @@ pub(crate) fn planner_native_implementation_set<Child>(
     match operator {
         LogicalOperator::Aggregate(aggregate) => {
             capabilities.perfect_hash_aggregate =
-                crate::physical::extraction::helpers::can_use_perfect_hash_aggregate(
+                crate::physical::lower::helpers::can_use_perfect_hash_aggregate(
                     aggregate,
                     &aggregate.groups,
                     &aggregate.aggregates,
@@ -787,7 +788,7 @@ impl<'a> RuntimeFilterInput<'a> {
             }
             Self::Boundary { layout, facts } => {
                 if layout.types() == facts.types()
-                    && crate::statistics::unique_keys::expressions_cover_unique_key_from_facts(
+                    && crate::estimate::unique_keys::expressions_cover_unique_key_from_facts(
                         layout,
                         &facts.unique_keys,
                         expressions,
@@ -1375,7 +1376,7 @@ impl PlannerImplementationSet {
 }
 pub(crate) fn planner_cost_facts(
     plan: &OwnedLogicalPlan,
-    column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
+    column_stats: &dyn crate::estimate::ColumnStatisticsLookup,
     binding_ids: &BindingCatalog,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 ) -> Result<PlannerCostFacts> {
@@ -1534,7 +1535,7 @@ pub(crate) fn planner_native_cost_facts<Child>(
     output_row_width: u64,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
     inputs: &[RuntimeFilterInput<'_>],
-    column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
+    column_stats: &dyn crate::estimate::ColumnStatisticsLookup,
     binding_ids: &BindingCatalog,
 ) -> Result<PlannerCostFacts> {
     let (child_materialization_risk_rows, child_row_widths) = child_sizes;
@@ -1648,7 +1649,7 @@ fn fill_runtime_filter_cost_facts<Child>(
     join: &paro_planner::operator::join::ComparisonJoin<Child>,
     left: RuntimeFilterInput<'_>,
     right: RuntimeFilterInput<'_>,
-    column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
+    column_stats: &dyn crate::estimate::ColumnStatisticsLookup,
     binding_ids: &BindingCatalog,
 ) {
     let left_keys = join
@@ -1761,7 +1762,7 @@ pub(crate) enum JoinKeySide {
 
 fn join_key_distinct_expected<Child>(
     join: &paro_planner::operator::join::ComparisonJoin<Child>,
-    column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
+    column_stats: &dyn crate::estimate::ColumnStatisticsLookup,
     side: JoinKeySide,
     bindings: &[ColumnBinding],
 ) -> Option<u64> {
@@ -1858,7 +1859,7 @@ pub(crate) fn infer_runtime_filter_probe_multiplicity<'a>(
 ) -> RuntimeFilterProbeMultiplicity {
     let equality_expressions = equality_expressions.into_iter().collect::<Vec<_>>();
     if !equality_expressions.is_empty()
-        && crate::statistics::unique_keys::expressions_cover_unique_key(plan, &equality_expressions)
+        && crate::estimate::unique_keys::expressions_cover_unique_key(plan, &equality_expressions)
     {
         return RuntimeFilterProbeMultiplicity::DeclaredUnique;
     }

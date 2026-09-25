@@ -164,7 +164,7 @@ pub(super) fn select(
         state,
         |column| {
             evidence.get(&column).map(|(point, values)| {
-                crate::cost_model::ColumnPredicateEvidence {
+                crate::estimate::selectivity::ColumnPredicateEvidence {
                     point: *point,
                     values: values.as_ref().map(|values| values.statistics()),
                     distribution: values.as_ref().and_then(|values| values.distribution()),
@@ -178,7 +178,7 @@ pub(super) fn select(
 pub(super) fn permutation<'a>(
     roots: &[ScalarExprId],
     state: &'a PlannerTransformState,
-    statistics: impl Fn(ColumnId) -> Option<crate::cost_model::ColumnPredicateEvidence<'a>>,
+    statistics: impl Fn(ColumnId) -> Option<crate::estimate::selectivity::ColumnPredicateEvidence<'a>>,
     mut checkpoint: impl FnMut() -> Result<bool>,
 ) -> Result<Option<PredicateSchedule>> {
     if !checkpoint()? {
@@ -400,13 +400,11 @@ mod tests {
             vec![0, 1, 2, 3, 4, 6],
             vec![0, 1, 2, 3, 4, usize::MAX],
         ] {
-            assert!(
-                PredicateOrder {
-                    ordinals: invalid.into_boxed_slice()
-                }
-                .verify(&roots, &arena)
-                .is_err()
-            );
+            assert!(PredicateOrder {
+                ordinals: invalid.into_boxed_slice()
+            }
+            .verify(&roots, &arena)
+            .is_err());
         }
     }
 
@@ -548,18 +546,16 @@ mod tests {
             });
         }
         let state = input.planner_state.read().unwrap();
-        assert!(
-            extract_planner_tree(
-                engine.memo(),
-                &state,
-                &input.bind_context,
-                input.root,
-                winner.goal,
-                winner.winner.candidate,
-                SearchMode::Memo
-            )
-            .is_err()
-        );
+        assert!(extract_planner_tree(
+            engine.memo(),
+            &state,
+            &input.bind_context,
+            input.root,
+            winner.goal,
+            winner.winner.candidate,
+            SearchMode::Memo
+        )
+        .is_err());
     }
 
     #[test]
@@ -627,24 +623,20 @@ mod tests {
         let count = state.payloads.physical_count();
         input.memo.control().begin_optional();
         input.memo.control().expire();
-        assert!(
-            implementation_schedule(
-                logical,
-                &state.metadata[&logical.payload],
-                &state,
-                &input.memo
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(implementation_schedule(
+            logical,
+            &state.metadata[&logical.payload],
+            &state,
+            &input.memo
+        )
+        .unwrap()
+        .is_none());
         assert_eq!(state.payloads.physical_count(), count);
         assert_eq!(state.payloads.schedule_counters()[1].1, 0);
-        assert!(
-            state
-                .payloads
-                .get_physical(state.metadata[&logical.payload].baseline_payload)
-                .is_some()
-        );
+        assert!(state
+            .payloads
+            .get_physical(state.metadata[&logical.payload].baseline_payload)
+            .is_some());
     }
 
     #[test]

@@ -143,7 +143,7 @@ struct PhysicalPayloadStorage {
 #[derive(Debug, Default)]
 pub(super) struct JoinRegionCache {
     pub(super) entries:
-        BTreeMap<(GroupId, Box<[u8]>), Arc<crate::join_order::optimizer::JoinGraphEnumeration>>,
+        BTreeMap<(GroupId, Box<[u8]>), Arc<crate::region::join::optimizer::JoinGraphEnumeration>>,
     pub(super) hits: u64,
     pub(super) builds: u64,
 }
@@ -355,7 +355,7 @@ pub(super) struct PlannerTransformState {
     pub(super) binder: Option<Binder>,
     pub(super) bind_context: BindContext,
     pub(super) session: Option<Arc<paro_context::StatementContext>>,
-    pub(super) cost_model: crate::cost_model::CostModel,
+    pub(super) cost_model: crate::estimate::selectivity::SelectivityModel,
     pub(super) verify_enabled: bool,
     pub(super) rowset_scan_pushdown: bool,
     pub(super) scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
@@ -425,7 +425,7 @@ impl PlannerTransformState {
     }
 
     pub(super) fn rollback_to(&mut self, savepoint: PlannerTransformSavepoint) -> Result<()> {
-        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Rollback);
+        let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Rollback);
         self.staging_arena
             .rollback_to(savepoint.staging_arena_checkpoint)?;
         self.settlement_cache
@@ -609,8 +609,8 @@ pub(super) struct PlannerOperatorMetadata {
 }
 
 impl PlannerOperatorMetadata {
-    pub(super) fn local_cost_model(&self) -> crate::physical::local_cost::LocalCostModel<'_> {
-        crate::physical::local_cost::LocalCostModel {
+    pub(super) fn local_cost_model(&self) -> crate::cost::operator::LocalCostModel<'_> {
+        crate::cost::operator::LocalCostModel {
             operator_type: self.operator_type,
             local_cost: self.local_cost,
             baseline: self.implementations.baseline,

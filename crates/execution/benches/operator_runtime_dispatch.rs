@@ -40,13 +40,11 @@ use paro_execution::runtime::{
     SourcePoll, TaskMemoryGrants, TransformGlobal, TransformLocal, TransformPoll, WakeGeneration,
 };
 use paro_execution::thread_context::ThreadContext;
-use paro_optimizer::physical::properties::PipelineProperties;
-use paro_optimizer::physical::row_type::RowType;
-use paro_optimizer::physical::specs::{
-    ChunkScanSpec, FilterSpec, ProjectSpec, SpillExecutionPolicy,
-};
 use paro_planner::expression::{Expression, ReferenceExpression};
 use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::physical::properties::PipelineProperties;
+use paro_planner::physical::row_type::RowType;
+use paro_planner::physical::specs::{ChunkScanSpec, FilterSpec, ProjectSpec, SpillExecutionPolicy};
 
 const CHAIN_ITERS: usize = 256;
 const SCRATCH_ITERS: usize = 4096;

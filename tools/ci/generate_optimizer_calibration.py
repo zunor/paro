@@ -14,7 +14,7 @@ import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE = REPO_ROOT / "benchmark/calibration/optimizer_cost_model.toml"
-OUTPUT = REPO_ROOT / "crates/optimizer/src/cascades/calibration/generated.rs"
+OUTPUT = REPO_ROOT / "crates/optimizer/src/cost/calibration/generated.rs"
 REQUIRED_CLASSES = {*range(1, 18), 20_001, 20_002, 20_003, 20_004}
 DIMENSIONS = {
     "Cpu",

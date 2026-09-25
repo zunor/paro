@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::PgCodec;
 
-use super::copy::{CopyFrontendMode, create_copy_in_source, create_copy_out_sink};
+use super::copy::{create_copy_in_source, create_copy_out_sink, CopyFrontendMode};
 use super::result::PgWireResultSink;
 
 pub struct ProtocolSink<'a> {

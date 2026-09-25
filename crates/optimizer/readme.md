@@ -1,9 +1,7 @@
 # Paro optimizer
 
 This crate turns bound statements into validated physical planning artifacts.
-It contains semantic normalization, Memo-based exploration, physical
-implementation and costing, property enforcement, candidate verification, and
-resource-aware plan portfolios.
+The default path uses deterministic rewrites, shared estimates, bounded relational regions and committed physical construction. Explicit Memo policies remain available for controlled comparisons.
 
 This document is a source map and a contract guide, not a benchmark diary.
 Diagnostic search paths and proposed convergence work are not automatically
@@ -13,38 +11,47 @@ corresponding evidence before making performance or correctness claims.
 ## Architecture
 
 ~~~text
-Bound statement / owned binder IR
-    -> semantic normalization and resident expression construction
-    -> Memo groups, scalar identities, relational facts and statistics
-    -> bounded logical / physical search for requirements and grant contexts
-    -> exact candidate choices, verification and frozen artifacts
-    -> physical portfolio
-    -> resource admission and execution lowering outside this crate
-
-Read-only diagnostics observe this flow; they must not select a plan.
+Bound statement (paro-planner)
+    -> statement/query split
+    -> rewrite: semantic normalization
+    -> estimate: column domains and relational estimates
+    -> region: legal join/aggregate alternatives with shared physical costs
+    -> physical: implementation selection, slots and immutable plan construction
+    -> shared physical artifact (paro-planner::physical)
+    -> execution: admission, executable image and runtime pipelines
 ~~~
 
-The opt-in `regional` policy runs a finite ordered native producer program,
-then costs the closed catalog without a logical exploration agenda. It shares
-the IR, semantic proofs, physical contracts and extraction with the current
-planner; it is not yet a lightweight region-local physical solver. See the
-[regional pipeline contract](../../docs/optimizer/regional-pipeline.md).
-The default must not change solely because a new scheduler terminates sooner.
+The default SQL policy is `pipeline`; its staged driver is
+[optimizer/staged.rs](src/optimizer/staged.rs). The public entry point routes
+explicit Memo policies to [optimizer/cascades.rs](src/optimizer/cascades.rs).
+There is no implicit policy fallback. Retaining the alternative engine does
+not make it the owner of common plan types or cost equations.
 
-The convergence target is one normalization/construction contract for both
-initial expressions and newly produced alternatives. Binder-owned mutable IR
-is legitimate; repeated whole-tree transport inside search is not the target
-architecture. Remaining bridges must be assessed by their ownership and
-semantic contract, not merely by whether a type is called “owned”.
+`paro-planner` owns binding, expressions, logical plans and immutable physical
+contracts. `paro-execution` has no production dependency on this crate. Its
+optimizer dev-dependency only builds test fixtures. Search-local ids and the
+property interner stay in `cascades`; shared plans carry neither a Memo nor a
+task registry. Published cost/resource values are contracts, not a searcher.
 
-Physical tasks retain immutable, shared ReadSet/dependency snapshots. Opening
-optional implementations invalidates coverage/completion, not the exact prices
-of unchanged child choices. Facts, requirements, calibration and grant contexts
-still control reuse. A retained mandatory winner remains an incumbent; it does
-not certify that a child's optional domain has been visited or completed.
-The immutable archive and price cache survive that transition, while active
-frontier membership reopens. Re-admission reuses the original candidate
-allocation; it is not another pricing pass or proof of full search completion.
+`rewrite` owns semantic transformations, not cost-based acceptance. Regions
+may use the same transformations to construct alternatives; they own the
+choice. `estimate` separates statistical expectations from semantic bounds.
+`cost` owns calibration and work formulas shared by both strategies. A DP
+transition must not restart whole-tree planning merely to reuse a formula.
+`physical/select` chooses implementations; `physical/lower` builds the selected
+plan. These are different responsibilities, not competing plan generators.
+
+Diagnostics retain typed receipts, bounded capture and explicit omission and
+completion states. Memo-specific detail remains attributable to that policy.
+Runtime admission, write isolation and capability checks are not debug-only
+checks. An execution occurrence is not interchangeable with a shared node id.
+
+Directory migration does not authorize deleting the explicit Cascades path,
+changing rule semantics, regenerating SQL expectations, or discarding evidence.
+Pure moves preserve canonical byte encoding and require result/type/order and
+resource checks in addition to plan-identity comparisons. Algorithm merging
+is a separate change requiring corpus validation; do not infer equivalence
+from similar filenames or one successful query.
 
 Frozen winners lower through immutable selected occurrences with cached output
 layouts and assigned scalar slots ([selected.rs](src/physical/selected.rs)).
@@ -59,34 +66,25 @@ Paths below are relative to this crate.
 
 | Area | Entry points | Responsibility |
 | --- | --- | --- |
-| Public orchestration | [lib.rs](src/lib.rs), [optimizer.rs](src/optimizer.rs) | Statement optimization, normalization, extraction and portfolio assembly |
-| Query context | [context.rs](src/context.rs) | Planning configuration and statement-scoped context |
-| Memo | [cascades/memo.rs](src/cascades/memo.rs) | Groups, alternatives, facts, frontiers, exact candidate identities and frozen candidates |
-| Search | [cascades/engine.rs](src/cascades/engine.rs) | Implementation, composition, publication and candidate handoff |
-| Finite relational program | [program](src/cascades/planner/regional.rs), [driver](src/cascades/engine/regional.rs) | Ordered normalization and bounded regional alternatives before physical costing |
-| Tasks | [cascades/tasks.rs](src/cascades/tasks.rs) | Goal-scoped work, read sets, continuations, invalidation and lifecycle |
-| Search bounds | [cascades/budget.rs](src/cascades/budget.rs), [cascades/control.rs](src/cascades/control.rs) | Work budgets, cancellation and incomplete-search reporting |
-| Scalar IR | [cascades/scalar.rs](src/cascades/scalar.rs), [cascades/scalar_lowering.rs](src/cascades/scalar_lowering.rs) | Interned expressions and binding-aware import/export |
-| Planner integration | [cascades/planner/mod.rs](src/cascades/planner/mod.rs), [state.rs](src/cascades/planner/state.rs) | Logical/physical payloads and planner contracts |
-| Transformations | [transformation.rs](src/cascades/planner/transformation.rs), [staging.rs](src/cascades/planner/transformation/staging.rs), [settlement.rs](src/cascades/planner/transformation/settlement.rs) | Matching, semantic production, resident facts and transactional publication |
-| Domain transfer | [domain_transfer.rs](src/cascades/planner/domain_transfer.rs), [quality_domain.rs](src/cascades/planner/quality_domain.rs) | Safe column/domain transport and selected-candidate evidence |
-| Quality policy | [cascades/quality.rs](src/cascades/quality.rs), [quality_production.rs](src/cascades/engine/quality_production.rs) | Candidate coverage, missing requirements and policy-driven handoff |
-| Specialized search | [join_order/](src/join_order/), [cte/](src/cte/), [graph/](src/graph/), [search/](src/search/) | Domain-specific normalization and candidate generation |
-| Statistics | [statistics/](src/statistics/), [cost_model.rs](src/cost_model.rs) | Evidence propagation and estimation |
-| Physical contracts | [physical/requirements.rs](src/physical/requirements.rs), [physical/cost.rs](src/physical/cost.rs), [physical/objective.rs](src/physical/objective.rs), [physical/resources.rs](src/physical/resources.rs) | Properties, work/cost composition, actual objective ordering and resource feasibility |
-| Portfolio / extraction | [physical/portfolio.rs](src/physical/portfolio.rs), [physical/extraction/](src/physical/extraction/) | Grant variants and physical construction |
-| Verification | [cascades/verifier.rs](src/cascades/verifier.rs), [physical/verifier.rs](src/physical/verifier.rs), [verify.rs](src/verify.rs) | Memo, physical and logical invariants |
-| Observability | [profiler.rs](src/profiler.rs), [work_partition.rs](src/work_partition.rs), [b3.rs](src/work_partition/b3.rs), [diagnostic_snapshot.rs](src/cascades/memo/diagnostic_snapshot.rs), [compiler boundary](../compiler/src/compile.rs) | Profiling scopes, detailed attribution and bounded snapshots; actual emitters also live in optimizer.rs, cascades/engine.rs and cascades/planner/mod.rs |
-
-Names and tables here are navigation, not a second implementation registry.
-Update links when moving code; keep operator/rule registration authoritative
-in code.
+| Public orchestration | [lib.rs](src/lib.rs), [optimizer.rs](src/optimizer.rs), [staged driver](src/optimizer/staged.rs) | Statement boundaries and ordered stage orchestration |
+| Context and binding | [context.rs](src/context.rs), [binding/](src/binding/) | Planning inputs and query-local operand domains |
+| Logical rewrites | [rewrite/](src/rewrite/), [normalize.rs](src/rewrite/normalize.rs) | Semantic transformations and ordered normalization |
+| Estimation | [estimate/](src/estimate/), [selectivity.rs](src/estimate/selectivity.rs) | Column statistics, selectivity, relation estimates and separately justified bounds |
+| Cost | [cost/](src/cost/), [calibration.rs](src/cost/calibration.rs), [operator.rs](src/cost/operator.rs) | Shared work formulas, resource floors and calibrated response |
+| Regions | [region/](src/region/), [join/](src/region/join/), [aggregate.rs](src/region/aggregate.rs) | Connected enumeration and grain-aware state transitions; shared traversal, distinct state domains |
+| Physical decisions | [select.rs](src/physical/select.rs), [implementation.rs](src/physical/implementation.rs), [access/](src/physical/access/) | Committed implementation and access-path choices |
+| Physical construction | [lower/](src/physical/lower/), [selected.rs](src/physical/selected.rs) | One constructor for both strategies, column slots and final payloads |
+| Shared plan contracts | [planner physical/](../planner/src/physical/) | Immutable plan, canonical identity, resource/admission and runtime verification contracts |
+| Compile diagnostics | [diagnostics/](src/diagnostics/), [compiler boundary](../compiler/src/compile.rs) | Bounded capture, work attribution and explicit terminal states |
+| Explicit Memo alternative | [adapter](src/optimizer/cascades.rs), [cascades/](src/cascades/) | Search-specific identities, property interning, alternatives, tasks, bounds and quality handoff |
+| Logical verification | [verify.rs](src/verify.rs) | Bound logical-plan invariants |
 
 ## Contracts to preserve
 
-These are required invariants. The convergence plan tracks remaining
-violations; listing an invariant here is not evidence that every existing path
-already satisfies it.
+These are required invariants. Memo/group/task clauses apply to the retained
+Cascades policy, not to the staged default. Shared semantic, physical, resource
+and evidence contracts apply to both. Listing an invariant is not a claim that
+every existing path already satisfies it.
 
 ### Semantics and facts
 
@@ -95,7 +93,7 @@ already satisfies it.
 - A projection or wrapper is not proof that a rewrite is safe across an outer
   join, aggregate, CTE or recursive boundary.
 - Local canonical laws share the postorder construction boundary in
-  `construction.rs`; nonlocal substitutions and predicate routing keep their
+  `rewrite/normalize.rs`; nonlocal substitutions and predicate routing keep their
   ordered barriers. Scalar-root reuse requires a live immutable allocation
   witness, not a stale address or an assumption that a pass ran previously.
 - Relation facts and statistics have an explicit owner and revision.
@@ -268,22 +266,18 @@ actual execution of that sealed artifact.
 The optimizer is one producer in a compiler-wide record, not the owner of
 session or execution instrumentation.
 
-The current Compile Evidence wire contract is schema v3. Physical identity is
-intended to be split from admission and execution: `PlanStructureId` will be
-derived from typed executable topology and payload, `CompiledArtifactId`
-includes the immutable dependency contract, and `ExecutionReceiptId` belongs
-to one actual admission. This crate does not yet certify that boundary because
-the working physical encoder still has a Debug-derived payload fallback; that
-fallback must be replaced with explicit typed binary encoders before the ID is
-used as a cross-run proof. The benchmark consumer must not reconstruct compile
-timing from `paro_optimizers()`, display text, arena ids or occurrence numbers.
-Current readers reject older evidence schemas, and missing identity joins remain
-`Uncovered` rather than being guessed.
+The Compile Evidence wire contract is schema v3. The canonical physical encoder
+is owned by `paro-planner::physical`: `PlanStructureId` describes typed
+executable topology and payload, `CompiledArtifactId` also includes immutable
+dependencies, and admission/execution receipts belong to actual invocations.
+Invalid physical identity graphs return structured errors before artifact
+construction. Canonical encodings are explicit; display/Debug formatting and
+query-local arena ids must not enter a cross-run identity. Equal fingerprints
+remain locators, not semantic equivalence proofs.
 
-Invalid physical identity graphs are rejected with a structured error before
-artifact construction. This does not certify the identity: replacing the
-remaining Debug-derived payload path with a complete typed canonical encoder is
-still required before cross-run `PlanStructureId` reuse.
+The benchmark consumer must not reconstruct compile timing from
+`paro_optimizers()`, display text or occurrence numbers. Readers reject older
+evidence schemas; missing identity joins remain `Uncovered`, never guessed.
 
 Summary is the default; bounded Detail is an opt-in T3 surface for supported
 COMPILE targets. It retains fixed opaque references from the real Memo and
@@ -317,9 +311,9 @@ The production decisions have different contracts:
 
 | Decision | Source | Meaning |
 | --- | --- | --- |
-| Continuation pruning | [cost.rs](src/physical/cost.rs) and [memo.rs](src/cascades/memo.rs) | Pareto comparison plus goal-dependent source-response equivalence; it can return no order |
-| Frontier selection | [objective.rs](src/physical/objective.rs) and [memo.rs](src/cascades/memo.rs) | Objective ordering among retained candidates, with caller tie-breaks |
-| Runtime admission | [portfolio.rs](src/physical/portfolio.rs) | Actual-resource and dependency checks, then objective selection among admissible operating points |
+| Continuation pruning | [cost.rs](../planner/src/physical/cost.rs) and [memo.rs](src/cascades/memo.rs) | Pareto comparison plus goal-dependent source-response equivalence; it can return no order |
+| Frontier selection | [objective.rs](../planner/src/physical/objective.rs) and [memo.rs](src/cascades/memo.rs) | Objective ordering among retained candidates, with caller tie-breaks |
+| Runtime admission | [portfolio.rs](../planner/src/physical/portfolio.rs) | Actual-resource and dependency checks, then objective selection among admissible operating points |
 
 Different task supplies block continuation dominance; they do not prohibit
 all comparisons across grant classes. Goal isolation and admission are

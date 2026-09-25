@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use crate::physical::identity::{BaseRelationId, SnapshotId};
 use crate::physical::requirements::MutationSafetyRequirement;
-pub use crate::physical::{ReturningImageContract, WriteContract};
 use paro_catalog::entry::{CatalogEntry, ConstraintType, TableCatalogEntry};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -22,6 +21,7 @@ use paro_planner::expression::Expression;
 use paro_planner::operator::{
     CopyTo, Delete, Explain, ExplainSpec, Insert, InsertOnConflict, LogicalOperator, Update,
 };
+use paro_planner::physical::{ReturningImageContract, WriteContract};
 use paro_planner::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan, PlanNodeId};
 
 #[derive(Debug, Clone)]

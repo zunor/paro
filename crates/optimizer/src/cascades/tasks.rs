@@ -242,7 +242,8 @@ impl ReadSet {
     /// Validate once per cursor; allocate only when at least one input
     /// changed. The old snapshot remains immutable for its task/evidence.
     pub(crate) fn refreshed(&self, memo: &Memo) -> Result<(Self, bool)> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Dependencies);
         let mut changed = None;
         for (index, read) in self.reads.iter().enumerate() {
             let current = read.refreshed(memo)?;
@@ -262,7 +263,8 @@ impl ReadSet {
     }
 
     pub fn is_current(&self, memo: &Memo) -> Result<bool> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Dependencies);
         self.reads
             .iter()
             .try_fold(true, |current, read| Ok(current && read.is_current(memo)?))
@@ -679,7 +681,8 @@ impl TaskRegistry {
         reads: ReadSet,
         memo: &Memo,
     ) -> Result<TaskRequest> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Dependencies);
         let intent = canonicalize_task_intent(memo, intent);
         let reads = canonicalize_read_set(memo, reads);
         self.request_with_current_reads(intent, reads, Some(memo), false)
@@ -693,7 +696,8 @@ impl TaskRegistry {
         intent: TaskIntent,
         observed: CurrentReadSet<'_>,
     ) -> Result<TaskRequest> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Dependencies);
         let intent = canonicalize_task_intent(observed.memo, intent);
         self.request_with_current_reads(intent, observed.reads, Some(observed.memo), true)
     }
@@ -1026,7 +1030,8 @@ impl TaskRegistry {
         memo: &Memo,
         reads: ReadSet,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Dependencies);
         if !matches!(self.state(task), Some(TaskState::Running)) {
             return Err(paro_error::internal(
                 "only a running task may replace its read set",
@@ -1915,7 +1920,7 @@ mod tests {
     fn canonical_task_reads_are_shared_not_reassembled() {
         let mut memo = Memo::new(Default::default());
         let group = memo.create_group(
-            crate::cascades::column::GroupSchema::new([]).unwrap(),
+            crate::binding::column::GroupSchema::new([]).unwrap(),
             crate::cascades::memo::LogicalProperties::default(),
             crate::cascades::memo::GroupCardinality::default(),
         );
@@ -1957,7 +1962,7 @@ mod tests {
             }
         );
     }
-    use crate::cascades::column::GroupSchema;
+    use crate::binding::column::GroupSchema;
     use crate::cascades::ids::{LogicalPayloadId, PropertySetId};
     use crate::cascades::memo::{
         EquivalenceProof, GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties,
@@ -2913,16 +2918,14 @@ mod tests {
         let obligation = registry
             .add_completion_obligation(task, "unrun child combination")
             .unwrap();
-        assert!(
-            registry
-                .complete(
-                    task,
-                    TaskOutcome::Progress {
-                        cursor: CursorId::new(0)
-                    }
-                )
-                .is_err()
-        );
+        assert!(registry
+            .complete(
+                task,
+                TaskOutcome::Progress {
+                    cursor: CursorId::new(0)
+                }
+            )
+            .is_err());
         registry.discharge_obligation(task, obligation).unwrap();
         registry
             .complete(
@@ -2951,37 +2954,31 @@ mod tests {
                 10,
             )
             .unwrap();
-        assert!(
-            registry
-                .bound_is_current(proof, &Memo::new(Default::default()))
-                .unwrap()
-        );
+        assert!(registry
+            .bound_is_current(proof, &Memo::new(Default::default()))
+            .unwrap());
         assert!(matches!(
             registry.bound(proof).unwrap().kind,
             BoundProofKind::Lower { value: 10 }
         ));
 
-        assert!(
-            registry
-                .record_lower_bound(
-                    task,
-                    BoundContext {
-                        group: GroupId::new(1),
-                        goal: goal(),
-                        reads,
-                        search_domain: Fingerprint(8),
-                    },
-                    11,
-                )
-                .is_err()
-        );
+        assert!(registry
+            .record_lower_bound(
+                task,
+                BoundContext {
+                    group: GroupId::new(1),
+                    goal: goal(),
+                    reads,
+                    search_domain: Fingerprint(8),
+                },
+                11,
+            )
+            .is_err());
 
         registry.invalidate(task).unwrap();
-        assert!(
-            !registry
-                .bound_is_current(proof, &Memo::new(Default::default()))
-                .unwrap()
-        );
+        assert!(!registry
+            .bound_is_current(proof, &Memo::new(Default::default()))
+            .unwrap());
     }
 
     #[test]
@@ -3006,11 +3003,9 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(
-            registry
-                .bound_is_current(proof, &Memo::new(Default::default()))
-                .unwrap()
-        );
+        assert!(registry
+            .bound_is_current(proof, &Memo::new(Default::default()))
+            .unwrap());
 
         let (mut ordinary_registry, ordinary_task) = registry_with_task();
         let ordinary_reads = ordinary_registry.intern_read_set(ReadSet::empty());
@@ -3032,10 +3027,8 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(
-            !ordinary_registry
-                .bound_is_current(ordinary_proof, &Memo::new(Default::default()))
-                .unwrap()
-        );
+        assert!(!ordinary_registry
+            .bound_is_current(ordinary_proof, &Memo::new(Default::default()))
+            .unwrap());
     }
 }

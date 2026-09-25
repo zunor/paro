@@ -85,7 +85,10 @@ impl PipelineRuntime {
                 breaker_handles.as_ref(),
                 program.source.operator_id,
             );
-            let _cold_work = paro_common::cold_work::WorkScope::operator(paro_common::cold_work::Kind::GlobalInit, program.source.operator_id.index());
+            let _cold_work = paro_common::cold_work::WorkScope::operator(
+                paro_common::cold_work::Kind::GlobalInit,
+                program.source.operator_id.index(),
+            );
             program.source.exec.create_global(&mut ctx)?
         };
 
@@ -106,7 +109,10 @@ impl PipelineRuntime {
                 breaker_handles.as_ref(),
                 transform.operator_id,
             );
-            let _cold_work = paro_common::cold_work::WorkScope::operator(paro_common::cold_work::Kind::GlobalInit, transform.operator_id.index());
+            let _cold_work = paro_common::cold_work::WorkScope::operator(
+                paro_common::cold_work::Kind::GlobalInit,
+                transform.operator_id.index(),
+            );
             transform_globals.push(transform.exec.create_global(&mut ctx)?);
         }
 
@@ -118,7 +124,10 @@ impl PipelineRuntime {
                 breaker_handles.as_ref(),
                 program.sink.operator_id,
             );
-            let _cold_work = paro_common::cold_work::WorkScope::operator(paro_common::cold_work::Kind::GlobalInit, program.sink.operator_id.index());
+            let _cold_work = paro_common::cold_work::WorkScope::operator(
+                paro_common::cold_work::Kind::GlobalInit,
+                program.sink.operator_id.index(),
+            );
             program.sink.exec.create_global(&mut ctx)?
         };
 
@@ -140,7 +149,10 @@ impl PipelineRuntime {
     ) -> Result<PipelineTaskState> {
         let source = {
             let mut ctx = self.init_context(query, self.program.source.operator_id);
-            let _cold_work = paro_common::cold_work::WorkScope::operator(paro_common::cold_work::Kind::LocalInit, self.program.source.operator_id.index());
+            let _cold_work = paro_common::cold_work::WorkScope::operator(
+                paro_common::cold_work::Kind::LocalInit,
+                self.program.source.operator_id.index(),
+            );
             self.program
                 .source
                 .exec
@@ -154,7 +166,10 @@ impl PipelineRuntime {
             .enumerate()
             .map(|(idx, transform)| {
                 let mut ctx = self.init_context(query, transform.operator_id);
-                let _cold_work = paro_common::cold_work::WorkScope::operator(paro_common::cold_work::Kind::LocalInit, transform.operator_id.index());
+                let _cold_work = paro_common::cold_work::WorkScope::operator(
+                    paro_common::cold_work::Kind::LocalInit,
+                    transform.operator_id.index(),
+                );
                 let global = self
                     .transform_globals
                     .get(idx)
@@ -166,7 +181,10 @@ impl PipelineRuntime {
 
         let sink = {
             let mut ctx = self.init_context(query, self.program.sink.operator_id);
-            let _cold_work = paro_common::cold_work::WorkScope::operator(paro_common::cold_work::Kind::LocalInit, self.program.sink.operator_id.index());
+            let _cold_work = paro_common::cold_work::WorkScope::operator(
+                paro_common::cold_work::Kind::LocalInit,
+                self.program.sink.operator_id.index(),
+            );
             self.program
                 .sink
                 .exec

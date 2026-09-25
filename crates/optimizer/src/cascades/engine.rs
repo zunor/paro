@@ -40,12 +40,7 @@ use smallvec::SmallVec;
 
 use super::bounds::{CertifiedLocalWorkFloor, ProvenChildLatencyFloor, ProvenRecipeLatencyFloor};
 use super::budget::{BudgetDecision, BudgetDimension};
-use super::calibration::{
-    LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_ENFORCER_RANDOM_FETCH,
-    OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW,
-};
 use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
-use super::enforcer::{replay_enforcer_chain, EnforcementPlanner, EnforcerStep};
 use super::governor::{Governor, PlanMilestone, PlanningPolicy};
 use super::grant::{derive_grant_sensitivity, verify_grant_sharing, GrantSensitivitySummary};
 use super::ids::{
@@ -68,25 +63,28 @@ use super::region::{
     JointCostProof, RegionArtifactKind, RegionBoundaryEndpoint, RegionCandidateContract,
     RegionDependencyEdge, RegionDependencyKind,
 };
-#[cfg(test)]
-use super::rules::WorkSourceId;
 use super::rules::{
     CostComposition, DomainContinuation, ImplementationContext, ImplementationRegistry,
     PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PatternOperand, PatternRead,
-    PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof, SourceWork,
-    SourceWorkData, TaskSupplyContract, TransformContext, TransformationPreflight,
+    PhysicalCandidate, RuleContext, TaskSupplyContract, TransformContext, TransformationPreflight,
     TransformationRule,
 };
 use super::tasks::{
     BoundContext, BoundProofId, BoundProofKind, Cursor, ReadSet, StopReason, TaskId, TaskIntent,
     TaskOutcome, TaskRegistry, TaskRequest, TaskState,
 };
+use crate::cost::calibration::{MachineCalibrationBundle, ParallelWorkProfile};
+use crate::cost::enforcer::{enforcer_cost, EnforcerCostInput};
+#[cfg(test)]
+use crate::cost::response::WorkSourceId;
+use crate::cost::response::{SourceFilterWork, SourceRetentionProof, SourceWork, SourceWorkData};
+use crate::physical::enforcer::{replay_enforcer_chain, EnforcementPlanner, EnforcerStep};
 use crate::physical::{ObjectiveProfile, ResourceGrantClass, SpillPolicy};
 
 mod quality_production;
 mod regional;
-pub(crate) use regional::RegionalPass;
 use quality_production::QualityProductionRequest;
+pub(crate) use regional::RegionalPass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -538,7 +536,7 @@ struct CostRecipe {
     /// interned requirement. Resumes share this geometry, not its price:
     /// calibration, row/grant inputs and active frontier membership remain
     /// subject to their existing cost-context checks.
-    enforcement: OnceLock<Option<super::enforcer::EnforcedPlan>>,
+    enforcement: OnceLock<Option<crate::physical::enforcer::EnforcedPlan>>,
 }
 
 impl CostRecipe {
@@ -821,30 +819,6 @@ impl ChildCombinationState {
     }
 }
 
-/// Fixed-size evidence used to replay property-enforcement cost. The row
-/// interval is the candidate output estimate; the grant fields make blocking
-/// enforcers part of feasibility rather than an extraction-time surprise.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EnforcerCostInput {
-    pub rows: super::cost::CompactRange,
-    pub row_width_bytes: u64,
-    pub hard_memory_bytes: u64,
-    pub spill_policy: SpillPolicy,
-    pub max_parallel_tasks: u16,
-}
-
-impl EnforcerCostInput {
-    pub fn unbounded(rows: super::cost::CompactRange, row_width_bytes: u64) -> Self {
-        Self {
-            rows,
-            row_width_bytes: row_width_bytes.max(1),
-            hard_memory_bytes: u64::MAX,
-            spill_policy: SpillPolicy::Allowed,
-            max_parallel_tasks: 1,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct BindingApplication {
     binding: super::rules::PatternBinding,
@@ -860,7 +834,7 @@ type BindingApplications = BTreeMap<(TransformationTaskId, Fingerprint), Vec<Bin
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuleWorkProfile {
     /// Guard witnesses for rejected bindings; not mutually exclusive.
-    pub rejection_guards: crate::transformation_rejection::TransformationRejectionCounts,
+    pub rejection_guards: crate::diagnostics::rejection::TransformationRejectionCounts,
     /// Transformation tasks that reached the matcher.
     pub discovered: u64,
     /// Exact bindings returned by the matcher.
@@ -2889,7 +2863,8 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         winner: Arc<Winner>,
     ) -> Result<GrantWinner> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityFreeze);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityFreeze);
         let started = Instant::now();
         let reference = ChildWinnerRef {
             group: self.memo.canonical_group(root),
@@ -2922,7 +2897,7 @@ impl CascadesEngine {
     }
 
     fn record_search_checkpoints(&mut self, root: GroupId) {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Finish);
         if !self.collect_rule_work_profile
             || self.diagnostic_checkpoint_goals.is_empty()
             || self.next_diagnostic_checkpoint >= SEARCH_CHECKPOINT_TARGETS_MS.len()
@@ -2987,7 +2962,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         winner: &Winner,
     ) -> Result<CheckpointCandidateEvidence> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Finish);
         let reference = ChildWinnerRef {
             group: self.memo.canonical_group(root),
             goal,
@@ -3029,7 +3004,7 @@ impl CascadesEngine {
     }
 
     fn record_diagnostic_checkpoints(&mut self) {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Finish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Finish);
         if let Some(root) = self.milestone_root {
             self.record_search_checkpoints(root);
         }
@@ -3296,7 +3271,7 @@ impl CascadesEngine {
         cost: SearchCost,
     ) -> Result<()> {
         let (group, goal) = subproblem;
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Publish);
         if !self.collect_rule_work_profile {
             return Ok(());
         }
@@ -3408,7 +3383,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         selected_changed: bool,
     ) -> Result<bool> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Publish);
         self.mark_physical_parents_dirty((self.memo.canonical_group(group), goal));
         self.physical_response_notifications
             .insert((self.memo.canonical_group(group), goal));
@@ -3533,7 +3508,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         origin: QualityCheckOrigin,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Quality);
         match origin {
             QualityCheckOrigin::PhysicalPublication => {
                 self.quality_handoff_publication_call_count = self
@@ -3880,7 +3855,7 @@ impl CascadesEngine {
         admissible_set: AdmissibleGrantSetId,
         classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Quality);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Quality);
         if !self.quality_handoff_enabled || self.quality_handoff_reached {
             return Ok(());
         }
@@ -3916,7 +3891,8 @@ impl CascadesEngine {
         let mut incumbent = None;
         if mode == SearchMode::Memo {
             let phase = self.memo.control().incumbent_phase();
-            let work_phase = crate::work_partition::phase(crate::work_partition::Phase::Mandatory);
+            let work_phase =
+                crate::diagnostics::work::phase(crate::diagnostics::work::Phase::Mandatory);
             self.mandatory_only = true;
             let baseline = self.optimize_group(root, goal);
             self.mandatory_only = false;
@@ -3943,7 +3919,8 @@ impl CascadesEngine {
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
             }
             self.open_optional_implementation_domain()?;
-            let _work_phase = crate::work_partition::phase(crate::work_partition::Phase::Optional);
+            let _work_phase =
+                crate::diagnostics::work::phase(crate::diagnostics::work::Phase::Optional);
             self.optional_search_started =
                 self.collect_rule_work_profile || self.quality_handoff_enabled;
             // Opening optional implementations changes search coverage, not
@@ -3996,7 +3973,7 @@ impl CascadesEngine {
 
     fn open_optional_implementation_domain(&mut self) -> Result<()> {
         let _partition =
-            crate::work_partition::enter(crate::work_partition::Bucket::PhaseTransition);
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::PhaseTransition);
         self.quality_production_requests.clear();
         self.quality_forced_transform_bindings.clear();
         self.quality_active_forced_transform_binding = None;
@@ -4123,7 +4100,8 @@ impl CascadesEngine {
     }
 
     fn winner_fact_reads(&self, group: GroupId, winner: &Winner) -> Result<ReadSet> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityReads);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityReads);
         let mut pending = vec![(self.memo.canonical_group(group), winner)];
         let mut visited_candidates = BTreeSet::new();
         let mut groups = BTreeSet::new();
@@ -4246,7 +4224,8 @@ impl CascadesEngine {
         self.set_terminal_bound_goals(root, checkpoint_goals.iter().copied())?;
         if mode == SearchMode::Memo {
             let phase = self.memo.control().incumbent_phase();
-            let work_phase = crate::work_partition::phase(crate::work_partition::Phase::Mandatory);
+            let work_phase =
+                crate::diagnostics::work::phase(crate::diagnostics::work::Phase::Mandatory);
             self.mandatory_only = true;
             let incumbent = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
             self.mandatory_only = false;
@@ -4409,7 +4388,8 @@ impl CascadesEngine {
         incumbent: Result<GrantOptimization>,
         optional_started: &mut bool,
     ) -> Result<GrantOptimization> {
-        let _work_phase = crate::work_partition::phase(crate::work_partition::Phase::Optional);
+        let _work_phase =
+            crate::diagnostics::work::phase(crate::diagnostics::work::Phase::Optional);
         self.memo.control().begin_optional();
         if !self.memo.control().checkpoint()? {
             self.governor
@@ -4731,7 +4711,8 @@ impl CascadesEngine {
         match parent {
             GrantGoalKey::Invariant(set) => match sensitivity {
                 GrantSensitivitySummary::Shared(proof)
-                    if proof.dependency == super::rules::GrantDependencyDescriptor::Invariant =>
+                    if proof.dependency
+                        == crate::cost::response::GrantDependencyDescriptor::Invariant =>
                 {
                     Ok(GrantGoalKey::Invariant(set))
                 }
@@ -4741,11 +4722,11 @@ impl CascadesEngine {
             },
             GrantGoalKey::Parallelism { admissible, tasks } => match sensitivity {
                 GrantSensitivitySummary::Shared(proof) => match proof.dependency {
-                    super::rules::GrantDependencyDescriptor::Invariant => {
+                    crate::cost::response::GrantDependencyDescriptor::Invariant => {
                         Ok(GrantGoalKey::Invariant(admissible))
                     }
-                    super::rules::GrantDependencyDescriptor::Parallelism => Ok(parent),
-                    super::rules::GrantDependencyDescriptor::Sensitive => {
+                    crate::cost::response::GrantDependencyDescriptor::Parallelism => Ok(parent),
+                    crate::cost::response::GrantDependencyDescriptor::Sensitive => {
                         Err(paro_error::internal("invalid grant-sharing proof"))
                     }
                 },
@@ -4794,7 +4775,7 @@ impl CascadesEngine {
         physical: PhysicalExprId,
         recipe: Fingerprint,
     ) {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Publish);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Publish);
         let child = self.memo.canonical_group(child);
         let parent = self.memo.canonical_group(parent);
         self.physical_goals
@@ -4824,7 +4805,8 @@ impl CascadesEngine {
         changed_subproblems: impl IntoIterator<Item = (GroupId, OptimizationGoal)>,
         interleave: &mut PhysicalInterleave,
     ) {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Schedule);
         for (group, changed_goal) in changed_subproblems {
             let group = self.memo.canonical_group(group);
             if !self.physical_parents.contains_key(&(group, changed_goal))
@@ -4861,7 +4843,8 @@ impl CascadesEngine {
         response_changed: bool,
         interleave: &mut PhysicalInterleave,
     ) {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Schedule);
         let group = self.memo.canonical_group(group);
         let Some(parents) = self.physical_parents.get(&(group, goal)).cloned() else {
             return;
@@ -4888,7 +4871,8 @@ impl CascadesEngine {
     }
 
     fn drain_physical_interleave(&mut self, interleave: &mut PhysicalInterleave) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Subproblem);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Subproblem);
         while let Some((group, goal)) = interleave.pop_next() {
             if self.diagnostic_obligation_only && group != interleave.root {
                 self.diagnostic_obligation_non_root_physical_groups
@@ -4967,7 +4951,7 @@ impl CascadesEngine {
         &mut self,
         mut interleave: Option<PhysicalInterleave>,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Agenda);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Agenda);
         self.memo.control().begin_optional();
         self.memo.seal_optional_group_budget();
         let mut agenda = StableAgenda::default();
@@ -5518,9 +5502,9 @@ impl CascadesEngine {
                 if preflight == TransformationPreflight::NoOutput {
                     if self.collect_rule_work_profile {
                         let mut reasons =
-                            crate::transformation_rejection::RejectionReasons::default();
+                            crate::diagnostics::rejection::RejectionReasons::default();
                         reasons.record(
-                            crate::transformation_rejection::TransformationRejectionGuard::NoOutput,
+                            crate::diagnostics::rejection::TransformationRejectionGuard::NoOutput,
                         );
                         self.rule_work_profile
                             .entry(rule)
@@ -5573,14 +5557,14 @@ impl CascadesEngine {
                 // The context owns the complete attempt. Its Memo snapshot is
                 // lazy, and rule-specific side state enlists in the same rollback
                 // domain before its first write.
-                let _b3_rule = crate::work_partition::rule(rule.0);
+                let _b3_rule = crate::diagnostics::work::rule(rule.0);
                 let mut context = TransformContext::new(&mut self.memo, group);
                 if quality_goal.is_some() {
                     context.enable_domain_continuations();
                 }
                 context.rejection_reasons = self
                     .collect_rule_work_profile
-                    .then(crate::transformation_rejection::RejectionReasons::default);
+                    .then(crate::diagnostics::rejection::RejectionReasons::default);
                 let apply_started = Instant::now();
                 let apply_allocated = paro_common::allocator::thread_allocated_bytes();
                 let outputs_result = {
@@ -5656,7 +5640,7 @@ impl CascadesEngine {
                     Err(error) => {
                         if self.collect_rule_work_profile {
                             let mut reasons = context.rejection_reasons.unwrap_or_default();
-                            reasons.record(crate::transformation_rejection::TransformationRejectionGuard::ApplicationError);
+                            reasons.record(crate::diagnostics::rejection::TransformationRejectionGuard::ApplicationError);
                             self.rule_work_profile
                                 .entry(rule)
                                 .or_default()
@@ -5692,7 +5676,7 @@ impl CascadesEngine {
                     if self.collect_rule_work_profile {
                         let mut reasons = context.rejection_reasons.unwrap_or_default();
                         reasons.record(
-                            crate::transformation_rejection::TransformationRejectionGuard::NoOutput,
+                            crate::diagnostics::rejection::TransformationRejectionGuard::NoOutput,
                         );
                         self.rule_work_profile
                             .entry(rule)
@@ -5735,8 +5719,8 @@ impl CascadesEngine {
                 if outputs.len() > output_events.len() {
                     if self.collect_rule_work_profile {
                         let mut reasons =
-                            crate::transformation_rejection::RejectionReasons::default();
-                        reasons.record(crate::transformation_rejection::TransformationRejectionGuard::OutputContract);
+                            crate::diagnostics::rejection::RejectionReasons::default();
+                        reasons.record(crate::diagnostics::rejection::TransformationRejectionGuard::OutputContract);
                         self.rule_work_profile
                             .entry(rule)
                             .or_default()
@@ -5798,7 +5782,7 @@ impl CascadesEngine {
                 }
                 let insertion = (|| -> Result<TransformationInsertion> {
                     let _partition =
-                        crate::work_partition::enter(crate::work_partition::Bucket::Insert);
+                        crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Insert);
                     let mut inserted_groups = BTreeSet::new();
                     let mut inserted_expressions = Vec::new();
                     for output in outputs {
@@ -5858,8 +5842,8 @@ impl CascadesEngine {
                     Err(error) => {
                         if self.collect_rule_work_profile {
                             let mut reasons =
-                                crate::transformation_rejection::RejectionReasons::default();
-                            reasons.record(crate::transformation_rejection::TransformationRejectionGuard::PublicationError);
+                                crate::diagnostics::rejection::RejectionReasons::default();
+                            reasons.record(crate::diagnostics::rejection::TransformationRejectionGuard::PublicationError);
                             self.rule_work_profile
                                 .entry(rule)
                                 .or_default()
@@ -7068,7 +7052,8 @@ impl CascadesEngine {
         promoted: bool,
         demanded: bool,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Schedule);
         let expressions = self
             .memo
             .group(group)
@@ -7111,7 +7096,8 @@ impl CascadesEngine {
         promoted: bool,
         demanded: bool,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Schedule);
         let expression_ref = self
             .memo
             .logical_expr(expression)
@@ -7201,7 +7187,8 @@ impl CascadesEngine {
         group: GroupId,
         agenda: &mut StableAgenda,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Schedule);
         let group = self.memo.canonical_group(group);
         let subscribers = self
             .transformation_subscribers
@@ -7333,7 +7320,8 @@ impl CascadesEngine {
         task: TransformationTaskId,
         reads: &[PatternRead],
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Schedule);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Schedule);
         let mut dependencies = reads.to_vec();
         // Discovery is shared by all bindings of a task. Application-only
         // evidence remains subscribed even when a later binding reads a
@@ -7437,7 +7425,7 @@ impl CascadesEngine {
     }
 
     fn enumerate_implementations(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Recipe);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Recipe);
         let group = self.memo.canonical_group(group);
         self.physical_implementation_requests =
             self.physical_implementation_requests.saturating_add(1);
@@ -7552,7 +7540,7 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         mut candidate: PhysicalCandidate,
     ) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Recipe);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Recipe);
         candidate.local_cost.validate()?;
         candidate.provided.validate()?;
         if candidate.key.implementation != implementation || candidate.key.logical != expression {
@@ -7808,7 +7796,8 @@ impl CascadesEngine {
     /// a newly published child winner creates a new evaluation without
     /// making every unchanged recursive visit resumable.
     fn physical_read_set(&self, group: GroupId, goal: OptimizationGoal) -> Result<ReadSet> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Dependencies);
         let group = self.memo.canonical_group(group);
         self.memo
             .group(group)
@@ -7864,7 +7853,8 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         previous: Option<&PhysicalTaskState>,
     ) -> Result<(ReadSet, bool)> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Dependencies);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Dependencies);
         let group = self.memo.canonical_group(group);
         self.memo
             .group(group)
@@ -7888,7 +7878,8 @@ impl CascadesEngine {
     }
 
     fn optimize_group(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Subproblem);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Subproblem);
         if !self.memo.control().checkpoint()? {
             return Ok(());
         }
@@ -9183,13 +9174,14 @@ impl CascadesEngine {
         &mut self,
         subproblem: (GroupId, OptimizationGoal, PhysicalExprId),
         recipe: &CostRecipe,
-        enforced: &super::enforcer::EnforcedPlan,
+        enforced: &crate::physical::enforcer::EnforcedPlan,
         state: &mut ChildCombinationState,
         children: &[CandidateId],
         count_recheck: bool,
     ) -> Result<(bool, bool, Option<CandidateId>)> {
         let (group, goal, physical) = subproblem;
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Admission);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Admission);
         let _admission_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 1);
         let Some(cached) = state.priced.get_mut(children) else {
             return Err(paro_error::internal(
@@ -9305,7 +9297,7 @@ impl CascadesEngine {
         physical: PhysicalExprId,
         goal: OptimizationGoal,
         recipe: &'recipe CostRecipe,
-    ) -> Result<Option<&'recipe super::enforcer::EnforcedPlan>> {
+    ) -> Result<Option<&'recipe crate::physical::enforcer::EnforcedPlan>> {
         if recipe.enforcement.get().is_some() {
             self.physical_enforcement_reuses = self.physical_enforcement_reuses.saturating_add(1);
         } else {
@@ -9791,7 +9783,7 @@ impl CascadesEngine {
                     combination_state.budget_rejected.remove(&child_ids);
                 }
                 let kernel_partition =
-                    crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
+                    crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Kernel);
                 let kernel_timer = CostPhaseTimer::start(&self.diagnostic_cost_phase_times, 0);
                 child_costs.clear();
                 child_fingerprints.clear();
@@ -11949,141 +11941,6 @@ fn validate_transformation_proof(
             "transformation output did not carry a matching equivalence proof",
         )),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct EnforcerPhaseCost {
-    /// Keep the discriminant outside `SearchCost` without boxing it. This
-    /// value is ignored when `present` is false; the explicit bit preserves
-    /// the semantic difference between no phase and a zero-work phase while
-    /// keeping candidate costing allocation-free.
-    cost: SearchCost,
-    present: bool,
-}
-
-impl EnforcerPhaseCost {
-    pub(crate) fn compose_after(self, input: SearchCost) -> Result<SearchCost> {
-        if self.present {
-            input.sequential(self.cost)
-        } else {
-            Ok(input)
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phase(self) -> Option<SearchCost> {
-        self.present.then_some(self.cost)
-    }
-}
-
-pub(crate) fn enforcer_cost(
-    steps: &[EnforcerStep],
-    input: EnforcerCostInput,
-    calibration: &MachineCalibrationBundle,
-) -> Result<Option<EnforcerPhaseCost>> {
-    if steps.is_empty() {
-        return Ok(Some(EnforcerPhaseCost {
-            cost: SearchCost::ZERO,
-            present: false,
-        }));
-    }
-    input.rows.checked_add(super::cost::CompactRange::ZERO)?;
-    let mut work = LocalOperatorWork::default();
-    let mut profile = ParallelWorkProfile::Pipeline;
-    let mut peak_memory_upper = 0_u64;
-    let mut spill_bytes_expected = 0_u64;
-    let row_bytes_upper = bytes_for_rows(input.rows.upper, input.row_width_bytes);
-    for step in steps {
-        match step {
-            EnforcerStep::Sort(_) | EnforcerStep::LocalSort(_) => {
-                profile = ParallelWorkProfile::BlockingMerge;
-                work.add(OP_ENFORCER_SORT_COMPARE, sort_work(input.rows)?)?;
-                if row_bytes_upper > input.hard_memory_bytes {
-                    if input.spill_policy == SpillPolicy::Forbidden {
-                        return Ok(None);
-                    }
-                    peak_memory_upper = peak_memory_upper.max(input.hard_memory_bytes);
-                    let spill_bytes = row_bytes_upper.saturating_mul(2);
-                    spill_bytes_expected = spill_bytes_expected.saturating_add(spill_bytes);
-                    work.add(
-                        OP_ENFORCER_SPILL_PAGE,
-                        super::cost::CompactRange::point(pages(spill_bytes) as f64)?,
-                    )?;
-                } else {
-                    peak_memory_upper = peak_memory_upper.max(row_bytes_upper);
-                }
-            }
-            EnforcerStep::MutationInputSpool { .. } | EnforcerStep::Spool => {
-                // The current immutable materialized-handle ABI owns chunks in
-                // memory. Advertising spill here would violate the runtime
-                // contract, so a class that cannot contain the upper bound is
-                // infeasible rather than silently overcommitted.
-                if row_bytes_upper > input.hard_memory_bytes {
-                    return Ok(None);
-                }
-                peak_memory_upper = peak_memory_upper.max(row_bytes_upper);
-                work.add(OP_ENFORCER_STREAM_ROW, input.rows)?;
-            }
-            EnforcerStep::Fetch { values } | EnforcerStep::FetchPreservingOrder { values, .. } => {
-                work.add(
-                    OP_ENFORCER_RANDOM_FETCH,
-                    scale_range(input.rows, values.len().max(1) as f64)?,
-                )?;
-            }
-            EnforcerStep::Gather
-            | EnforcerStep::RepartitionHash { .. }
-            | EnforcerStep::RepartitionRange { .. }
-            | EnforcerStep::MergeGather(_)
-            | EnforcerStep::PrepareOrderedFetch(_)
-            | EnforcerStep::Flatten
-            | EnforcerStep::Factorize(_) => {
-                work.add(OP_ENFORCER_STREAM_ROW, input.rows)?;
-            }
-        }
-    }
-    let mut result = calibration.fold_for_tasks(&work, profile, input.max_parallel_tasks)?;
-    result.peak_memory_upper = peak_memory_upper;
-    result.spill_bytes_expected = spill_bytes_expected;
-    result.validate()?;
-    Ok(Some(EnforcerPhaseCost {
-        cost: result,
-        present: true,
-    }))
-}
-
-fn scale_range(range: super::cost::CompactRange, factor: f64) -> Result<super::cost::CompactRange> {
-    super::cost::CompactRange::new(
-        range.lower * factor,
-        range.expected * factor,
-        range.upper * factor,
-    )
-}
-
-fn sort_work(rows: super::cost::CompactRange) -> Result<super::cost::CompactRange> {
-    let comparisons = |rows: f64| {
-        if rows <= 1.0 {
-            rows
-        } else {
-            rows * rows.log2()
-        }
-    };
-    super::cost::CompactRange::new(
-        comparisons(rows.lower),
-        comparisons(rows.expected),
-        comparisons(rows.upper),
-    )
-}
-
-fn bytes_for_rows(rows: f64, width: u64) -> u64 {
-    if !rows.is_finite() || rows >= u64::MAX as f64 / width.max(1) as f64 {
-        u64::MAX
-    } else {
-        rows.ceil().max(0.0) as u64 * width.max(1)
-    }
-}
-
-fn pages(bytes: u64) -> u64 {
-    bytes.saturating_add(4095) / 4096
 }
 
 fn enforced_fingerprint(

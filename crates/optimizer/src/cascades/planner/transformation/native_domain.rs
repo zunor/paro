@@ -14,10 +14,8 @@ use super::staging::{
 use super::*;
 use crate::cascades::memo::LogicalExpr;
 use crate::cascades::planner::domain_transfer;
-use crate::expression::traversal::visit_expression;
-use paro_planner::operator::{
-    BoundReference, BoundReferenceId, LogicalOutputLayout,
-};
+use crate::rewrite::expr::traversal::visit_expression;
+use paro_planner::operator::{BoundReference, BoundReferenceId, LogicalOutputLayout};
 use paro_planner::plan::PlanNodeId;
 
 fn local_domain(predicate: &Expression) -> bool {
@@ -86,13 +84,11 @@ pub(super) fn try_transfer_with_continuations(
     {
         return Ok(None);
     }
-    let [
-        PatternOperand::Expression {
-            expression: input,
-            children: inputs,
-            ..
-        },
-    ] = children.as_ref()
+    let [PatternOperand::Expression {
+        expression: input,
+        children: inputs,
+        ..
+    }] = children.as_ref()
     else {
         return Ok(None);
     };
@@ -1331,7 +1327,7 @@ fn push_domain(
             if join.join_type == JoinType::Inner
                 && join.duplicate_eliminated_columns.is_empty()
                 && !join.delim_flipped
-                && !crate::expression::comparison_join_has_evaluation_fence(&join) =>
+                && !crate::rewrite::expr::comparison_join_has_evaluation_fence(&join) =>
         {
             let left_layout = native_child_layout(&join.left, layouts)?;
             let right_layout = native_child_layout(&join.right, layouts)?;
@@ -1670,7 +1666,7 @@ pub(super) fn prune_output_demands(
             )?;
         }
         let layout = node.operator.output_layout_from_children(&after);
-        node.stats.unique_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
+        node.stats.unique_keys = crate::estimate::unique_keys::derive_unique_keys_from_facts(
             &node.operator,
             &layout,
             &after.iter().collect::<Vec<_>>(),
@@ -1687,8 +1683,8 @@ pub(super) fn refresh_statistics(
     state: &mut PlannerTransformState,
     memo: &Memo,
 ) -> Result<Option<RefreshedNativeStatistics>> {
-    let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Settlement);
-    let _refresh = crate::work_partition::native_refresh(shell.nodes.len());
+    let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Settlement);
+    let _refresh = crate::diagnostics::work::native_refresh(shell.nodes.len());
     use super::settlement::demand;
     use paro_planner::operator::bound_reference::{BoundRelationFactValues, BoundRelationFacts};
     let Some(session) = state.session.clone() else {
@@ -1835,7 +1831,7 @@ pub(super) fn refresh_statistics(
         if !memo.control().checkpoint()? {
             return Ok(None);
         }
-        crate::work_partition::native_refresh_node();
+        crate::diagnostics::work::native_refresh_node();
         let mut layouts = Vec::new();
         let mut maximums = Vec::new();
         let mut columns = HashMap::new();
@@ -1973,8 +1969,8 @@ pub(super) fn refresh_statistics(
         // not a fact result: changed input facts must still miss and be
         // re-derived.
         let statistics_partition =
-            crate::work_partition::enter_b3(crate::work_partition::Bucket::Statistics);
-        crate::expression::scalar_normalizer().visit_operator_expressions(&mut local);
+            crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Statistics);
+        crate::rewrite::expr::scalar_normalizer().visit_operator_expressions(&mut local);
         if local.op_type() != node.operator.op_type() {
             drop(statistics_partition);
             return Ok(None);
@@ -2139,7 +2135,7 @@ pub(super) fn refresh_statistics(
                     "native set-operation statistics arity changed",
                 ));
             };
-            crate::statistics::gathering::merge_set_operation_column_statistics(
+            crate::estimate::gathering::merge_set_operation_column_statistics(
                 &layout,
                 left.as_ref(),
                 right.as_ref(),

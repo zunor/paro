@@ -14,12 +14,12 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::NodeStats;
 
-use super::PlannerTransformState;
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use crate::aggregate::late_payload::{
-    RowIdPathPolicy, prefix_unary_child, prefix_unary_child_mut, prove_rowid_operator,
+use super::PlannerTransformState;
+use crate::physical::access::late_payload::{
+    prefix_unary_child, prefix_unary_child_mut, prove_rowid_operator, RowIdPathPolicy,
 };
-use crate::expression::traversal::visit_expression;
+use crate::rewrite::expr::traversal::visit_expression;
 
 pub(super) fn rewrite(
     shell: NativeShell,
@@ -37,7 +37,7 @@ pub(super) fn rewrite(
 
     // Eligibility is decided by the shared selected-input proof, including
     // its post-join locality rejection. Transport shape is not a second guard.
-    let Some(mut proof) = crate::aggregate::late_payload::prove_selective_projection_inputs(
+    let Some(mut proof) = crate::physical::access::late_payload::prove_selective_projection_inputs(
         &output.expressions,
         matches!(shell.nodes[input].operator, LogicalOperator::RowFetch(_)),
         shell.nodes[input].stats.estimated_cardinality,

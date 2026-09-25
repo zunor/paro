@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::aggregate::dimension_deferral::join_region as contract;
+use crate::rewrite::aggregate::dimension_deferral::join_region as contract;
 use paro_planner::operator::{JoinCondition, LogicalOutputLayout, ProjectionMap};
 
 /// Recover the observed group of an unchanged selected edge, not an arbitrary

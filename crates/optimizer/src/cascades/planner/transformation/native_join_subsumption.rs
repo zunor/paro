@@ -21,8 +21,8 @@ use std::sync::Arc;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::error as paro_error;
 use paro_common::types::LogicalType;
-use paro_function::aggregate::AggregateAlgebra;
 use paro_function::aggregate::distributive::sum::get_sum_function;
+use paro_function::aggregate::AggregateAlgebra;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression,
 };
@@ -32,7 +32,7 @@ use paro_planner::operator::{
 };
 
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use super::{Memo, PatternOperand, PlannerTransformState, boundary};
+use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 
 #[derive(Clone)]
 struct OuterSum {
@@ -1048,7 +1048,7 @@ mod tests {
     use super::*;
 
     use super::super::{
-        PlannerTransformation, PlannerTransformationRule, TransformContext, matching,
+        matching, PlannerTransformation, PlannerTransformationRule, TransformContext,
     };
     use crate::cascades::budget::{BudgetDimension, SearchBudget};
     use crate::cascades::planner::MemoBuilder;
@@ -1372,7 +1372,9 @@ mod tests {
                     ),
                 );
                 let (reference, changed) =
-                    crate::aggregate::join_subsumption::optimize_root_with_change(normalized);
+                    crate::rewrite::aggregate::join_subsumption::optimize_root_with_change(
+                        normalized,
+                    );
                 assert!(changed);
                 reference
             });
@@ -1388,21 +1390,17 @@ mod tests {
                     panic!("reference result must retain the outer aggregate")
                 };
                 assert_eq!(actual.groups.len(), expected.groups.len());
-                assert!(
-                    actual
-                        .groups
-                        .iter()
-                        .zip(&expected.groups)
-                        .all(|(a, b)| a.equals(b))
-                );
+                assert!(actual
+                    .groups
+                    .iter()
+                    .zip(&expected.groups)
+                    .all(|(a, b)| a.equals(b)));
                 assert_eq!(actual.aggregates.len(), expected.aggregates.len());
-                assert!(
-                    actual
-                        .aggregates
-                        .iter()
-                        .zip(&expected.aggregates)
-                        .all(|(a, b)| a.equals(b))
-                );
+                assert!(actual
+                    .aggregates
+                    .iter()
+                    .zip(&expected.aggregates)
+                    .all(|(a, b)| a.equals(b)));
             }
         }
     }

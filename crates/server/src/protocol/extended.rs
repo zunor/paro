@@ -7,13 +7,13 @@ use async_trait::async_trait;
 use paro_common::chunk::Chunk;
 use paro_common::error::{ParoError, Result};
 use paro_common::types::LogicalType;
+use paro_common::vector::VectorLifetimeOwner;
 use paro_execution::query_executor::compiled::ResultColumnDesc;
 use paro_function::copy::CopyOptions;
 use paro_session::{
     CopyProtocolSink, CopyProtocolSource, ExtendedQueryResponder, FormatCode,
     StatementCancellation, StatementCompletion,
 };
-use paro_common::vector::VectorLifetimeOwner;
 use pgwire::messages::data::{NoData, ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
     BindComplete, CloseComplete, ParseComplete, PortalSuspended,

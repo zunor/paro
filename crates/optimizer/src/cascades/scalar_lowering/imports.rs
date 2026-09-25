@@ -6,8 +6,8 @@
 //! This is an import cache, not an alternative scalar representation. Values
 //! are canonical ScalarExprIds; native rewrites continue to use the scalar DAG.
 
-use super::super::catalog_identity::CatalogVersion;
 use super::super::ids::{ColumnId, ScalarExprId};
+use crate::binding::catalog_identity::CatalogVersion;
 use paro_planner::expression::{Expression, ExpressionIdentity, ExpressionWitness};
 use std::collections::HashMap;
 
@@ -94,10 +94,9 @@ impl BoundImportCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binding::BindingCatalog;
     use crate::cascades::scalar::ScalarKind;
-    use crate::cascades::scalar_lowering::{
-        intern_column_binding, intern_expression, BindingCatalog,
-    };
+    use crate::cascades::scalar_lowering::{intern_column_binding, intern_expression};
     use crate::cascades::{
         ColumnCatalog, ColumnOrigin, ColumnVisibility, Fingerprint, ScalarArena,
     };

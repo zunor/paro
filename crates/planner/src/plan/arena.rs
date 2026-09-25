@@ -541,7 +541,9 @@ mod tests {
         assert!(arena.get(removed).is_err());
         assert!(arena.shared_output_layout(removed).is_err());
         assert!(arena.shared_output_layout(replacement).is_ok());
-        assert!(LogicalPlanArena::default().shared_output_layout(root).is_err());
+        assert!(LogicalPlanArena::default()
+            .shared_output_layout(root)
+            .is_err());
         assert!(arena.get(root).is_ok());
         assert!(arena
             .append(LogicalPlanNode {

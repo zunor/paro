@@ -22,9 +22,9 @@ use paro_execution::runtime::{
     BreakerHandleRegistry, ParameterBindings, PipelineScheduler, QueryOutputPort,
     QueryRuntimeContext,
 };
-use paro_optimizer::physical::properties::{Parallelism, PipelineProperties};
-use paro_optimizer::physical::row_type::RowType;
-use paro_optimizer::physical::specs::ChunkScanSpec;
+use paro_planner::physical::properties::{Parallelism, PipelineProperties};
+use paro_planner::physical::row_type::RowType;
+use paro_planner::physical::specs::ChunkScanSpec;
 
 const SOURCE_CHUNKS: usize = 1_024;
 const WORKER_THREADS: usize = 4;

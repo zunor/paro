@@ -6,8 +6,8 @@
 use paro_common::types::LogicalType;
 
 use super::*;
+use crate::binding::column::{ColumnDesc, ColumnOrigin, ColumnVisibility};
 use crate::cascades::budget::BudgetDecision;
-use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::ids::ColumnId;
 use crate::cascades::properties::{
@@ -86,7 +86,12 @@ fn statistics_read_cache_revalidates_registry_rollback_reinsert_and_merge() {
     // inventing a different statistics value fingerprint.
     assert_eq!(check(&memo), published);
     {
-        let cached = memo.group(reader).unwrap().statistics_read_fingerprint.lock().unwrap();
+        let cached = memo
+            .group(reader)
+            .unwrap()
+            .statistics_read_fingerprint
+            .lock()
+            .unwrap();
         let cached = cached.as_ref().unwrap();
         assert_eq!(cached.registry_revision, memo.cte_registry_revision);
         assert_eq!(cached.fingerprint, published);
@@ -119,8 +124,14 @@ fn statistics_read_cache_revalidates_producer_fact_update_without_registry_chang
         .unwrap();
     let registry_revision = memo.cte_registry_revision;
     let producer_registry = memo.cte_producers.clone();
-    let reader_snapshot = memo.group(reader).unwrap().statistics_snapshot_fingerprint();
-    let producer_snapshot = memo.group(producer).unwrap().statistics_snapshot_fingerprint();
+    let reader_snapshot = memo
+        .group(reader)
+        .unwrap()
+        .statistics_snapshot_fingerprint();
+    let producer_snapshot = memo
+        .group(producer)
+        .unwrap()
+        .statistics_snapshot_fingerprint();
     let before = memo.local_statistics_fingerprint(reader);
     assert_eq!(
         before,
@@ -140,10 +151,23 @@ fn statistics_read_cache_revalidates_producer_fact_update_without_registry_chang
     assert_eq!(memo.cte_registry_revision, registry_revision);
     assert_eq!(memo.cte_producers, producer_registry);
     assert_eq!(memo.canonical_group(producer), producer);
-    assert_eq!(memo.group(reader).unwrap().statistics_snapshot_fingerprint(), reader_snapshot);
-    assert_ne!(memo.group(producer).unwrap().statistics_snapshot_fingerprint(), producer_snapshot);
+    assert_eq!(
+        memo.group(reader)
+            .unwrap()
+            .statistics_snapshot_fingerprint(),
+        reader_snapshot
+    );
+    assert_ne!(
+        memo.group(producer)
+            .unwrap()
+            .statistics_snapshot_fingerprint(),
+        producer_snapshot
+    );
     let uncached = memo.compute_local_statistics_fingerprint(memo.group(reader).unwrap());
-    assert_ne!(uncached, before, "producer facts are an actual reader dependency");
+    assert_ne!(
+        uncached, before,
+        "producer facts are an actual reader dependency"
+    );
     assert_eq!(
         memo.local_statistics_fingerprint(reader),
         uncached,
@@ -152,7 +176,10 @@ fn statistics_read_cache_revalidates_producer_fact_update_without_registry_chang
     assert_eq!(memo.local_statistics_fingerprint(reader), uncached);
 
     let savepoint = memo.transformation_savepoint();
-    memo.group_mut(producer).unwrap().logical_properties.maximum_cardinality = Some(5);
+    memo.group_mut(producer)
+        .unwrap()
+        .logical_properties
+        .maximum_cardinality = Some(5);
     let changed_proof = memo.compute_local_statistics_fingerprint(memo.group(reader).unwrap());
     assert_ne!(changed_proof, uncached);
     assert_eq!(memo.local_statistics_fingerprint(reader), changed_proof);
@@ -175,7 +202,12 @@ fn non_cte_statistics_cache_is_independent_of_registry_mutations() {
     memo.register_cte_producer(7, group, BTreeMap::from([(CteColumnId(0), ColumnId(1))]))
         .unwrap();
     assert_eq!(memo.local_statistics_fingerprint(group), fingerprint);
-    let cached = memo.group(group).unwrap().statistics_read_fingerprint.lock().unwrap();
+    let cached = memo
+        .group(group)
+        .unwrap()
+        .statistics_read_fingerprint
+        .lock()
+        .unwrap();
     let cached = cached.as_ref().unwrap();
     assert_eq!(cached.registry_revision, 0);
     assert_eq!(cached.fingerprint, fingerprint);
@@ -205,7 +237,10 @@ fn typed_fact_updates_report_categories_and_do_not_invalidate_noops() {
             statistics_changed: false,
         }
     );
-    assert_eq!(memo.group(group).unwrap().logical_fact_fingerprint(), logical);
+    assert_eq!(
+        memo.group(group).unwrap().logical_fact_fingerprint(),
+        logical
+    );
     assert_eq!(
         memo.group(group).unwrap().statistics_snapshot_fingerprint(),
         statistics
@@ -220,7 +255,10 @@ fn typed_fact_updates_report_categories_and_do_not_invalidate_noops() {
         .unwrap();
     assert!(change.logical_changed);
     assert!(!change.statistics_changed);
-    assert_ne!(memo.group(group).unwrap().logical_fact_fingerprint(), logical);
+    assert_ne!(
+        memo.group(group).unwrap().logical_fact_fingerprint(),
+        logical
+    );
     assert_eq!(
         memo.group(group).unwrap().statistics_snapshot_fingerprint(),
         statistics,
@@ -230,13 +268,8 @@ fn typed_fact_updates_report_categories_and_do_not_invalidate_noops() {
 
     let change = memo
         .update_group_facts(group, |_properties, cardinality| {
-            *cardinality = GroupCardinality::new(
-                Fingerprint(2),
-                CardinalityRecipeKind::Statistics,
-                2,
-                2,
-                2,
-            );
+            *cardinality =
+                GroupCardinality::new(Fingerprint(2), CardinalityRecipeKind::Statistics, 2, 2, 2);
             Ok(())
         })
         .unwrap();
@@ -263,13 +296,8 @@ fn typed_fact_update_rolls_back_values_and_keeps_write_journal_precise() {
     let savepoint = memo.transformation_savepoint();
     memo.update_group_facts(group, |properties, cardinality| {
         properties.maximum_cardinality = Some(3);
-        *cardinality = GroupCardinality::new(
-            Fingerprint(3),
-            CardinalityRecipeKind::Statistics,
-            1,
-            2,
-            3,
-        );
+        *cardinality =
+            GroupCardinality::new(Fingerprint(3), CardinalityRecipeKind::Statistics, 1, 2, 3);
         Ok(())
     })
     .unwrap();
@@ -464,7 +492,10 @@ fn logical_insertion_contract_lowers_facts_inside_the_transaction() {
             .maximum_cardinality,
         Some(9)
     );
-    assert_eq!(memo.logical_expr(logical).unwrap().payload, LogicalPayloadId(1));
+    assert_eq!(
+        memo.logical_expr(logical).unwrap().payload,
+        LogicalPayloadId(1)
+    );
 
     memo.rollback_transformation(savepoint).unwrap();
     assert_eq!(memo.group(group).unwrap().logical_exprs().len(), 1);
@@ -489,8 +520,8 @@ fn provided() -> ProvidedProperties {
     }
 }
 
-fn enforcer_cost_input() -> super::super::engine::EnforcerCostInput {
-    super::super::engine::EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8)
+fn enforcer_cost_input() -> crate::cost::enforcer::EnforcerCostInput {
+    crate::cost::enforcer::EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8)
 }
 
 fn required() -> RequiredProperties {

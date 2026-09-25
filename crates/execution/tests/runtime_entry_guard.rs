@@ -105,7 +105,7 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
         "compiler must receive the typed physical plan image from the optimizer"
     );
     assert!(
-        !compiler.contains("PhysicalPlanExtractor")
+        !compiler.contains("PhysicalPlanBuilder")
             && !compiler.contains("ColumnBindingResolver")
             && !compiler.contains("generate_typed_physical_plan"),
         "compiler must not make physical choices or repair logical bindings"

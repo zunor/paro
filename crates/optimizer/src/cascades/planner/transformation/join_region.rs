@@ -16,9 +16,9 @@ use paro_planner::operator::{
 use paro_planner::plan::{CardinalityProvenance, NodeStats};
 use paro_storage::statistics::ColumnStatistics;
 
-use crate::join_order::optimizer::JoinOrderOptimizer;
-use crate::join_order::query_graph::{FilterInfo, JoinEdgeOrientation, JoinPredicateSet};
-use crate::join_order::relation_manager::{
+use crate::region::join::optimizer::JoinOrderOptimizer;
+use crate::region::join::query_graph::{FilterInfo, JoinEdgeOrientation, JoinPredicateSet};
+use crate::region::join::relation_manager::{
     DistinctCount, ExtractedFilter, RelationManager, RelationStats,
 };
 
@@ -107,14 +107,14 @@ pub(super) fn identity_with_facts(
                 .operator;
             match operator {
                 LogicalOperator::Join(join @ Join::Comparison(comparison))
-                    if comparison.join_type == JoinType::Inner && crate::join_order::relation_manager::RelationManager::join_shell_is_reorderable(join)
+                    if comparison.join_type == JoinType::Inner && crate::region::join::relation_manager::RelationManager::join_shell_is_reorderable(join)
                         && logical.key.scalars.len() == comparison.conditions.len() => {
                     graph.predicates.extend(logical.key.scalars.iter().map(|scalar| scalar.0 as u64));
                     graph.joins += 1;
                     for child in children { visit(child, memo, state, graph)?; }
                     return Ok(());
                 }
-                LogicalOperator::Join(join @ Join::Cross(_)) if crate::join_order::relation_manager::RelationManager::join_shell_is_reorderable(join) => {
+                LogicalOperator::Join(join @ Join::Cross(_)) if crate::region::join::relation_manager::RelationManager::join_shell_is_reorderable(join) => {
                     graph.joins += 1;
                     for child in children { visit(child, memo, state, graph)?; }
                     return Ok(());
@@ -528,7 +528,7 @@ fn collect_native_join_input(
                 && join.build_side_constraint == JoinBuildSideConstraint::Either
                 && join.duplicate_eliminated_columns.is_empty()
                 && !join.delim_flipped
-                && !crate::expression::comparison_join_has_evaluation_fence(join)
+                && !crate::rewrite::expr::comparison_join_has_evaluation_fence(join)
                 && join
                     .left_projection_map
                     .is_identity(native_child_layout(&join.left, layouts)?.len())
@@ -662,7 +662,7 @@ fn native_relation_stats(
         _ => None,
     };
     let cardinality = estimate.map_or_else(
-        || crate::statistics::gathering::default_table_cardinality(state.session.as_deref()),
+        || crate::estimate::gathering::default_table_cardinality(state.session.as_deref()),
         |estimate| usize::try_from(estimate.expected).unwrap_or(usize::MAX),
     );
     let mut stats = RelationStats::with_cardinality(cardinality);
@@ -687,7 +687,7 @@ fn native_relation_stats(
     }
     stats.materialization_cardinality = stats.risk_cardinality;
     stats.estimated_payload_width =
-        crate::join::build_probe_side::estimate_row_payload_width(atom.layout.types());
+        crate::cost::join_layout::estimate_row_payload_width(atom.layout.types());
     stats.unique_keys = atom
         .stats
         .unique_keys
@@ -717,7 +717,7 @@ fn native_relation_stats(
 }
 
 fn rebuild_native_join(
-    node: &crate::join_order::cost_model::DPJoinNode,
+    node: &crate::region::join::cost_model::DPJoinNode,
     atoms: &[NativeJoinAtom],
     filters: &[Arc<FilterInfo>],
     used_filters: &mut HashSet<usize>,
@@ -758,7 +758,7 @@ fn rebuild_native_join(
         nodes,
         state,
     )?;
-    let flip_for_build = node.build_side == crate::join::build_probe_side::JoinBuildSide::Left;
+    let flip_for_build = node.build_side == crate::cost::join_layout::JoinBuildSide::Left;
     let (left, right) = if flip_for_build {
         (right, left)
     } else {
@@ -891,7 +891,7 @@ fn rebuild_native_join(
 /// cardinalities, and can turn a selective join into a quota-exhausting plan.
 fn attach_native_filters(
     child: NativeChild,
-    relations: &crate::join_order::relation::JoinRelationSet,
+    relations: &crate::region::join::relation::JoinRelationSet,
     filters: &[Arc<FilterInfo>],
     used: &mut HashSet<usize>,
     nodes: &mut Vec<NativeNode>,
@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn reconstruction_consumes_local_and_multirelation_filters_at_first_support() {
-        use crate::join_order::relation::JoinRelationSet;
+        use crate::region::join::relation::JoinRelationSet;
         use paro_planner::expression::{
             ConjunctionExpression, ConjunctionType, ConstantExpression,
         };

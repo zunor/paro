@@ -26,7 +26,7 @@ use paro_planner::operator::{
 };
 
 use super::staging::{NativeChild, NativeNode, NativeShell};
-use super::{Memo, PatternOperand, PlannerTransformState, boundary};
+use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 
 /// Completion of this selected rewrite, independent of global search state.
 pub(super) enum EliminationResult {
@@ -729,8 +729,9 @@ mod tests {
                         source
                     };
                     let source = make_source();
-                    let (expected, changed) = crate::join::elimination::JoinElimination::new()
-                        .optimize_plan_with_change(make_source());
+                    let (expected, changed) =
+                        crate::rewrite::join::elimination::JoinElimination::new()
+                            .optimize_plan_with_change(make_source());
                     let actual =
                         rewrite_shell(NativeShell::from_owned(source, &HashMap::new()).unwrap())
                             .unwrap();
@@ -774,8 +775,8 @@ mod tests {
                     OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(distinct));
                 plan
             };
-            let (_, changed) =
-                crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+            let (_, changed) = crate::rewrite::join::elimination::JoinElimination::new()
+                .optimize_plan_with_change(make());
             let native =
                 rewrite_shell(NativeShell::from_owned(make(), &HashMap::new()).unwrap()).unwrap();
             assert_eq!(changed, target == Some(0));
@@ -801,33 +802,28 @@ mod tests {
                         vec![LogicalType::Integer],
                     )))
                 };
-                let (reference, changed) = crate::join::elimination::JoinElimination::new()
-                    .optimize_plan_with_change(make());
+                let (reference, changed) =
+                    crate::rewrite::join::elimination::JoinElimination::new()
+                        .optimize_plan_with_change(make());
                 assert!(changed);
                 let native =
                     rewrite_shell(NativeShell::from_owned(make(), &HashMap::new()).unwrap())
                         .unwrap()
                         .expect("both selected branches should be covered natively");
                 assert_eq!(native.root_layout().unwrap(), reference.output_layout());
-                assert!(
-                    !native
-                        .nodes
-                        .iter()
-                        .any(|node| matches!(node.operator, LogicalOperator::Join(_)))
-                );
+                assert!(!native
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node.operator, LogicalOperator::Join(_))));
                 let LogicalOperator::SetOperation(setop) = native.root_operator() else {
                     panic!("set operation disappeared")
                 };
                 assert_eq!((setop.setop_type, setop.setop_all), (kind, all));
                 let layouts = native.layouts().unwrap();
-                assert!(
-                    output_bindings_for_child(&layouts, &setop.left)
-                        .contains(&ColumnBinding::new(10, 0))
-                );
-                assert!(
-                    output_bindings_for_child(&layouts, &setop.right)
-                        .contains(&ColumnBinding::new(20, 0))
-                );
+                assert!(output_bindings_for_child(&layouts, &setop.left)
+                    .contains(&ColumnBinding::new(10, 0)));
+                assert!(output_bindings_for_child(&layouts, &setop.right)
+                    .contains(&ColumnBinding::new(20, 0)));
             }
         }
     }
@@ -854,8 +850,8 @@ mod tests {
                     ),
                 ))),
             };
-            let (reference, changed) =
-                crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+            let (reference, changed) = crate::rewrite::join::elimination::JoinElimination::new()
+                .optimize_plan_with_change(make());
             assert!(changed);
             let native = rewrite_shell(NativeShell::from_owned(make(), &HashMap::new()).unwrap())
                 .unwrap()
@@ -865,12 +861,10 @@ mod tests {
                 native.root_operator().op_type(),
                 reference.operator.op_type()
             );
-            assert!(
-                !native
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(node.operator, LogicalOperator::Join(_)))
-            );
+            assert!(!native
+                .nodes
+                .iter()
+                .any(|node| matches!(node.operator, LogicalOperator::Join(_))));
         }
     }
 
@@ -878,8 +872,8 @@ mod tests {
     fn materialization_and_external_are_complete_selected_rewrite_barriers() {
         for kind in 7..10 {
             let make = || barrier(kind, candidate(true, false));
-            let (reference, changed) =
-                crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+            let (reference, changed) = crate::rewrite::join::elimination::JoinElimination::new()
+                .optimize_plan_with_change(make());
             assert!(
                 !changed,
                 "the reference rule does not traverse this barrier"
@@ -1041,10 +1035,10 @@ mod tests {
     #[test]
     fn production_binding_uses_memo_unique_key_boundary() {
         use crate::cascades::budget::{BudgetDimension, SearchBudget};
-        use crate::cascades::planner::MemoBuilder;
         use crate::cascades::planner::transformation::{
-            PlannerTransformation, TransformContext, matching,
+            matching, PlannerTransformation, TransformContext,
         };
+        use crate::cascades::planner::MemoBuilder;
         use paro_planner::binder::context::BindContext;
 
         let mut input = MemoBuilder::build(
@@ -1120,10 +1114,10 @@ mod tests {
     #[test]
     fn production_apply_stages_native_elimination_candidate() {
         use crate::cascades::budget::{BudgetDimension, SearchBudget};
-        use crate::cascades::planner::MemoBuilder;
         use crate::cascades::planner::transformation::{
-            PlannerTransformation, PlannerTransformationRule, TransformContext, matching,
+            matching, PlannerTransformation, PlannerTransformationRule, TransformContext,
         };
+        use crate::cascades::planner::MemoBuilder;
         use crate::cascades::rules::TransformationRule;
         use paro_context::TestStatementContextBuilder;
         use paro_planner::binder::context::BindContext;
@@ -1394,11 +1388,9 @@ mod tests {
                         .logical_properties
                         .unique_keys
                         .insert(vec![column].into_boxed_slice());
-                    assert!(
-                        reads
-                            .iter()
-                            .any(|read| !read.is_current(&input.memo).unwrap())
-                    );
+                    assert!(reads
+                        .iter()
+                        .any(|read| !read.is_current(&input.memo).unwrap()));
                     let mut context = TransformContext::new(&mut input.memo, input.root);
                     assert_eq!(
                         rule.apply_binding(&binding, &mut context).unwrap().len(),
@@ -1447,8 +1439,8 @@ mod tests {
             *projection.child = window(join, column(1, 0));
             plan
         };
-        let (_, changed) =
-            crate::join::elimination::JoinElimination::new().optimize_plan_with_change(make());
+        let (_, changed) = crate::rewrite::join::elimination::JoinElimination::new()
+            .optimize_plan_with_change(make());
         assert!(
             !changed,
             "the Window invocation is still present even if its output is not selected"

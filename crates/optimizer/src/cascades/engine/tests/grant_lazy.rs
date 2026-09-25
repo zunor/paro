@@ -241,12 +241,10 @@ fn lazy_grants_preserve_invariant_goal_sharing() {
         goals,
         BTreeSet::from([GrantGoalKey::Invariant(AdmissibleGrantSetId(9))])
     );
-    assert!(
-        output
-            .safe_winners
-            .windows(2)
-            .all(|pair| pair[0].winner.candidate == pair[1].winner.candidate)
-    );
+    assert!(output
+        .safe_winners
+        .windows(2)
+        .all(|pair| pair[0].winner.candidate == pair[1].winner.candidate));
 }
 
 #[test]
@@ -296,16 +294,14 @@ fn lazy_grants_no_available_class_is_explicit_mandatory_only() {
         assert!(!output.stop.budget_limited);
         assert!(!engine.memo.search_obligations_empty());
         assert_eq!(engine.memo.search_obligations().len(), 3);
-        assert!(
-            engine
-                .memo
-                .search_obligations()
-                .iter()
-                .all(|obligation| matches!(
-                    obligation.reason,
-                    crate::cascades::budget::SearchIncompleteReason::OptionalGrantDeferred(_)
-                ))
-        );
+        assert!(engine
+            .memo
+            .search_obligations()
+            .iter()
+            .all(|obligation| matches!(
+                obligation.reason,
+                crate::cascades::budget::SearchIncompleteReason::OptionalGrantDeferred(_)
+            )));
         let coverage = output.grant_search.unwrap();
         assert_eq!(coverage.expected_class, None);
         assert!(coverage.optional_classes.is_empty());
@@ -313,20 +309,16 @@ fn lazy_grants_no_available_class_is_explicit_mandatory_only() {
             coverage.mandatory_only_classes,
             classes().map(|class| class.id).into_iter().collect()
         );
-        assert!(
-            !calls
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(op, _)| *op == Fingerprint(11))
-        );
-        assert!(
-            output
-                .winners
-                .iter()
-                .zip(output.safe_winners.iter())
-                .all(|(winner, safe)| Arc::ptr_eq(&winner.frozen, &safe.frozen))
-        );
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(op, _)| *op == Fingerprint(11)));
+        assert!(output
+            .winners
+            .iter()
+            .zip(output.safe_winners.iter())
+            .all(|(winner, safe)| Arc::ptr_eq(&winner.frozen, &safe.frozen)));
     }
 }
 
@@ -552,13 +544,11 @@ fn lazy_grants_cancel_and_deadline_roll_back_and_clear_temporary_goals() {
         } else {
             let output = result.unwrap();
             assert_eq!(output.winners.len(), 3);
-            assert!(
-                output
-                    .winners
-                    .iter()
-                    .zip(output.safe_winners.iter())
-                    .all(|(winner, safe)| Arc::ptr_eq(&winner.frozen, &safe.frozen))
-            );
+            assert!(output
+                .winners
+                .iter()
+                .zip(output.safe_winners.iter())
+                .all(|(winner, safe)| Arc::ptr_eq(&winner.frozen, &safe.frozen)));
         }
     }
 }

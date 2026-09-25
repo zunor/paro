@@ -17,7 +17,7 @@ use paro_planner::expression::OperatorType;
 use paro_planner::operator::{Join, LogicalOperator};
 
 use super::staging::{NativeChild, NativeShell};
-use super::{Memo, PatternOperand, PlannerTransformState, boundary};
+use super::{boundary, Memo, PatternOperand, PlannerTransformState};
 
 /// Try the supported LatePayloadFetch contracts on the native shell.
 ///
@@ -67,7 +67,7 @@ pub(super) fn try_native_late_payload_prefix(
         return Ok(None);
     };
     let mut paths = std::collections::HashMap::new();
-    let candidate = crate::aggregate::late_payload::prove_prefix_outputs(
+    let candidate = crate::physical::access::late_payload::prove_prefix_outputs(
         &projection.expressions,
         |binding, kernel, byte_width| {
             let path = paths.entry(binding.table_index).or_insert_with(|| {
@@ -326,7 +326,7 @@ fn native_prefix_path(
     }
 }
 
-use crate::aggregate::late_payload::{
+use crate::physical::access::late_payload::{
     prefix_unary_child, prefix_unary_child_mut, prove_prefix_filter_expression,
 };
 
@@ -338,8 +338,8 @@ mod tests {
     use paro_catalog::entry::{
         CatalogObjectId, ColumnDefinition, CreateTableInfo, TableCatalogEntry,
     };
-    use paro_function::scalar::ScalarBindInput;
     use paro_function::scalar::string::get_substring_functions;
+    use paro_function::scalar::ScalarBindInput;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, OperatorExpression,
@@ -348,7 +348,7 @@ mod tests {
     use paro_planner::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
 
-    use super::super::{PlannerTransformation, matching};
+    use super::super::{matching, PlannerTransformation};
     use crate::cascades::budget::{BudgetDimension, SearchBudget};
     use crate::cascades::planner::MemoBuilder;
 
@@ -649,38 +649,40 @@ mod tests {
             substring(source(binding)),
             substring_width(source(binding), 1),
         ];
-        let candidate =
-            crate::aggregate::late_payload::prove_prefix_outputs(&expressions, |_, _, width| {
-                Some(width == 2)
-            })
-            .unwrap();
+        let candidate = crate::physical::access::late_payload::prove_prefix_outputs(
+            &expressions,
+            |_, _, width| Some(width == 2),
+        )
+        .unwrap();
         assert_eq!(candidate.output_indices, [0]);
-        assert!(
-            crate::aggregate::late_payload::prove_prefix_outputs(&expressions, |_, _, _| None,)
-                .is_none()
-        );
-        assert!(
-            crate::aggregate::late_payload::prove_prefix_outputs(&expressions, |_, _, _| Some(
-                true
-            ),)
-            .is_none()
-        );
+        assert!(crate::physical::access::late_payload::prove_prefix_outputs(
+            &expressions,
+            |_, _, _| None,
+        )
+        .is_none());
+        assert!(crate::physical::access::late_payload::prove_prefix_outputs(
+            &expressions,
+            |_, _, _| Some(true),
+        )
+        .is_none());
         let repeated = [substring(source(binding)), substring(source(binding))];
         assert_eq!(
-            crate::aggregate::late_payload::prove_prefix_outputs(&repeated, |_, _, _| Some(true),)
-                .unwrap()
-                .output_indices,
+            crate::physical::access::late_payload::prove_prefix_outputs(&repeated, |_, _, _| Some(
+                true
+            ),)
+            .unwrap()
+            .output_indices,
             [0, 1]
         );
     }
 
     #[test]
     fn mixed_prefix_projection_cannot_chain_rowid_lowering() {
-        use crate::transformation_rejection::{
+        use crate::diagnostics::rejection::{
             RejectionReasons, TransformationRejectionCounts, TransformationRejectionGuard as Guard,
         };
         let (mut plan, prefix_changed) =
-            crate::aggregate::late_payload::rewrite_matched_prefix_node(production_plan(4))
+            crate::physical::access::late_payload::rewrite_matched_prefix_node(production_plan(4))
                 .unwrap();
         assert!(prefix_changed);
         let LogicalOperator::Projection(output) = &mut plan.operator else {
@@ -691,21 +693,19 @@ mod tests {
         output.child.stats.estimated_cardinality =
             Some(paro_planner::plan::CardinalityEstimate::exact(10));
         let mut reasons = Some(RejectionReasons::default());
-        let (_, changed) = crate::aggregate::late_payload::rewrite_node_profiled(
+        let (_, changed) = crate::physical::access::late_payload::rewrite_node_profiled(
             plan,
             &BindContext::new(),
-            &crate::cost_model::CostModel::default(),
+            &crate::estimate::selectivity::SelectivityModel::default(),
             &mut reasons,
         )
         .unwrap();
         assert!(!changed);
         let mut counts = TransformationRejectionCounts::default();
         counts.record(reasons.unwrap());
-        assert!(
-            counts
-                .iter()
-                .any(|(guard, count)| guard == Guard::SelectiveInvalidColumn && count == 1)
-        );
+        assert!(counts
+            .iter()
+            .any(|(guard, count)| guard == Guard::SelectiveInvalidColumn && count == 1));
     }
 
     #[test]
@@ -719,7 +719,7 @@ mod tests {
         };
         topn.projection_map = paro_planner::operator::ProjectionMap::new(vec![0]);
         let (rewritten, changed) =
-            crate::aggregate::late_payload::rewrite_matched_prefix_node(plan).unwrap();
+            crate::physical::access::late_payload::rewrite_matched_prefix_node(plan).unwrap();
         assert!(changed);
         let LogicalOperator::Projection(output) = &rewritten.operator else {
             panic!("expected output projection")
@@ -794,10 +794,10 @@ mod tests {
         use crate::cascades::rules::TransformationRule;
         for wrapper in 0..21 {
             if wrapper >= 16 {
-                let (reference, changed) = crate::aggregate::late_payload::rewrite_node(
+                let (reference, changed) = crate::physical::access::late_payload::rewrite_node(
                     production_plan(wrapper),
                     &BindContext::new(),
-                    &crate::cost_model::CostModel::default(),
+                    &crate::estimate::selectivity::SelectivityModel::default(),
                 )
                 .unwrap();
                 assert!(changed);
@@ -812,9 +812,9 @@ mod tests {
             }
             if wrapper == 14 || wrapper == 15 {
                 let (reference, changed) =
-                    crate::aggregate::late_payload::rewrite_matched_prefix_node(production_plan(
-                        wrapper,
-                    ))
+                    crate::physical::access::late_payload::rewrite_matched_prefix_node(
+                        production_plan(wrapper),
+                    )
                     .unwrap();
                 assert!(changed);
                 let LogicalOperator::Projection(output) = &reference.operator else {
@@ -974,15 +974,13 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .max = 100_000;
-                assert!(
-                    super::super::native_selective_payload::rewrite(
-                        original,
-                        original_layouts,
-                        &state
-                    )
-                    .unwrap()
-                    .is_none()
-                );
+                assert!(super::super::native_selective_payload::rewrite(
+                    original,
+                    original_layouts,
+                    &state
+                )
+                .unwrap()
+                .is_none());
             } else {
                 assert!(matches!(
                     projection.expressions.get(usize::from(wrapper == 15)),
@@ -996,7 +994,9 @@ mod tests {
                 assert!(matches!(projection.expressions[0], Expression::Function(_)));
             }
             if wrapper == 10 || wrapper == 11 {
-                use crate::aggregate::late_payload::{RowIdPathPolicy, prove_rowid_operator};
+                use crate::physical::access::late_payload::{
+                    prove_rowid_operator, RowIdPathPolicy,
+                };
                 use paro_planner::operator::JoinType;
                 for (join_type, allowed) in [
                     (JoinType::Inner, true),

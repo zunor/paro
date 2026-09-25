@@ -3,6 +3,7 @@
 
 //! Stable rule and implementation registries used by Direct and Memo search.
 
+use crate::cost::response::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
@@ -10,7 +11,6 @@ use paro_common::error::{self as paro_error, Result};
 use paro_planner::expression::Expression;
 
 use super::budget::BudgetDimension;
-use super::calibration::ParallelWorkProfile;
 use super::cost::SearchCost;
 use super::ids::{
     Fingerprint, GroupId, ImplementationId, LogicalExprId, LogicalPayloadId, PhysicalPayloadId,
@@ -22,6 +22,7 @@ use super::memo::{
 };
 use super::properties::ProvidedProperties;
 use super::region::RegionCandidateContract;
+use crate::cost::calibration::ParallelWorkProfile;
 
 pub const CTE_INLINE_RULE: RuleId = RuleId(10_007);
 pub const CTE_DEMAND_PUSHDOWN_RULE: RuleId = RuleId(10_008);
@@ -611,7 +612,7 @@ pub struct TransformContext<'a> {
     fact_value_fingerprint: Option<Fingerprint>,
     domain_continuations: Vec<DomainContinuation>,
     domain_continuations_enabled: bool,
-    pub(crate) rejection_reasons: Option<crate::transformation_rejection::RejectionReasons>,
+    pub(crate) rejection_reasons: Option<crate::diagnostics::rejection::RejectionReasons>,
 }
 
 impl<'a> TransformContext<'a> {
@@ -772,7 +773,7 @@ impl<'a> TransformContext<'a> {
     }
 
     pub(crate) fn rollback(mut self) -> Result<()> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Apply);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Apply);
         let mut failures = Vec::new();
         while let Some(rollback) = self.sidecar_rollbacks.pop() {
             if let Err(error) = rollback() {
@@ -795,7 +796,7 @@ impl<'a> TransformContext<'a> {
     }
 
     pub(crate) fn commit(mut self) -> Result<(Box<[GroupId]>, BTreeSet<GroupId>)> {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Insert);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Insert);
         let Some(savepoint) = self.memo_savepoint.take() else {
             return Ok((Box::new([]), BTreeSet::new()));
         };
@@ -976,150 +977,6 @@ pub trait TransformationRule: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum GrantDependencyDescriptor {
-    /// Neither memory-class decisions nor worker capacity affect this local
-    /// implementation. Children can still make the enclosing group sensitive.
-    Invariant,
-    /// Memory independent, but source supply/latency depends on the worker
-    /// capacity. Equal capacities may share a winner across memory classes.
-    Parallelism,
-    /// The complete operating point is required (including memory/spill).
-    Sensitive,
-}
-
-/// Query-local identity of one base row source. Binder table indexes are
-/// unique across aliases, so self joins remain distinct while equivalent Memo
-/// expressions retain the same source identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WorkSourceId(pub usize);
-
-/// Stable identity of one survivor-domain proof. It names the build domain,
-/// probe-key mapping, equality/NULL semantics, and statistics snapshot used
-/// to derive a source-local retention bound. Reusing the same proof cannot
-/// shrink the source domain twice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DomainProofId(pub Fingerprint);
-
-/// Stable identity of one physical predicate evaluation. This is deliberately
-/// separate from [`DomainProofId`]: two operators may evaluate the same domain
-/// proof, while replaying one operator during search must not charge it twice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct EvaluationOccurrenceId(pub Fingerprint);
-
-/// Source-local work retention derived for one runtime-filter installation.
-/// Keeping the ratio beside its source preserves a unique-key proof on one
-/// lineage even when another lineage of the same join key is non-unique.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SidewaysFilterSource {
-    pub source: WorkSourceId,
-    /// Identity of the exact domain proof. Replaying the same proof is
-    /// idempotent; different identities are conservatively correlated unless
-    /// a future joint-domain proof explicitly relates them.
-    pub domain: DomainProofId,
-    /// Physical evaluation which publishes `domain` to this source.
-    pub evaluation: EvaluationOccurrenceId,
-    pub expected_retained_ppm: u32,
-    pub upper_retained_ppm: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceRetentionProof {
-    pub domain: DomainProofId,
-    pub expected_retained_ppm: u32,
-    /// Absolute survivor bound relative to the immutable base source, never a
-    /// conditional selectivity relative to the preceding filter.
-    pub upper_retained_ppm: u32,
-}
-
-/// A disjoint portion of a winner's work proven to belong to one base source.
-/// The contained cost is work-only: memory and external-resource contracts
-/// remain on the complete winner and are never weakened by selectivity.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SourceFilterWork {
-    pub domain: DomainProofId,
-    pub evaluation: EvaluationOccurrenceId,
-    /// Immutable input-row domain on which this evaluation is charged.  This
-    /// is intentionally carried next to the occurrence rather than inferred
-    /// from `SourceWork::cost`: the latter already contains survivor
-    /// reductions and therefore changes with join composition order.
-    pub evaluation_rows: u64,
-    pub expected_retained_ppm: u32,
-    pub upper_retained_ppm: u32,
-    /// Cost of evaluating this predicate against the unfiltered source.  It is
-    /// allocated once from the operator-local full-source term and then only
-    /// scaled by preceding *distinct* domain proofs.  It must never be derived
-    /// from a lane's already-retained `cost`.
-    pub full_apply_cost: SearchCost,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SourceWork(Arc<SourceWorkData>);
-
-impl SourceWork {
-    pub(crate) fn snapshot(&self) -> &SourceWorkData {
-        &self.0
-    }
-
-    /// Diagnostic-only allocation identity, valid while the snapshot is
-    /// borrowed. This is never a semantic identity or retained cache key.
-    pub(crate) fn payload_identity(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
-    }
-
-    pub(crate) fn retained_payload_bytes(&self) -> usize {
-        std::mem::size_of::<SourceWorkData>()
-            + std::mem::size_of_val(self.retentions.as_ref())
-            + std::mem::size_of_val(self.filters.as_ref())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shares_payload(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl From<SourceWorkData> for SourceWork {
-    fn from(data: SourceWorkData) -> Self {
-        Self(Arc::new(data))
-    }
-}
-
-impl std::ops::Deref for SourceWork {
-    type Target = SourceWorkData;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// An immutable source response once published. Streaming/branch composition
-/// shares the complete snapshot; only a filter which changes this source
-/// constructs a new one. No mutable access to a published snapshot is exposed.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SourceWorkData {
-    pub source: WorkSourceId,
-    /// Immutable number of rows in this physical source lane before runtime
-    /// predicates. Predicate work is attributed by this row domain, never by
-    /// byte cost or by a cost already reduced by an earlier predicate.
-    pub source_rows: u64,
-    /// Work of the unfiltered source. Every survivor proof is interpreted in
-    /// this immutable domain so correlated filters cannot multiply hard bounds.
-    pub base_cost: SearchCost,
-    /// Base-source access work after every selected runtime filter.
-    pub cost: SearchCost,
-    /// Unique survivor proofs already applied to the base domain.
-    pub retentions: Box<[SourceRetentionProof]>,
-    /// Runtime predicates already attached to this source.
-    pub filters: Box<[SourceFilterWork]>,
-    /// Jointly ordered evaluation work currently present in the winner cost.
-    pub filter_apply_cost: SearchCost,
-    /// Complete source-pipeline work after retention and predicate ordering,
-    /// folded once at the pipeline operating point.
-    pub phased_cost: SearchCost,
-    pub phase_tasks: u16,
-}
-
 #[derive(Debug, Clone)]
 pub struct ChildGoalAlternative {
     pub children: Box<[(GroupId, OptimizationGoal)]>,
@@ -1227,7 +1084,7 @@ pub struct PhysicalCandidate {
     /// Whether operator-owned retained state can yield memory to spill after
     /// child winner peaks are known.
     pub spillable: bool,
-    pub enforcer_cost_input: super::engine::EnforcerCostInput,
+    pub enforcer_cost_input: crate::cost::enforcer::EnforcerCostInput,
     pub physical_fingerprint: Fingerprint,
     pub region: Option<RegionCandidateContract>,
     /// Every logical expression must have at least one mandatory implementation

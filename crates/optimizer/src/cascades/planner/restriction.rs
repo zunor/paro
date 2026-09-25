@@ -18,7 +18,7 @@ fn transparent<Child>(filter: &paro_planner::operator::Filter<Child>) -> bool {
 }
 
 fn compose(outer: &[Expression], inner: &[Expression]) -> Option<Vec<Expression>> {
-    crate::filter::pushdown::FilterPushdown::normalize_predicates(
+    crate::rewrite::predicate::pushdown::FilterPushdown::normalize_predicates(
         inner.iter().chain(outer).cloned(),
     )
 }

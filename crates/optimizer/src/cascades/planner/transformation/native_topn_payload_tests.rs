@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::{PlannerTransformation, TransformContext, boundary, matching};
+use super::super::{boundary, matching, PlannerTransformation, TransformContext};
 use super::*;
 use crate::cascades::budget::{BudgetDimension, SearchBudget};
 use crate::cascades::planner::MemoBuilder;
@@ -201,10 +201,10 @@ fn fetch_columns(shell: &NativeShell) -> Vec<Vec<usize>> {
 
 #[test]
 fn native_detail_topn_shared_admission_keeps_missing_facts_and_guard_reasons() {
-    use crate::aggregate::late_payload::prove_row_preserving_inputs;
-    use crate::transformation_rejection::{
+    use crate::diagnostics::rejection::{
         RejectionReasons, TransformationRejectionCounts, TransformationRejectionGuard as Guard,
     };
+    use crate::physical::access::late_payload::prove_row_preserving_inputs;
     use std::cell::Cell;
 
     with_shell(fixture(0), |shell, state| {
@@ -230,7 +230,7 @@ fn native_detail_topn_shared_admission_keeps_missing_facts_and_guard_reasons() {
             let source_reads = Cell::new(0);
             let mut reasons = Some(RejectionReasons::default());
             let result = prove_row_preserving_inputs(
-                crate::aggregate::late_payload::RowPreservingInputs {
+                crate::physical::access::late_payload::RowPreservingInputs {
                     total_rows: if case == 0 {
                         0
                     } else {
@@ -277,10 +277,10 @@ fn native_detail_topn_shared_admission_keeps_missing_facts_and_guard_reasons() {
 #[test]
 fn native_detail_topn_preserves_two_fetch_frontiers_without_owned_bridge() {
     for kind in 0..5 {
-        let (_, changed) = crate::aggregate::late_payload::rewrite_node(
+        let (_, changed) = crate::physical::access::late_payload::rewrite_node(
             fixture(kind),
             &BindContext::new(),
-            &crate::cost_model::CostModel::default(),
+            &crate::estimate::selectivity::SelectivityModel::default(),
         )
         .unwrap();
         assert!(changed, "legacy fixture {kind}");

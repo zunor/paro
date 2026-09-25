@@ -14,7 +14,7 @@ use paro_common::types::LogicalType;
 use paro_planner::expression::{ConstantExpression, Expression, SharedExpressionPayload};
 
 use super::super::ids::{Fingerprint, StableFingerprintBuilder};
-use super::super::scalar_lowering::{encode_value, value_fingerprint};
+use paro_planner::physical::scalar_identity::{encode_value, value_fingerprint};
 
 #[derive(Debug, Clone)]
 pub struct ScalarLiteral {

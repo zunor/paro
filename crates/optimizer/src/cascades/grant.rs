@@ -9,7 +9,8 @@ use paro_common::error::{self as paro_error, Result};
 
 use super::ids::{Fingerprint, GroupId, ImplementationId, StableFingerprintBuilder};
 use super::memo::Memo;
-use super::rules::{GrantDependencyDescriptor, ImplementationContext, ImplementationRegistry};
+use super::rules::{ImplementationContext, ImplementationRegistry};
+use crate::cost::response::GrantDependencyDescriptor;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantSharingProof {
@@ -155,8 +156,8 @@ mod tests {
     use paro_common::types::LogicalType;
 
     use super::*;
+    use crate::binding::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
     use crate::cascades::budget::SearchBudget;
-    use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
     use crate::cascades::ids::{ColumnId, LogicalExprId, LogicalPayloadId};
     use crate::cascades::memo::{
         EquivalenceProof, GroupCardinality, LogicalExpr, LogicalExprKey, LogicalProperties,

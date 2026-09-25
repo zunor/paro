@@ -24,6 +24,7 @@ use paro_storage::table::table_factory::TableFactory;
 
 use super::super::memo::LogicalExpr;
 use super::*;
+use paro_planner::physical::access_identity::encode_predicate;
 
 mod native_runtime_filter;
 
@@ -75,7 +76,7 @@ fn cte_domain_quality_inspects_selected_predicates_without_rule_provenance() {
                 consumer,
             )));
         if normalized {
-            crate::cte::normalize::normalize(plan).unwrap()
+            crate::rewrite::cte::normalize::normalize(plan).unwrap()
         } else {
             plan
         }
@@ -909,7 +910,7 @@ fn calibrated_hash_work_distinguishes_integral_and_wide_keys() {
 
 #[test]
 fn expression_cost_facts_read_current_group_cardinality() {
-    let schema = GroupSchema::new([super::super::column::ColumnDesc {
+    let schema = GroupSchema::new([crate::binding::column::ColumnDesc {
         id: ColumnId::new(0),
         logical_type: LogicalType::BigInt,
         nullable: false,
@@ -1189,7 +1190,7 @@ fn planner_topn_retains_hidden_sort_operand_without_widening_output() {
         (0, paro_context::OptimizerSearchPolicy::Regional),
         (3, paro_context::OptimizerSearchPolicy::Regional),
     ] {
-        let session = crate::subquery::partition_aggregate_tests::setup_session();
+        let session = crate::rewrite::subquery::partition_aggregate_tests::setup_session();
         let binder = Binder::new(session.clone());
         let bind_context = binder.bind_context.clone();
         let constant = |n| {
@@ -1536,10 +1537,10 @@ fn preserved_build_can_filter_a_direct_non_preserved_probe() {
 
 #[test]
 fn calibration_revision_can_change_the_selected_physical_algorithm() {
-    fn coefficient(value: f64) -> super::super::calibration::CalibratedOpCost {
+    fn coefficient(value: f64) -> crate::cost::calibration::CalibratedOpCost {
         let mut resources = [0.0; super::super::cost::RESOURCE_DIMS];
         resources[ResourceDimension::Cpu as usize] = value;
-        super::super::calibration::CalibratedOpCost {
+        crate::cost::calibration::CalibratedOpCost {
             expected_resources_per_unit: resources,
             risk_resources_per_unit: resources,
             latency_per_unit: CompactRange::point(value).unwrap(),
@@ -1670,7 +1671,7 @@ fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
     );
 
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
@@ -1788,7 +1789,7 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
         // test_grant_classes declares only class zero; do not derive class
         // two from a different session-side class domain.
         budget.max_grant_classes = 1;
-        let session = crate::subquery::partition_aggregate_tests::setup_session();
+        let session = crate::rewrite::subquery::partition_aggregate_tests::setup_session();
         let binder = Binder::new(session.clone());
         let context =
             crate::context::OptimizationContext::new(session, binder.bind_context.clone());
@@ -2127,7 +2128,7 @@ fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
         PhysicalImplementationFlavor::HashJoinRuntimeFilter
     );
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
@@ -2168,8 +2169,8 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
 
     let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
-            .extract(logical)
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
+            .build(logical)
             .unwrap();
     let [probe, _] = physical.child_ids(&physical.node(physical.root).children) else {
         panic!("outer hash join must be binary");
@@ -2210,8 +2211,8 @@ fn semi_join_preserved_probe_keeps_runtime_filter_consumer_lineage() {
 
     let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
-            .extract(logical)
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
+            .build(logical)
             .unwrap();
     let [probe, _] = physical.child_ids(&physical.node(physical.root).children) else {
         panic!("outer hash join must be binary");
@@ -2252,8 +2253,8 @@ fn left_outer_preserved_probe_keeps_runtime_filter_consumer_lineage() {
 
     let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
-            .extract(logical)
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
+            .build(logical)
             .unwrap();
     let [probe, _] = physical.child_ids(&physical.node(physical.root).children) else {
         panic!("outer hash join must be binary");
@@ -2345,7 +2346,7 @@ fn nested_runtime_filter_consumers(
     enforcers: ExtractedEnforcerContracts,
 ) -> Vec<(usize, usize)> {
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
             .with_winner_contracts(contracts)
             .with_enforcer_contracts(enforcers)
             .requiring_winner_contracts()
@@ -2652,7 +2653,7 @@ fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
         PhysicalImplementationFlavor::HashJoinRuntimeFilter
     );
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
@@ -2719,7 +2720,7 @@ fn build_left_semi_join_filters_every_union_all_probe_source() {
         PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
     );
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
@@ -2779,7 +2780,7 @@ fn global_sort_enforcer_is_extracted_as_an_executable_plan_node() {
         crate::physical::PlanOrigin::Enforcer(_)
     ));
     let physical =
-        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+        crate::physical::PhysicalPlanBuilder::new(crate::physical::PhysicalBuildContext::default())
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .extract_selected(&optimized.plan)

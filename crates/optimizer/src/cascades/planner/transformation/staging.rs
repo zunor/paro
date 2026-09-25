@@ -636,7 +636,7 @@ pub(super) fn stage_transformed_expression(
     memo: &mut Memo,
     state: &mut PlannerTransformState,
 ) -> Result<Option<StagedEquivalent>> {
-    let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Staging);
+    let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Staging);
     let StagingRequest {
         input,
         input_facts,
@@ -807,7 +807,7 @@ pub(super) fn stage_transformed_expression(
         request: NodeStagingRequest,
         mut child_states: Vec<NodeState>,
     ) -> Result<Option<(NodeState, Option<StagedEquivalent>)>> {
-        let _b3 = crate::work_partition::enter_b3(crate::work_partition::Bucket::Encoding);
+        let _b3 = crate::diagnostics::work::enter_b3(crate::diagnostics::work::Bucket::Encoding);
         let NodeStagingRequest {
             input,
             target,
@@ -823,7 +823,7 @@ pub(super) fn stage_transformed_expression(
                     layout,
                     resident,
                 } => {
-                    crate::work_partition::settled_node(false);
+                    crate::diagnostics::work::settled_node(false);
                     if let LogicalOperator::BoundReference(reference) = &node.operator {
                         if target.is_some()
                             || !session
@@ -883,7 +883,7 @@ pub(super) fn stage_transformed_expression(
                     )
                 }
             };
-        crate::work_partition::staging_payload(false);
+        crate::diagnostics::work::staging_payload(false);
         let native_direct = settled_layout.is_none();
         if native_direct {
             if let LogicalOperator::Aggregate(aggregate) = &semantic_operator {
@@ -1385,7 +1385,7 @@ pub(super) fn stage_transformed_expression(
         // Identity reuse still performs all fact merges and context checks.
         // Only new payloads consume the extraction template and cost vectors.
         // Read the same child snapshots, never post-merge Memo statistics.
-        crate::work_partition::staging_payload(true);
+        crate::diagnostics::work::staging_payload(true);
         #[cfg(test)]
         STAGING_PAYLOAD_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         // The old path instantiated each child transport, assembled the
@@ -1396,7 +1396,7 @@ pub(super) fn stage_transformed_expression(
         let cost_plan = if native_direct {
             None
         } else {
-            crate::work_partition::settled_node(true);
+            crate::diagnostics::work::settled_node(true);
             let children = child_states
                 .iter()
                 .map(|child| {
@@ -1766,7 +1766,7 @@ pub(super) fn stage_transformed_expression(
         )))
     }
 
-    use crate::search::optimizer::{SearchNodeRef, SearchOptimizer};
+    use crate::physical::access::optimizer::{SearchNodeRef, SearchOptimizer};
     let arena_roots = match &input {
         StagingInput::Arena(plan) => {
             SearchOptimizer::candidate_arena_roots(&state.staging_arena.plan(*plan)?)?

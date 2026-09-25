@@ -6,9 +6,11 @@
 use divan::Bencher;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_optimizer::expression::rewriter::ExpressionRewriter;
-use paro_optimizer::rules::expression_matcher::{AnyExpressionMatcher, ExpressionMatcher};
-use paro_optimizer::rules::rule::{Rule, RuleResult};
+use paro_optimizer::rewrite::expr::rewriter::ExpressionRewriter;
+use paro_optimizer::rewrite::expr::rules::expression_matcher::{
+    AnyExpressionMatcher, ExpressionMatcher,
+};
+use paro_optimizer::rewrite::expr::rules::rule::{Rule, RuleResult};
 use paro_planner::expression::{
     ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
 };

@@ -1,7 +1,10 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Opt-in counterfactual over LIVE entries in this same statement cache.
 //! This is not algebraic equivalence, a second cache, or a production key.
 use super::*;
-use crate::work_partition::MissKind;
+use crate::diagnostics::work::MissKind;
 use paro_planner::plan::CardinalityProvenance;
 
 fn same_local_content(a: &LocalKey, b: &LocalKey, cte_reference: bool) -> bool {

@@ -282,7 +282,8 @@ pub(super) fn frozen_quality_evidence(
     goal: OptimizationGoal,
     state: &PlannerTransformState,
 ) -> Result<Option<NativeQualityEvidence>> {
-    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityEvidence);
+    let _partition =
+        crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityEvidence);
     let Some(required) = memo.required(goal.required) else {
         return Ok(None);
     };

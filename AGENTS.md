@@ -49,8 +49,8 @@ order of these rows.
 | --- | --- |
 | `paro-common` | [Shared types, errors, vectors/chunks, memory and configuration](crates/common/src/lib.rs) |
 | `paro-parser` | [Tokenizer, SQL AST with source spans, parser and visitors](crates/parser/src/lib.rs) |
-| `paro-planner` | [Binding, name resolution, expressions and logical plan IR](crates/planner/src/lib.rs) |
-| `paro-optimizer` | [Normalization, Memo search, properties, costing and physical selection](crates/optimizer/readme.md) |
+| `paro-planner` | [Binding, expressions, logical plans and shared immutable physical-plan contracts](crates/planner/src/lib.rs) |
+| `paro-optimizer` | [Logical rewrites, estimation, bounded regions, costing and physical construction; explicit Memo alternative](crates/optimizer/readme.md) |
 | `paro-compiler` | [Planner/optimizer/execution orchestration](crates/compiler/src/lib.rs) |
 | `paro-execution` | [Physical operators, expression evaluation, pipelines, spill and admission](crates/execution/src/lib.rs) |
 | `paro-context` | [Statement/session environment, resources, write guards and cancellation](crates/context/src/lib.rs) |
@@ -67,6 +67,10 @@ order of these rows.
 
 Dependency and implementation constraints:
 
+- `paro-execution` consumes `paro-planner::physical`, not the optimizer.
+  Planner must not depend on optimizer or execution. Test-only construction
+  fixtures may depend on optimizer; production and target-specific dependency
+  edges are checked by `tools/ci/check_plan_boundaries.py`.
 - Lower-level storage/transaction facilities must not gain dependencies on
   planner, optimizer, execution or session merely to reuse a convenience type.
   Check normal versus dev dependencies and active features, not just a path.

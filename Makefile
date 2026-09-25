@@ -59,19 +59,26 @@ memory-guards:
 optimizer-calibration:
 	python3 tools/ci/generate_optimizer_calibration.py --check
 
+.PHONY: plan-boundaries
+plan-boundaries:
+	python3 tools/ci/check_plan_boundaries.py
+	python3 -m unittest discover -s tools/ci -p 'test_plan_boundaries.py'
+
 # Run the static checks used at the front of CI
 static:
-	@echo "══════ [1/6] header ══════"
+	@echo "══════ [1/7] header ══════"
 	$(MAKE) header
-	@echo "══════ [2/6] rustfmt ══════"
+	@echo "══════ [2/7] rustfmt ══════"
 	$(MAKE) fmt-check
-	@echo "══════ [3/6] memory guards ══════"
+	@echo "══════ [3/7] memory guards ══════"
 	$(MAKE) memory-guards
-	@echo "══════ [4/6] optimizer calibration ══════"
+	@echo "══════ [4/7] optimizer calibration ══════"
 	$(MAKE) optimizer-calibration
-	@echo "══════ [5/6] clippy ══════"
+	@echo "══════ [5/7] plan boundaries ══════"
+	$(MAKE) plan-boundaries
+	@echo "══════ [6/7] clippy ══════"
 	$(MAKE) clippy
-	@echo "══════ [6/6] actionlint ══════"
+	@echo "══════ [7/7] actionlint ══════"
 	$(MAKE) actionlint
 
 # Clean build artifacts

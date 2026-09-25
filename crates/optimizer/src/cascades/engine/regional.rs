@@ -32,8 +32,8 @@ impl CascadesEngine {
                 "regional candidate preparation must precede physical implementation",
             ));
         }
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::Agenda);
-        let _phase = crate::work_partition::phase(crate::work_partition::Phase::Optional);
+        let _partition = crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Agenda);
+        let _phase = crate::diagnostics::work::phase(crate::diagnostics::work::Phase::Optional);
         self.memo.record_regional_scope();
         self.memo.control().begin_optional();
         self.memo.seal_optional_group_budget();
@@ -233,7 +233,7 @@ impl CascadesEngine {
         }
         self.memo.mark_rule_applied(expression, rule)?;
         *self.rule_attempts.entry(rule).or_default() += 1;
-        let _rule = crate::work_partition::rule(rule.0);
+        let _rule = crate::diagnostics::work::rule(rule.0);
         let started = Instant::now();
         let allocated = paro_common::allocator::thread_allocated_bytes();
         let mut context = TransformContext::new(&mut self.memo, group);

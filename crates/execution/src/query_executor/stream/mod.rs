@@ -15,8 +15,8 @@ use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
-use paro_context::StatementCancellation;
 use paro_context::ExecutionReceiptHandle;
+use paro_context::StatementCancellation;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::query_executor::pipeline_driver::PipelineExecutionDriver;

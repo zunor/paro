@@ -22,8 +22,8 @@ use paro_execution::runtime::{
     WakeGeneration,
 };
 use paro_execution::thread_context::ThreadContext;
-use paro_optimizer::physical::properties::PipelineProperties;
-use paro_optimizer::physical::row_type::RowType;
+use paro_planner::physical::properties::PipelineProperties;
+use paro_planner::physical::row_type::RowType;
 
 const SOURCE_CHUNKS: usize = 16_384;
 

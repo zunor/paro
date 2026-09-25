@@ -298,7 +298,7 @@ impl SafeGroupingValue {
             TimestampTz,
             Time
         );
-        crate::cascades::scalar_lowering::encode_value(encoder, &value);
+        paro_planner::physical::scalar_identity::encode_value(encoder, &value);
     }
 
     fn from_value(value: &Value) -> Option<Self> {
@@ -1028,7 +1028,7 @@ impl BoundarySnapshot {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let layout = operator.output_layout_from_child_refs(&child_layouts);
-            let local_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
+            let local_keys = crate::estimate::unique_keys::derive_unique_keys_from_facts(
                 operator,
                 &layout,
                 &child_layouts,

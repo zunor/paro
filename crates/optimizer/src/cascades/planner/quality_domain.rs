@@ -125,7 +125,7 @@ pub(super) fn cte_domain_witnesses_with_properties(
                     if let Some(LogicalOperator::Filter(filter)) = operator(parent) {
                         // Filter has one exact input; its output projection
                         // does not change the input namespace of predicates.
-                        match crate::cte::normalize::filtered_cte_ref(
+                        match crate::rewrite::cte::normalize::filtered_cte_ref(
                             reference,
                             filter,
                             &cte.output_columns,
@@ -153,7 +153,9 @@ pub(super) fn cte_domain_witnesses_with_properties(
                 .map(|column| column.binding)
                 .collect::<Vec<_>>();
             if let Some(expected) =
-                crate::cte::predicate_domain::derive_producer_predicates(references, &bindings)
+                crate::rewrite::cte::predicate_domain::derive_producer_predicates(
+                    references, &bindings,
+                )
             {
                 selected_consumes_ref(&map, producer_child, memo, &expected, state)
             } else {
@@ -275,12 +277,12 @@ fn selected_consumes(
     predicates: &[Expression],
     state: &PlannerTransformState,
 ) -> bool {
-    use crate::expression::traversal::into_associative_terms;
+    use crate::rewrite::expr::traversal::into_associative_terms;
     use paro_planner::expression::ConjunctionType;
 
     let normalized_terms = |expression: &Expression| {
         let mut expression = expression.clone();
-        crate::expression::scalar_normalizer()
+        crate::rewrite::expr::scalar_normalizer()
             .rewrite_expression(&mut expression, &LogicalOperator::DummyScan);
         into_associative_terms(expression, ConjunctionType::And)
     };
@@ -325,7 +327,7 @@ fn selected_consumes(
             .collect::<Vec<_>>();
         uncovered.retain(|predicate| {
             !enforced.iter().any(|expression| {
-                crate::cte::predicate_domain::predicate_domains_equal(
+                crate::rewrite::cte::predicate_domain::predicate_domains_equal(
                     std::slice::from_ref(expression),
                     std::slice::from_ref(predicate),
                 )
@@ -383,7 +385,8 @@ pub(super) fn pending_transfers(
     root: &FrozenCandidate,
     state: &PlannerTransformState,
 ) -> Option<Box<[CandidateId]>> {
-    let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityDomain);
+    let _partition =
+        crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityDomain);
     let mut pending = Vec::new();
     let mut visited = BTreeSet::new();
     let mut stack = vec![root];
@@ -498,7 +501,8 @@ pub(super) fn pending_transfer_for_ref(
         .semantic_template
         .operator;
     if let LogicalOperator::Filter(filter) = operator {
-        let _partition = crate::work_partition::enter(crate::work_partition::Bucket::QualityDomain);
+        let _partition =
+            crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::QualityDomain);
         let [child] = node.children.as_ref() else {
             return None;
         };
@@ -642,12 +646,12 @@ fn selected_consumes_ref(
     predicates: &[Expression],
     state: &PlannerTransformState,
 ) -> bool {
-    use crate::expression::traversal::into_associative_terms;
+    use crate::rewrite::expr::traversal::into_associative_terms;
     use paro_planner::expression::ConjunctionType;
 
     let normalized_terms = |expression: &Expression| {
         let mut expression = expression.clone();
-        crate::expression::scalar_normalizer()
+        crate::rewrite::expr::scalar_normalizer()
             .rewrite_expression(&mut expression, &LogicalOperator::DummyScan);
         into_associative_terms(expression, ConjunctionType::And)
     };
@@ -698,7 +702,7 @@ fn selected_consumes_ref(
             .collect::<Vec<_>>();
         uncovered.retain(|predicate| {
             !enforced.iter().any(|expression| {
-                crate::cte::predicate_domain::predicate_domains_equal(
+                crate::rewrite::cte::predicate_domain::predicate_domains_equal(
                     std::slice::from_ref(expression),
                     std::slice::from_ref(predicate),
                 )

@@ -117,10 +117,10 @@ fn decimal_sum_rollup_spec(
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([4]),
-            resource: paro_optimizer::physical::PerfectHashResourceContract {
+            resource: paro_planner::physical::PerfectHashResourceContract {
                 slots: 4,
                 table_bytes_upper: usize::MAX,
-                memory: paro_optimizer::physical::ExecutionMemoryContract {
+                memory: paro_planner::physical::ExecutionMemoryContract {
                     fixed_non_revocable_bytes: u64::MAX,
                     max_concurrent_tasks: u16::try_from(max_local_tables).unwrap(),
                     ..Default::default()

@@ -32,7 +32,7 @@ use crate::physical::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use crate::physical::properties::{MorselCapability, PlanPropertyMap};
 use crate::physical::specs::PhysicalNodeKind;
 use crate::physical::{RowType, RowsetScanSpec};
-use paro_optimizer::physical::{ExtractionContext, PhysicalPlanExtractor};
+use paro_optimizer::physical::{PhysicalBuildContext, PhysicalPlanBuilder};
 
 use super::super::graph::{
     ClientResultSpec, ControlRegion, ControlRegionId, DelimJoinSide, DependencyKind,
@@ -67,8 +67,8 @@ fn linear_plan() -> crate::physical::PhysicalPlan {
         LogicalOperator::Limit(Box::new(Limit::new(project, None, None))),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(limit).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(limit).unwrap()
 }
 
 fn projection_changes_schema_plan() -> crate::physical::PhysicalPlan {
@@ -92,8 +92,8 @@ fn projection_changes_schema_plan() -> crate::physical::PhysicalPlan {
         ),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(project).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(project).unwrap()
 }
 
 fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
@@ -130,8 +130,8 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
         ))),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(aggregate).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(aggregate).unwrap()
 }
 
 fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
@@ -189,8 +189,8 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
         )),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(join).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(join).unwrap()
 }
 
 fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
@@ -225,8 +225,8 @@ fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
         ))),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let generated = extractor.extract(aggregate).unwrap();
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    let generated = extractor.build(aggregate).unwrap();
     let PhysicalNodeKind::Aggregate(spec) = &generated.node(generated.root).kind else {
         panic!("expected ungrouped aggregate root");
     };
@@ -273,8 +273,8 @@ fn topn_plan() -> crate::physical::PhysicalPlan {
         LogicalOperator::TopN(LogicalTopN::new(values, vec![order], 2, 0)),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(topn).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(topn).unwrap()
 }
 
 #[derive(Clone, Copy)]
@@ -376,12 +376,12 @@ fn single_task_breaker_probe_hash_join_plan(
         )),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(join).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(join).unwrap()
 }
 
 fn hash_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
-    hash_join_plan_with_context(join_type, ExtractionContext::default())
+    hash_join_plan_with_context(join_type, PhysicalBuildContext::default())
 }
 
 fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
@@ -453,14 +453,14 @@ fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
         )),
     );
 
-    PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(join)
+    PhysicalPlanBuilder::new(PhysicalBuildContext::default())
+        .build(join)
         .unwrap()
 }
 
 fn hash_join_plan_with_context(
     join_type: JoinType,
-    extraction_context: ExtractionContext,
+    extraction_context: PhysicalBuildContext,
 ) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let left = OwnedLogicalPlan::new(
@@ -490,8 +490,8 @@ fn hash_join_plan_with_context(
         LogicalOperator::Join(Join::comparison(join_type, left, right, vec![condition])),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(extraction_context);
-    extractor.extract(join).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(extraction_context);
+    extractor.build(join).unwrap()
 }
 
 fn nested_loop_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
@@ -524,8 +524,8 @@ fn nested_loop_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
         LogicalOperator::Join(Join::comparison(join_type, left, right, vec![condition])),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(join).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(join).unwrap()
 }
 
 fn sort_range_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
@@ -565,8 +565,8 @@ fn sort_range_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
         LogicalOperator::Join(Join::comparison(join_type, left, right, conditions)),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(join).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(join).unwrap()
 }
 
 fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
@@ -617,8 +617,8 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         ),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(project).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(project).unwrap()
 }
 
 fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
@@ -666,8 +666,8 @@ fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         ))),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(limit).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(limit).unwrap()
 }
 
 fn left_deep_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
@@ -709,8 +709,8 @@ fn left_deep_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         )),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(join).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(join).unwrap()
 }
 
 fn cross_product_plan() -> crate::physical::PhysicalPlan {
@@ -735,8 +735,8 @@ fn cross_product_plan() -> crate::physical::PhysicalPlan {
     );
     let join = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::cross(left, right)));
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(join).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(join).unwrap()
 }
 
 fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::PhysicalPlan {
@@ -796,8 +796,8 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
         )),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(join).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(join).unwrap()
 }
 
 fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan {
@@ -854,8 +854,8 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
         ))),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(aggregate).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(aggregate).unwrap()
 }
 
 fn materialized_cte_plan() -> crate::physical::PhysicalPlan {
@@ -895,16 +895,16 @@ fn materialized_cte_plan() -> crate::physical::PhysicalPlan {
         ),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(cte).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(cte).unwrap()
 }
 
 fn recursive_cte_plan(union_all: bool) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let cte = recursive_cte_logical_plan(&ctx, union_all);
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(cte).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(cte).unwrap()
 }
 
 fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPlan {
@@ -975,8 +975,8 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
         }),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(cte).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(cte).unwrap()
 }
 
 fn projected_recursive_cte_plan() -> crate::physical::PhysicalPlan {
@@ -996,8 +996,8 @@ fn projected_recursive_cte_plan() -> crate::physical::PhysicalPlan {
         ),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(project).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(project).unwrap()
 }
 
 fn ordered_recursive_cte_plan() -> crate::physical::PhysicalPlan {
@@ -1017,8 +1017,8 @@ fn ordered_recursive_cte_plan() -> crate::physical::PhysicalPlan {
         )),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(order).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(order).unwrap()
 }
 
 fn recursive_cte_logical_plan(ctx: &BindContext, union_all: bool) -> OwnedLogicalPlan {
@@ -1084,8 +1084,8 @@ fn left_delim_join_plan() -> crate::physical::PhysicalPlan {
     )];
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(plan).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(plan).unwrap()
 }
 
 fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
@@ -1152,8 +1152,8 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
         )),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(outer).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(outer).unwrap()
 }
 
 fn left_delim_join_with_recursive_dependent_plan() -> crate::physical::PhysicalPlan {
@@ -1182,8 +1182,8 @@ fn left_delim_join_with_recursive_dependent_plan() -> crate::physical::PhysicalP
     )];
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(plan).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(plan).unwrap()
 }
 
 fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
@@ -1233,12 +1233,12 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
         ),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(project).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(project).unwrap()
 }
 
 fn left_deep_hash_join_plan_with_context(
-    extraction: ExtractionContext,
+    extraction: PhysicalBuildContext,
 ) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let make_values = |table_index, key: &str, value: &str| {
@@ -1270,8 +1270,8 @@ fn left_deep_hash_join_plan_with_context(
         LogicalOperator::Join(Join::comparison(JoinType::Inner, ab, c, vec![condition()])),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(extraction);
-    extractor.extract(abc).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(extraction);
+    extractor.build(abc).unwrap()
 }
 
 fn order_plan() -> crate::physical::PhysicalPlan {
@@ -1295,8 +1295,8 @@ fn order_plan() -> crate::physical::PhysicalPlan {
         LogicalOperator::Order(LogicalOrder::new(values, vec![order])),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(order).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(order).unwrap()
 }
 
 fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
@@ -1347,8 +1347,8 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
         ),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(final_project).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(final_project).unwrap()
 }
 
 fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
@@ -1386,8 +1386,8 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
         )),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    extractor.extract(window).unwrap()
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    extractor.build(window).unwrap()
 }
 
 fn partition_aggregate_window_plan() -> crate::physical::PhysicalPlan {
@@ -1419,8 +1419,8 @@ fn partition_aggregate_window_plan() -> crate::physical::PhysicalPlan {
         )),
     );
 
-    PhysicalPlanExtractor::new(ExtractionContext::default())
-        .extract(window)
+    PhysicalPlanBuilder::new(PhysicalBuildContext::default())
+        .build(window)
         .unwrap()
 }
 

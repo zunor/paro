@@ -776,10 +776,10 @@ fn perfect_hash_aggregate_breaker_groups_and_emits_counts() {
     let spec = grouped_count_spec(Some(PerfectHashAggregatePlan {
         group_minima: vec![1].into_boxed_slice(),
         group_cardinalities: vec![4].into_boxed_slice(),
-        resource: paro_optimizer::physical::PerfectHashResourceContract {
+        resource: paro_planner::physical::PerfectHashResourceContract {
             slots: 4,
             table_bytes_upper: usize::MAX,
-            memory: paro_optimizer::physical::ExecutionMemoryContract {
+            memory: paro_planner::physical::ExecutionMemoryContract {
                 fixed_non_revocable_bytes: u64::MAX,
                 max_concurrent_tasks: 1,
                 ..Default::default()
@@ -892,10 +892,10 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([2]),
-            resource: paro_optimizer::physical::PerfectHashResourceContract {
+            resource: paro_planner::physical::PerfectHashResourceContract {
                 slots: 2,
                 table_bytes_upper: usize::MAX,
-                memory: paro_optimizer::physical::ExecutionMemoryContract {
+                memory: paro_planner::physical::ExecutionMemoryContract {
                     fixed_non_revocable_bytes: u64::MAX,
                     max_concurrent_tasks: 1,
                     ..Default::default()
@@ -996,10 +996,10 @@ fn perfect_hash_post_reduction_retains_every_global_maximum_tie() {
         Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([4]),
-            resource: paro_optimizer::physical::PerfectHashResourceContract {
+            resource: paro_planner::physical::PerfectHashResourceContract {
                 slots: 4,
                 table_bytes_upper: usize::MAX,
-                memory: paro_optimizer::physical::ExecutionMemoryContract {
+                memory: paro_planner::physical::ExecutionMemoryContract {
                     fixed_non_revocable_bytes: u64::MAX,
                     max_concurrent_tasks: 1,
                     ..Default::default()

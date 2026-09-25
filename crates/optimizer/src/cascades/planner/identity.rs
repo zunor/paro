@@ -4,6 +4,7 @@
 //! Stable identities for planner operators, scalar payloads, and searches.
 
 use super::*;
+use paro_planner::physical::access_identity::*;
 
 pub(super) fn binding_fingerprint(binding: ColumnBinding) -> Fingerprint {
     let mut fingerprint = StableFingerprintBuilder::default();
@@ -236,7 +237,7 @@ pub(super) fn query_operator_identity<Child>(
             fingerprint.write_u64(graph.columns.len() as u64);
             for column in &graph.columns {
                 fingerprint.write_bytes(column.alias.as_bytes());
-                crate::cascades::scalar::encode_logical_type(
+                paro_planner::physical::scalar_identity::encode_logical_type(
                     &mut fingerprint,
                     &column.logical_type,
                 );
@@ -475,7 +476,7 @@ pub(super) fn encode_get(
     }
     fingerprint.write_u64(get.column_types.len() as u64);
     for ty in &get.column_types {
-        crate::cascades::scalar::encode_logical_type(fingerprint, ty);
+        paro_planner::physical::scalar_identity::encode_logical_type(fingerprint, ty);
     }
     match &get.scan_order {
         None => fingerprint.write_u64(u64::MAX),
@@ -543,7 +544,10 @@ pub(super) fn encode_dependent_join<Child>(
     for correlation in &join.correlated_columns {
         fingerprint.write_u64(correlation.table_index as u64);
         fingerprint.write_u64(correlation.column_index as u64);
-        crate::cascades::scalar::encode_logical_type(fingerprint, &correlation.return_type);
+        paro_planner::physical::scalar_identity::encode_logical_type(
+            fingerprint,
+            &correlation.return_type,
+        );
         fingerprint.write_u64(correlation.depth as u64);
     }
     match &join.kind {
@@ -575,11 +579,17 @@ pub(super) fn encode_dependent_join<Child>(
                     fingerprint.write_u64(payload.comparison_type as u64);
                     fingerprint.write_u64(payload.child_types.len() as u64);
                     for ty in &payload.child_types {
-                        crate::cascades::scalar::encode_logical_type(fingerprint, ty);
+                        paro_planner::physical::scalar_identity::encode_logical_type(
+                            fingerprint,
+                            ty,
+                        );
                     }
                     fingerprint.write_u64(payload.child_targets.len() as u64);
                     for ty in &payload.child_targets {
-                        crate::cascades::scalar::encode_logical_type(fingerprint, ty);
+                        paro_planner::physical::scalar_identity::encode_logical_type(
+                            fingerprint,
+                            ty,
+                        );
                     }
                 }
             }
@@ -602,7 +612,7 @@ pub(super) fn encode_table_function(
     fingerprint.write_bytes(function.function.name.as_bytes());
     fingerprint.write_u64(function.function.arguments.len() as u64);
     for ty in &function.function.arguments {
-        crate::cascades::scalar::encode_logical_type(fingerprint, ty);
+        paro_planner::physical::scalar_identity::encode_logical_type(fingerprint, ty);
     }
     fingerprint.write_u64(function.function.projection_pushdown as u64);
     fingerprint.write_u64(function.function.filter_pushdown as u64);
@@ -610,13 +620,13 @@ pub(super) fn encode_table_function(
         None => fingerprint.write_u64(0),
         Some(ty) => {
             fingerprint.write_u64(1);
-            crate::cascades::scalar::encode_logical_type(fingerprint, ty);
+            paro_planner::physical::scalar_identity::encode_logical_type(fingerprint, ty);
         }
     }
     fingerprint.write_u64(function.function.named_parameters.len() as u64);
     for (name, ty) in &function.function.named_parameters {
         fingerprint.write_bytes(name.as_bytes());
-        crate::cascades::scalar::encode_logical_type(fingerprint, ty);
+        paro_planner::physical::scalar_identity::encode_logical_type(fingerprint, ty);
     }
     match &function.projection_ids {
         None => fingerprint.write_u64(u64::MAX),
@@ -624,7 +634,7 @@ pub(super) fn encode_table_function(
     }
     fingerprint.write_u64(function.input_table_types.len() as u64);
     for ty in &function.input_table_types {
-        crate::cascades::scalar::encode_logical_type(fingerprint, ty);
+        paro_planner::physical::scalar_identity::encode_logical_type(fingerprint, ty);
     }
     fingerprint.write_u64(function.with_ordinality as u64);
     match &function.bind_data {
@@ -636,292 +646,6 @@ pub(super) fn encode_table_function(
     }
 }
 
-pub(super) fn encode_hnsw_options(
-    fingerprint: &mut StableFingerprintBuilder,
-    options: paro_storage::index::hnsw::HnswQueryOptions,
-) {
-    encode_optional_usize(fingerprint, options.ef);
-    encode_optional_usize(fingerprint, options.rerank_window);
-    fingerprint.write_u64(match options.objective {
-        paro_storage::index::hnsw::HnswSearchObjective::CostOptimized => 0,
-        paro_storage::index::hnsw::HnswSearchObjective::Exact => 1,
-    });
-}
-
-pub(crate) fn encode_search_request(
-    fingerprint: &mut StableFingerprintBuilder,
-    request: &paro_storage::search::NormalizedSearchRequest,
-) {
-    use paro_storage::search::{DenseVectorQuery, FusionStrategy, SearchIntent, SearchRequestMode};
-
-    fingerprint.write_u64(request.table_id);
-    match request.mode {
-        SearchRequestMode::TopK { limit } => {
-            fingerprint.write_u64(0);
-            fingerprint.write_u64(limit as u64);
-        }
-        SearchRequestMode::Filter => fingerprint.write_u64(1),
-    }
-    match &request.predicate {
-        None => fingerprint.write_u64(0),
-        Some(predicate) => {
-            fingerprint.write_u64(1);
-            encode_predicate_tree(fingerprint, predicate);
-        }
-    }
-    encode_u32s(fingerprint, &request.projections.columns);
-    fingerprint.write_u64(request.projections.include_score as u64);
-    fingerprint.write_u64(request.intents.len() as u64);
-    for intent in &request.intents {
-        match intent {
-            SearchIntent::Hnsw(intent) => {
-                fingerprint.write_u64(0);
-                fingerprint.write_u64(intent.column_id as u64);
-                match &intent.query {
-                    DenseVectorQuery::Literal(values) => {
-                        fingerprint.write_u64(0);
-                        fingerprint.write_u64(values.len() as u64);
-                        for value in values {
-                            fingerprint.write_u64(value.to_bits() as u64);
-                        }
-                    }
-                    DenseVectorQuery::RuntimeParameter { slot, dimension } => {
-                        fingerprint.write_u64(1);
-                        fingerprint.write_u64(slot.index.index() as u64);
-                        crate::cascades::scalar::encode_logical_type(fingerprint, &slot.ty);
-                        fingerprint.write_u64(*dimension as u64);
-                    }
-                }
-                fingerprint.write_u64(intent.distance as u64);
-                encode_hnsw_options(fingerprint, intent.options);
-            }
-            SearchIntent::Sparse(intent) => {
-                fingerprint.write_u64(1);
-                fingerprint.write_u64(intent.column_id as u64);
-                encode_u32s(fingerprint, &intent.query_vector.dims);
-                fingerprint.write_u64(intent.query_vector.weights.len() as u64);
-                for value in &intent.query_vector.weights {
-                    fingerprint.write_u64(value.to_bits() as u64);
-                }
-            }
-            SearchIntent::FullText(intent) => {
-                fingerprint.write_u64(2);
-                fingerprint.write_u64(intent.column_id as u64);
-                fingerprint.write_bytes(intent.query.as_bytes());
-                fingerprint.write_u64(intent.query_kind as u64);
-                fingerprint.write_u64(intent.query_stats.term_count as u64);
-                fingerprint.write_u64(intent.query_stats.positive_term_count as u64);
-                fingerprint.write_u64(intent.query_stats.phrase_count as u64);
-                fingerprint.write_u64(intent.query_stats.proximity_count as u64);
-                fingerprint.write_u64(intent.query_stats.prefix_count as u64);
-                fingerprint.write_u64(intent.query_stats.not_count as u64);
-                fingerprint.write_u64(intent.query_stats.or_branch_count as u64);
-                fingerprint.write_bytes(intent.config.as_bytes());
-                fingerprint.write_u64(intent.score_mode as u64);
-            }
-        }
-    }
-    match &request.fusion {
-        None => fingerprint.write_u64(0),
-        Some(FusionStrategy::ReciprocalRankFusion {
-            window_size,
-            rank_constant,
-        }) => {
-            fingerprint.write_u64(1);
-            fingerprint.write_u64(*window_size as u64);
-            fingerprint.write_u64(*rank_constant as u64);
-        }
-        Some(FusionStrategy::WeightedBlend { weights }) => {
-            fingerprint.write_u64(2);
-            fingerprint.write_u64(weights.len() as u64);
-            for weight in weights {
-                fingerprint.write_u64(weight.to_bits() as u64);
-            }
-        }
-    }
-}
-
-pub(super) fn encode_predicate_tree(
-    fingerprint: &mut StableFingerprintBuilder,
-    tree: &paro_storage::index::PredicateTree,
-) {
-    use paro_storage::index::PredicateTree;
-
-    match tree {
-        PredicateTree::Leaf(predicate) => {
-            fingerprint.write_u64(0);
-            encode_predicate(fingerprint, predicate);
-        }
-        PredicateTree::And(children) => {
-            fingerprint.write_u64(1);
-            fingerprint.write_u64(children.len() as u64);
-            for child in children {
-                encode_predicate_tree(fingerprint, child);
-            }
-        }
-        PredicateTree::Or(children) => {
-            fingerprint.write_u64(2);
-            fingerprint.write_u64(children.len() as u64);
-            for child in children {
-                encode_predicate_tree(fingerprint, child);
-            }
-        }
-    }
-}
-
-pub(super) fn encode_predicate(
-    fingerprint: &mut StableFingerprintBuilder,
-    predicate: &paro_storage::index::Predicate,
-) {
-    use paro_storage::index::{FixedMembershipWidth, Predicate};
-
-    macro_rules! scalar_predicate {
-        ($tag:expr, $column_id:expr, $value:expr) => {{
-            fingerprint.write_u64($tag);
-            fingerprint.write_u64(u64::from(*$column_id));
-            crate::cascades::scalar_lowering::encode_value(fingerprint, $value);
-        }};
-    }
-
-    match predicate {
-        Predicate::Eq { column_id, value } => scalar_predicate!(0, column_id, value),
-        Predicate::NotEq { column_id, value } => scalar_predicate!(1, column_id, value),
-        Predicate::Lt { column_id, value } => scalar_predicate!(2, column_id, value),
-        Predicate::Le { column_id, value } => scalar_predicate!(3, column_id, value),
-        Predicate::Gt { column_id, value } => scalar_predicate!(4, column_id, value),
-        Predicate::Ge { column_id, value } => scalar_predicate!(5, column_id, value),
-        Predicate::In { column_id, values } => {
-            fingerprint.write_u64(6);
-            fingerprint.write_u64(u64::from(*column_id));
-            fingerprint.write_u64(values.len() as u64);
-            for value in values {
-                crate::cascades::scalar_lowering::encode_value(fingerprint, value);
-            }
-        }
-        Predicate::FixedIn { column_id, values } => {
-            fingerprint.write_u64(7);
-            fingerprint.write_u64(u64::from(*column_id));
-            fingerprint.write_u64(values.len() as u64);
-            let width = values.visit_canonical_values(|value| {
-                fingerprint.write_bytes(&value.to_le_bytes());
-            });
-            fingerprint.write_u64(match width {
-                FixedMembershipWidth::I32 => 0,
-                FixedMembershipWidth::I64 => 1,
-                FixedMembershipWidth::I128 => 2,
-            });
-        }
-        Predicate::Range {
-            column_id,
-            lower,
-            upper,
-        } => {
-            fingerprint.write_u64(8);
-            fingerprint.write_u64(u64::from(*column_id));
-            crate::cascades::scalar_lowering::encode_value(fingerprint, lower);
-            crate::cascades::scalar_lowering::encode_value(fingerprint, upper);
-        }
-        Predicate::IsNull { column_id } => {
-            fingerprint.write_u64(9);
-            fingerprint.write_u64(u64::from(*column_id));
-        }
-        Predicate::IsNotNull { column_id } => {
-            fingerprint.write_u64(10);
-            fingerprint.write_u64(u64::from(*column_id));
-        }
-        Predicate::StringPrefix {
-            column_id,
-            prefix,
-            negated,
-        } => {
-            fingerprint.write_u64(11);
-            fingerprint.write_u64(u64::from(*column_id));
-            fingerprint.write_bytes(prefix.as_bytes());
-            fingerprint.write_u64(*negated as u64);
-        }
-        Predicate::StringPrefixIn {
-            column_id,
-            prefixes,
-        } => {
-            fingerprint.write_u64(12);
-            fingerprint.write_u64(u64::from(*column_id));
-            fingerprint.write_u64(prefixes.len() as u64);
-            for prefix in prefixes {
-                fingerprint.write_bytes(prefix.as_bytes());
-            }
-        }
-        Predicate::StringLike {
-            column_id,
-            pattern,
-            negated,
-        } => {
-            fingerprint.write_u64(13);
-            fingerprint.write_u64(u64::from(*column_id));
-            fingerprint.write_bytes(pattern.as_bytes());
-            fingerprint.write_u64(*negated as u64);
-        }
-        Predicate::ColumnComparison {
-            left_column_id,
-            right_column_id,
-            comparison,
-        } => {
-            fingerprint.write_u64(14);
-            fingerprint.write_u64(u64::from(*left_column_id));
-            fingerprint.write_u64(u64::from(*right_column_id));
-            fingerprint.write_u64(match comparison {
-                paro_storage::index::PredicateComparison::Equal => 0,
-                paro_storage::index::PredicateComparison::NotEqual => 1,
-                paro_storage::index::PredicateComparison::LessThan => 2,
-                paro_storage::index::PredicateComparison::LessThanOrEqual => 3,
-                paro_storage::index::PredicateComparison::GreaterThan => 4,
-                paro_storage::index::PredicateComparison::GreaterThanOrEqual => 5,
-            });
-        }
-    }
-}
-
-pub(super) fn encode_optional_usize(
-    fingerprint: &mut StableFingerprintBuilder,
-    value: Option<usize>,
-) {
-    match value {
-        None => fingerprint.write_u64(0),
-        Some(value) => {
-            fingerprint.write_u64(1);
-            fingerprint.write_u64(value as u64);
-        }
-    }
-}
-
-pub(super) fn encode_optional_string(
-    fingerprint: &mut StableFingerprintBuilder,
-    value: Option<&str>,
-) {
-    match value {
-        None => fingerprint.write_u64(0),
-        Some(value) => {
-            fingerprint.write_u64(1);
-            fingerprint.write_bytes(value.as_bytes());
-        }
-    }
-}
-
-pub(super) fn encode_usizes(fingerprint: &mut StableFingerprintBuilder, values: &[usize]) {
-    fingerprint.write_u64(values.len() as u64);
-    for value in values {
-        fingerprint.write_u64(*value as u64);
-    }
-}
-
-pub(super) fn encode_u32s(fingerprint: &mut StableFingerprintBuilder, values: &[u32]) {
-    fingerprint.write_u64(values.len() as u64);
-    for value in values {
-        fingerprint.write_u64(u64::from(*value));
-    }
-}
-
-/// Encode an extraction-layout map for physical payload identity. Logical
-/// expression identity deliberately does not call this helper.
 pub(super) fn encode_projection_map(
     fingerprint: &mut StableFingerprintBuilder,
     projection: &paro_planner::operator::ProjectionMap,

@@ -96,7 +96,9 @@ pub trait ResultSink: Send {
         _chunk: &Chunk,
         _owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
     ) -> Result<()> {
-        Err(paro_common::error::not_supported("this result sink does not support bounded compile diagnostics"))
+        Err(paro_common::error::not_supported(
+            "this result sink does not support bounded compile diagnostics",
+        ))
     }
     /// Called when a statement starts producing a result set.
     ///
