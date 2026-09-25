@@ -4,7 +4,7 @@
 //! Statement/query boundary for the optimizer.
 //!
 //! The planner delivers a bound tree. This module consumes it once and makes
-//! the architectural split explicit: only the query child can enter Memo;
+//! the architectural split explicit: only query children enter relational planning;
 //! statement side effects are reattached after winner extraction.
 
 use std::collections::BTreeSet;

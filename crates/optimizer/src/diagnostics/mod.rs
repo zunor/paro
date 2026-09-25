@@ -4,6 +4,4 @@
 //! Bounded compile observation. Recording never changes planning decisions.
 
 pub mod profile;
-#[cfg(test)]
-pub mod rejection;
 pub mod work;

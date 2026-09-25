@@ -432,7 +432,7 @@ impl Binder {
         })
     }
 
-    /// Replace aggregate/group `BoundReference` nodes with `BoundColumnRef` nodes
+    /// Replace aggregate/group `SubplanRef` nodes with `BoundColumnRef` nodes
     /// bound to the aggregate operator output.
     ///
     /// in this logical phase.

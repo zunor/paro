@@ -17,7 +17,7 @@ pub(crate) struct FilteredCTERef {
 }
 
 /// Derive the producer domain from proved consumer occurrences. This helper
-/// has no policy or plan-tree side effects; Memo owns occurrence coverage.
+/// has no plan-tree side effects; callers own consumer coverage.
 pub(crate) fn derive_producer_predicates(
     references: Vec<FilteredCTERef>,
     producer_bindings: &[ColumnBinding],

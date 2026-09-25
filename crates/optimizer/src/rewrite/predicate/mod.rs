@@ -5,8 +5,6 @@
 
 pub mod combiner;
 pub mod propagate_result;
-#[cfg(test)]
-pub mod pullup;
 pub mod pushdown;
 
 pub(crate) mod column_transfer;

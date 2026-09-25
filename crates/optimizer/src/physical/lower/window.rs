@@ -30,7 +30,7 @@ impl PhysicalPlanBuilder {
             crate::physical::PhysicalImplementationFlavor::Window => None,
             _ => {
                 return Err(paro_error::internal(
-                    "Memo selected a non-window implementation for Window",
+                    "Physical selection chose a non-window implementation for Window",
                 ));
             }
         };
@@ -43,7 +43,7 @@ impl PhysicalPlanBuilder {
         if implementation == crate::physical::PhysicalImplementationFlavor::PartitionAggregateWindow
         {
             return Err(paro_error::internal(
-                "Memo selected partition aggregate window for an ineligible window",
+                "Physical selection chose partition aggregate window for an ineligible window",
             ));
         }
         let mut expressions = window.expressions.clone();

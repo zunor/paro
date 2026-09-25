@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Build an immutable physical plan from committed implementation contracts.
-//! Both staged and Memo planning use this constructor. It assigns slots and
+//! The committed physical constructor assigns slots and
 //! validates the chosen implementation; it must not choose an algorithm again.
 
 use std::collections::HashMap;
@@ -202,7 +202,7 @@ impl PhysicalPlanBuilder {
     }
 
     /// Query extraction requires an explicit implementation/resource contract
-    /// for every selected occurrence, from either Memo or direct selection.
+    /// for every selected node.
     /// Utility lowering does not enable this relational contract requirement.
     pub(crate) fn requiring_implementation_contracts(mut self) -> Self {
         self.require_implementation_contracts = true;
@@ -797,12 +797,6 @@ fn populate_plan_dependencies(
     }
 }
 
-#[cfg(test)]
-mod partition_aggregate_tests;
-#[cfg(test)]
-mod post_reduction_tests;
-#[cfg(test)]
-mod row_fetch_tests;
 #[cfg(test)]
 mod tests;
 

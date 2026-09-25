@@ -51,7 +51,7 @@ pub struct ColumnStatistics {
     /// serializes this plan-local evidence.
     estimated_distinct: Option<usize>,
     /// Provenance for an explicit planner estimate. This lets a
-    /// BoundReference transport an observed domain without manufacturing an
+    /// SubplanRef transport an observed domain without manufacturing an
     /// HLL, while keeping ordinary estimates visibly non-observed.
     estimated_provenance: Option<DistinctProvenance>,
     /// A proof-backed upper bound on the number of values this column can

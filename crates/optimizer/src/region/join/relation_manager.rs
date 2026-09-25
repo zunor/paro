@@ -134,7 +134,7 @@ pub struct DistinctCount {
     pub distinct_count: usize,
     /// Whether this is an expected domain at this relational boundary,
     /// rather than a fallback derived only from a row/range upper estimate.
-    /// A Memo estimate need not own a storage HyperLogLog allocation.
+    /// A relational estimate need not own a storage HyperLogLog allocation.
     #[cfg(test)]
     pub has_expected_distinct: bool,
     /// Evidence retained alongside the legacy costing point.  The point is
@@ -502,7 +502,7 @@ impl RelationManager {
         matches!(
             op_type,
             LogicalOperatorType::Projection
-                | LogicalOperatorType::BoundReference
+                | LogicalOperatorType::SubplanRef
                 | LogicalOperatorType::Get
                 | LogicalOperatorType::Aggregate
                 | LogicalOperatorType::Window

@@ -6,7 +6,7 @@ use super::*;
 pub(crate) fn logical_name<Child>(op: &LogicalOperator<Child>) -> &'static str {
     match op {
         LogicalOperator::Get(_) => "GET",
-        LogicalOperator::BoundReference(_) => "BOUND_REFERENCE",
+        LogicalOperator::SubplanRef(_) => "BOUND_REFERENCE",
         LogicalOperator::Filter(_) => "FILTER",
         LogicalOperator::Projection(_) => "PROJECTION",
         LogicalOperator::RowFetch(_) => "ROW_FETCH",

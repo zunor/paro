@@ -59,14 +59,16 @@ impl Normalization<'_> {
         plan = FilterPushdown::new().rewrite_plan(plan);
         plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
         plan = ExternalRoutineLoweringPass::lower(plan, &self.ctx.bind_context)?.plan;
-        plan = CTEInlining::new(&self.ctx.bind_context)
-            .single_reference_defaults()
-            .optimize_plan(plan);
+        plan = CTEInlining::new(&self.ctx.bind_context).optimize_plan(plan);
         plan = crate::rewrite::cte::normalize::normalize(plan)?;
         // Mandatory substitution creates fresh filter/projection/set
         // boundaries. Canonicalize predicate placement before regional choices.
         plan = crate::rewrite::predicate::canonical::predicates(plan, &mut scalar_construction);
         plan = crate::rewrite::predicate::canonical::finish(plan)?;
+        // These rewrites remove work only after proving multiplicity and
+        // evaluation safety; neither introduces a cost alternative.
+        plan = crate::rewrite::join::elimination::JoinElimination::new().optimize(plan);
+        plan = crate::rewrite::limit::pushdown::LimitPushdown::new().optimize_plan(plan);
         if self.ctx.verify_enabled {
             verify_logical_plan(&self.ctx.bind_context, &plan)?;
         }

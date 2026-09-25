@@ -13,20 +13,17 @@
 
 use std::collections::HashSet;
 
-use paro_catalog::entry::ConstraintType;
 use paro_planner::expression::{Expression, ExpressionIterator, WindowExpression};
 use paro_planner::logical::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator, Projection,
 };
 use paro_planner::logical::plan::OwnedLogicalPlan;
 
-pub struct JoinElimination {
-    changed: bool,
-}
+pub struct JoinElimination;
 
 impl JoinElimination {
     pub fn new() -> Self {
-        Self { changed: false }
+        Self
     }
 
     pub fn optimize(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
@@ -51,8 +48,7 @@ impl JoinElimination {
                 LogicalOperator::Filter(filter)
             }
             LogicalOperator::Projection(mut projection) => {
-                let child_required =
-                    projection_child_required_bindings(&projection, required_bindings);
+                let child_required = projection_child_required_bindings(&projection);
                 let child = *projection.child;
                 projection.child = Box::new(self.optimize_required_plan(child, &child_required));
                 LogicalOperator::Projection(projection)
@@ -269,12 +265,10 @@ impl JoinElimination {
 
                 if self.can_eliminate_right_side(&comparison, required_bindings) {
                     let left = *comparison.left;
-                    self.changed = true;
                     return left.into_operator();
                 }
                 if self.can_eliminate_left_side(&comparison, required_bindings) {
                     let right = *comparison.right;
-                    self.changed = true;
                     return right.into_operator();
                 }
 
@@ -389,13 +383,16 @@ impl JoinElimination {
                 &condition.left
             };
 
-            if !matches!(preserved_expr, Expression::ColumnRef(_)) {
+            if !matches!(preserved_expr, Expression::ColumnRef(column) if column.depth == 0) {
                 return false;
             }
 
             let Expression::ColumnRef(column_ref) = eliminated_expr else {
                 return false;
             };
+            if column_ref.depth != 0 {
+                return false;
+            }
             key_bindings.insert(column_ref.binding);
         }
 
@@ -403,35 +400,17 @@ impl JoinElimination {
             return false;
         }
         match &eliminated.operator {
-            LogicalOperator::Get(get) => {
-                let Some(table) = get.table.as_ref() else {
-                    return false;
-                };
-                let key_columns = key_bindings
-                    .iter()
-                    .filter(|binding| binding.table_index == get.table_index)
-                    .filter_map(|binding| get.stored_column(binding.column_index))
-                    .collect::<HashSet<_>>();
-                table.constraints().iter().any(|constraint| {
-                    matches!(
-                        constraint.constraint_type,
-                        ConstraintType::Unique | ConstraintType::PrimaryKey
-                    ) && !constraint.columns.is_empty()
-                        && constraint
-                            .columns
-                            .iter()
-                            .all(|column| key_columns.contains(column))
-                })
-            }
-            LogicalOperator::BoundReference(reference) => {
-                reference.facts.unique_keys.iter().any(|key| {
-                    !key.columns.is_empty()
+            LogicalOperator::Get(get) => crate::estimate::unique_keys::declared_unique_keys(get)
+                .iter()
+                .any(|key| {
+                    !key.bindings.is_empty()
                         && key
-                            .columns
+                            .bindings
                             .iter()
-                            .all(|column| key_bindings.contains(&column.binding))
-                })
-            }
+                            .all(|binding| key_bindings.contains(binding))
+                }),
+            // A summarized subplan can contain observable evaluation. Its
+            // unique key alone does not authorize removing the computation.
             _ => false,
         }
     }
@@ -460,16 +439,13 @@ fn filter_required_by_output(
         .collect()
 }
 
-fn projection_child_required_bindings(
-    projection: &Projection,
-    required_bindings: &HashSet<ColumnBinding>,
-) -> HashSet<ColumnBinding> {
+fn projection_child_required_bindings(projection: &Projection) -> HashSet<ColumnBinding> {
     let mut child_required = HashSet::new();
-    for (idx, expression) in projection.expressions.iter().enumerate() {
-        let projection_binding = ColumnBinding::new(projection.table_index, idx);
-        if required_bindings.contains(&projection_binding) {
-            collect_bindings_from_expr(expression, &mut child_required);
-        }
+    // This pass does not remove projection expressions. Even an unobserved
+    // output can still evaluate (or fail), and its bindings must remain valid.
+    // Column pruning owns proving and removing dead expressions first.
+    for expression in &projection.expressions {
+        collect_bindings_from_expr(expression, &mut child_required);
     }
     child_required
 }
@@ -552,7 +528,8 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, Expression};
     use paro_planner::logical::operator::{
-        ColumnBinding, Get, Join, JoinCondition, JoinType, LogicalOperator, Projection,
+        ColumnBinding, Get, Join, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
+        Projection,
     };
     use paro_planner::logical::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
@@ -648,6 +625,78 @@ mod tests {
             OwnedLogicalPlan::synthetic(right),
             conditions,
         ))
+    }
+
+    #[test]
+    fn correlated_reference_is_not_a_local_unique_key() {
+        for correlated_side in 0..2 {
+            let left = create_get(0, create_table("left_t", 1, vec![]), vec![0]);
+            let right = create_get(
+                1,
+                create_table("right_t", 1, vec![Constraint::unique(vec![0])]),
+                vec![0],
+            );
+            let mut columns = [col(0, 0), col(1, 0)];
+            let Expression::ColumnRef(column) = &mut columns[correlated_side] else {
+                unreachable!()
+            };
+            column.depth = 1;
+            let [left_key, right_key] = columns;
+            let plan = create_projection(
+                10,
+                create_join(
+                    JoinType::Left,
+                    left,
+                    right,
+                    vec![JoinCondition::new(
+                        left_key,
+                        right_key,
+                        JoinComparisonType::Equal,
+                    )],
+                ),
+                vec![col(0, 0)],
+            );
+            let optimized = JoinElimination::new().optimize(OwnedLogicalPlan::synthetic(plan));
+            let LogicalOperator::Projection(projection) = &optimized.operator else {
+                panic!("projection")
+            };
+            assert!(matches!(
+                projection.child.operator,
+                LogicalOperator::Join(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn nullable_unique_key_does_not_prove_null_safe_join_multiplicity() {
+        let left = create_get(0, create_table("left_nulls", 1, vec![]), vec![0]);
+        let right = create_get(
+            1,
+            create_table("right_nulls", 1, vec![Constraint::unique(vec![0])]),
+            vec![0],
+        );
+        let plan = create_projection(
+            10,
+            create_join(
+                JoinType::Left,
+                left,
+                right,
+                vec![JoinCondition::new(
+                    col(0, 0),
+                    col(1, 0),
+                    paro_planner::logical::operator::JoinComparisonType::NotDistinctFrom,
+                )],
+            ),
+            vec![col(0, 0)],
+        );
+        let optimized = JoinElimination::new().optimize(OwnedLogicalPlan::synthetic(plan));
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
+            panic!("projection")
+        };
+        assert!(matches!(
+            projection.child.operator,
+            LogicalOperator::Join(_)
+        ));
     }
 
     #[test]

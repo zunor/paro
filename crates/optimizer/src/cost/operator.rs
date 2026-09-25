@@ -3,7 +3,7 @@
 
 //! Local implementation costing and executable memory floors.
 //!
-//! This kernel owns no Memo, task registry, revisions, or candidate archive.
+//! This kernel evaluates estimates without owning candidate plans.
 //! Both planning strategies supply one immutable set of resolved input facts.
 
 use crate::cost::calibration::{
@@ -252,7 +252,7 @@ pub(crate) struct ResolvedPlannerCostFacts {
     /// Identity of the logical relation/key domain that produces a runtime
     /// filter.  This is deliberately separate from the physical operator
     /// fingerprint and from the evaluation occurrence: two physical
-    /// implementations of one Memo group share it, while nested joins with
+    /// implementations of one logical operator share it, while nested joins with
     /// the same operator shape do not alias one another.
     pub(crate) runtime_filter_build_left_distinct_expected: Option<u64>,
     pub(crate) runtime_filter_key_types: Box<[LogicalType]>,
@@ -716,7 +716,7 @@ pub(crate) fn implementation_cost(
                 .saturating_mul(facts.output_row_width.max(32));
         }
     }
-    // Preserve implementation work in a serial-normalized form. The Memo
+    // Preserve implementation work in a serial-normalized form. Local selection
     // engine assigns it to scheduler-visible phases only after concrete child
     // winners expose their pipeline task supply.
     let mut cost = calibration.fold(&work)?;

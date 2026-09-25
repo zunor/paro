@@ -23,8 +23,6 @@ use paro_common::logging::targets;
 use paro_context::{CompileReceiptSummary, StatementContext};
 use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
 use paro_planner::binder::Binder;
-#[cfg(test)]
-use paro_planner::logical::operator::Join;
 use paro_planner::logical::operator::LogicalOperator;
 use paro_planner::logical::plan::OwnedLogicalPlan;
 use tracing::debug;
@@ -51,8 +49,6 @@ use paro_context::compile_diagnostics::{
 };
 use paro_planner::logical::operator::ExplainMode;
 
-#[cfg(test)]
-mod rewrite_tests;
 #[cfg(test)]
 mod tests;
 mod write;
@@ -116,33 +112,6 @@ impl Optimizer {
 
     pub fn compile_receipt(&self) -> Option<CompileReceiptSummary> {
         self.compile_receipt
-    }
-
-    /// Exposes one proof-driven relational frontier to structural optimizer
-    /// tests.
-    ///
-    /// Production callers must consume [`OptimizedStatement`]; keeping this
-    /// hook test-only prevents the planner carrier from becoming an accidental
-    /// execution or compatibility API again.
-    #[cfg(test)]
-    pub(crate) fn correlated_frontier_for_test(
-        &mut self,
-        plan: OwnedLogicalPlan,
-    ) -> Result<OwnedLogicalPlan> {
-        let prepared = self.prepare_correlated_seed(plan);
-        let canonical = self.normalization().normalize(prepared)?;
-        Ok(self.correlated_aggregate_candidate(canonical)?.plan)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scalar_reuse_frontier_for_test(
-        &mut self,
-        plan: OwnedLogicalPlan,
-    ) -> Result<OwnedLogicalPlan> {
-        let prepared = self.prepare_correlated_seed(plan);
-        let canonical = self.normalization().normalize(prepared)?;
-        let baseline = self.normalization().settle_query_candidate(canonical)?;
-        Ok(self.scalar_reuse_candidate(baseline)?.plan)
     }
 
     pub fn optimize(&mut self, plan: OwnedLogicalPlan) -> Result<OptimizedStatement> {
@@ -508,7 +477,7 @@ impl Optimizer {
                 ));
             }
             // A smaller DOP is a local executable operating point, not a
-            // second logical search or an implicit switch to Cascades.
+            // second logical planning pass.
             grant.max_parallel_tasks = (grant.max_parallel_tasks / 2).max(1);
         };
         self.ctx.profiler.record(

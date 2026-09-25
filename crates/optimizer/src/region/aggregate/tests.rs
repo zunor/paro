@@ -98,7 +98,7 @@ fn exercise_domain(sql: &str, budget: usize, ordinary: bool) -> Work {
 }
 
 fn exercise_with_statistics(sql: &str, budget: usize, ordinary: bool, known: bool) -> Work {
-    let session = crate::rewrite::subquery::partition_aggregate_tests::setup_session();
+    let session = crate::tests::catalog::setup_session();
     let mut planner = Planner::new(session.clone());
     planner
         .create_plan(paro_parser::parse_one(sql).unwrap().stmt)
@@ -177,7 +177,7 @@ fn exercise_with_statistics(sql: &str, budget: usize, ordinary: bool, known: boo
             let mut joins = 0;
             selected.plan.try_visit_pre_order(|node| {
                 assert!(
-                    !matches!(node.operator, LogicalOperator::BoundReference(_)),
+                    !matches!(node.operator, LogicalOperator::SubplanRef(_)),
                     "no pricing boundary may escape reconstruction"
                 );
                 assert!(

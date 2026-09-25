@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fixed-size search cost used in the Memo hot path and extracted plans.
+//! Fixed-size work, latency and resource estimates for physical planning.
 
 use std::cmp::Ordering;
 

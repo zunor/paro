@@ -18,7 +18,7 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
     const OUTPUT: usize = 42;
 
     let ctx = BindContext::new();
-    let table = super::tests::test_get().table.expect("stored table");
+    let table = super::test_get().table.expect("stored table");
     let carrier = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
@@ -97,7 +97,7 @@ fn lowers_row_fetch_without_projection_parent() {
     const MATERIALIZED: usize = 51;
 
     let ctx = BindContext::new();
-    let table = super::tests::test_get().table.expect("stored table");
+    let table = super::test_get().table.expect("stored table");
     let carrier = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(

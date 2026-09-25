@@ -310,14 +310,14 @@ impl LogicalPlanDeepCopy {
                 self.remap_table_index(bind_shared, &mut g.table_index);
                 LogicalOperator::Get(g)
             }
-            LogicalOperator::BoundReference(reference) => {
-                let mut copied = crate::logical::operator::BoundReference::new(
+            LogicalOperator::SubplanRef(reference) => {
+                let mut copied = crate::logical::operator::SubplanRef::new(
                     reference.reference_id,
                     reference.bindings.clone(),
                     reference.types().to_vec(),
                 );
                 copied.facts = reference.facts.clone();
-                LogicalOperator::BoundReference(copied)
+                LogicalOperator::SubplanRef(copied)
             }
             LogicalOperator::Filter(f) => {
                 let child = self.copy_plan(f.child.as_ref(), bind_shared);

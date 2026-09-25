@@ -78,5 +78,5 @@ pub enum LogicalOperatorType {
     /// Schema-only boundary owned by an external relational optimizer.
     /// Appended so existing discriminants remain stable for downstream code
     /// that has not yet migrated to explicit operator tags.
-    BoundReference,
+    SubplanRef,
 }

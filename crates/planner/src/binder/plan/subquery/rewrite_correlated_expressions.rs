@@ -404,7 +404,7 @@ impl RewriteCorrelatedExpressions {
             | LogicalOperator::RefreshPropertyGraph(_)
             | LogicalOperator::Drop(_)
             | LogicalOperator::CTERef(_)
-            | LogicalOperator::BoundReference(_)
+            | LogicalOperator::SubplanRef(_)
             | LogicalOperator::TableFunctionGet(_)
             | LogicalOperator::SearchScan(_)
             | LogicalOperator::FullTextFilterScan(_)

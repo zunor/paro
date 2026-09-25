@@ -79,7 +79,7 @@ impl AccessPlanner {
                 };
                 let mut link = &projection.child;
                 let mut filters = Vec::new();
-                // The input is a finite local shell/arena, not the Memo. A
+                // The input is a finite local shell/arena. A
                 // malformed cycle is an internal error, never "unsupported".
                 for _ in 0..node_bound {
                     let Some(child) = read(link)? else {
@@ -124,7 +124,7 @@ impl AccessPlanner {
     }
 
     /// Derive a physical search payload for exactly this logical root.  It is
-    /// intentionally non-recursive: the Memo builder attaches the payload to
+    /// intentionally non-recursive: physical construction attaches the payload to
     /// the matching Filter/TopN expression and keeps the logical expression
     /// itself provider- and capability-free.
     pub(crate) fn physical_candidate_for_root(

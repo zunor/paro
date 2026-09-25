@@ -123,7 +123,7 @@ pub(crate) fn flatten_dependent_joins_in_plan(
             LogicalOperator::GraphExpand(ge)
         }
         other @ (LogicalOperator::Get(_)
-        | LogicalOperator::BoundReference(_)
+        | LogicalOperator::SubplanRef(_)
         | LogicalOperator::DummyScan
         | LogicalOperator::ExpressionGet(_)
         | LogicalOperator::DelimGet(_)

@@ -18,8 +18,8 @@ pub type MemoryBytes = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PhysicalGrantContract {
-    /// The selected node's algorithm and price are grant-independent. An
-    /// admissible-set id belongs to Memo search, not to this executable proof.
+    /// The selected node's algorithm and price are grant-independent. A
+    /// resource class is not needed for this executable contract.
     Invariant,
     Parallelism {
         tasks: u16,
@@ -28,7 +28,7 @@ pub enum PhysicalGrantContract {
 }
 
 impl PhysicalGrantContract {
-    /// A shared Memo winner is executable only at an operating point for
+    /// A selected node is executable only at an operating point for
     /// which its cost and task-supply contract were proved. Admission must
     /// check every selected child, not just overwrite the root's proof.
     pub fn accepts(self, class: ResourceGrantClassId, tasks: u16) -> bool {
@@ -44,7 +44,6 @@ impl PhysicalGrantContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanOrigin {
     Direct,
-    Memo,
     SpecializedRegion(Fingerprint),
     Enforcer(Fingerprint),
     StatementLowering,

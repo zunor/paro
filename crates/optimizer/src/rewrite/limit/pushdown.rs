@@ -1,7 +1,8 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Push constant `LIMIT` nodes below projections when the rewrite is cheap.
+//! Move constant limits below infallible, side-effect-free projections.
+//! Row order and multiplicity are unchanged; observable evaluation is a fence.
 
 use paro_planner::expression::Expression;
 use paro_planner::logical::operator::LogicalOperator;
@@ -51,23 +52,19 @@ impl LimitPushdown {
         let LogicalOperator::Projection(projection) = &limit.child.operator else {
             return false;
         };
-        if projection
-            .expressions
-            .iter()
-            .any(|expr| !expr.evaluation_properties().can_share_evaluation())
-        {
+        if projection.expressions.iter().any(|expr| {
+            let properties = expr.evaluation_properties();
+            properties.is_reorder_fence() || !properties.is_infallible()
+        }) {
             return false;
         }
 
         let Some(limit_expr) = &limit.limit else {
             return false;
         };
-        let Some(limit_val) = Self::extract_constant_value(limit_expr) else {
+        let Some(_) = Self::extract_constant_value(limit_expr) else {
             return false;
         };
-        if limit_val >= 8192 {
-            return false;
-        }
 
         if let Some(offset_expr) = &limit.offset {
             if Self::extract_constant_value(offset_expr).is_none() {
@@ -240,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cannot_optimize_large_limit() {
+    fn test_large_limit_has_the_same_semantic_contract() {
         let get = create_test_get();
         let projection = create_projection(get);
         let limit = LogicalOperator::Limit(Box::new(Limit::new(
@@ -249,7 +246,7 @@ mod tests {
             None,
         )));
 
-        assert!(!LimitPushdown::can_optimize(&limit));
+        assert!(LimitPushdown::can_optimize(&limit));
     }
 
     #[test]
@@ -286,6 +283,31 @@ mod tests {
             None,
         )));
 
+        assert!(!LimitPushdown::can_optimize(&limit));
+    }
+
+    #[test]
+    fn fallible_immutable_projection_is_an_evaluation_fence() {
+        let mut function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .unwrap();
+        function.stability = paro_function::scalar::FunctionStability::Consistent;
+        let mut call = FunctionExpression::new(function, vec![], LogicalType::Double);
+        call.function.error_mode = paro_function::scalar::FunctionErrorMode::CanError;
+        let expression = Expression::Function(call.into());
+        assert!(expression.evaluation_properties().can_share_evaluation());
+        let projection = LogicalOperator::Projection(Projection::new(
+            1,
+            OwnedLogicalPlan::synthetic(create_test_get()),
+            vec![expression],
+        ));
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
+            OwnedLogicalPlan::synthetic(projection),
+            Some(create_constant_expr(1)),
+            None,
+        )));
         assert!(!LimitPushdown::can_optimize(&limit));
     }
 

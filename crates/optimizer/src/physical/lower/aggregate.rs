@@ -485,7 +485,7 @@ impl PhysicalPlanBuilder {
             == crate::physical::PhysicalImplementationFlavor::SingletonAggregateProjection
         {
             return Err(paro_error::internal(
-                "Memo selected singleton aggregate projection for an ineligible aggregate",
+                "Physical selection chose singleton aggregate projection for an ineligible aggregate",
             ));
         }
         let child = self.extract_node(aggregate.child.as_ref())?;
@@ -542,7 +542,7 @@ impl PhysicalPlanBuilder {
             crate::physical::PhysicalImplementationFlavor::PerfectHashAggregate => {
                 Some(admitted_perfect_hash().ok_or_else(|| {
                     paro_error::internal(
-                        "Memo selected perfect-hash aggregate for an ineligible domain",
+                        "Physical selection chose perfect-hash aggregate for an ineligible domain",
                     )
                 })?)
             }
@@ -555,7 +555,7 @@ impl PhysicalPlanBuilder {
             crate::physical::PhysicalImplementationFlavor::Structural => None,
             _ => {
                 return Err(paro_error::internal(
-                    "Memo selected a non-aggregate implementation for Aggregate",
+                    "Physical selection chose a non-aggregate implementation for Aggregate",
                 ));
             }
         };
@@ -749,7 +749,7 @@ fn hash_aggregate_spill_supported(spec: &AggregateSpec) -> bool {
         })
 }
 
-/// Pure admission predicate shared by Memo registration and physical
+/// Pure eligibility predicate shared by local selection and physical
 /// extraction. The proof is revalidated against the final aggregate payload;
 /// a stale annotation therefore never creates a physical candidate.
 pub(crate) fn supports_singleton_aggregate_projection<
@@ -1120,8 +1120,7 @@ fn can_execute_post_input_rollup(spec: &AggregateSpec) -> bool {
 }
 
 #[cfg(test)]
-#[path = "aggregate_payload_tests.rs"]
-mod payload_tests;
+mod tests;
 
 pub(crate) fn can_use_perfect_hash_aggregate<Child>(
     aggregate: &LogicalAggregate<Child>,

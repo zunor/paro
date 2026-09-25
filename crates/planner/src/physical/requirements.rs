@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Required/provided physical property lattice and canonical interning.
+//! Required and provided ordering, distribution, representation and safety contracts.
 
 use std::collections::{BTreeMap, BTreeSet};
 

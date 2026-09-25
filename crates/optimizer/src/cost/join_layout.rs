@@ -5,7 +5,7 @@
 //!
 //! Production join enumeration consumes the free functions in this module.
 //! The former tree-rewriting optimizer remains test-only so physical
-//! orientation cannot be selected outside Memo.
+//! orientation is ineligible for local selection.
 
 #[cfg(test)]
 use std::sync::Arc;
@@ -248,7 +248,7 @@ fn default_cardinality(session: &StatementContext) -> usize {
 }
 
 pub(crate) fn contains_control_region_boundary(plan: &OwnedLogicalPlan) -> bool {
-    if let LogicalOperator::BoundReference(reference) = &plan.operator {
+    if let LogicalOperator::SubplanRef(reference) = &plan.operator {
         return reference.facts.contains_control_region;
     }
     let owns_region = matches!(

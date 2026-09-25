@@ -19,8 +19,8 @@ use paro_planner::expression::{
     WindowInvocation,
 };
 use paro_planner::logical::operator::{
-    aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, BoundReference,
-    ColumnBinding, Join, JoinComparisonType, LogicalOperator, LogicalOutputLayout,
+    aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Join,
+    JoinComparisonType, LogicalOperator, LogicalOutputLayout, SubplanRef,
 };
 use paro_planner::logical::plan::{LogicalPlanPostOrderFolder, OwnedLogicalPlan};
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StatsInfo};
@@ -246,7 +246,7 @@ impl StatisticsPropagator {
         }
     }
 
-    /// Begin a local propagation pass from facts already owned by the Memo
+    /// Begin a local propagation pass from immutable input facts
     /// expression being transformed. Opaque group references have no storage
     /// operator from which those facts could be rediscovered.
     pub(crate) fn with_statistics_map(
@@ -519,7 +519,7 @@ impl StatisticsPropagator {
         op: LogicalOperator,
     ) -> LogicalOperator {
         match op {
-            LogicalOperator::BoundReference(reference) => {
+            LogicalOperator::SubplanRef(reference) => {
                 for (binding, statistics) in reference
                     .bindings
                     .iter()
@@ -528,7 +528,7 @@ impl StatisticsPropagator {
                 {
                     self.statistics_map.insert(binding, statistics);
                 }
-                LogicalOperator::BoundReference(reference)
+                LogicalOperator::SubplanRef(reference)
             }
             LogicalOperator::Projection(proj) => {
                 for (i, expr) in proj.expressions.iter().enumerate() {
@@ -721,7 +721,7 @@ impl StatisticsPropagator {
     }
 
     /// Propagate the same expression/statistics rules through a native shell
-    /// whose children are Memo-owned BoundReferences.  Unlike
+    /// whose children are immutable subplan references. Unlike
     /// `propagate_operator`, this entry point never needs to manufacture an
     /// OwnedLogicalPlan for an empty-filter wrapper or for aggregate-child
     /// inspection.  A false filter is intentionally retained: its semantic
@@ -730,10 +730,10 @@ impl StatisticsPropagator {
     pub(crate) fn propagate_native_operator(
         &mut self,
         _ctx: &StatementContext,
-        op: LogicalOperator<BoundReference>,
-    ) -> LogicalOperator<BoundReference> {
+        op: LogicalOperator<SubplanRef>,
+    ) -> LogicalOperator<SubplanRef> {
         match op {
-            LogicalOperator::BoundReference(reference) => {
+            LogicalOperator::SubplanRef(reference) => {
                 for (binding, statistics) in reference
                     .bindings
                     .iter()
@@ -742,7 +742,7 @@ impl StatisticsPropagator {
                 {
                     self.statistics_map.insert(binding, statistics);
                 }
-                LogicalOperator::BoundReference(reference)
+                LogicalOperator::SubplanRef(reference)
             }
             LogicalOperator::Projection(proj) => {
                 for (i, expr) in proj.expressions.iter().enumerate() {

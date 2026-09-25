@@ -140,7 +140,7 @@ pub struct JoinRegionPlanner {
 /// rebuild a `NativeShell` directly, while the compatibility entry point
 /// below still reconstructs `OwnedLogicalPlan` values for legacy callers.
 ///
-/// The value is safe to share between equal, fact-keyed Memo requests: it
+/// The value is safe to share between identical region requests: it
 /// contains only immutable relation sets, predicate descriptions and DP
 /// nodes. Native plan-node identities are allocated later while rebuilding a
 /// shell, so sharing this graph result cannot alias an executable arena.
@@ -222,7 +222,7 @@ impl JoinRegionPlanner {
     ) -> Result<OwnedLogicalPlan> {
         self.column_stats = column_stats.clone();
         // Join costing needs the semantic live-column set, not the canonical
-        // `ProjectionMap::all()` payload retained by Memo identities. This
+        // `ProjectionMap::all()` payload retained by plan identities. This
         // prepass derives that view before enumeration; final candidate
         // settling still recomputes executable projection maps after the join
         // tree has been reconstructed.
@@ -791,13 +791,13 @@ impl JoinRegionPlanner {
         stats.contains_control_region =
             crate::cost::join_layout::contains_control_region_boundary(plan);
         stats.unique_keys = crate::estimate::unique_keys::proven_unique_keys(plan);
-        let memo_domain_observation = matches!(plan.operator, LogicalOperator::BoundReference(_));
-        // Opaque Memo inputs own their occurrence's domain. The binding map
+        let subplan_domain_observation = matches!(plan.operator, LogicalOperator::SubplanRef(_));
+        // Subplan inputs own their occurrence's domain. The binding map
         // belongs to the rule's original shell and may describe another CTE
         // restriction or an earlier equivalent expression with the same
         // column names. Never use it to override the input group's facts.
         let boundary_columns = match &plan.operator {
-            LogicalOperator::BoundReference(reference) => Some(reference.column_statistics()),
+            LogicalOperator::SubplanRef(reference) => Some(reference.column_statistics()),
             LogicalOperator::Get(get) => get
                 .table
                 .as_ref()
@@ -864,7 +864,7 @@ impl JoinRegionPlanner {
                         // bare Get; derived expressions remain estimates.
                         has_evidence
                             && (storage_observation
-                                || (memo_domain_observation
+                                || (subplan_domain_observation
                                     && !matches!(
                                         provenance,
                                         DistinctProvenance::ObservedPartial { .. }

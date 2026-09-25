@@ -89,9 +89,9 @@ impl BindContext {
     }
 
     /// Clone the visible binding state while giving plan-node allocation its
-    /// own namespace. Independent optimizer Memos may reuse the same table
-    /// and CTE indices, but work performed in one Memo must not advance the
-    /// allocator used by another measured search.
+    /// own namespace. Independent regional plans may reuse the same table
+    /// and CTE indices, but work performed in one region must not advance the
+    /// allocator used by another planning operation.
     pub fn with_independent_plan_ids(&self) -> Self {
         let mut context = self.clone();
         context.shared = Arc::new(BindShared::new());

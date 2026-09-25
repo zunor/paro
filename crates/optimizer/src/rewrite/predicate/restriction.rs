@@ -25,9 +25,9 @@ fn compose(outer: &[Expression], inner: &[Expression]) -> Option<Vec<Expression>
     )
 }
 
-/// Normalize the SQL pipeline before initial post-order Memo construction.
+/// Normalize predicate placement before regional planning.
 /// Transactional native publication uses the same transparency/composition
-/// contract below; generic Memo fixtures need not be SQL-normalized trees.
+/// contract below; generic plan fixtures need not be SQL-normalized trees.
 #[cfg(test)]
 pub(crate) fn normalize_tree(
     plan: OwnedLogicalPlan,

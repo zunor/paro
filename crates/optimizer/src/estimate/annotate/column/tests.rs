@@ -95,16 +95,16 @@ fn nullable_unique_key_is_not_a_group_determinant() {
 }
 
 #[test]
-fn memo_boundary_domains_do_not_leak_between_occurrences() {
-    use paro_planner::logical::operator::{BoundReference, SetOperation};
+fn subplan_boundary_domains_do_not_leak_between_occurrences() {
+    use paro_planner::logical::operator::{SetOperation, SubplanRef};
     let input = |reference_id, value| {
-        let reference = BoundReference::new(
-            paro_planner::logical::operator::BoundReferenceId::group_hole(reference_id),
+        let reference = SubplanRef::new(
+            paro_planner::logical::operator::SubplanRefId::input_ordinal(reference_id as usize),
             vec![ColumnBinding::new(7, 0)],
             vec![LogicalType::Integer],
         );
         OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-            OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference)),
+            OwnedLogicalPlan::synthetic(LogicalOperator::SubplanRef(reference)),
             vec![Expression::Comparison(
                 ComparisonExpression::new(
                     ComparisonType::Equal,

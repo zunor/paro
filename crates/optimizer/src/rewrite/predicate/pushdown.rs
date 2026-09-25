@@ -143,7 +143,7 @@ impl FilterPushdown {
         into_associative_terms(expr, ConjunctionType::And)
     }
 
-    /// The same local predicate normalization used by tree and Memo producers.
+    /// Local predicate normalization shared by owned trees and operator shells.
     /// `None` leaves contradiction/empty-output settlement to its owner.
     pub(crate) fn normalize_predicates(
         predicates: impl IntoIterator<Item = Expression>,
@@ -1261,5 +1261,4 @@ fn lower_mark_join_for_truth(join: &mut ComparisonJoin, expected: bool) -> bool 
 }
 
 #[cfg(test)]
-#[path = "pushdown_tests.rs"]
 mod tests;

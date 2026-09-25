@@ -15,15 +15,6 @@ use paro_planner::expression::{AggregateType, Expression};
 use paro_planner::logical::operator::{Aggregate, ComparisonJoin, JoinComparisonType, JoinType};
 use std::cell::Cell;
 
-#[cfg(test)]
-mod oracle;
-#[cfg(test)]
-pub(crate) use oracle::optimize_plan;
-#[cfg(test)]
-mod join_region;
-#[cfg(test)]
-use oracle::{expression_domain, ExpressionDomain};
-
 /// Necessary root-only eligibility shared by dispatch and both rewrite paths.
 /// These fields belong to the immutable aggregate shell. In particular this
 /// must not inspect the child: a later child alternative can expose a dimension

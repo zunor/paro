@@ -62,7 +62,8 @@ optimizer modules are not downstream APIs.
   of safe movement across an outer join, aggregate, CTE or recursive boundary.
 - Rewrites replace trees; optional cost decisions belong to regions or physical
   selection. Removing a historical rule registration does not make that rewrite
-  mandatory. Independent semantic oracles remain test-only where appropriate.
+  mandatory. Tests exercise the production kernels or small independent
+  semantic oracles, not an otherwise dormant alternative optimizer.
 - Statistics do not become facts because a rule ran. Unknown is not one row;
   a compound unique key does not imply uniqueness of any individual column.
   Filter monotonicity and join/aggregate bounds require matching semantics.
@@ -83,6 +84,33 @@ optimizer modules are not downstream APIs.
   join order, algorithm or resource semantics afterward.
 - Preserve error causes and cancellation, release leases on every terminal path,
   and never report an unsuccessful or unfinished phase as completed.
+
+## Rewrite admission and ownership
+
+The normalization program admits unused outer-lookup elimination only for a
+base-table input whose declared unique key is covered by ordinary equality.
+It retains NULL-safe joins, incomplete composite keys and any referenced
+output. Intermediate projections keep every binding they still evaluate;
+column pruning, not join elimination, owns deleting expressions.
+
+Constant LIMIT movement crosses only infallible, side-effect-free projections
+without external evaluation boundaries. There is no row-count magic threshold.
+CTE normalization has one policy: single-reference DEFAULT owners inline,
+multi-reference DEFAULT owners remain shared, and explicit SQL materialization
+directives retain their semantics.
+
+The old standalone late-payload, correlated-window/fusion, aggregate alternative
+and predicate-pullup implementations are not shipped as test-only optimizers.
+Their production-independent implementations remain recoverable from Git.
+Active access-path selection, scan materialization, aggregate-grain enumeration,
+partition-window lowering and their executable-contract tests remain owned by
+their respective stages. Adding a new alternative requires bounded local
+cost selection and semantic evidence, not restoring a mandatory historical pass.
+
+`planner::logical::operator::SubplanRef` carries immutable facts for an already
+planned regional input or a frozen output. It is not executable and carries no
+global search/group identity. Required physical properties and `PhysicalCost`
+are executable/estimation contracts, not evidence of global search completion.
 
 ## Compile diagnostics
 

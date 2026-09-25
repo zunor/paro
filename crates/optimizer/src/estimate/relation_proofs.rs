@@ -59,7 +59,7 @@ impl RelationProofs {
         };
         let mut result = FiniteDomains::new();
         match operator {
-            LogicalOperator::BoundReference(r) => result.clone_from(&r.facts.finite_domains),
+            LogicalOperator::SubplanRef(r) => result.clone_from(&r.facts.finite_domains),
             LogicalOperator::Projection(p) => {
                 for (binding, expression) in output.bindings().iter().zip(&p.expressions) {
                     if let Some(domain) = expression_domain(expression, 0) {

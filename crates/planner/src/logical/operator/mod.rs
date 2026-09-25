@@ -13,7 +13,6 @@ mod projection_map;
 
 pub mod aggregate;
 pub mod alter;
-pub mod bound_reference;
 pub mod copy_to;
 pub mod create_index;
 pub mod create_property_graph;
@@ -48,6 +47,7 @@ pub mod refresh_property_graph;
 pub mod row_fetch;
 pub mod search_scan;
 pub mod set_operation;
+pub mod subplan_ref;
 pub mod table_function;
 pub mod topn;
 pub mod update;
@@ -58,7 +58,6 @@ pub use aggregate::{
     Aggregate, GroupInputMultiplicity, PostAggregateReduction, SingletonGroupProof,
 };
 pub use alter::Alter;
-pub use bound_reference::{BoundReference, BoundReferenceId};
 pub use column_binding::ColumnBinding;
 pub use copy_to::CopyTo;
 pub use create_index::CreateIndex;
@@ -104,6 +103,7 @@ pub use search_scan::{
     FullTextScoreMode, SearchCandidate, SearchDecision, SearchScan,
 };
 pub use set_operation::{SetOpType, SetOperation};
+pub use subplan_ref::{SubplanRef, SubplanRefId};
 pub use table_function::TableFunctionGet;
 pub use topn::TopN;
 pub use update::Update;

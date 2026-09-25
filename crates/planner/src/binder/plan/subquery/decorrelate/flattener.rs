@@ -1711,7 +1711,7 @@ impl DependentJoinFlattener {
                 })
             }
             other @ (LogicalOperator::Alter(_)
-            | LogicalOperator::BoundReference(_)
+            | LogicalOperator::SubplanRef(_)
             | LogicalOperator::CreateTable(_)
             | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::CreateSequence(_)

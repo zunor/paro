@@ -192,16 +192,16 @@ fn optimize_converts_filtered_cross_product_to_comparison_join() {
 }
 
 #[test]
-fn memo_relation_uses_its_domain_instead_of_the_original_shell_snapshot() {
-    use paro_planner::logical::operator::bound_reference::{
+fn subplan_relation_uses_its_domain_instead_of_the_original_shell_snapshot() {
+    use paro_planner::logical::operator::subplan_ref::{
         BoundColumnDomain, BoundRelationFactValues, BoundRelationFacts,
     };
-    use paro_planner::logical::operator::BoundReference;
+    use paro_planner::logical::operator::SubplanRef;
     let session = make_test_session();
     let context = BindContext::new();
     let binding = ColumnBinding::new(0, 0);
-    let mut reference = BoundReference::new(
-        paro_planner::logical::operator::BoundReferenceId::group_hole(0),
+    let mut reference = SubplanRef::new(
+        paro_planner::logical::operator::SubplanRefId::input_ordinal(0),
         vec![binding],
         vec![LogicalType::Integer],
     );
@@ -217,7 +217,7 @@ fn memo_relation_uses_its_domain_instead_of_the_original_shell_snapshot() {
         },
         reference.types().to_vec(),
     ));
-    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference));
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::SubplanRef(reference));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(100));
     let mut optimizer = JoinRegionPlanner::new(SelectivityDefaults::default());
     optimizer.column_stats.insert(

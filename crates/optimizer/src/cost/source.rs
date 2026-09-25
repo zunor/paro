@@ -16,7 +16,7 @@ pub enum GrantDependencyDescriptor {
 }
 
 /// Query-local identity of one base row source. Binder table indexes are
-/// unique across aliases, so self joins remain distinct while equivalent Memo
+/// unique across aliases, so self joins remain distinct while equivalent region
 /// expressions retain the same source identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WorkSourceId(pub usize);

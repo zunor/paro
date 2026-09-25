@@ -12,14 +12,14 @@ use paro_common::{error::Result, types::LogicalType};
 use crate::logical::plan::OwnedLogicalPlan;
 
 use super::{
-    Aggregate, Alter, BoundReference, CTERef, ColumnBinding, CopyTo, CreateIndex,
-    CreatePropertyGraph, CreateRoutine, CreateSchema, CreateSequence, CreateTable, CreateView,
-    Delete, DelimGet, DependentJoin, DependentJoinKind, Distinct, Drop, DropPropertyGraph,
-    EmptyResult, Explain, ExpressionGet, Filter, FullTextFilterScan, Get, GraphExpand, GraphMatch,
-    GraphScan, Insert, Join, JoinType, Limit, LogicalExternalProject, LogicalExternalTable,
-    LogicalOperatorType, MaterializedCTE, Order, Projection, ProjectionMap, RecursiveCTE,
-    RefreshPropertyGraph, RowFetch, SearchScan, SetOpType, SetOperation, TableFunctionGet, TopN,
-    Update, Window,
+    Aggregate, Alter, CTERef, ColumnBinding, CopyTo, CreateIndex, CreatePropertyGraph,
+    CreateRoutine, CreateSchema, CreateSequence, CreateTable, CreateView, Delete, DelimGet,
+    DependentJoin, DependentJoinKind, Distinct, Drop, DropPropertyGraph, EmptyResult, Explain,
+    ExpressionGet, Filter, FullTextFilterScan, Get, GraphExpand, GraphMatch, GraphScan, Insert,
+    Join, JoinType, Limit, LogicalExternalProject, LogicalExternalTable, LogicalOperatorType,
+    MaterializedCTE, Order, Projection, ProjectionMap, RecursiveCTE, RefreshPropertyGraph,
+    RowFetch, SearchScan, SetOpType, SetOperation, SubplanRef, TableFunctionGet, TopN, Update,
+    Window,
 };
 
 /// The execution-facing positional output layout of one logical plan node.
@@ -213,7 +213,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Opaque schema boundary used only inside a transformation transaction.
     /// Keep this transport-only variant after every executable operator so
     /// introducing it cannot perturb legacy discriminant-based ordering.
-    BoundReference(BoundReference),
+    SubplanRef(SubplanRef),
 
     /// A dummy scan that produces one row (used for SELECT 1)
     DummyScan,
@@ -359,7 +359,7 @@ impl LogicalOperator {
     pub fn get_table_index(&self) -> Vec<usize> {
         match self {
             LogicalOperator::Get(get) => vec![get.table_index],
-            LogicalOperator::BoundReference(_) => vec![],
+            LogicalOperator::SubplanRef(_) => vec![],
             LogicalOperator::Projection(proj) => vec![proj.table_index],
             LogicalOperator::RowFetch(fetch) => fetch
                 .sources
@@ -471,7 +471,7 @@ fn derive_output_names(root: &LogicalOperator) -> Vec<String> {
         match task {
             Derive(operator) => match operator {
                 LogicalOperator::Get(get) => outputs.push(get.names.clone()),
-                LogicalOperator::BoundReference(reference) => outputs.push(
+                LogicalOperator::SubplanRef(reference) => outputs.push(
                     (0..reference.bindings.len())
                         .map(|index| format!("__bound_reference_{index}"))
                         .collect(),
@@ -778,7 +778,7 @@ impl<Child> LogicalOperator<Child> {
     pub fn op_type(&self) -> LogicalOperatorType {
         match self {
             LogicalOperator::Get(_) => LogicalOperatorType::Get,
-            LogicalOperator::BoundReference(_) => LogicalOperatorType::BoundReference,
+            LogicalOperator::SubplanRef(_) => LogicalOperatorType::SubplanRef,
             LogicalOperator::Filter(_) => LogicalOperatorType::Filter,
             LogicalOperator::Projection(_) => LogicalOperatorType::Projection,
             LogicalOperator::RowFetch(_) => LogicalOperatorType::RowFetch,
@@ -835,7 +835,7 @@ impl<Child> LogicalOperator<Child> {
 
     /// Derive presentation names from already-completed child names. This
     /// operator-local reducer is independent of child ownership, so native
-    /// Memo shells can use it without rebuilding an owned plan tree.
+    /// Local operator shells can use it without rebuilding an owned plan tree.
     pub fn output_names_from_child_refs(&self, child_names: &[&[String]]) -> Vec<String> {
         let mut arity = 0;
         self.visit_child_links(&mut |_| arity += 1);
@@ -858,7 +858,7 @@ impl<Child> LogicalOperator<Child> {
         };
         match self {
             LogicalOperator::Get(get) => get.names.clone(),
-            LogicalOperator::BoundReference(reference) => (0..reference.bindings.len())
+            LogicalOperator::SubplanRef(reference) => (0..reference.bindings.len())
                 .map(|index| format!("__bound_reference_{index}"))
                 .collect(),
             LogicalOperator::Filter(filter) => {
@@ -1161,7 +1161,7 @@ fn output_layout_children<Child>(operator: &LogicalOperator<Child>) -> OutputLay
             DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => Both,
         },
         LogicalOperator::Get(_)
-        | LogicalOperator::BoundReference(_)
+        | LogicalOperator::SubplanRef(_)
         | LogicalOperator::Projection(_)
         | LogicalOperator::ExternalTable(_)
         | LogicalOperator::CreateTable(_)
@@ -1205,7 +1205,7 @@ fn derive_local_output_layout<Child>(
         LogicalOperator::Get(get) => {
             LogicalOutputLayout::for_table(get.table_index, get.returned_types.clone())
         }
-        LogicalOperator::BoundReference(reference) => {
+        LogicalOperator::SubplanRef(reference) => {
             LogicalOutputLayout::new(reference.types().to_vec(), reference.bindings.clone())
         }
         LogicalOperator::Filter(filter) => {

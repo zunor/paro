@@ -22,7 +22,7 @@ use paro_planner::logical::operator::ColumnBinding;
 use paro_storage::statistics::{ColumnStatistics, EstimatedNumericDistribution, NumericStats};
 
 /// Derive the aggregate output once, at its producer. Consumers read these
-/// moments as column evidence, including through a Memo group hole or a pure
+/// moments as column evidence, including through a subplan reference or a pure
 /// renaming projection; they never reconstruct an Aggregate child to discover
 /// the distribution. The model and its assumptions are unchanged.
 pub(crate) fn estimate_grouped_sum_distribution(

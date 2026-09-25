@@ -10,7 +10,6 @@ use paro_planner::logical::plan::OwnedLogicalPlan;
 use std::collections::HashSet;
 
 #[cfg(test)]
-#[path = "normalize_tests.rs"]
 mod tests;
 
 /// Push a producer-side necessary condition through the transparent part of

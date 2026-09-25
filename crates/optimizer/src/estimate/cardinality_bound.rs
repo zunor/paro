@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Semantic row-count bounds shared by statistics and Cascades properties.
+//! Semantic row-count bounds shared by statistics and physical properties.
 //!
 //! These bounds must survive data changes and substitution by an equivalent
 //! expression. Snapshot row counts, selectivity estimates, and HLL domains do
@@ -23,7 +23,7 @@ pub(crate) fn derive_maximum_cardinality<Child>(
     };
     match operator {
         LogicalOperator::DummyScan => Some(1),
-        LogicalOperator::BoundReference(reference) => reference.facts.maximum_cardinality,
+        LogicalOperator::SubplanRef(reference) => reference.facts.maximum_cardinality,
         LogicalOperator::EmptyResult(_) => Some(0),
         // Resident rows are snapshot evidence. Prepared plans survive DML.
         LogicalOperator::Get(_) => None,

@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Statement-local bounds for regional enumeration, independent of Memo search.
+//! Statement-local bounds for connected-region enumeration.
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RegionLimits {

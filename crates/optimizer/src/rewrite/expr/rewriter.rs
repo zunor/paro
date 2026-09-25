@@ -162,8 +162,7 @@ mod tests {
     use super::*;
     use crate::rewrite::expr::rules::constant_folding::ConstantFoldingRule;
     use crate::rewrite::expr::rules::expression_matcher::{
-        ComparisonExpressionMatcher, ConstantExpressionMatcher, ExpressionMatcher,
-        FoldableConstantMatcher,
+        AnyExpressionMatcher, ExpressionMatcher, FoldableConstantMatcher,
     };
     use crate::rewrite::expr::rules::rule::{Rule, RuleResult};
     use paro_common::runtime_value::Value;
@@ -178,13 +177,13 @@ mod tests {
     /// A test rule that adds 1 to integer constants less than 100.
     /// This prevents infinite loops by only applying to small values.
     struct IncrementSmallConstantRule {
-        matcher: ConstantExpressionMatcher,
+        matcher: AnyExpressionMatcher,
     }
 
     impl IncrementSmallConstantRule {
         fn new() -> Self {
             Self {
-                matcher: ConstantExpressionMatcher,
+                matcher: AnyExpressionMatcher,
             }
         }
     }
@@ -220,13 +219,13 @@ mod tests {
 
     /// A test rule that simplifies `x = x` to `true`.
     struct SelfEqualityRule {
-        matcher: ComparisonExpressionMatcher,
+        matcher: AnyExpressionMatcher,
     }
 
     impl SelfEqualityRule {
         fn new() -> Self {
             Self {
-                matcher: ComparisonExpressionMatcher::with_type(ComparisonType::Equal),
+                matcher: AnyExpressionMatcher,
             }
         }
     }
@@ -244,7 +243,7 @@ mod tests {
         ) -> RuleResult {
             if let Expression::Comparison(comp) = bindings[0] {
                 // Check if left == right (simplified check for constants)
-                if comp.left.equals(&comp.right) {
+                if comp.comparison_type == ComparisonType::Equal && comp.left.equals(&comp.right) {
                     return RuleResult::Changed(Box::new(Expression::Constant(
                         ConstantExpression {
                             value: Value::Boolean(true),

@@ -7,7 +7,7 @@
 //! namespace at every operator boundary.  This module owns that agreement:
 //! callers provide predicates in the current operator's output namespace and
 //! receive predicates in each child namespace, together with predicates that
-//! must remain at the current boundary.  It deliberately does not create Memo
+//! must remain at the current boundary. It does not create alternative
 //! expressions or make a quality decision.
 
 use crate::rewrite::expr::traversal::visit_expression;

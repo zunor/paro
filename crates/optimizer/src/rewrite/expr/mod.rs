@@ -91,7 +91,7 @@ impl CanonicalScalars {
 }
 
 #[cfg(test)]
-mod canonical_tests;
+mod tests;
 
 pub(crate) fn scalar_normalizer() -> rewriter::ExpressionRewriter {
     let mut rewriter = rewriter::ExpressionRewriter::new();

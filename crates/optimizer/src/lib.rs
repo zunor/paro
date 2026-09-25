@@ -34,3 +34,6 @@ pub mod test_support {
     };
     pub use crate::rewrite::expr::rules::rule::{Rule, RuleResult};
 }
+
+#[cfg(test)]
+mod tests;

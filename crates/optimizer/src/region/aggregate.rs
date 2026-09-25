@@ -14,12 +14,10 @@ use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
 use paro_planner::expression::{
     AggregateExpression, ColumnRefExpression, ConjunctionType, Expression,
 };
-use paro_planner::logical::operator::bound_reference::{
-    BoundRelationFactValues, BoundRelationFacts,
-};
+use paro_planner::logical::operator::subplan_ref::{BoundRelationFactValues, BoundRelationFacts};
 use paro_planner::logical::operator::{
-    Aggregate, BoundReference, BoundReferenceId, ColumnBinding, ComparisonJoin, Join,
-    JoinBuildSideConstraint, JoinCondition, JoinType, LogicalOperator, LogicalOutputLayout,
+    Aggregate, ColumnBinding, ComparisonJoin, Join, JoinBuildSideConstraint, JoinCondition,
+    JoinType, LogicalOperator, LogicalOutputLayout, SubplanRef, SubplanRefId,
 };
 use paro_planner::logical::plan::{arena::LogicalPlanNode, OwnedLogicalPlan};
 
@@ -59,13 +57,13 @@ struct Node {
     /// Original SQL bindings carried by the current partial grain.
     rebind: BTreeMap<ColumnBinding, ColumnBinding>,
     partial_aggregate_index: Option<usize>,
-    boundary: BoundReference,
+    boundary: SubplanRef,
 }
 
 impl Node {
-    fn boundary(&self, ordinal: usize) -> Result<BoundReference> {
+    fn boundary(&self, ordinal: usize) -> Result<SubplanRef> {
         let mut reference = self.boundary.clone();
-        reference.reference_id = BoundReferenceId::input_ordinal(ordinal);
+        reference.reference_id = SubplanRefId::input_ordinal(ordinal);
         Ok(reference)
     }
 }
@@ -74,9 +72,9 @@ fn boundary(
     plan: &OwnedLogicalPlan,
     layout: &LogicalOutputLayout,
     response: &choose::PhysicalResponse,
-) -> Result<BoundReference> {
-    BoundReference::new(
-        BoundReferenceId::input_ordinal(0),
+) -> Result<SubplanRef> {
+    SubplanRef::new(
+        SubplanRefId::input_ordinal(0),
         layout.bindings().to_vec(),
         layout.types().to_vec(),
     )
@@ -448,7 +446,7 @@ impl crate::estimate::ColumnStatisticsLookup for InputColumns<'_> {
 enum CutCandidate {
     Ready(Arc<Node>),
     Priced {
-        operator: LogicalOperator<BoundReference>,
+        operator: LogicalOperator<SubplanRef>,
         children: Vec<Arc<Node>>,
         selection: choose::LocalSelection,
     },
@@ -477,7 +475,7 @@ impl Planner<'_> {
 
     fn price_cut(
         &mut self,
-        operator: LogicalOperator<BoundReference>,
+        operator: LogicalOperator<SubplanRef>,
         children: Vec<Arc<Node>>,
     ) -> Result<Option<CutCandidate>> {
         use crate::estimate::ColumnStatisticsLookup;
@@ -553,7 +551,7 @@ impl Planner<'_> {
 
     fn emit(
         &mut self,
-        operator: LogicalOperator<BoundReference>,
+        operator: LogicalOperator<SubplanRef>,
         children: Vec<Arc<Node>>,
     ) -> Result<Option<Arc<Node>>> {
         if !self.reserve_transition()? {
@@ -564,7 +562,7 @@ impl Planner<'_> {
 
     fn complete(
         &mut self,
-        operator: LogicalOperator<BoundReference>,
+        operator: LogicalOperator<SubplanRef>,
         children: Vec<Arc<Node>>,
     ) -> Result<Option<Arc<Node>>> {
         self.work.completed_outputs += 1;
@@ -642,8 +640,8 @@ impl Planner<'_> {
                 .collect(),
             _ => vec![None; layout.len()],
         };
-        let boundary = BoundReference::new(
-            BoundReferenceId::input_ordinal(0),
+        let boundary = SubplanRef::new(
+            SubplanRefId::input_ordinal(0),
             layout.bindings().to_vec(),
             layout.types().to_vec(),
         )
@@ -830,9 +828,9 @@ fn rebind(expression: Expression, bindings: &BTreeMap<ColumnBinding, ColumnBindi
 }
 
 fn filter(
-    child: BoundReference,
+    child: SubplanRef,
     expressions: Vec<Expression>,
-) -> paro_planner::logical::operator::Filter<BoundReference> {
+) -> paro_planner::logical::operator::Filter<SubplanRef> {
     paro_planner::logical::operator::Filter {
         child,
         expressions,

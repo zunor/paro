@@ -12,31 +12,11 @@ use std::ops::ControlFlow;
 
 pub struct CTEInlining<'a> {
     bind_context: &'a BindContext,
-    default_policy: DefaultInliningPolicy,
-}
-
-#[derive(Clone, Copy)]
-enum DefaultInliningPolicy {
-    All,
-    SingleReference,
 }
 
 impl<'a> CTEInlining<'a> {
     pub fn new(bind_context: &'a BindContext) -> Self {
-        Self {
-            bind_context,
-            default_policy: DefaultInliningPolicy::All,
-        }
-    }
-
-    /// Canonicalize every single-reference DEFAULT CTE and SQL's mandatory
-    /// `NOT MATERIALIZED` contract. A one-consumer materialization has no
-    /// reuse benefit, adds a blocking write/read boundary, and cannot dominate
-    /// the equivalent inline relation under any execution requirement. Only
-    /// multi-reference DEFAULT CTEs remain a Memo sharing decision.
-    pub fn single_reference_defaults(mut self) -> Self {
-        self.default_policy = DefaultInliningPolicy::SingleReference;
-        self
+        Self { bind_context }
     }
 
     pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
@@ -48,27 +28,6 @@ impl<'a> CTEInlining<'a> {
         plan: OwnedLogicalPlan,
     ) -> (OwnedLogicalPlan, bool) {
         self.rewrite_plan(plan)
-    }
-
-    /// Produce the alternative for one shared-plan owner without rewriting
-    /// nested owners. Memo combines this local choice with each child group's
-    /// winner; recursively rewriting here would collapse independent sharing
-    /// decisions into only "all inline" and "all materialized" shapes.
-    #[cfg(test)]
-    pub fn optimize_root_with_change(
-        &mut self,
-        plan: OwnedLogicalPlan,
-    ) -> (OwnedLogicalPlan, bool) {
-        let (id, stats, operator) = plan.into_parts();
-        let (operator, changed) = self.try_inline(operator);
-        (
-            OwnedLogicalPlan {
-                id,
-                stats,
-                operator,
-            },
-            changed,
-        )
     }
 
     fn rewrite_plan(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
@@ -108,10 +67,7 @@ impl<'a> CTEInlining<'a> {
             return ((*cte.child).into_operator(), true);
         }
 
-        if cte.materialized == CTEMaterialize::NotMaterialized
-            || (cte.materialized == CTEMaterialize::Default
-                && matches!(self.default_policy, DefaultInliningPolicy::All))
-        {
+        if cte.materialized == CTEMaterialize::NotMaterialized {
             let definition = cte.cte_query.as_ref();
             inline_copied_references(
                 self.bind_context,
@@ -369,9 +325,7 @@ mod tests {
                 cte_ref(&bind_context, 9, 3),
             )),
         );
-        let single = CTEInlining::new(&bind_context)
-            .single_reference_defaults()
-            .optimize_plan(single);
+        let single = CTEInlining::new(&bind_context).optimize_plan(single);
         assert!(!matches!(
             single.operator,
             LogicalOperator::MaterializedCTE(_)
@@ -397,9 +351,7 @@ mod tests {
             )),
         );
 
-        let optimized = CTEInlining::new(&bind_context)
-            .single_reference_defaults()
-            .optimize_plan(plan);
+        let optimized = CTEInlining::new(&bind_context).optimize_plan(plan);
         verify_logical_plan(&bind_context, &optimized).expect("shared plan should remain valid");
         assert!(matches!(
             optimized.operator,
@@ -408,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn memo_root_choice_preserves_an_independent_nested_owner() {
+    fn cte_root_choice_preserves_an_independent_nested_owner() {
         let bind_context = BindContext::new();
         let nested = OwnedLogicalPlan::new(
             &bind_context,
@@ -442,11 +394,11 @@ mod tests {
             )),
         );
 
-        let (optimized, changed) = CTEInlining::new(&bind_context).optimize_root_with_change(outer);
+        let (optimized, changed) = CTEInlining::new(&bind_context).optimize_plan_with_change(outer);
 
         assert!(changed);
         let LogicalOperator::MaterializedCTE(nested) = &optimized.operator else {
-            panic!("nested owner must remain a Memo choice")
+            panic!("nested owner must retain its materialization boundary")
         };
         assert_eq!(nested.cte_index, 20);
         assert!(!matches!(

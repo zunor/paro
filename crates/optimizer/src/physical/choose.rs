@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Bottom-up physical selection over one committed relation tree.
-//! Alternatives live only for the current operator; there is no Memo, goal
+//! Alternatives live only for the current operator; there is no global goal
 //! registry, immutable candidate archive, or grant-artifact cross product.
 
 use std::collections::HashMap;
@@ -485,7 +485,7 @@ fn select_costed(
 /// regional selection; no owned child tree is needed to resolve these facts.
 pub(crate) fn select_native(
     operator: &paro_planner::logical::operator::LogicalOperator<
-        paro_planner::logical::operator::BoundReference,
+        paro_planner::logical::operator::SubplanRef,
     >,
     stats: &paro_planner::logical::plan::NodeStats,
     layout: &paro_planner::logical::operator::LogicalOutputLayout,

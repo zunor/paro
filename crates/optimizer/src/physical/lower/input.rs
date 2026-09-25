@@ -14,7 +14,7 @@ use std::sync::Arc;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::logical::operator::{
-    BoundReference, BoundReferenceId, ColumnBinding, LogicalOperator, LogicalOutputLayout,
+    ColumnBinding, LogicalOperator, LogicalOutputLayout, SubplanRef, SubplanRefId,
 };
 use paro_planner::logical::plan::arena::LogicalPlanNode;
 use paro_planner::logical::plan::{NodeStats, OwnedLogicalPlan, PlanNodeId};
@@ -72,8 +72,8 @@ impl PreparedNode {
         OwnedLogicalPlan {
             id: self.id,
             stats: self.stats.clone(),
-            operator: LogicalOperator::BoundReference(BoundReference::new(
-                BoundReferenceId::frozen_output(),
+            operator: LogicalOperator::SubplanRef(SubplanRef::new(
+                SubplanRefId::frozen_output(),
                 self.get_column_bindings(),
                 self.types(),
             )),
@@ -92,7 +92,7 @@ impl PreparedNode {
         let mut inputs_match = true;
         local.operator.visit_child_links(&mut |boundary| {
             inputs_match &= inputs.next().is_some_and(|child| {
-                matches!(boundary.operator, LogicalOperator::BoundReference(_))
+                matches!(boundary.operator, LogicalOperator::SubplanRef(_))
                     && boundary.id == child.id
                     && boundary.output_layout() == child.layout
             });
@@ -155,7 +155,7 @@ impl PreparedNode {
         }))
     }
 
-    /// Utility statements do not enter Memo. Consume their binder tree once
+    /// Utility statements bypass relational optimization. Consume their binder tree once
     /// at this boundary; query winners instead call from_local during frozen
     /// candidate post-order extraction.
     pub fn from_owned(plan: OwnedLogicalPlan) -> Result<PreparedChild> {
@@ -286,12 +286,11 @@ mod tests {
         let child =
             PreparedNode::from_owned(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan))
                 .unwrap();
-        let other =
-            OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(BoundReference::new(
-                BoundReferenceId::frozen_output(),
-                vec![ColumnBinding::new(2, 0)],
-                vec![LogicalType::Integer],
-            )));
+        let other = OwnedLogicalPlan::synthetic(LogicalOperator::SubplanRef(SubplanRef::new(
+            SubplanRefId::frozen_output(),
+            vec![ColumnBinding::new(2, 0)],
+            vec![LogicalType::Integer],
+        )));
         let local =
             OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(other, vec![])));
         assert!(PreparedNode::from_local(local, vec![child], true).is_err());

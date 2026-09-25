@@ -10,9 +10,9 @@ use paro_common::types::LogicalType;
 use paro_parser::ast::PathQuantifier;
 use paro_planner::expression::{ComparisonExpression, ComparisonType, ConjunctionType, Expression};
 use paro_planner::logical::operator::{
-    BoundReference, ColumnBinding, Filter, FullTextFilterScan, Get, GraphExpand, GraphScan, Join,
+    ColumnBinding, Filter, FullTextFilterScan, Get, GraphExpand, GraphScan, Join,
     JoinComparisonType, JoinCondition, JoinType, LogicalOperator, LogicalOutputLayout, SearchScan,
-    SetOpType,
+    SetOpType, SubplanRef,
 };
 use paro_planner::logical::plan::{
     CardinalityEstimate, CardinalityProvenance, LogicalPlanPostOrderFolder, NodeStats,
@@ -147,7 +147,7 @@ impl LocalChildFacts for Box<OwnedLogicalPlan> {
     }
 }
 
-impl LocalChildFacts for BoundReference {
+impl LocalChildFacts for SubplanRef {
     fn finite_domains(&self) -> &paro_planner::logical::plan::finite_domain::FiniteDomains {
         &self.facts.finite_domains
     }
@@ -218,7 +218,7 @@ impl StatisticsGathering {
     /// statistics. Callers own the eligibility of delaying those operations.
     pub(crate) fn estimate_native_cardinality(
         &mut self,
-        operator: &LogicalOperator<BoundReference>,
+        operator: &LogicalOperator<SubplanRef>,
         child_layouts: &[LogicalOutputLayout],
         columns: &dyn crate::estimate::ColumnStatisticsLookup,
         context: &mut OptimizationContext,
@@ -310,7 +310,7 @@ impl StatisticsGathering {
     /// statistic update below; this is not a second statistics algorithm.
     pub(crate) fn gather_native_local(
         &mut self,
-        operator: LogicalOperator<BoundReference>,
+        operator: LogicalOperator<SubplanRef>,
         mut stats: NodeStats,
         child_layouts: &[LogicalOutputLayout],
         child_maximum_cardinalities: &[Option<u64>],
@@ -318,7 +318,7 @@ impl StatisticsGathering {
         ctx: &mut OptimizationContext,
     ) -> (
         NodeStats,
-        LogicalOperator<BoundReference>,
+        LogicalOperator<SubplanRef>,
         LogicalOutputLayout,
         Option<u64>,
     ) {
@@ -492,7 +492,7 @@ impl StatisticsGathering {
             // argument plans before an external table multiplies by its
             // per-invocation row estimate.
             LogicalOperator::DummyScan => Some(CardinalityEstimate::exact(1)),
-            LogicalOperator::BoundReference(reference) => reference.facts.cardinality,
+            LogicalOperator::SubplanRef(reference) => reference.facts.cardinality,
             LogicalOperator::Get(get) => Some(CardinalityEstimate::exact(
                 self.get_storage_rows(get, ctx) as u64,
             )),
@@ -678,7 +678,7 @@ impl StatisticsGathering {
             }
             LogicalOperator::CTERef(cte_ref) => {
                 // A transformation may optimize an inner shared-plan region
-                // independently from an owner in an enclosing Memo group.
+                // independently from an enclosing CTE owner.
                 // Alpha-renaming preserves the owner's cardinality summary on
                 // the reference; use it only when this estimator instance has
                 // no locally published producer. Cardinality is an estimate,
@@ -970,7 +970,7 @@ impl StatisticsGathering {
     ) {
         let output_stats = match operator {
             LogicalOperator::Get(get) => self.get_output_stats(get, ctx),
-            LogicalOperator::BoundReference(reference) => reference.column_statistics(),
+            LogicalOperator::SubplanRef(reference) => reference.column_statistics(),
             LogicalOperator::Projection(proj) => proj
                 .expressions
                 .iter()
@@ -1112,7 +1112,7 @@ impl StatisticsGathering {
         let preserves_distribution = matches!(
             operator,
             LogicalOperator::Get(_)
-                | LogicalOperator::BoundReference(_)
+                | LogicalOperator::SubplanRef(_)
                 | LogicalOperator::Projection(_)
                 | LogicalOperator::RowFetch(_)
                 | LogicalOperator::ExternalProject(_)
@@ -1240,520 +1240,12 @@ fn finite_filter_fraction(
 /// sample of the preserved key distribution, and repeated demand keys do not
 /// multiply the output. The estimate remains deliberately uncertain; this is
 /// a costing interval, never a correctness bound.
-fn estimate_same_domain_semi_join<Child>(
-    join: &paro_planner::logical::operator::ComparisonJoin<Child>,
-    left: CardinalityEstimate,
-    right: CardinalityEstimate,
-    left_bindings: &[ColumnBinding],
-    right_bindings: &[ColumnBinding],
-    ctx: &CardinalityInputs<'_>,
-) -> Option<CardinalityEstimate> {
-    let (preserved, demand, preserved_bindings, demand_bindings) = match join.join_type {
-        JoinType::Semi => (left, right, left_bindings, right_bindings),
-        JoinType::RightSemi => (right, left, right_bindings, left_bindings),
-        _ => return None,
-    };
-    let [condition] = join.conditions.as_slice() else {
-        return None;
-    };
-    if condition.comparison != JoinComparisonType::Equal {
-        return None;
-    }
-    let preserved_key = expression_binding(&condition.left, preserved_bindings)
-        .or_else(|| expression_binding(&condition.right, preserved_bindings))?;
-    let demand_key = expression_binding(&condition.right, demand_bindings)
-        .or_else(|| expression_binding(&condition.left, demand_bindings))?;
-    let preserved_stats = ctx.column_stats.get(&preserved_key)?;
-    let demand_stats = ctx.column_stats.get(&demand_key)?;
-    let preserved_distinct = preserved_stats.distinct_evidence().point;
-    if preserved_distinct == 0
-        || preserved_distinct != demand_stats.distinct_evidence().point
-        || preserved_stats.get_type() != demand_stats.get_type()
-        || preserved_stats.statistics().min_value() != demand_stats.statistics().min_value()
-        || preserved_stats.statistics().max_value() != demand_stats.statistics().max_value()
-    {
-        return None;
-    }
+mod join;
+use join::*;
 
-    let expected = preserved.expected.min(demand.expected);
-    Some(CardinalityEstimate {
-        min: 0,
-        expected,
-        // `demand.max` already carries the estimator's uncertainty envelope.
-        // Applying another arbitrary factor here double-counts uncertainty
-        // and makes a duplicate-insensitive semi join look riskier than the
-        // unfiltered relation it replaces.
-        max: preserved.max.min(demand.max).max(expected),
-    })
-}
-
-/// Estimate an equality lookup into a declared unique relation against the
-/// key domain actually present on the fact side.
-///
-/// A filtered date/customer dimension retains base-column NDV statistics even
-/// though its row count is selective. Dividing by that historical dimension
-/// NDV can underestimate a foreign-key-shaped join by orders of magnitude.
-/// Uniqueness proves at most one match per fact row; the expected match ratio
-/// is therefore `selected_dimension_rows / fact_key_domain`, capped at one.
-fn estimate_unique_dimension_join<Child: LocalChildFacts>(
-    join: &paro_planner::logical::operator::ComparisonJoin<Child>,
-    left: CardinalityEstimate,
-    right: CardinalityEstimate,
-    left_layout: &LogicalOutputLayout,
-    right_layout: &LogicalOutputLayout,
-    ctx: &CardinalityInputs<'_>,
-) -> Option<CardinalityEstimate> {
-    let [condition] = join.conditions.as_slice() else {
-        return None;
-    };
-    if condition.comparison != JoinComparisonType::Equal {
-        return None;
-    }
-    let left_key = expression_binding(&condition.left, left_layout.bindings())?;
-    let right_key = expression_binding(&condition.right, right_layout.bindings())?;
-
-    if plan_has_single_column_unique_key(&join.right, right_key) {
-        return unique_lookup_estimate(left, right, left_key, ctx);
-    }
-    if plan_has_single_column_unique_key(&join.left, left_key) {
-        return unique_lookup_estimate(right, left, right_key, ctx);
-    }
-    None
-}
-
-fn plan_has_single_column_unique_key<Child: LocalChildFacts>(
-    child: &Child,
-    binding: ColumnBinding,
-) -> bool {
-    child
-        .unique_keys()
-        .iter()
-        .any(|key| key.len() == 1 && key[0] == binding)
-}
-
-fn cap_unique_join<Child: LocalChildFacts>(
-    mut estimate: CardinalityEstimate,
-    join: &paro_planner::logical::operator::ComparisonJoin<Child>,
-    left: CardinalityEstimate,
-    right: CardinalityEstimate,
-    left_layout: &LogicalOutputLayout,
-    right_layout: &LogicalOutputLayout,
-) -> CardinalityEstimate {
-    let mut left_keys = BTreeSet::new();
-    let mut right_keys = BTreeSet::new();
-    for condition in &join.conditions {
-        if condition.comparison == JoinComparisonType::Equal {
-            if let Some(binding) = expression_binding(&condition.left, left_layout.bindings()) {
-                left_keys.insert(binding);
-            }
-            if let Some(binding) = expression_binding(&condition.right, right_layout.bindings()) {
-                right_keys.insert(binding);
-            }
-        }
-    }
-    let covered = |keys: Vec<Vec<ColumnBinding>>, matched: &BTreeSet<ColumnBinding>| {
-        keys.iter()
-            .any(|key| !key.is_empty() && key.iter().all(|k| matched.contains(k)))
-    };
-    for bound in [
-        covered(join.right.unique_keys(), &right_keys).then_some(left),
-        covered(join.left.unique_keys(), &left_keys).then_some(right),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        estimate.expected = estimate.expected.min(bound.expected);
-        estimate.max = estimate.max.min(bound.max).max(estimate.expected);
-        estimate.min = estimate.min.min(estimate.expected);
-    }
-    estimate
-}
-
-fn unique_lookup_estimate(
-    fact: CardinalityEstimate,
-    dimension: CardinalityEstimate,
-    fact_key: ColumnBinding,
-    ctx: &CardinalityInputs<'_>,
-) -> Option<CardinalityEstimate> {
-    let domain = ctx.column_stats.get(&fact_key)?.distinct_evidence().point;
-    if domain == 0 {
-        return None;
-    }
-    let scale = |rows: u64, selected: u64| {
-        ((rows as u128).saturating_mul(selected as u128) / domain as u128).min(rows as u128) as u64
-    };
-    let expected = scale(fact.expected, dimension.expected);
-    Some(CardinalityEstimate {
-        min: scale(fact.min, dimension.min).min(expected),
-        expected,
-        max: scale(fact.max, dimension.max).max(expected),
-    })
-}
-
-/// Estimate a comparison join without manufacturing independence between
-/// marginal statistics of one composite relation pair.
-///
-/// Two equality keys between the same aliases are commonly a composite key.
-/// Multiplying their individual NDV selectivities can underestimate the join
-/// by orders of magnitude unless joint-domain statistics prove independence.
-/// Keep the strongest equality domain for each concrete alias pair, while
-/// conditions connecting different pairs and non-equality residuals remain
-/// independent factors. This matches the correlation contract used by the
-/// join-order estimator and keeps post-reorder statistics from reversing a
-/// sound build/probe decision.
-fn estimate_comparison_join_selectivity(
-    conditions: &[JoinCondition],
-    left_bindings: &[ColumnBinding],
-    right_bindings: &[ColumnBinding],
-    left_rows: u64,
-    right_rows: u64,
-    ctx: &CardinalityInputs<'_>,
-) -> f64 {
-    correlate_join_condition_selectivities(conditions.iter().map(|condition| {
-        (
-            equality_relation_pair(condition, left_bindings, right_bindings),
-            estimate_join_condition_selectivity(
-                condition,
-                left_bindings,
-                right_bindings,
-                left_rows,
-                right_rows,
-                ctx,
-            ),
-        )
-    }))
-}
-
-fn correlate_join_condition_selectivities(
-    conditions: impl IntoIterator<Item = (Option<(usize, usize)>, f64)>,
-) -> f64 {
-    // This map participates in a floating-point reduction. Iterating a HashMap
-    // would make the estimate (and potentially the winning physical plan)
-    // depend on the process hash seed.
-    let mut equality_by_relation_pair = BTreeMap::<(usize, usize), f64>::new();
-    let mut independent_selectivity = 1.0;
-
-    for (relation_pair, selectivity) in conditions {
-        if let Some(pair) = relation_pair {
-            equality_by_relation_pair
-                .entry(pair)
-                .and_modify(|strongest| *strongest = strongest.min(selectivity))
-                .or_insert(selectivity);
-        } else {
-            independent_selectivity *= selectivity;
-        }
-    }
-
-    equality_by_relation_pair
-        .values()
-        .fold(independent_selectivity, |product, selectivity| {
-            product * selectivity
-        })
-        .clamp(0.0, 1.0)
-}
-
-fn equality_relation_pair(
-    condition: &JoinCondition,
-    left_bindings: &[ColumnBinding],
-    right_bindings: &[ColumnBinding],
-) -> Option<(usize, usize)> {
-    if !matches!(
-        condition.comparison,
-        JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
-    ) {
-        return None;
-    }
-    let left = expression_binding(&condition.left, left_bindings)?;
-    let right = expression_binding(&condition.right, right_bindings)?;
-    let pair = (left.table_index, right.table_index);
-    Some(if pair.0 <= pair.1 {
-        pair
-    } else {
-        (pair.1, pair.0)
-    })
-}
-
-fn expression_binding(
-    expression: &Expression,
-    positional_bindings: &[ColumnBinding],
-) -> Option<ColumnBinding> {
-    match expression {
-        Expression::ColumnRef(column) => Some(column.binding),
-        Expression::Reference(reference) => positional_bindings.get(reference.index).copied(),
-        // A cast preserves column lineage for correlation purposes. It changes
-        // the comparison domain, whose selectivity is still estimated by the
-        // ordinary expression model, but not which aliases form the pair.
-        Expression::Cast(cast) => expression_binding(cast.child.as_ref(), positional_bindings),
-        _ => None,
-    }
-}
-
-fn collect_output_stats_for_layout(
-    layout: &LogicalOutputLayout,
-    ctx: &impl ColumnStatsView,
-) -> Vec<Arc<ColumnStatistics>> {
-    layout
-        .types()
-        .iter()
-        .cloned()
-        .zip(layout.bindings().iter().copied())
-        .map(|(ty, binding)| {
-            ctx.get_stat(&binding)
-                .unwrap_or_else(|| ColumnStatistics::create_unknown(ty))
-        })
-        .collect()
-}
-
-fn filter_output_stats<Child>(
-    filter: &Filter<Child>,
-    child_layout: &LogicalOutputLayout,
-    ctx: &impl ColumnStatsView,
-) -> Vec<Arc<ColumnStatistics>> {
-    let mut child_output = collect_output_stats_for_layout(child_layout, ctx);
-
-    fn refine(
-        expression: &Expression,
-        bindings: &[ColumnBinding],
-        output: &mut [Arc<ColumnStatistics>],
-    ) {
-        if let Expression::Conjunction(conjunction) = expression {
-            if conjunction.conjunction_type == ConjunctionType::And {
-                for child in &conjunction.children {
-                    refine(child, bindings, output);
-                }
-                return;
-            }
-        }
-
-        let Some((binding, values)) = finite_equality_domain(expression) else {
-            return;
-        };
-        let Some(index) = bindings.iter().position(|candidate| *candidate == binding) else {
-            return;
-        };
-        let Some((first, rest)) = values.split_first() else {
-            return;
-        };
-        let mut domain = BaseStatistics::from_constant(first);
-        for value in rest {
-            domain.merge(&BaseStatistics::from_constant(value));
-        }
-        let Some(statistics) = output.get_mut(index) else {
-            return;
-        };
-        *statistics = Arc::new(
-            ColumnStatistics::with_estimated_distinct(domain, Some(values.len()))
-                .with_guaranteed_distinct_upper(values.len() as u64),
-        );
-    }
-
-    for expression in &filter.expressions {
-        refine(expression, child_layout.bindings(), &mut child_output);
-    }
-
-    filter
-        .projection_map
-        .to_indices(child_layout.len())
-        .into_iter()
-        .filter_map(|child_index| {
-            child_layout
-                .types()
-                .get(child_index)
-                .cloned()
-                .map(|output_type| {
-                    child_output
-                        .get(child_index)
-                        .cloned()
-                        .unwrap_or_else(|| ColumnStatistics::create_unknown(output_type))
-                })
-        })
-        .collect()
-}
-
-/// Extract a finite value domain proven by an equality predicate.
-///
-/// OR is accepted only when every branch constrains the same column. The
-/// resulting bound follows from the predicate itself and remains valid after
-/// DML, unlike a min/max range observed in one table snapshot.
-pub(crate) fn finite_equality_domain(
-    expression: &Expression,
-) -> Option<(ColumnBinding, Vec<Value>)> {
-    match expression {
-        Expression::Comparison(comparison)
-            if matches!(
-                comparison.comparison_type,
-                ComparisonType::Equal | ComparisonType::NotDistinctFrom
-            ) =>
-        {
-            let (column, constant) = match (comparison.left.as_ref(), comparison.right.as_ref()) {
-                (Expression::ColumnRef(column), Expression::Constant(constant))
-                | (Expression::Constant(constant), Expression::ColumnRef(column))
-                    if column.depth == 0 && !constant.value.is_null() =>
-                {
-                    (column, constant)
-                }
-                _ => return None,
-            };
-            Some((column.binding, vec![constant.value.clone()]))
-        }
-        Expression::Conjunction(conjunction)
-            if conjunction.conjunction_type == ConjunctionType::Or
-                && !conjunction.children.is_empty() =>
-        {
-            let mut binding = None;
-            let mut values = Vec::new();
-            for child in &conjunction.children {
-                let (child_binding, child_values) = finite_equality_domain(child)?;
-                if binding.is_some_and(|binding| binding != child_binding) {
-                    return None;
-                }
-                binding = Some(child_binding);
-                for value in child_values {
-                    if !values.contains(&value) {
-                        values.push(value);
-                    }
-                }
-            }
-            Some((binding?, values))
-        }
-        _ => None,
-    }
-}
-
-fn merge_setop_output_stats(
-    left_layout: &LogicalOutputLayout,
-    right_layout: &LogicalOutputLayout,
-    types: &[LogicalType],
-    ctx: &impl ColumnStatsView,
-) -> Vec<Arc<ColumnStatistics>> {
-    types
-        .iter()
-        .enumerate()
-        .map(|(idx, ty)| {
-            let left_stats = left_layout
-                .bindings()
-                .get(idx)
-                .and_then(|binding| ctx.get_stat(binding));
-            let right_stats = right_layout
-                .bindings()
-                .get(idx)
-                .and_then(|binding| ctx.get_stat(binding));
-            merge_column_statistics(left_stats, right_stats, ty.clone())
-        })
-        .collect()
-}
-
-fn project_column_statistics(
-    statistics: Vec<Arc<ColumnStatistics>>,
-    projection: &paro_planner::logical::operator::ProjectionMap,
-) -> Vec<Arc<ColumnStatistics>> {
-    projection
-        .to_indices(statistics.len())
-        .into_iter()
-        .filter_map(|index| statistics.get(index).cloned())
-        .collect()
-}
-
-fn merge_column_statistics(
-    left: Option<Arc<ColumnStatistics>>,
-    right: Option<Arc<ColumnStatistics>>,
-    ty: LogicalType,
-) -> Arc<ColumnStatistics> {
-    match (left, right) {
-        (Some(left), Some(right)) => {
-            let mut merged = left.copy();
-            merged.merge(right.as_ref());
-            Arc::new(merged)
-        }
-        (Some(left), None) => left,
-        (None, Some(right)) => right,
-        (None, None) => ColumnStatistics::create_unknown(ty),
-    }
-}
-
-fn aggregate_expression_statistics(
-    expr: &Expression,
-    ctx: &impl ColumnStatsView,
-    guaranteed_output_rows: Option<u64>,
-) -> Arc<ColumnStatistics> {
-    let Expression::Aggregate(agg) = expr else {
-        return expression_statistics(expr, ctx);
-    };
-
-    match agg.function.name.to_ascii_lowercase().as_str() {
-        "count" | "count_star" => Arc::new(ColumnStatistics::new(BaseStatistics::new(
-            LogicalType::BigInt,
-        ))),
-        _ if agg.function.preserves_input_domain() && agg.children.len() == 1 => {
-            // These aggregates can only publish a value drawn from their
-            // input domain. Cap its NDV where the result is produced so every
-            // downstream consumer observes self-consistent column statistics.
-            let mut statistics = expression_statistics(&agg.children[0], ctx).as_ref().copy();
-            if let Some(output_rows) = guaranteed_output_rows {
-                statistics = statistics.with_guaranteed_distinct_upper(output_rows);
-            }
-            Arc::new(statistics)
-        }
-        _ => ColumnStatistics::create_unknown(agg.return_type.clone()),
-    }
-}
-
-fn expression_statistics(expr: &Expression, ctx: &impl ColumnStatsView) -> Arc<ColumnStatistics> {
-    match expr {
-        Expression::ColumnRef(col_ref) => ctx
-            .get_stat(&col_ref.binding)
-            .unwrap_or_else(|| ColumnStatistics::create_unknown(col_ref.return_type.clone())),
-        Expression::Constant(constant) => Arc::new(
-            ColumnStatistics::new(BaseStatistics::from_constant(&constant.value))
-                .with_guaranteed_distinct_upper(1),
-        ),
-        Expression::Cast(cast) => ColumnStatistics::create_unknown(cast.target_type.clone()),
-        Expression::Reference(reference) => {
-            ColumnStatistics::create_unknown(reference.return_type.clone())
-        }
-        _ => ColumnStatistics::create_unknown(expr.return_type()),
-    }
-}
-
-fn estimate_group_distinct(
-    expr: &Expression,
-    ctx: &impl ColumnStatsView,
-    child_expected_rows: u64,
-    child_max_rows: u64,
-) -> (u64, Option<u64>) {
-    match expr {
-        Expression::ColumnRef(col_ref) => {
-            let statistics = ctx.get_stat(&col_ref.binding);
-            let guaranteed_upper = statistics
-                .as_ref()
-                .and_then(|stats| stats.guaranteed_distinct_upper())
-                .map(|upper| upper.min(child_max_rows));
-            let distinct = statistics
-                .as_ref()
-                .map(|stats| stats.distinct_evidence().point)
-                .filter(|count| *count > 0);
-            match (distinct, guaranteed_upper) {
-                (Some(distinct), Some(upper)) => (distinct.min(upper), Some(upper)),
-                (None, Some(upper)) => (upper.min(child_expected_rows), Some(upper)),
-                // HLL is an estimate rather than a semantic bound. A 2x
-                // envelope remains conservative for planning while avoiding
-                // the useless input-cardinality upper bound that made a
-                // proven preaggregation look riskier than its unreduced join.
-                (Some(distinct), None) => (
-                    distinct,
-                    Some(distinct.saturating_mul(2).min(child_max_rows).max(distinct)),
-                ),
-                (None, None) => (fallback_group_distinct(child_expected_rows), None),
-            }
-        }
-        Expression::Constant(_) => (1, Some(1)),
-        _ => (fallback_group_distinct(child_expected_rows), None),
-    }
-}
-
-fn fallback_group_distinct(child_rows: u64) -> u64 {
-    ((child_rows.max(1) as f64).sqrt().ceil() as u64).max(1)
-}
+mod output;
+pub(crate) use output::finite_equality_domain;
+use output::*;
 
 pub(crate) fn default_table_cardinality(session: Option<&paro_context::StatementContext>) -> usize {
     match session.and_then(|session| session.get_setting("default_table_cardinality")) {
@@ -1988,71 +1480,8 @@ fn saturating_mul_u64(left: u64, right: u64) -> u64 {
     product.min(u64::MAX as u128) as u64
 }
 
-fn quantifier_bounds(quantifier: Option<&PathQuantifier>) -> (u64, u64) {
-    match quantifier {
-        None => (1, 1),
-        Some(PathQuantifier::Plus) => (1, 4),
-        Some(PathQuantifier::Star) => (0, 4),
-        Some(PathQuantifier::Bounded { lower, upper }) => (*lower, upper.unwrap_or(4).min(4)),
-    }
-}
-
-fn hop_multiplier(min_hops: u64, max_hops: u64) -> f64 {
-    if min_hops == 1 && max_hops == 1 {
-        1.0
-    } else {
-        max_hops.max(min_hops.max(1)) as f64
-    }
-}
-
-fn estimate_expand_factor(
-    stats: &dyn GraphStatsProvider,
-    source_label: &str,
-    edge_label: &str,
-    target_label: &str,
-    direction: paro_planner::logical::operator::ExpandDirection,
-) -> f64 {
-    use paro_planner::logical::operator::ExpandDirection;
-
-    match direction {
-        ExpandDirection::Forward => {
-            estimate_pattern_factor(stats, source_label, edge_label, target_label)
-        }
-        ExpandDirection::Backward => {
-            estimate_pattern_factor(stats, target_label, edge_label, source_label)
-        }
-        ExpandDirection::Both => {
-            estimate_pattern_factor(stats, source_label, edge_label, target_label)
-                + estimate_pattern_factor(stats, target_label, edge_label, source_label)
-        }
-    }
-}
-
-fn estimate_pattern_factor(
-    stats: &dyn GraphStatsProvider,
-    source_label: &str,
-    edge_label: &str,
-    target_label: &str,
-) -> f64 {
-    let source_count = stats.vertex_count(source_label).unwrap_or(1).max(1) as f64;
-    stats
-        .pattern_step_count(source_label, edge_label, target_label)
-        .map(|count| (count as f64 / source_count).max(1.0 / source_count))
-        .or_else(|| stats.avg_degree(source_label))
-        .unwrap_or(1.0)
-}
-
-fn graph_name_for_plan(mut plan: &OwnedLogicalPlan) -> Option<&str> {
-    loop {
-        plan = match &plan.operator {
-            LogicalOperator::GraphScan(scan) => return Some(scan.graph_name.as_str()),
-            LogicalOperator::GraphExpand(expand) => expand.child.as_ref(),
-            LogicalOperator::Filter(filter) => filter.child.as_ref(),
-            LogicalOperator::EmptyResult(empty) => empty.child.as_ref(),
-            _ => return None,
-        };
-    }
-}
+mod graph;
+use graph::*;
 
 trait ColumnStatsView {
     fn get_stat(&self, binding: &ColumnBinding) -> Option<Arc<ColumnStatistics>>;

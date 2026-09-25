@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Opaque bound-relation boundary used while adapting Memo transformations.
+//! Immutable facts and output bindings for an already planned subplan.
 
 use crate::logical::plan::{CardinalityEstimate, UniqueKey};
 use paro_common::types::LogicalType;
@@ -12,30 +12,17 @@ use std::sync::{Arc, OnceLock};
 
 use super::ColumnBinding;
 
-/// The identity carried by a bound relation boundary is role-specific.  A
-/// single integer previously served as an input ordinal, a Memo group-hole
-/// token, and a plan-node occurrence; mixing those domains made an invalid
-/// reference look plausible and allowed unchecked indexing.  Keeping the role
-/// in the value makes transport contracts explicit and lets maps preserve it.
+/// Regional input positions and sealed physical outputs are different roles.
+/// A sealed output must never be interpreted as an index into regional inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum BoundReferenceId {
+pub enum SubplanRefId {
     InputOrdinal(usize),
-    GroupHole(u32),
-    NodeOccurrence(u32),
     FrozenOutput,
 }
 
-impl BoundReferenceId {
-    pub const fn group_hole(value: u32) -> Self {
-        Self::GroupHole(value)
-    }
-
+impl SubplanRefId {
     pub fn input_ordinal(value: usize) -> Self {
         Self::InputOrdinal(value)
-    }
-
-    pub const fn node_occurrence(value: u32) -> Self {
-        Self::NodeOccurrence(value)
     }
 
     pub const fn frozen_output() -> Self {
@@ -46,16 +33,7 @@ impl BoundReferenceId {
         match self {
             Self::InputOrdinal(value) => Ok(value),
             _ => Err(paro_common::error::internal(
-                "bound reference is not an input ordinal",
-            )),
-        }
-    }
-
-    pub fn group_hole_value(self) -> paro_common::error::Result<u32> {
-        match self {
-            Self::GroupHole(value) => Ok(value),
-            _ => Err(paro_common::error::internal(
-                "bound reference is not a Memo group hole",
+                "subplan reference is not a regional input ordinal",
             )),
         }
     }
@@ -63,7 +41,7 @@ impl BoundReferenceId {
 
 /// Immutable value-domain evidence at a relational boundary. NDV estimates and
 /// their proofs are separate; this snapshot contains validity, typed bounds,
-/// and nested value domains, without carrying an HLL allocation into Memo.
+/// and nested value domains, without cloning storage HLL allocations.
 #[derive(Debug, Clone)]
 pub struct BoundColumnValues {
     statistics: Arc<BaseStatistics>,
@@ -146,17 +124,17 @@ impl BoundColumnValues {
     }
 }
 
-/// A fact-backed relation reference whose implementation remains owned by an
-/// external relational optimizer. It is legal only inside a transformation
-/// transaction and must be consumed before physical planning.
+/// A placeholder for a committed subplan, with no executable children.
+/// Regional costing reads its facts; physical lowering reconnects the selected
+/// input. It must not survive as an executable operator or authorize removing
+/// the referenced computation solely from its estimated cardinality.
 #[derive(Debug, Clone)]
-pub struct BoundReference {
+pub struct SubplanRef {
     /// Stable identity of this reference occurrence. Unlike `PlanNodeId`, this
     /// survives optimizer passes that rebuild an operator shell.
-    pub reference_id: BoundReferenceId,
+    pub reference_id: SubplanRefId,
     pub bindings: Vec<ColumnBinding>,
-    /// Immutable evidence resolved by the owning Memo, never by choosing or
-    /// reconstructing a representative input tree.
+    /// Immutable evidence from the input's owner, without reconstructing it.
     pub facts: Arc<BoundRelationFacts>,
 }
 
@@ -179,7 +157,7 @@ pub struct BoundRelationFactValues {
     /// safe to evaluate independently again on the same inputs. Splitting a
     /// sharing owner requires this proof; commuting evaluation requires more.
     pub can_replay: bool,
-    /// Immutable row-domain estimate supplied by the referenced Memo group.
+    /// Immutable row-domain estimate supplied by the referenced subplan.
     /// A shell rewrite may clear NodeStats; it cannot clear this boundary fact.
     pub cardinality: Option<CardinalityEstimate>,
     /// A semantic row bound, separate from snapshot/cardinality estimates.
@@ -305,7 +283,7 @@ pub struct BoundColumnDomain {
     pub provenance: DistinctProvenance,
 }
 
-impl BoundReference {
+impl SubplanRef {
     pub fn column_statistics(&self) -> Vec<Arc<ColumnStatistics>> {
         self.facts.column_statistics().to_vec()
     }
@@ -314,7 +292,7 @@ impl BoundReference {
         self.facts.types()
     }
     pub fn new(
-        reference_id: BoundReferenceId,
+        reference_id: SubplanRefId,
         bindings: Vec<ColumnBinding>,
         types: Vec<LogicalType>,
     ) -> Self {
@@ -378,8 +356,8 @@ mod tests {
             7
         );
         assert_eq!(columns[0].guaranteed_distinct_upper(), Some(100));
-        let reference = BoundReference::new(
-            BoundReferenceId::input_ordinal(0),
+        let reference = SubplanRef::new(
+            SubplanRefId::input_ordinal(0),
             vec![ColumnBinding::new(0, 0)],
             vec![LogicalType::Integer],
         )
@@ -408,8 +386,8 @@ mod tests {
         assert_eq!(values.hull(&values).unwrap(), values);
         assert_eq!(values.hull(&unknown).unwrap(), unknown);
         assert_eq!(unknown.hull(&values).unwrap(), unknown);
-        let mut reference = BoundReference::new(
-            BoundReferenceId::input_ordinal(0),
+        let mut reference = SubplanRef::new(
+            SubplanRefId::input_ordinal(0),
             vec![ColumnBinding::new(7, 0)],
             vec![LogicalType::Double],
         );

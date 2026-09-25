@@ -17,7 +17,7 @@ fn pipeline_real_entry_has_one_resource_contract_and_no_memo() {
         "SELECT c_custkey FROM customer WHERE EXISTS (SELECT 1 FROM nation WHERE n_nationkey=c_nationkey)",
         "SELECT c_nationkey FROM customer UNION ALL SELECT n_nationkey FROM nation",
     ] {
-        let mut session = crate::rewrite::subquery::partition_aggregate_tests::setup_session();
+        let mut session = crate::tests::catalog::setup_session();
         Arc::get_mut(&mut session).unwrap().limits.use_temporary_directory = true;
         let mut planner = Planner::new(session.clone());
         planner.create_plan(paro_parser::parse_one(sql).unwrap().stmt).unwrap();
@@ -39,7 +39,7 @@ fn pipeline_real_entry_has_one_resource_contract_and_no_memo() {
 
 #[test]
 fn bounded_region_fallback_keeps_an_executable_plan_and_reports_its_limit() {
-    let mut session = crate::rewrite::subquery::partition_aggregate_tests::setup_session();
+    let mut session = crate::tests::catalog::setup_session();
     Arc::get_mut(&mut session)
         .unwrap()
         .limits
@@ -70,4 +70,29 @@ fn bounded_region_fallback_keeps_an_executable_plan_and_reports_its_limit() {
         Observed(PlanningStatus::PlannedWithFallback)
     );
     assert_eq!(receipt.budget_limited, Observed(true));
+}
+
+#[test]
+fn normalization_eliminates_only_an_unobserved_unique_outer_lookup() {
+    use paro_planner::physical::PhysicalNodeKind;
+    for (sql, expected_joins) in [
+        ("SELECT c.c_custkey FROM customer c LEFT JOIN nation n ON c.c_nationkey=n.n_nationkey", 0),
+        ("SELECT c.c_custkey, n.n_name FROM customer c LEFT JOIN nation n ON c.c_nationkey=n.n_nationkey", 1),
+        ("SELECT c.c_custkey FROM customer c LEFT JOIN nation n ON c.c_nationkey=n.n_regionkey", 1),
+        ("SELECT c.c_custkey FROM customer c INNER JOIN nation n ON c.c_nationkey=n.n_nationkey", 1),
+    ] {
+        let mut session = crate::tests::catalog::setup_session();
+        Arc::get_mut(&mut session).unwrap().limits.use_temporary_directory = true;
+        let mut planner = Planner::new(session.clone());
+        planner.create_plan(paro_parser::parse_one(sql).unwrap().stmt).unwrap();
+        let mut optimizer = Optimizer::new(planner.binder.clone(), session);
+        let OptimizedStatement::Physical(artifact) = optimizer.optimize(planner.take_plan().unwrap()).unwrap() else {
+            panic!("expected physical query");
+        };
+        artifact.verify().unwrap();
+        let joins = artifact.plan.nodes.iter().filter(|node| matches!(node.kind,
+            PhysicalNodeKind::HashJoin(_) | PhysicalNodeKind::NestedLoopJoin(_)
+        )).count();
+        assert_eq!(joins, expected_joins, "{sql}");
+    }
 }

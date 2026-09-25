@@ -13,82 +13,14 @@ use std::collections::{HashMap, HashSet};
 use paro_catalog::entry::ConstraintType;
 use paro_common::error::Result;
 use paro_planner::expression::Expression;
+#[cfg(test)]
+use paro_planner::logical::operator::JoinCondition;
 use paro_planner::logical::operator::{
     ColumnBinding, Get, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
 use paro_planner::logical::plan::{
     OwnedLogicalPlan, UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, UniqueKeyProvenance,
 };
-#[cfg(test)]
-use paro_planner::{expression::ColumnRefExpression, logical::operator::JoinCondition};
-
-/// Evidence that every candidate key binding is evaluated by an ordinary
-/// equality predicate and therefore rejects NULL before uniqueness is used.
-#[derive(Debug, Clone)]
-#[cfg(test)]
-pub(crate) struct NullRejectedKeyProof {
-    keys: Box<[NullRejectedRightKey]>,
-}
-
-#[derive(Debug, Clone)]
-#[cfg(test)]
-struct NullRejectedRightKey {
-    left: Expression,
-    right: ColumnRefExpression,
-}
-
-#[cfg(test)]
-impl NullRejectedKeyProof {
-    #[cfg(test)]
-    pub(crate) fn from_equal_right_keys(conditions: &[JoinCondition]) -> Option<Self> {
-        if conditions.is_empty() {
-            return None;
-        }
-        let keys = conditions
-            .iter()
-            .cloned()
-            .map(|condition| {
-                if condition.comparison != JoinComparisonType::Equal {
-                    return None;
-                }
-                let Expression::ColumnRef(right) = condition.right else {
-                    return None;
-                };
-                if right.depth != 0 {
-                    return None;
-                }
-                Some(NullRejectedRightKey {
-                    left: condition.left,
-                    right: right.into_inner(),
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self { keys: keys.into() })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn bindings(&self) -> impl Iterator<Item = ColumnBinding> + '_ {
-        self.keys.iter().map(|key| key.right.binding)
-    }
-
-    /// Reconstruct the exact ordinary-equality conditions encoded by the
-    /// witness. Equality is a type invariant rather than mutable payload.
-    #[cfg(test)]
-    pub(crate) fn conditions(&self) -> impl Iterator<Item = JoinCondition> + '_ {
-        self.keys.iter().map(|key| {
-            JoinCondition::new(
-                key.left.clone(),
-                Expression::ColumnRef(key.right.clone().into()),
-                JoinComparisonType::Equal,
-            )
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn right_keys(&self) -> impl Iterator<Item = (&Expression, &ColumnRefExpression)> {
-        self.keys.iter().map(|key| (&key.left, &key.right))
-    }
-}
 
 pub(crate) struct DeclaredUniqueKey {
     pub(crate) bindings: Vec<ColumnBinding>,
@@ -96,13 +28,6 @@ pub(crate) struct DeclaredUniqueKey {
 }
 
 impl DeclaredUniqueKey {
-    #[cfg(test)]
-    pub(crate) fn is_unique_with_nulls_rejected(&self, proof: &NullRejectedKeyProof) -> bool {
-        self.bindings
-            .iter()
-            .all(|binding| proof.bindings().any(|candidate| candidate == *binding))
-    }
-
     /// Whether the declared key remains unique when NULL tuples compare equal,
     /// as they do in GROUP BY. Key coverage is deliberately a separate proof
     /// obligation so all callers use the same division of responsibility.
@@ -265,7 +190,7 @@ pub(crate) fn derive_local_unique_keys(
     )
 }
 
-/// One operator algebra shared by plan statistics and Memo-native facts.
+/// One operator algebra shared by plan statistics and subplan facts.
 /// Inputs are schemas and proof sets, never representative child trees.
 pub(crate) fn derive_unique_keys_from_facts<Child>(
     operator: &LogicalOperator<Child>,
@@ -274,7 +199,7 @@ pub(crate) fn derive_unique_keys_from_facts<Child>(
     children: &[&[UniqueKey]],
 ) -> Vec<UniqueKey> {
     let mut keys = match operator {
-        LogicalOperator::BoundReference(reference) => reference
+        LogicalOperator::SubplanRef(reference) => reference
             .facts
             .unique_keys
             .iter()
@@ -915,41 +840,6 @@ mod tests {
             )
             .into(),
         )
-    }
-
-    #[test]
-    fn null_rejection_proof_requires_ordinary_equality() {
-        let equal = JoinCondition::new(column(1, 0), column(2, 0), JoinComparisonType::Equal);
-        let proof = NullRejectedKeyProof::from_equal_right_keys(&[equal.clone()])
-            .expect("ordinary equality proves NULL rejection");
-        let condition = proof.conditions().next().expect("sole equality condition");
-        assert_eq!(condition.comparison, JoinComparisonType::Equal);
-        assert!(matches!(&condition.right,
-            Expression::ColumnRef(column) if column.binding == ColumnBinding::new(2, 0)));
-
-        let null_safe = JoinCondition::new(
-            column(1, 0),
-            column(2, 0),
-            JoinComparisonType::NotDistinctFrom,
-        );
-        assert!(NullRejectedKeyProof::from_equal_right_keys(&[null_safe]).is_none());
-    }
-
-    #[test]
-    fn nullable_unique_key_requires_its_typed_null_rejection_proof() {
-        let key = DeclaredUniqueKey {
-            bindings: vec![ColumnBinding::new(2, 0), ColumnBinding::new(2, 1)],
-            primary_key: false,
-        };
-        let conditions = [
-            JoinCondition::new(column(1, 0), column(2, 0), JoinComparisonType::Equal),
-            JoinCondition::new(column(1, 1), column(2, 1), JoinComparisonType::Equal),
-        ];
-        let complete = NullRejectedKeyProof::from_equal_right_keys(&conditions).unwrap();
-        assert!(key.is_unique_with_nulls_rejected(&complete));
-
-        let incomplete = NullRejectedKeyProof::from_equal_right_keys(&conditions[..1]).unwrap();
-        assert!(!key.is_unique_with_nulls_rejected(&incomplete));
     }
 
     #[test]

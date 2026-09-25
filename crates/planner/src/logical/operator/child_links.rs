@@ -298,7 +298,7 @@ impl<Child> LogicalOperator<Child> {
             }
             Self::GraphMatch(operator) => LogicalOperator::GraphMatch(operator),
             Self::GraphScan(operator) => LogicalOperator::GraphScan(Box::new(*operator)),
-            Self::BoundReference(operator) => LogicalOperator::BoundReference(operator),
+            Self::SubplanRef(operator) => LogicalOperator::SubplanRef(operator),
             Self::DummyScan => LogicalOperator::DummyScan,
         })
     }
@@ -348,7 +348,7 @@ impl<Child> LogicalOperator<Child> {
             | Self::FullTextFilterScan(_)
             | Self::GraphMatch(_)
             | Self::GraphScan(_)
-            | Self::BoundReference(_)
+            | Self::SubplanRef(_)
             | Self::DummyScan => {}
         }
     }
@@ -398,7 +398,7 @@ impl<Child> LogicalOperator<Child> {
             | Self::FullTextFilterScan(_)
             | Self::GraphMatch(_)
             | Self::GraphScan(_)
-            | Self::BoundReference(_)
+            | Self::SubplanRef(_)
             | Self::DummyScan => {}
         }
     }

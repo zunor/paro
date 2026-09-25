@@ -273,7 +273,7 @@ impl NodeStats {
 
 /// Mutable, occurrence-owned IR at binder and local semantic-rule boundaries.
 /// The relational search representation is [`LogicalPlan`], whose children
-/// are immutable arena indices. This type must not be stored in Memo payloads.
+/// are immutable arena indices and belong to exactly one plan arena.
 #[derive(Debug)]
 pub struct OwnedLogicalPlan {
     pub id: PlanNodeId,
