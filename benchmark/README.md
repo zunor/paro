@@ -21,7 +21,8 @@ benchmark/
 ├── policies/                # Gate policy TOML files
 ├── baselines/               # Gate measurement references
 ├── suites/                  # Checked-in workload/query selections for CI
-└── report/                  # Run-owned runtime outputs
+├── report/                  # Legacy/default output paths; inspect each CLI
+└── runs/                    # Ignored, explicitly owned exploratory run roots
 ```
 
 ## Prerequisites
@@ -53,10 +54,17 @@ creating another large build/data copy by default.
 
 There are two workflows in this framework, not two benchmark implementations:
 
-- Engineering gates, policies, calibration and archive maintenance:
+- Engineering gates and ordinary exploratory comparisons:
   [paro-benchmark](../.agents/skills/paro-benchmark/SKILL.md).
-- Controlled cold/warm, cross-engine and model-quality experiments:
+- Formal release, parity, non-inferiority and model-quality certification:
   [paro-evidence](../.agents/skills/paro-evidence/SKILL.md) and `corpora/`.
+
+Raw data stays under an explicitly owned ignored `runs/<run-id>/` or external
+run root; use supported output flags and check nested writers. Review and
+remove disposable runs, normally within 14 days, without automatic deletion
+of active runs or unique unresolved reproducers. Git normally keeps at most a
+page of consequential conclusions, not routine logs, traces or every pilot.
+Historical records are indexed in [evidence/README.md](evidence/README.md).
 
 Skills are optional contributor guidance; the CLI and contracts in this
 repository remain usable without an agent installation. Discover commands with
@@ -414,9 +422,9 @@ mixed-concurrency workloads are distinct from accidental concurrent runners.
 
 For controlled experiments, retain all normal samples and explicit exclusions,
 keep diagnostic cohorts separate, and apply the repository's
-[comparison and evidence contracts](../crates/optimizer/readme.md#comparison-validity).
-The compact campaign/EXPLAIN contract described there is a migration target;
-current collectors must not be assumed to implement its bounds or receipts.
+[comparison validity rules](../.agents/skills/paro-evidence/SKILL.md#comparison-validity).
+Use the actual RunOutput/typed-receipt validators for the chosen collector;
+missing coverage cannot be inferred from another collector's support.
 
 If a query opts into explain sidecars, the JSON report also includes `explain_profile` with flattened operator rows.
 If memory collection is enabled, the JSON report additionally includes `memory_tags` and `spill_metrics`, and the Markdown summary adds explain / tag-delta / spill-delta sections.

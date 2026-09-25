@@ -1,4 +1,4 @@
 interface:
   display_name: "Paro Benchmark"
-  short_description: "Run Paro performance gates with scoped evidence"
-  default_prompt: "Use $paro-benchmark to check the requested gate in the selected worktree and report evidence without changing baselines."
+  short_description: "Explore Paro performance and run engineering gates"
+  default_prompt: "Use $paro-benchmark to investigate the requested performance question with a scoped experiment and no baseline changes."

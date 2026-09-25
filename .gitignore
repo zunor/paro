@@ -51,6 +51,7 @@ __pycache__/
 /regress/.venv/
 
 # Benchmark
+/benchmark/runs/
 /benchmark/report/*
 !/benchmark/report/.gitkeep
 /benchmark/.venv/

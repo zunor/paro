@@ -129,9 +129,12 @@ does not authorize `regress-update`; only an explicitly scoped, independently
 validated expected-result change may be regenerated and reviewed. Preserve
 result/type/order failures and distinguish environment failures from semantics.
 
-Use the versioned [paro-benchmark](.agents/skills/paro-benchmark/SKILL.md) workflow
-for engineering gates and [paro-evidence](.agents/skills/paro-evidence/SKILL.md)
-for controlled comparisons. Neither a skill nor a successful check authorizes
+Use [paro-optimizer](.agents/skills/paro-optimizer/SKILL.md) for planning changes,
+[paro-benchmark](.agents/skills/paro-benchmark/SKILL.md) for engineering gates and
+ordinary exploratory comparisons, and
+[paro-evidence](.agents/skills/paro-evidence/SKILL.md) only for formal claims.
+Raw runs belong in ignored `benchmark/runs/`; durable correctness inputs belong
+in tests/corpora. Neither a skill nor a successful check authorizes
 bless, policy evolution, archive publication or history cleanup. Do not copy
 performance numbers or mutable experiment status into this guide.
 
