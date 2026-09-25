@@ -10,6 +10,7 @@ use paro_context::compile_diagnostics::Observation::Observed;
 use paro_planner::operator::ExplainMode;
 
 mod aggregate_region;
+mod statement;
 #[cfg(test)]
 mod tests;
 
@@ -28,14 +29,7 @@ impl Optimizer {
                 "Memo rule ablations do not apply to the pipeline planning program",
             ));
         }
-        // Write barriers must be selected explicitly, not inherited from a
-        // structural lowering default. Until that owner is wired, fail closed.
-        if !matches!(layer, QueryStatementLayer::Query) {
-            return Err(paro_error::not_implemented(
-                "pipeline write planning is not yet supported",
-            ));
-        }
-        let grant = ResourceGrantClass {
+        let mut grant = ResourceGrantClass {
             id: ResourceGrantClassId(0),
             hard_memory_bytes: self.ctx.session.limits.max_memory as u64,
             spill_policy: if self.ctx.session.limits.use_temporary_directory {
@@ -122,6 +116,21 @@ impl Optimizer {
             )?;
         plan = crate::construction::predicates(plan, &mut Default::default());
         plan = TopNOptimizer::new().optimize_plan(plan);
+        // Access paths are local decisions over a committed tree. Visit the
+        // outer window first so a filter rewrite cannot destroy a TopK window.
+        fn select_access(
+            plan: OwnedLogicalPlan,
+            ctx: &OptimizationContext,
+        ) -> Result<OwnedLogicalPlan> {
+            ctx.session.cancellation.check()?;
+            if let Some(provider) = crate::search::optimizer::SearchOptimizer::new()
+                .physical_candidate_for_root(&plan, ctx)?
+            {
+                return Ok(provider);
+            }
+            plan.try_map_children(|child| select_access(child, ctx))
+        }
+        plan = select_access(plan, &self.ctx)?;
         let mut candidate = self.settle_query_candidate(plan)?;
         candidate.plan = self.pipeline_occurrences(candidate.plan)?;
         self.ctx.column_stats = candidate.column_stats;
@@ -134,16 +143,28 @@ impl Optimizer {
 
         let physical_started = Instant::now();
         let physical_scope = crate::work_partition::enter(crate::work_partition::Bucket::Kernel);
-        let selection = direct::select(
-            &candidate.plan,
-            &self.ctx.column_stats,
-            grant,
-            &self.calibration,
-            &self.ctx.session,
-        )?
-        .ok_or_else(|| {
-            paro_error::invalid_input("pipeline plan exceeds its executable memory envelope")
-        })?;
+        let mut physical_operating_points = 0_u64;
+        let mut selection = loop {
+            self.ctx.session.cancellation.check()?;
+            physical_operating_points += 1;
+            if let Some(selected) = direct::select(
+                &candidate.plan,
+                &self.ctx.column_stats,
+                grant,
+                &self.calibration,
+                &self.ctx.session,
+            )? {
+                break selected;
+            }
+            if grant.max_parallel_tasks <= 1 {
+                return Err(paro_error::invalid_input(
+                    "pipeline plan exceeds its executable memory envelope",
+                ));
+            }
+            // A smaller DOP is a local executable operating point, not a
+            // second logical search or an implicit switch to Cascades.
+            grant.max_parallel_tasks = (grant.max_parallel_tasks / 2).max(1);
+        };
         self.ctx.profiler.record(
             OptimizerComponent::PhysicalSelection,
             physical_started.elapsed(),
@@ -153,7 +174,8 @@ impl Optimizer {
         let physical_started = Instant::now();
         let extraction_scope =
             crate::work_partition::enter(crate::work_partition::Bucket::PhysicalLowering);
-        let mut plan = candidate.plan;
+        let (mut plan, enforcers, writes) =
+            self.attach_pipeline_statement(candidate.plan, &layer, grant, &mut selection)?;
         let analyze_spec = explain
             .as_ref()
             .and_then(|e| (e.spec.mode == ExplainMode::Analyze).then_some(e.spec));
@@ -181,6 +203,8 @@ impl Optimizer {
             dependency_template,
         })
         .with_winner_contracts(contracts)
+        .with_enforcer_contracts(enforcers)
+        .with_statement_write_contracts(writes)
         .requiring_winner_contracts()
         .extract(plan)?;
         let identity = physical
@@ -252,6 +276,10 @@ impl Optimizer {
                 ("pipeline_selection_us", selection_us),
                 ("pipeline_extraction_us", extraction_us),
                 ("pipeline_selected_nodes", selection.nodes),
+                (
+                    "pipeline_physical_operating_points",
+                    physical_operating_points,
+                ),
                 ("pipeline_local_alternatives", selection.alternatives),
                 ("pipeline_aggregate_decisions", region_work.regions),
                 ("pipeline_joint_transitions", region_work.transitions),

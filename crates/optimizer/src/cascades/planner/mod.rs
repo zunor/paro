@@ -132,6 +132,7 @@ mod transformation;
 use contracts::*;
 use costing::*;
 use extraction::*;
+pub(crate) use identity::encode_search_request;
 use identity::*;
 use state::*;
 

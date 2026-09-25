@@ -28,6 +28,135 @@ fn rows(sink: &CollectingSink) -> Vec<Vec<Value>> {
 }
 
 #[tokio::test]
+async fn order_by_result_namespace_is_not_the_input_namespace() {
+    let mut session = Session::new(
+        11,
+        Instance::new_in_memory_with_config(
+            InstanceConfig::in_memory().with_max_memory(256 * 1024 * 1024),
+        )
+        .unwrap(),
+    );
+    let mut sink = CollectingSink::new();
+    for sql in [
+        "CREATE TABLE order_a(item_id INT, v INT)",
+        "CREATE TABLE order_b(item_id INT, v INT)",
+        "INSERT INTO order_a VALUES (2,10),(1,20)",
+        "INSERT INTO order_b VALUES (4,10),(3,20)",
+    ] {
+        exec_ok(&mut session, &mut sink, sql).await;
+    }
+    for policy in ["pipeline", "quality"] {
+        exec_ok(
+            &mut session,
+            &mut sink,
+            &format!("SET optimizer_search_policy='{policy}'"),
+        )
+        .await;
+        for sql in [
+            "SELECT a.item_id FROM order_a a JOIN order_b b ON a.v=b.v ORDER BY item_id",
+            "WITH a AS (SELECT item_id,v FROM order_a), b AS (SELECT item_id,v FROM order_b) SELECT a.item_id FROM a,b WHERE a.v=b.v ORDER BY item_id",
+            "SELECT a.item_id AS v FROM order_a a ORDER BY v",
+            "SELECT a.item_id AS \"MixedName\" FROM order_a a ORDER BY \"MixedName\"",
+            "SELECT a.item_id,a.item_id FROM order_a a ORDER BY item_id",
+        ] {
+            exec_ok(&mut session, &mut sink, sql).await;
+            assert_eq!(query_i64_col(&sink, 0), vec![1,2], "{policy}: {sql}");
+        }
+        // A compound ORDER expression binds its inputs, not output aliases.
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT item_id AS v FROM order_a ORDER BY v+0",
+        )
+        .await;
+        assert_eq!(query_i64_col(&sink, 0), vec![2, 1]);
+        for sql in [
+            "SELECT a.item_id,b.item_id FROM order_a a JOIN order_b b ON a.v=b.v ORDER BY item_id",
+            "SELECT a.item_id FROM order_a a JOIN order_b b ON a.v=b.v WHERE item_id=1",
+        ] {
+            sink.clear();
+            assert!(
+                session.execute_simple_query(sql, &mut sink).await.is_err(),
+                "{policy}: {sql}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pipeline_writes_preserve_input_and_transaction_contracts() {
+    let mut session = Session::new(
+        12,
+        Instance::new_in_memory_with_config(
+            InstanceConfig::in_memory().with_max_memory(256 * 1024 * 1024),
+        )
+        .unwrap(),
+    );
+    let mut sink = CollectingSink::new();
+    for sql in [
+        "SET optimizer_search_policy='pipeline'",
+        "SET optimizer_verify=true",
+        "CREATE TABLE pipe_write(k INT PRIMARY KEY, v INT)",
+        "INSERT INTO pipe_write VALUES (1,10),(2,20),(3,30)",
+        "INSERT INTO pipe_write SELECT k+3,v FROM pipe_write",
+        "UPDATE pipe_write SET v=v+1 WHERE k<4",
+        "BEGIN",
+        "DELETE FROM pipe_write WHERE k>3",
+        "ROLLBACK",
+    ] {
+        exec_ok(&mut session, &mut sink, sql).await;
+    }
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT k,v FROM pipe_write ORDER BY k",
+    )
+    .await;
+    assert_eq!(
+        rows(&sink),
+        [(1, 11), (2, 21), (3, 31), (4, 10), (5, 20), (6, 30)]
+            .into_iter()
+            .map(|(k, v)| vec![Value::Integer(k), Value::Integer(v)])
+            .collect::<Vec<_>>()
+    );
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "UPDATE pipe_write SET k=k+10 WHERE k<4",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT k FROM pipe_write WHERE k>10",
+    )
+    .await;
+    let mut keys = query_i64_col(&sink, 0);
+    keys.sort();
+    assert_eq!(keys, vec![11, 12, 13]);
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT v FROM pipe_write WHERE k>10",
+    )
+    .await;
+    let mut values = query_i64_col(&sink, 0);
+    values.sort();
+    assert_eq!(values, vec![11, 21, 31]);
+    exec_ok(&mut session, &mut sink, "DELETE FROM pipe_write WHERE k>10").await;
+    sink.clear();
+    assert!(session
+        .execute_simple_query(
+            "INSERT INTO pipe_write SELECT CAST('bad' AS INT),999",
+            &mut sink
+        )
+        .await
+        .is_err());
+    exec_ok(&mut session, &mut sink, "SELECT COUNT(*) FROM pipe_write").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![3]);
+}
+
+#[tokio::test]
 async fn direct_pipeline_executes_relational_boundaries_without_memo() {
     let instance = Instance::new_in_memory_with_config(
         InstanceConfig::in_memory().with_max_memory(256 * 1024 * 1024),

@@ -13,11 +13,11 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OptimizerSearchPolicy {
     /// Canonical plan, bounded region decisions and direct physical selection.
+    #[default]
     Pipeline,
     /// Ordered relational stages followed by costing a closed candidate catalog.
     Regional,
     QualityCoverage,
-    #[default]
     BudgetedSearch,
 }
 
@@ -243,6 +243,10 @@ mod tests {
 
     #[test]
     fn search_policy_is_validated_and_separates_plan_cache_identity() {
+        assert_eq!(
+            OptimizerSearchPolicy::default(),
+            OptimizerSearchPolicy::Pipeline
+        );
         let settings = |value: &str| {
             EffectiveSettings::new(HashMap::from([(
                 "optimizer_search_policy".into(),

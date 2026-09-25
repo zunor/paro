@@ -103,6 +103,25 @@ impl Binder {
                 let mut qualified_expr = *expr.clone();
                 ExpressionBinder::qualify_column_names(self, &mut qualified_expr);
                 bind_state.add_projection(qualified_expr.to_string(), i);
+                let column_identity = matches!(qualified_expr, AstExpr::ColumnRef { .. })
+                    .then(|| qualified_expr.to_string());
+                if let Some(name) = alias {
+                    bind_state.add_order_output_name(
+                        &name.name,
+                        name.quote.is_some(),
+                        i,
+                        column_identity,
+                    );
+                } else if let AstExpr::ColumnRef { column, .. } = expr.as_ref() {
+                    if let paro_parser::ast::ColumnID::Name(name) = &column.column {
+                        bind_state.add_order_output_name(
+                            &name.name,
+                            name.quote.is_some(),
+                            i,
+                            column_identity,
+                        );
+                    }
+                }
             }
         }
 

@@ -212,6 +212,11 @@ impl SearchOptimizer {
         let mut pending = vec![plan];
         while let Some(plan) = pending.pop() {
             let observed_get = match plan.operator() {
+                // Direct planning commits the provider before dependency
+                // extraction. Its capability observation must survive that
+                // replacement just like an unselected Filter/TopN window.
+                LogicalOperator::SearchScan(search) => Some(&search.get),
+                LogicalOperator::FullTextFilterScan(search) => Some(&search.get),
                 LogicalOperator::TopN(topn) => extract_topn_pattern(topn)
                     .map(|pattern| {
                         let observes = extract_vector_intent(

@@ -236,6 +236,26 @@ struct ReadCsvBindData {
 }
 
 impl TableFunctionBindData for ReadCsvBindData {
+    fn canonical_plan_payload(&self) -> Option<Vec<u8>> {
+        Some(
+            serde_json::json!([
+                "paro.read-csv.v1",
+                self.source.identity_value(),
+                self.types,
+                self.skip_header,
+                self.options.delimiter,
+                self.options.null_string,
+                self.options.header,
+                self.options.quote,
+                self.options.escape,
+                self.options.parallel,
+                self.options.parallel_workers
+            ])
+            .to_string()
+            .into_bytes(),
+        )
+    }
+
     fn clone_box(&self) -> Box<dyn TableFunctionBindData> {
         Box::new(self.clone())
     }

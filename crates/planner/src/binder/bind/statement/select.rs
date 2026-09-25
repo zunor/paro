@@ -132,6 +132,8 @@ impl Binder {
         let mut bind_state = SelectBindState::new();
         for (index, name) in names.iter().enumerate() {
             bind_state.add_alias(name, false, index);
+            // These are already resolved output names, not SQL tokens.
+            bind_state.add_order_output_name(name, true, index, None);
         }
         let alias_lookup = AliasLookup::snapshot(&bind_state);
         let mut order_binder = OrderBinder::new(self, &mut bind_state, alias_lookup);

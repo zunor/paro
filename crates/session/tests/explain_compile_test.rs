@@ -151,6 +151,14 @@ fn compile_query_cte_and_reject_unimplemented_options() {
             let detail_record: serde_json::Value = serde_json::from_str(&detail).unwrap();
             assert_eq!(detail_record["capture_level"], "Detail");
             let detail_events = detail_record["detail"].as_array().unwrap();
+            assert!(detail_events.is_empty(), "pipeline must not invent Memo proposals");
+            assert!(detail_record["search_counters"].as_array().unwrap().iter()
+                .any(|counter| counter["name"] == "pipeline_selected_nodes"));
+            let mut policy_sink = CollectingSink::new();
+            session.execute_simple_query("SET optimizer_search_policy='quality'", &mut policy_sink).await.unwrap();
+            let memo_detail = document(&mut session, "EXPLAIN (COMPILE, DETAIL, FORMAT JSON) SELECT 1").await;
+            let memo_record: serde_json::Value = serde_json::from_str(&memo_detail).unwrap();
+            let detail_events = memo_record["detail"].as_array().unwrap();
             assert!(!detail_events.is_empty());
             assert!(detail_events.iter().any(|event| {
                 event["type"] == "Proposal"

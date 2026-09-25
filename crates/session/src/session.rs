@@ -1126,7 +1126,8 @@ impl Session {
     }
 
     pub(crate) fn finish_statement_cache_decision(&self, decision_id: u64) {
-        self.diagnostics.finish_statement_cache_decision(decision_id);
+        self.diagnostics
+            .finish_statement_cache_decision(decision_id);
     }
 
     /// Hold an extended-protocol trace until Sync has completed the pipeline.
@@ -2163,6 +2164,9 @@ mod tests {
         let instance = Instance::new_in_memory();
         let mut session = Session::new(1, instance.clone());
         session
+            .set_session_setting("optimizer_search_policy", Value::Varchar("quality".into()))
+            .unwrap();
+        session
             .set_session_setting("threads", Value::Integer(1))
             .unwrap();
         session
@@ -2256,6 +2260,9 @@ mod tests {
         instance.set_threads(4).unwrap();
         let mut session = Session::new(1, instance.clone());
         session
+            .set_session_setting("optimizer_search_policy", Value::Varchar("quality".into()))
+            .unwrap();
+        session
             .set_session_setting("threads", Value::Integer(4))
             .unwrap();
         session
@@ -2309,7 +2316,9 @@ mod tests {
         instance
             .get_memory_arbitrator()
             .set_system_reserve_bytes(48 << 20);
-        session.set_session_setting("threads", Value::Integer(1)).unwrap();
+        session
+            .set_session_setting("threads", Value::Integer(1))
+            .unwrap();
         let runtime = session.freeze_query_context();
         let mut stream = Executor::new(runtime)
             .execute(ExecutionRequest::unparameterized(compiled).unwrap())

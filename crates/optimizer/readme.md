@@ -197,11 +197,15 @@ already satisfies it.
 ## Completion vocabulary
 
 `optimizer_search_policy` is a validated session setting included in planning
-cache identity. The SQL default, `quality`, permits handoff only after the
-selected candidate satisfies the quality policy and executable verification.
-`budgeted` continues optional exploration subject to the same search budgets.
-Neither setting implies exhaustive search. Embedders without session settings
-default to budgeted search and may explicitly supply `SearchBudget.search_policy`.
+cache identity. SQL sessions, RESET and embedders share the typed default,
+`pipeline`: committed normalization, bounded regional decisions and direct
+physical selection. A lower DOP may be selected to fit the executable resource
+contract; this does not rerun logical search or switch planning policies.
+Production Cascades remains explicitly available: `quality` permits handoff
+after quality validation, while `budgeted` continues optional exploration
+subject to search budgets. A pipeline failure does not silently select either.
+Neither policy implies exhaustive search. Embedders may explicitly supply
+`SearchBudget.search_policy`.
 The former `PARO_QUALITY_POLICY_HANDOFF` environment switch is not an alias.
 
 Materialized CTE necessary-domain normalization is shared by both policies,

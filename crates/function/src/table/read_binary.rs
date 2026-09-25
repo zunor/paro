@@ -140,6 +140,20 @@ impl BinaryColumnDecoder {
 }
 
 impl TableFunctionBindData for ReadBinaryBindData {
+    fn canonical_plan_payload(&self) -> Option<Vec<u8>> {
+        // Decoder functions are derived entirely from these types. Function
+        // pointers and the consumed STDIN stream are not plan identities.
+        Some(
+            serde_json::json!([
+                "paro.read-binary.v1",
+                self.source.identity_value(),
+                self.types
+            ])
+            .to_string()
+            .into_bytes(),
+        )
+    }
+
     fn clone_box(&self) -> Box<dyn TableFunctionBindData> {
         Box::new(self.clone())
     }

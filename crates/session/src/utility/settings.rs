@@ -171,11 +171,11 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
     SettingDescriptor {
         name: "optimizer_search_policy",
         category: "Query Tuning",
-        description: "Use a finite regional program, quality coverage, or budgeted search",
+        description: "Use staged pipeline planning or explicitly select regional, quality or budgeted Memo search",
         vartype: "string",
         context: "user",
         unit: None,
-        default_value: |_| Value::Varchar("quality".into()),
+        default_value: |_| Value::Varchar(paro_context::OptimizerSearchPolicy::default().as_str().into()),
         parse_value: parse_optimizer_search_policy,
         apply_effective: apply_noop,
     },
@@ -1084,7 +1084,12 @@ mod tests {
         let instance = paro_instance::Instance::new_in_memory();
         let mut session = crate::Session::new(1, instance);
         let mut sink = CollectingSink::new();
+        assert_eq!(
+            session.effective_setting("optimizer_search_policy"),
+            Some(&Value::Varchar("pipeline".into()))
+        );
         for (value, accepted) in [
+            ("pipeline", true),
             ("regional", true),
             ("budgeted", true),
             ("QUALITY", true),
@@ -1115,6 +1120,21 @@ mod tests {
                 );
             }
         }
+        let paro_parser::ast::Statement::VariableSet(reset) =
+            paro_parser::parse("RESET optimizer_search_policy")
+                .unwrap()
+                .remove(0)
+                .stmt
+        else {
+            unreachable!()
+        };
+        execute_variable_set(&mut session, &reset, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.effective_setting("optimizer_search_policy"),
+            Some(&Value::Varchar("pipeline".into()))
+        );
     }
 
     #[test]

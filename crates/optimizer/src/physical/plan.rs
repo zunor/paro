@@ -297,7 +297,7 @@ impl PhysicalPlan {
     /// explicit so a consumer never treats a later encoding as compatible.
     pub fn structural_identity_fingerprint(&self) -> Result<Fingerprint, PhysicalIdentityError> {
         let mut builder = StableFingerprintBuilder::default();
-        builder.write_bytes(b"paro.physical-plan-structure.v5.typed-canonical");
+        builder.write_bytes(b"paro.physical-plan-structure.v6.typed-canonical");
 
         // The traversal is iterative on purpose.  Physical plans can contain
         // long unary spines and a fingerprint must not depend on recursion
@@ -1090,6 +1090,9 @@ fn write_canonical_kind(
     Ok(())
 }
 
+mod graph_identity;
+mod search_identity;
+
 fn write_semantic_kind_fields(
     builder: &mut StableFingerprintBuilder,
     kind: &PhysicalNodeKind,
@@ -1128,6 +1131,64 @@ fn write_semantic_kind_fields(
             SpillExecutionPolicy::Adaptive => 1,
             SpillExecutionPolicy::ForcedExternal => 2,
         });
+    }
+
+    fn write_mark(
+        builder: &mut StableFingerprintBuilder,
+        semantics: paro_planner::operator::join::MarkJoinSemantics,
+    ) {
+        use paro_planner::operator::join::MarkJoinSemantics;
+        match semantics {
+            MarkJoinSemantics::NotMark => builder.write_u64(0),
+            MarkJoinSemantics::TwoValued => builder.write_u64(1),
+            MarkJoinSemantics::ThreeValuedFrom(index) => {
+                builder.write_u64(2);
+                builder.write_u64(index as u64);
+            }
+        }
+    }
+
+    fn write_mutation(builder: &mut StableFingerprintBuilder, write: &super::WriteContract) {
+        builder.write_u64(write.target_object_id);
+        builder.write_u64(write.target_relation.0 as u64);
+        write_hashed(builder, b"modified-columns", &write.modified_columns);
+        write_hashed(
+            builder,
+            b"modified-key-columns",
+            &write.modified_key_columns,
+        );
+        builder.write_u64(match write.returning {
+            super::ReturningImageContract::CountOnly => 0,
+            super::ReturningImageContract::BeforeImage => 1,
+            super::ReturningImageContract::AfterImage => 2,
+        });
+        match &write.mutation_safety {
+            super::requirements::MutationSafetyRequirement::None => builder.write_u64(0),
+            super::requirements::MutationSafetyRequirement::StableReadBeforeWrite {
+                targets,
+                snapshot,
+            } => {
+                builder.write_u64(1);
+                write_hashed(builder, b"mutation-targets", targets);
+                builder.write_u64(snapshot.0 as u64);
+            }
+        }
+        // The transaction version is an execution dependency, not a different
+        // operator topology. The typed snapshot slot above is structural.
+    }
+
+    fn write_external_routine(
+        builder: &mut StableFingerprintBuilder,
+        routine: &super::specs::ExternalRoutineDescriptor,
+    ) {
+        // RoutineSpec is the versioned, typed catalog contract: no pointers,
+        // maps with nondeterministic order, or runtime worker handles. Keep
+        // implementation/environment/permissions, not just the display label.
+        builder.write_bytes(b"paro.external-routine.v1");
+        builder.write_bytes(
+            &serde_json::to_vec(&(&routine.identity, &routine.semantics, &routine.spec))
+                .expect("typed external routine contract"),
+        );
     }
 
     // Ordinary and partition-window aggregates own the same execution
@@ -1334,6 +1395,26 @@ fn write_semantic_kind_fields(
             write_hashed_slice(builder, b"nested-left-projection", &spec.left_projection);
             write_hashed_slice(builder, b"nested-right-projection", &spec.right_projection);
         }
+        PhysicalNodeKind::SortRangeJoin(spec) => {
+            builder.write_u64(27);
+            builder.write_bytes(spec.join_type.to_string().as_bytes());
+            write_mark(builder, spec.mark_semantics);
+            write_join_conditions(builder, &spec.conditions);
+            write_hashed_slice(builder, b"range-left", &spec.left_projection);
+            write_hashed_slice(builder, b"range-right", &spec.right_projection);
+            write_hashed_slice(builder, b"range-left-types", &spec.left_output_types);
+            write_hashed_slice(builder, b"range-right-types", &spec.right_output_types);
+        }
+        PhysicalNodeKind::ClassicIeJoin(spec) => {
+            builder.write_u64(28);
+            builder.write_bytes(spec.join_type.to_string().as_bytes());
+            write_mark(builder, spec.mark_semantics);
+            write_join_conditions(builder, &spec.conditions);
+            write_hashed_slice(builder, b"ie-left", &spec.left_projection);
+            write_hashed_slice(builder, b"ie-right", &spec.right_projection);
+            write_hashed_slice(builder, b"ie-left-types", &spec.left_output_types);
+            write_hashed_slice(builder, b"ie-right-types", &spec.right_output_types);
+        }
         PhysicalNodeKind::Aggregate(spec) => {
             builder.write_u64(9);
             write_aggregate(builder, spec);
@@ -1417,11 +1498,18 @@ fn write_semantic_kind_fields(
         PhysicalNodeKind::DummyScan(_) | PhysicalNodeKind::EmptyResult(_) => {
             builder.write_u64(15);
         }
-        PhysicalNodeKind::TableFunctionScan(spec) if spec.bind_data.is_none() => {
-            // Ordinary table functions bind from these arguments at execution.
-            // Statement-specific opaque bind data has no canonical contract and
-            // must continue to fail closed rather than use Debug or an address.
+        PhysicalNodeKind::TableFunctionScan(spec) => {
             builder.write_u64(16);
+            if let Some(binding) = &spec.bind_data {
+                let payload = binding
+                    .as_ref()
+                    .canonical_plan_payload()
+                    .ok_or(PhysicalIdentityError::UnsupportedKind { kind: kind.name() })?;
+                builder.write_u64(1);
+                builder.write_bytes(&payload);
+            } else {
+                builder.write_u64(0);
+            }
             builder.write_bytes(spec.function.name.as_bytes());
             write_hashed_slice(builder, b"signature", &spec.function.arguments);
             write_hashed(builder, b"varargs", &spec.function.varargs);
@@ -1441,7 +1529,95 @@ fn write_semantic_kind_fields(
             write_strings(builder, spec.output_names.iter());
             builder.write_u64(spec.with_ordinality as u64);
         }
+        PhysicalNodeKind::Insert(spec) => {
+            builder.write_u64(22);
+            builder.write_u64(spec.table.base.base.object_id.raw());
+            write_hashed_slice(builder, b"insert-columns", &spec.column_index_map);
+            write_hashed_slice(builder, b"insert-types", &spec.expected_types);
+            builder.write_u64(spec.copy_from_read_csv as u64);
+            write_mutation(builder, &spec.write);
+            builder.write_u64(spec.on_conflict.is_some() as u64);
+            if let Some(conflict) = &spec.on_conflict {
+                write_hashed_slice(builder, b"conflict-target", &conflict.target_columns);
+                match &conflict.action {
+                    paro_planner::operator::InsertOnConflictAction::DoNothing => {
+                        builder.write_u64(0)
+                    }
+                    paro_planner::operator::InsertOnConflictAction::DoUpdate {
+                        target_columns,
+                        source_columns,
+                    } => {
+                        builder.write_u64(1);
+                        write_hashed_slice(builder, b"conflict-update-target", target_columns);
+                        write_hashed_slice(builder, b"conflict-update-source", source_columns);
+                    }
+                }
+            }
+        }
+        PhysicalNodeKind::Update(spec) => {
+            builder.write_u64(23);
+            builder.write_u64(spec.table.base.base.object_id.raw());
+            write_hashed_slice(builder, b"update-columns", &spec.columns);
+            builder.write_u64(spec.row_id_index as u64);
+            write_mutation(builder, &spec.write);
+        }
+        PhysicalNodeKind::Delete(spec) => {
+            builder.write_u64(24);
+            builder.write_u64(spec.table.base.base.object_id.raw());
+            builder.write_u64(spec.row_id_index as u64);
+            builder.write_u64(spec.is_full_table_delete as u64);
+            write_mutation(builder, &spec.write);
+        }
+        PhysicalNodeKind::MutationInputSpool(spec) => {
+            builder.write_u64(25);
+            builder.write_u64(spec.barrier.0 as u64);
+            write_hashed(builder, b"mutation-spool-targets", &spec.targets);
+            builder.write_u64(spec.snapshot.0 as u64);
+        }
+        PhysicalNodeKind::CopyToFile(spec) => {
+            builder.write_u64(26);
+            builder.write_bytes(&spec.bind_data.canonical_plan_payload());
+            builder.write_bytes(spec.file_path.as_bytes());
+            builder.write_u64(spec.per_thread_output as u64);
+            write_hashed_slice(builder, b"copy-output-types", &spec.output_types);
+        }
+        PhysicalNodeKind::ExternalProject(spec) => {
+            builder.write_u64(29);
+            builder.write_u64(spec.routines.len() as u64);
+            for routine in &spec.routines {
+                write_external_routine(builder, routine);
+            }
+            builder.write_u64(spec.expressions.len() as u64);
+            for expression in &spec.expressions {
+                builder.write_bytes(expression.output_name.as_bytes());
+                builder.write_fingerprint(crate::cascades::physical_expression_fingerprint(
+                    &expression.expression,
+                ));
+                builder.write_bytes(
+                    &serde_json::to_vec(&expression.routine_meta)
+                        .expect("typed bound external call"),
+                );
+            }
+            write_hashed_slice(builder, b"external-input-types", &spec.input_types);
+            write_strings(builder, spec.input_names.iter());
+        }
+        PhysicalNodeKind::ExternalTable(spec) => {
+            builder.write_u64(30);
+            write_external_routine(builder, &spec.routine);
+            write_hashed_slice(builder, b"external-worker-types", &spec.worker_output_types);
+            write_hashed_slice(
+                builder,
+                b"external-emitted-types",
+                &spec.emitted_output_types,
+            );
+            builder.write_u64(spec.argument_count as u64);
+            builder.write_u64(spec.lateral as u64);
+            builder.write_u64(spec.parameterized as u64);
+        }
         _ => {
+            if graph_identity::write(builder, kind) || search_identity::write(builder, kind) {
+                return Ok(());
+            }
             return Err(PhysicalIdentityError::UnsupportedKind { kind: kind.name() });
         }
     }
@@ -3460,6 +3636,53 @@ mod identity_tests {
     }
 
     #[test]
+    fn structural_identity_tracks_graph_binding_and_predicate() {
+        use crate::physical::specs::GraphScanSpec;
+        let mut plan = dummy_plan(false, "graph", "id");
+        plan.nodes.get_mut(plan.root).unwrap().kind =
+            PhysicalNodeKind::GraphScan(Box::new(GraphScanSpec {
+                vertex_info: paro_catalog::entry::VertexTableInfo {
+                    table_name: "vertices".into(),
+                    table_oid: 19,
+                    key_column_ids: vec![0],
+                    label: "v".into(),
+                    property_column_ids: vec![1],
+                },
+                filter: None,
+                table_index: 3,
+                label: "v".into(),
+                graph_name: "g".into(),
+                schema_name: "public".into(),
+                output_types: Box::new([LogicalType::Integer]),
+            }));
+        let identity = plan.structural_identity_fingerprint().unwrap();
+        let changes: [fn(&mut GraphScanSpec); 4] = [
+            |s| s.vertex_info.table_oid += 1,
+            |s| s.vertex_info.key_column_ids = vec![1],
+            |s| s.table_index += 1,
+            |s| {
+                s.filter = Some(Expression::Constant(
+                    paro_planner::expression::ConstantExpression::new(
+                        paro_common::runtime_value::Value::Boolean(false),
+                        LogicalType::Boolean,
+                    )
+                    .into(),
+                ))
+            },
+        ];
+        for change in changes {
+            let mut changed = plan.clone();
+            let PhysicalNodeKind::GraphScan(spec) =
+                &mut changed.nodes.get_mut(changed.root).unwrap().kind
+            else {
+                unreachable!()
+            };
+            change(spec);
+            assert_ne!(identity, changed.structural_identity_fingerprint().unwrap());
+        }
+    }
+
+    #[test]
     fn structural_identity_excludes_cost_and_resource_operating_point() {
         let mut left = dummy_plan(false, "same", "value");
         let mut right = dummy_plan(false, "same", "value");
@@ -3485,6 +3708,61 @@ mod identity_tests {
             left.structural_identity_fingerprint().unwrap(),
             right.structural_identity_fingerprint().unwrap()
         );
+    }
+
+    #[test]
+    fn external_identity_tracks_routine_generation_and_call_shape() {
+        use super::super::specs::{ExternalRoutineDescriptor, ExternalTableSpec};
+        use paro_external::routine::identity::RoutineCallIdentity;
+        use paro_external::routine::spec::*;
+        let mut plan = dummy_plan(false, "external", "value");
+        plan.nodes.get_mut(plan.root).unwrap().kind =
+            PhysicalNodeKind::ExternalTable(ExternalTableSpec {
+                routine: ExternalRoutineDescriptor {
+                    label: "not an identity".into(),
+                    identity: RoutineCallIdentity::Catalog {
+                        routine_id: RoutineId(3),
+                        generation: 4,
+                    },
+                    semantics: RoutineSemantics {
+                        stability: RoutineStability::Volatile,
+                        null_policy: RoutineNullPolicy::CalledOnNullInput,
+                        side_effects: RoutineSideEffects::HasSideEffects,
+                        row_semantics: RowSemantics::RelationExpanding,
+                        may_block: true,
+                    },
+                    spec: None,
+                },
+                worker_output_types: Box::new([LogicalType::Integer]),
+                emitted_output_types: Box::new([LogicalType::Integer]),
+                argument_count: 1,
+                lateral: true,
+                parameterized: true,
+                estimated_cardinality: 100,
+                cost: Default::default(),
+            });
+        let identity = plan.structural_identity_fingerprint().unwrap();
+        let changes: [fn(&mut ExternalTableSpec); 4] = [
+            |s| {
+                s.routine.identity = RoutineCallIdentity::Catalog {
+                    routine_id: RoutineId(3),
+                    generation: 5,
+                }
+            },
+            |s| s.routine.semantics.null_policy = RoutineNullPolicy::Strict,
+            |s| s.parameterized = false,
+            |s| s.worker_output_types = Box::new([LogicalType::BigInt]),
+        ];
+        for change in changes {
+            let mut changed = plan.clone();
+            let PhysicalNodeKind::ExternalTable(spec) =
+                &mut changed.nodes.get_mut(changed.root).unwrap().kind
+            else {
+                unreachable!()
+            };
+            change(spec);
+            assert_ne!(identity, changed.structural_identity_fingerprint().unwrap());
+        }
     }
 
     #[test]
@@ -3688,7 +3966,7 @@ mod identity_tests {
     }
 
     #[test]
-    fn structural_identity_fails_closed_for_unencoded_operator_payloads() {
+    fn mutation_spool_identity_tracks_the_execution_contract() {
         let mut nodes = PhysicalPlanNodeArena::default();
         let root = nodes.push(PhysicalPlanNode {
             id: PhysicalPlanNodeId::INVALID,
@@ -3702,17 +3980,27 @@ mod identity_tests {
             children: PlanChildren::Empty,
             label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "values"),
         });
-        let plan = PhysicalPlan::new(
+        let mut plan = PhysicalPlan::new(
             root,
             nodes,
             PlanChildrenArena::default(),
             PlanPropertyMap::default(),
         );
-        assert_eq!(
-            plan.structural_identity_fingerprint(),
-            Err(PhysicalIdentityError::UnsupportedKind {
-                kind: "MUTATION_INPUT_SPOOL"
-            })
-        );
+        let before = plan.structural_identity_fingerprint().unwrap();
+        let PhysicalNodeKind::MutationInputSpool(spec) =
+            &mut plan.nodes.get_mut(root).unwrap().kind
+        else {
+            unreachable!()
+        };
+        spec.snapshot = SnapshotId::new(1);
+        assert_ne!(before, plan.structural_identity_fingerprint().unwrap());
+        let PhysicalNodeKind::MutationInputSpool(spec) =
+            &mut plan.nodes.get_mut(root).unwrap().kind
+        else {
+            unreachable!()
+        };
+        spec.snapshot = SnapshotId::new(0);
+        spec.barrier = MutationBarrierId::new(1);
+        assert_ne!(before, plan.structural_identity_fingerprint().unwrap());
     }
 }

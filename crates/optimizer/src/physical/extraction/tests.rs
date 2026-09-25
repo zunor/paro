@@ -1627,6 +1627,28 @@ fn arena_extractor_lowers_search_scan_with_planned_token() {
     assert_eq!(spec.projected_columns.as_ref(), [2]);
     assert!(spec.emit_score);
     assert_eq!(spec.output_names.as_ref(), ["c", "score"]);
+    let identity = physical.structural_identity_fingerprint().unwrap();
+    assert_eq!(
+        identity,
+        physical.clone().structural_identity_fingerprint().unwrap()
+    );
+    let changes: [fn(&mut crate::physical::specs::FullTextSearchSpec); 5] = [
+        |s| s.query.push_str(" changed"),
+        |s| s.score_mode = FullTextScoreMode::CorpusBm25V1,
+        |s| s.capability_token.root_version += 1,
+        |s| s.emit_score = false,
+        |s| s.projected_columns = Box::new([1]),
+    ];
+    for change in changes {
+        let mut changed = physical.clone();
+        let PhysicalNodeKind::FullTextSearch(spec) =
+            &mut changed.nodes.get_mut(changed.root).unwrap().kind
+        else {
+            unreachable!()
+        };
+        change(spec);
+        assert_ne!(identity, changed.structural_identity_fingerprint().unwrap());
+    }
 }
 
 #[test]

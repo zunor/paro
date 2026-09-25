@@ -24,9 +24,21 @@ pub enum CopyFromSource {
     Stdin,
 }
 
+impl CopyFromSource {
+    pub(crate) fn identity_value(&self) -> serde_json::Value {
+        match self {
+            Self::File(path) => serde_json::json!(["file", path]),
+            Self::Stdin => serde_json::json!(["stdin"]),
+        }
+    }
+}
+
 /// Internal options for CopyFunction, produced during the bind phase.
 pub trait CopyFunctionBindData: Send + Sync + Debug {
     fn as_any(&self) -> &dyn Any;
+    /// Versioned semantic binding owned by the format, excluding open files
+    /// and execution state. Formats must encode every output-affecting option.
+    fn canonical_plan_payload(&self) -> Vec<u8>;
 }
 
 pub trait CopyToGlobalState: Send + Sync {
@@ -98,4 +110,43 @@ pub fn register_copy_functions() -> Vec<CopyFunction> {
     let mut functions = csv::register_copy_functions();
     functions.extend(json::register_copy_functions());
     functions
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn bound_copy_payload_is_stable_and_distinguishes_formats_and_types() {
+        let names = vec!["a".to_string()];
+        let types = vec![LogicalType::Integer];
+        let mut input_payloads = std::collections::BTreeSet::new();
+        let mut output_payloads = std::collections::BTreeSet::new();
+        for function in register_copy_functions() {
+            let mut options = CopyOptions::default();
+            options.format = CopyFormat::parse(&function.name).unwrap();
+            if let Some(input) = function.copy_from {
+                let bind = |types: &[LogicalType]| {
+                    (input.copy_from_bind)(CopyFromSource::Stdin, &options, &names, types).unwrap()
+                };
+                let payload = bind(&types).canonical_plan_payload().unwrap();
+                assert_eq!(payload, bind(&types).canonical_plan_payload().unwrap());
+                assert_ne!(
+                    payload,
+                    bind(&[LogicalType::BigInt])
+                        .canonical_plan_payload()
+                        .unwrap()
+                );
+                assert!(input_payloads.insert(payload));
+            }
+            if let Some(output) = function.copy_to {
+                let bind =
+                    |names: &[String]| (output.copy_to_bind)(&options, names, &types).unwrap();
+                let payload = bind(&names).canonical_plan_payload();
+                assert_eq!(payload, bind(&names).canonical_plan_payload());
+                assert_ne!(payload, bind(&["b".into()]).canonical_plan_payload());
+                assert!(output_payloads.insert(payload));
+            }
+        }
+    }
 }

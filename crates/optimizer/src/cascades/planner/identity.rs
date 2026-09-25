@@ -648,7 +648,7 @@ pub(super) fn encode_hnsw_options(
     });
 }
 
-pub(super) fn encode_search_request(
+pub(crate) fn encode_search_request(
     fingerprint: &mut StableFingerprintBuilder,
     request: &paro_storage::search::NormalizedSearchRequest,
 ) {

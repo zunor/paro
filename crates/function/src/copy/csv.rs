@@ -31,6 +31,21 @@ struct CsvCopyToBindData {
 }
 
 impl CopyFunctionBindData for CsvCopyToBindData {
+    fn canonical_plan_payload(&self) -> Vec<u8> {
+        serde_json::json!([
+            "paro.copy.csv.v1",
+            self.names,
+            self.delimiter,
+            self.null_string,
+            self.header,
+            self.quote,
+            self.escape,
+            self.force_quote_columns
+        ])
+        .to_string()
+        .into_bytes()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
