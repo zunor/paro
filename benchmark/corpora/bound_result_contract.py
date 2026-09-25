@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """One SQL output binding for identity, integer mappings and peer ordering.
 
 This is deliberately not a SQL executor: only projections, scoped expansion

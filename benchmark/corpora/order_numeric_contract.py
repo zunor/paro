@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Typed ORDER-only binary64 casts. Never change exact output/bag identity.
 
 Paro: decimal_casts::decimal_to_float_cast (integer coefficient / 10f64.powi).

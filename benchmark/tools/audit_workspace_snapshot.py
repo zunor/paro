@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Verify C0 backups using an isolated Git index and untracked archive bytes.
 
 The original index and worktree are never written. Private snapshot contents

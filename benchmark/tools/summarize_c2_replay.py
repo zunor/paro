@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Join exact replay verdicts to separately hash-bound numerical certificates.
 
 This generates an evidence ledger, not a comparator exception. Raw exact

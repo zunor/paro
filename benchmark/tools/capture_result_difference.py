@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Capture complete, typed result evidence without relaxing the corpus oracle.
 
 This is a correctness diagnostic, never a performance sample. The supplied
@@ -36,7 +39,6 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--listen", default="127.0.0.1:16439")
     parser.add_argument("--verify", choices=("on", "off"), default="off")
-    parser.add_argument("--handoff", choices=("on", "off"), default="on")
     args = parser.parse_args()
     sys.path.insert(0, str(args.harness.resolve() / "corpora"))
     from benchmark_evidence import (
@@ -66,8 +68,6 @@ def main():
     for name in list(os.environ):
         if name.startswith("PARO_"):
             del os.environ[name]
-    if args.handoff == "on":
-        os.environ["PARO_QUALITY_POLICY_HANDOFF"] = "1"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     seed = ImmutableDataSeed.capture(args.seed)
     query = args.sql.read_text()
@@ -86,7 +86,7 @@ def main():
         "duckdb_runtime_contract": duckdb_runtime,
         "duckdb_extension_sha256": content_digest(Path(_duckdb.__file__)),
         "duckdb_database_sha256": content_digest(args.duckdb),
-        "optimizer_verify": args.verify, "handoff": args.handoff,
+        "optimizer_verify": args.verify,
         "default_null_order": "NULLS_LAST_ON_ASC_FIRST_ON_DESC",
         "harness_files": {p.name: content_digest(p) for p in
             sorted((args.harness / "corpora").glob("*.py"))},

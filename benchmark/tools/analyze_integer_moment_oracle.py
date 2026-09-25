@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Independent diagnostic for grouped mean / sample coefficient of variation.
 
 Consumes capture_result_difference artifacts. This never changes benchmark

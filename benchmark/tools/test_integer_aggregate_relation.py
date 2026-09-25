@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Relation/ordering negative controls for the registered numerical oracle."""
 import copy
 from pathlib import Path

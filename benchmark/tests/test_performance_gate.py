@@ -58,7 +58,7 @@ POLICY_PATH = Path(__file__).resolve().parents[1] / "policies" / "operator-runti
 DIVAN_POLICY_PATH = Path(__file__).resolve().parents[1] / "policies" / "divan-dispatch.toml"
 
 
-def test_policy(**overrides):
+def make_policy(**overrides):
     return replace(load_policy(POLICY_PATH), **overrides)
 
 
@@ -130,7 +130,7 @@ class PerformanceGateTests(unittest.TestCase):
         current = payload(query("new"))
 
         outcome = evaluate_gate(
-            policy=test_policy(metrics=("p50",)),
+            policy=make_policy(metrics=("p50",)),
             current_payload=current,
             baseline_payload=baseline,
         )
@@ -147,14 +147,14 @@ class PerformanceGateTests(unittest.TestCase):
         )
 
         hard = evaluate_gate(
-            policy=replace(test_policy(metrics=("p50",)), enforcement=GateEnforcement.HARD),
+            policy=replace(make_policy(metrics=("p50",)), enforcement=GateEnforcement.HARD),
             current_payload=current,
             baseline_payload=baseline,
         )
         self.assertTrue(hard.blocking_failed)
 
     def test_staging_query_missing_baseline_is_diagnostic_until_expiry(self) -> None:
-        policy = test_policy(metrics=("p50",))
+        policy = make_policy(metrics=("p50",))
         current = payload(query("new"))
         baseline = baseline_payload()
         staging = {
@@ -193,7 +193,7 @@ class PerformanceGateTests(unittest.TestCase):
         current = payload(query("q", stats={"p99": 10.0}))
 
         baseline_missing = evaluate_gate(
-            policy=test_policy(metrics=("p99",)),
+            policy=make_policy(metrics=("p99",)),
             current_payload=current,
             baseline_payload=baseline,
         )
@@ -201,7 +201,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertEqual(baseline_missing.entries[0].status, GateStatus.REGRESS)
 
         current_missing = evaluate_gate(
-            policy=test_policy(metrics=("p99",)),
+            policy=make_policy(metrics=("p99",)),
             current_payload=payload(query("q", stats={})),
             baseline_payload=baseline_payload(query("q", stats={"p99": 10.0})),
         )
@@ -213,7 +213,7 @@ class PerformanceGateTests(unittest.TestCase):
         current = payload(query("q", error="boom"))
 
         outcome = evaluate_gate(
-            policy=test_policy(metrics=("p50",)),
+            policy=make_policy(metrics=("p50",)),
             current_payload=current,
             baseline_payload=baseline,
         )
@@ -246,7 +246,7 @@ class PerformanceGateTests(unittest.TestCase):
                 load_policy(bad_policy)
 
     def test_compared_metric_statuses_cover_regress_improve_and_noise(self) -> None:
-        policy = test_policy(
+        policy = make_policy(
             metrics=("p50",),
             latency_regression_percent=15.0,
             latency_noise_floor_ms=0.0,
@@ -269,7 +269,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertEqual(improve.entries[0].status, GateStatus.IMPROVE)
 
         noisy = evaluate_gate(
-            policy=test_policy(metrics=("p50",), latency_noise_floor_ms=1.0),
+            policy=make_policy(metrics=("p50",), latency_noise_floor_ms=1.0),
             current_payload=payload(query("q", p50=10.5)),
             baseline_payload=baseline_payload(query("q", p50=10.0)),
         )
@@ -278,7 +278,7 @@ class PerformanceGateTests(unittest.TestCase):
 
     def test_short_query_tail_and_throughput_noise_are_filtered(self) -> None:
         tail = evaluate_gate(
-            policy=test_policy(
+            policy=make_policy(
                 metrics=("p99",),
                 latency_regression_percent=15.0,
                 p99_latency_noise_floor_ms=0.0,
@@ -290,7 +290,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertEqual(tail.entries[0].status, GateStatus.OK)
 
         throughput = evaluate_gate(
-            policy=test_policy(
+            policy=make_policy(
                 metrics=("throughput_per_second",),
                 throughput_min_ratio=0.85,
                 short_query_latency_noise_floor_ms=2.5,
@@ -301,7 +301,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertEqual(throughput.entries[0].status, GateStatus.OK)
 
     def test_statistical_gate_consumes_calibration_and_holm(self) -> None:
-        policy = test_policy(metrics=("p50",), latency_regression_percent=5.0)
+        policy = make_policy(metrics=("p50",), latency_regression_percent=5.0)
         baseline = baseline_payload(query("q", p50=10.0))
         calibration = calibration_payload(policy, *([10.0] * 29 + [10.2]))
 
@@ -323,7 +323,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertGreaterEqual(compared.noise_floor_abs or 0.0, 0.0)
 
     def test_first_phase_uses_threshold_and_noise_floor_before_retry(self) -> None:
-        policy = test_policy(metrics=("p50",), latency_regression_percent=5.0)
+        policy = make_policy(metrics=("p50",), latency_regression_percent=5.0)
         baseline = baseline_payload(query("q", p50=10.0))
         calibration = calibration_payload(policy, *([10.0] * 30))
 
@@ -341,7 +341,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertIn("quorum retry", compared.detail)
 
     def test_statistical_gate_filters_rolling_p95_noise(self) -> None:
-        policy = test_policy(metrics=("p50",), latency_regression_percent=5.0)
+        policy = make_policy(metrics=("p50",), latency_regression_percent=5.0)
         baseline = baseline_payload(query("q", p50=10.0))
         calibration = calibration_payload(policy, *([10.0] * 28 + [11.5, 11.6]))
 
@@ -358,7 +358,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertIn("rolling P95", outcome.entries[0].detail)
 
     def test_confirmed_quorum_requires_retry_sample_to_still_regress(self) -> None:
-        policy = test_policy(metrics=("p50",), latency_regression_percent=5.0)
+        policy = make_policy(metrics=("p50",), latency_regression_percent=5.0)
         baseline = baseline_payload(query("q", p50=10.0))
         calibration = calibration_payload(policy, *([10.0] * 30))
 
@@ -376,7 +376,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertEqual(outcome.entries[0].status, GateStatus.OK)
 
     def test_power_deficit_is_reported_for_underpowered_candidate(self) -> None:
-        policy = test_policy(metrics=("p50",), latency_regression_percent=5.0)
+        policy = make_policy(metrics=("p50",), latency_regression_percent=5.0)
         baseline = baseline_payload(query("q", p50=100.0))
         calibration = calibration_payload(policy, *([70.0, 130.0] * 15))
 
@@ -448,7 +448,7 @@ class PerformanceGateTests(unittest.TestCase):
             result = gate_check.report_missing_auto_baseline(
                 args,
                 root_dir=root,
-                policy=test_policy(enforcement=GateEnforcement.SHADOW),
+                policy=make_policy(enforcement=GateEnforcement.SHADOW),
                 baseline_path=missing,
             )
 
@@ -470,14 +470,14 @@ class PerformanceGateTests(unittest.TestCase):
             result = gate_check.report_missing_auto_baseline(
                 args,
                 root_dir=root,
-                policy=test_policy(enforcement=GateEnforcement.HARD),
+                policy=make_policy(enforcement=GateEnforcement.HARD),
                 baseline_path=missing,
             )
 
             self.assertEqual(result, 1)
 
     def test_source_family_alpha_is_split_across_sources(self) -> None:
-        policy = test_policy()
+        policy = make_policy()
 
         adjusted = gate_common.policy_for_source_family(policy, 2)
 
@@ -551,7 +551,7 @@ class PerformanceGateTests(unittest.TestCase):
 
     def test_absolute_metric_bounds_fail(self) -> None:
         outcome = evaluate_gate(
-            policy=test_policy(
+            policy=make_policy(
                 metrics=("rss_peak_kb",),
                 resource_regression_percent=1000.0,
                 rss_noise_floor_kb=0.0,
@@ -564,7 +564,7 @@ class PerformanceGateTests(unittest.TestCase):
 
     def test_query_specific_absolute_metric_bounds_override_global(self) -> None:
         outcome = evaluate_gate(
-            policy=test_policy(
+            policy=make_policy(
                 metrics=("p99",),
                 latency_regression_percent=1000.0,
                 absolute_max={"p99": 1000.0, "q.p99": 90.0},
@@ -577,7 +577,7 @@ class PerformanceGateTests(unittest.TestCase):
 
     def test_workload_specific_absolute_metric_bounds_override_query_bound(self) -> None:
         outcome = evaluate_gate(
-            policy=test_policy(
+            policy=make_policy(
                 metrics=("throughput_per_second",),
                 throughput_min_ratio=0.1,
                 absolute_min={
@@ -593,7 +593,7 @@ class PerformanceGateTests(unittest.TestCase):
 
     def test_audit_metric_absolute_bound_is_supported(self) -> None:
         outcome = evaluate_gate(
-            policy=test_policy(
+            policy=make_policy(
                 metrics=("audit_manifest_publish_bytes",),
                 resource_regression_percent=1000.0,
                 absolute_max={"audit_manifest_publish_bytes": 1024.0},
@@ -610,7 +610,7 @@ class PerformanceGateTests(unittest.TestCase):
 
     def test_zero_baseline_audit_metric_is_valid_when_current_stays_zero(self) -> None:
         outcome = evaluate_gate(
-            policy=test_policy(metrics=("audit_search_layer_varlen_fallback_seek_count",)),
+            policy=make_policy(metrics=("audit_search_layer_varlen_fallback_seek_count",)),
             current_payload=payload(
                 query("q", audit={"search_layer_varlen_fallback_seek_count": 0.0})
             ),
@@ -625,7 +625,7 @@ class PerformanceGateTests(unittest.TestCase):
 
     def test_zero_baseline_audit_metric_regresses_when_current_becomes_positive(self) -> None:
         outcome = evaluate_gate(
-            policy=test_policy(metrics=("audit_search_layer_varlen_fallback_seek_count",)),
+            policy=make_policy(metrics=("audit_search_layer_varlen_fallback_seek_count",)),
             current_payload=payload(
                 query("q", audit={"search_layer_varlen_fallback_seek_count": 1.0})
             ),
@@ -676,7 +676,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertEqual(gate_common.minimum_sample_count(policy, policy.sources[0].name), 7)
 
     def test_baseline_schema_carries_policy_and_source_payload(self) -> None:
-        policy = test_policy()
+        policy = make_policy()
         measurement = SimpleNamespace(
             source=policy.sources[0],
             payload=payload(query("q")),
@@ -720,7 +720,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertNotIn("memory_tags", projected_query)
 
     def test_bless_aggregation_uses_median_payload(self) -> None:
-        policy = test_policy(metrics=("p50",))
+        policy = make_policy(metrics=("p50",))
         runs = [
             [SimpleNamespace(source=policy.sources[0], payload=payload(query("q", p50=30.0, samples=10)))],
             [SimpleNamespace(source=policy.sources[0], payload=payload(query("q", p50=10.0, samples=20)))],
@@ -735,7 +735,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertEqual(query_payload["samples_count"], 20)
 
     def test_bless_aggregation_keeps_param_variants_separate(self) -> None:
-        policy = test_policy(metrics=("p50",))
+        policy = make_policy(metrics=("p50",))
         runs = [
             [
                 SimpleNamespace(
@@ -768,7 +768,7 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertEqual(indexed[QueryKey("w", "q", '{"scale": 2}')].query["stats"]["p50"], 150.0)
 
     def test_baseline_validation_rejects_policy_and_platform_mismatch(self) -> None:
-        policy = test_policy()
+        policy = make_policy()
         fingerprint = GateFingerprint(
             system={},
             build={"cargo_profile": "unknown"},
@@ -809,7 +809,7 @@ class PerformanceGateTests(unittest.TestCase):
             )
 
     def test_hard_compare_rejects_missing_fingerprint_coverage(self) -> None:
-        policy = replace(test_policy(), enforcement=GateEnforcement.HARD)
+        policy = replace(make_policy(), enforcement=GateEnforcement.HARD)
         baseline_fingerprint = GateFingerprint(
             system={},
             build={"cargo_profile": "unknown", "rustflags": []},
@@ -879,7 +879,7 @@ class PerformanceGateTests(unittest.TestCase):
         )
 
     def test_policy_evolution_requires_version_bump(self) -> None:
-        policy = test_policy()
+        policy = make_policy()
         fingerprint = GateFingerprint(system={}, build={}, runtime={}, audit={})
         measurement = SimpleNamespace(source=policy.sources[0], payload=payload(query("q")))
         baseline_json = build_baseline_payload(
@@ -934,7 +934,7 @@ class PerformanceGateTests(unittest.TestCase):
         )
 
     def test_suite_staging_metadata_is_policy_bounded(self) -> None:
-        policy = test_policy(sources=(replace(test_policy().sources[0], suite="s"),))
+        policy = make_policy(sources=(replace(make_policy().sources[0], suite="s"),))
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "suites").mkdir()

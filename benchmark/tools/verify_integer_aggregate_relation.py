@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Registered oracle for a keyed self-join of filtered small integer aggregates.
 
 Inputs and relation roles are explicit evidence, not inferred from result

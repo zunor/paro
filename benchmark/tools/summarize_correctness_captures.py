@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Index raw correctness captures; never turn an uncovered difference into PASS."""
 import argparse
 from collections import Counter

@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Independent, bounded binary64 aggregate result contract.
 
 No global epsilon: exact integer bags define high precision moments and the

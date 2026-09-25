@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Read-only SQL cast checks against both engines; no performance evidence."""
 import argparse
 from decimal import Decimal

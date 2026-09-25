@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Lossless scalar values after validation of each engine's declared type.
 
 An exact rational is a comparison representation, not permission to map two

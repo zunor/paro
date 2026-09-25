@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Small real-server T1 contract probe; stdout is raw evidence, never timing data."""
 import argparse
 import json

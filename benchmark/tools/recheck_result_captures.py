@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Rebind immutable captures; never execute target SQL or overwrite raw evidence."""
 import argparse
 from datetime import date, datetime, time
