@@ -98,19 +98,3 @@ policies, with the same sample counts/resources/observers above. Do not pool the
 two probes. Full pipeline SQL regress is blocked by its explicit unsupported
 write-planning boundary; setup errors are not SELECT result comparisons and
 must not be hidden by automatic quality fallback.
-
-## Delivered scope and follow-up boundary
-
-The shared traversal, native response kernel, borrowed equality-cut pricing,
-source-scoped RF materialization model, explicit budget status and real Session
-counterexamples are implemented. The completed experiments and limitations live
-in [the bounded delivery record](../../benchmark/evidence/optimizer/20260925/region-kernel-v1/README.md).
-This closes the implementation slice, not migration/default promotion.
-
-Remaining work is concrete: compact residual/aggregate state summaries and
-complete native capability pricing; promote eligible fully bound residual
-equalities/inequalities into join key/residual contracts; calibrate filtered
-group/NDV and build payload decisions; close write/corpus coverage and the Q72
-storage reproducer. Do not reopen global Memo search or raise its budget to
-address these issues. Keep runtime build-side adaptation a separately designed
-execution contract rather than an implicit planner fallback.

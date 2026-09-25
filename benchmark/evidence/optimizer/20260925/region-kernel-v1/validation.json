@@ -1,0 +1,37 @@
+{
+  "kind": "implementation_validation_record",
+  "evidence_id": "region-kernel-v1",
+  "source_commit": "a1a4e369e",
+  "optimizer_commit": "1976ceb62",
+  "binary_sha256": "3f16f1c982c7e6887e11ddfe1cd0397113a2698ae0d9f698e010f8b5d7c81c35",
+  "workspace_tests": {
+    "command": "make test",
+    "passed": 7007,
+    "failed": 0,
+    "ignored": 85
+  },
+  "clippy": {
+    "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "status": "passed"
+  },
+  "release": {
+    "command": "cargo build --release -p paro-server --bin parod --locked",
+    "status": "passed"
+  },
+  "benchmark_unit_tests": {"passed": 215},
+  "regress_unit_tests": {"passed": 104, "skipped": 1},
+  "sql_regress_probe_binary": {
+    "quality": {"passed": 183, "failed": 2, "classification": "owned Python import fixture path text differs from default report root"},
+    "pipeline": {"status": "Blocked", "reason": "pipeline write planning unsupported; INSERT/setup rejected, full suite not completed"}
+  },
+  "sql_regress_final_query_subset": {"policy": "quality", "verifier": true, "filter": "query/", "passed": 67, "failed": 0},
+  "expected_result_updates": 0,
+  "archive_contracts": {"campaign_summaries": 20, "cell_payloads": 41, "compile_captures": 20, "d6_campaign_summary": "not produced; cell/capture separately validated"},
+  "normal_matrix_final": {"queries": ["04", "11", "74", "72"], "policies": ["pipeline", "quality"], "blocks_per_cell": 3, "result_validation": "passed", "performance_certification": "NotCertified"},
+  "headers": {"status": "failed", "pre_existing_issues": 169},
+  "memory_api_guard": "passed",
+  "vector_copy_api_guard": "passed",
+  "default_promoted": false,
+  "proof_complete": false,
+  "open": ["fully compact residual/aggregate transition summaries", "native physical capability coverage", "Q04/Q11 build-direction quality", "Q72 post-join residual materialization", "Q72 baseline Block handle is None", "pipeline write/full-corpus coverage", "unloaded-host performance certification"]
+}

@@ -74,6 +74,48 @@ binary was overwritten by the initial rebuild rather than retained separately;
 its original build attestation and report remain, but a contemporaneous binary
 ABBA comparison cannot be claimed.
 
+## Final-source verification (separate cohort)
+
+The `verified-*` packages use clean source `a1a4e369e` (optimizer fix
+`1976ceb62`), binary
+`3f16f1c982c7e6887e11ddfe1cd0397113a2698ae0d9f698e010f8b5d7c81c35`.
+See [final-registration.md](final-registration.md). All eight cells completed
+with full result validation. Do not pool these samples with the first probe.
+
+| Query | Pipeline compiler | Quality compiler | Pipeline C1 / warm | Quality C1 / warm | DuckDB C1 in pipeline cell |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q04 | 10.338 | 24.257 | 322.211 / 184.804 | 277.844 / 158.689 | 169.369 |
+| Q11 | 5.112 | 12.829 | 150.235 / 101.508 | 170.913 / 93.900 | 71.819 |
+| Q74 | 4.238 | 11.669 | 121.856 / 66.156 | 108.057 / 67.662 | 96.068 |
+| Q72 | 15.298 | 384.055 | 866.364 / 669.340 | 1184.234 / 552.076 | 27.057 |
+
+Q04 final Detail region time is 4.693ms, with the same 92 borrowed cuts and 120
+completed outputs. The narrower work reduction is real; a repeatable general
+end-to-end gain is not established. Q04/Q11/Q72 warm non-inferiority to quality
+is not established either. Slower samples, including Q04's 17.409ms compiler
+sample, remain in the package. No milestone/parity gate is certified.
+
+[final-plan-inspection.txt](final-plan-inspection.txt) is a separate verifier-on
+diagnostic, not a source of normal compiler or C1 timings. It shows:
+
+- Q04/Q11 still use the wide customer input as the store branch build side;
+  the quality reference uses the partial aggregate. The new source-response
+  model alone has not fixed that decision; filtered group/NDV estimates and
+  actual hash payload/orientation pricing need a controlled follow-up.
+- Q72 no longer builds the old 16.4M-row intermediate and all spill replay
+  operators in this execution report zero rows. However, an inventory join
+  still emits 38,355,730 matches before a Filter leaves 10,552 rows. The Filter
+  includes `d1.d_week_seq = d2.d_week_seq` as well as the inventory quantity
+  inequality. Promoting eligible newly bound equalities to composite hash keys,
+  and safe inequalities to join residual evaluation, is a concrete next target;
+  merely attaching a Filter at the earliest relation subset is not equivalent
+  to avoiding this match materialization.
+
+The final full Rust suite again passed 7,007 tests (85 ignored), strict Clippy
+and release build passed. All 67 `query/` SQL regress cases passed on the final
+binary with quality + verifier on. This post-fix subset does not rewrite the
+earlier full-suite/pipeline coverage outcomes below.
+
 ## Correctness and remaining migration barriers
 
 The initial final workspace check via `make test` passed 7,007 tests, with 85
@@ -95,3 +137,18 @@ No fixture was rewritten to hide a failure. Q39/Q58, the broad corpus gate,
 runtime adaptive build orientation and the Q72 storage failure are not claimed
 resolved by this slice. No historical worktree, data or recovery material was
 removed. Runtime data/server logs are not archived here.
+
+## Package validation
+
+The shared validators accept 20 campaign summaries, 41 cell payloads and 20
+compile captures, including the structurally valid failed baseline cell.
+The older D6 diagnostic package does not produce `campaign.json`; its payload
+and capture validate separately, not as a completed campaign. Checksums cover
+every archived file except the checksum manifest itself. No raw event flood,
+server log or data directory is in this archive.
+
+Global header checking still reports the 169 pre-existing issues also present
+before this slice; it is not reported as green. Memory/vector API guards pass.
+All task changes are committed separately from historical evidence; the task
+created no new source worktree and changed neither the default policy nor
+toolchain/dependency versions.
