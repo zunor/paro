@@ -31,9 +31,10 @@ remain explicit choices. A failed pipeline plan never silently selects them.
 
 ## Validation boundaries
 
-The default-switch workspace run passed 7,019 tests (85 ignored). Subsequent
-identity and window regression tests require the final run recorded below;
-the earlier result does not certify code added afterwards.
+The final workspace run passed **7,022 tests (85 ignored)**. Strict all-target
+Clippy, memory-runtime and fallible-vector-copy guards passed. Benchmark has
+218 passing tests. Full-tree header validation retains 166 historical findings;
+the changed files pass the same header checker. No full static-green claim.
 
 Release SQL regress was run from empty owned storage with pipeline active for
 setup, writes and queries: **164 passed, 21 failed**. The maintained whole-block
@@ -43,9 +44,11 @@ no other non-EXPLAIN result differences. Raw snapshots remain failed, and no
 expected result was updated. An earlier run uncovered unsupported external
 operator identity; that implementation gap was fixed, not blessed away.
 
-The latest local audit is
-`/private/tmp/paro-pipeline-default.7dx8h6/regress-audit.json`; final compact
-evidence and source identity will be recorded after validation.
+The whole-block audit, original failure transcripts, five bounded campaigns
+and their validation are retained in the
+[compact delivery](../../benchmark/evidence/optimizer/20260925/pipeline-default-v1/README.md).
+Measurement source is clean `0852571cf`; all five selected queries pass their
+independent complete result contracts. Q58's real SF1 binding failure is fixed.
 
 This implements default selection, not the full PipelineReady release gate.
 Q39 certification, the historical spill reproducer, bounded same-execution
@@ -76,3 +79,14 @@ Store ordinary bounded RunOutput evidence only, at most 64 MiB, outside the
 source tree during collection. Historical samples are context, not a causal
 control. No same-process policy A/B or execution-layer speedup is certified by
 this limited run.
+
+## Scope still open
+
+P0 is partial (Q58 and campaign terminal fixed; Q39, broader fixture
+adjudication and the historical spill reproducer remain). P2 has the bounded
+input-workspace implementation and tests, but no matched-binary speedup
+certification. P5/P6 implement and exercise the default path, statement layers,
+search/graph/external and low-DOP operating point. They do not establish every
+resource edge or the full release gate. P1/P3/P4 are not implemented by this
+delivery. Preserve that distinction instead of treating a default switch as
+completion of the whole convergence plan.

@@ -1,0 +1,88 @@
+DROP TABLE IF EXISTS search_opt_docs;
+DROP TABLE
+
+CREATE TABLE search_opt_docs (
+    id INT PRIMARY KEY,
+    category VARCHAR,
+    content VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO search_opt_docs VALUES
+    (1, 'tech', 'graph database systems and query planning'),
+    (2, 'tech', 'graph traversal with database statistics'),
+    (3, 'life', 'mountain hiking and travel journal'),
+    (4, 'tech', 'vector search and graph database hybrid');
+INSERT 0 4
+
+CREATE INDEX idx_search_opt_docs_fts
+ON search_opt_docs USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+-- @normalize explain_search_ids
+EXPLAIN (VERBOSE)
+SELECT id
+FROM search_opt_docs
+WHERE fulltext_match(content, 'graph database')
+ORDER BY bm25(content, 'graph database') DESC, id
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: id
+  Cardinality: [0, 1, 1]
+  Output Schema: id INTEGER
+  ->  TOP_N  (rows=1)
+        Sort Key: bm25(public.search_opt_docs.content, 'graph database') DESC NULLS FIRST, id ASC NULLS LAST
+        Limit: 2
+        Cardinality: [0, 1, 1]
+        Output Schema: id INTEGER
+        ->  PROJECTION  (rows=1)
+              Output: id, bm25(public.search_opt_docs.content, 'graph database')
+              Cardinality: [0, 1, 1]
+              Output Schema: id INTEGER, expression_2 FLOAT
+              ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=1)
+                    Search Definition: <search-definition-id>
+                    Search Generation: <search-generation-id>
+                    Search Root: <search-root-id>
+                    Search Capability: queryable
+                    Search Candidate: full text
+                    Column: content
+                    Mode: filter
+                    Cardinality: [0, 1, 1]
+                    Output Schema: public.search_opt_docs.id INTEGER, public.search_opt_docs.content VARCHAR
+
+SELECT id
+FROM search_opt_docs
+WHERE fulltext_match(content, 'graph database')
+ORDER BY bm25(content, 'graph database') DESC, id
+LIMIT 2;
+id
+1
+2
+
+-- @normalize explain_search_ids
+EXPLAIN (VERBOSE)
+SELECT id
+FROM search_opt_docs
+WHERE fulltext_match(content, 'graph database')
+  AND category = 'tech';
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: id
+  Cardinality: [0, 1, 1]
+  Output Schema: id INTEGER
+  ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=1)
+        Search Definition: <search-definition-id>
+        Search Generation: <search-generation-id>
+        Search Root: <search-root-id>
+        Search Capability: queryable
+        Search Candidate: full text
+        Column: content
+        Mode: filter
+        Pushed Predicate: category = 'tech'
+        Filter Pushdown: exact segment row set materialized by column scan; no residual filter
+        Cardinality: [0, 1, 1]
+        Output Schema: public.search_opt_docs.id INTEGER, public.search_opt_docs.category VARCHAR, public.search_opt_docs.content VARCHAR
+
+DROP TABLE search_opt_docs;
+DROP TABLE

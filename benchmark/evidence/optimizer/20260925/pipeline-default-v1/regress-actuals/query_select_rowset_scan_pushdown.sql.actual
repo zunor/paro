@@ -1,0 +1,333 @@
+DROP TABLE IF EXISTS rowset_pushdown_dim;
+DROP TABLE
+
+DROP TABLE IF EXISTS rowset_pushdown_case;
+DROP TABLE
+
+CREATE TABLE rowset_pushdown_case(
+    id INT,
+    k INT,
+    nullable_k INT,
+    score INT,
+    payload VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO rowset_pushdown_case
+SELECT
+    g,
+    g % 10,
+    CASE WHEN g % 8 = 0 THEN NULL ELSE g % 7 END,
+    65 - g,
+    'payload_' || CAST(g AS VARCHAR)
+FROM generate_series(1, 64) AS t(g);
+INSERT 0 64
+
+CREATE TABLE rowset_pushdown_dim(k INT);
+CREATE TABLE
+
+INSERT INTO rowset_pushdown_dim VALUES (2), (5), (8);
+INSERT 0 3
+
+SELECT COUNT(*) FROM rowset_pushdown_case;
+COUNT(*)
+64
+
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k = 3;
+COUNT(*)
+7
+
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
+COUNT(*)
+21
+
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k IN (1, 4, 9);
+COUNT(*)
+20
+
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE nullable_k IS NULL;
+COUNT(*)
+8
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k = 3;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: "COUNT(*)" BIGINT
+  ->  AGGREGATE  (rows=1)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+              Pushed Predicate: k = 3
+              Cardinality: [3, 6, 10]
+              Output Schema: (none)
+
+EXPLAIN (VERBOSE)
+SELECT payload FROM rowset_pushdown_case WHERE k = 3;
+QUERY PLAN
+PROJECTION  (rows=6)
+  Output: payload
+  Cardinality: [3, 6, 10]
+  Output Schema: payload VARCHAR
+  ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+        Column IDs: 4
+        Columns: payload
+        Pushed Predicate: k = 3
+        Late Materialize: auto
+        Cardinality: [3, 6, 10]
+        Output Schema: public.rowset_pushdown_case.payload VARCHAR
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: "COUNT(*)" BIGINT
+  ->  AGGREGATE  (rows=1)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
+              Pushed Predicate: k >= 2 AND k < 5
+              Cardinality: [9, 19, 29]
+              Output Schema: (none)
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE k IN (1, 4, 9);
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: "COUNT(*)" BIGINT
+  ->  AGGREGATE  (rows=1)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
+              Pushed Predicate: k IN (1, 4, 9)
+              Cardinality: [9, 19, 29]
+              Output Schema: (none)
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*) FROM rowset_pushdown_case WHERE nullable_k IS NULL;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: "COUNT(*)" BIGINT
+  ->  AGGREGATE  (rows=1)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
+              Pushed Predicate: nullable_k IS NULL
+              Cardinality: [3, 6, 10]
+              Output Schema: (none)
+
+EXPLAIN (VERBOSE)
+SELECT COUNT(*)
+FROM rowset_pushdown_case c
+JOIN rowset_pushdown_dim d ON c.k = d.k;
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: COUNT(*)
+  Cardinality: [1, 1, 1]
+  Output Schema: "COUNT(*)" BIGINT
+  ->  AGGREGATE  (rows=1)
+        Aggregates: count_star(*)
+        Cardinality: [1, 1, 1]
+        Output Schema: aggregate_state_1 BIGINT
+        ->  HASH_JOIN  (rows=19)
+              Join Type: INNER
+              Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=b90fdac674cf7ca987aa48915e7147a9
+              Build Index: integer_build_time
+              Join Condition: c.k = d.k
+              Cardinality: [10, 19, 29]
+              Output Schema: (none)
+              ->  ROWSET_SCAN on public.rowset_pushdown_case c  (rows=64)
+                    Column IDs: 1
+                    Columns: k
+                    Cardinality: [64, 64, 64]
+                    Output Schema: c.k INTEGER
+              ->  ROWSET_SCAN on public.rowset_pushdown_dim d  (rows=3)
+                    Column IDs: 0
+                    Columns: k
+                    Cardinality: [3, 3, 3]
+                    Output Schema: d.k INTEGER
+
+EXPLAIN (VERBOSE)
+SELECT id FROM rowset_pushdown_case ORDER BY score ASC LIMIT 5;
+QUERY PLAN
+PROJECTION  (rows=5)
+  Output: id
+  Cardinality: [5, 5, 5]
+  Output Schema: id INTEGER
+  ->  TOP_N  (rows=5)
+        Sort Key: public.rowset_pushdown_case.score ASC NULLS LAST
+        Limit: 5
+        Cardinality: [5, 5, 5]
+        Output Schema: id INTEGER
+        ->  PROJECTION  (rows=64)
+              Output: id, score
+              Cardinality: [64, 64, 64]
+              Output Schema: id INTEGER, public.rowset_pushdown_case.score INTEGER
+              ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=64)
+                    Column IDs: 0, 3
+                    Columns: id, score
+                    Cardinality: [64, 64, 64]
+                    Output Schema: public.rowset_pushdown_case.id INTEGER, public.rowset_pushdown_case.score INTEGER
+
+DROP TABLE rowset_pushdown_dim;
+DROP TABLE
+
+DROP TABLE rowset_pushdown_case;
+DROP TABLE
+
+DROP TABLE IF EXISTS matched_prefix_projection_case;
+DROP TABLE
+
+CREATE TABLE matched_prefix_projection_case(id INT, phone VARCHAR, note VARCHAR);
+CREATE TABLE
+
+INSERT INTO matched_prefix_projection_case VALUES
+    (1, '13alpha', 'keep'),
+    (2, '31beta', 'keep'),
+    (3, '13', 'keep'),
+    (4, '1', 'short'),
+    (5, 'éclair', 'non-ascii'),
+    (6, NULL, 'null'),
+    (7, '44gamma', 'other');
+INSERT 0 7
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id;
+id	prefix
+1	13
+2	31
+3	13
+
+SET rowset_scan_pushdown = false;
+SET
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id;
+id	prefix
+1	13
+2	31
+3	13
+
+SET rowset_scan_pushdown = DEFAULT;
+SET
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+  AND id % 2 = 1
+ORDER BY id;
+id	prefix
+1	13
+3	13
+
+DROP TABLE matched_prefix_projection_case;
+DROP TABLE
+
+DROP TABLE IF EXISTS matched_prefix_late_payload_case;
+DROP TABLE
+
+CREATE TABLE matched_prefix_late_payload_case(
+    id INT,
+    phone VARCHAR,
+    wide VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO matched_prefix_late_payload_case
+SELECT
+    g,
+    CASE WHEN g % 3 = 0 THEN '44z' WHEN g % 2 = 0 THEN '31y' ELSE '13x' END,
+    'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww'
+        || CAST(g AS VARCHAR)
+FROM generate_series(1, 5000) AS t(g);
+INSERT 0 5000
+
+EXPLAIN (VERBOSE)
+SELECT phone, wide
+FROM matched_prefix_late_payload_case
+WHERE phone IN ('13x', '31y')
+ORDER BY id
+LIMIT 3;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: phone, wide
+  Cardinality: [3, 3, 3]
+  Output Schema: phone VARCHAR, wide VARCHAR
+  ->  TOP_N  (rows=3)
+        Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
+        Limit: 3
+        Cardinality: [3, 3, 3]
+        Output Schema: phone VARCHAR, wide VARCHAR
+        ->  PROJECTION  (rows=3333)
+              Output: phone, wide, id
+              Cardinality: [1666, 3333, 5000]
+              Output Schema: phone VARCHAR, wide VARCHAR, public.matched_prefix_late_payload_case.id INTEGER
+              ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
+                    Column IDs: 0, 1, 2
+                    Columns: id, phone, wide
+                    Pushed Predicate: phone IN ('13x', '31y')
+                    Cardinality: [1666, 3333, 5000]
+                    Output Schema: public.matched_prefix_late_payload_case.id INTEGER, public.matched_prefix_late_payload_case.phone VARCHAR, public.matched_prefix_late_payload_case.wide VARCHAR
+
+SELECT phone, wide
+FROM matched_prefix_late_payload_case
+WHERE phone IN ('13x', '31y')
+ORDER BY id
+LIMIT 3;
+phone	wide
+13x	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww1
+31y	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww2
+31y	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww4
+
+EXPLAIN (VERBOSE)
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix, wide
+FROM matched_prefix_late_payload_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id
+LIMIT 3;
+QUERY PLAN
+TOP_N  (rows=3)
+  Sort Key: id ASC NULLS LAST
+  Limit: 3
+  Cardinality: [3, 3, 3]
+  Output Schema: id INTEGER, prefix VARCHAR, wide VARCHAR
+  ->  PROJECTION  (rows=1000)
+        Output: id, prefix, wide
+        Cardinality: [500, 1000, 1501]
+        Output Schema: id INTEGER, prefix VARCHAR, wide VARCHAR
+        ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=1000)
+              Column IDs: 0, 1, 2
+              Columns: id, phone, wide
+              Pushed Predicate: phone HAS PREFIX IN ("13", "31")
+              Late Materialize: auto
+              Cardinality: [500, 1000, 1501]
+              Output Schema: public.matched_prefix_late_payload_case.id INTEGER, public.matched_prefix_late_payload_case.phone VARCHAR, public.matched_prefix_late_payload_case.wide VARCHAR
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix, wide
+FROM matched_prefix_late_payload_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id
+LIMIT 3;
+id	prefix	wide
+1	13	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww1
+2	31	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww2
+4	31	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww4
+
+DROP TABLE matched_prefix_late_payload_case;
+DROP TABLE

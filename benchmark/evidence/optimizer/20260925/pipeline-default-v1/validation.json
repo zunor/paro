@@ -1,0 +1,536 @@
+{
+  "validator": "benchmark/harness/receipt_contract.py",
+  "timing_summary": "benchmark/corpora/tpcds_compare.py",
+  "runs": [
+    {
+      "run": "q04-run",
+      "query": "04",
+      "status": "passed",
+      "rows": 6,
+      "cells_validated": 2,
+      "captures_validated": 1,
+      "compiler": {
+        "samples_ms": [
+          9.681,
+          9.438
+        ],
+        "minimum_ms": 9.438,
+        "median_ms": 9.5595,
+        "p95_ms": 9.681
+      },
+      "cold": {
+        "cohort": "normal_trace_off",
+        "cold_miss_evidence": {
+          "method": "post_timer_typed_statement_receipt_channel",
+          "status": "Verified"
+        },
+        "compile_document": "normal target uses production receipt channel",
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            1.676364,
+            2.136239
+          ],
+          "process_block_ratios": [
+            1.676364,
+            2.136239
+          ],
+          "process_blocks": 2,
+          "ratio": 1.892383,
+          "resampling_unit": "fresh_process_block_only",
+          "samples_per_engine": 2
+        },
+        "duckdb": {
+          "median_ms": 149.256687,
+          "minimum_ms": 145.902917,
+          "p95_ms": 152.610458,
+          "samples_ms": [
+            152.610458,
+            145.902917
+          ]
+        },
+        "normal_observation_verified": true,
+        "normal_receipt_coverage": {
+          "method": "post_timer_statement_decision_and_execution_id",
+          "sample_count": 4,
+          "status": "Verified",
+          "verified_count": 4
+        },
+        "paro": {
+          "median_ms": 283.757105,
+          "minimum_ms": 255.83075,
+          "p95_ms": 311.683459,
+          "samples_ms": [
+            255.83075,
+            311.683459
+          ]
+        },
+        "primary_gate_eligible": true,
+        "trace_mode": "off"
+      },
+      "warm": {
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            1.215524,
+            1.96488
+          ],
+          "process_block_ratios": [
+            1.660454,
+            1.379133
+          ],
+          "process_blocks": 2,
+          "ratio": 1.51327,
+          "resampling_unit": "fresh_process_block_then_within_block_sample",
+          "samples_per_engine": 4
+        },
+        "duckdb": {
+          "median_ms": 134.283062,
+          "minimum_ms": 128.136875,
+          "p95_ms": 152.424125,
+          "samples_ms": [
+            134.643041,
+            128.136875,
+            152.424125,
+            133.923083
+          ]
+        },
+        "paro": {
+          "median_ms": 198.824042,
+          "minimum_ms": 159.658709,
+          "p95_ms": 297.933375,
+          "samples_ms": [
+            297.933375,
+            159.658709,
+            225.37825,
+            172.269833
+          ]
+        }
+      }
+    },
+    {
+      "run": "q11-run",
+      "query": "11",
+      "status": "passed",
+      "rows": 90,
+      "cells_validated": 2,
+      "captures_validated": 1,
+      "compiler": {
+        "samples_ms": [
+          5.59,
+          6.979
+        ],
+        "minimum_ms": 5.59,
+        "median_ms": 6.2845,
+        "p95_ms": 6.979
+      },
+      "cold": {
+        "cohort": "normal_trace_off",
+        "cold_miss_evidence": {
+          "method": "post_timer_typed_statement_receipt_channel",
+          "status": "Verified"
+        },
+        "compile_document": "normal target uses production receipt channel",
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            1.990042,
+            2.311923
+          ],
+          "process_block_ratios": [
+            1.990042,
+            2.311923
+          ],
+          "process_blocks": 2,
+          "ratio": 2.144953,
+          "resampling_unit": "fresh_process_block_only",
+          "samples_per_engine": 2
+        },
+        "duckdb": {
+          "median_ms": 88.545166,
+          "minimum_ms": 78.276833,
+          "p95_ms": 98.8135,
+          "samples_ms": [
+            78.276833,
+            98.8135
+          ]
+        },
+        "normal_observation_verified": true,
+        "normal_receipt_coverage": {
+          "method": "post_timer_statement_decision_and_execution_id",
+          "sample_count": 4,
+          "status": "Verified",
+          "verified_count": 4
+        },
+        "paro": {
+          "median_ms": 192.111709,
+          "minimum_ms": 155.774167,
+          "p95_ms": 228.44925,
+          "samples_ms": [
+            155.774167,
+            228.44925
+          ]
+        },
+        "primary_gate_eligible": true,
+        "trace_mode": "off"
+      },
+      "warm": {
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            1.110027,
+            2.015978
+          ],
+          "process_block_ratios": [
+            1.322595,
+            1.558609
+          ],
+          "process_blocks": 2,
+          "ratio": 1.435761,
+          "resampling_unit": "fresh_process_block_then_within_block_sample",
+          "samples_per_engine": 4
+        },
+        "duckdb": {
+          "median_ms": 100.067813,
+          "minimum_ms": 94.514292,
+          "p95_ms": 140.16775,
+          "samples_ms": [
+            100.263542,
+            99.872084,
+            140.16775,
+            94.514292
+          ]
+        },
+        "paro": {
+          "median_ms": 141.120937,
+          "minimum_ms": 115.498,
+          "p95_ms": 246.451625,
+          "samples_ms": [
+            151.658333,
+            115.498,
+            246.451625,
+            130.583542
+          ]
+        }
+      }
+    },
+    {
+      "run": "q51-run",
+      "query": "51",
+      "status": "passed",
+      "rows": 100,
+      "cells_validated": 2,
+      "captures_validated": 1,
+      "compiler": {
+        "samples_ms": [
+          3.644,
+          2.451
+        ],
+        "minimum_ms": 2.451,
+        "median_ms": 3.0475,
+        "p95_ms": 3.644
+      },
+      "cold": {
+        "cohort": "normal_trace_off",
+        "cold_miss_evidence": {
+          "method": "post_timer_typed_statement_receipt_channel",
+          "status": "Verified"
+        },
+        "compile_document": "normal target uses production receipt channel",
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            13.892125,
+            15.950282
+          ],
+          "process_block_ratios": [
+            13.892125,
+            15.950282
+          ],
+          "process_blocks": 2,
+          "ratio": 14.885675,
+          "resampling_unit": "fresh_process_block_only",
+          "samples_per_engine": 2
+        },
+        "duckdb": {
+          "median_ms": 139.976709,
+          "minimum_ms": 130.870084,
+          "p95_ms": 149.083334,
+          "samples_ms": [
+            149.083334,
+            130.870084
+          ]
+        },
+        "normal_observation_verified": true,
+        "normal_receipt_coverage": {
+          "method": "post_timer_statement_decision_and_execution_id",
+          "sample_count": 4,
+          "status": "Verified",
+          "verified_count": 4
+        },
+        "paro": {
+          "median_ms": 2079.24952,
+          "minimum_ms": 2071.084333,
+          "p95_ms": 2087.414708,
+          "samples_ms": [
+            2071.084333,
+            2087.414708
+          ]
+        },
+        "primary_gate_eligible": true,
+        "trace_mode": "off"
+      },
+      "warm": {
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            14.304107,
+            17.695634
+          ],
+          "process_block_ratios": [
+            15.815486,
+            15.853217
+          ],
+          "process_blocks": 2,
+          "ratio": 15.834341,
+          "resampling_unit": "fresh_process_block_then_within_block_sample",
+          "samples_per_engine": 4
+        },
+        "duckdb": {
+          "median_ms": 133.468896,
+          "minimum_ms": 121.751,
+          "p95_ms": 158.934,
+          "samples_ms": [
+            125.981833,
+            140.955959,
+            121.751,
+            158.934
+          ]
+        },
+        "paro": {
+          "median_ms": 2120.891605,
+          "minimum_ms": 2078.546208,
+          "p95_ms": 2310.515917,
+          "samples_ms": [
+            2078.546208,
+            2136.961959,
+            2104.82125,
+            2310.515917
+          ]
+        }
+      }
+    },
+    {
+      "run": "q58-run",
+      "query": "58",
+      "status": "passed",
+      "rows": 5,
+      "cells_validated": 2,
+      "captures_validated": 1,
+      "compiler": {
+        "samples_ms": [
+          5.591,
+          5.688
+        ],
+        "minimum_ms": 5.591,
+        "median_ms": 5.6395,
+        "p95_ms": 5.688
+      },
+      "cold": {
+        "cohort": "normal_trace_off",
+        "cold_miss_evidence": {
+          "method": "post_timer_typed_statement_receipt_channel",
+          "status": "Verified"
+        },
+        "compile_document": "normal target uses production receipt channel",
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            8.908436,
+            10.912189
+          ],
+          "process_block_ratios": [
+            10.912189,
+            8.908436
+          ],
+          "process_blocks": 2,
+          "ratio": 9.85954,
+          "resampling_unit": "fresh_process_block_only",
+          "samples_per_engine": 2
+        },
+        "duckdb": {
+          "median_ms": 12.046896,
+          "minimum_ms": 11.549792,
+          "p95_ms": 12.544,
+          "samples_ms": [
+            12.544,
+            11.549792
+          ]
+        },
+        "normal_observation_verified": true,
+        "normal_receipt_coverage": {
+          "method": "post_timer_statement_decision_and_execution_id",
+          "sample_count": 4,
+          "status": "Verified",
+          "verified_count": 4
+        },
+        "paro": {
+          "median_ms": 119.886541,
+          "minimum_ms": 102.890583,
+          "p95_ms": 136.8825,
+          "samples_ms": [
+            136.8825,
+            102.890583
+          ]
+        },
+        "primary_gate_eligible": true,
+        "trace_mode": "off"
+      },
+      "warm": {
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            7.933104,
+            8.424919
+          ],
+          "process_block_ratios": [
+            8.224106,
+            8.030667
+          ],
+          "process_blocks": 2,
+          "ratio": 8.126811,
+          "resampling_unit": "fresh_process_block_then_within_block_sample",
+          "samples_per_engine": 4
+        },
+        "duckdb": {
+          "median_ms": 7.803937,
+          "minimum_ms": 7.257167,
+          "p95_ms": 7.885167,
+          "samples_ms": [
+            7.80975,
+            7.257167,
+            7.798125,
+            7.885167
+          ]
+        },
+        "paro": {
+          "median_ms": 62.669896,
+          "minimum_ms": 61.202875,
+          "p95_ms": 63.240666,
+          "samples_ms": [
+            62.633959,
+            61.202875,
+            63.240666,
+            62.705833
+          ]
+        }
+      }
+    },
+    {
+      "run": "q74-run",
+      "query": "74",
+      "status": "passed",
+      "rows": 92,
+      "cells_validated": 2,
+      "captures_validated": 1,
+      "compiler": {
+        "samples_ms": [
+          3.935,
+          6.997
+        ],
+        "minimum_ms": 3.935,
+        "median_ms": 5.466,
+        "p95_ms": 6.997
+      },
+      "cold": {
+        "cohort": "normal_trace_off",
+        "cold_miss_evidence": {
+          "method": "post_timer_typed_statement_receipt_channel",
+          "status": "Verified"
+        },
+        "compile_document": "normal target uses production receipt channel",
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            1.076637,
+            1.248083
+          ],
+          "process_block_ratios": [
+            1.076637,
+            1.248083
+          ],
+          "process_blocks": 2,
+          "ratio": 1.159195,
+          "resampling_unit": "fresh_process_block_only",
+          "samples_per_engine": 2
+        },
+        "duckdb": {
+          "median_ms": 95.081084,
+          "minimum_ms": 94.926542,
+          "p95_ms": 95.235625,
+          "samples_ms": [
+            94.926542,
+            95.235625
+          ]
+        },
+        "normal_observation_verified": true,
+        "normal_receipt_coverage": {
+          "method": "post_timer_statement_decision_and_execution_id",
+          "sample_count": 4,
+          "status": "Verified",
+          "verified_count": 4
+        },
+        "paro": {
+          "median_ms": 110.531688,
+          "minimum_ms": 102.201417,
+          "p95_ms": 118.861959,
+          "samples_ms": [
+            102.201417,
+            118.861959
+          ]
+        },
+        "primary_gate_eligible": true,
+        "trace_mode": "off"
+      },
+      "warm": {
+        "crossover": {
+          "bootstrap_samples": 1000,
+          "hierarchical_confidence_interval_95": [
+            0.913215,
+            0.978221
+          ],
+          "process_block_ratios": [
+            0.948895,
+            0.934042
+          ],
+          "process_blocks": 2,
+          "ratio": 0.941439,
+          "resampling_unit": "fresh_process_block_then_within_block_sample",
+          "samples_per_engine": 4
+        },
+        "duckdb": {
+          "median_ms": 71.435,
+          "minimum_ms": 63.700917,
+          "p95_ms": 76.187041,
+          "samples_ms": [
+            63.700917,
+            67.9155,
+            74.9545,
+            76.187041
+          ]
+        },
+        "paro": {
+          "median_ms": 67.346875,
+          "minimum_ms": 60.638542,
+          "p95_ms": 70.713791,
+          "samples_ms": [
+            64.239458,
+            60.638542,
+            70.713791,
+            70.454292
+          ]
+        }
+      }
+    }
+  ]
+}

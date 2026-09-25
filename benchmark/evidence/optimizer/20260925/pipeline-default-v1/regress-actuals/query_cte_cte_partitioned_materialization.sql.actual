@@ -1,0 +1,90 @@
+-- @normalize explain_cte_ids
+EXPLAIN
+WITH segmented(v, st) AS (
+    SELECT 10, 1
+    UNION ALL
+    SELECT 20, 2
+    UNION ALL
+    SELECT 30, 3
+)
+SELECT SUM(first_ref.v + second_ref.v + third_ref.v)::BIGINT AS selected_sum
+FROM (SELECT * FROM segmented WHERE st = 1) AS first_ref
+CROSS JOIN (SELECT * FROM segmented WHERE st = 2) AS second_ref
+CROSS JOIN (SELECT * FROM segmented WHERE st = 3) AS third_ref;
+QUERY PLAN
+MATERIALIZED_CTE  (rows=1)
+  CTE Name: segmented
+  Materialization: MATERIALIZED
+  Reference Count: 3
+  ->  VALUES  (rows=3)
+  ->  PROJECTION  (rows=1)
+        Output: selected_sum
+        ->  AGGREGATE  (rows=1)
+              Aggregates: sum(+(+(first_ref.v, second_ref.v), third_ref.v))
+              ->  CROSS_PRODUCT  (rows=1)
+                    ->  CROSS_PRODUCT  (rows=1)
+                          ->  PROJECTION  (rows=1)
+                                Output: v
+                                ->  FILTER  (rows=1)
+                                      Filter: segmented.st = 1
+                                      ->  CTE_SCAN  (rows=3)
+                                            CTE Index: <cte-1>
+                                            Table Index: 33
+                          ->  PROJECTION  (rows=1)
+                                Output: v
+                                ->  FILTER  (rows=1)
+                                      Filter: segmented.st = 2
+                                      ->  CTE_SCAN  (rows=3)
+                                            CTE Index: <cte-1>
+                                            Table Index: 41
+                    ->  PROJECTION  (rows=1)
+                          Output: v
+                          ->  FILTER  (rows=1)
+                                Filter: segmented.st = 3
+                                ->  CTE_SCAN  (rows=3)
+                                      CTE Index: <cte-1>
+                                      Table Index: 49
+
+WITH segmented(v, st) AS (
+    SELECT 10, 1
+    UNION ALL
+    SELECT 20, 2
+    UNION ALL
+    SELECT 30, 3
+)
+SELECT SUM(first_ref.v + second_ref.v + third_ref.v)::BIGINT AS selected_sum
+FROM (SELECT * FROM segmented WHERE st = 1) AS first_ref
+CROSS JOIN (SELECT * FROM segmented WHERE st = 2) AS second_ref
+CROSS JOIN (SELECT * FROM segmented WHERE st = 3) AS third_ref;
+selected_sum
+60
+
+WITH segmented(v, st) AS (
+    SELECT 10, 1
+    UNION ALL
+    SELECT 20, 2
+    UNION ALL
+    SELECT 30, 3
+)
+SELECT COUNT(nullable_ref.st)::BIGINT AS matched_discriminators
+FROM (SELECT * FROM segmented WHERE st = 1) AS preserved_ref
+LEFT JOIN (SELECT * FROM segmented WHERE st = 2) AS nullable_ref
+    ON FALSE
+CROSS JOIN (SELECT * FROM segmented WHERE st = 3) AS third_ref;
+matched_discriminators
+0
+
+WITH segmented(v, st) AS (
+    SELECT 10, 1
+    UNION ALL
+    SELECT 20, 2
+    UNION ALL
+    SELECT 30, 3
+    UNION ALL
+    SELECT 40, 4
+)
+SELECT SUM(first_ref.v + fourth_ref.v)::BIGINT AS selected_sum
+FROM (SELECT * FROM segmented WHERE st = 1) AS first_ref
+CROSS JOIN (SELECT * FROM segmented WHERE st = 4) AS fourth_ref;
+selected_sum
+50
